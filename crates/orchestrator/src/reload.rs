@@ -349,6 +349,59 @@ Do {{ issue.identifier }}.
         );
     }
 
+    /// STUDIO-950: `agent.max_concurrent_reviews` hot-reloads with the rest of WORKFLOW.md. Setting
+    /// it, changing it, and removing it all take effect on `on_reload` without a restart — the
+    /// knob's whole point is that an operator can tune the review pool live.
+    #[test]
+    fn reload_applies_a_changed_review_budget() {
+        let (path, _dir) = write_workflow(CLAUDE_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            None,
+            "absent on the first load ⇒ the shared budget"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 1\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            Some(1),
+            "the key must hot-reload without a restart"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 3\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            Some(3),
+            "a changed value must take effect"
+        );
+
+        std::fs::write(&path, CLAUDE_WF).unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            None,
+            "removing the key returns to the shared budget"
+        );
+    }
+
     // STUDIO-671: a `projects:` config with NO top-level `tracker.project_slug` — the shape
     // `config::validate` deliberately accepts, and the shape the daemon that wedged was running.
     // The account-level client is bound to that empty slug, so it is NOT a substitute for the

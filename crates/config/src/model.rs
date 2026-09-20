@@ -133,6 +133,17 @@ pub struct Hooks {
 pub struct Agent {
     pub backend: String,
     pub max_concurrent_agents: i64,
+    /// A SEPARATE global budget for ticketless review runs (STUDIO-950). `None` — the default, and
+    /// every install that never writes the key — means reviews keep drawing the shared
+    /// `max_concurrent_agents` pool exactly as before. A positive value gives reviews their own pool
+    /// so a review round can dispatch while every implementation slot is occupied (the inversion D2
+    /// fixed per teammate, never at the global cap). Anything ≤ 0 is treated as unset.
+    ///
+    /// **Rhapsody-only** (no Go reference): decoded, carried on `Effective`, and preserved by
+    /// `encode` (so a console Save keeps it), but deliberately NOT rendered by `effective_json`,
+    /// whose response is byte-pinned to the Go config goldens — the same pattern as
+    /// `mcp.allow_handoff`.
+    pub max_concurrent_reviews: Option<i64>,
     pub max_turns: i64,
     pub max_retry_backoff_ms: i64,
     /// Per-state concurrency caps: keys lowercased, only positive ints kept (upstream §5.3.5).
@@ -455,6 +466,8 @@ pub(crate) struct RawHooks {
 pub(crate) struct RawAgent {
     pub backend: String,
     pub max_concurrent_agents: Option<i64>,
+    /// STUDIO-950; Rhapsody-only, absent ⇒ reviews keep the shared `max_concurrent_agents` pool.
+    pub max_concurrent_reviews: Option<i64>,
     pub max_turns: Option<i64>,
     pub max_retry_backoff_ms: Option<i64>,
     pub handoff_drain_grace_ms: Option<i64>,

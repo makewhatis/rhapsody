@@ -456,6 +456,24 @@ impl Orchestrator {
         out
     }
 
+    /// The ticketless review runs currently in flight — the count the separate review budget
+    /// ([`Effective::max_concurrent_reviews`](crate::effective::Effective::max_concurrent_reviews))
+    /// is drawn against when it is set.
+    ///
+    /// Only the TICKETLESS shape counts. This budget governs exactly what
+    /// [`service_review_pr`](Self::service_review_pr) dispatches; a quorum review is a real tracker
+    /// ticket on the implementation ladder, drawing the implementation budget, and counting it here
+    /// would let it silently consume ticketless review capacity it never drew from.
+    fn running_ticketless_reviews(&self) -> i64 {
+        i64::try_from(
+            self.running
+                .values()
+                .filter(|re| re.review.is_some())
+                .count(),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
     /// Turns one tick's observations into drops, re-arms and review dispatches. **The watcher's
     /// whole decision**, on the control task, where the watch set is single-writer and
     /// `running`/`claimed` cannot race.
@@ -477,14 +495,25 @@ impl Orchestrator {
         // the tick and spent down as reviews are dispatched, so it composes with the per-identity
         // `max_concurrent` rather than replacing it. No config loaded ⇒ no budget: a dispatch could
         // not resolve a project to route with in any case.
+        //
+        // STUDIO-950: when the operator has set `agent.max_concurrent_reviews`, reviews draw their
+        // OWN pool instead — `max_concurrent_reviews` less the ticketless reviews already running —
+        // so a round dispatches while implementations hold every `max_concurrent_agents` slot. That
+        // is D2 ("reviews are free") applied at the global cap it was never applied to; a review
+        // clearing a pull request is what FREES an implementation slot, so sharing the one budget
+        // queues the capacity-creating work behind the capacity-spending work. Unset ⇒ the shared
+        // draw below, byte-identical to before the key existed.
         let mut slots = self
             .eff
             .as_ref()
-            .map(|eff| {
-                crate::concurrency::global_slots(
+            .map(|eff| match eff.max_concurrent_reviews {
+                Some(max_reviews) => {
+                    crate::concurrency::global_slots(max_reviews, self.running_ticketless_reviews())
+                }
+                None => crate::concurrency::global_slots(
                     eff.max_concurrent,
                     i64::try_from(self.running.len()).unwrap_or(i64::MAX),
-                )
+                ),
             })
             .unwrap_or(0);
         for obs in observed {
@@ -622,6 +651,7 @@ impl Orchestrator {
         self.auto_merge_announced.remove(&churn_key(pr));
         for id in retired_ids {
             self.review_unassignable.remove(&id);
+            self.review_capacity_held.remove(&id);
         }
         dropped
     }
@@ -669,13 +699,24 @@ impl Orchestrator {
                 row.key.number,
                 &row.key.reviewer,
             );
+            // STUDIO-950: this sweep is about to re-evaluate the round, so any hold recorded by a
+            // PREVIOUS sweep is stale from here on. Cleared unconditionally — a round that then
+            // defers for a different reason must not keep suppressing the reconciliation sweep's
+            // report under a capacity hold that no longer applies. The capacity branch below
+            // re-inserts it when the budget is what deferred this round.
+            self.review_capacity_held.remove(&id);
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             if !review_round_due(row, head, live) {
                 continue;
             }
             if *slots <= 0 {
+                // STUDIO-950: remember WHY this round is deferred, so the reconciliation sweep can
+                // tell a deliberate capacity hold from an unexplained stall. The count is the runs
+                // holding the pool, for the log a human reads when tuning the key.
+                let holding = self.running_ticketless_reviews();
+                self.review_capacity_held.insert(id.clone());
                 tracing::debug!(
-                    pr = %pr,
+                    pr = %pr, holding,
                     "ticketless review: the daemon-wide concurrency budget is spent; this round is \
                      re-considered next tick"
                 );
@@ -2714,6 +2755,176 @@ mod tests {
         assert_eq!(report.dispatched, 2, "the global cap must bound one tick");
         assert_eq!(report.deferred, 2, "and the rest are deferred, not lost");
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
+    /// One busy IMPLEMENTATION run for `identity`, keyed by `id`. It carries no `review`
+    /// coordinates, so the separate review budget (which counts TICKETLESS review runs) leaves it
+    /// out — exactly the shape of the four implementations that held all four slots in the incident.
+    fn add_impl_run(o: &mut Orchestrator, id: &str, identity: &str) {
+        let mut re = RunningEntry::empty(crate::testsupport::issue(id, id, "Todo"));
+        re.identity = identity.to_string();
+        o.running.insert(id.to_string(), re);
+    }
+
+    /// Records one FINISHED run of `identifier`, so the reconciliation sweep can date the row.
+    fn finished_run(o: &Orchestrator, identifier: &str, started: &str, ended: &str) {
+        let id = o
+            .store()
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: identifier.to_string(),
+                started_at: started.to_string(),
+                ..Default::default()
+            })
+            .expect("start_run");
+        o.store()
+            .end_run(
+                id,
+                rhapsody_store::RunEnd {
+                    outcome: "completed".to_string(),
+                    ended_at: ended.to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("end_run");
+    }
+
+    /// STUDIO-950, named after makewhatis/strava#31 (2026-09-20): four implementation runs held all
+    /// four global slots and a review round waited over an hour for one. With
+    /// `agent.max_concurrent_reviews` set, reviews draw their OWN pool, so the round that would
+    /// CLEAR a pull request — and thereby free an implementation slot — is no longer queued behind
+    /// the work spending the slots.
+    ///
+    /// Mutation check: delete the separate budget and restore the shared draw, and this reds — it
+    /// asserts the round ran *while implementations held the global cap*, which is the whole
+    /// property, not merely that some review ran.
+    #[test]
+    fn a_review_round_dispatches_while_implementations_hold_the_global_budget() {
+        let (mut o, dispatched) = orch(ticketless(&["bob"]));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.max_concurrent = 4;
+            eff.max_concurrent_reviews = Some(2);
+        }
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 1,
+            "the review must not queue behind a full implementation budget"
+        );
+        assert_eq!(report.deferred, 0);
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// The behaviour-preservation gate: the SAME fixture with `max_concurrent_reviews` left unset —
+    /// every install that never writes the key — keeps the shared draw, so the round is deferred
+    /// because implementations hold the one global budget. This test passes against the code before
+    /// and after STUDIO-950, which is what "unset preserves today exactly" means.
+    #[test]
+    fn an_unset_review_budget_keeps_the_shared_global_draw() {
+        let (mut o, dispatched) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        // `max_concurrent_reviews` deliberately left `None` — the pre-STUDIO-950 install.
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(
+            report.deferred, 1,
+            "an unset key must keep reviews on the shared global budget"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// With the key set, review runs never exceed their OWN budget — four rounds due in one tick and
+    /// a budget of two dispatch two and defer two, whatever the implementation budget is doing.
+    #[test]
+    fn review_runs_never_exceed_their_own_budget() {
+        let (mut o, dispatched) = orch(ticketless(&["bob"]));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.max_concurrent = 10;
+            eff.max_concurrent_reviews = Some(2);
+        }
+        for n in 31..35 {
+            introduce(&o, row(n, "bob"));
+        }
+
+        let report = o.handle_review_sweep(&[
+            open_at(31, HEAD_A),
+            open_at(32, HEAD_A),
+            open_at(33, HEAD_A),
+            open_at(34, HEAD_A),
+        ]);
+
+        assert_eq!(
+            report.dispatched, 2,
+            "the review budget must bound the tick"
+        );
+        assert_eq!(report.deferred, 2);
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
+    /// STUDIO-950's second half: a round the watcher is HOLDING for capacity is not an unexplained
+    /// stall. `reviewwatch` recorded the hold when it deferred the round; the reconciliation sweep
+    /// must read it and stay silent, then report normally once the hold is gone.
+    ///
+    /// The positive control (`clear` then reconcile again, non-empty) is deliberate: without it the
+    /// test would still pass if the divergence rule stopped firing for everyone.
+    ///
+    /// Mutation check: revert the sweep's `capacity_held` exclusion and the first assertion reds.
+    #[test]
+    fn a_review_held_for_capacity_is_not_reported_as_a_divergence() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        // The row's origin ticket, so the `requested` rule has an author run to anchor on. Long
+        // stale, so the rule WOULD report without the hold.
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(
+            report.deferred, 1,
+            "the fixture holds the round for capacity"
+        );
+        let id = review_key(OWNER, REPO, 31, "bob");
+        assert!(
+            o.review_capacity_held.contains(&id),
+            "the hold must be recorded for the sweep to read"
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "a held round is a healthy wait, not a divergence: {:?}",
+            o.review_divergences()
+        );
+
+        // Positive control: forget the hold and the SAME row is reported, so the silence above is
+        // the exclusion and not the rule failing to fire.
+        o.review_capacity_held.clear();
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "without the hold the owed round IS a divergence"
+        );
     }
 
     // --- the off-loop task --------------------------------------------------------------------

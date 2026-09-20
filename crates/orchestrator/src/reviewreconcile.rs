@@ -231,6 +231,13 @@ pub(crate) struct RowFacts {
     /// The row's `origin_ticket`, or `""` when its origin names none.
     pub ticket: String,
     pub open: bool,
+    /// Whether the review watcher deferred THIS row's round for want of a global slot on its most
+    /// recent sweep (STUDIO-950). A capacity hold is a deliberate, healthy wait — the budget is
+    /// spent, the round is re-considered next tick, and `reviewwatch` logs the reason — so it is
+    /// NOT the unexplained stall this sweep exists to catch, and [`row_divergence`] reports nothing
+    /// for it. Without this the sweep re-derived "a round is owed and no reviewer run has started"
+    /// and paged a human for work the daemon was holding on purpose.
+    pub capacity_held: bool,
     /// The newest run of `review_key(pr, reviewer)` — this row's own review round.
     pub reviewer_run: Option<RunMoment>,
     /// The newest run of `ticket`.
@@ -329,6 +336,13 @@ fn row_divergence(
     now: DateTime<Utc>,
     stale_after: Duration,
 ) -> Option<Divergence> {
+    if row.capacity_held {
+        // A round the watcher is holding for want of a global slot (STUDIO-950). Nothing is owed
+        // and nothing is wrong: the budget frees and the next sweep of the watcher dispatches it.
+        // Reporting it would be the "nothing has reported it blocked" page the bottom of this
+        // module exists to retire, one tick after `reviewwatch` reported exactly why.
+        return None;
+    }
     match row.status.as_str() {
         // The reviewer posted findings, so the AUTHOR owes a run on the origin ticket.
         REVIEW_STATUS_REVIEWED => {
@@ -478,6 +492,12 @@ impl Orchestrator {
                 status: row.status.clone(),
                 ticket: ticket.clone(),
                 open: row.open,
+                capacity_held: self.review_capacity_held.contains(&review_key(
+                    &row.key.owner,
+                    &row.key.repo,
+                    row.key.number,
+                    &row.key.reviewer,
+                )),
                 reviewer_run: self.newest_run_moment(&review_key(
                     &row.key.owner,
                     &row.key.repo,
@@ -674,6 +694,7 @@ mod tests {
             status: status.to_string(),
             ticket: ticket.to_string(),
             open: true,
+            capacity_held: false,
             reviewer_run,
             ticket_run,
         }

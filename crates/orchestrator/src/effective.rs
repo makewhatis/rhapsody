@@ -147,6 +147,11 @@ pub struct Effective {
     pub capabilities: Vec<String>,
     pub per_state_limits: HashMap<String, i64>,
     pub max_concurrent: i64,
+    /// The SEPARATE global budget for ticketless review runs (STUDIO-950), or `None` when the
+    /// operator never set `agent.max_concurrent_reviews` — in which case the review watcher draws
+    /// the shared `max_concurrent` pool exactly as it did before the key existed. A non-positive
+    /// value is normalized to `None` here, so every reader can treat `Some(n)` as `n > 0`.
+    pub max_concurrent_reviews: Option<i64>,
     pub prompt_file: String,
     pub git_flow: String,
     /// The top-level/legacy effective workspace-provisioning policy (`"worktree"` | `"clone"`;
@@ -666,6 +671,9 @@ pub fn build_effective_with_runner(
         capabilities: cfg.tracker.capabilities.clone(),
         per_state_limits: cfg.agent.max_concurrent_agents_by_state.clone(),
         max_concurrent: cfg.agent.max_concurrent_agents,
+        // STUDIO-950: a positive value opts in; absent/zero/negative keep the shared pool (D2's
+        // global half, opt-in by construction so an existing install schedules identically).
+        max_concurrent_reviews: cfg.agent.max_concurrent_reviews.filter(|n| *n > 0),
         max_turns: cfg.agent.max_turns,
         max_retry_backoff_ms: cfg.agent.max_retry_backoff_ms,
         poll_interval: Duration::from_millis(cfg.polling.interval_ms.max(0) as u64),
@@ -740,6 +748,41 @@ claude:
         assert!(eff.terminal_states.contains("canceled"));
         assert_eq!(eff.stall_timeout, Duration::from_millis(5000));
         assert_eq!(eff.prompt_tmpl, "Do {{ issue.identifier }}.");
+    }
+
+    /// STUDIO-950: `agent.max_concurrent_reviews` reaches `Effective` as an opt-in review pool, and
+    /// a non-positive value normalizes to `None` so every reader can treat `Some(n)` as `n > 0`.
+    #[test]
+    fn build_effective_carries_max_concurrent_reviews() {
+        let absent = decode_cfg(CLAUDE_WF, "x");
+        assert_eq!(
+            build_effective(&absent)
+                .expect("build")
+                .max_concurrent_reviews,
+            None,
+            "absent ⇒ the shared `max_concurrent_agents` budget"
+        );
+
+        let set = decode_cfg(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\nagent:\n  max_concurrent_agents: 4\n  max_concurrent_reviews: 2\n",
+            "x",
+        );
+        assert_eq!(
+            build_effective(&set).expect("build").max_concurrent_reviews,
+            Some(2)
+        );
+
+        let zero = decode_cfg(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\nagent:\n  max_concurrent_reviews: 0\n",
+            "x",
+        );
+        assert_eq!(
+            build_effective(&zero)
+                .expect("build")
+                .max_concurrent_reviews,
+            None,
+            "≤ 0 is unset, not a zero-slot pool that would starve every review"
+        );
     }
 
     // Mirrors Go `TestBuildEffectiveSingleProjectPopulatesLegacyFields`.

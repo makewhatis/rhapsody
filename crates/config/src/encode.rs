@@ -100,6 +100,9 @@ fn raw_from_config(c: &Config) -> Raw {
 
     r.agent.backend = c.agent.backend.clone();
     r.agent.max_concurrent_agents = Some(c.agent.max_concurrent_agents);
+    // STUDIO-950: emit only when set; `prune_empty` drops the `None` so an untouched workflow
+    // round-trips without the key (and stays byte-identical to the pre-key config).
+    r.agent.max_concurrent_reviews = c.agent.max_concurrent_reviews;
     r.agent.max_turns = Some(c.agent.max_turns);
     r.agent.max_retry_backoff_ms = Some(c.agent.max_retry_backoff_ms);
     r.agent.handoff_drain_grace_ms = Some(c.agent.handoff_drain_grace_ms);

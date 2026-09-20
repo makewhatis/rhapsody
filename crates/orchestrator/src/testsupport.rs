@@ -219,6 +219,7 @@ pub(crate) fn empty_effective(tracker: Arc<dyn Tracker>) -> Effective {
         capabilities: Vec::new(),
         per_state_limits: HashMap::new(),
         max_concurrent: 0,
+        max_concurrent_reviews: None,
         prompt_file: String::new(),
         git_flow: String::new(),
         workspace_mode: String::new(),

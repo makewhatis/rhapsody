@@ -587,6 +587,18 @@ pub struct Orchestrator {
     /// bounds how much review a pull request may be GIVEN, this one notices when it is being given
     /// none at all.
     pub(crate) review_unassignable: HashMap<String, usize>,
+    /// The ticketless review rounds the watcher deferred for want of a global slot on its most
+    /// recent sweep (STUDIO-950), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id
+    /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler; a
+    /// round is cleared from it as soon as the next sweep re-evaluates it (including when it
+    /// dispatches), so it only ever reflects the MOST RECENT sweep, and it is dropped when the pull
+    /// request leaves the watch set.
+    ///
+    /// It exists so the reconciliation sweep can tell a DELIBERATE capacity hold — a healthy wait the
+    /// operator can see in `reviewwatch`'s own log — from an unexplained stall. Without it the sweep
+    /// re-derives "a round is owed and nobody ran it" and pages a human for a round the daemon is
+    /// holding on purpose (the second instance of the STUDIO-923 class).
+    pub(crate) review_capacity_held: std::collections::HashSet<String>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -861,6 +873,7 @@ impl Orchestrator {
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
             review_unassignable: HashMap::new(),
+            review_capacity_held: std::collections::HashSet::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,
