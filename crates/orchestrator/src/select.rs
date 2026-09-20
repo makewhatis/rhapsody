@@ -100,6 +100,14 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut issues = issues.into_iter();
         while let Some(iss) = issues.next() {
+            // Observe the CURRENT label on every candidate, BEFORE any branch or filter — including
+            // one the daemon is running (STUDIO-949 round 8). The reporting rule below deliberately
+            // excludes live work from `held`, but the refusal is absolute and the handoff's review
+            // decision reads this observation on the run's OWN ticket, whose issue snapshot predates
+            // a label added mid-run. A label seen and then not reported is still a label we honour.
+            if crate::teams::is_human(&iss) {
+                self.human_holds.note_human_label(&iss.identifier);
+            }
             if global_remaining <= 0 {
                 // Name what the cap turned away before stopping (STUDIO-885). The candidates are
                 // sorted, so everything from `iss` onward is unexamined — and the fetch includes
@@ -116,6 +124,11 @@ impl Orchestrator {
                 // publishes nothing.
                 let mut held: Vec<String> = Vec::new();
                 for i in std::iter::once(iss).chain(issues.by_ref()) {
+                    // See the main loop: the current label is observed for every candidate, live
+                    // work included, independently of the reported hold set.
+                    if crate::teams::is_human(&i) {
+                        self.human_holds.note_human_label(&i.identifier);
+                    }
                     if self.is_unworked_candidate(&i, &running, &recovered_claims) {
                         // The human note takes the SAME filter as the capacity tally (STUDIO-949
                         // round 3). The tail is dominated by the daemon's own in-flight work, and
@@ -357,6 +370,11 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut tagged = tagged.into_iter();
         while let Some(ti) = tagged.next() {
+            // See the single-project ladder: observe the current label on every candidate before
+            // any branch, live work included (STUDIO-949 round 8).
+            if crate::teams::is_human(&ti.iss) {
+                self.human_holds.note_human_label(&ti.iss.identifier);
+            }
             if global_remaining <= 0 {
                 // See the single-project ladder: the same diagnostic, same filter, on the pass a
                 // `projects:` install actually runs. Two ladders means two call sites or the
@@ -365,6 +383,11 @@ impl Orchestrator {
                 // (STUDIO-949): a fully-booked pass must still name the deliberate holds.
                 let mut held: Vec<String> = Vec::new();
                 for t in std::iter::once(ti).chain(tagged.by_ref()) {
+                    // See the main loop: the current label is observed for every candidate, live
+                    // work included, independently of the reported hold set.
+                    if crate::teams::is_human(&t.iss) {
+                        self.human_holds.note_human_label(&t.iss.identifier);
+                    }
                     if self.is_unworked_candidate(&t.iss, &running, &recovered_claims) {
                         // See the single-project ladder: the human note shares the capacity
                         // tally's filter so a ticket with a live run is never reported as held —

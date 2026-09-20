@@ -1315,20 +1315,18 @@ impl Orchestrator {
         //
         // Two in-memory sources, because neither alone is enough on this path. The run's own `issue`
         // is the direct evidence but is the dispatch-time snapshot, so it only sees a label that
-        // predates the dispatch. The `HumanHoldLedger`'s current set is the LIVE signal — the same
-        // one the ticketless watcher's origin gate and the auto-merge gate read — but it is built
-        // from the candidate fetch and is only populated for a ticket the ladders see as unworked.
-        // Reading both means a labelled parent is refused wherever either can see it; the residual
-        // bound (a label added mid-run to a ticket still claimed, before any pass has re-noted it)
-        // is the same candidacy bound documented on [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger).
-        let held: HashSet<String> = self
-            .human_holds
-            .held()
-            .into_iter()
-            .map(|h| h.issue_identifier.to_ascii_lowercase())
-            .collect();
+        // predates the dispatch. The ledger's CURRENT-LABEL set is the live signal — every candidate
+        // the last pass saw wearing the label, INCLUDING one the daemon is running. It is
+        // deliberately NOT the `held()` set the console reads: that one excludes live work (a run in
+        // flight is not yet a deliberate hold), and reading it here is what left this gate blind to
+        // the only shape production creates — a label added to the ticket while this very run is
+        // live, whose handoff then fans out a review (STUDIO-949 round 8). Reading both means a
+        // labelled parent is refused wherever either can see it; the residual bound (no candidate
+        // pass has run since the label was added) is the same candidacy bound documented on
+        // [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger).
+        let labelled: HashSet<String> = self.human_holds.labelled();
         if crate::teams::is_human(&re.issue)
-            || held.contains(&re.issue.identifier.to_ascii_lowercase())
+            || labelled.contains(&re.issue.identifier.to_ascii_lowercase())
         {
             tracing::debug!(
                 issue = %re.issue.identifier,
@@ -3031,6 +3029,67 @@ mod tests {
             o.plan_quorum(&running_entry(held_parent, "alice"))
                 .is_none(),
             "a snapshot-labelled parent must not fan out a review"
+        );
+    }
+
+    // STUDIO-949 round 8 — the state PRODUCTION actually creates, not two seeded guard inputs. The
+    // round-7 test above seeds the ledger and the snapshot directly, which proves the two arms exist
+    // but not that either sees a normally dispatched run: `re.issue` is the DISPATCH-TIME snapshot
+    // (a run that started before the label cannot carry it), and the selection ladders deliberately
+    // exclude running work from the reported `held()` set. So the only mid-run hold shape — label
+    // added to a ticket the daemon is running right now — reached neither arm.
+    //
+    // This drives the real sequence: a selection pass over the CURRENT labelled row (which is what
+    // populates the current-label signal), then `plan_quorum` on the run whose snapshot predates the
+    // label. The control below proves the fixture would otherwise fan out, so the refusal is the
+    // label's work and not an unrelated gate's.
+    //
+    // MUTATION: read the reported `held()` set instead of `labelled()` in `plan_quorum` and this
+    // reds (a live-labelled parent fans out a review); the round-7 test above still passes because it
+    // seeds `hold()`, which feeds both sets.
+    #[test]
+    fn a_human_label_added_while_the_run_is_live_is_refused_at_the_handoff() {
+        use crate::testsupport::{empty_effective, running_entry, set_of};
+
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.review_states = set_of(&["in review"]);
+        eff.max_concurrent = 10;
+        o.eff = Some(eff);
+
+        // The tracker's CURRENT row: parked in review, labelled mid-run. A fresh selection pass sees
+        // this one.
+        let mut current = marked_parent();
+        current
+            .labels
+            .get_or_insert_with(Vec::new)
+            .push(crate::teams::HUMAN_LABEL.to_string());
+        // The run's OWN snapshot: dispatched before the label, so it carries no hold.
+        let mut snapshot = marked_parent();
+        snapshot.labels = Some(vec![
+            QUORUM_REQUESTED_LABEL.to_string(),
+            "rhapsody:@alice".to_string(),
+        ]);
+        let mut re = running_entry(snapshot, "", "");
+        re.identity = "alice".to_string();
+        o.running.insert("iss-1".to_string(), re.clone());
+
+        // Control: with the current row NOT labelled, the very same run plans a fan-out — so the
+        // refusal below is the label's work.
+        let _ = o.select_dispatch_with_reopens(vec![marked_parent()]);
+        assert!(
+            o.plan_quorum(&re).is_some(),
+            "the fixture is otherwise live: an unlabelled parent fans out"
+        );
+
+        // Now the pass observes the mid-run label on the current row...
+        let (_active, _reopen, _) = o.select_dispatch_with_reopens(vec![current]);
+        // ...and the run's handoff, whose snapshot predates it, must not fan out.
+        assert!(
+            o.plan_quorum(&re).is_none(),
+            "a label added while the run was live must prevent its handoff from fanning out a review"
         );
     }
 

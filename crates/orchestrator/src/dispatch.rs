@@ -105,10 +105,15 @@ const HUMAN_HOLD_CAPACITY: usize = 256;
 /// the ticket, and never again. That is [`crate::runautomerge::AutoMergeLedger`]'s idiom, and the
 /// reason for it is the same.
 ///
-/// It also carries the CURRENT hold set for the console's `/api/v1/state` key. The two jobs are one
-/// ledger because both are per-selection-pass facts: [`begin_pass`](Self::begin_pass) clears the
-/// current set (a ticket no longer held stops being reported), while the announced set survives so
-/// re-holding it the next tick is not news again.
+/// It also carries the CURRENT hold set for the console's `/api/v1/state` key, and beside it the
+/// CURRENT-LABEL set (`labelled`): every candidate the pass saw wearing `rhapsody:human`, live work
+/// included. The two are kept apart because they answer different questions — "is this a deliberate
+/// hold to show an operator" (no live work) and "does this ticket wear the label right now" (yes,
+/// live work too) — and only the second is the dispatch refusal's signal on a RUNNING ticket. The
+/// jobs live in one ledger because all are per-selection-pass facts:
+/// [`begin_pass`](Self::begin_pass) clears both current sets (a ticket no longer held stops being
+/// reported, a delisted label stops refusing), while the announced set survives so re-holding the
+/// next tick is not news again.
 ///
 /// Unlike [`Orchestrator::held_for_capacity`](crate::orchestrator::Orchestrator), the current set is
 /// deliberately NOT retired on the tick's three early returns (a failed preflight, an armed drain, a
@@ -129,6 +134,17 @@ struct HumanHoldState {
     announced: HashSet<String>,
     /// Tickets held by the MOST RECENT selection pass, for the console.
     held: Vec<HeldForHuman>,
+    /// Every ticket the most recent selection pass OBSERVED wearing
+    /// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), whether or not it already has a live run —
+    /// lowercased, for case-insensitive comparison.
+    ///
+    /// This is the CURRENT-LABEL signal, deliberately separate from [`Self::held`]. The reporting
+    /// rule excludes a ticket the daemon is running right now, because a live run is not yet a
+    /// deliberate hold (see [`Self::held`]); but the refusal itself is absolute, and the handoff's
+    /// review decision (STUDIO-949 round 8) must see a label added mid-run even though the run's own
+    /// issue snapshot predates it. Kept separate so tightening a decision gate never makes the
+    /// console call live work "held".
+    labelled: HashSet<String>,
 }
 
 impl Default for HumanHoldLedger {
@@ -144,11 +160,22 @@ impl HumanHoldLedger {
     /// wearing the label — or left the candidate set — stops being reported. The announced set is
     /// deliberately NOT touched.
     pub(crate) fn begin_pass(&self) {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.held.clear();
+        st.labelled.clear();
+    }
+
+    /// Records a ticket the pass OBSERVED wearing [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), with
+    /// no log and no console row — the CURRENT-LABEL half, independent of the reporting rule that
+    /// excludes live work (STUDIO-949 round 8). Called for every candidate that wears the label,
+    /// including one the daemon is running, so a decision made on the RUNNING ticket's handoff can
+    /// see a label added after it was dispatched.
+    pub(crate) fn note_human_label(&self, issue_identifier: &str) {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .held
-            .clear();
+            .labelled
+            .insert(issue_identifier.to_ascii_lowercase());
     }
 
     /// Records a hold and returns whether it is NEWS (the first time this ticket has been announced
@@ -164,6 +191,10 @@ impl HumanHoldLedger {
     /// facts; the project slug differs only between the ladders and the Backlog pass).
     pub(crate) fn hold(&self, entry: HeldForHuman) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        // A reported hold is by definition an observed current label, so the decision half is fed
+        // here too (STUDIO-949 round 8).
+        st.labelled
+            .insert(entry.issue_identifier.to_ascii_lowercase());
         if st.announced.len() >= HUMAN_HOLD_CAPACITY
             && !st.announced.contains(&entry.issue_identifier)
         {
@@ -179,6 +210,18 @@ impl HumanHoldLedger {
             None => st.held.push(entry),
         }
         news
+    }
+
+    /// The tickets the most recent selection pass OBSERVED wearing the human label, including any
+    /// the daemon is running right now — lowercased. This is the decision signal for a gate on a
+    /// RUNNING ticket (the handoff review decision, the ticketless origin gate); the console reads
+    /// [`Self::held`] instead, which excludes live work.
+    pub(crate) fn labelled(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .labelled
+            .clone()
     }
 
     /// The tickets held by the most recent selection pass, for the snapshot. Empty until a pass has

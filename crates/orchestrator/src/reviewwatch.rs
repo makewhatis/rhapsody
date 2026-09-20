@@ -656,15 +656,12 @@ impl Orchestrator {
             .map_or(1, |t| t.review.effective_reviewers().max(1));
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
-        // The current `rhapsody:human` hold set (STUDIO-949), lowercased once for the case-insensitive
-        // comparison against a row's origin ticket below. Empty on any daemon with no hold, which is
-        // what keeps the default path paying only a clone of an empty Vec.
-        let held: HashSet<String> = self
-            .human_holds
-            .held()
-            .into_iter()
-            .map(|h| h.issue_identifier.to_ascii_lowercase())
-            .collect();
+        // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
+        // a row's origin ticket below. This is `labelled()`, not the console's `held()`: the reported
+        // hold excludes a ticket the daemon is running, but this gate must also catch an origin
+        // labelled while its run was still LIVE — the mid-run hold shape. Empty on any daemon with no
+        // hold, which is what keeps the default path paying only a clone of an empty set.
+        let held: HashSet<String> = self.human_holds.labelled();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
         // go stale the moment one row is reassigned: the next row would still see the retired
@@ -838,8 +835,9 @@ impl Orchestrator {
         // would still clear auto-merge here — and the merge then runs `plan_review_done` on the next
         // tick and moves the ticket to `review.done_state`. Refusing the review round while MERGING
         // the code and closing the ticket is the daemon finishing work the label says only a person
-        // can do, and the merge is irreversible. Read from the same current hold set as the round
-        // gate, and decided before the plan is formed so nothing is handed across the seam.
+        // can do, and the merge is irreversible. Read from the same current-LABEL set as the round
+        // gate (`labelled()`, live runs included), and decided before the plan is formed so nothing
+        // is handed across the seam.
         //
         // MUTATION: delete this gate and
         // `a_held_origin_ticket_holds_back_auto_merge` reds (a plan is proposed).

@@ -1264,7 +1264,11 @@ armed, so a later label removal still gets the review it is owed). The **ticket-
 is its sibling and refuses for the same reason: `plan_quorum` does not fan out a review quorum for a
 held parent, and the room's `file_review` answers an explicit "review this" the way its
 `confirm_assignment` answers "assign this" — both refuse, so a held parent cannot mint a new,
-unlabelled review ticket that no hold on the parent could reach. A held origin ticket also holds
+unlabelled review ticket that no hold on the parent could reach. That handoff decision, and the
+ticketless watcher and auto-merge gates with it, read the `HumanHoldLedger`'s current-**label** set —
+every candidate the selection pass saw wearing the label, **live runs included** — because the only
+mid-run hold shape is a ticket labelled while the daemon is running it, whose `RunningEntry` carries
+only its dispatch-time snapshot. A held origin ticket also holds
 back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
 would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
 finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
@@ -1280,13 +1284,15 @@ real failed run, which must keep saying `failed` rather than being repainted `qu
 **How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
 dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the
 adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and a ticket that
-never becomes a candidate is never dispatched either. The ticket-mode quorum (`plan_quorum`, through
-the `HumanHoldLedger`'s current set), the ticketless review watcher, the reconciliation sweep, the
-auto-merge gate and the console's `held_for_human` key instead read dispatcher state built as the
-selection pass walks the candidate fetch (active ∪ review states, narrowed by `claim_mode`). Under
+never becomes a candidate is never dispatched either. The ticket-mode quorum (`plan_quorum`), the
+ticketless review watcher, the reconciliation sweep and the auto-merge gate instead read the
+`HumanHoldLedger`'s current-**label** set, built as the selection pass walks the candidate fetch
+(active ∪ review states, narrowed by `claim_mode`) and deliberately including a ticket the daemon is
+running; the console's `held_for_human` key reads the reported-hold subset of the same pass, which
+excludes live work. Under
 `claim_mode: pool` the pool claim ASSIGNS the ticket and nothing ever clears it, so a ticket that
 has run leaves the candidate query and its label stops reaching those readers; in assignee mode the
-same happens the moment the ticket is reassigned to the person taking it over. Those five readers
+same happens the moment the ticket is reassigned to the person taking it over. Those readers
 are therefore best-effort off the candidate path rather than
 guarantees, and they say so here rather than implying the refusal holds while the daemon no longer
 owns the ticket.

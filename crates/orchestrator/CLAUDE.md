@@ -95,13 +95,18 @@ the `Orchestrator` struct itself. Concretely:
     outside the log", which that module's doc still states and this read does not weaken.
 
   - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
-    STUDIO-949) — a `Mutex`-guarded pair of sets behind a `&self`-callable handle: the ticket
-    identifiers already ANNOUNCED (the once-per-ticket log dedupe) and the CURRENT `rhapsody:human`
-    hold set the console reads. It is a seam because the selection pass (`select.rs`, both ladders)
+    STUDIO-949) — a `Mutex`-guarded handle over three sets behind a `&self`-callable API: the ticket
+    identifiers already ANNOUNCED (the once-per-ticket log dedupe), the CURRENT `rhapsody:human`
+    **reported**-hold set the console reads (`held`, unworked tickets only), and the CURRENT-**label**
+    set (`labelled`, every candidate the last pass saw wearing the label, live runs included) that
+    the decision gates read — the handoff review quorum, the ticketless watcher and auto-merge.
+    Keeping the last two apart is deliberate: a running ticket is not yet a deliberate hold for an
+    operator, but its label must still refuse a decision made on that running ticket. It is a seam
+    because the selection pass (`select.rs`, both ladders)
     discovers the holds while taking `&self` by design, and the control task's `build_snapshot`
     reads the same cell. Never held across an `.await` — two map operations and out. Unlike
     `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
-    SURVIVE a pass, so the ledger owns it; `begin_pass` clears only the current set.
+    SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets.
     This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
     both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
 
