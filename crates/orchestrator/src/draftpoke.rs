@@ -88,9 +88,13 @@ pub const MAX_DRAFT_POKES: usize = 3;
 /// pull request would park exactly as makewhatis/booch#537 did. A draft that stays at one head
 /// across this many sweeps is not an author mid-push; it is an author who is not coming.
 ///
-/// Thirty sweeps is about an hour at [`crate::prstate::PR_STATE_POLL_INTERVAL`] (120s): long enough
-/// that a re-engaged run has time to start, push and publish, and far shorter than the 4h55m the
-/// incident sat refused. Counted in sweeps rather than a `Duration` for
+/// Thirty sweeps is about an hour at [`crate::prstate::PR_STATE_POLL_INTERVAL`] (120s) WHEN EVERY
+/// WATCHED PULL REQUEST ANSWERS EVERY TICK — the count advances only on a sweep that actually
+/// observed this pull request, and the watcher asks about a bounded number of coordinates per tick
+/// on a rotating cursor, so a larger watch set or a flaky `gh` makes an hour a floor rather than a
+/// promise. Either way it is long enough that a re-engaged run has time to start, push and publish,
+/// and far shorter than the 4h55m the incident sat refused. Counted in sweeps rather than a
+/// `Duration` for
 /// [`crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS`]'s reason: the state is already in sweeps, and
 /// a clock here would be a second unit to keep honest.
 pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
@@ -196,9 +200,9 @@ pub fn escalation_body(esc: &DraftEscalation) -> String {
     let n = esc.pokes;
     let pr = &esc.pr;
     format!(
-        "`{pr}` is still a **draft** {n} poke{} after the run that opened it finished, and {who} \
-         has not published it. A human must mark it ready for review or close it — the daemon has \
-         stopped poking.\n\
+        "`{pr}` is still a **draft** after the daemon made {n} attempt{} to have {who} publish it \
+         since the run that opened it finished. A human must mark it ready for review or close it — \
+         the daemon has stopped poking.\n\
          \n\
          The daemon never marks a pull request ready itself: un-drafting is the author's declaration \
          that the work is ready for review, and auto-merge refuses a draft, so this pull request \

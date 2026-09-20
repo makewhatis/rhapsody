@@ -808,10 +808,17 @@ impl Orchestrator {
         snap: &PrSnapshot,
         report: &mut ReviewSweepReport,
     ) {
-        if !snap.draft_observed() {
-            // The draft resolved (or GitHub did not positively say it is one); forget the count so
-            // a re-draft starts afresh and the map does not grow for the daemon's whole life.
+        if snap.draft_published() {
+            // GitHub positively said it is NOT a draft — it was published. Forget the count so a
+            // re-draft starts afresh and the map does not grow for the daemon's whole life.
             self.draft_pokes.remove(&churn_key(pr));
+            return;
+        }
+        if !snap.draft_observed() {
+            // GitHub did not say. An unstated answer is not a resolved draft: forgetting here would
+            // drop a ledger that may already have escalated and restart the poke cycle at the same
+            // head — acting on a guess, the direction the summon read exists to refuse. Change
+            // nothing; the ledger stands.
             return;
         }
         let head = snap.head_sha.trim();
@@ -1915,6 +1922,21 @@ mod tests {
         }
     }
 
+    /// One observation of an OPEN pull request at `head` whose payload carried NO boolean
+    /// `isDraft` — GitHub did not say whether it is a draft ([`PrSnapshot::is_draft`]).
+    fn unstated_at(number: i64, head: &str) -> PrObservation {
+        observed(
+            number,
+            PrLookup::Found(PrSnapshot {
+                is_draft: None,
+                head_sha: head.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }),
+        )
+    }
+
     /// The origin ticket with a run in flight RIGHT NOW — the mid-run shape a draft is normal in.
     fn live_author_run(o: &mut Orchestrator, identifier: &str) {
         let iss = rhapsody_core::Issue {
@@ -2054,6 +2076,44 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    /// ⚠️ Acceptance (alice's round-2 blocker): an UNSTATED `isDraft` is not a published draft. A
+    /// pull request already handed to a human must survive a tick GitHub could not answer — if the
+    /// state-clearing branch took `None` as "resolved" it would drop the ledger, including
+    /// `escalated`, and the next `Some(true)` tick would restart the whole poke cycle at the same
+    /// head, re-summoning a run a human was just told to take over.
+    #[test]
+    fn an_unstated_draft_does_not_forget_the_poke_ledger() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // Poke the static head, then let it reach the human escalation.
+        o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        for _ in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        }
+        assert!(matches!(
+            o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                .nudges
+                .first(),
+            Some(crate::draftpoke::DraftNudge::Escalate(_))
+        ));
+
+        // GitHub does not say: no answer is not an answer, and the ledger — and the escalation —
+        // stands. Nothing is poked, and the state is not dropped.
+        let unstated = o.handle_review_sweep(&[unstated_at(12, HEAD_A)]);
+        assert!(unstated.nudges.is_empty(), "{:?}", unstated.nudges);
+        assert_eq!(
+            poke_state(&o, 12).map(|s| s.escalated),
+            Some(true),
+            "an unstated answer must not erase the escalation"
+        );
+
+        // And the next tick that positively says "still a draft" stays silent rather than reopening
+        // as a fresh "poke 1 of at most 3".
+        let again = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert!(again.nudges.is_empty(), "{:?}", again.nudges);
     }
 
     /// Acceptance: a draft ignored across every head escalates to a human rather than poking

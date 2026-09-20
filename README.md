@@ -1375,7 +1375,9 @@ re-engaged run a review's findings reopened) is never poked.
 **The poking is bounded on two axes, because the incident shape is a static head.** An author who
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` distinct heads; an author who does
 nothing at all — booch#537 never moved its head — is bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive
-sweeps at the same head (thirty, about an hour at the two-minute poll). Either bound stops the poking
+sweeps at the same head (thirty, about an hour at the two-minute poll when every watched pull request
+answers every tick; the clock counts observations, so a larger watch set or a flaky `gh` makes an hour
+a floor). Either bound stops the poking
 and ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly
 one comment and then silence forever, which is the parking this feature exists to end.
 
@@ -1383,12 +1385,15 @@ one comment and then silence forever, which is the parking this feature exists t
 record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets it, and the worst that costs is
 one more poke at a head already poked.
 
-**An unstated `isDraft` is not a draft for the poke.** `PrSnapshot::is_draft` is an `Option<bool>`,
-and its two readers take an unstated answer in opposite safe directions: the auto-merge gate refuses
-unless GitHub POSITIVELY said the pull request is not a draft (STUDIO-881), while the poke acts only
-on a POSITIVELY observed draft — a summons that reopens the author's run must never fire on a guess
-any more than a merge may. The two are separate methods (`draft_blocks_merge` / `draft_observed`) for
-that reason; do not collapse them back to one default, which would be safe for exactly one caller.
+**An unstated `isDraft` is never acted on, in either direction.** `PrSnapshot::is_draft` is an
+`Option<bool>`, and its readers take an unstated answer in the safe direction each needs: the
+auto-merge gate refuses unless GitHub POSITIVELY said the pull request is not a draft (STUDIO-881);
+the poke acts only on a POSITIVELY observed draft, because a summons that reopens the author's run
+must never fire on a guess any more than a merge may; and the poke FORGETS its bookkeeping only on a
+POSITIVELY observed publication, because dropping the ledger on an unstated tick would restart a
+poke cycle that may already have escalated. They are separate methods (`draft_blocks_merge` /
+`draft_observed` / `draft_published`) for that reason; do not collapse them back to one default,
+which would be safe for exactly one caller.
 
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 

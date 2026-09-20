@@ -1167,14 +1167,17 @@ pub struct PrSnapshot {
     /// (STUDIO-881). It is on this payload rather than a seam of its own so the gate costs no extra
     /// round trip — the auto-merge already re-resolves the pull request here before merging.
     ///
-    /// **Two callers want opposite things from an unstated answer**, so each reads it through its
+    /// **The readers want opposite things from an unstated answer**, so each reads it through its
     /// own method rather than a shared default:
     /// [`draft_blocks_merge`](Self::draft_blocks_merge) (STUDIO-881) refuses unless GitHub
     /// POSITIVELY said this is not a draft — a merge must never happen on a guess — while
     /// [`draft_observed`](Self::draft_observed) (STUDIO-962) acts only on a POSITIVELY observed
-    /// draft, because a summon reopens the author's run and must never do so on a guess either. Do
-    /// not collapse the two back into one `bool` with one default: the safe directions are
-    /// opposite, and a single default is safe for exactly one of them.
+    /// draft, because a summon reopens the author's run and must never do so on a guess either. The
+    /// third read, [`draft_published`](Self::draft_published), is the poke's state-clearing gate: it
+    /// forgets a ledger only on a POSITIVELY observed publication, never on an unstated answer that
+    /// might otherwise restart a cycle already handed to a human. Do not collapse these back into
+    /// one `bool` with one default: the safe directions are opposite, and a single default is safe
+    /// for exactly one of them.
     pub is_draft: Option<bool>,
     /// `mergedAt`, when GitHub states one it can parse. Informational: [`PrStatus::Merged`] is what
     /// a caller acts on.
@@ -1199,6 +1202,16 @@ impl PrSnapshot {
     /// merge gate's, which is why the two are separate methods.
     pub fn draft_observed(&self) -> bool {
         self.is_draft == Some(true)
+    }
+
+    /// The poke's state-clearing read (STUDIO-962): forget what is known about a draft only when
+    /// GitHub POSITIVELY said this is NOT one. An unstated answer (`None`) is deliberately not a
+    /// publication: the draft bookkeeping may already have escalated, and dropping it would restart
+    /// the poke cycle at the same head — a fresh "poke 1 of at most 3" on a pull request a human was
+    /// just asked to take over. The unstated direction is the same one [`Self::draft_observed`]
+    /// refuses, applied to the other decision this feature makes.
+    pub fn draft_published(&self) -> bool {
+        self.is_draft == Some(false)
     }
 }
 
@@ -2255,19 +2268,20 @@ mod tests {
     /// cover it — the two live drafts that motivated the ticket both reported `CLEAN`.
     ///
     /// A payload with no `isDraft` at all reads as `None`, and each reader takes it in its OWN safe
-    /// direction (STUDIO-962): the merge gate refuses (see `draft_blocks_merge`), while the draft
-    /// poke does not act (`draft_observed`). An error would be the wrong shape: this call is also
-    /// the review watcher's head observation, and one field two gates read must not be able to
-    /// blind it.
+    /// direction (STUDIO-962): the merge gate refuses (see `draft_blocks_merge`), the draft poke
+    /// does not act (`draft_observed`), and the poke does not forget its ledger
+    /// (`draft_published`). An error would be the wrong shape: this call is also the review
+    /// watcher's head observation, and one field three gates read must not be able to blind it.
     #[tokio::test]
     async fn pr_state_reads_is_draft_and_leaves_an_unstated_answer_to_each_reader() {
-        for (payload, blocks_merge, observed, why) in [
+        for (payload, blocks_merge, observed, published, why) in [
             (
                 r#"{"headRefOid":"abc","state":"OPEN","isDraft":true,
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
                 true,
+                false,
                 "a draft is reported as one",
             ),
             (
@@ -2276,6 +2290,7 @@ mod tests {
                      "headRepositoryOwner":{"login":"o"}}"#,
                 false,
                 false,
+                true,
                 "a ready pull request is not a draft",
             ),
             (
@@ -2284,7 +2299,8 @@ mod tests {
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
                 false,
-                "an absent isDraft refuses the merge but does not summon",
+                false,
+                "an absent isDraft refuses the merge but does not summon or forget",
             ),
             (
                 r#"{"headRefOid":"abc","state":"OPEN","isDraft":"no",
@@ -2292,7 +2308,8 @@ mod tests {
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
                 false,
-                "a non-boolean isDraft refuses the merge too, and does not summon either",
+                false,
+                "a non-boolean isDraft refuses the merge too, and neither summons nor forgets",
             ),
         ] {
             let src = GH::new(
@@ -2308,6 +2325,7 @@ mod tests {
             };
             assert_eq!(snap.draft_blocks_merge(), blocks_merge, "({why})");
             assert_eq!(snap.draft_observed(), observed, "({why})");
+            assert_eq!(snap.draft_published(), published, "({why})");
         }
     }
 
