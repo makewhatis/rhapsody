@@ -114,7 +114,7 @@ use rhapsody_store::{
 };
 
 use crate::control_loop::{CancelWait, Event};
-use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource, PrStatus};
+use crate::ghsummons::{HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrStateSource, PrStatus};
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
@@ -207,6 +207,11 @@ pub struct ReviewSweepReport {
     /// sweeps (STUDIO-891) — a SUBSET of [`ReviewSweepReport::deferred`], and the part of it that
     /// is not going to resolve itself. Always `<= deferred`.
     pub stalled: usize,
+    /// Conflicts routed back to their author this tick (STUDIO-961). A COUNT rather than a work
+    /// list, because the work — a PR comment and a tracker move — is already handed to the review
+    /// notification task on the control task, through the same channel a verdict's completion
+    /// uses; the watcher task performs nothing extra for it.
+    pub routed: usize,
 }
 
 /// The carried-budget sentinel meaning "this hand-back reached no decision": it spent nothing and
@@ -484,12 +489,14 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 stalled,
                 done,
                 merge,
+                routed,
             } = one;
             report.dispatched += dispatched;
             report.retired += retired;
             report.deferred += deferred;
             report.armed += armed;
             report.stalled += stalled;
+            report.routed += routed;
             report.done.extend(done);
             report.merge.extend(merge);
         }
@@ -505,6 +512,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 armed = report.armed,
                 done = report.done.len(),
                 merge = report.merge.len(),
+                routed = report.routed,
                 "ticketless review watcher tick"
             );
         }
@@ -686,9 +694,14 @@ impl Orchestrator {
                     };
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
-                PrLookup::Found(snap) => {
-                    self.service_review_pr(&rows, &obs.pr, &snap.head_sha, &mut slots, &mut report)
-                }
+                PrLookup::Found(snap) => self.service_review_pr(
+                    &rows,
+                    &obs.pr,
+                    &snap.head_sha,
+                    &snap.merge_state,
+                    &mut slots,
+                    &mut report,
+                ),
             }
         }
         (report, slots)
@@ -807,6 +820,10 @@ impl Orchestrator {
         self.review_rounds.remove(&churn_key(pr));
         // And what was announced about its auto-merge plan, for the first two of those reasons.
         self.auto_merge_announced.remove(&churn_key(pr));
+        // And its conflict route-back record (STUDIO-961): a retired pull request has no ticket to
+        // route back, and leaving the entry would keep the reconciliation sweep silent about a
+        // coordinate that is watched again later.
+        self.conflict_routed.remove(pr);
         for id in retired_ids {
             self.review_unassignable.remove(&id);
         }
@@ -820,6 +837,7 @@ impl Orchestrator {
         rows: &[ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
+        merge_state: &str,
         slots: &mut i64,
         report: &mut ReviewSweepReport,
     ) {
@@ -994,6 +1012,86 @@ impl Orchestrator {
         }
 
         self.propose_auto_merge(&mine, pr, head, report);
+        self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
+    }
+
+    /// Routes a CONFLICTED watch row's ticket back to its author, once per conflicted head
+    /// (STUDIO-961).
+    ///
+    /// The second trigger of the [`crate::reviewchanges`] route-back, and deliberately independent
+    /// of the review verdict: a pull request that cannot merge is unfinished work, so an approved
+    /// one still needs its author to publish a working diff. The route-back itself — comment first,
+    /// then the tracker move — is performed by [`crate::reviewnotify`]'s off-loop task, through the
+    /// same channel and the same plan/perform split a findings verdict uses; this half only decides.
+    ///
+    /// Four guards, each of which the ticket names:
+    ///
+    /// * **Settled only.** GitHub computes mergeability lazily and answers `UNKNOWN` — or, briefly,
+    ///   nothing — while it does, so only a positively-recognised [`MERGE_STATE_DIRTY`] acts. Any
+    ///   other value (including a resolved conflict) CLEARS the record for this pull request, so a
+    ///   conflict that clears stops suppressing the reconciliation sweep.
+    /// * **The ticket is in review.** A `reviewed` row is this daemon's own record that a findings
+    ///   verdict already routed the ticket out; moving it again would be churn, and the author is
+    ///   already engaged.
+    /// * **Once per conflicted HEAD.** The conflict persists across every poll until a push lands,
+    ///   so a naive trigger re-routes and re-summons on every sweep.
+    /// * **A performer exists.** Without the notification task there is nobody to move the ticket,
+    ///   so nothing is recorded and the next tick can still fire.
+    fn propose_conflict_route_back(
+        &mut self,
+        mine: &[&ReviewWatchRow],
+        pr: &PrCoord,
+        head: &str,
+        merge_state: &str,
+        report: &mut ReviewSweepReport,
+    ) {
+        // The settled-state guard and the clear, in one condition: anything that is not a settled
+        // conflict is not this trigger's business, and a record left standing would keep the sweep
+        // silent about a pull request whose conflict has gone away.
+        if merge_state != MERGE_STATE_DIRTY {
+            self.conflict_routed.remove(pr);
+            return;
+        }
+        if head.is_empty() {
+            return; // an answer with no head is not an answer about a head
+        }
+        if mine.is_empty() {
+            return;
+        }
+        if mine.iter().any(|r| r.status == REVIEW_STATUS_REVIEWED) {
+            return;
+        }
+        if self
+            .conflict_routed
+            .get(pr)
+            .is_some_and(|routed| routed == head)
+        {
+            return;
+        }
+        let Some(plan) = self.plan_conflict_route_back(pr, &mine[0].introduced_by) else {
+            return;
+        };
+        if self.review_notify_tx.is_none() {
+            return;
+        }
+        // Recorded BEFORE the send, exactly as `auto_merge_announced` is recorded when the plan is
+        // formed: the plan is what the tick acted on, and a notification task that dies between here
+        // and the perform leaves the ticket where a findings route-back would have left it too.
+        self.conflict_routed.insert(pr.clone(), head.to_string());
+        let completion = crate::reviewnotify::ReviewCompletion {
+            reason: crate::reviewnotify::CompletionReason::Conflict,
+            owner: pr.owner.clone(),
+            repo: pr.repo.clone(),
+            number: pr.number,
+            reviewer: String::new(),
+            author: mine[0].author.clone(),
+            head_sha: head.to_string(),
+            approved: false,
+            summon_token: self.review_summon_token(),
+            changes: Some(plan),
+        };
+        report.routed += 1;
+        self.request_review_notify(Some(completion));
     }
 
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
@@ -1469,6 +1567,7 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
             }),
         }
     }
@@ -1485,6 +1584,7 @@ mod tests {
                 .ok()
                 .map(|t| t.with_timezone(&chrono::Utc)),
             head_repo: format!("{OWNER}/{REPO}"),
+            merge_state: String::new(),
         })
     }
 
@@ -1496,6 +1596,7 @@ mod tests {
             status: PrStatus::Closed,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
+            merge_state: String::new(),
         })
     }
 
@@ -1731,6 +1832,7 @@ mod tests {
             status: PrStatus::Merged,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
+            merge_state: String::new(),
         });
         let closed = PrLookup::Found(PrSnapshot {
             is_draft: false,
@@ -1738,6 +1840,7 @@ mod tests {
             status: PrStatus::Closed,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
+            merge_state: String::new(),
         });
         for (n, lookup) in [
             (12, merged),
@@ -2228,6 +2331,254 @@ mod tests {
         assert!(
             o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
             "the retirement forgot it"
+        );
+    }
+
+    // --- the conflict route-back (STUDIO-961) ------------------------------------------------
+
+    /// [`ticketless`] with the route-back's state configured — the gate the transition reads.
+    fn ticketless_conflict(names: &[&str], state: &str) -> Teams {
+        let mut teams = ticketless(names);
+        teams.review.changes_state = state.to_string();
+        teams
+    }
+
+    /// One observation of an OPEN pull request at `head` carrying GitHub's `mergeStateStatus`.
+    fn open_conflicted(number: i64, head: &str, merge_state: &str) -> PrObservation {
+        PrObservation {
+            pr: coord(number),
+            lookup: PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: head.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: merge_state.to_string(),
+            }),
+        }
+    }
+
+    /// Arms every stream the acceptance names at once: a watched row, the run whose opaque ids the
+    /// move needs, and the notification channel the route-back is handed to.
+    fn conflict_harness(
+        teams: Teams,
+    ) -> (
+        Orchestrator,
+        tokio::sync::mpsc::UnboundedReceiver<crate::reviewnotify::ReviewCompletion>,
+    ) {
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        run_of(&o, "STUDIO-721");
+        let rx = o.open_review_notify_channel();
+        (o, rx)
+    }
+
+    /// The headline acceptance: a pull request observed CONFLICTED routes its ticket back to its
+    /// author once, with a message naming the conflict — and not once per tick.
+    ///
+    /// Mutation check: delete the once-per-head guard in `propose_conflict_route_back` and the
+    /// many-ticks loop below routes six more times, so `routed.len() == 2` reds. Delete the settled
+    /// guard and the unsettled loop reds first.
+    #[test]
+    fn a_conflicted_pull_request_routes_its_ticket_back_once_per_head() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        // ⚠️ An unsettled (or non-conflict) mergeability read acts on nothing: GitHub computes
+        // mergeability lazily and answers UNKNOWN — or, briefly, nothing — while it does.
+        for state in ["", "UNKNOWN", "CLEAN", "BLOCKED", "BEHIND", "DRAFT"] {
+            assert_eq!(
+                o.handle_review_sweep(&[open_conflicted(12, HEAD_A, state)])
+                    .routed,
+                0,
+                "({state:?}) must not route a ticket"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "no completion was sent");
+
+        // The settled conflict routes once…
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        // ⚠️ …and not again at the same head, however many ticks pass with the state unchanged.
+        for _ in 0..5 {
+            assert_eq!(
+                o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                    .routed,
+                0,
+                "a conflict that persists across a tick is not a new event"
+            );
+        }
+        // A push moves the head, so a conflict at the NEW head is a new event.
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_B, "DIRTY")])
+                .routed,
+            1
+        );
+
+        let mut routed = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            routed.push(c);
+        }
+        assert_eq!(
+            routed.len(),
+            2,
+            "exactly one route-back per conflicted head, not one per tick"
+        );
+        assert!(
+            routed
+                .iter()
+                .all(|c| c.reason == crate::reviewnotify::CompletionReason::Conflict),
+            "both completions are conflict route-backs, not verdicts"
+        );
+        assert_eq!(routed[0].head_sha, HEAD_A);
+        assert_eq!(routed[1].head_sha, HEAD_B);
+        // The message names the conflict as the reason and what to fix, and it re-engages the
+        // author through the real summon matcher.
+        let body = crate::reviewnotify::re_engage_comment(&routed[0]);
+        assert!(body.contains("CONFLICTED"), "{body}");
+        assert!(body.contains("rebase"), "{body}");
+        assert!(
+            crate::reviewnotify::summons_author(&body, &routed[0].summon_token),
+            "the conflict comment must carry the token that reopens the author's run"
+        );
+        let plan = routed[0].changes.as_ref().expect("a route-back plan");
+        assert_eq!(plan.identifier, "STUDIO-721");
+        assert_eq!(plan.state, "In Progress");
+        assert_eq!(plan.pr, "makewhatis/rhapsody#12");
+    }
+
+    /// ⚠️ A conflict on a pull request whose ticket is ALREADY out of review — here, a `reviewed`
+    /// row is this daemon's own record that a findings verdict moved it — routes it nowhere.
+    #[test]
+    fn a_conflict_does_not_re_route_a_ticket_a_findings_verdict_already_moved() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        // The row the finder left behind: findings at HEAD_A, ticket already routed back.
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("a findings verdict");
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "a ticket already routed back must not be moved again"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The origin scope is the shared one: an operator-introduced pull request names an operator,
+    /// not a ticket this daemon parked, so a conflict routes nothing.
+    #[test]
+    fn a_conflict_on_an_operator_introduced_pull_request_routes_no_ticket() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                introduced_by: "console:operator".to_string(),
+                ..row(12, "bob")
+            })
+            .expect("reintroduce");
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An installation that has not named `teams.review.changes_state` has no transition to fire,
+    /// so a conflict routes nothing — the byte-identical-when-unconfigured property.
+    #[test]
+    fn a_conflict_routes_nothing_when_the_transition_is_unconfigured() {
+        let (mut o, mut rx) = conflict_harness(ticketless(&["alice", "bob"]));
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Without the notification task there is nobody to post the comment or move the ticket, so the
+    /// plan is not recorded as routed — the next tick, with a task, can still fire.
+    #[test]
+    fn a_conflict_routes_nothing_when_no_task_can_perform_it() {
+        let (mut o, _d) = orch(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        introduce(&o, row(12, "bob"));
+        run_of(&o, "STUDIO-721");
+        // Deliberately no `open_review_notify_channel`.
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0
+        );
+        // And because nothing was recorded, a later tick with a task can still route it.
+        let mut rx = o.open_review_notify_channel();
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// A conflict that CLEARS forgets the head it routed for, so the record stops suppressing the
+    /// reconciliation sweep and a fresh conflict (even at the same head) is news again.
+    #[test]
+    fn a_resolved_conflict_forgets_the_head_it_routed_for() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "CLEAN")])
+                .routed,
+            0
+        );
+        assert!(
+            !o.conflict_routed.contains_key(&coord(12)),
+            "a resolved conflict must stop suppressing the sweep for this pull request"
+        );
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2);
+    }
+
+    /// Retiring a pull request drops its conflict record — a coordinate watched again later must
+    /// not inherit the old silence.
+    #[test]
+    fn retiring_a_pull_request_forgets_its_conflict_route_back() {
+        let (mut o, _rx) = conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+
+        o.handle_review_sweep(&[observed(12, merged_at(HEAD_A))]);
+
+        assert!(
+            !o.conflict_routed.contains_key(&coord(12)),
+            "the retired pull request's record must not survive"
         );
     }
 
@@ -3128,6 +3479,7 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
             }))
         }
     }
@@ -3346,6 +3698,7 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
             }))
         }
     }
@@ -3371,6 +3724,7 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
             }))
         }
     }
@@ -3627,6 +3981,7 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
             }))
         }
     }

@@ -647,6 +647,7 @@ mod tests {
             is_draft,
             merged_at: None,
             head_repo: "makewhatis/tally".to_string(),
+            merge_state: String::new(),
         })
     }
 

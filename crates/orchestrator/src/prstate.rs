@@ -227,6 +227,7 @@ mod tests {
                         status: PrStatus::Open,
                         merged_at: None,
                         head_repo: "o/r".to_string(),
+                        merge_state: String::new(),
                     }))
                 }),
                 seen: Arc::clone(&seen),

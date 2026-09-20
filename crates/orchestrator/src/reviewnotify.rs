@@ -66,6 +66,22 @@ use crate::orchestrator::Orchestrator;
 use crate::review::ReviewRun;
 use crate::reviewchanges::{ReviewChangesPlan, ReviewChangesSink};
 
+/// What put a [`ReviewCompletion`] on the notification task's channel.
+///
+/// A second trigger rather than a second task (STUDIO-961): the conflict route-back is the SAME
+/// consequence — a comment that re-engages the author and a ticket moved out of the review state —
+/// and it must run on the same off-loop task, in the same order, for the same reason. What differs
+/// is the body the comment carries, so the reason selects the template and nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompletionReason {
+    /// A review round finished: approved or findings (the original, and the default).
+    #[default]
+    Verdict,
+    /// The watched pull request was observed CONFLICTED and its ticket is being routed back to its
+    /// author to publish a working diff (STUDIO-961).
+    Conflict,
+}
+
 /// One finished review round, as the CONTROL TASK observed it, on its way to a comment.
 ///
 /// Everything here is already in memory at the review's exit — the coordinates come off the run's
@@ -73,6 +89,9 @@ use crate::reviewchanges::{ReviewChangesPlan, ReviewChangesSink};
 /// network, exactly as [`crate::reviewintro`]'s does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewCompletion {
+    /// Whether this is a review round's exit or a conflict route-back. Defaults to
+    /// [`CompletionReason::Verdict`], so every existing constructor is unchanged.
+    pub reason: CompletionReason,
     /// The pull request's repository owner.
     pub owner: String,
     /// The pull request's repository name.
@@ -156,6 +175,9 @@ pub fn summons_author(body: &str, token: &str) -> bool {
 /// re-review loop needs — read the comments, push to this branch — rather than merely announcing
 /// that a review happened.
 pub fn re_engage_comment(c: &ReviewCompletion) -> String {
+    if c.reason == CompletionReason::Conflict {
+        return conflict_comment(c);
+    }
     let ReviewCompletion {
         reviewer,
         author,
@@ -192,6 +214,39 @@ pub fn re_engage_comment(c: &ReviewCompletion) -> String {
          notify.\n\
          \n\
          Reviewed, not merged — {who} owns the merge.\n"
+    )
+}
+
+/// The host-composed CONFLICT route-back comment (STUDIO-961).
+///
+/// The same shape and the same guarantees as the findings comment above: it LEADS with the summon
+/// token (so the author's run reopens), it is written to be read by the author's AGENT as its
+/// next instruction, and it says what to fix rather than merely announcing a state. What it says
+/// is the maintainer's rule — *a conflicted pull request is not a working diff* — and the only
+/// action that clears it: rebase or merge the base and resolve.
+///
+/// It names no reviewer: a conflict is GitHub's report about the branch, not a person's verdict.
+pub fn conflict_comment(c: &ReviewCompletion) -> String {
+    let who = if c.author.is_empty() {
+        "The author"
+    } else {
+        c.author.as_str()
+    };
+    let head = short_sha(&c.head_sha);
+    let token = &c.summon_token;
+    let where_ = if c.owner.is_empty() || c.repo.is_empty() || c.number <= 0 {
+        "this branch".to_string()
+    } else {
+        format!("`{}/{}#{}`", c.owner, c.repo, c.number)
+    };
+    format!(
+        "{token} {where_} cannot be merged: GitHub reports the branch as CONFLICTED with its base \
+         at `{head}`.\n\
+         \n\
+         A conflicted pull request is not a working diff — nothing will merge it until the branch \
+         does. {who}: rebase this branch (or merge the base branch into it) and resolve the \
+         conflict, then push. Pushing is the whole of it — the daemon watches this pull request's \
+         head, so there is no merge to request and nobody to notify.\n"
     )
 }
 
@@ -387,6 +442,7 @@ impl Orchestrator {
             return None;
         }
         Some(ReviewCompletion {
+            reason: CompletionReason::Verdict,
             owner: run.owner.clone(),
             repo: run.repo.clone(),
             number: run.number,
@@ -419,7 +475,10 @@ impl Orchestrator {
     /// The configured summon token the completion comment leads with. Empty config ⇒ the shipped
     /// default, for [`crate::quorum`]'s reason: a comment naming no token would silently produce
     /// reviews that never re-engage the author, which is the exact failure this slice removes.
-    fn review_summon_token(&self) -> String {
+    ///
+    /// `pub(crate)` since STUDIO-961: the conflict route-back in [`crate::reviewwatch`] forms a
+    /// completion of its own on the control task and leads it with the same token.
+    pub(crate) fn review_summon_token(&self) -> String {
         let token = self
             .eff
             .as_ref()
@@ -454,6 +513,7 @@ mod tests {
 
     fn completion(approved: bool, token: &str) -> ReviewCompletion {
         ReviewCompletion {
+            reason: CompletionReason::Verdict,
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
             number: 12,
@@ -477,6 +537,16 @@ mod tests {
                 state: "In Progress".to_string(),
             }),
             ..completion(approved, token)
+        }
+    }
+
+    /// A CONFLICT route-back (STUDIO-961): no reviewer, a token-bearing conflict body, and the same
+    /// ticket move a findings verdict performs.
+    fn conflict_completion_moving() -> ReviewCompletion {
+        ReviewCompletion {
+            reason: CompletionReason::Conflict,
+            reviewer: String::new(),
+            ..completion_moving(false, "@symphony")
         }
     }
 
@@ -979,6 +1049,52 @@ mod tests {
             moved[0].1,
             "a posted, token-bearing findings comment re-engages the author"
         );
+    }
+
+    /// STUDIO-961: a CONFLICT route-back posts a comment naming the conflict and what to fix, and
+    /// moves the same ticket through the same perform a findings verdict uses.
+    ///
+    /// The body LEADS with the token so the author's run reopens — the conflict is not a verdict a
+    /// reviewer made, but the author is still the one who must publish a working diff.
+    #[tokio::test]
+    async fn a_conflict_route_back_posts_a_conflict_comment_and_moves_the_ticket() {
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        drain(deps(&sink, &tickets), vec![conflict_completion_moving()]).await;
+
+        let posted = sink.taken();
+        assert_eq!(posted.len(), 1, "the comment is posted");
+        let body = &posted[0].2;
+        assert!(body.contains("CONFLICTED"), "names the conflict: {body}");
+        assert!(body.contains("rebase"), "says what to fix: {body}");
+        assert!(
+            summons_author(body, "@symphony"),
+            "the conflict comment must reopen the author's run: {body}"
+        );
+        assert!(
+            !body.contains("reviewed this pull request"),
+            "a conflict is not a review verdict and must not read like one: {body}"
+        );
+
+        let moved = tickets.taken();
+        assert_eq!(moved.len(), 1, "and the ticket is moved once");
+        assert_eq!(moved[0].0.identifier, "STUDIO-999");
+        assert_eq!(moved[0].0.state, "In Progress");
+        assert!(
+            moved[0].1,
+            "the token-bearing comment re-engages the author"
+        );
+    }
+
+    /// The conflict body renders the role, never a blank, when the author is unknown — the same
+    /// contract `an_unknown_author_is_addressed_by_role` pins for the verdict comments.
+    #[test]
+    fn a_conflict_comment_addresses_an_unknown_author_by_role() {
+        let mut c = conflict_completion_moving();
+        c.author.clear();
+        let body = re_engage_comment(&c);
+        assert!(body.contains("The author"), "{body}");
+        assert!(!body.contains("—  "), "{body}");
     }
 
     /// Arm two, and the guard that makes it more than a planner convention: an APPROVED completion

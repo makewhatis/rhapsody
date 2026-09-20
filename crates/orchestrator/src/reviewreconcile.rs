@@ -514,6 +514,14 @@ impl Orchestrator {
                 // (the review watcher never spawned) and no entry for this coordinate (auto-merge
                 // off, or this head never reached a gate) both fall back to the plain wording.
                 if d.kind == DivergenceKind::ApprovedStillOpen {
+                    // STUDIO-961: a conflict route-back the watcher has already fired IS the
+                    // progress this pull request was waiting on — the author has been handed it and
+                    // owns the next move. Reporting it as needing a human would be the false
+                    // positive the divergence's own docs warn against, so it is dropped entirely
+                    // (and logged as recovered, once, by `set_review_divergences`).
+                    if self.conflict_routed.contains_key(pr) {
+                        return None;
+                    }
                     d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
                 }
                 Some(d)
@@ -1624,6 +1632,61 @@ mod store_tests {
             !warn.message.contains("Auto-merge has declined"),
             "no ledger entry must never invent a decline count: {}",
             warn.message
+        );
+    }
+
+    /// STUDIO-961: an approved-and-open pull request whose conflict the watcher has already routed
+    /// back to its author is PROGRESSING, not waiting for a human — the transition is the progress.
+    ///
+    /// Mutation check: delete the `conflict_routed` branch in `reconcile_review_divergence` and this
+    /// test reds — the control call below proves the divergence would otherwise be reported.
+    #[test]
+    fn a_conflict_route_back_in_flight_is_not_reported_as_needing_a_human() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+
+        // The control: with no route-back on record, this IS reported as diverged.
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "an approved-and-open pull request is diverged until something progresses it"
+        );
+
+        // The watcher routed it back for a conflict at HEAD, so the sweep must fall silent.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD.to_string(),
+        );
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a conflict route-back in flight must not be reported as needing a human"
+        );
+        assert!(
+            o.project_statuses()
+                .iter()
+                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "and the advisory must not light"
+        );
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert!(
+            rendered.get("review_divergence").is_none(),
+            "nor may it reach /api/v1/state"
         );
     }
 }

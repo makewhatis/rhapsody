@@ -578,6 +578,17 @@ pub struct Orchestrator {
     /// [`AutoMergeLedger`](crate::runautomerge::AutoMergeLedger), which does the same job for the
     /// refusals on the other side of the seam.
     pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
+    /// The HEAD at which each watched pull request was last routed back to its author for a
+    /// CONFLICT (STUDIO-961), keyed by coordinate. Written and read only by the watcher's
+    /// loop-side handler, and dropped when the pull request leaves the watch set, exactly as
+    /// [`auto_merge_announced`](Orchestrator::auto_merge_announced) is.
+    ///
+    /// It is the once-per-conflicted-HEAD guard: the conflict persists across every poll until a
+    /// push lands, so without it a naive trigger would re-route and re-summons the author into a
+    /// loop. It also carries the fact the reconciliation sweep reads to stop reporting the pull
+    /// request as needing a human while the author has been handed it — the transition IS the
+    /// progress, so the sweep must not cry wolf for it.
+    pub(crate) conflict_routed: HashMap<crate::prstate::PrCoord, String>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
@@ -860,6 +871,7 @@ impl Orchestrator {
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
+            conflict_routed: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),

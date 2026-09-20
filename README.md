@@ -1399,6 +1399,7 @@ and the route-back In Review → In Progress was a manual step the maintainer to
 | --- | --- | --- |
 | findings | no review feature exists | ticket moved to `teams.review.changes_state` by NAME |
 | approved | — | nothing — approval is the pause in the re-review loop |
+| a conflict at the watched head (STUDIO-961) | no review feature exists | ticket moved to `teams.review.changes_state` by NAME, **once per conflicted head** |
 | default | — | **off**: `changes_state` is empty unless an operator names a state |
 
 **The pairing is the whole of the decision, and it is enforced twice.** Findings move the ticket;
@@ -1433,6 +1434,20 @@ no GitHub attachments (STUDIO-674). The daemon reports the half it knows: a move
 a WARNING naming the ticket and the pull request, and a move WITH one still names the remaining
 condition rather than promising a run. A ticket sitting in the changes state with no run is
 therefore traceable to one line.
+
+**A conflicted pull request is the same route-back on a different edge (STUDIO-961).** A pull
+request GitHub reports as `DIRTY` cannot merge, so it is unfinished work rather than work awaiting a
+decision — the maintainer's rule is *a conflicted pull request is not a working diff*. The watcher
+observes the pull request's `mergeStateStatus` on the `gh pr view` it already makes every poll (the
+same payload `isDraft` rides), and a settled `DIRTY` plans the SAME route-back a findings verdict
+does: a token-bearing comment naming the conflict and what to fix, then the ticket moved by NAME.
+It is deliberately **independent of the review verdict** — an approved-but-conflicted pull request
+still needs its author — so it does not take the findings trigger's approved-arm refusal. It fires
+**once per conflicted head**, the review edge trigger's discipline: the conflict persists across
+every tick until a push lands, and a naive trigger would re-summons the author into a loop. An
+unsettled read (`UNKNOWN`, or nothing) moves nothing, because GitHub computes mergeability lazily.
+And because the transition IS the progress, the reconciliation sweep stops reporting such a pull
+request as needing a human while the route-back is in flight.
 
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 

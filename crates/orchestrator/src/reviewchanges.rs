@@ -157,7 +157,6 @@ impl Orchestrator {
         if approved {
             return None;
         }
-        let state = self.teams.as_ref()?.review_changes_state()?.to_string();
         let identifier = origin_ticket(&run.introduced_by)?.to_string();
         let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         // The anti-race guard against `reviewdone`: a merged pull request's rows are retired, so an
@@ -174,11 +173,41 @@ impl Orchestrator {
                 return None;
             }
         }
+        self.resolve_route_back(&pr, &identifier)
+    }
+
+    /// Resolves a route-back for a CONFLICTED pull request (STUDIO-961) — the SECOND trigger of the
+    /// transition above, and deliberately INDEPENDENT of the review verdict.
+    ///
+    /// A findings verdict refuses the approved arm ([`Self::plan_review_changes`]); a conflict does
+    /// not, because a conflicted pull request is unfinished work rather than work awaiting a
+    /// decision — an approved-but-conflicted pull request still needs its author to publish a
+    /// working diff. It reuses the same resolution and the same perform, so it moves the ticket to
+    /// exactly the state `teams.review.changes_state` names, with the same origin scope.
+    ///
+    /// The caller has already established that the pull request is open — the watcher's watch rows
+    /// are LIVE by construction — so this half does no watch-row read, unlike the findings planner's
+    /// anti-race guard. ⚠️ A conflict on a ticket whose author is already routed back is the
+    /// caller's guard to keep: see `plan_conflict_route_back`'s call site in `reviewwatch`.
+    pub(crate) fn plan_conflict_route_back(
+        &self,
+        pr: &crate::prstate::PrCoord,
+        introduced_by: &str,
+    ) -> Option<ReviewChangesPlan> {
+        let identifier = origin_ticket(introduced_by)?.to_string();
+        self.resolve_route_back(&pr.to_string(), &identifier)
+    }
+
+    /// The shared resolution both triggers end in: the configured state NAME plus the opaque
+    /// tracker ids the move needs, resolved BEFORE it leaves the control task so the off-loop half
+    /// makes one call and has no decision left to get wrong.
+    fn resolve_route_back(&self, pr: &str, identifier: &str) -> Option<ReviewChangesPlan> {
+        let state = self.teams.as_ref()?.review_changes_state()?.to_string();
         // The opaque tracker ids the move needs live on the run that produced the pull request. The
         // LATEST run of that ticket, because a retried ticket has several and they all carry the
         // same issue and team — `list_issue_runs` returns one row per identifier, newest first.
         let runs = match self.store().list_issue_runs(RunFilter {
-            issue: identifier.clone(),
+            issue: identifier.to_string(),
             limit: 1,
             ..RunFilter::default()
         }) {
@@ -197,10 +226,10 @@ impl Orchestrator {
             return None;
         }
         Some(ReviewChangesPlan {
-            pr,
+            pr: pr.to_string(),
             issue_id: r.issue_id,
             team_id: r.team_id,
-            identifier,
+            identifier: identifier.to_string(),
             state,
         })
     }
@@ -266,6 +295,7 @@ mod tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
+    use crate::prstate::PrCoord;
     use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_CONSOLE};
     use crate::testsupport::{empty_effective, set_of};
 
@@ -505,6 +535,55 @@ mod tests {
                 "origin {origin:?}"
             );
         }
+    }
+
+    // ── the second trigger: a conflicted pull request (STUDIO-961) ───────────────────────────────
+
+    /// The second trigger resolves the same ticket a findings verdict would, and deliberately
+    /// WITHOUT the approved-arm refusal — a conflicted pull request still needs its author even
+    /// when every reviewer approved it. The plan/perform it feeds is the same one.
+    #[test]
+    fn a_conflict_route_back_resolves_the_same_ticket_a_findings_verdict_would() {
+        let o = orch(ticketless_changes("In Progress"));
+        run_of(&o, "STUDIO-839", "ID-839", "TEAM-1");
+        assert_eq!(
+            o.plan_conflict_route_back(&PrCoord::new(OWNER, REPO, 64), "handoff:STUDIO-839")
+                .expect("a plan"),
+            ReviewChangesPlan {
+                pr: "makewhatis/rhapsody#64".to_string(),
+                issue_id: "ID-839".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-839".to_string(),
+                state: "In Progress".to_string(),
+            }
+        );
+    }
+
+    /// The same origin scope the findings trigger has: an operator-introduced pull request names an
+    /// operator, not a ticket this daemon parked, so a conflict routes nothing.
+    #[test]
+    fn a_conflict_route_back_names_no_ticket_for_an_operator_introduced_pull_request() {
+        let o = orch(ticketless_changes("In Progress"));
+        run_of(&o, "STUDIO-839", "ID-839", "TEAM-1");
+        assert_eq!(
+            o.plan_conflict_route_back(
+                &PrCoord::new(OWNER, REPO, 64),
+                &format!("{REVIEW_ORIGIN_CONSOLE}:operator")
+            ),
+            None
+        );
+    }
+
+    /// An installation that has not named a state has no transition, so a conflict routes nothing —
+    /// the same byte-identical-when-unconfigured property the findings trigger has.
+    #[test]
+    fn an_unconfigured_transition_plans_no_conflict_route_back() {
+        let o = orch(ticketless_changes(""));
+        run_of(&o, "STUDIO-839", "ID-839", "TEAM-1");
+        assert_eq!(
+            o.plan_conflict_route_back(&PrCoord::new(OWNER, REPO, 64), "handoff:STUDIO-839"),
+            None
+        );
     }
 
     /// The guard against [`crate::reviewdone`], the other writer of ticket state off a review
