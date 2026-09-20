@@ -1367,6 +1367,18 @@ impl Orchestrator {
                 return;
             }
             if self.rounds_used(pr) >= threshold {
+                // A pull request that CONVERGED on its last allowed round is not a failure for the
+                // manager to decide. `auto_merge_verdict` is the head-exact "every live row approved
+                // at this head" predicate the merge gate already uses; `is_ok()` is the convergence
+                // question. Sending a converged pull request to the manager would ask it to decide a
+                // loop that already did — on a prompt that asserts it did NOT converge and names no
+                // findings — and an `ESCALATE` answer would post a false alarm and freeze the author
+                // half for a pull request every reviewer approved. Let it fall to the ordinary
+                // auto-merge path below, which re-applies every gate.
+                if crate::automerge::auto_merge_verdict(&mine, head).is_ok() {
+                    self.propose_auto_merge(&mine, pr, head, report);
+                    return;
+                }
                 // Never decide over a round mid-flight: findings could still land, and the author's
                 // own fix may be about to supersede the head this would decide against.
                 if self.review_round_in_flight(&mine) {
@@ -3958,6 +3970,39 @@ mod tests {
         // The author half is stopped too, on the same threshold.
         let iss = author_issue("STUDIO-12", 12);
         assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **The threshold is not a failure when the loop CONVERGED.** A pull request whose last allowed
+    /// round ended with every live row approved at the head has finished; handing it to the manager
+    /// would spawn a turn whose prompt falsely asserts "reached its limit without converging" and
+    /// lists no findings, and an `ESCALATE` answer would post a false alarm and freeze the author
+    /// half for a pull request every reviewer approved. Pinned on the default (`auto_merge: false`)
+    /// config, where the turn is the only effect of this branch.
+    #[test]
+    fn a_converged_pull_request_at_the_threshold_is_not_sent_to_the_manager() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "every reviewer approved at the head: the loop converged and the manager has nothing to \
+             decide"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "and no decision is even marked in flight"
+        );
+        assert_eq!(report.dispatched, 0, "an approved row owes no round");
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "nothing reached a worker"
+        );
     }
 
     /// Once a decision has LANDED, the loop stays stopped and is not re-asked — and a `ship` verdict

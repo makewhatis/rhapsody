@@ -362,6 +362,30 @@ pub async fn perform_adjudication(
     };
 
     let body = decision_body(plan, &verdict);
+    let adjudication = match verdict {
+        Verdict::Ship => Adjudication::Ship {
+            head: plan.head.clone(),
+            rounds: plan.rounds,
+        },
+        Verdict::Escalate { reason } => Adjudication::Escalate {
+            head: plan.head.clone(),
+            rounds: plan.rounds,
+            findings: plan.findings.clone(),
+            reason,
+        },
+    };
+    // Settle the ledger BEFORE the two audit writes. On the bounded-failure path above,
+    // `note_failure` has just REMOVED the in-flight marker, so recording after the writes would
+    // leave the ledger reading "no decision, not in flight, N failures" for the whole duration of
+    // the (unbounded) `post_pr_comment`. Nothing on the control task reads the failure tally any
+    // more, so that window is one in which `service_review_pr`'s settled-entry and threshold checks
+    // BOTH fall through and a FOURTH manager turn is handed out — a turn that either erases the
+    // settled escalation (`note_failure` removes the entry unconditionally) or overturns it with a
+    // contradicting `SHIP`. Recording first makes the window unrepresentable rather than merely
+    // brief. The success path's `InFlight` marker already survives its awaits, so this ordering is
+    // only load-bearing for the failure path — but one ordering for both keeps them from drifting.
+    deps.ledger.record(&plan.pr, adjudication.clone());
+
     let refs = vec![plan.pr.to_string()];
     if let Some(room) = deps.room.as_ref() {
         let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());
@@ -388,18 +412,6 @@ pub async fn perform_adjudication(
         );
     }
 
-    let adjudication = match verdict {
-        Verdict::Ship => Adjudication::Ship {
-            head: plan.head.clone(),
-            rounds: plan.rounds,
-        },
-        Verdict::Escalate { reason } => Adjudication::Escalate {
-            head: plan.head.clone(),
-            rounds: plan.rounds,
-            findings: plan.findings.clone(),
-            reason,
-        },
-    };
     let outcome = match &adjudication {
         Adjudication::Ship { .. } => "ship",
         Adjudication::Escalate { .. } => "escalate",
@@ -413,7 +425,6 @@ pub async fn perform_adjudication(
         findings = plan.findings.len(),
         "review adjudication: the manager decided"
     );
-    deps.ledger.record(&plan.pr, adjudication);
 }
 
 /// The prompt the manager answers. Names the pull request, the head, the round count and every open
@@ -463,11 +474,22 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 /// ([`strip_answer_decoration`]), because they carry no decision content but otherwise pushed an
 /// obviously-correct reply into the error path.
 ///
+/// An answer that names BOTH decisions and does so only on decorated lines is ambiguous, not a
+/// decision: that is the shape of a reply that merely ENUMERATES the two options ("- ESCALATE: …\n-
+/// SHIP: …"), and the last bullet would otherwise be read as the answer. It is an error, so the
+/// caller re-asks rather than guessing.
+///
 /// An answer naming neither decision is an error, and the caller re-asks rather than guessing.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
     let mut decided: Option<Verdict> = None;
+    let mut saw_ship = false;
+    let mut saw_escalate = false;
+    // Whether any decision-shaped line was written WITHOUT decoration. A reply that states one of
+    // the decisions on a plain line is answering, whatever it said about the other; a reply whose
+    // every decision word sits behind a bullet or emphasis is listing them.
+    let mut any_undecorated = false;
     for raw in stdout.lines() {
-        let line = strip_answer_decoration(raw);
+        let (line, decorated) = strip_answer_decoration(raw);
         let line = line.as_str();
         if line.is_empty() {
             continue;
@@ -476,6 +498,8 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
         let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
         if bare == "SHIP" || upper.starts_with("SHIP:") {
             decided = Some(Verdict::Ship);
+            saw_ship = true;
+            any_undecorated |= !decorated;
             continue;
         }
         if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
@@ -490,7 +514,16 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
                     rest.to_string()
                 },
             });
+            saw_escalate = true;
+            any_undecorated |= !decorated;
         }
+    }
+    if saw_ship && saw_escalate && !any_undecorated {
+        return Err(format!(
+            "adjudication reply named BOTH decisions, each only on a decorated line; ambiguous \
+             rather than an answer: {}",
+            snippet(stdout)
+        ));
     }
     decided.ok_or_else(|| {
         format!(
@@ -502,27 +535,34 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
 
 /// Strips the leading markdown/quoting decoration and an optional `Decision:`/`Verdict:` label a
 /// model routinely wraps its one-line answer in, so `**SHIP**`, `- SHIP` and `Decision: SHIP` are
-/// read as the decisions they are.
+/// read as the decisions they are. Returns whether anything was stripped, which [`parse_verdict`]
+/// uses to tell a decision from an enumerated list item.
 ///
 /// Deliberately not a prose scanner: it removes LEADING decoration only, so a line that begins
 /// `SHIP ` still carries its explanation and is still not a decision. Three such replies used to be
 /// Err, which the caller counts as a failed turn and blames the model for being unreachable when it
 /// answered clearly — a misdiagnosis, not a safety property.
-fn strip_answer_decoration(line: &str) -> String {
+fn strip_answer_decoration(line: &str) -> (String, bool) {
     // Decoration can sit on either side of the label (`**Decision: SHIP**`), so this is applied
     // again after the label comes off.
-    fn undecorate(s: &str) -> &str {
-        s.trim().trim_start_matches(['*', '_', '#', '>', '-', ' '])
+    fn undecorate(s: &str) -> (&str, bool) {
+        let trimmed = s.trim();
+        let stripped = trimmed.trim_start_matches(['*', '_', '#', '>', '-', ' ']);
+        (stripped, stripped.len() != trimmed.len())
     }
-    let s = undecorate(line);
+    let (s, decorated) = undecorate(line);
     let upper = s.to_ascii_uppercase();
     for label in ["DECISION:", "VERDICT:"] {
         if upper.starts_with(label) {
-            // Byte-slicing is safe here: `starts_with` proved the prefix is these ASCII bytes.
-            return undecorate(s.get(label.len()..).unwrap_or("")).to_string();
+            // Byte-slicing is safe here: `starts_with` proved the prefix is these ASCII bytes. The
+            // label ITSELF is decoration, so the line is decorated whatever `undecorate` says.
+            return (
+                undecorate(s.get(label.len()..).unwrap_or("")).0.to_string(),
+                true,
+            );
         }
     }
-    s.to_string()
+    (s.to_string(), decorated)
 }
 
 /// A short, single-line excerpt of a reply for an error message, so a long transcript does not land
@@ -655,6 +695,26 @@ mod tests {
             Ok(Verdict::Escalate {
                 reason: "needs a security owner".to_string()
             })
+        );
+    }
+
+    /// **A reply that ENUMERATES both options is not a decision.** Once the leading `- ` strip
+    /// landed, a reply that merely lists the two choices parsed as whichever it listed last, in the
+    /// unsafe direction when that was `SHIP`. A decision word behind a bullet is a list item; a
+    /// reply that lists both and states neither plainly is ambiguous, so the caller re-asks.
+    #[test]
+    fn a_reply_that_enumerates_both_options_on_decorated_lines_is_ambiguous() {
+        for reply in [
+            "I weighed both:\n- ESCALATE: the migration needs a DBA\n- SHIP: the rest are nits\n",
+            "Options:\n  * ESCALATE: risky\n  * SHIP: fine\n",
+            "**SHIP: the rest are nits**\n**ESCALATE: the migration needs a DBA**",
+        ] {
+            assert!(parse_verdict(reply).is_err(), "({reply:?})");
+        }
+        // …but one decision stated plainly still wins, even beside a bulleted mention of the other.
+        assert_eq!(
+            parse_verdict("- ESCALATE: risky\n- SHIP: fine\nMy decision:\nSHIP"),
+            Ok(Verdict::Ship)
         );
     }
 
@@ -837,6 +897,31 @@ mod tests {
         }
     }
 
+    /// A comment sink that blocks once a post begins, so a test can read the ledger from the middle
+    /// of the audit writes — the shape that catches a settled entry recorded AFTER the POST.
+    #[derive(Default)]
+    struct BlockingComments {
+        posted: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        bodies: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PrCommentSink for BlockingComments {
+        async fn post_pr_comment(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            body: &str,
+        ) -> crate::ghsummons::PrCommentResult {
+            self.bodies.lock().unwrap().push(body.to_string());
+            self.posted.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
     struct FixedVerdict(Verdict);
 
     #[async_trait]
@@ -855,10 +940,10 @@ mod tests {
         }
     }
 
-    fn deps(
+    fn deps<C: PrCommentSink + 'static>(
         adjudicator: Arc<dyn ReviewAdjudicator>,
         room: Arc<RecordingRoom>,
-        comments: Arc<RecordingComments>,
+        comments: Arc<C>,
         ledger: Arc<AdjudicationLedger>,
     ) -> AdjudicationDeps {
         AdjudicationDeps {
@@ -1008,6 +1093,50 @@ mod tests {
             0,
             "a landed escalation resets the failure tally"
         );
+    }
+
+    /// **The failure-path window, pinned from the middle of the POST.** The bounded-failure
+    /// escalation clears the in-flight marker (`note_failure`) before its audit writes, so if the
+    /// settled `Escalate` were recorded only AFTER `post_pr_comment` returned, the control task
+    /// would read "no decision, not in flight" for the whole of that unbounded await and hand out a
+    /// FOURTH turn — one that erases the escalation or overturns it with a contradicting `SHIP`.
+    /// The ledger must already be settled while the comment POST is outstanding. A comment sink that
+    /// blocks (the shape above) is the only way to observe it; an end-state assertion passes either
+    /// ordering.
+    #[tokio::test]
+    async fn the_failure_escalation_is_settled_before_the_comment_post_returns() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(BlockingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = plan();
+        let deps = deps(
+            Arc::new(BrokenVerdict),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        // The first two failures re-ask and never reach the audit writes.
+        for _ in 0..(MAX_ADJUDICATION_ATTEMPTS - 1) {
+            perform_adjudication(&plan, &deps, Utc::now()).await;
+        }
+        // The Nth, on its own task, so the test can read the ledger while the POST is blocked.
+        let spawned_plan = plan.clone();
+        let handle =
+            tokio::spawn(
+                async move { perform_adjudication(&spawned_plan, &deps, Utc::now()).await },
+            );
+        comments.posted.notified().await;
+        match ledger.peek(&plan.pr) {
+            Some(Adjudication::Escalate { reason, .. }) => {
+                assert!(reason.contains("failed 3 times"), "{reason}");
+            }
+            other => {
+                panic!("the ledger must be settled before the comment POST returns, got {other:?}")
+            }
+        }
+        comments.release.notify_one();
+        handle.await.expect("the adjudication task must not panic");
     }
 
     /// A failed turn is NOT a decision: nothing is recorded, the marker is cleared so the next
