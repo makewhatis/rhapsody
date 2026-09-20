@@ -45,6 +45,21 @@
 //!   owes a merge. This is what found the STUDIO-881 draft loop and the `BEHIND` decline by hand.
 //! * `in_flight` — a round is happening RIGHT NOW. Never divergence.
 //!
+//! # A human-gated ticket is deliberately NOT this sweep's business (STUDIO-949)
+//!
+//! `rhapsody:human` is the one hold the dispatcher applies on purpose: the ticket can only be done by
+//! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep must
+//! never report it as a stall, and it cannot rely on such a ticket having no watch row: a ticket
+//! labelled AFTER an agent already ran has one, which is the likeliest way the label is ever applied.
+//! So a row whose origin ticket currently WEARS the label is dropped before the rules see it (see
+//! [`Orchestrator::reconcile_review_divergence`]) — the exclusion is explicit, not by construction,
+//! and it reads the live-inclusive current-label set so a label added while the origin run is still
+//! live is honoured too. The dispatch refusal itself lives on the review watcher
+//! ([`crate::reviewwatch`]), so a row that is held arms nothing new either; this filter is what keeps
+//! the ALREADY-ARMED row from reporting the deliberate hold as a stalled obligation. A future change
+//! that made this sweep range over tickets rather than watch rows would have to add the hold back
+//! deliberately.
+//!
 //! # It reports and it does NOT act
 //!
 //! Nothing here re-dispatches, re-arms, merges or moves a ticket. That is a decision, not an
@@ -447,6 +462,29 @@ impl Orchestrator {
             self.set_review_divergences(Vec::new());
             return;
         }
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
+        // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
+        // selection pass has ever READ THE BOARD, leaving `labelled` empty for the whole process
+        // lifetime. The held-row filter below would then match nothing, and this sweep would publish
+        // a `review_divergence` WARN for the very ticket the operator deliberately took over — the
+        // false alarm the filter exists to prevent, on every tick. With no pass having looked, an
+        // empty set is "unknown", not "no hold", so report NOTHING rather than a verdict the sweep
+        // cannot stand behind. (Once a pass has run the set is a real answer and the filter is
+        // exact; a false stall for a held ticket is strictly worse than a deferred report, and this
+        // sweep is a report, not a control.)
+        //
+        // The set and the latch are read together, under one lock (STUDIO-949 round 13): read
+        // separately, a pass landing between the two calls would let this sweep hold an un-primed
+        // empty set and then read `primed == true`, treating "nothing has looked" as "no hold".
+        //
+        // MUTATION: drop this branch and
+        // `an_unprimed_hold_ledger_reports_no_divergence` reds (the held row is reported).
+        let (labelled, ledger_primed) = self.human_holds.labelled_and_primed();
+        if !ledger_primed {
+            self.set_review_divergences(Vec::new());
+            return;
+        }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -460,11 +498,31 @@ impl Orchestrator {
                 return;
             }
         };
+        // The current `rhapsody:human` LABEL set (STUDIO-949), already lowercased for the
+        // case-insensitive comparison below. A row whose origin ticket wears the label is a
+        // DELIBERATE hold, not a stalled obligation, so it is dropped before the rules can date it —
+        // the module doc's "a held ticket never arms a watch row" is false (a label applied after a
+        // run leaves one), so this is a filter, not a construction. Read with the priming latch,
+        // above, under one lock.
+        //
+        // This reads the CURRENT-LABEL set, not the reported-hold subset the console reads. The
+        // reported set deliberately excludes a ticket the daemon is RUNNING right now (a live run is
+        // not yet a deliberate hold for an operator), but the sweep must honour a label added to a
+        // run that is still live — the likeliest way the label is ever applied, and precisely the
+        // shape the ticketless watcher and the auto-merge gate already read this same set for. Using
+        // the reported subset instead let the sweep publish a `review_divergence` WARN for a ticket
+        // this feature had deliberately blocked. Empty on a daemon with no hold, so the default path
+        // is byte-identical.
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
         for row in &rows {
+            if let Some(ticket) = origin_ticket(&row.introduced_by)
+                && labelled.contains(&ticket.to_ascii_lowercase())
+            {
+                continue; // a deliberate hold, not this sweep's business
+            }
             let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
             // Per project (STUDIO-927): each pull request reads the override for the project
             // that owns its repo, so one repo can be held back while a sibling still merges.
@@ -1245,7 +1303,18 @@ mod store_tests {
             .with_timezone(&Utc)
     }
 
+    /// An enabled ticketless daemon with one project. Primed by a selection pass, because every
+    /// sweep test after this one simulates a running daemon whose dispatch half has executed; the
+    /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(auto_merge: bool, now: &str) -> Orchestrator {
+        let o = orch_before_first_pass(auto_merge, now);
+        o.human_holds.begin_pass(true);
+        o
+    }
+
+    /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so its
+    /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
+    fn orch_before_first_pass(auto_merge: bool, now: &str) -> Orchestrator {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo"]);
@@ -1399,6 +1468,97 @@ mod store_tests {
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["ticket"], "STUDIO-893");
+    }
+
+    /// STUDIO-949: the shape above, but with the origin ticket CURRENTLY held for a human. The row
+    /// exists (it was armed by an earlier run) yet the obligation is a deliberate hold, not a stall,
+    /// so the sweep must report nothing — on either surface.
+    ///
+    /// The fixture seeds the CURRENT-LABEL-only state (`note_human_label`, which is what the
+    /// selection pass records for a candidate wearing the label while its run is still live) rather
+    /// than `hold` (which feeds the reported subset too). That is the state the two sets disagree
+    /// on, so only this fixture pins the sweep to the live-inclusive signal; seeding `hold` passes
+    /// against either reader.
+    ///
+    /// MUTATION: delete the held-origin filter from `reconcile_review_divergence` and this reds;
+    /// read the reported `held()` set instead of `labelled()` and this reds too.
+    #[test]
+    fn a_held_ticket_is_not_reported_as_a_stall() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        // The authoring run ended BEFORE the review, which is the divergence the test above pins.
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        o.human_holds.note_human_label("STUDIO-893");
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a held ticket is a deliberate hold, not a stalled obligation"
+        );
+        assert!(
+            o.project_statuses()
+                .iter()
+                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
+        );
+    }
+
+    /// ⚠️ STUDIO-949 round 11: while the human-hold ledger has never been primed by a selection
+    /// pass, the sweep reports NOTHING — even a genuinely diverged row with no hold on it. The
+    /// current-label set has no writer above `on_tick`'s three early gates, and this sweep runs
+    /// ABOVE them on purpose, so on a daemon held by a bad config, an armed drain or a dead
+    /// credential the set is empty for the whole process lifetime. With no pass having looked, "the
+    /// row is not held" is not a fact the sweep can assert, and publishing a `review_divergence` WARN
+    /// for a held ticket is the false alarm the filter exists to prevent.
+    ///
+    /// `a_diverged_pull_request_is_reported_on_both_surfaces` is the live control: the SAME fixture
+    /// through a primed daemon reports on both surfaces.
+    ///
+    /// MUTATION: drop the un-primed (`!ledger_primed`) branch from `reconcile_review_divergence` and this reds (a
+    /// divergence is published).
+    #[test]
+    fn an_unprimed_hold_ledger_reports_no_divergence() {
+        let o = &mut orch_before_first_pass(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "with no pass having looked, the sweep cannot tell a hold from a stall"
+        );
+
+        // Once a pass has run, the same row is reported again.
+        o.human_holds.begin_pass(true);
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a primed sweep reports the divergence"
+        );
     }
 
     /// The healthy case through the same path: the author answered the findings, so nothing is

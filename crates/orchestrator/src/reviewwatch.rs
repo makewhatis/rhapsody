@@ -1055,6 +1055,17 @@ impl Orchestrator {
             .map_or(1, |t| t.review.effective_reviewers().max(1));
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
+        // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
+        // a row's origin ticket below. This is `labelled()`, not the console's `held()`: the reported
+        // hold excludes a ticket the daemon is running, but this gate must also catch an origin
+        // labelled while its run was still LIVE — the mid-run hold shape. Empty on any daemon with no
+        // hold, which is what keeps the default path paying only a clone of an empty set.
+        //
+        // Read together with the priming latch, under one lock (STUDIO-949 round 13): read
+        // separately, a selection pass landing between the two calls would let a gate hold an
+        // un-primed empty set and then read `primed == true`, treating "nothing has looked" as "no
+        // hold". The pair is now always the pair one pass produced.
+        let (held, ledger_primed) = self.human_holds.labelled_and_primed();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly
         // would go stale the moment one row is reassigned: the next row would still see the retired
@@ -1079,6 +1090,44 @@ impl Orchestrator {
             );
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             if !review_round_due(row, head, live) {
+                continue;
+            }
+            // A `rhapsody:human` origin ticket is refused at dispatch on every path (STUDIO-949), and
+            // this watcher is a dispatch path. The gate is deliberately on the ROW'S CURRENT HOLD
+            // rather than on the row's creation: a ticket labelled after an agent already flailed on
+            // it is the likeliest way the label is ever applied, and that ticket has a watch row from
+            // the earlier round. The row is LEFT ARMED — the hold can come off, and the obligation it
+            // records is still real when it does — so this defers rather than retires, and unlike the
+            // `requested` back-pressure above it is a deliberate hold, not a budget.
+            //
+            // Fail CLOSED while the ledger has never been primed (STUDIO-949 round 13). The
+            // current-label set has no writer above `on_tick`'s three early-return gates, so on a
+            // daemon held by a bad config, an armed drain or a dead credential it is empty for the
+            // WHOLE process lifetime — and this sweep runs from the watcher's own 120s task,
+            // independent of those gates. `dispatch_review` gates on a drain but on neither of the
+            // other two, so reading an unknown empty set as "no hold" here dispatches a REAL review
+            // round, for the whole life of the gate, at a held ticket's pull request. An empty set
+            // with no pass having looked is "unknown", not "no hold".
+            //
+            // MUTATION: drop this fail-closed branch and
+            // `an_unprimed_hold_ledger_refuses_the_review_round` reds (a round is dispatched).
+            if !ledger_primed {
+                tracing::debug!(
+                    pr = %pr, reviewer = %row.key.reviewer,
+                    "ticketless review: no selection pass has run yet, so the human-hold label set \
+                     is unknown; the round waits"
+                );
+                report.deferred += 1;
+                continue;
+            }
+            let origin = crate::reviewdone::origin_ticket(&row.introduced_by)
+                .map(|t| t.to_ascii_lowercase());
+            if origin.as_deref().is_some_and(|t| held.contains(t)) {
+                tracing::debug!(
+                    pr = %pr, reviewer = %row.key.reviewer, origin = %row.introduced_by,
+                    "ticketless review: the origin ticket is held for a human; the round waits"
+                );
+                report.deferred += 1;
                 continue;
             }
             if *slots <= 0 {
@@ -1214,7 +1263,47 @@ impl Orchestrator {
             }
         }
 
-        self.propose_auto_merge(&mine, pr, head, report);
+        // A `rhapsody:human` origin ticket must not have its pull request auto-merged either
+        // (STUDIO-949 round 5). The round gate above refuses to DISPATCH against a held ticket, but
+        // a pull request whose reviewers had already approved the current head when the label landed
+        // would still clear auto-merge here — and the merge then runs `plan_review_done` on the next
+        // tick and moves the ticket to `review.done_state`. Refusing the review round while MERGING
+        // the code and closing the ticket is the daemon finishing work the label says only a person
+        // can do, and the merge is irreversible. Read from the same current-LABEL set as the round
+        // gate (`labelled()`, live runs included), and decided before the plan is formed so nothing
+        // is handed across the seam.
+        //
+        // MUTATION: delete this gate and
+        // `a_held_origin_ticket_holds_back_auto_merge` reds (a plan is proposed).
+        let held_origin = mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+        });
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11), so on a daemon held by a bad config, an armed drain or a dead credential — the
+        // exact daemon whose dispatch has stopped — `held` is empty for the whole process lifetime
+        // and `held_origin` is `false` for a ticket that genuinely wears the label. The gate then
+        // opens and merges human-only work, irreversibly. Fail CLOSED instead: until a pass has
+        // actually READ THE BOARD, an empty set is "unknown", not "no hold". Once a pass has run the
+        // answer is real and the gate behaves exactly as before. `ledger_primed` is the same latch
+        // the round gate above reads, taken in the same lock as `held`.
+        //
+        // MUTATION: drop the fail-closed branch and
+        // `an_unprimed_hold_ledger_refuses_auto_merge` reds (a plan is proposed).
+        if !ledger_primed {
+            tracing::debug!(
+                pr = %pr,
+                "auto-merge: no selection pass has run yet, so the human-hold label set is unknown; \
+                 refusing to merge"
+            );
+        } else if held_origin {
+            tracing::debug!(
+                pr = %pr,
+                "auto-merge: the origin ticket is held for a human; not merging"
+            );
+        } else {
+            self.propose_auto_merge(&mine, pr, head, report);
+        }
     }
 
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
@@ -1601,7 +1690,20 @@ mod tests {
 
     /// An orchestrator with one enabled project owning [`REPO_URL`], an in-memory store and a
     /// recording spawn seam — the shape `dispatch_review` needs to reach a worker.
+    ///
+    /// Primed by a selection pass, because every watcher test after this one simulates a daemon that
+    /// is actually dispatching: on a real one the first tick runs before the watcher's 120s first
+    /// sweep, so the human-hold label set is a real answer by the time the watcher reads it. The
+    /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(teams: Teams) -> (Orchestrator, DispatchedEntries) {
+        let (o, dispatched) = orch_before_first_pass(teams);
+        o.human_holds.begin_pass(true);
+        (o, dispatched)
+    }
+
+    /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so the ledger's
+    /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
+    fn orch_before_first_pass(teams: Teams) -> (Orchestrator, DispatchedEntries) {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo", "in progress"]);
@@ -2033,6 +2135,77 @@ mod tests {
         assert_eq!(dispatched.lock().expect("lock").len(), 1);
     }
 
+    /// STUDIO-949: a watch row whose ORIGIN ticket is currently held for a human dispatches no
+    /// review, even though the row exists from an earlier round — a ticket labelled after an agent
+    /// already flailed on it is the likeliest way the label is ever applied. The row is left armed,
+    /// so a later label removal still gets the review it is owed.
+    ///
+    /// The fixture seeds the CURRENT-LABEL-only state (`note_human_label`, the state the selection
+    /// pass produces for a candidate labelled while its run is still live) rather than `hold`, which
+    /// feeds the reported subset too. That pins this gate to `labelled()`: seeding `hold` passed
+    /// against either reader.
+    ///
+    /// MUTATION: delete the origin-hold gate from `service_review_pr` and the first assertion reds;
+    /// read the reported `held()` set instead of `labelled()` and it reds too.
+    #[test]
+    fn a_watch_row_whose_origin_ticket_is_held_for_a_human_is_not_dispatched() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
+        o.human_holds.note_human_label("STUDIO-721");
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "a held ticket's review must not dispatch"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the row must stay armed for a later label removal"
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — so the row is
+        // still owed, and now dispatches.
+        o.human_holds.begin_pass(true);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+    }
+
+    /// ⚠️ STUDIO-949 round 13: the SAME un-primed latch fail-closes the ROUND gate ten lines above
+    /// the auto-merge gate, on the same sweep. `dispatch_review` gates on a drain but on neither
+    /// `validate()` nor `credential_preflight()`, both of which are on `on_tick`'s dispatch half
+    /// only — so on a daemon whose config validation has failed since boot this sweep would
+    /// otherwise dispatch a REAL review round at a held ticket's pull request for the whole life of
+    /// the gate. Nothing is held here; the set is simply unknown.
+    ///
+    /// `a_watch_row_whose_origin_ticket_is_held_for_a_human_is_not_dispatched` is the live control:
+    /// the same fixture through a primed ledger refuses for the held reason, and dispatches once the
+    /// label is cleared.
+    ///
+    /// MUTATION: drop the `!ledger_primed` branch before the origin-hold check and this reds (a
+    /// round is dispatched).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_the_review_round() {
+        let (mut o, dispatched) = orch_before_first_pass(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob")); // nothing held — the label set is just unknown
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "with no pass having read the board, the hold set is unknown and no round may dispatch"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the row must stay armed for once the set is known"
+        );
+
+        // Once a pass has read the board the set is a real answer, and the row is dispatched.
+        o.human_holds.begin_pass(true);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+    }
+
     /// Acceptance: a `max_turns`-truncated round is re-reviewed AT THE SAME HEAD. Nothing but the
     /// status distinguishes it from a completed one — `last_reviewed_sha` was deliberately not
     /// advanced — so a SHA-only trigger would call the partial review sufficient forever.
@@ -2313,6 +2486,74 @@ mod tests {
             }]
         );
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
+    }
+
+    /// STUDIO-949 round 5: an approved, at-head pull request whose ORIGIN ticket is held for a human
+    /// is not proposed for merge. The round gate refuses to dispatch a review against a held ticket;
+    /// without this one, a pull request approved before the label landed would still merge, and the
+    /// merge then moves the ticket to Done — the daemon finishing what only a person may do.
+    /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: the
+    /// identical fixture without the hold proposes the plan.
+    ///
+    /// MUTATION: delete the `held_origin` gate from `service_review_pr` and this reds; read the
+    /// reported `held()` set instead of `labelled()` and it reds too (the fixture seeds the
+    /// current-label-only state, the live-labelled hold shape).
+    #[test]
+    fn a_held_origin_ticket_holds_back_auto_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A)); // origin: `handoff:STUDIO-721`
+        o.human_holds.note_human_label("STUDIO-721");
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "a held ticket's pull request must not self-merge: {:?}",
+            report.merge
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — and the merge
+        // the reviewers already approved is proposed on the next tick.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
+            1,
+            "once the hold is gone the approved merge is proposed"
+        );
+    }
+
+    /// ⚠️ STUDIO-949 round 11: an approved, at-head pull request is NOT merged while the human-hold
+    /// ledger has never been primed by a selection pass — even with nothing labelled at all. This is
+    /// the failing-open direction: the current-label set has no writer above `on_tick`'s three early
+    /// gates (a bad config, an armed drain, a dead credential), so on a daemon held by one of them it
+    /// is empty for the whole process lifetime and the ordinary hold check would see "no hold" for a
+    /// ticket that wears the label. An unknown set fails closed.
+    ///
+    /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: it
+    /// runs the SAME fixture through a primed daemon and proposes the plan.
+    ///
+    /// MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `service_review_pr` and this reds (a
+    /// plan is proposed).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_auto_merge() {
+        let (mut o, _d) = orch_before_first_pass(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A)); // nothing held — the label set is just unknown
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "with no pass having looked, the hold set is unknown and the merge must not run: {:?}",
+            report.merge
+        );
+
+        // Once a pass has run the set is a real answer, and the same pull request merges.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
+            1,
+            "a primed ledger merges the approved head"
+        );
     }
 
     /// ⚠️ The D5 invariant and the opt-in, at the one place it decides anything: the SAME approved,

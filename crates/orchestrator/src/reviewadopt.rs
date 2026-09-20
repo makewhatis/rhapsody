@@ -107,8 +107,12 @@ pub(crate) struct AdoptSweep {
     pub(crate) planned: Vec<ReviewIntroRequest>,
     /// `(project group, ticket identifier, why)` for each candidate that could not be adopted.
     pub(crate) refused: Vec<(String, String, &'static str)>,
-    /// `(project group, ticket identifier)` for each candidate that IS adoptable — the input to
-    /// retiring an advisory an earlier sweep filed against it.
+    /// `(project group, ticket identifier)` for each candidate whose stale orphan advisory must be
+    /// retired — the ADOPTABLE ones, and (STUDIO-949) a `rhapsody:human` one this daemon now skips.
+    /// The name is about the EFFECT, not adoptability: the field is the input to
+    /// [`clear_orphaned_review`](Self::clear_orphaned_review), which is the only thing that retires
+    /// a recorded advisory, so a held ticket whose advisory predates the label is repaired here
+    /// rather than left standing forever.
     ///
     /// Reported separately from [`planned`](Self::planned) rather than derived from it, because the
     /// advisory is keyed by (group, ticket) and a `ReviewIntroRequest` carries neither: it names a
@@ -149,7 +153,29 @@ impl Orchestrator {
                 break;
             }
             match self.adopt_verdict(iss, proj, &origins, &running, load.counts(), now) {
-                Verdict::Skip => {}
+                Verdict::Skip => {
+                    // A `rhapsody:human` ticket is HELD, not orphaned (STUDIO-949 round 4). The gate
+                    // returns Skip, so it never reaches the Adopt arm that retires an advisory filed
+                    // against it — and an advisory recorded BEFORE the label landed ("parked in a
+                    // review state ... and cannot be adopted") would then outlive the hold forever,
+                    // telling an operator to fix work that is now deliberately theirs. Retire it
+                    // here. The refusal itself stays in `adopt_verdict`; this only feeds the same
+                    // `clear_orphaned_review` the Adopt arm uses.
+                    if crate::teams::is_human(iss) {
+                        // The pace memo must go with the advisory (STUDIO-949 round 5). This ticket
+                        // may carry a `review_adopt_probed` entry from an earlier sweep — the
+                        // quarter-hour memo that keeps a parked-but-unadoptable ticket from costing
+                        // a `gh` lookup every tick. Retiring the advisory while leaving the memo
+                        // armed means: the label is removed, the orphan warning is already gone, and
+                        // `adopt_verdict` still hits the stale timestamp and skips BEFORE it
+                        // reconsiders — adoption silently suppressed for the balance of the
+                        // interval, which is the state the repair exists to eliminate. Dropping the
+                        // memo here makes the label's removal take effect on the very next sweep.
+                        self.review_adopt_probed.remove(&iss.identifier);
+                        out.repaired
+                            .push((self.adopt_group(proj), iss.identifier.clone()));
+                    }
+                }
                 Verdict::Considered => probed.push(iss.identifier.clone()),
                 Verdict::Adopt(req) => {
                     probed.push(iss.identifier.clone());
@@ -244,6 +270,17 @@ impl Orchestrator {
         now: Instant,
     ) -> Verdict {
         if iss.identifier.is_empty() {
+            return Verdict::Skip;
+        }
+        // Human-only gate (STUDIO-949). This predicate is the structural sibling of
+        // `review_reopen_eligible`, and it is reached with INVERTED polarity: a `true` reopen answer
+        // means SKIP the adoption (the ladder is about to re-dispatch underneath us). So refusing a
+        // `rhapsody:human` ticket in `review_reopen_eligible` — which we do — makes it `false` here,
+        // and without this gate the ticket would FALL THROUGH to the adoption machinery: a reviewer
+        // introduced, and an agent dispatched at work only a person can do (STUDIO-949 round 3). The
+        // hold is already reported by the selection ladders' review branch, so this path stays
+        // silent like every other Skip.
+        if crate::teams::is_human(iss) {
             return Verdict::Skip;
         }
         let Some(eff) = self.eff.as_ref() else {
@@ -800,6 +837,125 @@ mod tests {
         );
 
         assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
+    }
+
+    /// The adoption path's OWN human gate (STUDIO-949 round 3). `adopt_verdict` consults
+    /// `review_reopen_eligible` with INVERTED polarity — `true` there means "the ladder is about to
+    /// reopen this ticket, so do NOT adopt". Gating the human label only inside that predicate
+    /// therefore turns the refusal into an ADOPTION: the ticket falls through and a reviewer is
+    /// introduced for work only a person can do, which is the exact leak the reopen gate was meant
+    /// to close, moved one step along.
+    ///
+    /// `an_orphaned_review_state_ticket_is_adopted` is the live control: the identical fixture
+    /// without the label plans exactly one adoption.
+    ///
+    /// MUTATION: delete the `is_human` gate from `adopt_verdict` and this reds (the ticket is
+    /// adopted). Deleting it from `review_reopen_eligible` alone does not — which is why the gate
+    /// must live on BOTH.
+    #[test]
+    fn a_human_labelled_review_state_ticket_is_not_adopted() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let mut iss = parked("STUDIO-836");
+        iss.labels = Some(vec!["rhapsody:human".to_string()]);
+
+        let got = sweep(&mut o, &[iss], Instant::now());
+        assert!(got.planned.is_empty(), "a human ticket is never adopted");
+        assert!(
+            got.refused.is_empty(),
+            "and is not filed as an orphan either — the hold is deliberate"
+        );
+        // It IS retired, though: an advisory filed before the label landed must not outlive the
+        // hold. See `a_pre_existing_orphan_advisory_is_retired_when_the_human_label_lands`.
+        assert_eq!(
+            got.repaired,
+            vec![("rhapsody".to_string(), "STUDIO-836".to_string())]
+        );
+    }
+
+    /// STUDIO-949 round 4. The scenario the round-3 gate created: a ticket parked in review with no
+    /// watch row is REFUSED and an advisory is filed against it; the operator reads that advisory,
+    /// concludes only a person can finish the ticket, and labels it `rhapsody:human`. The gate now
+    /// SKIPS it — so without this repair the advisory `clear_orphaned_review` retires would never be
+    /// called again, and the message that prompted the label would persist forever.
+    #[test]
+    fn a_pre_existing_orphan_advisory_is_retired_when_the_human_label_lands() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        o.warnings
+            .record_orphaned_review("rhapsody", "STUDIO-836", "no branch resolved");
+
+        let mut iss = parked("STUDIO-836");
+        iss.labels = Some(vec!["rhapsody:human".to_string()]);
+
+        let got = sweep(&mut o, &[iss], Instant::now());
+        assert_eq!(
+            got.repaired,
+            vec![("rhapsody".to_string(), "STUDIO-836".to_string())],
+            "the hold feeds the advisory's retirement instead of stranding it"
+        );
+    }
+
+    /// STUDIO-949 round 5. Retiring the advisory is not enough: the ticket's `review_adopt_probed`
+    /// pace memo must be retired with it. The memo is armed by the very refusal that filed the
+    /// advisory, and it survives the label's arrival — `adopt_verdict` returns at the human gate
+    /// BEFORE the pace gate, so the walk below never touches it. Without this clearing, an operator
+    /// who labels the ticket and then removes the label a second later is left with: no orphan
+    /// warning (the hold's repair deleted it), and adoption silently suppressed by the stale
+    /// timestamp for the balance of `REVIEW_ADOPT_PROBE_INTERVAL`. This drives the whole transition
+    /// through `sweep_review_adoptions`, because asserting only on `plan_review_adoptions`'s
+    /// `repaired` cannot see the interval.
+    ///
+    /// MUTATION: drop the `review_adopt_probed.remove` from the human Skip arm and the third sweep
+    /// reds (refused empty, advisory not re-filed).
+    #[test]
+    fn removing_a_human_hold_immediately_restores_the_orphan_advisory() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let _rx = o.open_review_intro_channel();
+        let t0 = Instant::now();
+
+        // Tick 1: no label, and the roster holds nobody but the author — so the sweep REFUSES and
+        // files the advisory, arming the pace memo on the way through.
+        o.sweep_review_adoptions([(&parked("STUDIO-836"), Some(0))].into_iter(), t0);
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-836")),
+            "the orphan is reported before the hold exists"
+        );
+        assert!(
+            o.review_adopt_probed.contains_key("STUDIO-836"),
+            "the refusal armed the pace memo"
+        );
+
+        // Tick 2, one second later: the label lands. The hold retires the advisory and the memo.
+        let mut held = parked("STUDIO-836");
+        held.labels = Some(vec!["rhapsody:human".to_string()]);
+        o.sweep_review_adoptions([(&held, Some(0))].into_iter(), t0 + Duration::from_secs(1));
+        assert!(
+            o.warnings.merged_for("rhapsody").is_empty(),
+            "the hold retires the advisory"
+        );
+        assert!(
+            !o.review_adopt_probed.contains_key("STUDIO-836"),
+            "the pace memo must be retired with the advisory"
+        );
+
+        // Tick 3, one second after that: the label is gone and the ticket is still an orphan. It must
+        // be visible again at once, not suppressed for the rest of the interval.
+        o.sweep_review_adoptions(
+            [(&parked("STUDIO-836"), Some(0))].into_iter(),
+            t0 + Duration::from_secs(2),
+        );
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-836")),
+            "once the human hold is removed, the still-orphaned review must be visible again"
+        );
     }
 
     /// The memo holds only what still paces something. An entry older than the probe interval can

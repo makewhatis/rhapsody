@@ -209,6 +209,13 @@ export interface JobRow {
   startedAtMs: number;
   /** Secondary label under the row; today only set for `failed` jobs (the failure reason). */
   subLabel?: string;
+  /**
+   * True when this row is a `rhapsody:human` HOLD (from `state.held_for_human`, STUDIO-949), not a
+   * blocker. Carried as a fact rather than re-derived from `subLabel`'s wording, because the console
+   * must paint a deliberate hold as Queued while a predecessor-held row stays Blocked, and a string
+   * comparison is how the two words would silently drift apart.
+   */
+  heldForHuman?: boolean;
 }
 
 export interface ProjectMeta {
@@ -295,6 +302,9 @@ interface MergedRow {
   waiting: boolean;
   /** The formatted "<blocker> · <state>" a waiting row is held on (waiting rows only). */
   waitingOn?: string;
+  /** A synthetic `rhapsody:human` hold (from state.held_for_human, STUDIO-949) — deliberately held
+   *  for a person, not blocked by a predecessor. Gives the row its own sub-label. */
+  heldForHuman?: boolean;
   /** Failure reason (history rows only; drives the failed sub-label). */
   error: string;
 }
@@ -321,8 +331,14 @@ export function jobStatus(
   if (group.some((r) => r.live || r.queued)) return "running";
   // A held dependent reads "waiting" (INF-320) — but ONLY when the whole group is synthetic-waiting:
   // a ticket that is live/retrying (handled above) or has a real finished segment is no longer purely
-  // waiting, so its real run status wins and the run stays openable. In practice the daemon never holds
-  // a ticket that has already run, so this is a defensive guard (every() ⇒ no real/history sibling).
+  // waiting, so its real run status wins and the run stays openable.
+  //
+  // The `every(waiting)` half is NOT merely defensive: the dispatcher can hold a `rhapsody:human`
+  // ticket that HAS run (parked in review, then labelled), so one group can hold both a real history
+  // row and a synthetic held row. When it does, the real run status wins HERE — the lane must stay
+  // the run's, and the row must stay openable on it (STUDIO-949). But the HOLD is not lost: `mergeJobs`
+  // carries `heldForHuman` and the "held for a human" sub-label independently of this status, so the
+  // default List view still reads the ticket as deliberately held rather than merely completed.
   if (group.some((r) => r.waiting) && group.every((r) => r.waiting)) return "waiting";
   const newest = group[0];
   switch (newest?.outcome) {
@@ -434,6 +450,35 @@ export function mergeJobs(
     });
   }
 
+  // Synthetic held-for-human rows: one per `rhapsody:human` hold (state.held_for_human, STUDIO-949).
+  // A ticket the dispatcher refuses has usually NEVER RUN, so no other source contributes a row for
+  // it and it would be absent from the worklist entirely — `buildConsoleBoard` synthesizes one too,
+  // for that reason. It is a deliberate HOLD, not a blocker, so it carries `heldForHuman` and its own
+  // sub-label rather than masquerading as "waiting on <blocker>".
+  for (const h of state?.held_for_human ?? []) {
+    merged.push({
+      key: `held-${h.issue_identifier}`,
+      runId: 0,
+      issue: h.issue_identifier,
+      title: h.title,
+      agent: agentName(h.project, "", meta),
+      agentColor: agentColor(h.project, meta),
+      project: h.project,
+      projectShort: projectDisplayName(h.project, meta),
+      turn: 0,
+      tokens: formatTokens(0),
+      duration: "",
+      durationAccent: false,
+      startedAtMs: 0,
+      outcome: "waiting",
+      live: false,
+      queued: false,
+      waiting: true,
+      heldForHuman: true,
+      error: "",
+    });
+  }
+
   for (const h of rows) {
     if (h.id > 0 && liveIds.has(h.id)) continue; // already represented by the live row
     const live = h.outcome === "running";
@@ -477,10 +522,20 @@ export function mergeJobs(
     const status = jobStatus(g);
     const liveRow = g.find((r) => r.live);
     const waitingRow = g.find((r) => r.waiting);
+    const heldRow = g.find((r) => r.heldForHuman === true);
     const newestReal = g.find((r) => !r.queued && !r.waiting); // a live or history row (never synthetic)
     const isWaiting = status === "waiting";
-    // For a held job the waiting row owns the display (its title/project come from BlockedEntry) and
-    // the row is never clickable (it has never run → runId 0). Otherwise the live/newest-real row wins.
+    // A current hold outlives a prior run (STUDIO-949). The dispatcher can hold a ticket that HAS
+    // run — parked in review, then labelled — so a held row and a real history row can share one
+    // group. The real run still decides the lane and keeps the row openable, but `heldForHuman` is
+    // carried INDEPENDENTLY of the historical status, so the default List view never presents
+    // deliberately held work as merely completed/stopped. A live group is the one exception: the
+    // daemon does not hold a ticket it is mid-run on, so a hold beside a running row would be a
+    // stale pass's ghost (and `consoleJobStatus` would wrongly repaint a live run "queued").
+    const heldForHuman = heldRow !== undefined && status !== "running";
+    // For a held job that has never run, the waiting row owns the display (its title/project come
+    // from the hold entry) and the row is never clickable (runId 0). Otherwise the live/newest-real
+    // row wins, so a held ticket that HAS run stays openable on its real run.
     const rep = liveRow ?? (isWaiting ? waitingRow : undefined) ?? newestReal ?? g[0];
     out.push({
       key: rep.key,
@@ -498,11 +553,14 @@ export function mergeJobs(
       durationAccent: rep.durationAccent,
       live: !!liveRow,
       startedAtMs: rep.startedAtMs,
-      subLabel: isWaiting
-        ? `waiting on ${waitingRow?.waitingOn ?? ""}`
-        : status === "failed"
-          ? failureSubLabel(newestReal?.error ?? "") || undefined
-          : undefined,
+      subLabel: heldForHuman
+        ? "held for a human"
+        : isWaiting
+          ? `waiting on ${waitingRow?.waitingOn ?? ""}`
+          : status === "failed"
+            ? failureSubLabel(newestReal?.error ?? "") || undefined
+            : undefined,
+      heldForHuman,
     });
   }
 

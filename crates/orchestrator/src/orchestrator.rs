@@ -553,6 +553,16 @@ pub struct Orchestrator {
     /// Loop-confined, like every other scheduling map here: the ladder takes `&self` and returns
     /// this tally, and the `&mut self` caller stores it.
     pub(crate) held_for_capacity: HashMap<String, i64>,
+    /// The `rhapsody:human` hold ledger (STUDIO-949): the once-per-ticket log dedupe and the
+    /// CURRENT hold set the console reads off `/api/v1/state`.
+    ///
+    /// Shared behind an [`Arc`] rather than loop-confined because the selection pass that discovers
+    /// the holds takes `&self` by design; the control task assembles the snapshot from the same cell.
+    /// Unlike [`held_for_capacity`](Orchestrator::held_for_capacity) the announced set must SURVIVE
+    /// a pass, so the ledger is not simply overwritten by the caller. See
+    /// [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger) and the seam list in
+    /// `crates/orchestrator/CLAUDE.md`.
+    pub(crate) human_holds: Arc<crate::dispatch::HumanHoldLedger>,
     /// Issue ids whose work has completed this process lifetime, a set.
     pub completed: HashSet<String>,
     /// Graphite-mode stacking facts carried from the auto-promote pass to the next tick's dispatch
@@ -855,6 +865,7 @@ impl Orchestrator {
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
             held_for_capacity: HashMap::new(),
+            human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),

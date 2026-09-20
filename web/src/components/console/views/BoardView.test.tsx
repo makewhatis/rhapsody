@@ -75,6 +75,7 @@ function mount(
     <BoardView
       rows={rows}
       blocked={[]}
+      heldForHuman={[]}
       project=""
       counts={counts}
       maxConcurrent={maxConcurrent}
@@ -130,6 +131,37 @@ describe("the board (STUDIO-925)", () => {
     const chip = document.querySelector(".bcard .rchip");
     expect(chip?.querySelector(".o")?.textContent).toBe("failed");
     expect(chip?.classList.contains("bad")).toBe(true);
+  });
+
+  it("reads a held-for-human ticket as deliberately held, not idle (STUDIO-949)", () => {
+    mount(
+      [row({ issue: "STUDIO-939", trackerState: "Todo", status: "queued", statusLabel: "queued" })],
+      vi.fn(),
+      COUNTS,
+      4,
+      {
+        heldForHuman: [
+          { issue_identifier: "STUDIO-939", title: "store work", project: "rhapsody" },
+        ],
+      },
+    );
+    const chip = document.querySelector(".bcard .hchip");
+    expect(chip?.textContent).toBe("held for a human");
+    // It waits in Queued — a lane is run status, and a held ticket has no run.
+    expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-939");
+  });
+
+  it("draws a card for a held ticket that has NEVER RAN (STUDIO-949)", () => {
+    // The production shape: a fresh `rhapsody:human` ticket has no history row and no live row, so
+    // `rows` is empty and the hold is the only evidence the ticket exists. Without synthesizing from
+    // the hold set the board shows nothing for it — the silent stall this feature exists to end.
+    mount([], vi.fn(), COUNTS, 4, {
+      heldForHuman: [{ issue_identifier: "STUDIO-939", title: "store work", project: "rhapsody" }],
+    });
+    const card = document.querySelector('.bcard[aria-label="STUDIO-939 store work"]');
+    expect(card).not.toBeNull();
+    expect(card?.querySelector(".hchip")?.textContent).toBe("held for a human");
+    expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-939");
   });
 
   it("never renders a review row as its own card, even with a null tracker_state", () => {
