@@ -592,13 +592,15 @@ pub struct Orchestrator {
     /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler, which
     /// clears it ONCE per tick — on the tick's first hand-back — and re-inserts only the rounds that
     /// tick held, so on a healthy tick it means exactly "what this tick's sweep held" rather than an
-    /// accumulation. The one deliberate exception is a first hand-back whose store read of the watch
-    /// set FAILED: it decided neither a dispatch nor a defer, so the tick's holds are unknown and the
-    /// previous tick's (still fresh under the watcher's `CAPACITY_HOLD_TTL`) records are KEPT rather
-    /// than blanked — a round that really is held keeps its annotation instead of paging a human with
-    /// "nothing has reported it blocked" because the watcher could not read its own watch set. On
-    /// that path the map IS an accumulation, so a future reader must not iterate it expecting only
-    /// this tick's rows; `fresh_capacity_hold` reads it by key. A sweep only
+    /// accumulation. The exception is a first hand-back that returns before reaching the clear — the
+    /// watcher not ticketless-enabled, or a store read of the watch set that FAILED. It decided
+    /// neither a dispatch nor a defer, so the tick's holds are unknown and the previous tick's (still
+    /// fresh under the watcher's `CAPACITY_HOLD_TTL`) records are left in place rather than blanked.
+    /// For the store-read failure that is DELIBERATE: a round that really is held keeps its
+    /// annotation instead of paging a human with "nothing has reported it blocked" because the
+    /// watcher could not read its own watch set. On such a path the map IS an accumulation, so a
+    /// future reader must not iterate it expecting only this tick's rows; `fresh_capacity_hold` reads
+    /// it by key. A sweep only
     /// visits the rotated slice of the watch set (`MAX_PR_STATE_CALLS_PER_TICK` pull requests per
     /// tick), so with more watched pull requests than that a round's hold can blink out for one
     /// sweep and return on the next; an absent entry means "not held by the most RECENT sweep", not
