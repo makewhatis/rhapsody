@@ -32,7 +32,11 @@ the `Orchestrator` struct itself. Concretely:
   - `warnings.rs`'s `WarningsState` (`Orchestrator::warnings: Arc<WarningsState>`, wrapping an
     `RwLock<WarningMaps>`) — mutated by spawned resolver tasks running off the control task, with a
     generation-counter guard so a slow/older pass can't clobber a newer reload's warnings (see
-    "API-facing views" below).
+    "API-facing views" below). Two producers carry no generation guard because they are recorded
+    directly rather than recomputed wholesale: the poll loop's fetch/enrichment streaks on the
+    control task, and the lost-review advisory written by the off-loop quorum task's `give_up` and
+    by the HANDOFF task's landed-move gate, which is why `ControlHandle` carries this same `Arc`
+    (STUDIO-949 round 18).
   - `teamsmemory.rs`'s `TeamsMemory` (`Orchestrator::teams_memory: Option<Arc<TeamsMemory>>`,
     STUDIO-645) — the `/api/v1/teams/*` handlers drive it entirely on the HTTP task, with **no
     control round-trip at all**, because the design requires a `teams_retain` never to block the
@@ -121,8 +125,12 @@ the `Orchestrator` struct itself. Concretely:
     path entirely) — so on a daemon gated since boot `labelled` is empty for the whole process
     lifetime. All four therefore fail CLOSED while the ledger is un-primed — the round gate defers,
     auto-merge refuses, the sweep reports nothing, `plan_quorum` refuses the fan-out (STUDIO-949
-    rounds 11-13). Those gates read the label set and the latch TOGETHER, under one lock
-    (`labelled_and_primed`), so the pair is always the pair one pass produced.
+    rounds 11-18). Those gates read the label set and the latch TOGETHER, under one lock
+    (`labelled_and_primed`), so the pair is always the pair one pass produced. The quorum's refusal
+    is the one that must be LOUD: it is one-shot and unrecoverable, so it logs at `warn!` and carries
+    a `DroppedQuorum` on the `HandoffPlan` for the handoff to record on the project advisory — but
+    ONLY once the review-state move lands, because `plan_quorum` runs before the move and a refused
+    move is not a handoff.
     The quorum is the one a TICKET-mode install depends on, since `quorum_enabled()` excludes the
     ticketless watcher and its auto-merge branch. Don't move the primed write into
     `hold`/`note_human_label`: the

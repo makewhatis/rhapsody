@@ -72,6 +72,16 @@ pub struct HandoffPlan {
     /// the target state are all resolved before this struct exists — so the handoff itself never
     /// waits on the quorum and the quorum never reaches into loop-owned state.
     pub quorum: Option<crate::quorum::QuorumRequest>,
+    /// The un-primed human-hold refusal `plan_quorum` carried out, to RECORD on the project's
+    /// advisory surface once the review-state move lands (STUDIO-949 round 18). `None` whenever the
+    /// fan-out was not refused for that reason.
+    ///
+    /// Carried rather than recorded at plan time because `handle_handoff_run` runs BEFORE
+    /// [`handoff_run`](ControlHandle::handoff_run) attempts the move, and a move the tracker
+    /// refused is not a handoff: recording there named a review as permanently lost while the agent
+    /// was still retrying, and re-armed it on every attempt. It is recorded beside
+    /// [`quorum`](Self::quorum) it stands in for, under the same landed-move gate.
+    pub lost_review: Option<crate::quorum::DroppedQuorum>,
     /// The ticketless review INTRODUCTION to fire once the review-state move SUCCEEDS (STUDIO-720,
     /// slice 6; design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §15-a). `None`
     /// on every installation that has not opted into `review.mode: ticketless`, which is the
@@ -167,6 +177,10 @@ impl Orchestrator {
         let Some(re) = self.running.get(&id) else {
             return HandoffPlan::default();
         };
+        // The quorum decision, and the un-primed refusal inside it if that is why it refused. The
+        // refusal travels to `handoff_run` rather than being recorded here — see
+        // [`HandoffPlan::lost_review`].
+        let quorum_plan = self.plan_quorum(re);
         HandoffPlan {
             found: true,
             issue_id: id.clone(),
@@ -177,7 +191,8 @@ impl Orchestrator {
             // is the moment the daemon EXECUTES rather than merely infers, which is why the design
             // chose it over "PR opened" (the PR exists mid-run, long before it is reviewable) or
             // "review posted" (that is the quorum's output, not its input).
-            quorum: self.plan_quorum(re),
+            quorum: quorum_plan.request,
+            lost_review: quorum_plan.dropped,
             // The ticketless sibling of the line above, at the same moment and for the same
             // reason. The two are mutually exclusive by their gates, so at most one of them is
             // ever `Some` (STUDIO-720).
@@ -280,6 +295,16 @@ impl ControlHandle {
         // so it never blocks the agent's tool call, and a closed one only means the daemon is
         // already shutting down.
         if res.move_err.is_empty() {
+            // A quorum the un-primed fail-closed gate dropped is recorded on the project advisory
+            // ONLY now the move has landed (STUDIO-949 round 18): `plan_quorum` decided it on the
+            // control task, before this attempt, and a move the tracker refused is not a handoff —
+            // recording at plan time named a review as permanently lost while the agent was still
+            // retrying, and re-armed it on every attempt. `give_up`'s own doc gives the reason the
+            // advisory is more than the `WARN` line the gate already logged.
+            if let Some(dropped) = plan.lost_review.as_ref() {
+                self.warnings
+                    .record_lost_review(&dropped.group, &dropped.identifier, &dropped.why);
+            }
             self.request_quorum(plan.quorum);
             // The ticketless path's introduction, gated on the same landed move and for the same
             // reason: a move the tracker refused is not a handoff, so it introduces no pull request
@@ -414,7 +439,16 @@ mod tests {
     /// fake spawn that records each worker's cancel observer, and the lifetime ctx set. The loop is NOT
     /// started (the caller seeds state race-free first). Mirrors the stop harness (`newStopHarness`),
     /// with the review-state config the handoff resolution needs.
-    fn handoff_orch(tr: Arc<Fake>, review_states: &[&str]) -> (Orchestrator, Env) {
+    ///
+    /// `prime` seeds the human-hold ledger with one no-hold pass. Every handoff fixture primes, so the
+    /// un-primed fail-closed branch in `plan_quorum` (STUDIO-949 round 12) is exercised by its own
+    /// tests rather than being what every fixture happens to trip; the round-18 landed-gate tests pass
+    /// `false` on purpose.
+    fn handoff_orch_with(
+        tr: Arc<Fake>,
+        review_states: &[&str],
+        prime: bool,
+    ) -> (Orchestrator, Env) {
         let store: Arc<dyn Store + Send + Sync> =
             Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
         let mut eff = empty_effective(tr);
@@ -429,11 +463,9 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.set_store(Arc::clone(&store));
         o.eff = Some(eff);
-        // A handoff is reached from a run the daemon is running; on a real daemon a selection pass
-        // has therefore run and primed the human-hold ledger. Prime it here so the un-primed
-        // fail-closed branch in `plan_quorum` (STUDIO-949 round 12) is exercised by its own test
-        // rather than being what every handoff fixture happens to trip.
-        o.human_holds.begin_pass(true);
+        if prime {
+            o.human_holds.begin_pass(true);
+        }
         let cancelled = Arc::new(Mutex::new(HashMap::<String, CancelWait>::new()));
         let cancelled2 = Arc::clone(&cancelled);
         o.spawn = Some(Box::new(move |iss, _attempt, re| {
@@ -445,6 +477,11 @@ mod tests {
         let signal = CancelSignal::new();
         o.ctx = Some(signal.wait());
         (o, Env { cancelled, signal })
+    }
+
+    /// [`handoff_orch_with`], primed — the shape every ordinary handoff test wants.
+    fn handoff_orch(tr: Arc<Fake>, review_states: &[&str]) -> (Orchestrator, Env) {
+        handoff_orch_with(tr, review_states, true)
     }
 
     /// Snapshots the control handle and launches the loop, returning its task + the handle.
@@ -874,6 +911,136 @@ mod tests {
 
         signal.cancel();
         let _ = task.await;
+    }
+
+    /// Drives one handoff of an UN-PRIMED daemon — the config-gated-since-boot shape — for `iss`,
+    /// returning the loop task, handle, quorum receiver, run id and signal. The run is marked
+    /// `proj-a` so the advisory group is readable from the returned orchestrator's warnings.
+    fn unprimed_handoff_harness(
+        tr: Arc<Fake>,
+        iss: Issue,
+    ) -> (
+        tokio::task::JoinHandle<Orchestrator>,
+        ControlHandle,
+        tokio::sync::mpsc::UnboundedReceiver<crate::quorum::QuorumRequest>,
+        i64,
+        CancelSignal,
+    ) {
+        let (mut o, env) = handoff_orch_with(Arc::clone(&tr), &["In Review"], false);
+        o.teams = Some(quorum_teams(&["alice", "bob", "carol"]));
+        let rx = o.open_quorum_channel();
+        o.record_quorum_state(std::iter::once(&iss));
+        let id = iss.id.clone();
+        o.dispatch_issue(iss, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
+            re.project_slug = "proj-a".to_string();
+            re.project_group = "proj-a".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+        (task, handle, rx, run_id, env.signal)
+    }
+
+    // STUDIO-949 round 18 — the un-primed refusal records its advisory ONLY once the review-state
+    // move lands. `plan_quorum` runs at PLAN time, before `handoff_run` attempts the move, and a
+    // move the tracker refused is not a handoff (`handoff_run` fires the quorum only on a landed
+    // move), so recording at plan time named a review as permanently lost while the agent was still
+    // retrying — and re-armed the advisory on every attempt.
+    //
+    // MUTATION: record the refusal inside `plan_quorum` instead of at the landed gate and the
+    // `fails` arm reds (an advisory appears for a move that never landed); drop the landed gate
+    // around the record here and the same arm reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unprimed_refusal_is_recorded_only_once_the_move_lands() {
+        for fails in [false, true] {
+            let mut fake = Fake::new();
+            if fails {
+                fake.move_err = Some(TrackerError::Other("linear_move_rejected: nope".into()));
+            }
+            let tr = Arc::new(fake);
+            let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+            let (task, handle, mut rx, run_id, signal) = unprimed_handoff_harness(tr, parent);
+
+            let res = handle
+                .handoff_run(CancelWait::default(), run_id)
+                .await
+                .expect("handoff_run");
+            assert_eq!(res.move_err.is_empty(), !fails, "move result: {res:?}");
+            assert!(
+                rx.try_recv().is_err(),
+                "the un-primed refusal fans nothing out"
+            );
+
+            signal.cancel();
+            let o = task.await.expect("loop task");
+            let advisories = o.warnings.merged_for("proj-a");
+            assert_eq!(
+                advisories.iter().any(|l| l.contains("MT-1")),
+                !fails,
+                "recorded only when the move landed (fails={fails}): {advisories:?}"
+            );
+        }
+    }
+
+    // STUDIO-949 round 18 — the advisory is keyed by ticket, so the un-primed refusal re-firing on
+    // every handoff attempt for one ticket refreshes one line instead of spending the whole
+    // five-slot cap on it and evicting the group's other lost reviews.
+    //
+    // MUTATION: push instead of refresh in `WarningsState::record_lost_review` and this reds (six
+    // calls produce five lines).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_unprimed_handoffs_keep_one_advisory_line() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        let (task, handle, mut rx, run_id, signal) = unprimed_handoff_harness(tr, parent);
+
+        for _ in 0..6 {
+            handle
+                .handoff_run(CancelWait::default(), run_id)
+                .await
+                .expect("handoff_run");
+        }
+        assert!(rx.try_recv().is_err(), "nothing fans out while un-primed");
+
+        signal.cancel();
+        let o = task.await.expect("loop task");
+        let lines: Vec<_> = o
+            .warnings
+            .merged_for("proj-a")
+            .into_iter()
+            .filter(|l| l.contains("MT-1"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line per ticket, not per attempt: {lines:?}"
+        );
+    }
+
+    // STUDIO-949 round 18 — a team-less ticket has no review to lose, primed or not, so the
+    // un-primed refusal sits BELOW the team-id refusal and records no advisory for it. The other
+    // order would claim a review was dropped, and advise a re-summon that could fix nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unprimed_teamless_handoff_records_no_advisory() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", ""); // no team
+        let (task, handle, mut rx, run_id, signal) = unprimed_handoff_harness(tr, parent);
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(rx.try_recv().is_err(), "no team ⇒ no fan-out");
+
+        signal.cancel();
+        let o = task.await.expect("loop task");
+        assert!(
+            o.warnings.merged_for("proj-a").is_empty(),
+            "a team-less ticket was never reviewable, so no review was lost: {:?}",
+            o.warnings.merged_for("proj-a")
+        );
     }
 
     // The acceptance criterion for the default installation: quorum OFF (and Teams off) means the

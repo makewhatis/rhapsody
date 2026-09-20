@@ -318,6 +318,36 @@ pub struct QuorumRequest {
     pub summon_token: String,
 }
 
+/// A review fan-out the un-primed human-hold gate REFUSED, carried to the handoff so the advisory
+/// is recorded only once the review-state move actually LANDS (STUDIO-949 round 18).
+///
+/// Recording it at PLAN time — inside `plan_quorum` — named a review
+/// as permanently lost while the agent was still retrying the handoff, and a `move_err` handoff is
+/// not a handoff at all (`handoff_run` fires the quorum only on a move that landed). So the refusal
+/// travels on [`HandoffPlan`](crate::handoff::HandoffPlan) and the record happens beside the
+/// fan-out it stands in for.
+#[derive(Debug, Clone)]
+pub struct DroppedQuorum {
+    /// The project group the advisory lands on (`quorum_warning_group`), resolved on the control
+    /// task where `eff` lives.
+    pub group: String,
+    /// The parent ticket whose round will have no reviewer.
+    pub identifier: String,
+    /// Why it will not be delivered, quoted into the advisory.
+    pub why: String,
+}
+
+/// The outcome of `plan_quorum`: the fan-out to fire, if any, and the un-primed refusal to RECORD
+/// if the handoff carrying it lands. `Default` is "no fan-out, nothing dropped" — every ordinary
+/// refusal.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QuorumPlan {
+    /// The fan-out to hand the off-loop task once the review-state move succeeds.
+    pub request: Option<QuorumRequest>,
+    /// The un-primed refusal to record on the project advisory once the move succeeds.
+    pub dropped: Option<DroppedQuorum>,
+}
+
 /// The live tracker one fan-out runs against, read fresh per request so a hot-reloaded tracker is
 /// honoured — [`crate::triage::TriageTarget`]'s shape and its reason.
 pub struct QuorumTarget {
@@ -1472,9 +1502,13 @@ impl Orchestrator {
         self.quorum_facts = facts;
     }
 
-    /// Builds the fan-out plan for a handoff, or `None` when this handoff is not one the quorum
-    /// fires on. Runs ON the control task, and every gate here is a comparison over data already in
-    /// memory — no tracker call, no `.await`, nothing that could stall a tick.
+    /// Builds the fan-out plan for a handoff when the quorum fires on it; [`QuorumPlan::default`]
+    /// (no request, nothing dropped) for every ordinary refusal. Runs ON the control task, and every
+    /// gate here is a comparison over data already in memory — no tracker call, no `.await`, nothing
+    /// that could stall a tick.
+    ///
+    /// The one non-default refusal is the un-primed human-hold gate, which carries a
+    /// [`DroppedQuorum`] on [`QuorumPlan::dropped`] for the handoff to record once its move lands.
     ///
     /// The gates, in the order §0.12 states them:
     ///
@@ -1496,12 +1530,9 @@ impl Orchestrator {
     ///   [`fan_out`]'s, since the head is GitHub's answer and not this task's. The label is still
     ///   WRITTEN — see [`QUORUM_REQUESTED_LABEL`] — and a re-handoff now reaches the off-loop task,
     ///   which costs one `gh pr list` and, at an unchanged head, still fans out nothing.
-    pub(crate) fn plan_quorum(
-        &self,
-        re: &crate::orchestrator::RunningEntry,
-    ) -> Option<QuorumRequest> {
+    pub(crate) fn plan_quorum(&self, re: &crate::orchestrator::RunningEntry) -> QuorumPlan {
         if !self.quorum_enabled() || re.identity.is_empty() {
-            return None;
+            return QuorumPlan::default();
         }
         // A `rhapsody:human` parent is refused here too (STUDIO-949 round 7). This is a DISPATCH
         // path — the fan-out mints review tickets and wakes reviewers — and it does not go through
@@ -1528,7 +1559,28 @@ impl Orchestrator {
                 issue = %re.issue.identifier,
                 "teams quorum: the handed-off ticket is held for a human; no review is requested"
             );
-            return None;
+            return QuorumPlan::default();
+        }
+        // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
+        // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
+        // and, because the parent would then stay unmarked, fail again on the next handoff, and the
+        // next. Refusing here turns a permanent, recurring "REVIEW QUORUM ABANDONED" room post into
+        // one debug line. Triage drops team-less tickets for the same reason, before spending a
+        // model turn on them.
+        //
+        // Deliberately ABOVE the un-primed branch below (STUDIO-949 round 18): a team-less ticket
+        // was never reviewable, primed or not, so the un-primed refusal's "a review will never be
+        // delivered" advisory would be false for it — there was no review to lose, and the
+        // re-summon advice would fix nothing. The structural refusal first keeps the advisory
+        // meaning what it says. The off-loop outcomes (`NoReviewers`, `NoPullRequest`) cannot be
+        // ordered against it here: neither is known until the quorum task resolves the PR.
+        if re.issue.team_id.is_empty() {
+            tracing::debug!(
+                issue = %re.issue.identifier,
+                "teams quorum: the handed-off ticket has no team id, so no review ticket could be \
+                 created in it; nothing is requested"
+            );
+            return QuorumPlan::default();
         }
         // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
         // round 11): on a daemon held since boot no selection pass has ever run, so `labelled` is
@@ -1556,20 +1608,27 @@ impl Orchestrator {
         //
         // This refusal DROPS the decision, and unlike the watcher's round and auto-merge gates it is
         // NOT re-offered: the handoff has already landed, the run winds down, and `request_quorum` is
-        // the only feeder of the fan-out. So it is BOTH logged at `warn!`, naming the ticket, and
-        // recorded on the project's advisory surface (`record_lost_review`) — exactly the two things
-        // `give_up` does for a fan-out it abandoned, and for the reason its own doc gives: a `WARN`
-        // line alone is not enough, because the operator this branch is written for (config
-        // validation failing since boot) is the one most likely to be looking at the console and
-        // least likely to be reading `WARN` lines. `publish_snapshot` runs ABOVE the `validate()`
-        // early return, so that advisory reaches the console even while the dispatch half is dark.
-        // A one-shot, unrecoverable refusal filed below both, at `debug!` and nowhere else, is a
-        // review lost in silence — which is the defect this branch was fixed for.
+        // the only feeder of the fan-out. So the refusal is BOTH logged at `warn!`, naming the ticket,
+        // and CARRIED on the plan as a [`DroppedQuorum`] so the handoff records it on the project's
+        // advisory surface (`record_lost_review`) — exactly the two things `give_up` does for a
+        // fan-out it abandoned, and for the reason its own doc gives: a `WARN` line alone is not
+        // enough, because the operator this branch is written for (config validation failing since
+        // boot) is the one most likely to be looking at the console and least likely to be reading
+        // `WARN` lines. `publish_snapshot` runs ABOVE the `validate()` early return, so that advisory
+        // reaches the console even while the dispatch half is dark.
+        //
+        // The record is deferred to the handoff's landed-move gate rather than done here (STUDIO-949
+        // round 18): `plan_quorum` runs at PLAN time, BEFORE `handoff_run` attempts the review-state
+        // move, and a move the tracker refused is not a handoff — recording here named a review as
+        // permanently lost while the agent was still retrying, and re-armed it on every attempt. The
+        // `warn!` stays at decision time because that is when the gate decided.
         //
         // MUTATION: drop this branch and
         // `an_unprimed_hold_ledger_refuses_a_quorum_fan_out` reds (the un-primed daemon fans out);
-        // demote the log below `warn!` or delete the `record_lost_review` call and the same test
-        // reds on the level assertion or the advisory assertion respectively.
+        // demote the log below `warn!` and the same test reds on the level assertion; stop carrying
+        // the [`DroppedQuorum`] and
+        // `handoff::tests::an_unprimed_refusal_is_recorded_only_once_the_move_lands` reds; move the
+        // record back here (out of the landed gate) and the same test reds the other way.
         if !ledger_primed {
             tracing::warn!(
                 issue = %re.issue.identifier,
@@ -1577,28 +1636,20 @@ impl Orchestrator {
                  is unknown; no review is requested, so this handoff's review is dropped. Re-summon \
                  the ticket once the daemon is healthy if the review is still wanted."
             );
-            self.warnings.record_lost_review(
-                &self.quorum_warning_group(re),
-                &re.issue.identifier,
-                "no selection pass has read the board, so the human-hold label set was unknown",
-            );
-            return None;
+            return QuorumPlan {
+                request: None,
+                dropped: Some(DroppedQuorum {
+                    group: self.quorum_warning_group(re),
+                    identifier: re.issue.identifier.clone(),
+                    why: "no selection pass has read the board, so the human-hold label set was \
+                          unknown"
+                        .to_string(),
+                }),
+            };
         }
-        // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
-        // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
-        // and, because the parent would then stay unmarked, fail again on the next handoff, and the
-        // next. Refusing here turns a permanent, recurring "REVIEW QUORUM ABANDONED" room post into
-        // one debug line. Triage drops team-less tickets for the same reason, before spending a
-        // model turn on them.
-        if re.issue.team_id.is_empty() {
-            tracing::debug!(
-                issue = %re.issue.identifier,
-                "teams quorum: the handed-off ticket has no team id, so no review ticket could be \
-                 created in it; nothing is requested"
-            );
-            return None;
-        }
-        let teams = self.teams.as_ref()?;
+        let Some(teams) = self.teams.as_ref() else {
+            return QuorumPlan::default();
+        };
         let facts = self.quorum_facts.get(&re.issue.id);
         // The Linear GitHub attachment when there is one, and NOT a gate (STUDIO-674): an
         // installation whose Linear↔GitHub link never materializes holds `attachments: []` on every
@@ -1622,35 +1673,38 @@ impl Orchestrator {
         let (pr_owner, pr_repo) = crate::ghsummons::parse_repo(&repo_url).unwrap_or_default();
         // Decided before the struct literal moves `pr_owner`/`pr_repo` into it (STUDIO-875).
         let link = crate::prlink::pr_link_target(&re.issue, &pr_owner, &pr_repo);
-        Some(QuorumRequest {
-            parent_issue_id: re.issue.id.clone(),
-            parent_team_id: re.issue.team_id.clone(),
-            parent_identifier: re.issue.identifier.clone(),
-            parent_title: re.issue.title.clone(),
-            // The owning project, so the off-loop task creates the review ticket through THAT
-            // project's slug-bound tracker (STUDIO-677). Empty on the legacy single-project path,
-            // which is the account tracker's own slug and handled as such.
-            parent_project_slug: re.project_slug.clone(),
-            parent_project_group: self.quorum_warning_group(re),
-            pr_url,
-            // Derived from config alone, and carried even when the attachment already won so the
-            // request's shape never depends on which path filled the URL. `symphony/<key>` is the
-            // branch the run's worktree was created on (`rhapsody_workspace::Manager::ensure_*`), a
-            // frozen cross-process contract; `project_repo` is the remote it was pushed to.
-            pr_owner,
-            pr_repo,
-            pr_head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
-            link,
-            author: re.identity.clone(),
-            reviewers: select_reviewers(
-                teams,
-                &re.identity,
-                &self.quorum_load,
-                &self.reviewer_exclusions(teams),
-            ),
-            state_name: self.quorum_create_state(&re.project_slug),
-            summon_token: self.quorum_summon_token(),
-        })
+        QuorumPlan {
+            request: Some(QuorumRequest {
+                parent_issue_id: re.issue.id.clone(),
+                parent_team_id: re.issue.team_id.clone(),
+                parent_identifier: re.issue.identifier.clone(),
+                parent_title: re.issue.title.clone(),
+                // The owning project, so the off-loop task creates the review ticket through THAT
+                // project's slug-bound tracker (STUDIO-677). Empty on the legacy single-project path,
+                // which is the account tracker's own slug and handled as such.
+                parent_project_slug: re.project_slug.clone(),
+                parent_project_group: self.quorum_warning_group(re),
+                pr_url,
+                // Derived from config alone, and carried even when the attachment already won so the
+                // request's shape never depends on which path filled the URL. `symphony/<key>` is the
+                // branch the run's worktree was created on (`rhapsody_workspace::Manager::ensure_*`), a
+                // frozen cross-process contract; `project_repo` is the remote it was pushed to.
+                pr_owner,
+                pr_repo,
+                pr_head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
+                link,
+                author: re.identity.clone(),
+                reviewers: select_reviewers(
+                    teams,
+                    &re.identity,
+                    &self.quorum_load,
+                    &self.reviewer_exclusions(teams),
+                ),
+                state_name: self.quorum_create_state(&re.project_slug),
+                summon_token: self.quorum_summon_token(),
+            }),
+            dropped: None,
+        }
     }
 
     /// The project GROUP a fan-out this daemon gives up on is reported against (STUDIO-822), so the
@@ -3169,7 +3223,7 @@ mod tests {
 
             assert_eq!(o.quorum_enabled(), want_plan, "mode={mode:?}");
             assert_eq!(
-                o.plan_quorum(&re).is_some(),
+                o.plan_quorum(&re).request.is_some(),
                 want_plan,
                 "the ticket fan-out under mode={mode:?}"
             );
@@ -3368,6 +3422,7 @@ mod tests {
         o.human_holds.begin_pass(true);
         let req = o
             .plan_quorum(&running_entry(marked_parent(), "alice"))
+            .request
             .expect("a parent already marked must still plan a fan-out");
 
         let (tr, src) = run_handoffs(vec![req.clone(), req], &["head-a", "head-b"]).await;
@@ -3405,6 +3460,7 @@ mod tests {
         o.human_holds.begin_pass(true);
         let req = o
             .plan_quorum(&running_entry(marked_parent(), "alice"))
+            .request
             .expect("planned");
 
         let (tr, src) = run_handoffs(vec![req.clone(), req], &["head-a"]).await;
@@ -3464,6 +3520,7 @@ mod tests {
         });
         assert!(
             o.plan_quorum(&running_entry(marked_parent(), "alice"))
+                .request
                 .is_none(),
             "a parent in the current hold set must not fan out a review"
         );
@@ -3479,6 +3536,7 @@ mod tests {
         o.human_holds.begin_pass(true);
         assert!(
             o.plan_quorum(&running_entry(held_parent, "alice"))
+                .request
                 .is_none(),
             "a snapshot-labelled parent must not fan out a review"
         );
@@ -3532,7 +3590,7 @@ mod tests {
         // refusal below is the label's work.
         let _ = o.select_dispatch_with_reopens(vec![marked_parent()]);
         assert!(
-            o.plan_quorum(&re).is_some(),
+            o.plan_quorum(&re).request.is_some(),
             "the fixture is otherwise live: an unlabelled parent fans out"
         );
 
@@ -3540,7 +3598,7 @@ mod tests {
         let (_active, _reopen, _) = o.select_dispatch_with_reopens(vec![current]);
         // ...and the run's handoff, whose snapshot predates it, must not fan out.
         assert!(
-            o.plan_quorum(&re).is_none(),
+            o.plan_quorum(&re).request.is_none(),
             "a label added while the run was live must prevent its handoff from fanning out a review"
         );
     }
@@ -3559,17 +3617,20 @@ mod tests {
     //
     // Unlike the watcher's round and auto-merge gates, this refusal is NOT re-offered: the handoff has
     // landed, the run winds down, and nothing else feeds the fan-out. The dropped review must
-    // therefore be LOUD, so the refusal is `warn!` naming the ticket.
+    // therefore be LOUD, so the refusal is `warn!` naming the ticket AND carries a `DroppedQuorum`
+    // for the handoff to record on the project advisory once its move lands (STUDIO-949 round 18).
+    // The recording itself is pinned where it happens —
+    // `handoff::tests::an_unprimed_refusal_is_recorded_only_once_the_move_lands`.
     //
     // MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `plan_quorum` and this
     // reds (the un-primed daemon plans a fan-out); demote the log below `warn!` and the level
-    // assertion reds; delete the `record_lost_review` call and the advisory assertion reds.
+    // assertion reds; stop carrying the `DroppedQuorum` and the drop assertion below reds.
     #[test]
     fn an_unprimed_hold_ledger_refuses_a_quorum_fan_out() {
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
         let mut re = running_entry(marked_parent(), "alice");
-        // The group the advisory lands on, so the assertion below can read it back.
+        // The group the advisory lands on, so the drop assertion below can read it back.
         re.project_group = "proj-a".to_string();
 
         // No selection pass has run: the ledger's label set is not an answer, so the fan-out is
@@ -3577,7 +3638,7 @@ mod tests {
         assert!(!o.human_holds.labelled_and_primed().1);
         let (planned, events) = capture_events(|| o.plan_quorum(&re));
         assert!(
-            planned.is_none(),
+            planned.request.is_none(),
             "an un-primed ledger must fail closed rather than fan out a review it cannot prove unheld"
         );
         // ...and the dropped, unrecoverable decision is logged at WARN, naming the ticket, so it can
@@ -3594,22 +3655,26 @@ mod tests {
             "a one-shot, unrecoverable refusal must not be filed below WARN"
         );
         assert_eq!(warned.fields.get("issue").map(String::as_str), Some("MT-1"));
-        // ...and it is recorded on a surface an operator actually looks at, exactly as `give_up`
-        // does for an exhausted fan-out: a `WARN` alone is the state STUDIO-822 decided was not
-        // enough for a strictly narrower loss. `publish_snapshot` runs ABOVE the `validate()` return,
-        // so on a config-gated-since-boot daemon this advisory reaches the console while dispatch is
-        // dark — the one surface that daemon's operator has.
-        let advisories = o.warnings.merged_for("proj-a");
+        // ...and the refusal is CARRIED so the handoff can record it on a surface an operator
+        // actually looks at, exactly as `give_up` does for an exhausted fan-out: a `WARN` alone is
+        // the state STUDIO-822 decided was not enough for a strictly narrower loss. It is not
+        // recorded HERE — `plan_quorum` runs before the move, and a refused move is not a handoff.
+        let dropped = planned
+            .dropped
+            .expect("the un-primed refusal must carry the advisory to the handoff");
+        assert_eq!(dropped.group, "proj-a");
+        assert_eq!(dropped.identifier, "MT-1");
         assert!(
-            advisories.iter().any(|l| l.contains("MT-1")),
-            "the un-primed refusal must record a lost-review advisory: {advisories:?}"
+            dropped.why.contains("no selection pass has read the board"),
+            "the advisory names the cause: {}",
+            dropped.why
         );
 
         // ...and once a pass has looked the SAME unlabelled parent fans out, so the refusal above is
         // the missing pass and not some unrelated gate.
         o.human_holds.begin_pass(true);
         assert!(
-            o.plan_quorum(&re).is_some(),
+            o.plan_quorum(&re).request.is_some(),
             "a primed daemon with no hold plans the fan-out exactly as before"
         );
     }

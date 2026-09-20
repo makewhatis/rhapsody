@@ -1,7 +1,7 @@
 //! warnings — parity port of Go `internal/orchestrator/warnings.go` (the two per-project advisory
 //! producers surfaced on `GET /api/v1/projects`), plus the Rhapsody-only producers added since:
 //! the candidate-fetch-failure streak (STUDIO-406), the GitHub-summons enrichment-deferred streak
-//! (STUDIO-811), and the abandoned review fan-out (STUDIO-822).
+//! (STUDIO-811), and the lost review fan-out (STUDIO-822, plus STUDIO-949's un-primed refusal).
 //!
 //! The two PORTED producers have DIFFERENT trust domains, kept in separate maps so each refreshes
 //! independently and merges at read ([`WarningsState::merged_for`]):
@@ -54,12 +54,15 @@ pub(crate) const FETCH_FAILURE_WARN_AFTER: u32 = 3;
 /// which is also what makes the advisory stable on the console instead of flapping between rows.
 pub(crate) const ENRICH_DEFERRED_WARN_AFTER: u32 = 3;
 
-/// How many ABANDONED review fan-outs one project group keeps in its advisory (STUDIO-822). The
-/// most recent this many; an older one is dropped to make room.
+/// How many lost review fan-outs one project group keeps in its advisory (STUDIO-822; STUDIO-949).
+/// The most recent this many DISTINCT tickets; an older one is dropped to make room.
 ///
-/// Bounded because the list is never cleared automatically and a daemon that cannot reach Linear
-/// for an hour would otherwise grow one entry per handoff. Five is enough for an operator to see
-/// that it is happening repeatedly, which is the only thing more than one entry tells them.
+/// Bounded because nothing clears it automatically. Keyed by TICKET since STUDIO-949, like
+/// [`ORPHANED_REVIEW_WARN_CAP`]'s map and for its reason: `give_up`'s abandoned fan-outs were
+/// distinct events after a full retry ladder, but `plan_quorum`'s un-primed refusal fires on every
+/// handoff attempt for the whole life of a config-gated daemon, so an append-only list let one
+/// ticket's repeats evict every other lost review in the group. One ticket is one line, refreshed
+/// rather than repeated; five distinct ones is already an installation-wide fault.
 pub(crate) const LOST_REVIEW_WARN_CAP: usize = 5;
 
 /// How many orphaned reviews one project's advisory names (STUDIO-838).
@@ -125,9 +128,12 @@ struct WarningMaps {
     /// for want of the poll path's per-tick enrichment budget. Recorded directly by the poll loop,
     /// exactly as `fetch` is, and for the same reason it carries no generation guard.
     enrich: HashMap<String, EnrichDeferred>,
-    /// Producer 5 (STUDIO-822) — the review fan-outs this daemon ATTEMPTED, retried and finally
-    /// gave up on, per project group. Recorded directly by the off-loop quorum task, so it carries
-    /// no generation guard for `fetch`'s reason.
+    /// Producer 5 (STUDIO-822; STUDIO-949 round 18) — the review fan-outs that will never be
+    /// delivered, per project group. TWO producers write it on TWO tasks: the off-loop quorum
+    /// task's `give_up`, for a fan-out it retried to exhaustion, and the handoff's landed-move gate,
+    /// for the un-primed refusal `plan_quorum` carried in on the control task. It carries no
+    /// generation guard for `fetch`'s reason — a slow resolver pass cannot clobber it, because
+    /// nothing here recomputes it wholesale.
     ///
     /// **Never cleared by a later success**, unlike every other producer here, and that is the
     /// point. The others describe a live condition that self-heals: a project whose candidate fetch
@@ -136,14 +142,18 @@ struct WarningMaps {
     /// nonetheless report as reviewed — and clearing it on the next unrelated handoff is exactly
     /// how it stayed invisible. It is capped instead ([`LOST_REVIEW_WARN_CAP`]) and a restart
     /// forgets it, which is the operator saying they have seen it.
+    ///
+    /// **Keyed by TICKET** since STUDIO-949 round 18, like `orphaned` below: `plan_quorum`'s refusal
+    /// can repeat on every handoff attempt, so re-recording one ticket refreshes its line rather
+    /// than pushing a second, and one ticket's repeats cannot evict the group's other lost reviews.
     lost_review: HashMap<String, Vec<LostReview>>,
     /// Producer 6 (STUDIO-838) — the pull requests this daemon can see are parked in a review state
     /// with NO watch row and is not allowed to adopt, per project group. Recorded directly by the
     /// control task's adoption sweep, so it carries no generation guard for `fetch`'s reason.
     ///
-    /// **Keyed by TICKET**, unlike `lost_review`'s append-only list, because the sweep re-observes
-    /// the same orphan on every poll tick: a list would grow one entry per tick per orphan. One
-    /// ticket is one line, and re-observing it refreshes the reason rather than adding a line.
+    /// **Keyed by TICKET**, as `lost_review` now is too, because the sweep re-observes the same
+    /// orphan on every poll tick: a list would grow one entry per tick per orphan. One ticket is
+    /// one line, and re-observing it refreshes the reason rather than adding a line.
     ///
     /// **Never cleared by a later success**, for `lost_review`'s reason and one of its own: the
     /// condition it describes is a pull request sitting unreviewed, and the only thing that makes
@@ -161,12 +171,15 @@ struct WarningMaps {
 #[derive(Debug, Clone, Default)]
 struct OrphanedReviews(Vec<(String, String)>);
 
-/// One review fan-out this daemon gave up on (STUDIO-822).
+/// One review fan-out that will never be delivered (STUDIO-822; STUDIO-949) — either abandoned
+/// after every retry failed, or refused before it started because no selection pass had read the
+/// board. Keyed by [`identifier`](Self::identifier) so a repeat refreshes it in place.
 #[derive(Debug, Clone)]
 struct LostReview {
     /// The PARENT ticket whose round has no reviewer — the thing an operator has to act on.
     identifier: String,
-    /// Why it failed, quoted into the advisory so the cause is visible without the log.
+    /// Why it will not be delivered, quoted into the advisory so the cause is visible without the
+    /// log.
     why: String,
 }
 
@@ -286,8 +299,15 @@ impl WarningsState {
     /// Records a review fan-out that will never be delivered, so the round that will never be
     /// reviewed is visible somewhere an operator looks instead of only in a `WARN` line. Two
     /// producers: the off-loop quorum task's `give_up`, for a fan-out it retried to exhaustion
-    /// (STUDIO-822), and `plan_quorum`'s un-primed fail-closed refusal, which drops the decision
-    /// before anything is created (STUDIO-949 round 16) — the advisory wording covers both.
+    /// (STUDIO-822), and the handoff's landed-move gate, for `plan_quorum`'s un-primed fail-closed
+    /// refusal, which drops the decision before anything is created (STUDIO-949 round 16) — the
+    /// advisory wording covers both.
+    ///
+    /// **Keyed by ticket, refreshed in place**, unlike an append-only list: `plan_quorum`'s refusal
+    /// re-fires on every handoff attempt for the whole life of a gated daemon, so appending would
+    /// let one ticket's repeats spend the whole five-slot cap and evict the group's other lost
+    /// reviews (STUDIO-949 round 18). `give_up`'s distinct abandoned events keep their own lines;
+    /// a repeat of the SAME ticket refreshes its reason and keeps its place.
     ///
     /// A LOCAL surface deliberately: the fan-out fails because the tracker is unreachable, so a
     /// comment on the ticket — the other obvious place to put it — is the one write guaranteed to
@@ -295,11 +315,16 @@ impl WarningsState {
     pub(crate) fn record_lost_review(&self, group: &str, identifier: &str, why: &str) {
         let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
         let e = m.lost_review.entry(group.to_string()).or_default();
-        e.push(LostReview {
-            identifier: identifier.to_string(),
-            why: why.to_string(),
-        });
-        // Oldest first out, so the advisory always names the most recent failures.
+        match e.iter_mut().find(|l| l.identifier == identifier) {
+            // Re-observed: refresh the reason and keep its place, so a per-attempt refusal neither
+            // grows the advisory nor churns its order.
+            Some(l) => l.why = why.to_string(),
+            None => e.push(LostReview {
+                identifier: identifier.to_string(),
+                why: why.to_string(),
+            }),
+        }
+        // Oldest first out, so the advisory always names the most recent distinct failures.
         while e.len() > LOST_REVIEW_WARN_CAP {
             e.remove(0);
         }
@@ -338,7 +363,8 @@ impl WarningsState {
 
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
     /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
-    /// enrichment-deferred warning (STUDIO-811), then the abandoned review fan-outs (STUDIO-822).
+    /// enrichment-deferred warning (STUDIO-811), then the lost review fan-outs (STUDIO-822;
+    /// STUDIO-949).
     /// A fresh slice so callers never alias the stored maps. Mirrors Go `projectWarningsFor`, plus
     /// the Rhapsody-only producers.
     pub(crate) fn merged_for(&self, group: &str) -> Vec<String> {
@@ -371,8 +397,9 @@ impl WarningsState {
             ));
         }
         // Appended after the enrichment producer, for the same golden-ordering reason (STUDIO-822).
-        // One line per abandoned fan-out rather than one summary line: the identifier is the whole
-        // actionable content, and collapsing them would name none of them.
+        // One line per lost fan-out rather than one summary line: the identifier is the whole
+        // actionable content, and collapsing them would name none of them. Keyed by ticket since
+        // STUDIO-949 round 18, so a ticket that repeats does not evict its neighbours.
         // The wording must fit BOTH producers: `give_up`'s exhausted retries and `plan_quorum`'s
         // un-primed fail-closed refusal, which drops the decision before anything is created. "will
         // never be delivered" is true of each; "abandoned after every retry failed" was only true of
@@ -1255,6 +1282,32 @@ mod tests {
             w.record_orphaned_review("proj-a", "STUDIO-836", "boom");
         }
         assert_eq!(w.merged_for("proj-a").len(), 1);
+    }
+
+    /// One ticket, one line, however many times it is recorded — STUDIO-949 round 18. `give_up`'s
+    /// abandoned fan-outs are distinct events, but `plan_quorum`'s un-primed refusal re-fires on
+    /// every handoff attempt for the whole life of a gated daemon, so an append-only list let one
+    /// ticket's repeats spend the whole five-slot cap and evict the group's other lost reviews.
+    #[test]
+    fn re_recording_a_lost_review_refreshes_it_in_place() {
+        let w = WarningsState::default();
+        // A genuinely abandoned review sits at the front...
+        w.record_lost_review("proj-a", "MT-1", "abandoned after every retry failed");
+        // ...then the un-primed refusal re-fires six times for ONE ticket, with a changed reason.
+        for _ in 0..6 {
+            w.record_lost_review("proj-a", "MT-2", "no selection pass has read the board");
+        }
+        let got = w.merged_for("proj-a");
+        assert_eq!(
+            got.len(),
+            2,
+            "one line per ticket, not per attempt: {got:?}"
+        );
+        assert!(
+            got[0].contains("MT-1"),
+            "and the earlier lost review is not evicted: {got:?}"
+        );
+        assert!(got[1].contains("MT-2") && got[1].contains("no selection pass has read the board"));
     }
 
     /// Bounded like its sibling, because nothing clears it automatically either, and the OLDEST go

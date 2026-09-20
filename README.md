@@ -1328,14 +1328,20 @@ a drained daemon, irreversibly, how a real review round is dispatched at its pul
 held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
 therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
 ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
-both are re-offered — the watcher asks again in 120s), the
-reconciliation sweep reports nothing — a false `review_divergence` WARN on the exact ticket the
-operator took over is the alarm that filter exists to prevent — and `plan_quorum` refuses the fan-out,
-logging at `WARN!`, naming the ticket and recording a lost-review advisory on the project's status
-surface (`record_lost_review`, as `give_up` does for an exhausted fan-out) because that refusal is
-**one-shot and unrecoverable**: the handoff has already landed, the run winds down, and
-`request_quorum` is the only feeder of the fan-out, so the review is dropped for good. The quorum is the one that matters most for a TICKET-mode
-install, because it is the only `labelled()` gate such an install runs: `quorum_enabled()` is
+both are re-offered — the watcher asks again in 120s), the reconciliation sweep reports nothing — a
+false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
+exists to prevent — and `plan_quorum` refuses the fan-out, logging at `warn!` and naming the ticket.
+That refusal is **one-shot and unrecoverable**: the handoff has already landed, the run winds down,
+and `request_quorum` is the only feeder of the fan-out, so the review is dropped for good. Because a
+`WARN` line alone is the state STUDIO-822 decided was not enough, the refusal also records a
+lost-review advisory on the project's status surface (`record_lost_review`, as `give_up` does for
+an exhausted fan-out) — but only once the review-state move it rides on has LANDED: `plan_quorum`
+runs at plan time, before the move is attempted, and a move the tracker refused is not a handoff.
+The advisory is keyed by ticket, so the refusal re-firing on every handoff attempt refreshes one
+line rather than letting one ticket's repeats evict the group's other lost reviews. A team-less
+ticket is refused above this branch — it was never reviewable, so no review was lost and no
+advisory is recorded. The quorum is the one that matters most for a TICKET-mode install, because
+it is the only `labelled()` gate such an install runs: `quorum_enabled()` is
 `teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
 auto-merge branch are simply absent there. Priming means a pass actually **read the WHOLE board**,
 not that a pass ran: the multi-project ladder is reached even when a project's candidate fetch
