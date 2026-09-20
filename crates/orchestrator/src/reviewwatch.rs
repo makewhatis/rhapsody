@@ -3643,6 +3643,16 @@ mod tests {
             "2020-01-01T01:00:00Z",
         );
 
+        // Pin the clock before the sweep so `recorded` is exactly `base`. Pinning it only for the
+        // advance below would leave `recorded` on the real clock, and the age at reconcile would be
+        // `worst_case - 1` PLUS whatever wall-clock elapsed between the sweep and the advance — so
+        // one real second of scheduling stall would red this test with the same
+        // `left: None / right: Some(4)` the TTL mutation produces, sending a maintainer after the
+        // constant. The pin costs the assertion nothing: the advance is still derived from the
+        // documented worst case.
+        let base = chrono::Utc::now();
+        o.now = Box::new(move || base);
+
         let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
         assert_eq!(report.deferred, 1);
 
@@ -3651,8 +3661,8 @@ mod tests {
         let worst_case = crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
             + crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
                 * crate::ghsummons::GH_EXEC_TIMEOUT.as_secs();
-        let later = chrono::Utc::now()
-            + chrono::Duration::seconds(i64::try_from(worst_case).expect("worst case") - 1);
+        let later =
+            base + chrono::Duration::seconds(i64::try_from(worst_case).expect("worst case") - 1);
         o.now = Box::new(move || later);
 
         o.reconcile_review_divergence();
