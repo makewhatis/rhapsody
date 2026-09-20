@@ -1022,8 +1022,8 @@ impl Orchestrator {
     /// this one guard's question ("may I forget the head I routed for?"), not a second
     /// classification of GitHub's vocabulary. [`crate::ghsummons::MergeStateResult`] is explicit
     /// that the vocabulary is open and has grown before, so an unrecognised value is neither the
-    /// conflict nor evidence that it resolved — it must forget nothing, exactly as
-    /// [`crate::ghsummons::MERGE_STATE_UNKNOWN`] does. The cost of a rename is at most
+    /// conflict nor evidence that it resolved — it must forget nothing, exactly as the unsettled
+    /// `UNKNOWN` (or, briefly, empty) read does. The cost of a rename is at most
     /// [`crate::reviewreconcile::RECONCILE_STALE_AFTER`] of sweep silence; the cost of the
     /// deny-list it replaces is re-summonsing an author on a vocabulary change.
     const SETTLED_NON_CONFLICT_MERGE_STATES: [&str; 6] = [
@@ -2589,36 +2589,53 @@ mod tests {
 
     /// A conflict that CLEARS forgets the head it routed for, so the record stops suppressing the
     /// reconciliation sweep and a fresh conflict (even at the same head) is news again.
+    ///
+    /// Every settled non-conflict the allow-list recognises is driven through the clear, because
+    /// the allow-list IS the load-bearing decision and it is data: a value dropped or misspelled
+    /// there must be caught here. Mutation check: shrink
+    /// `SETTLED_NON_CONFLICT_MERGE_STATES` to `["CLEAN"]` and each of the other five loop
+    /// iterations reds at the `contains_key` assertion.
     #[test]
     fn a_resolved_conflict_forgets_the_head_it_routed_for() {
         let (mut o, mut rx) =
             conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
 
-        assert_eq!(
-            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
-                .routed,
-            1
-        );
-        assert_eq!(
-            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "CLEAN")])
-                .routed,
-            0
-        );
-        assert!(
-            !o.conflict_routed.contains_key(&coord(12)),
-            "a resolved conflict must stop suppressing the sweep for this pull request"
-        );
-        assert_eq!(
-            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
-                .routed,
-            1
-        );
+        for settled in [
+            "BEHIND",
+            "BLOCKED",
+            "CLEAN",
+            "DRAFT",
+            "HAS_HOOKS",
+            "UNSTABLE",
+        ] {
+            // The conflict is present and routes back at this head…
+            assert_eq!(
+                o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                    .routed,
+                1,
+                "({settled:?}) the conflict must route back first"
+            );
+            // …then GitHub settles on a non-conflict, which must NOT route and must forget the head.
+            assert_eq!(
+                o.handle_review_sweep(&[open_conflicted(12, HEAD_A, settled)])
+                    .routed,
+                0,
+                "({settled:?}) is a settled non-conflict and is not a route-back"
+            );
+            assert!(
+                !o.conflict_routed.contains_key(&coord(12)),
+                "({settled:?}) is a settled non-conflict and must stop suppressing the sweep"
+            );
+        }
 
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
         }
-        assert_eq!(n, 2);
+        assert_eq!(
+            n, 6,
+            "one summons per conflict, and every settled value forgets it"
+        );
     }
 
     /// ⚠️ An UNSETTLED read between two DIRTY reads at one head must not re-route. GitHub recomputes
