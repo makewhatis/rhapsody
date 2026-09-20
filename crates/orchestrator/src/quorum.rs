@@ -1311,19 +1311,25 @@ impl Orchestrator {
         // path — the fan-out mints review tickets and wakes reviewers — and it does not go through
         // `eligible()`, so without this a held parent that HAD run (parked in review, then labelled)
         // still fanned out: the hold cannot reach the review ticket, which is NEW and unlabelled, and
-        // an agent is dispatched onto the held ticket's pull request through it. Read from the same
-        // current hold set the ticketless watcher's origin gate and the auto-merge gate read, because
-        // the run's own `issue` is the dispatch-time snapshot and cannot carry a label added while
-        // the run was active. The candidacy bound documented on
-        // [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger) applies to this reader as it does to
-        // those two: a ticket the candidate query no longer returns is not in this set.
+        // an agent is dispatched onto the held ticket's pull request through it.
+        //
+        // Two in-memory sources, because neither alone is enough on this path. The run's own `issue`
+        // is the direct evidence but is the dispatch-time snapshot, so it only sees a label that
+        // predates the dispatch. The `HumanHoldLedger`'s current set is the LIVE signal — the same
+        // one the ticketless watcher's origin gate and the auto-merge gate read — but it is built
+        // from the candidate fetch and is only populated for a ticket the ladders see as unworked.
+        // Reading both means a labelled parent is refused wherever either can see it; the residual
+        // bound (a label added mid-run to a ticket still claimed, before any pass has re-noted it)
+        // is the same candidacy bound documented on [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger).
         let held: HashSet<String> = self
             .human_holds
             .held()
             .into_iter()
             .map(|h| h.issue_identifier.to_ascii_lowercase())
             .collect();
-        if held.contains(&re.issue.identifier.to_ascii_lowercase()) {
+        if crate::teams::is_human(&re.issue)
+            || held.contains(&re.issue.identifier.to_ascii_lowercase())
+        {
             tracing::debug!(
                 issue = %re.issue.identifier,
                 "teams quorum: the handed-off ticket is held for a human; no review is requested"
@@ -2992,14 +2998,14 @@ mod tests {
     // STUDIO-949 round 7 — the TICKET-mode sibling of the ticketless watcher's held-origin gate.
     // A held parent that HAD run (parked in review, then labelled) must not fan out a review: the
     // fan-out mints a NEW, unlabelled review ticket and dispatches an agent at the held ticket's pull
-    // request, and the hold cannot reach that new ticket. `is_human` on `re.issue` cannot catch it —
-    // that issue is the dispatch-time snapshot, taken before the label was added — so the gate reads
-    // the current hold set, exactly as the watcher and the auto-merge gate do.
+    // request, and the hold cannot reach that new ticket. Two in-memory sources are read, because
+    // neither alone sees every shape (see the gate's own comment), so both are pinned here.
     //
-    // MUTATION: delete the held-identifier gate from `plan_quorum` and this reds (`plan_quorum`
+    // MUTATION: delete either half of the gate from `plan_quorum` and this reds (`plan_quorum`
     // returns `Some`, and `run_handoffs` would create a review ticket for the held parent).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_human_held_parent_does_not_fan_out_a_review() {
+        // (a) The hold is in the current set the selection ladders build — the live signal.
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
         o.human_holds.hold(crate::dispatch::HeldForHuman {
@@ -3010,7 +3016,21 @@ mod tests {
         assert!(
             o.plan_quorum(&running_entry(marked_parent(), "alice"))
                 .is_none(),
-            "a held parent must not fan out a review"
+            "a parent in the current hold set must not fan out a review"
+        );
+
+        // (b) The hold is on the run's own issue snapshot — the direct evidence the run carries.
+        let mut held_parent = marked_parent();
+        held_parent
+            .labels
+            .get_or_insert_with(Vec::new)
+            .push(crate::teams::HUMAN_LABEL.to_string());
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        o.record_quorum_state(std::iter::once(&held_parent));
+        assert!(
+            o.plan_quorum(&running_entry(held_parent, "alice"))
+                .is_none(),
+            "a snapshot-labelled parent must not fan out a review"
         );
     }
 
