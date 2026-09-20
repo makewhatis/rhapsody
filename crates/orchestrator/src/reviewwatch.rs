@@ -832,7 +832,29 @@ impl Orchestrator {
             }
         }
 
-        self.propose_auto_merge(&mine, pr, head, report);
+        // A `rhapsody:human` origin ticket must not have its pull request auto-merged either
+        // (STUDIO-949 round 5). The round gate above refuses to DISPATCH against a held ticket, but
+        // a pull request whose reviewers had already approved the current head when the label landed
+        // would still clear auto-merge here — and the merge then runs `plan_review_done` on the next
+        // tick and moves the ticket to `review.done_state`. Refusing the review round while MERGING
+        // the code and closing the ticket is the daemon finishing work the label says only a person
+        // can do, and the merge is irreversible. Read from the same current hold set as the round
+        // gate, and decided before the plan is formed so nothing is handed across the seam.
+        //
+        // MUTATION: delete this gate and
+        // `a_held_origin_ticket_holds_back_auto_merge` reds (a plan is proposed).
+        let held_origin = mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+        });
+        if held_origin {
+            tracing::debug!(
+                pr = %pr,
+                "auto-merge: the origin ticket is held for a human; not merging"
+            );
+        } else {
+            self.propose_auto_merge(&mine, pr, head, report);
+        }
     }
 
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
@@ -1732,6 +1754,42 @@ mod tests {
             }]
         );
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
+    }
+
+    /// STUDIO-949 round 5: an approved, at-head pull request whose ORIGIN ticket is held for a human
+    /// is not proposed for merge. The round gate refuses to dispatch a review against a held ticket;
+    /// without this one, a pull request approved before the label landed would still merge, and the
+    /// merge then moves the ticket to Done — the daemon finishing what only a person may do.
+    /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: the
+    /// identical fixture without the hold proposes the plan.
+    ///
+    /// MUTATION: delete the `held_origin` gate from `service_review_pr` and this reds.
+    #[test]
+    fn a_held_origin_ticket_holds_back_auto_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A)); // origin: `handoff:STUDIO-721`
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "STUDIO-721".to_string(),
+            title: "human work".to_string(),
+            project: String::new(),
+        });
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "a held ticket's pull request must not self-merge: {:?}",
+            report.merge
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — and the merge
+        // the reviewers already approved is proposed on the next tick.
+        o.human_holds.begin_pass();
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
+            1,
+            "once the hold is gone the approved merge is proposed"
+        );
     }
 
     /// ⚠️ The D5 invariant and the opt-in, at the one place it decides anything: the SAME approved,

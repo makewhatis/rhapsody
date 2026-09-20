@@ -1251,11 +1251,27 @@ otherwise reach an agent: the review-reopen ladder refuses it in `review_reopen_
 review-adoption sweep refuses it in `adopt_verdict`, an in-flight retry re-reads the ticket's current
 labels so a label added while it was backing off releases it, and the ticketless review watcher
 refuses to dispatch a round for a watch row whose origin ticket is currently held (the row is left
-armed, so a later label removal still gets the review it is owed). The reconciliation sweep is told
-the same state explicitly: a watch row whose origin ticket is held is dropped before the rules can
-date it, because a ticket labelled *after* it ran does have a row. The board reads a held ticket that
-has run as held too, independently of the historical run status, while the row stays openable on its
-real run.
+armed, so a later label removal still gets the review it is owed). A held origin ticket also holds
+back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
+would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
+finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
+explicitly: a watch row whose origin ticket is held is dropped before the rules can date it, because
+a ticket labelled *after* it ran does have a row. The board reads a held ticket that has run as held
+too, independently of the historical run status, and keeps it in the run's lane (Review, with a
+"held for a human" sub-label) while the row stays openable on its real run; the hold key, the board
+and the Now strip all count such a ticket once, in that lane.
+
+**How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
+dispatch is read from the candidate issue itself, so `eligible()` and the reopen ladder refuse it
+wherever the daemon can see the ticket, and a ticket that never becomes a candidate is never
+dispatched either. The watcher, adoption, reconciliation and auto-merge gates, and the console's
+`held_for_human` key, instead read dispatcher state built as the selection pass walks the candidate
+fetch (active ∪ review states, narrowed by `claim_mode`). Under `claim_mode: pool` the pool claim
+ASSIGNS the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query
+and its label stops reaching those readers; in assignee mode the same happens the moment the ticket
+is reassigned to the person taking it over. Those four readers are therefore best-effort off the
+candidate path rather than guarantees, and they say so here rather than implying the refusal holds
+while the daemon no longer owns the ticket.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
