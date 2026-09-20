@@ -66,6 +66,15 @@
 //! dispatch. The fresh answer is ADOPTED: refusing on a move would let a short-cycle author starve
 //! the review entirely, which is strictly worse than reviewing slightly-stale code.
 //!
+//! **Why two passes.** They do different jobs: the sweep's read CLASSIFIES — a merged, closed, gone
+//! or untrusted answer dispatches nothing and leaves the watch set, and only an OPEN one may be
+//! re-read — while the re-read PINS the head the dispatch records. One interleaved pass could do
+//! both from a single call, at N `gh` requests per tick instead of 2N, but it would fold away the
+//! sweep's own answer: the control task's retirement paths read that classification, and the
+//! re-read's FAILURE rule ("keep the observed answer") exists only because the two answers can
+//! disagree. Doubling the requests is a deliberate price for keeping classification and pinning on
+//! their own answers — not an oversight (STUDIO-953).
+//!
 //! **What this closes, and what it does not.** It closes the window between the batched
 //! observation and the dispatch — on this deployment that is the ~2.4 s the tick body spends on
 //! its serial lookups. It does NOT close the window that produced makewhatis/rhapsody#185: there
@@ -200,6 +209,17 @@ pub struct ReviewSweepReport {
     /// is not going to resolve itself. Always `<= deferred`.
     pub stalled: usize,
 }
+
+/// The carried-budget sentinel meaning "this hand-back reached no decision": it spent nothing and
+/// counted nothing, so the next hand-back's fresh count governs unchallenged (STUDIO-953).
+///
+/// `i64::MAX` rather than `0` because a hand-back that fails before the control task decides — a
+/// store read that errors, a dropped reply, a dead control channel — must not convert into a zero
+/// budget that retires every remaining observation of the tick. It never reaches the per-dispatch
+/// decrement: [`Orchestrator::handle_review_sweep_slots`] clamps any carry to that tick's fresh
+/// [`Orchestrator::review_dispatch_budget`] before spending it, so `MAX` only ever means "count
+/// afresh".
+const UNCAPPED_SLOTS: i64 = i64::MAX;
 
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
 /// the task must be testable without a control loop, and the seam is what lets a test assert on the
@@ -619,15 +639,27 @@ impl Orchestrator {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; this tick decides nothing");
-                return (report, slots.unwrap_or(0));
+                // This hand-back decides nothing, so it must SPEND nothing either: a carried budget
+                // stands, and with none carried the next hand-back counts its own. Returning `0`
+                // would convert one failed WAL read into a zero budget for every remaining
+                // observation of the tick (STUDIO-953).
+                return (report, slots.unwrap_or(UNCAPPED_SLOTS));
             }
         };
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
-        // tick would otherwise spawn twenty agents past a cap the operator set. Counted ONCE by the
-        // tick's first hand-back and spent down as reviews are dispatched, so it composes with the
-        // per-identity `max_concurrent` rather than replacing it.
-        let mut slots = slots.unwrap_or_else(|| self.review_dispatch_budget());
+        // tick would otherwise spawn twenty agents past a cap the operator set. TWO bounds compose
+        // here and both are load-bearing (STUDIO-953): the CARRIED leftover bounds REPLENISHMENT —
+        // a review worker that exits mid-tick cannot hand its slot to another round in the same
+        // tick — while a FRESH count bounds CONSUMPTION, because the control task can start an
+        // ordinary ticket run (`Event::Tick` → `on_tick`) between two hand-backs while the watcher
+        // sits in a blocking `gh` call, and a tick must not spend slots that no longer exist.
+        // Taking the smaller of the two keeps `running` at or below `max_concurrent` whichever
+        // direction moves; dropping either half is a regression.
+        let fresh_budget = self.review_dispatch_budget();
+        let mut slots = slots
+            .map(|left| left.min(fresh_budget))
+            .unwrap_or(fresh_budget);
         for obs in observed {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
@@ -813,8 +845,8 @@ impl Orchestrator {
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
-        // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly would
-        // go stale the moment one row is reassigned: the next row would still see the retired
+        // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly
+        // would go stale the moment one row is reassigned: the next row would still see the retired
         // reviewer as a peer and not see the substitute, and could hand that substitute a second
         // required review of the same pull request.
         let mut assigned: Vec<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
@@ -968,9 +1000,9 @@ impl Orchestrator {
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
     /// (STUDIO-874), appending the plan to `report` if they do.
     ///
-    /// Decided from `mine` — this hand-back's OPENING snapshot of this pull request's rows — for the
-    /// same reason the dispatch loop above is: it is the state the control task owns, and nothing
-    /// this function reads is written by the loop it follows. A row re-armed by
+    /// Decided from `mine` — this hand-back's OPENING snapshot of this pull request's rows — for
+    /// the same reason the dispatch loop above is: it is the state the control task owns, and
+    /// nothing this function reads is written by the loop it follows. A row re-armed by
     /// [`Self::handle_review_head_advanced`] moved to `requested`, which this gate refuses on
     /// EITHER reading; a row the loop dispatched is `in_flight` on either; and a row whose verdict
     /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
@@ -1250,12 +1282,18 @@ impl ControlHandle {
             })
             .is_err()
         {
-            return (ReviewSweepReport::default(), slots.unwrap_or(0));
+            return (
+                ReviewSweepReport::default(),
+                slots.unwrap_or(UNCAPPED_SLOTS),
+            );
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
-            r = rx => r.unwrap_or_default(),
-            _ = lifetime.cancelled() => (ReviewSweepReport::default(), slots.unwrap_or(0)),
+            // A dropped reply is a control task that never decided: like the failed send above, it
+            // spent nothing, so the carry stands and the next hand-back counts its own rather than
+            // inheriting a zero that would retire the rest of the tick (STUDIO-953).
+            r = rx => r.unwrap_or_else(|_| (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS))),
+            _ = lifetime.cancelled() => (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS)),
         }
     }
 }
@@ -3692,6 +3730,132 @@ mod tests {
         assert!(
             watch_row(&guard, 13, "bob").requested_sha.is_empty(),
             "the round past the spent budget must stay un-dispatched, re-considered next tick"
+        );
+    }
+
+    /// A sink running the real control decision and then simulating the control task starting an
+    /// unrelated TICKET run while the watcher sits in its blocking pre-dispatch `gh` read — the
+    /// opposite direction from [`WorkerExitSink`]. It starts exactly ONE such run, on the first
+    /// hand-back: a real control task starts no more once `running` is at its cap.
+    struct TicketStartSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        /// One message per hand-back, so a test can await the tick without busy-waiting (which
+        /// would stop tokio's paused clock from advancing to the watcher's poll interval).
+        handed: tokio::sync::mpsc::UnboundedSender<()>,
+        /// The most agents (reviews + the ticket run) ever live at once, read after each hand-back.
+        peak: Arc<Mutex<usize>>,
+        /// Reviews the control task dispatched across the tick.
+        dispatched: Arc<Mutex<usize>>,
+        started: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for TicketStartSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let mut orch = self.orch.lock().expect("orchestrator lock");
+            let (report, left) = orch.handle_review_sweep_slots(&observed, slots);
+            if self.started.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The control task started an ordinary ticket run while the watcher was blocked on
+                // `gh`, filling the last free slot. A later hand-back that keeps the carried budget
+                // would spend a slot this run already holds.
+                let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+                    id: "iss-ticket".to_string(),
+                    identifier: "STUDIO-999".to_string(),
+                    ..Default::default()
+                });
+                busy.identity = "carol".to_string();
+                orch.running.insert("iss-ticket".to_string(), busy);
+            }
+            let live = orch.running.len();
+            drop(orch);
+            let mut peak = self.peak.lock().expect("peak lock");
+            *peak = (*peak).max(live);
+            let _ = self.handed.send(());
+            *self.dispatched.lock().expect("dispatched lock") += report.dispatched;
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// The carried budget must compose with a FRESH count, not replace it (STUDIO-953, jimmy's
+    /// round-4 blocker). `max_concurrent = 2`; the first hand-back dispatches one review and the
+    /// control task then starts one ordinary ticket run, so `running` is at its cap. A later
+    /// hand-back must dispatch nothing: a budget counted before that run existed would spend a slot
+    /// that no longer exists and take `running` to 3. This is the START direction that
+    /// [`the_daemon_wide_cap_bounds_a_tick_of_single_observation_sweeps`] does not exercise — it
+    /// covers a worker EXITING mid-tick, which moves the budget the other way.
+    ///
+    /// Mutation: replace the `left.min(fresh_budget)` clamp in `handle_review_sweep_slots` with the
+    /// bare carry and this reds on peak 3 > 2.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_started_mid_tick_lowers_the_carried_review_budget() {
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "bob", "carol", "dave"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 2;
+        for n in 12..16 {
+            introduce(&o, row(n, "bob"));
+        }
+        let (handed, mut hand_backs) = tokio::sync::mpsc::unbounded_channel();
+        let peak = Arc::new(Mutex::new(0usize));
+        let total = Arc::new(Mutex::new(0usize));
+        let sink = Arc::new(TicketStartSink {
+            watched: (12..16).map(coord).collect(),
+            orch: Mutex::new(o),
+            handed,
+            peak: Arc::clone(&peak),
+            dispatched: Arc::clone(&total),
+            started: AtomicUsize::new(0),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        let whole_tick = async {
+            for _ in 0..4 {
+                if hand_backs.recv().await.is_none() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, whole_tick)
+            .await
+            .expect("the watcher never handed the whole tick back");
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        assert!(
+            *peak.lock().expect("peak lock") <= 2,
+            "a ticket run started mid-tick must lower the tick's remaining review budget, not be \
+             ignored: peak {} agents against max_concurrent 2",
+            *peak.lock().expect("peak lock")
+        );
+        assert_eq!(
+            *total.lock().expect("dispatched lock"),
+            1,
+            "only the first review fits before the ticket run fills the last slot"
+        );
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            watch_row(&guard, 12, "bob").requested_sha,
+            format!("{:040}", 12),
+            "the one dispatch the budget allowed is the first pull request"
+        );
+        assert!(
+            watch_row(&guard, 13, "bob").requested_sha.is_empty(),
+            "a head the budget can no longer afford must stay un-dispatched, re-considered next tick"
         );
     }
 }
