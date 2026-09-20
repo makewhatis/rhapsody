@@ -255,7 +255,11 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     // Re-read from GitHub on every tick, and deliberately not remembered: marking a draft ready
     // for review does NOT move the head, so a gate that latched on this answer would strand a pull
     // request the author had already un-drafted. Only the REPORT is de-duplicated — see `refuse`.
-    if snap.is_draft {
+    //
+    // `draft_blocks_merge`, not a bare bool (STUDIO-962): the gate refuses unless GitHub POSITIVELY
+    // said the pull request is not a draft, and the reader carries that default itself so the draft
+    // poke can take the opposite one from the same unstated answer.
+    if snap.draft_blocks_merge() {
         return refuse(plan, deps, DECLINE_DRAFT);
     }
 
@@ -644,7 +648,7 @@ mod tests {
         PrLookup::Found(PrSnapshot {
             head_sha: head.to_string(),
             status,
-            is_draft,
+            is_draft: Some(is_draft),
             merged_at: None,
             head_repo: "makewhatis/tally".to_string(),
         })

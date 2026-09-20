@@ -795,6 +795,12 @@ impl Orchestrator {
     /// mid-run, so a live author run is never poked — and the per-head bookkeeping in
     /// [`Orchestrator::draft_pokes`], which makes the poke once per head and the escalation once
     /// ever rather than once per tick.
+    ///
+    /// The poking is bounded on two axes (STUDIO-962, jimmy's round-1 finding): after
+    /// [`crate::draftpoke::MAX_DRAFT_POKES`] DISTINCT heads, and after
+    /// [`crate::draftpoke::MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head. The second
+    /// is the one that matters for the incident this was filed on — a head that never moves would
+    /// otherwise get one poke and then silence, which is the parking the ticket names.
     fn plan_draft_poke(
         &mut self,
         rows: &[ReviewWatchRow],
@@ -802,9 +808,9 @@ impl Orchestrator {
         snap: &PrSnapshot,
         report: &mut ReviewSweepReport,
     ) {
-        if !snap.is_draft {
-            // The draft resolved; forget the count so a re-draft starts afresh and the map does not
-            // grow for the daemon's whole life.
+        if !snap.draft_observed() {
+            // The draft resolved (or GitHub did not positively say it is one); forget the count so
+            // a re-draft starts afresh and the map does not grow for the daemon's whole life.
             self.draft_pokes.remove(&churn_key(pr));
             return;
         }
@@ -835,7 +841,22 @@ impl Orchestrator {
             return;
         }
         if state.pokes > 0 && state.poked_head == head {
-            return; // already poked at this head
+            // Already poked at this head: the author has not moved it. Count the sweeps it has
+            // stayed a draft and hand it to a human once the poke has clearly gone unanswered —
+            // the bound that makes the escalation reachable in the STATIC-head shape booch#537 had,
+            // where a distinct-head ceiling alone would poke once and then go silent forever.
+            state.unanswered_sweeps = state.unanswered_sweeps.saturating_add(1);
+            if state.unanswered_sweeps >= crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+                state.escalated = true;
+                report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
+                    crate::draftpoke::DraftEscalation {
+                        pr: pr.clone(),
+                        author,
+                        pokes: state.pokes,
+                    },
+                ));
+            }
+            return;
         }
         if state.pokes >= crate::draftpoke::MAX_DRAFT_POKES {
             state.escalated = true;
@@ -851,6 +872,9 @@ impl Orchestrator {
         let pokes = state.pokes;
         state.poked_head = head.to_string();
         state.pokes += 1;
+        // A new head is a fresh poke: the unanswered-sweep clock restarts, because the author has
+        // demonstrably done something since the last poke.
+        state.unanswered_sweeps = 0;
         report.nudges.push(crate::draftpoke::DraftNudge::Poke(
             crate::draftpoke::DraftPokePlan {
                 pr: pr.clone(),
@@ -1620,7 +1644,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -1634,7 +1658,7 @@ mod tests {
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: head.to_string(),
             status: PrStatus::Merged,
             merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
@@ -1647,7 +1671,7 @@ mod tests {
     /// One observation of a pull request that was CLOSED without merging.
     fn closed_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: head.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1882,7 +1906,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
-                is_draft: true,
+                is_draft: Some(true),
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -1987,6 +2011,49 @@ mod tests {
                 .nudges
                 .is_empty()
         );
+    }
+
+    /// ⚠️ Acceptance (jimmy's round-1 blocker): a draft IGNORED at a static head — the shape
+    /// booch#537 actually had — escalates to a human instead of parking in silence forever. The
+    /// distinct-head ceiling alone poked once and then heard from nobody, so this pins the SECOND
+    /// bound: the same head still draft for `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps.
+    #[test]
+    fn a_static_draft_head_escalates_to_a_human_after_a_bounded_silence() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // The one poke, at the head the author never moves.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        // The poke is unanswered and the head does not move: silence until the bound, then a human.
+        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty(),
+                "sweep {sweep}: the same head is never poked twice"
+            );
+        }
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Escalate(e) => {
+                assert_eq!(e.pr, coord(12));
+                assert_eq!(e.author, "alice");
+                assert_eq!(e.pokes, 1, "poked once; the head never moved");
+            }
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+        // And once a human holds it, the static head stays quiet forever rather than re-poking.
+        for _ in 0..5 {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty()
+            );
+        }
     }
 
     /// Acceptance: a draft ignored across every head escalates to a human rather than poking
@@ -2094,14 +2161,14 @@ mod tests {
     #[test]
     fn a_retired_pull_request_leaves_the_watch_set() {
         let merged = PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Merged,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
         });
         let closed = PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -3492,7 +3559,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: format!("{number:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -3710,7 +3777,7 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let head = if call == 0 { &self.first } else { &self.rest };
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head.clone(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -3735,7 +3802,7 @@ mod tests {
         ) -> PrStateResult {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: format!("{n:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -3992,7 +4059,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| HEAD_A.to_string());
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head,
                 status: PrStatus::Open,
                 merged_at: None,

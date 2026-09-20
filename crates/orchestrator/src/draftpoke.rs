@@ -40,11 +40,18 @@
 //! the head it last poked and says nothing again while the head is unchanged. When the author
 //! pushes but leaves it a draft, the new head is poked once too.
 //!
-//! An author who deliberately keeps a pull request in draft needs an out, so the poking is bounded:
-//! after [`MAX_DRAFT_POKES`] distinct heads the daemon stops poking and ESCALATES to a human — a
-//! room post and a tokenless comment on the pull request naming how many times it was poked. The
-//! escalation carries no summon token: it is not asking the author again, it is telling a human the
-//! author will not.
+//! An author who deliberately keeps a pull request in draft needs an out, so the poking is bounded
+//! on TWO axes, because the incident this feature was filed for was a STATIC head:
+//!
+//! * [`MAX_DRAFT_POKES`] distinct heads — the bound for an author who keeps pushing without ever
+//!   publishing.
+//! * [`MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head — the bound for the shape that
+//!   actually happens (booch#537 never moved its head). A done-nothing author would otherwise be
+//!   poked once and then heard from never again, which is the parking this ticket's title names.
+//!
+//! Either bound the daemon stops poking and ESCALATES to a human — a room post and a tokenless
+//! comment on the pull request naming how many times it was poked. The escalation carries no summon
+//! token: it is not asking the author again, it is telling a human the author will not.
 //!
 //! # Off the loop
 //!
@@ -74,6 +81,22 @@ pub const MANAGER_IDENTITY: &str = "@manager";
 /// author who simply forgot once, and far below the point where a machine repeating itself at a
 /// human is noise.
 pub const MAX_DRAFT_POKES: usize = 3;
+
+/// How many CONSECUTIVE watcher sweeps the SAME poked head may stay a draft before the daemon stops
+/// poking and asks a human.
+///
+/// This is the second bound, and it is the one that makes the human backstop reachable in the shape
+/// the ticket was filed for. [`MAX_DRAFT_POKES`] bounds DISTINCT heads, so an author who does
+/// nothing — the head never moves — would be poked once and then heard from never again, and the
+/// pull request would park exactly as makewhatis/booch#537 did. A draft that stays at one head
+/// across this many sweeps is not an author mid-push; it is an author who is not coming.
+///
+/// Thirty sweeps is about an hour at [`crate::prstate::PR_STATE_POLL_INTERVAL`] (120s): long enough
+/// that a re-engaged run has time to start, push and publish, and far shorter than the 4h55m the
+/// incident sat refused. Counted in sweeps rather than a `Duration` for
+/// [`crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS`]'s reason: the state is already in sweeps, and
+/// a clock here would be a second unit to keep honest.
+pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
 
 /// One pull request the daemon must poke: a run has finished, and its pull request is still a draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +144,10 @@ pub struct DraftPokeState {
     pub poked_head: String,
     /// How many distinct heads this pull request has been poked at.
     pub pokes: usize,
+    /// How many CONSECUTIVE sweeps the [`Self::poked_head`] has been observed still a draft since it
+    /// was poked. Reset when the head moves (a new head is a fresh poke) and never advanced while
+    /// the author's run is live; the escalation fires at [`MAX_DRAFT_POKE_SWEEPS`].
+    pub unanswered_sweeps: usize,
     /// Whether the human escalation has already been made. Once true, this pull request is silent
     /// until it stops being a draft.
     pub escalated: bool,
@@ -151,11 +178,11 @@ pub fn poke_comment(plan: &DraftPokePlan) -> String {
          \n\
          {who}: publish it — mark it ready for review (`gh pr ready`). The daemon will not do it \
          for you: un-drafting is the author's own declaration that the work is ready, and auto-merge \
-         refuses a draft, so nothing progresses while it stays one. This is poke {n} of \
+         refuses a draft, so nothing progresses while it stays one. This is poke {n} of at most \
          {MAX_DRAFT_POKES}.\n\
          \n\
-         If you mean to keep it a draft, say so on this pull request — the daemon stops poking after \
-         {MAX_DRAFT_POKES} and asks a human instead.\n"
+         The daemon does not poke forever: if the draft stands, it stops poking and asks a human \
+         instead.\n"
     )
 }
 
@@ -172,8 +199,9 @@ pub fn escalation_body(esc: &DraftEscalation) -> String {
     let n = esc.pokes;
     let pr = &esc.pr;
     format!(
-        "`{pr}` has been a **draft** across {n} poke{}, and {who} has not published it. A human \
-         must mark it ready for review or close it — the daemon has stopped poking.\n\
+        "`{pr}` is still a **draft** {n} poke{} after the run that opened it finished, and {who} \
+         has not published it. A human must mark it ready for review or close it — the daemon has \
+         stopped poking.\n\
          \n\
          The daemon never marks a pull request ready itself: un-drafting is the author's declaration \
          that the work is ready for review, and auto-merge refuses a draft, so this pull request \

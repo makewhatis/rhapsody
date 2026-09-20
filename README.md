@@ -1361,7 +1361,7 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 | detection | none (the feature does not exist) | the ticketless review watch set: a row exists only because a run HANDED OVER its pull request, which is what "finished" means here |
 | action | n/a | a summons comment naming the pull request and the action; the daemon never marks it ready |
 | frequency | n/a | **once per head** — the same head is never poked twice, and a per-tick poke is the re-dispatch loop STUDIO-956 bounds |
-| if ignored | n/a | after three distinct heads it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
+| if ignored | n/a | **two bounds**: after three distinct heads, or after an hour at one static head, it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
 | default | n/a | **inert**: silent with Teams off, off the ticketless path (there is no watch set to observe), and on a healthy board |
 
 **The trigger is the handoff, not the process exiting.** The only pull requests the daemon observes
@@ -1371,9 +1371,23 @@ whose author's run has stopped. The one remaining guard is a LIVE author run: a 
 normal mid-run, so a pull request whose author is running right now (the re-engaged run a review's
 findings reopened) is never poked.
 
+**The poking is bounded on two axes, because the incident shape is a static head.** An author who
+keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` distinct heads; an author who does
+nothing at all — booch#537 never moved its head — is bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive
+sweeps at the same head (thirty, about an hour at the two-minute poll). Either bound stops the poking
+and ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly
+one comment and then silence forever, which is the parking this feature exists to end.
+
 **In memory, and that is deliberate.** The per-head bookkeeping is a churn floor rather than an audit
 record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets it, and the worst that costs is
 one more poke at a head already poked.
+
+**An unstated `isDraft` is not a draft for the poke.** `PrSnapshot::is_draft` is an `Option<bool>`,
+and its two readers take an unstated answer in opposite safe directions: the auto-merge gate refuses
+unless GitHub POSITIVELY said the pull request is not a draft (STUDIO-881), while the poke acts only
+on a POSITIVELY observed draft — a summons that reopens the author's run must never fire on a guess
+any more than a merge may. The two are separate methods (`draft_blocks_merge` / `draft_observed`) for
+that reason; do not collapse them back to one default, which would be safe for exactly one caller.
 
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 
