@@ -1141,6 +1141,88 @@ pub(crate) struct ReviewerExclusions {
     pub(crate) unpinnable: HashSet<String>,
 }
 
+/// The required reviewers [`rank_reviewers`] actually promotes into its pinned prefix, in
+/// declaration order — the **effective** pin set, as opposed to the configured
+/// [`Teams::review_required`] list.
+///
+/// [`reviewwatch`](crate::reviewwatch)'s continuity guard is the caller: it must yield to a
+/// required reviewer only when one is genuinely going to jump the queue. Reading the raw config
+/// list there counted an `unpinnable` or off-roster name as a pin the ranking never made, which
+/// broke continuity to make way for a teammate who was not selected — and handed the round to
+/// whoever merely led on load (STUDIO-951, round 3).
+pub(crate) fn pinned_required_reviewers(
+    teams: &Teams,
+    author: &str,
+    exclusions: &ReviewerExclusions,
+) -> Vec<String> {
+    plan_required_pins(teams, author, exclusions)
+        .pinned
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// One bucket per reason a configured pin does not become an effective one, so
+/// [`rank_reviewers`] can warn about each distinctly and a caller can ask which names were
+/// **actually pinned** without re-deriving the classification.
+struct RequiredPinPlan<'a> {
+    /// On-roster, non-author, dispatchable pins — the prefix `rank_reviewers` emits.
+    pinned: Vec<&'a str>,
+    /// Not a roster member; the selector only ever names roster members.
+    unknown: Vec<&'a str>,
+    /// On the roster but its profile names a harness this build cannot run, so the pin is dropped
+    /// while the teammate stays a ranked candidate.
+    unpinnable: Vec<&'a str>,
+    /// On the roster but cannot be dispatched at all; removed from the ranked fill too.
+    unselectable: Vec<&'a str>,
+}
+
+/// Classifies [`Teams::review_required`] into [`RequiredPinPlan`]'s buckets. Pure and warning-free
+/// so both [`rank_reviewers`] and [`pinned_required_reviewers`] can share one definition of what an
+/// effective pin is.
+fn plan_required_pins<'a>(
+    teams: &'a Teams,
+    author: &str,
+    exclusions: &ReviewerExclusions,
+) -> RequiredPinPlan<'a> {
+    let on_roster = |name: &str| teams.roster.iter().any(|i| i.name == name);
+    // Declaration order, trimmed and deduped, with every non-candidate dropped rather than
+    // emitted. The roster and author checks are repeated here so a caller that passes no
+    // exclusions still cannot pin an impossible reviewer.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut plan = RequiredPinPlan {
+        pinned: Vec::new(),
+        unknown: Vec::new(),
+        unpinnable: Vec::new(),
+        unselectable: Vec::new(),
+    };
+    for name in teams.review_required() {
+        if !seen.insert(name) {
+            continue;
+        }
+        // The author case is the normal, intended state — a pinned teammate who opened this pull
+        // request — so it is skipped silently. Warning here would fire on every round of every
+        // pull request the pinned teammate authors and would tell them to fix correct config.
+        if name == author {
+            continue;
+        }
+        if !on_roster(name) {
+            plan.unknown.push(name);
+            continue;
+        }
+        if exclusions.unselectable.contains(name) {
+            plan.unselectable.push(name);
+            continue;
+        }
+        if exclusions.unpinnable.contains(name) {
+            plan.unpinnable.push(name);
+            continue;
+        }
+        plan.pinned.push(name);
+    }
+    plan
+}
+
 /// The whole roster minus `author` and minus every `unselectable` name, **required reviewers
 /// first** and then least-loaded with roster order as the tie-break — the ranking
 /// [`select_reviewers`] truncates to the quorum's count and the ticketless path truncates to its
@@ -1185,39 +1267,12 @@ pub(crate) fn rank_reviewers(
     load: &HashMap<String, i64>,
     exclusions: &ReviewerExclusions,
 ) -> Vec<String> {
-    let on_roster = |name: &str| teams.roster.iter().any(|i| i.name == name);
-    // Declaration order, trimmed and deduped, with every non-candidate dropped rather than
-    // emitted. The roster and author checks are repeated here so a caller that passes no
-    // exclusions still cannot pin an impossible reviewer.
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut pinned: Vec<&str> = Vec::new();
-    let mut unknown: Vec<&str> = Vec::new();
-    let mut unpinnable: Vec<&str> = Vec::new();
-    let mut unselectable: Vec<&str> = Vec::new();
-    for name in teams.review_required() {
-        if !seen.insert(name) {
-            continue;
-        }
-        // The author case is the normal, intended state — a pinned teammate who opened this pull
-        // request — so it is skipped silently. Warning here would fire on every round of every
-        // pull request the pinned teammate authors and would tell them to fix correct config.
-        if name == author {
-            continue;
-        }
-        if !on_roster(name) {
-            unknown.push(name);
-            continue;
-        }
-        if exclusions.unselectable.contains(name) {
-            unselectable.push(name);
-            continue;
-        }
-        if exclusions.unpinnable.contains(name) {
-            unpinnable.push(name);
-            continue;
-        }
-        pinned.push(name);
-    }
+    let RequiredPinPlan {
+        pinned,
+        unknown,
+        unpinnable,
+        unselectable,
+    } = plan_required_pins(teams, author, exclusions);
     if !unselectable.is_empty() {
         tracing::warn!(
             required = %unselectable.join(", "),
