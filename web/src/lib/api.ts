@@ -76,6 +76,19 @@ export interface StateResponse {
   // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
   // mean the same thing.
   review_divergence?: ReviewDivergence[];
+  // Tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), or ABSENT
+  // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
+  // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.
+  held_for_human?: HeldForHuman[];
+}
+
+// HeldForHuman is one row of /api/v1/state's `held_for_human` key (STUDIO-949): a ticket the
+// dispatcher refuses because only a person can do it. The board reads it as deliberately held, not
+// mysteriously idle.
+export interface HeldForHuman {
+  issue_identifier: string;
+  title: string;
+  project: string;
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request

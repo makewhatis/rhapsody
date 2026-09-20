@@ -67,6 +67,9 @@ impl Orchestrator {
         &self,
         mut issues: Vec<Issue>,
     ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
+        // The human-hold set is a per-PASS fact (STUDIO-949): clear it here so a ticket no longer
+        // held stops being reported, while the ledger's announced set keeps the log once-per-ticket.
+        self.human_holds.begin_pass();
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
@@ -150,8 +153,14 @@ impl Orchestrator {
             };
             let elig = eligibility(&iss, &running, &self.claimed, &gate);
             if !elig.ok {
-                // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
-                self.log_blocked_skip(&iss, &elig.blocked_by);
+                // A `rhapsody:human` hold is a deliberate refusal, not an ordinary drop (STUDIO-949):
+                // report it (once per ticket) rather than as a blocker miss.
+                if elig.held_for_human {
+                    self.note_human_hold(&iss, "");
+                } else {
+                    // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
+                    self.log_blocked_skip(&iss, &elig.blocked_by);
+                }
                 continue;
             }
             // Work already materialized as a linked PR with no newer summons → don't fresh-dispatch
@@ -282,6 +291,8 @@ impl Orchestrator {
         &self,
         mut tagged: Vec<TaggedIssue>,
     ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
+        // See the single-project ladder: the hold set is per-PASS.
+        self.human_holds.begin_pass();
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
@@ -362,7 +373,12 @@ impl Orchestrator {
             };
             let elig = eligibility(&ti.iss, &running, &self.claimed, &gate);
             if !elig.ok {
-                self.log_blocked_skip(&ti.iss, &elig.blocked_by);
+                // A `rhapsody:human` hold is a deliberate refusal, not an ordinary drop (STUDIO-949).
+                if elig.held_for_human {
+                    self.note_human_hold(&ti.iss, &p.slug);
+                } else {
+                    self.log_blocked_skip(&ti.iss, &elig.blocked_by);
+                }
                 continue;
             }
             if self.pr_suppressed(&ti.iss) {
@@ -519,6 +535,8 @@ mod tests {
     use crate::testsupport::*;
 
     const SKIP_BLOCKED: &str = "skipping dispatch: blocked by non-terminal blocker";
+    const HELD_FOR_HUMAN: &str =
+        "skipping dispatch: held for a human (rhapsody:human); only a person can do this ticket";
     const HELD_FOR_CAPACITY: &str =
         "skipping dispatch: no global concurrency slot; candidates not considered this tick";
 
@@ -698,6 +716,43 @@ mod tests {
         );
     }
 
+    // STUDIO-949: a `rhapsody:human` ticket is refused and the refusal is reported ONCE per ticket,
+    // not once per tick — a refusal that repeats every poll interval is not a signal anyone reads.
+    //
+    // MUTATION: log on every pass (drop the ledger dedupe) and the second `count_messages` reds.
+    #[test]
+    fn select_dispatch_logs_human_hold_once_per_ticket() {
+        let o = orch_for_select(10, HashMap::new(), None);
+        let mut human = issue("1", "A-1", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        let (got, events) = capture_events(|| o.select_dispatch(vec![human.clone()]));
+        assert!(got.is_empty(), "a human-gated ticket must not dispatch");
+        assert_eq!(
+            count_messages(&events, HELD_FOR_HUMAN),
+            1,
+            "the hold is logged on the first pass"
+        );
+        assert_eq!(
+            count_messages(&events, SKIP_BLOCKED),
+            0,
+            "a human hold is not an ordinary blocker miss"
+        );
+
+        // A second tick over the same ticket is not news.
+        let (_got, events2) = capture_events(|| o.select_dispatch(vec![human]));
+        assert_eq!(
+            count_messages(&events2, HELD_FOR_HUMAN),
+            0,
+            "the hold must not be logged again"
+        );
+
+        // ...and it is carried for the console (the current hold set).
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].issue_identifier, "A-1");
+    }
+
     // Mirrors Go `TestSelectDispatchLogsUnknownBlockerState`.
     #[test]
     fn select_dispatch_logs_unknown_blocker_state() {
@@ -773,6 +828,21 @@ mod tests {
             a1.fields.get("blocker_state").map(String::as_str),
             Some("In Review")
         );
+    }
+
+    // STUDIO-949: the multi-project ladder refuses and reports a human hold too — two ladders means
+    // two call sites, and the one that is missing it is silently absent for the installs that use it.
+    #[test]
+    fn select_dispatch_multi_logs_human_hold() {
+        let o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], None);
+        let mut human = issue("1", "A-1", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let (got, events) = capture_events(|| o.select_dispatch_multi(tag_for(0, vec![human])));
+        assert!(got.is_empty(), "a human-gated ticket must not dispatch");
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].project, "a");
     }
 
     // Mirrors Go `TestSelectDispatchSkipsPRSuppressed`.

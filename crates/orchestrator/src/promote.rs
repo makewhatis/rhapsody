@@ -122,6 +122,13 @@ impl Orchestrator {
             if self.running.contains_key(&iss.id) || self.claimed.contains(&iss.id) {
                 continue;
             }
+            // rhapsody:human (STUDIO-949): never promote a human-only ticket to Todo. Auto-promote
+            // moving it would strand it — the standard select's `eligible` refuses it outright, so it
+            // would sit in Todo dispatching nothing forever, strictly worse than leaving it in
+            // Backlog. Checked BEFORE the label gate because the hold is absolute.
+            if crate::teams::is_human(&iss) {
+                continue;
+            }
             // Label gate: a project with required labels only proactively works tickets carrying one.
             // Apply it here too, so auto-promote never moves a label-less dependent to Todo where the
             // standard select's eligibility would then reject it — stranding it in Todo (INF-318).
@@ -764,6 +771,40 @@ mod tests {
             "a store read error must NOT promote"
         );
         assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // STUDIO-939 is the case this gate exists for: a human-gated Backlog dependent whose blocker is
+    // already Done (the 2026-09-20 audit found STUDIO-939 sitting in Backlog with its blocker Done).
+    // Under dag the naive auto-promote moves it Backlog→Todo, `eligible` then refuses it forever, and
+    // it sits in Todo dispatching nothing — strictly worse than leaving it in Backlog. It must stay
+    // put while an ordinary sibling is still promoted.
+    //
+    // MUTATION: delete the `is_human` skip from `promote_unblocked_scope` and this reds while
+    // `eligible_refuses_human_label` (dispatch.rs) still passes — two independent properties.
+    #[tokio::test]
+    async fn promote_unblocked_939_human_ticket_stays_in_backlog() {
+        let mut f = Fake::new();
+        let mut human = backlog_dep("Done");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let mut ordinary = backlog_dep("Done");
+        ordinary.id = "b3".into();
+        ordinary.identifier = "MT-3".into();
+        f.blocked_backlog = vec![human, ordinary];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+
+        o.promote_unblocked().await;
+
+        let moves = tr.move_to_type_calls();
+        assert_eq!(
+            moves.len(),
+            1,
+            "only the ordinary dependent is promoted; the human one stays in Backlog"
+        );
+        assert_eq!(moves[0].issue_id, "b3");
+        assert_eq!(dispatched_len(&dispatched), 0);
+        assert!(o.pending_stack.is_empty(), "dag stashes no stack hint");
     }
 
     // Never-run guard (durable): a ticket with a prior run row is NEVER re-promoted (Stop/park stays

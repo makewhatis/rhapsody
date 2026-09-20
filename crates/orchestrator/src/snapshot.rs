@@ -138,6 +138,14 @@ pub struct Snapshot {
     /// non-empty, so a daemon with nothing to report serves a `/api/v1/state` payload byte-identical
     /// to the Go daemon's — which is what `harness/fixtures/api/state.json` pins.
     pub review_divergence: Vec<crate::reviewreconcile::Divergence>,
+    /// The tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), as the
+    /// most recent selection pass found them.
+    ///
+    /// Empty is the load-bearing half, exactly as [`Snapshot::drain`]'s `None` is:
+    /// [`crate::snapshot_json::render`] emits the `held_for_human` key ONLY when this is non-empty,
+    /// so a daemon with no human-gated ticket serves a `/api/v1/state` payload byte-identical to the
+    /// Go daemon's — which is what `harness/fixtures/api/state.json` pins.
+    pub held_for_human: Vec<crate::dispatch::HeldForHuman>,
     /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
     ///
     /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
@@ -248,6 +256,9 @@ impl Orchestrator {
             // STUDIO-898: empty unless the reconciliation sweep reported something, which keeps the
             // wire payload — and the golden — exactly as it was on every healthy daemon.
             review_divergence: self.review_divergences().to_vec(),
+            // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
+            // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.
+            held_for_human: self.human_holds.held(),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {

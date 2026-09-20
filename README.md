@@ -1220,6 +1220,38 @@ activity however long it runs, and a row the `runs` ledger cannot date is report
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
 
 
+### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
+
+Some tickets cannot be done by an agent at all — console work in a web dashboard, a purchase on a
+physical device, a legal form. The team had been saying so **in the title** (`(HUMAN-GATED)`,
+`[HUMAN — do not move to Todo]`, `— HUMAN, console work`), and the daemon cannot read a title. On
+2026-09-20 an audit found STUDIO-939 sitting in Backlog with its blocker already Done, so enabling
+`dependency_mode: dag` would have moved it straight to Todo and dispatched an agent at App Store
+Connect. Go Symphony v0.4.0 has no such label; this is Rhapsody-only.
+
+`rhapsody:human` is a constant beside `SOLO_LABEL`, matching the existing `rhapsody:*` family. The
+label is the entire opt-in: a ticket without it behaves byte-identically to today.
+
+| A `rhapsody:human` ticket | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| dispatch | n/a | refused in `eligible()`, the single chokepoint every dispatch path flows through |
+| auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever) |
+| triage | n/a | never assigned an identity, never spending a manager turn |
+| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key |
+| Teams | n/a | **not** gated on it — the refusal holds on any install |
+
+The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,
+never the all-default miss), so the selection pass can log it once per ticket rather than per tick,
+and the console board can read a held card as deliberately held rather than mysteriously idle. The
+reconciliation sweep never reports it as a stall, by construction: a held ticket never runs, so it
+never arms a watch row for the sweep to see.
+
+**The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
+such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
+unchanged, and a second test asserts the key is ABSENT on a daemon with no hold so the conditional
+cannot decay into an unconditional `[]` on a Go-pinned surface.
+
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it

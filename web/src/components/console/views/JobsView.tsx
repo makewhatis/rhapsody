@@ -236,6 +236,7 @@ export function JobsView({
         <BoardView
           rows={rows}
           blocked={state.data?.blocked ?? []}
+          heldForHuman={state.data?.held_for_human ?? []}
           project={project}
           counts={counts}
           maxConcurrent={maxConcurrent}

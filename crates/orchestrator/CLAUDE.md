@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Seven exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Eight exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -92,8 +92,17 @@ the `Orchestrator` struct itself. Concretely:
     outside the log", which that module's doc still states and this read does not weaken.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  seven seams; if none fits, that's a real design decision — don't reach for an eighth ad hoc
+  eight seams; if none fits, that's a real design decision — don't reach for a ninth ad hoc
   `Arc<Mutex<..>>` without updating this list.
+
+  - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
+    STUDIO-949) — a `Mutex`-guarded pair of sets behind a `&self`-callable handle: the ticket
+    identifiers already ANNOUNCED (the once-per-ticket log dedupe) and the CURRENT `rhapsody:human`
+    hold set the console reads. It is a seam because the selection pass (`select.rs`, both ladders)
+    discovers the holds while taking `&self` by design, and the control task's `build_snapshot`
+    reads the same cell. Never held across an `.await` — two map operations and out. Unlike
+    `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
+    SURVIVE a pass, so the ledger owns it; `begin_pass` clears only the current set.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.

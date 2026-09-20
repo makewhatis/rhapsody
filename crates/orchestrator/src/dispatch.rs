@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use rhapsody_config::{DEPENDENCY_MODE_DAG, DEPENDENCY_MODE_GRAPHITE};
@@ -79,6 +80,94 @@ pub struct EligibilityGate<'a> {
     pub mode: &'a str,
     pub review: &'a HashSet<String>,
     pub canceled: &'a HashSet<String>,
+}
+
+/// One ticket the dispatcher is holding because it wears
+/// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL) (STUDIO-949). The console board's own shape: the
+/// ticket key, a title for the card, and the project slug it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldForHuman {
+    pub issue_identifier: String,
+    pub title: String,
+    pub project: String,
+}
+
+/// How many distinct tickets [`HumanHoldLedger`] remembers having announced before it forgets the
+/// oldest set wholesale. Comfortably above any plausible set of human-gated tickets; the cost of
+/// hitting it is one repeated log line per ticket.
+const HUMAN_HOLD_CAPACITY: usize = 256;
+
+/// The once-per-ticket memory behind the human-hold report (STUDIO-949).
+///
+/// A `rhapsody:human` ticket in a dispatchable state is refused on EVERY selection pass — twice a
+/// minute at the default poll interval — and a refusal repeated forever is indistinguishable from a
+/// daemon that is stuck. So the LOG fires when the hold is NEWS: the first time this process sees
+/// the ticket, and never again. That is [`crate::runautomerge::AutoMergeLedger`]'s idiom, and the
+/// reason for it is the same.
+///
+/// It also carries the CURRENT hold set for the console's `/api/v1/state` key. The two jobs are one
+/// ledger because both are per-selection-pass facts: [`begin_pass`](Self::begin_pass) clears the
+/// current set (a ticket no longer held stops being reported), while the announced set survives so
+/// re-holding it the next tick is not news again.
+///
+/// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
+/// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
+/// and never across an `.await`; see `crates/orchestrator/CLAUDE.md`'s seam list.
+pub struct HumanHoldLedger {
+    inner: Mutex<HumanHoldState>,
+}
+
+#[derive(Default)]
+struct HumanHoldState {
+    /// Ticket identifiers already announced this process lifetime (the dedupe).
+    announced: HashSet<String>,
+    /// Tickets held by the MOST RECENT selection pass, for the console.
+    held: Vec<HeldForHuman>,
+}
+
+impl Default for HumanHoldLedger {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HumanHoldState::default()),
+        }
+    }
+}
+
+impl HumanHoldLedger {
+    /// Starts a fresh selection pass: the CURRENT hold set is dropped, so a ticket that stopped
+    /// wearing the label — or left the candidate set — stops being reported. The announced set is
+    /// deliberately NOT touched.
+    pub(crate) fn begin_pass(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held
+            .clear();
+    }
+
+    /// Records a hold and returns whether it is NEWS (the first time this ticket has been announced
+    /// this process lifetime). Only a news hold is logged.
+    pub(crate) fn hold(&self, entry: HeldForHuman) -> bool {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.announced.len() >= HUMAN_HOLD_CAPACITY
+            && !st.announced.contains(&entry.issue_identifier)
+        {
+            st.announced.clear();
+        }
+        let news = st.announced.insert(entry.issue_identifier.clone());
+        st.held.push(entry);
+        news
+    }
+
+    /// The tickets held by the most recent selection pass, for the snapshot. Empty until a pass has
+    /// run, which is what keeps a daemon with no human-gated ticket serving the Go-identical payload.
+    pub(crate) fn held(&self) -> Vec<HeldForHuman> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held
+            .clone()
+    }
 }
 
 /// The STATE half of dispatch eligibility: is `st` (already normalized) a state the daemon
@@ -156,10 +245,20 @@ impl DispatchStates {
 /// non-empty only when `ok` is false AND non-terminal blockers were the operative reason — so the
 /// dispatch loop can surface exactly that (otherwise silent) drop and nothing else. Mirrors Go
 /// `eligibilityResult`.
+///
+/// `held_for_human` is the Rhapsody-only third outcome (STUDIO-949): the issue wears
+/// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL) and is refused because only a person can do it. It is
+/// a deliberate hold, not ordinary ineligibility, so it is a named field rather than the all-default
+/// [`EligibilityResult::default`] — a caller MUST be able to tell "held for a human" from "not a
+/// candidate", or the ticket sits in Todo dispatching nothing and saying nothing, which is the new
+/// silent-stall class this field exists to prevent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct EligibilityResult {
     pub ok: bool,
     pub blocked_by: Vec<BlockerRef>,
+    /// True when the refusal was [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL). Never true together
+    /// with a non-empty `blocked_by`: the human gate short-circuits above the blocker rule.
+    pub held_for_human: bool,
 }
 
 /// Reports whether an issue is intrinsically dispatch-eligible (upstream §8.2). Slot availability is
@@ -206,6 +305,19 @@ pub(crate) fn eligibility(
     if running.contains(&iss.id) || claimed.contains(&iss.id) {
         return EligibilityResult::default();
     }
+    // Human-only gate (STUDIO-949): a ticket wearing `rhapsody:human` cannot be done by an agent at
+    // all, so the dispatcher refuses it here — the one chokepoint every dispatch path flows through,
+    // Teams on or off. Deliberately BEFORE the required-label gate and the blocker rule: the hold is
+    // absolute and owes no explanation from either. It sets `held_for_human` (rather than returning
+    // the all-default result) so the caller can distinguish it from ordinary ineligibility and
+    // report it once; `reviewreconcile.rs` records why the sweep cannot mistake a hold for a stall.
+    if crate::teams::is_human(iss) {
+        return EligibilityResult {
+            ok: false,
+            blocked_by: Vec::new(),
+            held_for_human: true,
+        };
+    }
     // Label gate: when required labels are configured, the issue must carry AT LEAST ONE of them
     // (match-ANY, case-insensitive). A miss short-circuits with empty `blocked_by` so it is never
     // mislabeled as blocker-held. Empty set ⇒ no filter, so the verdict is byte-identical to the
@@ -225,12 +337,14 @@ pub(crate) fn eligibility(
             return EligibilityResult {
                 ok: false,
                 blocked_by: blocked,
+                held_for_human: false,
             };
         }
     }
     EligibilityResult {
         ok: true,
         blocked_by: Vec::new(),
+        held_for_human: false,
     }
 }
 
@@ -318,6 +432,25 @@ pub(crate) fn blocker_state_name(b: &BlockerRef) -> String {
 }
 
 impl Orchestrator {
+    /// Records and reports a `rhapsody:human` hold (STUDIO-949). The refusal itself is
+    /// [`eligibility`]'s; this is the otherwise-silent half — one `tracing::info!` line the FIRST
+    /// time the ticket is held, and the entry the console reads. A hold that repeats every tick is
+    /// not a signal anyone reads, so the ledger dedupes it; `project` is the owning project slug
+    /// (empty on the legacy single-tracker path), carried for the console card.
+    pub(crate) fn note_human_hold(&self, iss: &Issue, project: &str) {
+        let entry = HeldForHuman {
+            issue_identifier: iss.identifier.clone(),
+            title: iss.title.clone(),
+            project: project.to_string(),
+        };
+        if self.human_holds.hold(entry) {
+            tracing::info!(
+                issue_identifier = %iss.identifier,
+                "skipping dispatch: held for a human (rhapsody:human); only a person can do this ticket"
+            );
+        }
+    }
+
     /// Surfaces the otherwise-silent drop of a Todo candidate held back by non-terminal blockers
     /// (INF-249): one `tracing::info!` line per non-terminal blocker, each naming the blocked issue,
     /// the blocker, and the blocker's state. `blockers` is the [`EligibilityResult::blocked_by`]
@@ -662,6 +795,75 @@ mod tests {
         assert!(
             !res.ok && res.blocked_by.is_empty(),
             "label-miss must not be a blocker drop"
+        );
+    }
+
+    // STUDIO-949: a `rhapsody:human` ticket in a dispatchable state is refused outright, and the
+    // refusal is DISTINGUISHABLE from ordinary ineligibility — `held_for_human` is set and
+    // `blocked_by` stays empty, so a caller can tell "held for a human" from "not a candidate".
+    //
+    // MUTATION: delete the `is_human` gate from `eligibility` and this reds.
+    #[test]
+    fn eligible_refuses_human_label() {
+        let g = GateData::standard();
+        let mut human = base_issue();
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        assert!(
+            !eligible(&human, &no_ids(), &no_ids(), &g.gate()),
+            "a human-gated ticket must never dispatch"
+        );
+        let res = eligibility(&human, &no_ids(), &no_ids(), &g.gate());
+        assert!(!res.ok, "refused");
+        assert!(
+            res.held_for_human,
+            "the refusal must be distinguishable from a plain miss"
+        );
+        assert!(res.blocked_by.is_empty(), "not a blocker drop");
+
+        // An ordinary ticket is NOT reported as held.
+        assert!(
+            !eligibility(&base_issue(), &no_ids(), &no_ids(), &g.gate()).held_for_human,
+            "only a labelled ticket is held"
+        );
+    }
+
+    // STUDIO-949: the label match is case-insensitive, consistent with `has_any_label`.
+    #[test]
+    fn human_label_match_is_case_insensitive() {
+        let g = GateData::standard();
+        for spelling in ["rhapsody:human", "Rhapsody:Human", "RHAPSODY:HUMAN"] {
+            let mut human = base_issue();
+            human.labels = Some(vec![spelling.into()]);
+            assert!(
+                eligibility(&human, &no_ids(), &no_ids(), &g.gate()).held_for_human,
+                "spelling {spelling:?} must be held"
+            );
+        }
+    }
+
+    // STUDIO-949 acceptance: a ticket WITHOUT the label behaves identically to today. Written
+    // against `eligible()`'s bool ONLY — the exact call the pre-STUDIO-949 code answered — so it
+    // compiles and passes against both the old and the new implementation.
+    #[test]
+    fn eligible_unaffected_without_human_label() {
+        let g = GateData::standard();
+        assert!(
+            eligible(&base_issue(), &no_ids(), &no_ids(), &g.gate()),
+            "an ordinary ticket still dispatches"
+        );
+        let mut labelled = base_issue();
+        labelled.labels = Some(vec!["infra".into()]);
+        assert!(
+            eligible(&labelled, &no_ids(), &no_ids(), &g.gate()),
+            "an unrelated label must not change the verdict"
+        );
+        // The ordinary blocker rule is untouched.
+        let mut blocked = issue("2", "MT-2", "Todo");
+        blocked.blocked_by = Some(vec![blocker(Some("MT-9"), Some("In Progress"))]);
+        assert!(
+            !eligible(&blocked, &no_ids(), &no_ids(), &g.gate()),
+            "a blocked Todo is still refused for the ordinary reason"
         );
     }
 

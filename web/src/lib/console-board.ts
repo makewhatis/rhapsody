@@ -24,7 +24,7 @@
 // THE LANE SET IS FIXED. Lanes are never built from the cards present: the board is quietest exactly
 // when the pipeline is idle or starved, and an absent lane would hide the very condition the console
 // most needs to shout about. All four always exist, empty ones included.
-import type { BlockedEntry } from "@/lib/api";
+import type { BlockedEntry, HeldForHuman } from "@/lib/api";
 import { runOutcomeLabel } from "@/lib/console-job-detail";
 import type { ConsoleJobRow, ConsoleJobStatus } from "@/lib/console-jobs";
 
@@ -110,6 +110,12 @@ export interface BoardCard {
   reviewers: ReviewerChip[];
   /** Blockers holding this ticket, each "X · State" (`state.blocked`, INF-318/INF-320). */
   dependencies: string[];
+  /**
+   * True when the dispatcher is deliberately holding this ticket for a person (`rhapsody:human`,
+   * STUDIO-949). Distinct from `dependencies`: nobody is blocking it and no agent will ever run it —
+   * it is console/legal/physical work, so the board must read it as held, not as mysteriously idle.
+   */
+  heldForHuman: boolean;
 }
 
 /** The four lanes, left to right — the order a ticket travels them. */
@@ -281,9 +287,11 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
   blocked: readonly BlockedEntry[] = [],
+  heldForHuman: readonly HeldForHuman[] = [],
 ): BoardLane[] {
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
+  const held = new Set(heldForHuman.map((h) => h.issue_identifier));
   for (const row of rows) {
     // A review run is never its own card: it belongs to the ticket it reviews, and an unattributed
     // run (no issue key) has no ticket to group under.
@@ -303,6 +311,7 @@ export function buildConsoleBoard(
       pr: undefined,
       reviewers: [],
       dependencies: [],
+      heldForHuman: held.has(row.issue),
     };
     cards.push(card);
     byIssue.set(row.issue, card);

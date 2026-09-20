@@ -84,6 +84,25 @@ pub(crate) const IDENTITY_LABEL_PREFIX: &str = "rhapsody:@";
 /// exactly as for `@`.
 pub(crate) const SOLO_LABEL: &str = "rhapsody:solo";
 
+/// The **human-only** gate: a ticket wearing `rhapsody:human` can never be done by an
+/// agent — console work in a web dashboard, a purchase on a physical device, a legal
+/// form — so the dispatcher refuses it outright (STUDIO-949).
+///
+/// Unlike [`SOLO_LABEL`] this is **not a Teams feature**: it lives in the shared
+/// `rhapsody:` namespace only for naming consistency, is enforced in
+/// [`eligible`](crate::dispatch::eligible) — the single chokepoint every dispatch path
+/// flows through — and must hold on any install, Teams enabled or not. It is the
+/// Rhapsody-only opt-in the frozen Go reference has no counterpart for (README
+/// Divergences).
+///
+/// Three consumers agree on it: the dispatch gate refuses it (distinguishably from
+/// ordinary ineligibility, via
+/// [`EligibilityResult::held_for_human`](crate::dispatch::EligibilityResult)),
+/// [`Orchestrator::promote_unblocked`](crate::orchestrator::Orchestrator::promote_unblocked)
+/// never moves one to Todo, and triage never assigns it an identity
+/// ([`crate::triage::unlabelled_candidates`]).
+pub(crate) const HUMAN_LABEL: &str = "rhapsody:human";
+
 /// The `events` row kind for a routed run (§3.4). A **data** value in the
 /// existing `kind` column — no schema change, no new column, no golden move.
 pub(crate) const EVENT_ROUTE: &str = "teams.route";
@@ -437,6 +456,18 @@ pub(crate) fn is_solo(iss: &Issue) -> bool {
         .iter()
         .flatten()
         .any(|l| l.eq_ignore_ascii_case(SOLO_LABEL))
+}
+
+/// Whether `iss` carries [`HUMAN_LABEL`] — the human-only dispatch gate (STUDIO-949).
+///
+/// Case-insensitive for [`is_solo`]'s reason, and consistent with
+/// [`has_any_label`](crate::dispatch::has_any_label), which normalizes at compare
+/// time: labels reach the daemon however the tracker spells them.
+pub(crate) fn is_human(iss: &Issue) -> bool {
+    iss.labels
+        .iter()
+        .flatten()
+        .any(|l| l.eq_ignore_ascii_case(HUMAN_LABEL))
 }
 
 /// Whether `iss` carries the `rhapsody:@<name>` label for exactly `name`.

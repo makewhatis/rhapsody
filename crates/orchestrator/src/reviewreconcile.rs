@@ -45,6 +45,17 @@
 //!   owes a merge. This is what found the STUDIO-881 draft loop and the `BEHIND` decline by hand.
 //! * `in_flight` — a round is happening RIGHT NOW. Never divergence.
 //!
+//! # A human-gated ticket is deliberately NOT this sweep's business (STUDIO-949)
+//!
+//! `rhapsody:human` is the one hold the dispatcher applies on purpose: the ticket can only be done by
+//! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep can
+//! never report it as a stall and needs no rule to be taught that, because its input is the LIVE
+//! WATCH SET — one row per pull request a run introduced — and a human-gated ticket is refused at
+//! dispatch, so it never runs and never arms a watch row. The exclusion is by CONSTRUCTION rather
+//! than by a filter here, which is why the sweep's own "unknown is never a divergence" rule is not
+//! the thing keeping it quiet: there is no row to date in the first place. A future change that made
+//! this sweep range over tickets rather than watch rows would have to add the hold back deliberately.
+//!
 //! # It reports and it does NOT act
 //!
 //! Nothing here re-dispatches, re-arms, merges or moves a ticket. That is a decision, not an

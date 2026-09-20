@@ -203,6 +203,21 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(cards(board)[0].dependencies).toEqual(["STUDIO-900 · In Progress"]);
   });
 
+  it("attaches a held-for-human flag from the live snapshot's held set (STUDIO-949)", () => {
+    const board = buildConsoleBoard(
+      [
+        row({ issue: "STUDIO-939", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+        row({ issue: "STUDIO-940", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+      ],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const byIssue = new Map(cards(board).map((c) => [c.issue, c]));
+    expect(byIssue.get("STUDIO-939")?.heldForHuman).toBe(true);
+    // A ticket without the hold is untouched — the label is the entire opt-in.
+    expect(byIssue.get("STUDIO-940")?.heldForHuman).toBe(false);
+  });
+
   it("carries assignee and provider onto the card", () => {
     const board = buildConsoleBoard([
       row({
