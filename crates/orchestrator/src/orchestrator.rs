@@ -591,7 +591,11 @@ pub struct Orchestrator {
     /// recent sweep (STUDIO-950), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id
     /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler, which
     /// CLEARS it wholesale at the top of each sweep and re-inserts only the rounds that sweep held —
-    /// so it always means exactly "what the latest sweep held", never an accumulation.
+    /// so it always means exactly "what the latest sweep held", never an accumulation. A sweep only
+    /// visits the rotated slice of the watch set (`MAX_PR_STATE_CALLS_PER_TICK` pull requests per
+    /// tick), so with more watched pull requests than that a round's hold can blink out for one
+    /// sweep and return on the next; an absent entry means "not held by the most RECENT sweep", not
+    /// "not held".
     ///
     /// It exists so the reconciliation sweep can name a DELIBERATE capacity hold — a wait the
     /// operator can see in `reviewwatch`'s own log — as the cause, instead of reporting an

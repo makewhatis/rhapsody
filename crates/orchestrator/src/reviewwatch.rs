@@ -1138,6 +1138,13 @@ pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 /// does for auto-merge (STUDIO-923). Under this module's own 90-minute threshold only a hold that
 /// has genuinely lasted an hour and a half reaches the report at all, which is the incident — a
 /// transient hold resolves long before the threshold and never pages.
+///
+/// The record is deliberately coarse: it is taken the moment the slot check fails, BEFORE the
+/// permanent refusals below it (the per-PR churn cap, `choose_review_reviewer`, `review_repo_url`)
+/// are evaluated, so a round that would have been turned away for one of those anyway is annotated
+/// "held for capacity" while the budget happens to be spent. That is a true statement about the
+/// present and self-corrects the moment a slot frees; it does not claim the round WOULD dispatch
+/// next tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityHold {
     /// How many runs held the ACTIVE pool when the sweep deferred this round — every running run in
@@ -1157,13 +1164,22 @@ pub struct CapacityHold {
 pub(crate) type CapacityHolds = HashMap<String, CapacityHold>;
 
 /// How long a recorded [`CapacityHold`] stays meaningful. The watcher refreshes its holds on every
-/// sweep it actually runs, which is [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)
-/// apart; a hold older than two intervals is from a sweep that has since stopped happening — a `gh`
-/// outage, a cancelled watcher — and the reconciliation sweep must not keep naming a fact nothing is
-/// refreshing. The threshold keeps the two sweeps decoupled: the reconciliation sweep asks only
-/// whether a hold is FRESH, never whether the watcher is running.
-pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration =
-    std::time::Duration::from_secs(crate::prstate::PR_STATE_POLL_INTERVAL.as_secs() * 2);
+/// sweep it actually runs, and a healthy sweep-to-sweep gap is NOT one
+/// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL): the interval is the sleep
+/// BEFORE each sweep, and the sweep then asks about up to
+/// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) pull requests
+/// sequentially, each bounded by
+/// [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT). Three slow lookups already put a healthy
+/// watcher past two intervals, so the bound is the worst case — the sleep plus a full tick of
+/// lookups — rather than the cadence alone. A hold older than that is from a sweep that has since
+/// stopped happening (a `gh` outage, a cancelled watcher), and the reconciliation sweep must not
+/// keep naming a fact nothing is refreshing. The threshold keeps the two sweeps decoupled: the
+/// reconciliation sweep asks only whether a hold is FRESH, never whether the watcher is running.
+pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::from_secs(
+    crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
+        + crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
+            * crate::ghsummons::GH_EXEC_TIMEOUT.as_secs(),
+);
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -3013,7 +3029,8 @@ mod tests {
         let warn = events
             .iter()
             .find(|e| {
-                e.message.contains("review reconciliation") && e.message.contains("held for capacity")
+                e.message.contains("review reconciliation")
+                    && e.message.contains("held for capacity")
             })
             .expect("a capacity-held round must be reported");
         assert!(
