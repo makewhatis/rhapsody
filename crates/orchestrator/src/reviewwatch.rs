@@ -262,6 +262,11 @@ pub struct WatchedPr {
     /// equal to one of these is already read; a head different from all of them may have MOVED, and
     /// only then is a diff comparison worth its `gh` calls.
     pub reviewed_shas: Vec<String>,
+    /// Distinct non-empty `requested_sha` values across the same rows — the heads a round has been
+    /// DISPATCHED against. A head equal to one of these already has a round in flight, so the edge
+    /// trigger arms nothing and the comparison is not needed either; carrying these is what keeps a
+    /// long review from re-spending two `gh` calls per tick for its whole duration.
+    pub requested_shas: Vec<String>,
 }
 
 impl WatchedPr {
@@ -270,6 +275,7 @@ impl WatchedPr {
         WatchedPr {
             pr,
             reviewed_shas: Vec::new(),
+            requested_shas: Vec::new(),
         }
     }
 }
@@ -583,12 +589,10 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // Advance by the budget, not by what actually answered: a failed lookup has had its turn,
         // and holding the cursor back for it would starve everything behind it instead.
         cursor = start.saturating_add(crate::prstate::MAX_PR_STATE_CALLS_PER_TICK);
-        // The reviewed SHAs, by coordinate, for the diff comparison below. Kept here rather than
-        // re-read from the store: this task holds none (STUDIO-960).
-        let reviewed: HashMap<PrCoord, Vec<String>> = rotated
-            .iter()
-            .map(|w| (w.pr.clone(), w.reviewed_shas.clone()))
-            .collect();
+        // The reviewed and requested SHAs, by coordinate, for the diff comparison below. Kept here
+        // rather than re-read from the store: this task holds none (STUDIO-960).
+        let recorded: HashMap<PrCoord, WatchedPr> =
+            rotated.iter().map(|w| (w.pr.clone(), w.clone())).collect();
         let coords: Vec<PrCoord> = rotated.into_iter().map(|w| w.pr).collect();
         let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &coords).await;
         if sweep.deferred > 0 || sweep.failed > 0 {
@@ -624,13 +628,26 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             if let Some(diff) = deps.diff_source.as_ref()
                 && let PrLookup::Found(snap) = &fresh.lookup
                 && snap.status == PrStatus::Open
-                && let Some(shas) = reviewed.get(&fresh.pr)
+                && let Some(known) = recorded.get(&fresh.pr)
                 && !snap.head_sha.is_empty()
-                && shas.iter().any(|s| !s.is_empty() && s != &snap.head_sha)
+                // Nothing to prove with no reviewed head to compare against, and nothing to prove
+                // when the head is already read or already dispatched: in every one of those cases
+                // the edge trigger arms nothing, so the `gh` calls would be pure waste.
+                && !known.reviewed_shas.is_empty()
+                && !known
+                    .reviewed_shas
+                    .iter()
+                    .chain(known.requested_shas.iter())
+                    .any(|s| !s.is_empty() && s == &snap.head_sha)
             {
-                fresh.unchanged_from =
-                    unchanged_reviewed_shas(&ctx, diff.as_ref(), &fresh.pr, &snap.head_sha, shas)
-                        .await;
+                fresh.unchanged_from = unchanged_reviewed_shas(
+                    &ctx,
+                    diff.as_ref(),
+                    &fresh.pr,
+                    &snap.head_sha,
+                    &known.reviewed_shas,
+                )
+                .await;
             }
             let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
             slots = Some(left);
@@ -781,9 +798,13 @@ impl Orchestrator {
                     i
                 }
             };
-            let sha = row.last_reviewed_sha.trim();
-            if !sha.is_empty() && !out[idx].reviewed_shas.iter().any(|s| s == sha) {
-                out[idx].reviewed_shas.push(sha.to_string());
+            let reviewed = row.last_reviewed_sha.trim();
+            if !reviewed.is_empty() && !out[idx].reviewed_shas.iter().any(|s| s == reviewed) {
+                out[idx].reviewed_shas.push(reviewed.to_string());
+            }
+            let requested = row.requested_sha.trim();
+            if !requested.is_empty() && !out[idx].requested_shas.iter().any(|s| s == requested) {
+                out[idx].requested_shas.push(requested.to_string());
             }
         }
         out
@@ -3449,6 +3470,9 @@ mod tests {
         o.store()
             .mark_review_completed(&key(12, "carol"), HEAD_B, REVIEW_STATUS_REVIEWED)
             .expect("carol completed");
+        o.store()
+            .mark_review_requested(&key(13, "bob"), HEAD_C)
+            .expect("bob dispatched");
 
         let got = o.review_watch_coords();
         let mut twelve = got
@@ -3466,7 +3490,12 @@ mod tests {
             .expect("the pull request is polled");
         assert!(
             thirteen.reviewed_shas.is_empty(),
-            "a never-reviewed row contributes no SHA"
+            "a never-reviewed row contributes no reviewed SHA"
+        );
+        assert_eq!(
+            thirteen.requested_shas,
+            vec![HEAD_C.to_string()],
+            "a dispatched head is carried so the comparison can tell it apart from a move"
         );
     }
 
@@ -3602,6 +3631,28 @@ mod tests {
         }
     }
 
+    /// A [`ReviewDiffSource`] that counts every call, so a test can prove the watcher spends NO
+    /// `gh` read when nothing could have moved (STUDIO-960).
+    struct CountingDiffSource(Arc<Mutex<usize>>);
+
+    #[async_trait]
+    impl ReviewDiffSource for CountingDiffSource {
+        async fn pr_base_ref(&self, _owner: &str, _repo: &str, _number: i64) -> ReviewDiffResult {
+            *self.0.lock().expect("count") += 1;
+            Ok("main".to_string())
+        }
+        async fn merge_base_patch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _base: &str,
+            _sha: &str,
+        ) -> ReviewDiffResult {
+            *self.0.lock().expect("count") += 1;
+            Ok("diff".to_string())
+        }
+    }
+
     /// A [`PrStateSource`] that always reports one fixed, OPEN head — the shape a rebase leaves
     /// behind for the watcher to compare (STUDIO-960).
     struct FixedHeadSource(&'static str);
@@ -3699,7 +3750,8 @@ mod tests {
     /// control task receives carries the reviewed head that was proven identical.
     #[tokio::test(start_paused = true)]
     async fn the_watcher_proves_an_unchanged_head_move_before_handing_it_over() {
-        let handed = run_one_watch_tick(FakeDiffSource::same()).await;
+        let handed =
+            run_one_watch_tick(watched_pr(&[HEAD_A], &[]), Arc::new(FakeDiffSource::same())).await;
         assert_eq!(handed.len(), 1);
         assert_eq!(
             handed[0].unchanged_from,
@@ -3713,7 +3765,11 @@ mod tests {
     /// comparison it did not complete turns this red.
     #[tokio::test(start_paused = true)]
     async fn the_watcher_proves_nothing_when_the_diff_changed() {
-        let handed = run_one_watch_tick(FakeDiffSource::changed()).await;
+        let handed = run_one_watch_tick(
+            watched_pr(&[HEAD_A], &[]),
+            Arc::new(FakeDiffSource::changed()),
+        )
+        .await;
         assert_eq!(handed.len(), 1);
         assert!(
             handed[0].unchanged_from.is_empty(),
@@ -3721,9 +3777,50 @@ mod tests {
         );
     }
 
-    /// Runs exactly one watcher tick against a pull request at [`HEAD_B`] whose row already read
-    /// [`HEAD_A`], and returns the observations handed to the control task.
-    async fn run_one_watch_tick(diff: FakeDiffSource) -> Vec<PrObservation> {
+    /// The comparison costs `gh` reads, so it is spent only when a head move is even possible
+    /// (STUDIO-960): a head already read, a head already dispatched, and a pull request with no
+    /// reviewed head at all all cost ZERO calls.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_compares_only_when_a_head_move_is_possible() {
+        for watched in [
+            // Already read at this head: no move.
+            watched_pr(&[HEAD_B], &[]),
+            // A round is already dispatched at this head: the edge trigger arms nothing.
+            watched_pr(&[], &[HEAD_B]),
+            // Nothing has ever been reviewed, so there is nothing to compare against.
+            watched_pr(&[], &[]),
+        ] {
+            let calls = Arc::new(Mutex::new(0usize));
+            let handed =
+                run_one_watch_tick(watched, Arc::new(CountingDiffSource(Arc::clone(&calls)))).await;
+            assert_eq!(handed.len(), 1);
+            assert!(
+                handed[0].unchanged_from.is_empty(),
+                "no comparison means no proof"
+            );
+            assert_eq!(
+                *calls.lock().expect("count"),
+                0,
+                "no gh read may be spent when nothing could have moved"
+            );
+        }
+    }
+
+    /// A watched pull request at the fixed head [`HEAD_B`] with the given reviewed/requested SHAs.
+    fn watched_pr(reviewed: &[&str], requested: &[&str]) -> WatchedPr {
+        WatchedPr {
+            pr: coord(12),
+            reviewed_shas: reviewed.iter().map(|s| (*s).to_string()).collect(),
+            requested_shas: requested.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Runs exactly one watcher tick against a pull request at [`HEAD_B`], and returns the
+    /// observations handed to the control task.
+    async fn run_one_watch_tick(
+        watched: WatchedPr,
+        diff: Arc<dyn ReviewDiffSource>,
+    ) -> Vec<PrObservation> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
@@ -3733,16 +3830,13 @@ mod tests {
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
             sink: Arc::new(FakeSink {
-                watched: vec![WatchedPr {
-                    pr: coord(12),
-                    reviewed_shas: vec![HEAD_A.to_string()],
-                }],
+                watched: vec![watched],
                 seen: Arc::clone(&seen),
                 boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
             }),
-            diff_source: Some(Arc::new(diff)),
+            diff_source: Some(diff),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
         done.notified().await;
