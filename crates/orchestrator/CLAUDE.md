@@ -111,8 +111,10 @@ the `Orchestrator` struct itself. Concretely:
     SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets and sets the
     ledger's **primed** flag — the boolean that distinguishes "the last pass read the board and saw
     no hold" from "no pass has read the board yet". `begin_pass` takes the caller's candidate-FETCH
-    verdict and does nothing at all when it is false (every enabled project's fetch failed on a
-    multi-project install), so a pass that could not look neither clears nor primes. Every writer is
+    verdict and does nothing at all when it is false — any enabled project's fetch failed on a
+    multi-project install, OR no project is enabled at all — so a pass that could not read the WHOLE
+    board neither clears nor primes (STUDIO-949 rounds 13-15; the clear is wholesale, with no
+    per-project scope, so a partial read must not erase the failed project's holds). Every writer is
     below `on_tick`'s three early-return gates while FOUR decision gates keep running independently
     of them — the ticketless watcher's round gate and its auto-merge gate, the reconciliation sweep,
     and the ticket-mode handoff quorum (`plan_quorum`, reached from `evHandoffRun`, off the `on_tick`

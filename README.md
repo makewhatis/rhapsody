@@ -1299,11 +1299,14 @@ reaches a class of ticket the candidate poll cannot. Under `claim_mode: pool` th
 the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query and its
 label stops reaching the selection-pass half; in assignee mode the same happens the moment the ticket
 is reassigned to the person taking it over. And a project whose candidate fetch fails is skipped for
-that tick (`poll_all_projects`), so its tickets contribute nothing to either current set until a
-later fetch succeeds — which, because `begin_pass` clears both sets at the top of the next selection
-pass, is the window in which a label that was live a tick ago stops reaching the decision readers.
-When **every** enabled project's fetch fails the pass has not read the board at all, so it neither
-clears nor primes (`STUDIO-949` round 13) and the previous answer stands rather than being emptied.
+that tick (`poll_all_projects`), so its tickets contribute nothing to that pass. `begin_pass` clears
+both current sets only when EVERY enabled project answered, so a partial read neither clears nor
+primes (`STUDIO-949` rounds 13-15): the failed project's holds SURVIVE from the last full pass and the
+previous answer stands rather than being emptied. The same holds when NO project is enabled — an
+all-paused install has nothing to poll, so the board has not been read and the gates stay closed
+instead of publishing an empty set as a settled "no hold". The cost is over-holding: one permanently
+unreadable project freezes the clear, so a label that comes OFF keeps refusing until every enabled
+project answers again — the conservative direction for a gate in front of an irreversible merge.
 These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
 here rather than implying the refusal holds while the daemon no longer owns the ticket.
 
@@ -1316,7 +1319,7 @@ quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not 
 The handed-off run is LIVE, and on a gated daemon live runs come from the RETRY path, not from
 recovery: `boot_recovery` restores no running entry (it converts every interrupted claim into an
 immediate retry), and `on_retry` is gated by the drain only — not by `validate()`, which returns
-`on_tick` at its first line. So a daemon whose config validation has failed **since boot** keeps
+before dispatch on every tick. So a daemon whose config validation has failed **since boot** keeps
 dispatching healthy runs off the last-good config while no tick ever primes, and each of their
 handoffs reaches the quorum gate. On a daemon held by one of those gates **since boot**, no selection
 pass has ever read the board, so the current-label set is not "no hold" but "nothing has looked". An
@@ -1325,29 +1328,30 @@ a drained daemon, irreversibly, how a real review round is dispatched at its pul
 held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
 therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
 ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
-both are re-offered — the watcher asks again in 120s and the reconciliation sweep next tick), the
+both are re-offered — the watcher asks again in 120s), the
 reconciliation sweep reports nothing — a false `review_divergence` WARN on the exact ticket the
 operator took over is the alarm that filter exists to prevent — and `plan_quorum` refuses the fan-out,
-logging at `WARN!` and naming the ticket because that refusal is **one-shot and unrecoverable**: the
-handoff has already landed, the run winds down, and `request_quorum` is the only feeder of the
-fan-out, so the review is dropped for good. The quorum is the one that matters most for a TICKET-mode
+logging at `WARN!`, naming the ticket and recording a lost-review advisory on the project's status
+surface (`record_lost_review`, as `give_up` does for an exhausted fan-out) because that refusal is
+**one-shot and unrecoverable**: the handoff has already landed, the run winds down, and
+`request_quorum` is the only feeder of the fan-out, so the review is dropped for good. The quorum is the one that matters most for a TICKET-mode
 install, because it is the only `labelled()` gate such an install runs: `quorum_enabled()` is
 `teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
-auto-merge branch are simply absent there. Priming means a pass actually **read the board**, not that
-a pass ran: the multi-project ladder is reached even when every project's candidate fetch failed, and
-the fetch verdict is threaded in so a pass that could not look neither clears nor primes. This is a
-deliberate conservatism for a bounded window — though on a daemon gated since boot the window is the
-whole process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy
-daemon's first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act
-after it (the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation
-sweep — which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that
-first un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the
-board the set is real and the bounds above are the ones left. Those bounds are unchanged by this:
-after any pass the set is only as fresh as that pass, so a daemon gated *after* it dispatched freezes
-the set at the last one and a label that lands during the gate is unseen until dispatch resumes. That
-is the same "as fresh as the last pass"
-property the two-writer paragraph names; the fail-closed branch closes the strictly larger "never
-looked at all" case, not this one.
+auto-merge branch are simply absent there. Priming means a pass actually **read the WHOLE board**,
+not that a pass ran: the multi-project ladder is reached even when a project's candidate fetch
+failed, and even when no project is enabled at all, and the fetch verdict is threaded in so a pass
+that could not read every enabled project neither clears nor primes. This is a deliberate
+conservatism for a bounded window — though on a daemon gated since boot the window is the whole
+process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy daemon's
+first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act after it
+(the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation sweep —
+which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that first
+un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the board
+the set is real and the bounds above are the ones left. Those bounds are unchanged by this: after any
+pass the set is only as fresh as that pass, so a daemon gated *after* it dispatched freezes the set
+at the last one and a label that lands during the gate is unseen until dispatch resumes. That is the
+same "as fresh as the last pass" property the two-writer paragraph names; the fail-closed branch
+closes the strictly larger "never looked at all" case, not this one.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes

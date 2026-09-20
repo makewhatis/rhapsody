@@ -1347,8 +1347,8 @@ impl Orchestrator {
         // The run being handed off is LIVE, and on a gated daemon live runs come from the RETRY path,
         // not from recovery: `boot_recovery` restores no running entry — it converts every interrupted
         // claim into an IMMEDIATE RETRY (`recovery.rs` `arm_immediate_retry`) — and `on_retry` is
-        // gated by the drain ONLY, not by `validate()` (which returns `on_tick` at its first line) and
-        // not by the credential preflight. The real shape is therefore a daemon whose CONFIG
+        // gated by the drain ONLY, not by `validate()` (which returns before DISPATCH on every tick)
+        // and not by the credential preflight. The real shape is therefore a daemon whose CONFIG
         // VALIDATION HAS FAILED SINCE BOOT: every tick returns before dispatch and never primes, while
         // `on_retry` keeps dispatching perfectly healthy runs off the last-good `eff`, and each of
         // their handoffs reaches this gate for the whole life of the gate (STUDIO-949 round 14). An
@@ -1360,14 +1360,20 @@ impl Orchestrator {
         //
         // This refusal DROPS the decision, and unlike the watcher's round and auto-merge gates it is
         // NOT re-offered: the handoff has already landed, the run winds down, and `request_quorum` is
-        // the only feeder of the fan-out. So it is logged at `warn!`, naming the ticket, the way
-        // `request_quorum` warns for a gone task and `give_up` posts `REVIEW QUORUM FAILED` for an
-        // undelivered fan-out. A one-shot, unrecoverable refusal filed below those two, at `debug!`,
-        // is a review lost in silence — which is the defect this branch was fixed for.
+        // the only feeder of the fan-out. So it is BOTH logged at `warn!`, naming the ticket, and
+        // recorded on the project's advisory surface (`record_lost_review`) — exactly the two things
+        // `give_up` does for a fan-out it abandoned, and for the reason its own doc gives: a `WARN`
+        // line alone is not enough, because the operator this branch is written for (config
+        // validation failing since boot) is the one most likely to be looking at the console and
+        // least likely to be reading `WARN` lines. `publish_snapshot` runs ABOVE the `validate()`
+        // early return, so that advisory reaches the console even while the dispatch half is dark.
+        // A one-shot, unrecoverable refusal filed below both, at `debug!` and nowhere else, is a
+        // review lost in silence — which is the defect this branch was fixed for.
         //
         // MUTATION: drop this branch and
         // `an_unprimed_hold_ledger_refuses_a_quorum_fan_out` reds (the un-primed daemon fans out);
-        // demote the log below `warn!` and the same test's level assertion reds.
+        // demote the log below `warn!` or delete the `record_lost_review` call and the same test
+        // reds on the level assertion or the advisory assertion respectively.
         if !ledger_primed {
             tracing::warn!(
                 issue = %re.issue.identifier,
@@ -1375,12 +1381,17 @@ impl Orchestrator {
                  is unknown; no review is requested, so this handoff's review is dropped. Re-summon \
                  the ticket once the daemon is healthy if the review is still wanted."
             );
+            self.warnings.record_lost_review(
+                &self.quorum_warning_group(re),
+                &re.issue.identifier,
+                "no selection pass has read the board, so the human-hold label set was unknown",
+            );
             return None;
         }
         // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
         // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
         // and, because the parent would then stay unmarked, fail again on the next handoff, and the
-        // next. Refusing here turns a permanent, recurring "REVIEW QUORUM FAILED" room post into
+        // next. Refusing here turns a permanent, recurring "REVIEW QUORUM ABANDONED" room post into
         // one debug line. Triage drops team-less tickets for the same reason, before spending a
         // model turn on them.
         if re.issue.team_id.is_empty() {
@@ -3166,12 +3177,14 @@ mod tests {
     //
     // MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `plan_quorum` and this
     // reds (the un-primed daemon plans a fan-out); demote the log below `warn!` and the level
-    // assertion reds.
+    // assertion reds; delete the `record_lost_review` call and the advisory assertion reds.
     #[test]
     fn an_unprimed_hold_ledger_refuses_a_quorum_fan_out() {
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
-        let re = running_entry(marked_parent(), "alice");
+        let mut re = running_entry(marked_parent(), "alice");
+        // The group the advisory lands on, so the assertion below can read it back.
+        re.project_group = "proj-a".to_string();
 
         // No selection pass has run: the ledger's label set is not an answer, so the fan-out is
         // refused even though this parent wears no hold...
@@ -3195,6 +3208,16 @@ mod tests {
             "a one-shot, unrecoverable refusal must not be filed below WARN"
         );
         assert_eq!(warned.fields.get("issue").map(String::as_str), Some("MT-1"));
+        // ...and it is recorded on a surface an operator actually looks at, exactly as `give_up`
+        // does for an exhausted fan-out: a `WARN` alone is the state STUDIO-822 decided was not
+        // enough for a strictly narrower loss. `publish_snapshot` runs ABOVE the `validate()` return,
+        // so on a config-gated-since-boot daemon this advisory reaches the console while dispatch is
+        // dark — the one surface that daemon's operator has.
+        let advisories = o.warnings.merged_for("proj-a");
+        assert!(
+            advisories.iter().any(|l| l.contains("MT-1")),
+            "the un-primed refusal must record a lost-review advisory: {advisories:?}"
+        );
 
         // ...and once a pass has looked the SAME unlabelled parent fans out, so the refusal above is
         // the missing pass and not some unrelated gate.

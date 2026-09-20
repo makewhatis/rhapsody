@@ -341,11 +341,11 @@ impl Orchestrator {
     /// before dispatching. Mirrors Go `selectDispatchMultiWithReopens`.
     ///
     /// This is the board-READ form: the caller is handing in a candidate list it fetched, so the
-    /// human-hold ledger is primed as a pass that saw the board. A production caller whose fetch may
-    /// have FAILED (the multi-project poll `continue`s past a per-project error and reaches the
-    /// ladder even when every project failed) must use
-    /// [`Self::select_dispatch_multi_after_fetch`] and pass the fetch verdict, or an empty candidate
-    /// list would mark an unknown label set as known (STUDIO-949 round 13).
+    /// human-hold ledger is primed as a pass that saw the whole board. A production caller whose
+    /// fetch may have FAILED PARTIALLY (the multi-project poll `continue`s past a per-project error)
+    /// must use [`Self::select_dispatch_multi_after_fetch`] and pass the fetch verdict, or a candidate
+    /// list missing a failed project's holds would mark an unknown label set as known
+    /// (STUDIO-949 rounds 13-15).
     ///
     /// `held_for_capacity` is the third return, carried out and stored by the `&mut self` caller
     /// exactly as in [`Orchestrator::select_dispatch_with_reopens`] (STUDIO-803) — the capacity
@@ -360,13 +360,15 @@ impl Orchestrator {
     }
 
     /// [`Self::select_dispatch_multi_with_reopens`] with the candidate FETCH VERDICT threaded in
-    /// (STUDIO-949 round 13). `read_the_board` is `true` when at least one enabled project's
-    /// candidate fetch succeeded. When it is `false` the ladder still runs — `poll_all_projects`
-    /// `continue`s past each failed project rather than returning — but the human-hold ledger is
-    /// neither cleared nor primed: an un-read board must not look like an empty one, or every
-    /// fail-closed decision gate a gated daemon has reopens on a tracker outage that started before
-    /// boot. The legacy single-project ladder has no such parameter because its failed fetch returns
-    /// BEFORE the ladder, so it is `true` by construction.
+    /// (STUDIO-949 rounds 13-15). `read_the_board` is `true` when EVERY enabled project's candidate
+    /// fetch succeeded. When it is `false` — any project failed, or no project is enabled at all —
+    /// the ladder still runs (`poll_all_projects` `continue`s past each failed project rather than
+    /// returning) but the human-hold ledger is neither cleared nor primed: a partly-read board must
+    /// not look like an empty one, or every fail-closed decision gate a gated daemon has reopens on a
+    /// tracker outage that started before boot, and a wholly unpolled install (all projects paused)
+    /// would publish an empty set as a settled "no hold". The legacy single-project ladder has no
+    /// such parameter because its failed fetch returns BEFORE the ladder, so it is `true` by
+    /// construction.
     pub fn select_dispatch_multi_after_fetch(
         &self,
         mut tagged: Vec<TaggedIssue>,

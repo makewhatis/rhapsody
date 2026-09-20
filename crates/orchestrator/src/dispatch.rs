@@ -173,12 +173,15 @@ struct HumanHoldState {
     /// auto-promote pass observes only Backlog dependents, a partial view, and must not be able to
     /// make an unknown label set look known.
     ///
-    /// It is deliberately "read the board", not "ran a pass" (STUDIO-949 round 13): a `projects:`
-    /// install's ladder is reached unconditionally even when EVERY project's candidate fetch failed
-    /// (`poll_all_projects` `continue`s past each error), so a pass that saw no candidate because it
-    /// could not fetch is exactly the unknown-set case this latch exists to forbid. The fetch verdict
-    /// is threaded in through [`HumanHoldLedger::begin_pass`]; a pass that could not look neither
-    /// clears nor primes, leaving the last good answer (or the un-primed state) standing.
+    /// It is deliberately "read the WHOLE board", not "ran a pass" (STUDIO-949 rounds 13-15): a
+    /// `projects:` install's ladder is reached unconditionally even when a project's candidate fetch
+    /// failed (`poll_all_projects` `continue`s past each error), and `begin_pass` clears both sets
+    /// WHOLESALE with no per-project scope. So a pass that could only see SOME of the board is the
+    /// unknown-set case this latch exists to forbid — priming on it would erase the holds of the
+    /// project that failed and mark the result known. The verdict is threaded in through
+    /// [`HumanHoldLedger::begin_pass`], and it is "EVERY enabled project answered", with an
+    /// all-paused install (`zero`) counting as NOT read; a pass that could not look neither clears
+    /// nor primes, leaving the last good answer (or the un-primed state) standing.
     primed: bool,
 }
 
@@ -198,13 +201,16 @@ impl HumanHoldLedger {
     /// fail-closed decision gates (the ticketless watcher's round and auto-merge gates, the
     /// reconciliation sweep's held-row filter, the ticket-mode handoff quorum) read an answer.
     ///
-    /// `read_the_board` is the candidate fetch's verdict (STUDIO-949 round 13). When it is `false`
-    /// the pass could not look — on a `projects:` install where every project's fetch failed, the
-    /// ladder still runs on an empty candidate list — so this does NOTHING: the sets are neither
-    /// cleared nor primed, and the last answer (or the un-primed state) stands. Clearing on a failed
-    /// fetch would reopen every gate by emptying the set; priming would mark an unknown set known.
-    /// The legacy single-tracker path passes `true` by construction (its failed fetch returns before
-    /// the ladder). No other method sets `primed`; see [`HumanHoldState::primed`].
+    /// `read_the_board` is the candidate fetch's verdict (STUDIO-949 rounds 13-15): `true` when
+    /// EVERY enabled project answered. When it is `false` the pass could not see the whole board —
+    /// any project's fetch failed, or there are no enabled projects at all (an all-paused install) —
+    /// so this does NOTHING: the sets are neither cleared nor primed, and the last answer (or the
+    /// un-primed state) stands. Clearing on a partial fetch would reopen every gate for the failed
+    /// project's holds by emptying the set; priming would mark an unknown set known. The over-hold
+    /// cost of the all-projects predicate is deliberate: a label that comes OFF keeps refusing while
+    /// any project is unreadable. The legacy single-tracker path passes `true` by construction (its
+    /// failed fetch returns before the ladder). No other method sets `primed`; see
+    /// [`HumanHoldState::primed`].
     pub(crate) fn begin_pass(&self, read_the_board: bool) {
         if !read_the_board {
             return;

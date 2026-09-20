@@ -283,9 +283,11 @@ impl WarningsState {
         m.enrich.remove(group);
     }
 
-    /// Records a review fan-out this daemon retried to exhaustion and gave up on (STUDIO-822), so
-    /// the round that will never be reviewed is visible somewhere an operator looks instead of only
-    /// in a `WARN` line. Called from the off-loop quorum task.
+    /// Records a review fan-out that will never be delivered, so the round that will never be
+    /// reviewed is visible somewhere an operator looks instead of only in a `WARN` line. Two
+    /// producers: the off-loop quorum task's `give_up`, for a fan-out it retried to exhaustion
+    /// (STUDIO-822), and `plan_quorum`'s un-primed fail-closed refusal, which drops the decision
+    /// before anything is created (STUDIO-949 round 16) — the advisory wording covers both.
     ///
     /// A LOCAL surface deliberately: the fan-out fails because the tracker is unreachable, so a
     /// comment on the ticket — the other obvious place to put it — is the one write guaranteed to
@@ -371,9 +373,13 @@ impl WarningsState {
         // Appended after the enrichment producer, for the same golden-ordering reason (STUDIO-822).
         // One line per abandoned fan-out rather than one summary line: the identifier is the whole
         // actionable content, and collapsing them would name none of them.
+        // The wording must fit BOTH producers: `give_up`'s exhausted retries and `plan_quorum`'s
+        // un-primed fail-closed refusal, which drops the decision before anything is created. "will
+        // never be delivered" is true of each; "abandoned after every retry failed" was only true of
+        // the first (STUDIO-949 round 16).
         for l in m.lost_review.get(group).into_iter().flatten() {
             out.push(format!(
-                "the review fan-out for {} was abandoned after every retry failed — {}. That round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
+                "the review fan-out for {} will never be delivered — {}. That round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
                 l.identifier, l.why
             ));
         }
