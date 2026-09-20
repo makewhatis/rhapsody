@@ -9,7 +9,8 @@
 //! Rhapsody's reviewers are dispatched by the daemon, not by a notification, so a draft buys
 //! nothing — and it costs everything: [`crate::runautomerge`] refuses a draft outright, and nothing
 //! in the pipeline ever marks one ready. On 2026-09-17 makewhatis/booch#537 sat approved and green
-//! for **4h55m** for exactly this reason, refused 361 times, until a human marked it ready by hand.
+//! for **4h55m** for exactly this reason, auto-merge refusing it 146 times, until a human marked it
+//! ready by hand.
 //!
 //! The obvious fix — have the daemon un-draft it — is the one this module must not take.
 //! **Un-drafting is the author's declaration that the work is ready for review.** Having the daemon
@@ -22,11 +23,11 @@
 //! # The run has finished by construction
 //!
 //! The trigger is *run finished **and** still draft*, and "finished" means the HANDOFF, not merely
-//! the process exiting. That is enforced structurally rather than by a flag: the only pull requests
-//! the daemon ever observes are the ones in [`crate::reviewintro`]'s watch set, and a row exists
-//! there only because a run handed its pull request over ([`crate::reviewintro`]) or the adoption
-//! sweep found a parked one ([`crate::reviewadopt`]). A run that merely exits without a handoff
-//! introduces no row and is never seen here.
+//! the process exiting. That is enforced structurally rather than by a flag: the poke only applies
+//! to a pull request with an ORIGIN TICKET, so a draft is summonable only when [`crate::reviewintro`]
+//! recorded a run handing its pull request over or [`crate::reviewadopt`] adopted a parked one. A run
+//! that merely exits without a handoff introduces no row, and a `console:` row a `reviewconsole`
+//! merge introduced carries no ticket to reopen, so it is never poked either.
 //!
 //! The one guard that remains is [`Orchestrator::ticket_run_live`](crate::orchestrator::Orchestrator):
 //! a draft is entirely normal mid-run, so a pull request whose author is running RIGHT NOW is never
@@ -67,11 +68,7 @@ use rhapsody_config::room::{Message, RoomLog};
 
 use crate::ghsummons::PrCommentSink;
 use crate::prstate::PrCoord;
-
-/// The `from` every escalation post is host-stamped with. Same value as
-/// `crate::triage::MANAGER_IDENTITY` and the adjudicator's, restated rather than imported because
-/// the manager is one function however many of its halves exist.
-pub const MANAGER_IDENTITY: &str = "@manager";
+use crate::triage::MANAGER_IDENTITY;
 
 /// How many distinct HEADS one pull request may be poked at before the daemon stops poking and asks
 /// a human.

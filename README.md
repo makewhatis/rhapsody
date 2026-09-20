@@ -1346,8 +1346,8 @@ guardrail rather than the surface.
 A draft pull request exists to withhold it from reviewers until it is worth their attention, but
 Rhapsody dispatches its reviewers itself, so a draft buys nothing and costs everything:
 `runautomerge` refuses a draft outright (above), and nothing in the pipeline ever marks one ready. On
-2026-09-17 makewhatis/booch#537 sat approved and green for 4h55m, refused 361 times, until a human
-marked it ready by hand.
+2026-09-17 makewhatis/booch#537 sat approved and green for 4h55m, auto-merge refusing it 146 times,
+until a human marked it ready by hand.
 
 **The daemon does not mark it ready.** Un-drafting is the author's declaration that the work is ready
 for review; doing it silently would turn a deliberate signal into a no-op and remove the only way an
@@ -1358,18 +1358,19 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 
 | A finished run's still-draft pull request | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| detection | none (the feature does not exist) | the ticketless review watch set: a row exists only because a run HANDED OVER its pull request, which is what "finished" means here |
+| detection | none (the feature does not exist) | the ticketless review watch set: a row carrying an origin ticket is one a run HANDED OVER (or the adoption sweep adopted), which is what "finished" means here; a console-introduced row has none and is never poked |
 | action | n/a | a summons comment naming the pull request and the action; the daemon never marks it ready |
 | frequency | n/a | **once per head** — the same head is never poked twice, and a per-tick poke is the re-dispatch loop STUDIO-956 bounds |
 | if ignored | n/a | **two bounds**: after three distinct heads, or after an hour at one static head, it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
 | default | n/a | **inert**: silent with Teams off, off the ticketless path (there is no watch set to observe), and on a healthy board |
 
-**The trigger is the handoff, not the process exiting.** The only pull requests the daemon observes
-are the ones in the ticketless watch set, and a row exists there only because a run handed its pull
-request over or the adoption sweep found a parked one — so an observed draft is by construction one
-whose author's run has stopped. The one remaining guard is a LIVE author run: a draft is entirely
-normal mid-run, so a pull request whose author is running right now (the re-engaged run a review's
-findings reopened) is never poked.
+**The trigger is the handoff, not the process exiting.** A watch row comes from a run handing its
+pull request over, from the adoption sweep finding a parked one, or from a console merge introducing
+one; only the first two carry an origin ticket, and the poke's summons reopens a TICKET's run, so a
+console-introduced row is never poked even if it is a draft. So an observed draft this feature acts
+on is by construction one whose author's run has stopped. The one remaining guard is a LIVE author
+run: a draft is entirely normal mid-run, so a pull request whose author is running right now (the
+re-engaged run a review's findings reopened) is never poked.
 
 **The poking is bounded on two axes, because the incident shape is a static head.** An author who
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` distinct heads; an author who does
