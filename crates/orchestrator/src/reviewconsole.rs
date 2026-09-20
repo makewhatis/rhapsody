@@ -357,14 +357,21 @@ impl Orchestrator {
             // ...and the unreadability record, keyed by coordinate for `retire_review_pr`'s reason:
             // left behind it would outlive the pull request it names (STUDIO-950 round 14).
             //
-            // Sits under `dropped > 0`, unlike the per-row `review_capacity_held` removal above: a
-            // dismissal whose every store drop FAILED left every row watched, so the failure count
-            // is still a live fact about a pull request the daemon still polls and nothing is
-            // removed. Once AT LEAST one row is gone the operator has said they are not waiting on
-            // it. In the mixed case — some rows dropped, some failed — the surviving row is still
-            // polled but loses the record, restarting its one-attempt grace period; that can only
-            // delay a denial, never invent one, so it is preferred to keeping a dismissed pull
-            // request's record named forever.
+            // Sits under `dropped > 0`, unlike the per-row removals above: those run whether or not
+            // the store drop succeeds (a row the operator is not waiting on must not keep
+            // `REVIEW_UNASSIGNABLE_WARNING` latched, or its hold annotated), while this record and
+            // the churn budget are keyed by coordinate rather than by row and so cannot be retired
+            // per row. A dismissal whose every store drop FAILED therefore leaves the failure count
+            // standing, which is still a live fact about a pull request the daemon continues to
+            // poll; once AT LEAST one row is gone the operator has said they are not waiting on it.
+            // In the mixed case — some rows dropped, some failed — the surviving row is still polled
+            // but loses the record, restarting its one-attempt grace period. That can only DELAY a
+            // denial, never invent one (the count climbs again from zero), so it is preferred to
+            // keeping a dismissed pull request's record named forever. It also drops the
+            // `capacity_unreadable` ANNOTATION from the surviving row's report until the count
+            // climbs back to `UNREADABLE_ATTEMPTS_TO_DROP_HOLD`, so that row reads as an ordinary
+            // divergence for one grace period while `gh` still refuses the coordinate — a delay of
+            // the same page, which is why this is the smaller harm, not a harm-free choice.
             self.review_watch_unreadable.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }

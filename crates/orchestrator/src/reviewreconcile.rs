@@ -232,9 +232,15 @@ pub struct Divergence {
     /// answering for — and it is mutually exclusive with `capacity_held`, because the count reaching
     /// the threshold is exactly what makes [`Orchestrator::fresh_capacity_hold`] deny the hold.
     ///
-    /// It exists so the sweep can say WHY a hold it still has in memory is not being named: GitHub
+    /// It exists so the sweep can say WHY a row is not being reported as a capacity hold — GitHub
     /// stopped answering for this coordinate, which is a fact the daemon knows and previously
     /// declined to state, falling through instead to the false "nothing has reported it blocked".
+    /// The common case is a hold it still has in memory whose freshness is denied for that reason,
+    /// but the annotation is filled from the per-coordinate count unconditionally (not gated on a
+    /// hold existing), so a row that never held a slot — including an approved-and-open pull request
+    /// awaiting a merge — reports the silence too (STUDIO-950 round 20). The sweep's own local
+    /// determination is unaffected: it still reports the divergence under its ordinary kind, this
+    /// only states a fact the daemon already has — GitHub was refusing the coordinate.
     pub capacity_unreadable: Option<u32>,
 }
 
@@ -366,6 +372,10 @@ pub(crate) fn reconcile_pr(
                 // A capacity hold defers a ROUND; it has nothing to say about an approved-and-open
                 // pull request, whose next move is a merge.
                 capacity_held: None,
+                // The unreadability annotation is NOT a hold and does not transfer that reasoning:
+                // "GitHub stopped answering for this coordinate" is exactly as true, and more
+                // alarming, for a pull request whose next move is a merge. Filled in by the caller
+                // (which has the per-coordinate count [`reconcile_pr`] deliberately does not).
                 capacity_unreadable: None,
             });
         }
@@ -603,6 +613,15 @@ impl Orchestrator {
                 // off, or this head never reached a gate) both fall back to the plain wording.
                 if d.kind == DivergenceKind::ApprovedStillOpen {
                     d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
+                    // The approved-and-open arm hardcodes `capacity_held` to `None` (a hold defers a
+                    // ROUND, and this row's next move is a merge), but that reasoning does not extend
+                    // to the unreadability annotation: GitHub refusing the coordinate is exactly as
+                    // true for a row awaiting a merge, and during a `gh` outage the auto-merge ledger
+                    // stays empty — the outage that sets `review_watch_unreadable` is the same one
+                    // that keeps `peek` from answering — so `(None, None)` is the ordinary arm here,
+                    // not the unlucky one. Without this the row reports the false "nothing has
+                    // reported it blocked" page the watcher refutes every tick (STUDIO-950 round 20).
+                    d.capacity_unreadable = self.unreadable_attempts(pr);
                 }
                 Some(d)
             })
@@ -2338,6 +2357,86 @@ mod store_tests {
             !warn.message.contains("Auto-merge has declined"),
             "no ledger entry must never invent a decline count: {}",
             warn.message
+        );
+    }
+
+    /// STUDIO-950 (round 20, alice's blocking finding; jimmy's round-20 BLOCKING 1): the unreadable
+    /// annotation is not a capacity HOLD, so its suppression of the false page cannot be justified
+    /// by the approved-and-open arm's `capacity_held: None`. During a `gh` outage the auto-merge
+    /// ledger stays empty — the outage that sets `review_watch_unreadable` is the same one that
+    /// keeps `peek` from answering — so `(None, None)` is the ORDINARY arm for an approved row, and
+    /// without the annotation it reports "nothing has reported it blocked" while the watcher refutes
+    /// that every tick.
+    ///
+    /// Mutation check: delete the `d.capacity_unreadable = self.unreadable_attempts(pr)` line in
+    /// [`Orchestrator::reconcile_review_divergence`] and this reds on the fallback wording, its
+    /// advisory reverting to [`REVIEW_DIVERGENCE_WARNING`].
+    #[test]
+    fn an_approved_row_whose_coordinate_is_unreadable_is_reported_as_unreadable() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+        // No ledger: the `gh` outage that made the coordinate unreadable is the same one that kept
+        // auto-merge from evaluating the pull request at all.
+        assert!(o.automerge_ledger.is_none());
+        o.review_watch_unreadable.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            UNREADABLE_ATTEMPTS_TO_DROP_HOLD,
+        );
+
+        // See the sibling tests for why the warm-up call exists: this callsite is exercised by no
+        // other test, so it needs registration before the real, captured call.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("could not be read"),
+            "an approved row's unreadable coordinate must be named, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the unreadable line replaces the fallback wording, not sits beside it: {}",
+            warn.message
+        );
+
+        let projects = o.project_statuses();
+        assert!(
+            projects.iter().any(|p| p
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_DIVERGENCE_UNREADABLE_WARNING)),
+            "the advisory must name the unreadable coordinate, got {projects:?}"
+        );
+        assert!(
+            !projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "it must not also claim nothing has reported it blocked, got {projects:?}"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["capacity_unreadable"]["attempts"],
+            UNREADABLE_ATTEMPTS_TO_DROP_HOLD
         );
     }
 }
