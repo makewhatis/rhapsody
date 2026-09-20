@@ -242,6 +242,15 @@ pub trait ReviewWatchSink: Send + Sync {
         observed: Vec<PrObservation>,
         slots: Option<i64>,
     ) -> (ReviewSweepReport, i64);
+    /// Reports the coordinates whose `gh` lookup FAILED this tick (STUDIO-950), so the control task
+    /// can stop trusting a capacity hold for a pull request it can no longer read.
+    ///
+    /// Separate from [`Self::sweep`] rather than a field on it because a failure is a TICK-level
+    /// fact: a coordinate whose lookup failed yields no observation at all, so there is no
+    /// hand-back of its own to carry it, and it must still be reported on a tick where EVERY lookup
+    /// failed — the watcher hands no observation back at all then. The same §16 master gate as
+    /// every other entry point: a Teams-off daemon runs no tick and reports nothing.
+    async fn unreadable(&self, failed: Vec<PrCoord>);
     /// Merges ONE pull request whose gates the control task cleared (STUDIO-874).
     ///
     /// On the sink for [`Self::finish`]'s reason: the remaining gates are GitHub round trips and
@@ -301,6 +310,9 @@ impl ReviewWatchSink for ControlWatchSink {
         slots: Option<i64>,
     ) -> (ReviewSweepReport, i64) {
         self.control.review_sweep(observed, slots).await
+    }
+    async fn unreadable(&self, failed: Vec<PrCoord>) {
+        self.control.review_unreadable(failed).await
     }
     async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
         let Some(deps) = self.automerge.as_ref() else {
@@ -446,13 +458,21 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // and holding the cursor back for it would starve everything behind it instead.
         cursor = start.saturating_add(crate::prstate::MAX_PR_STATE_CALLS_PER_TICK);
         let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &rotated).await;
-        if sweep.deferred > 0 || sweep.failed > 0 {
+        if sweep.deferred > 0 || !sweep.failed.is_empty() {
             tracing::debug!(
                 observed = sweep.observed.len(),
                 budget_deferred = sweep.deferred,
-                failed = sweep.failed,
+                failed = sweep.failed.len(),
                 "ticketless review watcher: not every watched pull request answered this tick"
             );
+        }
+        // Report the failures BEFORE the observations (STUDIO-950 round 14): the control task must
+        // stop trusting a capacity hold for a pull request GitHub would not answer for, and a tick
+        // on which EVERY lookup failed hands back no observation at all — so this is the only place
+        // the failure reaches it. A success this tick is the other direction and clears the record
+        // on the control task's side (`handle_review_sweep_slots`).
+        if !sweep.failed.is_empty() {
+            deps.sink.unreadable(sweep.failed).await;
         }
         if sweep.observed.is_empty() {
             continue;
@@ -688,8 +708,17 @@ impl Orchestrator {
         // only FILTERS on read and never removes, so they are still in the map and re-stamping
         // liveness here would re-date every one of them — RESURRECTING a round nothing has
         // re-observed since before the outage (STUDIO-950 round 12). A first sweep after a gap
-        // therefore DROPS them rather than re-dating them. The gap is stamp-to-stamp, so a healthy
-        // tick's per-observation hand-backs are microseconds apart and never trip it.
+        // therefore DROPS them rather than re-dating them.
+        //
+        // A HEALTHY watcher can never trip the gap condition, and the reason is structural rather
+        // than a matter of the gaps happening to be small. The gap is stamp-to-stamp, and with
+        // `I = PR_STATE_POLL_INTERVAL`, `N = MAX_PR_STATE_CALLS_PER_TICK` and
+        // `T = GH_EXEC_TIMEOUT`, the worst healthy gap is the interval, one full lookup phase
+        // (`N*T`) and the ONE bounded pre-dispatch re-read that opens the next phase (`T`) —
+        // `I + N*T + T` — while the TTL budgets `I + 2*N*T`. So `gap <= TTL` reduces to `T <= N*T`,
+        // true for every `N >= 1`: the TTL always reserves a whole second phase that a healthy gap
+        // cannot spend. (The two hand-backs WITHIN a tick are separated by at most one such bounded
+        // `gh` call, which is well inside the same bound.)
         let swept_now = (self.now)();
         if let Some(prev) = self.review_watch_swept {
             // A clock that went backwards is not continuity either: treat it as a gap, so the holds
@@ -714,6 +743,12 @@ impl Orchestrator {
                 return (report, slots.unwrap_or(UNCAPPED_SLOTS));
             }
         };
+        // A coordinate that ANSWERED is readable again (STUDIO-950 round 14): drop the failure
+        // record its failed lookups left, so a round it still holds can be named again and a
+        // failure run that ended does not leave a stale entry behind.
+        for obs in observed {
+            self.review_watch_unreadable.remove(&obs.pr);
+        }
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
         // tick would otherwise spawn twenty agents past a cap the operator set. TWO bounds compose
@@ -794,6 +829,29 @@ impl Orchestrator {
             }
         }
         (report, slots)
+    }
+
+    /// Records that a tick's `gh` lookup FAILED for every coordinate in `failed` (STUDIO-950
+    /// round 14). The reconciliation sweep reads this to stop trusting a capacity hold for a pull
+    /// request GitHub would not answer for: the watcher's global liveness
+    /// ([`Orchestrator::review_watch_swept`]) is advanced by any ANSWERING sibling, so on its own it
+    /// cannot tell a healthy unreached round from one whose pull request has become unreadable.
+    ///
+    /// The FIRST failure of a run is what is timestamped (`or_insert`), not the latest: the clock
+    /// that has to be reached is "how long since this pull request last answered", and refreshing
+    /// the stamp on every failure would make a permanently failing pull request look permanently
+    /// fresh. A success clears the entry (`handle_review_sweep_slots`), so the next failure starts a
+    /// fresh run.
+    pub(crate) fn handle_review_unreadable(&mut self, failed: &[PrCoord]) {
+        if !self.review_ticketless_enabled() {
+            return; // §16
+        }
+        let now = (self.now)();
+        for pr in failed {
+            self.review_watch_unreadable
+                .entry(pr.clone())
+                .or_insert(now);
+        }
     }
 
     /// The daemon-wide dispatch budget available to one watcher tick. Unset, that is
@@ -913,6 +971,9 @@ impl Orchestrator {
         self.review_rounds.remove(&churn_key(pr));
         // And what was announced about its auto-merge plan, for the first two of those reasons.
         self.auto_merge_announced.remove(&churn_key(pr));
+        // The failure record goes too (STUDIO-950 round 14): keyed by coordinate, it would otherwise
+        // outlive the pull request it names and sit in the map for the daemon's whole life.
+        self.review_watch_unreadable.remove(pr);
         for id in retired_ids {
             self.review_unassignable.remove(&id);
             // A round cannot be held for capacity once its pull request has left the watch set
@@ -1547,6 +1608,18 @@ impl ControlHandle {
             r = rx => r.unwrap_or_else(|_| (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS))),
             _ = lifetime.cancelled() => (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS)),
         }
+    }
+
+    /// Reports the coordinates whose `gh` lookup failed this tick to the control task (STUDIO-950
+    /// round 14). Fire-and-forget: it records control-owned state, but nothing else in the same
+    /// tick depends on the write having landed, and the unbounded event channel preserves its order
+    /// ahead of the observations that tick hands back. A gone control task drops it silently, which
+    /// is what a failed send already means for [`Self::review_sweep`].
+    pub(crate) async fn review_unreadable(&self, failed: Vec<PrCoord>) {
+        if failed.is_empty() {
+            return;
+        }
+        let _ = self.events.send(Event::ReviewUnreadable { failed });
     }
 }
 
@@ -3774,6 +3847,129 @@ mod tests {
         );
     }
 
+    /// STUDIO-950 (round 14, sol's blocker): a pull request whose `gh` lookup keeps FAILING must age
+    /// out its capacity hold, even while an answering sibling keeps the watcher's global liveness
+    /// fresh.
+    ///
+    /// The global stamp ([`Orchestrator::review_watch_swept`]) advances on ANY answering pull
+    /// request, so a sibling that answers every tick kept a hold live for a pull request GitHub had
+    /// stopped answering for — indefinitely, after its recorded holders had all exited. The
+    /// per-coordinate failure record ([`Orchestrator::handle_review_unreadable`]) is what lets the
+    /// sweep tell a healthy unreached round from an unreadable one. The TTL grace, rather than an
+    /// immediate drop, keeps one transient rate-limit from blinking a live annotation off.
+    ///
+    /// Mutation check: drop the `review_watch_unreadable` test in `fresh_capacity_hold` and this reds
+    /// — the hold stays named past the TTL on the answering sibling's liveness alone.
+    #[test]
+    fn an_unreadable_pull_request_ages_out_its_capacity_hold() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        let ttl_secs = i64::try_from(CAPACITY_HOLD_TTL.as_secs()).expect("ttl");
+        let base = chrono::Utc::now();
+        o.now = Box::new(move || base);
+
+        // The last read that ANSWERED records the hold; from here `#31` stops answering.
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1);
+        o.handle_review_unreadable(&[coord(31)]);
+        let id31 = review_key(OWNER, REPO, 31, "bob");
+
+        // Half a TTL of unreadability: the grace holds, so a transient failure does not blink the
+        // annotation. `#32` answers this tick, keeping the watcher's global liveness fresh — the
+        // mechanism that used to keep the stale hold alive.
+        let half = base + chrono::Duration::seconds(ttl_secs / 2);
+        o.now = Box::new(move || half);
+        o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], None);
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences()[0].capacity_held.map(|h| h.holders),
+            Some(4),
+            "within the TTL grace the hold is still named"
+        );
+
+        // Past a full TTL of unreadability it stops being named, and stays gone while the failures
+        // continue and `#32` keeps answering.
+        let later = base + chrono::Duration::seconds(ttl_secs + 1);
+        o.now = Box::new(move || later);
+        o.handle_review_unreadable(&[coord(31)]);
+        o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], None);
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "the owed round still reports"
+        );
+        assert!(
+            o.review_divergences()[0].capacity_held.is_none(),
+            "a pull request GitHub has not answered for is not a live capacity hold"
+        );
+        assert!(
+            o.review_capacity_held.contains_key(&id31),
+            "the record itself is kept; only its freshness is denied"
+        );
+
+        // Recovery: `#31` answers again and is still deferred, so the hold is named again — a
+        // success clears the failure record, not merely the freshness check.
+        o.handle_review_sweep_slots(&[open_at(31, HEAD_A)], None);
+        assert!(
+            !o.review_watch_unreadable.contains_key(&coord(31)),
+            "an answering pull request clears its failure record"
+        );
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences()[0].capacity_held.map(|h| h.holders),
+            Some(4),
+            "an answering pull request's hold is named again"
+        );
+    }
+
+    /// STUDIO-950 (round 14, alice's non-blocking 2): the backwards-clock branch is a deliberate
+    /// behavioural choice with its own comment — a clock that went backwards is not continuity — and
+    /// this pins it. The gap is computed from a negative duration, whose `to_std()` fails and takes
+    /// the `unwrap_or(CAPACITY_HOLD_TTL)` arm, so the holds are dropped.
+    ///
+    /// Mutation check: change `.unwrap_or(CAPACITY_HOLD_TTL)` to `.unwrap_or(Duration::ZERO)` in
+    /// `handle_review_sweep_slots` and this reds — the negative gap no longer reads as a gap and the
+    /// holds are retained.
+    #[test]
+    fn a_backwards_clock_drops_a_capacity_hold() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+
+        let base = chrono::Utc::now();
+        o.now = Box::new(move || base);
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1);
+        assert!(
+            !o.review_capacity_held.is_empty(),
+            "precondition: the sweep recorded a hold"
+        );
+
+        let earlier = base - chrono::Duration::hours(1);
+        o.now = Box::new(move || earlier);
+        o.handle_review_sweep_slots(&[], None);
+
+        assert!(
+            o.review_capacity_held.is_empty(),
+            "a clock that went backwards is not continuity; the holds must be dropped"
+        );
+    }
+
     /// STUDIO-950: [`CAPACITY_HOLD_TTL`]'s LOWER bound — the half the stale test above cannot see,
     /// because it only ever advances past the constant. A hold is recorded partway through a tick
     /// and the reconciliation sweep may read it only after the watcher has finished the rest of that
@@ -4065,6 +4261,8 @@ mod tests {
         finished: Arc<Mutex<Vec<crate::reviewdone::ReviewDonePlan>>>,
         /// The auto-merges the task asked for, in order (STUDIO-874).
         merged: Arc<Mutex<Vec<crate::automerge::AutoMergePlan>>>,
+        /// The coordinates the task reported as unreadable, across every tick (STUDIO-950 round 14).
+        unreadable: Arc<Mutex<Vec<PrCoord>>>,
     }
 
     #[async_trait]
@@ -4082,6 +4280,12 @@ mod tests {
             self.seen.lock().expect("seen lock").push(observed);
             self.done.notify_one();
             (self.hand_back.clone(), 0)
+        }
+        async fn unreadable(&self, failed: Vec<PrCoord>) {
+            self.unreadable
+                .lock()
+                .expect("unreadable lock")
+                .extend(failed);
         }
         async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
             self.merged.lock().expect("merged lock").push(plan);
@@ -4110,6 +4314,65 @@ mod tests {
                 head_repo: format!("{OWNER}/{REPO}"),
             }))
         }
+    }
+
+    /// A [`PrStateSource`] that never answers — the per-pull-request lookup failure STUDIO-950
+    /// round 14 exists for.
+    struct FailingSource;
+
+    #[async_trait]
+    impl PrStateSource for FailingSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            Err("gh: API rate limit exceeded".into())
+        }
+    }
+
+    /// STUDIO-950 round 14: one tick's FAILED lookups reach the control task, so a capacity hold for
+    /// a pull request GitHub would not answer for stops being trusted. A failure yields no
+    /// observation, so this is the only channel that can carry it — and it must fire even on a tick
+    /// where EVERY lookup failed and no observation is handed back.
+    ///
+    /// Mutation check: drop the `deps.sink.unreadable(..)` call in `run_review_watch_task` and this
+    /// reds with an empty recorded list.
+    #[tokio::test(start_paused = true)]
+    async fn the_task_reports_the_coordinates_github_would_not_answer_for() {
+        let unreadable = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let signal = CancelSignal::new();
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FailingSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: Arc::new(FakeSink {
+                watched: vec![coord(12), coord(13)],
+                seen: Arc::clone(&seen),
+                done: Arc::clone(&done),
+                unreadable: Arc::clone(&unreadable),
+                ..FakeSink::default()
+            }),
+        };
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        tokio::time::sleep(crate::prstate::PR_STATE_POLL_INTERVAL * 2).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let reported = unreadable.lock().expect("unreadable lock").clone();
+        assert!(
+            reported.contains(&coord(12)) && reported.contains(&coord(13)),
+            "every coordinate whose lookup failed must be reported, got {reported:?}"
+        );
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "a failed lookup is not an observation"
+        );
     }
 
     /// The task's whole shape: it asks the control task what to poll, asks GitHub about exactly
@@ -4407,6 +4670,12 @@ mod tests {
             self.done.notify_one();
             (report, left)
         }
+        async fn unreadable(&self, failed: Vec<PrCoord>) {
+            self.orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_unreadable(&failed);
+        }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
     }
@@ -4645,6 +4914,12 @@ mod tests {
             self.done.notify_one();
             (report, left)
         }
+        async fn unreadable(&self, failed: Vec<PrCoord>) {
+            self.orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_unreadable(&failed);
+        }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
     }
@@ -4790,6 +5065,12 @@ mod tests {
             let _ = self.handed.send(());
             (report, left)
         }
+        async fn unreadable(&self, failed: Vec<PrCoord>) {
+            self.orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_unreadable(&failed);
+        }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
     }
@@ -4907,6 +5188,12 @@ mod tests {
             let _ = self.handed.send(());
             *self.dispatched.lock().expect("dispatched lock") += report.dispatched;
             (report, left)
+        }
+        async fn unreadable(&self, failed: Vec<PrCoord>) {
+            self.orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_unreadable(&failed);
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}

@@ -633,6 +633,20 @@ pub struct Orchestrator {
     /// freshness only filters a hold on read, and re-stamping liveness would resurrect a round
     /// nothing had re-observed since before the outage (STUDIO-950 round 12).
     pub(crate) review_watch_swept: Option<DateTime<Utc>>,
+    /// The pull requests whose most recent `gh` lookup FAILED, timestamped with the FIRST failure of
+    /// the current run (STUDIO-950 round 14). Keyed by COORDINATE, not by review id: one lookup
+    /// answers for every reviewer row of a pull request, so a failure there makes every one of its
+    /// holds unconfirmable.
+    ///
+    /// It exists because [`Orchestrator::review_watch_swept`] alone cannot distinguish a healthy
+    /// round the rotating cursor has not reached from one whose pull request GitHub has stopped
+    /// answering for. The watcher stamps its global liveness on every tick that answers ANYTHING, so
+    /// one answering sibling keeps a stale hold fresh indefinitely — the stale-holder-count defect
+    /// this round closes. A failure is recorded here, a success removes it, and
+    /// [`Orchestrator::fresh_capacity_hold`](crate::reviewreconcile) drops a hold whose coordinate
+    /// has gone unanswered for `CAPACITY_HOLD_TTL`. The grace, rather than an immediate drop, keeps
+    /// one transient rate-limit from blinking a live annotation off and on for a single sweep.
+    pub(crate) review_watch_unreadable: HashMap<crate::prstate::PrCoord, DateTime<Utc>>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -909,6 +923,7 @@ impl Orchestrator {
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
             review_watch_swept: None,
+            review_watch_unreadable: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,

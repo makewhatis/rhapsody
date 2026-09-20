@@ -527,6 +527,7 @@ impl Orchestrator {
                 ticket: ticket.clone(),
                 open: row.open,
                 capacity_held: self.fresh_capacity_hold(
+                    &pr,
                     &review_key(
                         &row.key.owner,
                         &row.key.repo,
@@ -595,11 +596,39 @@ impl Orchestrator {
     /// any sweep (no liveness stamp yet) falls back to its own `recorded`; no PRODUCTION hold can be
     /// in that state (the watcher stamps before it ever inserts a hold), so the fallback exists for
     /// this module's own fixtures, which insert holds directly.
-    fn fresh_capacity_hold(&self, id: &str, now: DateTime<Utc>) -> Option<CapacityHold> {
+    ///
+    /// The global stamp alone is not enough (STUDIO-950 round 14): it advances whenever ANY watched
+    /// pull request answers, so a sibling keeps a hold fresh for a pull request GitHub has stopped
+    /// answering for. `review_watch_unreadable` carries that per-coordinate fact — the moment the
+    /// pull request last STOPPED answering — and a hold whose coordinate has gone unanswered for a
+    /// full TTL is not a wait anything is still confirming. The TTL grace, rather than an immediate
+    /// drop, keeps one transient lookup failure from blinking a live annotation off for a sweep.
+    fn fresh_capacity_hold(
+        &self,
+        pr: &PrCoord,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<CapacityHold> {
         let hold = self.review_capacity_held.get(id)?;
         let swept = self.review_watch_swept.unwrap_or(hold.recorded);
         let age = now.signed_duration_since(swept).to_std().ok()?;
-        (age < CAPACITY_HOLD_TTL).then_some(*hold)
+        if age >= CAPACITY_HOLD_TTL {
+            return None;
+        }
+        // A pull request whose lookup has been failing for a full TTL is not one the watcher can be
+        // said to be holding. A stamp in the future (a clock that went backwards) is not continuity
+        // either, so it reads as unanswered.
+        if let Some(unreadable_since) = self.review_watch_unreadable.get(pr) {
+            let unanswered = now
+                .signed_duration_since(*unreadable_since)
+                .to_std()
+                .map(|d| d >= CAPACITY_HOLD_TTL)
+                .unwrap_or(true);
+            if unanswered {
+                return None;
+            }
+        }
+        Some(*hold)
     }
 
     /// The newest `runs` row for one issue identifier, or `None` when the ledger has none (a store
