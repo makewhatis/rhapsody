@@ -84,6 +84,28 @@
 //! of this ticket's scope. The cost of this guard is honest and not free: one extra `gh` call per
 //! OPEN observation per tick, up to doubling this subsystem's share of GitHub's hourly budget.
 //!
+//! # A head move that carried no work arms nobody (STUDIO-960)
+//!
+//! The edge trigger above fires on the head MOVING, and it cannot tell why it moved. A rebase onto
+//! `main`, a `gh pr update-branch`, a squash or an amend all rewrite every SHA while often
+//! introducing exactly the change a reviewer already read — so the whole round is billed again, and
+//! with STUDIO-959 that round is the expensive full cold read, because the old reviewed SHA is no
+//! longer an ancestor of the new head.
+//!
+//! The fix asks the sharper question: did the DIFF change? The watcher compares the pull request's
+//! three-dot diff against its base at the previously-reviewed head and at the new head (one `gh`
+//! compare per SHA, off-loop, bounded by [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT)).
+//! When the two are byte-identical it hands the reviewed SHA back in
+//! [`PrObservation::unchanged_from`], and the control task advances `last_reviewed_sha` to the new
+//! head while keeping the terminal status — an approval stays an approval, a rejection stays a
+//! rejection, and neither round is re-earned. When the diff changed (a resolved conflict is the
+//! canonical case), the comparison proves nothing, `unchanged_from` is empty, and a normal round is
+//! armed exactly as before. A comparison that failed, timed out or could not read a file in full
+//! also proves nothing: the one direction this must never fail is toward silently skipping a review.
+//!
+//! Only a row that COMPLETED a round can be carried: a `requested`, `in_flight` or `truncated` row
+//! still owes a review of this head, whatever the diff says.
+//!
 //! # Off the loop, then back onto it (§5, F3)
 //!
 //! Asking GitHub where a pull request stands is a `gh` call, and [`crate::ghsummons::GH`] shells out
@@ -114,7 +136,7 @@ use rhapsody_store::{
 };
 
 use crate::control_loop::{CancelWait, Event};
-use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource, PrStatus};
+use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource, PrStatus, ReviewDiffSource};
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
@@ -190,6 +212,12 @@ pub struct ReviewSweepReport {
     /// Rows re-armed to `requested` by the head-advance signal (design §14.1's in-process Event,
     /// standing in for the room post it forbids).
     pub armed: usize,
+    /// Rows whose head moved but whose diff against the base was proven byte-identical to the one
+    /// the row's verdict was made against, so the head move cost NO review round (STUDIO-960). A
+    /// SUBSET of the rows the advance would otherwise have re-armed; they are disjoint from
+    /// [`ReviewSweepReport::armed`]. Reported rather than silently no-op'd, because "the author
+    /// pushed" and "the author rebased onto main" look identical in every other line this tick logs.
+    pub skipped: usize,
     /// The implementation tickets whose pull request MERGED this tick, and the terminal state each
     /// is going to (STUDIO-712). A work LIST rather than a count, because the move itself is a
     /// tracker round-trip and must not happen on the control task: the loop resolves it, the
@@ -220,6 +248,38 @@ pub struct ReviewSweepReport {
 /// afresh".
 const UNCAPPED_SLOTS: i64 = i64::MAX;
 
+/// One pull request the watcher should ask GitHub about this tick, with the head SHAs its watch
+/// rows have already had READ (STUDIO-960).
+///
+/// The reviewed SHAs travel beside the coordinate rather than being re-read by the watcher, which
+/// holds no store: the control task is what reads the watch set, and this is the one fact the
+/// off-loop diff comparison needs from it. The watcher keeps no row state of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedPr {
+    /// The pull request's repository and number.
+    pub pr: PrCoord,
+    /// Distinct non-empty `last_reviewed_sha` values across this pull request's live rows. A head
+    /// equal to one of these is already read; a head different from all of them may have MOVED, and
+    /// only then is a diff comparison worth its `gh` calls.
+    pub reviewed_shas: Vec<String>,
+    /// Distinct non-empty `requested_sha` values across the same rows — the heads a round has been
+    /// DISPATCHED against. A head equal to one of these already has a round in flight, so the edge
+    /// trigger arms nothing and the comparison is not needed either; carrying these is what keeps a
+    /// long review from re-spending two `gh` calls per tick for its whole duration.
+    pub requested_shas: Vec<String>,
+}
+
+impl WatchedPr {
+    /// A watched pull request with no completed review yet — the shape a freshly-introduced row has.
+    pub fn new(pr: PrCoord) -> WatchedPr {
+        WatchedPr {
+            pr,
+            reviewed_shas: Vec::new(),
+            requested_shas: Vec::new(),
+        }
+    }
+}
+
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
 /// the task must be testable without a control loop, and the seam is what lets a test assert on the
 /// coordinates handed over rather than on a side effect two hops away.
@@ -227,8 +287,8 @@ const UNCAPPED_SLOTS: i64 = i64::MAX;
 /// [`ReviewIntroSink`]: crate::reviewintro::ReviewIntroSink
 #[async_trait]
 pub trait ReviewWatchSink: Send + Sync {
-    /// The pull requests worth asking GitHub about this tick.
-    async fn watched(&self) -> Vec<PrCoord>;
+    /// The pull requests worth asking GitHub about this tick, each with the head SHAs already read.
+    async fn watched(&self) -> Vec<WatchedPr>;
     /// Hands observations to the control task and reports what it decided.
     ///
     /// `slots` is the daemon-wide dispatch budget this call may spend: `None` on a tick's FIRST
@@ -292,7 +352,7 @@ impl ControlWatchSink {
 
 #[async_trait]
 impl ReviewWatchSink for ControlWatchSink {
-    async fn watched(&self) -> Vec<PrCoord> {
+    async fn watched(&self) -> Vec<WatchedPr> {
         self.control.review_watch_list().await
     }
     async fn sweep(
@@ -345,6 +405,11 @@ pub struct ReviewWatchDeps {
     pub teams: Teams,
     /// Where a tick's observations are handed back to the control task.
     pub sink: Arc<dyn ReviewWatchSink>,
+    /// The two reads that prove a head move carried no new work (STUDIO-960). `None` disables the
+    /// comparison: every head move then arms a normal round, which is exactly the behaviour before
+    /// this feature, so a daemon that cannot ask (or an installation that never wires it) loses the
+    /// saving and never the review.
+    pub diff_source: Option<Arc<dyn ReviewDiffSource>>,
 }
 
 /// Re-reads one OPEN observation's head once, off-loop, immediately before that observation is
@@ -394,7 +459,11 @@ async fn refresh_observed_head(
         .pr_state(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
         .await
     {
-        Ok(lookup) => PrObservation { pr: obs.pr, lookup },
+        Ok(lookup) => PrObservation {
+            unchanged_from: obs.unchanged_from,
+            pr: obs.pr,
+            lookup,
+        },
         Err(e) => {
             tracing::warn!(
                 pr = %obs.pr,
@@ -405,6 +474,81 @@ async fn refresh_observed_head(
             obs
         }
     }
+}
+
+/// Which of a pull request's previously-reviewed heads carry a diff against the base that is
+/// byte-identical to `head`'s — the proof that a head move did no work (STUDIO-960).
+///
+/// One `gh` read per DISTINCT reviewed head plus one for `head`, and none at all when nothing could
+/// have moved (the caller filters that case out). The comparison is on the three-dot diff's text,
+/// not on the SHAs and not on the history's shape: a rebase, a squash, an amend and a
+/// `gh pr update-branch` all rewrite the head and can all carry the same change, which is exactly
+/// the case this exists to detect. A rebase that resolved a conflict changes the diff text and is
+/// therefore NOT in the answer.
+///
+/// Every failure — an unreadable base, a compare that timed out, a diff with a file GitHub will not
+/// render — returns the reviewed heads it could NOT prove, i.e. omits them, so the caller arms a
+/// normal round. The function never reports "unchanged" from a comparison it did not complete:
+/// that direction is the one that silently skips a review of real work.
+async fn unchanged_reviewed_shas(
+    ctx: &CancelWait,
+    src: &dyn ReviewDiffSource,
+    pr: &PrCoord,
+    head: &str,
+    reviewed: &[String],
+) -> Vec<String> {
+    let head = head.trim();
+    if head.is_empty() {
+        return Vec::new();
+    }
+    let olds: Vec<&str> = reviewed
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != head)
+        .collect();
+    if olds.is_empty() {
+        return Vec::new();
+    }
+    let base = match src.pr_base_ref(&pr.owner, &pr.repo, pr.number).await {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!(
+                pr = %pr, error = %e,
+                "ticketless review: the pull request's base branch could not be read; a head move \
+                 is not proven to have carried no work, so a normal round will be armed"
+            );
+            return Vec::new();
+        }
+    };
+    let head_patch = match src.merge_base_patch(&pr.owner, &pr.repo, &base, head).await {
+        Ok(patch) => patch,
+        Err(e) => {
+            tracing::warn!(
+                pr = %pr, base, head, error = %e,
+                "ticketless review: the head's diff against the base could not be read; a normal \
+                 round will be armed"
+            );
+            return Vec::new();
+        }
+    };
+    let mut unchanged = Vec::new();
+    for old in olds {
+        if ctx.is_cancelled() {
+            break;
+        }
+        match src.merge_base_patch(&pr.owner, &pr.repo, &base, old).await {
+            Ok(patch) if patch == head_patch => unchanged.push(old.to_string()),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    pr = %pr, base, reviewed_sha = old, error = %e,
+                    "ticketless review: a previously-reviewed diff against the base could not be \
+                     read; that head is not proven unchanged, so a normal round will be armed"
+                );
+            }
+        }
+    }
+    unchanged
 }
 
 /// Polls the watch set on [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) until
@@ -441,11 +585,16 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             continue;
         }
         let start = cursor % prs.len();
-        let rotated: Vec<PrCoord> = prs[start..].iter().chain(&prs[..start]).cloned().collect();
+        let rotated: Vec<WatchedPr> = prs[start..].iter().chain(&prs[..start]).cloned().collect();
         // Advance by the budget, not by what actually answered: a failed lookup has had its turn,
         // and holding the cursor back for it would starve everything behind it instead.
         cursor = start.saturating_add(crate::prstate::MAX_PR_STATE_CALLS_PER_TICK);
-        let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &rotated).await;
+        // The reviewed and requested SHAs, by coordinate, for the diff comparison below. Kept here
+        // rather than re-read from the store: this task holds none (STUDIO-960).
+        let recorded: HashMap<PrCoord, WatchedPr> =
+            rotated.iter().map(|w| (w.pr.clone(), w.clone())).collect();
+        let coords: Vec<PrCoord> = rotated.into_iter().map(|w| w.pr).collect();
+        let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &coords).await;
         if sweep.deferred > 0 || sweep.failed > 0 {
             tracing::debug!(
                 observed = sweep.observed.len(),
@@ -470,8 +619,36 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // `None` on the first hand-back tells the control task to count the budget then.
         let mut slots: Option<i64> = None;
         for obs in sweep.observed {
-            let fresh =
+            let mut fresh =
                 refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
+            // STUDIO-960: prove the head move carried no new work before the control task decides
+            // whether to arm a round. Off-loop, bounded by GH_EXEC_TIMEOUT like every other read
+            // here, and only when a head move is even possible: a head equal to one of this pull
+            // request's reviewed SHAs is already read and costs nothing.
+            if let Some(diff) = deps.diff_source.as_ref()
+                && let PrLookup::Found(snap) = &fresh.lookup
+                && snap.status == PrStatus::Open
+                && let Some(known) = recorded.get(&fresh.pr)
+                && !snap.head_sha.is_empty()
+                // Nothing to prove with no reviewed head to compare against, and nothing to prove
+                // when the head is already read or already dispatched: in every one of those cases
+                // the edge trigger arms nothing, so the `gh` calls would be pure waste.
+                && !known.reviewed_shas.is_empty()
+                && !known
+                    .reviewed_shas
+                    .iter()
+                    .chain(known.requested_shas.iter())
+                    .any(|s| !s.is_empty() && s == &snap.head_sha)
+            {
+                fresh.unchanged_from = unchanged_reviewed_shas(
+                    &ctx,
+                    diff.as_ref(),
+                    &fresh.pr,
+                    &snap.head_sha,
+                    &known.reviewed_shas,
+                )
+                .await;
+            }
             let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
             slots = Some(left);
             // Destructured rather than field-by-field so a field added later cannot be silently
@@ -481,6 +658,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 retired,
                 deferred,
                 armed,
+                skipped,
                 stalled,
                 done,
                 merge,
@@ -489,6 +667,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             report.retired += retired;
             report.deferred += deferred;
             report.armed += armed;
+            report.skipped += skipped;
             report.stalled += stalled;
             report.done.extend(done);
             report.merge.extend(merge);
@@ -503,6 +682,10 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 // "deferred = 1" every 30 seconds can be told apart from one that is waiting.
                 stalled = report.stalled,
                 armed = report.armed,
+                // Head moves proven to have carried no new work (STUDIO-960): a re-arm that did
+                // NOT happen, counted apart from `armed` so an operator can tell a rebase from a
+                // push in the one line that reports the tick.
+                skipped = report.skipped,
                 done = report.done.len(),
                 merge = report.merge.len(),
                 "ticketless review watcher tick"
@@ -572,12 +755,15 @@ pub(crate) fn churn_key(pr: &PrCoord) -> String {
 
 impl Orchestrator {
     /// The pull requests the watcher asks GitHub about this tick: every distinct coordinate the
-    /// watch set still considers live.
+    /// watch set still considers live, each beside the head SHAs its rows have already had READ
+    /// (STUDIO-960).
     ///
     /// Distinct by coordinate rather than by row: N reviewers of one pull request share one head,
     /// and asking GitHub N times for it would spend the per-tick call budget on an answer already
-    /// in hand.
-    pub(crate) fn review_watch_coords(&self) -> Vec<PrCoord> {
+    /// in hand. The reviewed SHAs are UNIONED across those rows and de-duplicated, because two
+    /// reviewers can be at two different reviewed heads and each is a head the diff comparison must
+    /// be able to prove against.
+    pub(crate) fn review_watch_coords(&self) -> Vec<WatchedPr> {
         if !self.review_ticketless_enabled() {
             return Vec::new(); // §16
         }
@@ -588,8 +774,8 @@ impl Orchestrator {
                 return Vec::new();
             }
         };
-        let mut seen: HashSet<(String, String, i64)> = HashSet::new();
-        let mut out = Vec::new();
+        let mut seen: HashMap<(String, String, i64), usize> = HashMap::new();
+        let mut out: Vec<WatchedPr> = Vec::new();
         for row in rows {
             if !row.open || row.status == REVIEW_STATUS_DROPPED {
                 continue;
@@ -599,8 +785,26 @@ impl Orchestrator {
                 row.key.repo.to_ascii_lowercase(),
                 row.key.number,
             );
-            if seen.insert(k) {
-                out.push(PrCoord::new(&row.key.owner, &row.key.repo, row.key.number));
+            let idx = match seen.get(&k) {
+                Some(i) => *i,
+                None => {
+                    let i = out.len();
+                    out.push(WatchedPr::new(PrCoord::new(
+                        &row.key.owner,
+                        &row.key.repo,
+                        row.key.number,
+                    )));
+                    seen.insert(k, i);
+                    i
+                }
+            };
+            let reviewed = row.last_reviewed_sha.trim();
+            if !reviewed.is_empty() && !out[idx].reviewed_shas.iter().any(|s| s == reviewed) {
+                out[idx].reviewed_shas.push(reviewed.to_string());
+            }
+            let requested = row.requested_sha.trim();
+            if !requested.is_empty() && !out[idx].requested_shas.iter().any(|s| s == requested) {
+                out[idx].requested_shas.push(requested.to_string());
             }
         }
         out
@@ -686,9 +890,14 @@ impl Orchestrator {
                     };
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
-                PrLookup::Found(snap) => {
-                    self.service_review_pr(&rows, &obs.pr, &snap.head_sha, &mut slots, &mut report)
-                }
+                PrLookup::Found(snap) => self.service_review_pr(
+                    &rows,
+                    &obs.pr,
+                    &snap.head_sha,
+                    &obs.unchanged_from,
+                    &mut slots,
+                    &mut report,
+                ),
             }
         }
         (report, slots)
@@ -820,6 +1029,7 @@ impl Orchestrator {
         rows: &[ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
+        unchanged_from: &[String],
         slots: &mut i64,
         report: &mut ReviewSweepReport,
     ) {
@@ -832,7 +1042,9 @@ impl Orchestrator {
         // touch rows that already exist, and it changes no field this function's decision reads —
         // `review_round_due` answers identically before and after it — which is why `rows` (loaded
         // fresh for this observation's hand-back) is still sound to decide from.
-        report.armed += self.handle_review_head_advanced(pr, head);
+        let advance = self.handle_review_head_advanced(pr, head, unchanged_from);
+        report.armed += advance.armed;
+        report.skipped += advance.skipped.len();
 
         // How many dispatches one ROUND of this pull request costs — the unit the churn budget
         // below has to be expressed in. Read from config rather than from `mine.len()`, which is
@@ -850,6 +1062,15 @@ impl Orchestrator {
         // required review of the same pull request.
         let mut assigned: Vec<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
         for (idx, row) in mine.iter().enumerate() {
+            // A row whose verdict was just carried across an unchanged head move (STUDIO-960). The
+            // advance above wrote the NEW head into its `last_reviewed_sha`, but `rows` is this
+            // hand-back's opening snapshot and still holds the old one, so `review_round_due` below
+            // would report the round due again. Skipping it here is what keeps the dispatch loop
+            // reading the state the store now holds; `mine` is left whole so the auto-merge gate
+            // still sees this row's verdict.
+            if advance.skipped.iter().any(|k| k == &row.key) {
+                continue;
+            }
             let id = review_key(
                 &row.key.owner,
                 &row.key.repo,
@@ -1264,9 +1485,10 @@ pub type ReviewRounds = HashMap<String, usize>;
 pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 
 impl ControlHandle {
-    /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
-    /// control task is gone — an empty poll list, never a guess.
-    pub(crate) async fn review_watch_list(&self) -> Vec<PrCoord> {
+    /// The pull requests the watcher should ask GitHub about, each with the head SHAs its rows have
+    /// already had read. Empty when the subsystem is off or the control task is gone — an empty
+    /// poll list, never a guess.
+    pub(crate) async fn review_watch_list(&self) -> Vec<WatchedPr> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .events
@@ -1336,7 +1558,7 @@ mod tests {
 
     use super::*;
     use crate::control_loop::CancelSignal;
-    use crate::ghsummons::{PrSnapshot, PrStateResult};
+    use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult};
     use crate::orchestrator::RunningEntry;
     use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project, set_of};
 
@@ -1474,6 +1696,16 @@ mod tests {
                 merged_at: None,
                 head_repo: format!("{OWNER}/{REPO}"),
             }),
+            unchanged_from: Vec::new(),
+        }
+    }
+
+    /// One observation of an OPEN pull request at `head`, with `unchanged_from` set as the off-loop
+    /// watcher would after proving a head move carried no new work (STUDIO-960).
+    fn open_at_proven(number: i64, head: &str, unchanged_from: &[String]) -> PrObservation {
+        PrObservation {
+            unchanged_from: unchanged_from.to_vec(),
+            ..open_at(number, head)
         }
     }
 
@@ -1507,6 +1739,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup,
+            unchanged_from: Vec::new(),
         }
     }
 
@@ -1536,6 +1769,17 @@ mod tests {
         o.store()
             .mark_review_completed(&key(number, reviewer), head, REVIEW_STATUS_REVIEWED)
             .expect("complete");
+    }
+
+    /// [`complete`] as a clean APPROVAL — the verdict a rebase must carry forward rather than make
+    /// the reviewer earn again (STUDIO-960).
+    fn approve(o: &mut Orchestrator, number: i64, reviewer: &str, head: &str) {
+        let id = review_key(OWNER, REPO, number, reviewer);
+        o.running.remove(&id);
+        o.claimed.remove(&id);
+        o.store()
+            .mark_review_completed(&key(number, reviewer), head, REVIEW_STATUS_APPROVED)
+            .expect("approve");
     }
 
     /// Ends the live review of `(number, reviewer)` the way a CRASH does: the run is gone from
@@ -1587,6 +1831,170 @@ mod tests {
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    // --- STUDIO-960: a head move that carried no new work -------------------------------------
+
+    /// Acceptance, named after the case that produces most of these head moves: a
+    /// `gh pr update-branch` rewrites every SHA while re-introducing the same change, so the diff
+    /// the reviewer already approved is byte-identical. It must arm NOBODY and carry the approval
+    /// forward to the new head — not discard an approval the diff still justifies and bill a whole
+    /// round.
+    #[tokio::test]
+    async fn an_update_branch_arms_no_round_and_carries_the_approval() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        approve(&mut o, 12, "bob", HEAD_A);
+        let before = dispatched.lock().expect("lock").len();
+        assert_eq!(
+            before, 1,
+            "the round under test is the one already dispatched"
+        );
+
+        // The watcher compared the two diffs off-loop and proved them identical. Driven through the
+        // REAL comparison, so a helper that reported "unchanged" (or "changed") unconditionally
+        // turns this red rather than being bypassed by a hand-written proof.
+        let signal = CancelSignal::new();
+        let proven = unchanged_reviewed_shas(
+            &signal.wait(),
+            &FakeDiffSource::same(),
+            &coord(12),
+            HEAD_B,
+            &[HEAD_A.to_string()],
+        )
+        .await;
+        assert_eq!(proven, vec![HEAD_A.to_string()]);
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+
+        assert_eq!(report.dispatched, 0, "an unchanged diff must arm nobody");
+        assert_eq!(report.armed, 0);
+        assert_eq!(
+            report.skipped, 1,
+            "the round that did not happen is reported"
+        );
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            before,
+            "no second agent was spawned"
+        );
+        let row = watch_row(&o, 12, "bob");
+        assert_eq!(row.status, REVIEW_STATUS_APPROVED);
+        assert_eq!(
+            row.last_reviewed_sha, HEAD_B,
+            "the verdict moved to the new head"
+        );
+        assert_eq!(
+            crate::automerge::auto_merge_verdict(&[&row], HEAD_B),
+            Ok(vec!["bob".to_string()]),
+            "the approval is valid AT THE NEW HEAD, which is what carrying it forward means"
+        );
+
+        // And it stays carried: the next tick at the same head has nothing to do.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 0);
+    }
+
+    /// Acceptance, the dangerous direction: a head move whose diff CHANGED is real work and a
+    /// normal round applies. The watcher proves nothing here, so the re-arm happens exactly as
+    /// before — and an implementation that carried approvals regardless of the diff would skip this
+    /// and red.
+    #[test]
+    fn a_head_move_that_changed_the_diff_arms_a_normal_round() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        approve(&mut o, 12, "bob", HEAD_A);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(report.dispatched, 1, "a changed diff is a fresh round");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// Acceptance: a rebase that RESOLVED A CONFLICT is new SHAs *and* a changed diff. It must arm
+    /// a normal round, never a skip — the case the "always report unchanged" mutation is required
+    /// to turn red.
+    #[tokio::test]
+    async fn a_conflict_resolving_rebase_arms_a_round_not_a_skip() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        approve(&mut o, 12, "bob", HEAD_A);
+
+        // The watcher's comparison ran and found the conflict in the patch text, so it proved
+        // nothing — `unchanged_from` is empty, which is the whole distinction from the rebase above.
+        let signal = CancelSignal::new();
+        let proven = unchanged_reviewed_shas(
+            &signal.wait(),
+            &FakeDiffSource::changed(),
+            &coord(12),
+            HEAD_B,
+            &[HEAD_A.to_string()],
+        )
+        .await;
+        assert!(
+            proven.is_empty(),
+            "a conflict resolution is not a content-preserving move"
+        );
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+        assert_eq!(report.dispatched, 1, "a conflict resolution is real work");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
+    /// Acceptance: a failed or timed-out comparison degrades to arming a NORMAL round, never to
+    /// silently skipping one.
+    #[tokio::test]
+    async fn a_failed_comparison_arms_a_round() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        approve(&mut o, 12, "bob", HEAD_A);
+
+        let signal = CancelSignal::new();
+        let proven = unchanged_reviewed_shas(
+            &signal.wait(),
+            &FakeDiffSource::base_fails(),
+            &coord(12),
+            HEAD_B,
+            &[HEAD_A.to_string()],
+        )
+        .await;
+        assert!(proven.is_empty(), "a read that failed proves nothing");
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
+    /// The skip is confined to a row that COMPLETED a round. A `truncated` row read the head only
+    /// partially and owes a full round of the new head however identical the diff is — carrying it
+    /// forward would ship a partial read as a verdict. The same holds for a crashed `in_flight`.
+    #[test]
+    fn only_a_completed_round_is_carried_across_an_unchanged_head_move() {
+        for status in [REVIEW_STATUS_TRUNCATED, REVIEW_STATUS_IN_FLIGHT] {
+            let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+            introduce(&o, row(12, "bob"));
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            o.store()
+                .mark_review_completed(&key(12, "bob"), HEAD_A, status)
+                .expect("mark");
+            o.running.remove(&review_key(OWNER, REPO, 12, "bob"));
+            o.claimed.remove(&review_key(OWNER, REPO, 12, "bob"));
+
+            let report =
+                o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+            assert_eq!(
+                report.dispatched, 1,
+                "({status}) a partial round still owes one"
+            );
+            assert_eq!(report.skipped, 0, "({status})");
+            assert_eq!(dispatched.lock().expect("lock").len(), 2, "({status})");
+        }
     }
 
     /// Acceptance: a crashed review re-surfaces WITHOUT a daemon restart. The exit path leaves the
@@ -2606,6 +3014,7 @@ mod tests {
         o.handle_review_sweep(&[PrObservation {
             pr: coord(12),
             lookup: PrLookup::Gone,
+            unchanged_from: Vec::new(),
         }]);
         assert!(
             o.review_unassignable.is_empty(),
@@ -2808,7 +3217,7 @@ mod tests {
         );
 
         assert!(
-            !o.review_watch_coords().contains(&coord(12)),
+            !o.review_watch_coords().iter().any(|w| w.pr == coord(12)),
             "a dismissed pull request is not even polled"
         );
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
@@ -3046,7 +3455,52 @@ mod tests {
         introduce(&o, row(12, "carol"));
         introduce(&o, row(13, "bob"));
 
-        assert_eq!(o.review_watch_coords(), vec![coord(12), coord(13)]);
+        let prs: Vec<PrCoord> = o.review_watch_coords().into_iter().map(|w| w.pr).collect();
+        assert_eq!(prs, vec![coord(12), coord(13)]);
+    }
+
+    /// Each polled coordinate carries the UNION of its rows' reviewed SHAs, de-duplicated
+    /// (STUDIO-960): two reviewers can sit at two different reviewed heads and the comparison must
+    /// be able to prove either. A row that has never completed contributes nothing.
+    #[test]
+    fn the_poll_list_carries_the_union_of_its_rows_reviewed_shas() {
+        let (o, _d) = orch(ticketless(&["alice", "bob", "carol"]));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "carol"));
+        introduce(&o, row(13, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_APPROVED)
+            .expect("bob completed");
+        o.store()
+            .mark_review_completed(&key(12, "carol"), HEAD_B, REVIEW_STATUS_REVIEWED)
+            .expect("carol completed");
+        o.store()
+            .mark_review_requested(&key(13, "bob"), HEAD_C)
+            .expect("bob dispatched");
+
+        let got = o.review_watch_coords();
+        let mut twelve = got
+            .iter()
+            .find(|w| w.pr == coord(12))
+            .expect("the pull request is polled")
+            .reviewed_shas
+            .clone();
+        twelve.sort();
+        assert_eq!(twelve, vec![HEAD_A.to_string(), HEAD_B.to_string()]);
+
+        let thirteen = got
+            .iter()
+            .find(|w| w.pr == coord(13))
+            .expect("the pull request is polled");
+        assert!(
+            thirteen.reviewed_shas.is_empty(),
+            "a never-reviewed row contributes no reviewed SHA"
+        );
+        assert_eq!(
+            thirteen.requested_shas,
+            vec![HEAD_C.to_string()],
+            "a dispatched head is carried so the comparison can tell it apart from a move"
+        );
     }
 
     /// The daemon-wide dispatch budget is honoured, not just each identity's. Twenty pull requests
@@ -3076,7 +3530,7 @@ mod tests {
     /// A sink recording what the task asked for and handed back.
     #[derive(Default)]
     struct FakeSink {
-        watched: Vec<PrCoord>,
+        watched: Vec<WatchedPr>,
         seen: Arc<Mutex<Vec<Vec<PrObservation>>>>,
         /// `seen.len()` at the start of each tick, recorded by [`ReviewWatchSink::watched`] — which
         /// the task calls exactly once per tick. A test can then slice `seen` into whole ticks
@@ -3093,7 +3547,7 @@ mod tests {
 
     #[async_trait]
     impl ReviewWatchSink for FakeSink {
-        async fn watched(&self) -> Vec<PrCoord> {
+        async fn watched(&self) -> Vec<WatchedPr> {
             let start = self.seen.lock().expect("seen lock").len();
             self.boundaries.lock().expect("boundaries lock").push(start);
             self.watched.clone()
@@ -3112,6 +3566,117 @@ mod tests {
         }
         async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
             self.finished.lock().expect("finished lock").push(plan);
+        }
+    }
+
+    /// A [`ReviewDiffSource`] whose two patches are fixed, so a test can drive the watcher's
+    /// "did this head move carry no work" comparison without GitHub (STUDIO-960). `head_patch` is
+    /// answered for [`HEAD_B`] and `old_patch` for anything else, matching how
+    /// [`unchanged_reviewed_shas`] calls it (once for the head, once per reviewed SHA).
+    struct FakeDiffSource {
+        base: Result<String, String>,
+        head_patch: Result<String, String>,
+        old_patch: Result<String, String>,
+    }
+
+    impl FakeDiffSource {
+        fn same() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok("diff".to_string()),
+                old_patch: Ok("diff".to_string()),
+            }
+        }
+        fn changed() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok("head diff".to_string()),
+                old_patch: Ok("conflict-resolved diff".to_string()),
+            }
+        }
+        fn base_fails() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Err("gh: boom".to_string()),
+                head_patch: Ok("diff".to_string()),
+                old_patch: Ok("diff".to_string()),
+            }
+        }
+        fn old_fails() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok("diff".to_string()),
+                old_patch: Err("gh: boom".to_string()),
+            }
+        }
+    }
+
+    fn diff_err(e: String) -> Box<dyn std::error::Error + Send + Sync> {
+        e.into()
+    }
+
+    #[async_trait]
+    impl ReviewDiffSource for FakeDiffSource {
+        async fn pr_base_ref(&self, _owner: &str, _repo: &str, _number: i64) -> ReviewDiffResult {
+            self.base.clone().map_err(diff_err)
+        }
+        async fn merge_base_patch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _base: &str,
+            sha: &str,
+        ) -> ReviewDiffResult {
+            let which = if sha == HEAD_B {
+                &self.head_patch
+            } else {
+                &self.old_patch
+            };
+            which.clone().map_err(diff_err)
+        }
+    }
+
+    /// A [`ReviewDiffSource`] that counts every call, so a test can prove the watcher spends NO
+    /// `gh` read when nothing could have moved (STUDIO-960).
+    struct CountingDiffSource(Arc<Mutex<usize>>);
+
+    #[async_trait]
+    impl ReviewDiffSource for CountingDiffSource {
+        async fn pr_base_ref(&self, _owner: &str, _repo: &str, _number: i64) -> ReviewDiffResult {
+            *self.0.lock().expect("count") += 1;
+            Ok("main".to_string())
+        }
+        async fn merge_base_patch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _base: &str,
+            _sha: &str,
+        ) -> ReviewDiffResult {
+            *self.0.lock().expect("count") += 1;
+            Ok("diff".to_string())
+        }
+    }
+
+    /// A [`PrStateSource`] that always reports one fixed, OPEN head — the shape a rebase leaves
+    /// behind for the watcher to compare (STUDIO-960).
+    struct FixedHeadSource(&'static str);
+
+    #[async_trait]
+    impl PrStateSource for FixedHeadSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: self.0.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }))
         }
     }
 
@@ -3148,8 +3713,9 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: Arc::new(FakeSink {
-                watched: vec![coord(12), coord(13)],
+                watched: vec![WatchedPr::new(coord(12)), WatchedPr::new(coord(13))],
                 seen: Arc::clone(&seen),
                 boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
@@ -3181,6 +3747,161 @@ mod tests {
         );
     }
 
+    // --- STUDIO-960: the off-loop diff comparison ---------------------------------------------
+
+    /// The watcher compares the two diffs and hands the PROOF to the control task. The whole
+    /// feature is off without this wiring, so it is asserted end to end: the observation the
+    /// control task receives carries the reviewed head that was proven identical.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_proves_an_unchanged_head_move_before_handing_it_over() {
+        let handed =
+            run_one_watch_tick(watched_pr(&[HEAD_A], &[]), Arc::new(FakeDiffSource::same())).await;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(
+            handed[0].unchanged_from,
+            vec![HEAD_A.to_string()],
+            "the reviewed head whose diff is identical must be handed over as proof"
+        );
+    }
+
+    /// The dangerous direction, wired: when the comparison finds a changed diff it proves NOTHING,
+    /// and the control task arms a normal round. An implementation that reported "unchanged" from a
+    /// comparison it did not complete turns this red.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_proves_nothing_when_the_diff_changed() {
+        let handed = run_one_watch_tick(
+            watched_pr(&[HEAD_A], &[]),
+            Arc::new(FakeDiffSource::changed()),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "a changed diff is not proof of anything"
+        );
+    }
+
+    /// The comparison costs `gh` reads, so it is spent only when a head move is even possible
+    /// (STUDIO-960): a head already read, a head already dispatched, and a pull request with no
+    /// reviewed head at all all cost ZERO calls.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_compares_only_when_a_head_move_is_possible() {
+        for watched in [
+            // Already read at this head: no move.
+            watched_pr(&[HEAD_B], &[]),
+            // A round is already dispatched at this head: the edge trigger arms nothing.
+            watched_pr(&[], &[HEAD_B]),
+            // Nothing has ever been reviewed, so there is nothing to compare against.
+            watched_pr(&[], &[]),
+        ] {
+            let calls = Arc::new(Mutex::new(0usize));
+            let handed =
+                run_one_watch_tick(watched, Arc::new(CountingDiffSource(Arc::clone(&calls)))).await;
+            assert_eq!(handed.len(), 1);
+            assert!(
+                handed[0].unchanged_from.is_empty(),
+                "no comparison means no proof"
+            );
+            assert_eq!(
+                *calls.lock().expect("count"),
+                0,
+                "no gh read may be spent when nothing could have moved"
+            );
+        }
+    }
+
+    /// A watched pull request at the fixed head [`HEAD_B`] with the given reviewed/requested SHAs.
+    fn watched_pr(reviewed: &[&str], requested: &[&str]) -> WatchedPr {
+        WatchedPr {
+            pr: coord(12),
+            reviewed_shas: reviewed.iter().map(|s| (*s).to_string()).collect(),
+            requested_shas: requested.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Runs exactly one watcher tick against a pull request at [`HEAD_B`], and returns the
+    /// observations handed to the control task.
+    async fn run_one_watch_tick(
+        watched: WatchedPr,
+        diff: Arc<dyn ReviewDiffSource>,
+    ) -> Vec<PrObservation> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let signal = CancelSignal::new();
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FixedHeadSource(HEAD_B))),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: Arc::new(FakeSink {
+                watched: vec![watched],
+                seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
+                done: Arc::clone(&done),
+                ..FakeSink::default()
+            }),
+            diff_source: Some(diff),
+        };
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+        done.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let seen = seen.lock().expect("seen lock").clone();
+        let boundaries = boundaries.lock().expect("boundaries lock").clone();
+        let end = boundaries.get(1).copied().unwrap_or(seen.len());
+        seen[..end].iter().flatten().cloned().collect()
+    }
+
+    /// The helper itself, in isolation: an identical patch on both heads is proof; a different one
+    /// is not (the conflict case); and a read that failed proves nothing at all.
+    #[tokio::test]
+    async fn unchanged_reviewed_shas_proves_only_an_identical_patch() {
+        let signal = CancelSignal::new();
+        let ctx = signal.wait();
+        let reviewed = [HEAD_A.to_string()];
+
+        let same =
+            unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &reviewed)
+                .await;
+        assert_eq!(same, vec![HEAD_A.to_string()]);
+
+        for source in [
+            FakeDiffSource::changed(),
+            FakeDiffSource::base_fails(),
+            FakeDiffSource::old_fails(),
+        ] {
+            let got = unchanged_reviewed_shas(&ctx, &source, &coord(12), HEAD_B, &reviewed).await;
+            assert!(got.is_empty(), "only a fully-read, identical diff is proof");
+        }
+    }
+
+    /// A head that is already one of the reviewed SHAs is not a move and costs no `gh` call; so does
+    /// an empty reviewed set. Asserted on a source that would panic-free return either way by
+    /// counting calls.
+    #[tokio::test]
+    async fn unchanged_reviewed_shas_costs_nothing_when_nothing_moved() {
+        let signal = CancelSignal::new();
+        let ctx = signal.wait();
+
+        assert!(
+            unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &[])
+                .await
+                .is_empty()
+        );
+        assert!(
+            unchanged_reviewed_shas(
+                &ctx,
+                &FakeDiffSource::same(),
+                &coord(12),
+                HEAD_A,
+                &[HEAD_A.to_string()],
+            )
+            .await
+            .is_empty()
+        );
+    }
+
     /// A watch set larger than the per-tick `gh` budget must not starve its tail. The list comes
     /// back in a stable order and `sweep_pr_states` takes the first N of it, so polling from the
     /// front every tick would ask about the same 20 pull requests forever — the budget's
@@ -3189,7 +3910,9 @@ mod tests {
     async fn the_poll_list_rotates_so_nothing_past_the_budget_starves() {
         let budget = crate::prstate::MAX_PR_STATE_CALLS_PER_TICK;
         let total = budget + 5;
-        let watched: Vec<PrCoord> = (0..total).map(|n| coord(n as i64 + 1)).collect();
+        let watched: Vec<WatchedPr> = (0..total)
+            .map(|n| WatchedPr::new(coord(n as i64 + 1)))
+            .collect();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
@@ -3198,6 +3921,7 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: Arc::new(FakeSink {
                 watched: watched.clone(),
                 seen: Arc::clone(&seen),
@@ -3235,7 +3959,7 @@ mod tests {
         );
         let covered: HashSet<PrCoord> = ticks.iter().flatten().map(|o| o.pr.clone()).collect();
         for pr in &watched {
-            assert!(covered.contains(pr), "{pr} was never polled");
+            assert!(covered.contains(&pr.pr), "{:?} was never polled", pr.pr);
         }
     }
 
@@ -3258,8 +3982,9 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: Arc::new(FakeSink {
-                watched: vec![coord(64)],
+                watched: vec![WatchedPr::new(coord(64))],
                 seen: Arc::clone(&seen),
                 done: Arc::clone(&done),
                 hand_back: ReviewSweepReport {
@@ -3296,8 +4021,9 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: teams_with(false, ReviewMode::Ticketless, vec![ident("bob", 0)]),
+            diff_source: None,
             sink: Arc::new(FakeSink {
-                watched: vec![coord(12)],
+                watched: vec![WatchedPr::new(coord(12))],
                 seen: Arc::clone(&seen),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
@@ -3408,14 +4134,14 @@ mod tests {
     /// `Mutex` standing in for the single control task, so a test can assert what the watcher's
     /// hand-back actually caused to be dispatched rather than merely what it handed over.
     struct ControlStubSink {
-        watched: Vec<PrCoord>,
+        watched: Vec<WatchedPr>,
         orch: Mutex<Orchestrator>,
         done: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
     impl ReviewWatchSink for ControlStubSink {
-        async fn watched(&self) -> Vec<PrCoord> {
+        async fn watched(&self) -> Vec<WatchedPr> {
             self.watched.clone()
         }
         async fn sweep(
@@ -3539,7 +4265,7 @@ mod tests {
         introduce(&o, row(12, "bob"));
         let done = Arc::new(tokio::sync::Notify::new());
         let sink = Arc::new(ControlStubSink {
-            watched: vec![coord(12)],
+            watched: vec![WatchedPr::new(coord(12))],
             orch: Mutex::new(o),
             done: Arc::clone(&done),
         });
@@ -3551,6 +4277,7 @@ mod tests {
             })),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -3639,7 +4366,7 @@ mod tests {
     /// was handed over — so a test can assert the watcher interleaves re-read and hand-back rather
     /// than batching the re-reads.
     struct OrderRecordingSink {
-        watched: Vec<PrCoord>,
+        watched: Vec<WatchedPr>,
         orch: Mutex<Orchestrator>,
         done: Arc<tokio::sync::Notify>,
         events: Arc<Mutex<Vec<String>>>,
@@ -3647,7 +4374,7 @@ mod tests {
 
     #[async_trait]
     impl ReviewWatchSink for OrderRecordingSink {
-        async fn watched(&self) -> Vec<PrCoord> {
+        async fn watched(&self) -> Vec<WatchedPr> {
             self.watched.clone()
         }
         async fn sweep(
@@ -3687,7 +4414,7 @@ mod tests {
         let done = Arc::new(tokio::sync::Notify::new());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(OrderRecordingSink {
-            watched: vec![coord(12), coord(13)],
+            watched: vec![WatchedPr::new(coord(12)), WatchedPr::new(coord(13))],
             orch: Mutex::new(o),
             done: Arc::clone(&done),
             events: Arc::clone(&events),
@@ -3705,6 +4432,7 @@ mod tests {
             })),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -3741,7 +4469,7 @@ mod tests {
         introduce(&o, row(12, "bob"));
         let done = Arc::new(tokio::sync::Notify::new());
         let sink = Arc::new(ControlStubSink {
-            watched: vec![coord(12)],
+            watched: vec![WatchedPr::new(coord(12))],
             orch: Mutex::new(o),
             done: Arc::clone(&done),
         });
@@ -3751,6 +4479,7 @@ mod tests {
             })),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -3784,7 +4513,7 @@ mod tests {
     /// The control task processes that exit between hand-backs, so a budget recomputed per hand-back
     /// would see the slot as free and let one tick exceed `max_concurrent`.
     struct WorkerExitSink {
-        watched: Vec<PrCoord>,
+        watched: Vec<WatchedPr>,
         orch: Mutex<Orchestrator>,
         /// One message per hand-back, so a test can await the tick without busy-waiting (which
         /// would stop tokio's paused clock from advancing to the watcher's poll interval).
@@ -3795,7 +4524,7 @@ mod tests {
 
     #[async_trait]
     impl ReviewWatchSink for WorkerExitSink {
-        async fn watched(&self) -> Vec<PrCoord> {
+        async fn watched(&self) -> Vec<WatchedPr> {
             self.watched.clone()
         }
         async fn sweep(
@@ -3836,7 +4565,7 @@ mod tests {
         let (handed, mut hand_backs) = tokio::sync::mpsc::unbounded_channel();
         let total = Arc::new(Mutex::new(0usize));
         let sink = Arc::new(WorkerExitSink {
-            watched: (12..16).map(coord).collect(),
+            watched: (12..16).map(|n| WatchedPr::new(coord(n))).collect(),
             orch: Mutex::new(o),
             handed,
             dispatched: Arc::clone(&total),
@@ -3845,6 +4574,7 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            diff_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -3888,7 +4618,7 @@ mod tests {
     /// opposite direction from [`WorkerExitSink`]. It starts exactly ONE such run, on the first
     /// hand-back: a real control task starts no more once `running` is at its cap.
     struct TicketStartSink {
-        watched: Vec<PrCoord>,
+        watched: Vec<WatchedPr>,
         orch: Mutex<Orchestrator>,
         /// One message per hand-back, so a test can await the tick without busy-waiting (which
         /// would stop tokio's paused clock from advancing to the watcher's poll interval).
@@ -3902,7 +4632,7 @@ mod tests {
 
     #[async_trait]
     impl ReviewWatchSink for TicketStartSink {
-        async fn watched(&self) -> Vec<PrCoord> {
+        async fn watched(&self) -> Vec<WatchedPr> {
             self.watched.clone()
         }
         async fn sweep(
@@ -3957,7 +4687,7 @@ mod tests {
         let peak = Arc::new(Mutex::new(0usize));
         let total = Arc::new(Mutex::new(0usize));
         let sink = Arc::new(TicketStartSink {
-            watched: (12..16).map(coord).collect(),
+            watched: (12..16).map(|n| WatchedPr::new(coord(n))).collect(),
             orch: Mutex::new(o),
             handed,
             peak: Arc::clone(&peak),
@@ -3968,6 +4698,7 @@ mod tests {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            diff_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();

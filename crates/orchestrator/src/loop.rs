@@ -335,13 +335,13 @@ pub enum Event {
     ReviewHeadAdvanced {
         pr: crate::prstate::PrCoord,
         head_sha: String,
-        reply: oneshot::Sender<usize>,
+        reply: oneshot::Sender<crate::reviewintro::ReviewHeadAdvance>,
     },
     /// The coordinates the ticketless review watcher should ask GitHub about this tick (STUDIO-721,
     /// slice 5; NEW beyond Go v0.4.0). A loop-confined READ of the watch set, so the watcher never
     /// touches the store the control task is the single writer of.
     ReviewWatchList {
-        reply: oneshot::Sender<Vec<crate::prstate::PrCoord>>,
+        reply: oneshot::Sender<Vec<crate::reviewwatch::WatchedPr>>,
     },
     /// One watcher tick's observations, for the control task to turn into drops, re-arms and review
     /// dispatches (STUDIO-721; NEW beyond Go v0.4.0).
@@ -673,7 +673,7 @@ impl Orchestrator {
                 head_sha,
                 reply,
             } => {
-                let _ = reply.send(self.handle_review_head_advanced(&pr, &head_sha));
+                let _ = reply.send(self.handle_review_head_advanced(&pr, &head_sha, &[]));
             }
             Event::ReviewWatchList { reply } => {
                 let _ = reply.send(self.review_watch_coords());

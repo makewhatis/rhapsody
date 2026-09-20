@@ -73,8 +73,14 @@ export function pullRequestLabel(pr: PullRequestRef): string {
 
 /** One reviewer's review of a card, folded from a `review_run` row. */
 export interface ReviewerChip {
-  /** Stable React key — the review row's own issue key. */
+  /** Stable React key — the review row's own key, so a live and a history row cannot collide. */
   key: string;
+  /**
+   * The review RUN's own issue key (`pr:<owner>/<repo>#<n>@<reviewer>`) — what clicking the chip
+   * opens (STUDIO-955). The chip represents one RUN, not the ticket, and this is the `job/:key`
+   * route target for it.
+   */
+  issue: string;
   /** The reviewer, from the review key's `@name`, else the row's durable assignee. */
   reviewer: string;
   /**
@@ -232,6 +238,63 @@ export function boardLaneTally(
   }
 }
 
+/** Whether a row's status means an agent is working its run right now — `run` or `reviewing`. */
+function isLiveStatus(status: ConsoleJobStatus): boolean {
+  return status === "run" || status === "reviewing";
+}
+
+/**
+ * One running RUN, rendered as a compact row in the Running lane (STUDIO-955).
+ *
+ * THE LANE'S UNIT. A lane's count is a count of RUNS, so a lane reading `5 / 6` must show five
+ * things. A running TICKET already shows as its card there, but a running REVIEW has no card at
+ * all: its ticket is parked in In Review, and the board folds the review onto that card as a chip.
+ * So five live reviews left the Running lane reading `5 / 6` beside zero cards and a caption
+ * asserting an agent had a ticket. This is the compact row that closes the gap — one per live
+ * review run, naming who is reviewing what, on which provider, for how long.
+ */
+export interface RunningRun {
+  /** Stable React key — the row's own, so a live and a history run cannot collide. */
+  key: string;
+  /** The run's own issue key (`pr:<owner>/<repo>#<n>@<reviewer>`) — the `job/:key` route target. */
+  issue: string;
+  /** The reviewer, from the key's `@name` else the row's durable assignee. */
+  reviewer: string;
+  /** The ticket this review is of, or "" when its origin did not resolve to one. */
+  ticket: string;
+  /** The provider the review run billed, or "" when it recorded none. */
+  provider: string;
+  /** The run's project slug — the project Select's value, so the filter narrows rows like cards. */
+  projectSlug: string;
+  /** How long the run has been going ("6m"), or "" while unknown. */
+  elapsed: string;
+}
+
+/**
+ * The live review runs the Running lane must render beside its cards — one compact row each.
+ *
+ * Only REVIEW runs: a live ticket run is already a card in the lane (`boardLaneOf` puts it there),
+ * so returning it here would draw the same run twice and break "a lane's number describes what the
+ * lane shows". A finished review is a chip on its ticket, not a running run, and is left out too.
+ */
+export function runningRuns(rows: readonly ConsoleJobRow[]): RunningRun[] {
+  const out: RunningRun[] = [];
+  for (const row of rows) {
+    if (!row.reviewRun || !isLiveStatus(row.status)) continue;
+    const pr = parsePullRequest(row.issue);
+    out.push({
+      key: row.key,
+      issue: row.issue,
+      reviewer: pr?.reviewer || row.assignee || "unknown",
+      ticket: row.reviewOf,
+      provider: row.provider,
+      projectSlug: row.projectSlug,
+      elapsed: row.elapsed,
+    });
+  }
+  return out;
+}
+
 /**
  * The board's issue rows: the paged listing plus the wide, latest-run-outcome active fetch, one row
  * per issue. The PAGE wins a collision because it is the fresher read — it polls on the live cadence
@@ -322,6 +385,8 @@ export function buildConsoleBoard(
     const pr = parsePullRequest(row.issue);
     card.reviewers.push({
       key: row.key,
+      // The review run's OWN key, so the chip opens this run and not the ticket's card (STUDIO-955).
+      issue: row.issue,
       reviewer: pr?.reviewer || row.assignee || "unknown",
       // The review row's OWN provider, not the card's: implementation and review run on different
       // models on purpose, so folding them onto one field is the defect STUDIO-952 fixes.
