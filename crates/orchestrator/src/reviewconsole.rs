@@ -991,6 +991,87 @@ mod tests {
         );
     }
 
+    /// **A decision that lands AFTER a Clear can still be cleared.** The ordered window is real: the
+    /// manager's turn runs off-loop, `mark_in_flight` is on the control task, and `record` fires only
+    /// after an un-timed comment POST. An operator who clears inside it leaves a settled decision
+    /// with no counter, and the old counter-first check then refused every later Clear as "no
+    /// budget" — while the WARN and the README both name this POST as the recovery. Pinned with a
+    /// TWO-step clear: a single clear with both present passes under either ordering and would not
+    /// discriminate this.
+    #[test]
+    fn a_clear_after_a_decision_landed_without_a_counter_still_clears_it() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        // The operator clears while the adjudication plan is out: the counter goes, and nothing
+        // else is there yet.
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        // …then the off-loop turn lands its decision, with no counter to pair it with.
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec![],
+                reason: "needs a human".to_string(),
+            },
+        );
+        assert!(o.adjudication(&pr()).is_some());
+
+        // The second clear must still drop it, or the loop stays stopped with the lever reading 409.
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1),
+            "dropping a decision is as much a clear as dropping a counter"
+        );
+        assert_eq!(o.adjudication(&pr()), None);
+    }
+
+    /// **A settled decision must not survive an operator re-run.** Re-run refunds one round and
+    /// clears the decision so the refunded round can actually dispatch; without the clear the lever
+    /// reports `Applied(1)` while the settled `ship`/`escalate` keeps the loop stopped, so nothing
+    /// moves. Deleting the `ledger.clear` from the re-run path left every other test green.
+    #[test]
+    fn an_operator_rerun_also_drops_a_manager_adjudication() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes".to_string()],
+                reason: "needs a human".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds.insert(
+            "makewhatis/rhapsody#12".to_string(),
+            o.reviewers_per_round() * 2,
+        );
+
+        assert_eq!(
+            o.handle_review_rerun(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.adjudication(&pr()),
+            None,
+            "a re-run overrides a settled decision, or the refunded round never dispatches"
+        );
+    }
+
     /// Clear touches no row: unlike re-run it re-arms nothing, so it dispatches only what was
     /// already due. An approved pull request stays approved after its budget is cleared.
     #[test]
