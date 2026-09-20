@@ -465,105 +465,136 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 /// Reads `SHIP` or `ESCALATE: …` out of the turn's stdout.
 ///
 /// Lenient about surrounding prose and punctuation, strict about the decision. It scans every line
-/// and keeps the LAST one shaped like a decision, because a model asked to justify itself states
-/// its decision last — after any preamble that explains the options. Two rules make that safe:
+/// and RANKS each decision-shaped line by how strongly it reads as the ANSWER rather than a mention
+/// of the option the reply rejected, then keeps the strongest; ties break on position, so the last
+/// of two equally-strong lines wins.
 ///
-/// * The last match wins, so the prompt's own sentence ("SHIP means the remaining open findings do
-///   not block") cannot outrank a decision below it. Taking the FIRST match let exactly that
-///   happen, in the unsafe direction: the reply escalates and the daemon ships.
-/// * A `SHIP` line must BE the decision — bare `SHIP` or a `SHIP:` prefix — not merely begin with
-///   the word. The prompt shows the model "SHIP means …" verbatim, and a line of prose beginning
-///   `SHIP ` is an explanation, not an answer.
-/// * A decision stated on an UNDECORATED line outranks a later decorated one. A model that closes
-///   a decision by listing what it rejected produces a plain `ESCALATE` above a bulleted
-///   `SHIP`; pure last-match would read the bullet and ship the escalation. The plain line is the
-///   answer wherever it sits, so the result no longer depends on line order.
+/// The ranks, highest first:
+///
+/// * **2 — an explicit `Decision:`/`Verdict:` label.** The model marked this line as its answer, so
+///   it outranks every line that lacks one.
+/// * **1 — an undecorated decision in exactly the form the prompt asked for**: a bare `SHIP`, or
+///   `ESCALATE: <reason>`. A plain line is an answer.
+/// * **0 — decorated, or a `SHIP: <prose>` line.** A bullet or emphasis is as likely a bulleted
+///   mention of the option the reply rejected as an answer; the prompt asks for a bare `SHIP`, so
+///   `SHIP: <prose>` is at least as likely an enumeration of the option being explained away as it
+///   is the answer. Neither outranks the other, and neither outranks a real answer.
+///
+/// The ranking replaces a plain-beats-decorated rule that got the axis wrong: it let a plain
+/// `SHIP: <prose>` explanatory line outrank a decorated `ESCALATE` answer below it, so a reply that
+/// escalated shipped. It also treats the label as an answer marker rather than as decoration, so
+/// `Decision: SHIP` beside a bulleted `ESCALATE` is a decision rather than an ambiguity.
+///
+/// A `SHIP` line must BE the decision — a bare `SHIP`, a `SHIP:` prefix, or a labelled answer — not
+/// merely begin with the word. The prompt shows the model "SHIP means …" verbatim, and a line of
+/// prose beginning `SHIP ` is an explanation, not an answer.
 ///
 /// Leading markdown decoration and an optional `Decision:`/`Verdict:` label are stripped first
 /// ([`strip_answer_decoration`]), because they carry no decision content but otherwise pushed an
 /// obviously-correct reply into the error path.
 ///
-/// An answer that names BOTH decisions and does so only on decorated lines is ambiguous, not a
-/// decision: that is the shape of a reply that merely ENUMERATES the two options ("- ESCALATE: …\n-
-/// SHIP: …"), and the last bullet would otherwise be read as the answer. It is an error, so the
-/// caller re-asks rather than guessing.
+/// An answer that names BOTH decisions and does so only weakly — every decision word behind a
+/// bullet, an emphasis, or a `SHIP:` explanation — is ambiguous, not a decision: that is the shape
+/// of a reply that merely ENUMERATES the two options ("- ESCALATE: …\n- SHIP: …"), and the last of
+/// them would otherwise be read as the answer. It is an error, so the caller re-asks rather than
+/// guessing.
 ///
 /// An answer naming neither decision is an error, and the caller re-asks rather than guessing.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
-    let mut decided: Option<Verdict> = None;
-    // The last decision stated on an UNDECORATED line. A plain line is an answer; a decorated one
-    // is as likely a bulleted mention of the option the reply rejected. Preferring the plain line
-    // keeps the answer independent of line order — otherwise a plainly-stated `ESCALATE` above a
-    // bulleted `SHIP` resolved by position to `Ship`, shipping a reply that escalated.
-    let mut decided_plain: Option<Verdict> = None;
+    // The strongest decision seen so far and its line's rank. `>=` below keeps the LAST of two
+    // equally-ranked decisions, which is pure last-match among equals — what the module doc
+    // promises for a reply that lays out both options before stating which one it picks.
+    let mut best: Option<(u8, Verdict)> = None;
     let mut saw_ship = false;
     let mut saw_escalate = false;
-    // Whether any decision-shaped line was written WITHOUT decoration. A reply that states one of
-    // the decisions on a plain line is answering, whatever it said about the other; a reply whose
-    // every decision word sits behind a bullet or emphasis is listing them.
-    let mut any_undecorated = false;
     for raw in stdout.lines() {
-        let (line, decorated) = strip_answer_decoration(raw);
+        let (line, labelled, decorated) = strip_answer_decoration(raw);
         let line = line.as_str();
         if line.is_empty() {
             continue;
         }
         let upper = line.to_ascii_uppercase();
         let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
-        if bare == "SHIP" || upper.starts_with("SHIP:") {
-            decided = Some(Verdict::Ship);
-            if !decorated {
-                decided_plain = Some(Verdict::Ship);
-            }
-            saw_ship = true;
-            any_undecorated |= !decorated;
-            continue;
-        }
-        if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
+        // `requested_form` is whether the line is a decision in the exact shape the prompt asked
+        // for. A `SHIP: <prose>` line is deliberately NOT one: the prompt asks for a bare `SHIP`,
+        // and the explanation form is at least as likely to enumerate the rejected option.
+        let (verdict, requested_form) = if bare == "SHIP" {
+            (Verdict::Ship, true)
+        } else if upper.starts_with("SHIP:") {
+            (Verdict::Ship, false)
+        } else if upper.starts_with("ESCALATE:") {
             let rest = line
                 .get("ESCALATE:".len()..)
                 .map(|r| r.trim().trim_end_matches(['*', '`', ' ']).trim())
                 .unwrap_or_default();
-            let verdict = Verdict::Escalate {
-                reason: if rest.is_empty() {
-                    "the manager escalated without stating a reason".to_string()
-                } else {
-                    rest.to_string()
+            (
+                Verdict::Escalate {
+                    reason: if rest.is_empty() {
+                        "the manager escalated without stating a reason".to_string()
+                    } else {
+                        rest.to_string()
+                    },
                 },
-            };
-            decided = Some(verdict.clone());
-            if !decorated {
-                decided_plain = Some(verdict);
-            }
+                true,
+            )
+        } else if bare == "ESCALATE" {
+            (
+                Verdict::Escalate {
+                    reason: "the manager escalated without stating a reason".to_string(),
+                },
+                true,
+            )
+        } else {
+            continue;
+        };
+        if matches!(&verdict, Verdict::Ship) {
+            saw_ship = true;
+        } else {
             saw_escalate = true;
-            any_undecorated |= !decorated;
+        }
+        let rank = if labelled {
+            2
+        } else if requested_form && !decorated {
+            1
+        } else {
+            0
+        };
+        if best.as_ref().map(|(r, _)| rank >= *r).unwrap_or(true) {
+            best = Some((rank, verdict));
         }
     }
-    if saw_ship && saw_escalate && !any_undecorated {
-        return Err(format!(
-            "adjudication reply named BOTH decisions, each only on a decorated line; ambiguous \
-             rather than an answer: {}",
-            snippet(stdout)
-        ));
-    }
-    decided_plain.or(decided).ok_or_else(|| {
+    let (rank, verdict) = best.ok_or_else(|| {
         format!(
             "adjudication reply named neither SHIP nor ESCALATE: {}",
             snippet(stdout)
         )
-    })
+    })?;
+    if saw_ship && saw_escalate && rank == 0 {
+        return Err(format!(
+            "adjudication reply named BOTH decisions, each only weakly (decorated, or a `SHIP:` \
+             explanation) rather than as an answer: {}",
+            snippet(stdout)
+        ));
+    }
+    Ok(verdict)
 }
 
 /// Strips the leading markdown/quoting decoration and an optional `Decision:`/`Verdict:` label a
 /// model routinely wraps its one-line answer in, so `**SHIP**`, `- SHIP` and `Decision: SHIP` are
-/// read as the decisions they are. Returns whether anything was stripped, which [`parse_verdict`]
-/// uses to tell a decision from an enumerated list item.
+/// read as the decisions they are. Returns the undecorated content, whether an explicit
+/// `Decision:`/`Verdict:` label came off, and whether any other decoration was stripped.
+///
+/// The label is reported separately because it is an ANSWER marker, not decoration:
+/// [`parse_verdict`] ranks a labelled line above an unlabelled one, since a model that writes
+/// `Decision: SHIP` has named the line as its answer. Treating the label itself as decoration (the
+/// old behaviour) ranked the most explicit answer below any plain decision-shaped line above it,
+/// so a labelled `ESCALATE` lost to the prompt's own echoed `SHIP` menu line.
 ///
 /// Deliberately not a prose scanner: it removes LEADING decoration only, so a line that begins
 /// `SHIP ` still carries its explanation and is still not a decision. Three such replies used to be
 /// Err, which the caller counts as a failed turn and blames the model for being unreachable when it
 /// answered clearly — a misdiagnosis, not a safety property.
-fn strip_answer_decoration(line: &str) -> (String, bool) {
+fn strip_answer_decoration(line: &str) -> (String, bool, bool) {
     // Decoration can sit on either side of the label (`**Decision: SHIP**`), so this is applied
     // again after the label comes off.
     fn undecorate(s: &str) -> (&str, bool) {
@@ -575,15 +606,15 @@ fn strip_answer_decoration(line: &str) -> (String, bool) {
     let upper = s.to_ascii_uppercase();
     for label in ["DECISION:", "VERDICT:"] {
         if upper.starts_with(label) {
-            // Byte-slicing is safe here: `starts_with` proved the prefix is these ASCII bytes. The
-            // label ITSELF is decoration, so the line is decorated whatever `undecorate` says.
+            // Byte-slicing is safe here: `starts_with` proved the prefix is these ASCII bytes.
             return (
                 undecorate(s.get(label.len()..).unwrap_or("")).0.to_string(),
                 true,
+                decorated,
             );
         }
     }
-    (s.to_string(), decorated)
+    (s.to_string(), false, decorated)
 }
 
 /// A short, single-line excerpt of a reply for an error message, so a long transcript does not land
@@ -770,6 +801,70 @@ mod tests {
         assert_eq!(
             parse_verdict("SHIP\n- ESCALATE: the alternative"),
             Ok(Verdict::Ship)
+        );
+    }
+
+    /// **The label is an answer marker, not decoration.** A reply that echoes the prompt's own menu
+    /// (`SHIP` / `ESCALATE: <the specific reason a human is needed>`) and then states its answer on
+    /// a `Decision:` line must resolve to the labelled line. Ranking the label as decoration made
+    /// the echo win instead: the placeholder became the escalation reason, or a plain `SHIP` echo
+    /// beat a real `Decision: ESCALATE` and the escalation shipped.
+    #[test]
+    fn a_labelled_answer_outranks_the_prompts_own_echoed_menu() {
+        let echo = "Answer with exactly one line, one of:\nSHIP\n\
+                    ESCALATE: <the specific reason a human is needed>\n\n";
+        assert_eq!(
+            parse_verdict(&format!(
+                "{echo}Decision: ESCALATE: the schema migration needs DBA sign-off before this lands"
+            )),
+            Ok(Verdict::Escalate {
+                reason: "the schema migration needs DBA sign-off before this lands".to_string()
+            }),
+            "the labelled answer is the decision, not the echoed placeholder"
+        );
+        assert_eq!(
+            parse_verdict(&format!("{echo}Decision: SHIP")),
+            Ok(Verdict::Ship),
+            "a labelled SHIP is the answer even under the prompt's echoed ESCALATE menu line"
+        );
+    }
+
+    /// **A plain `SHIP: <prose>` line is an explanation, not an answer.** The prompt asks for a bare
+    /// `SHIP`, so `SHIP: <why it does not apply>` is at least as likely to be explaining the
+    /// rejected option as stating the decision. It must not outrank the real answer below it — the
+    /// previous plain-beats-decorated rule did exactly that and shipped an escalation.
+    #[test]
+    fn a_plain_ship_explanation_does_not_outrank_the_answer_below_it() {
+        // The real answer is decorated (bold), the explanatory SHIP line is plain. Neither outranks
+        // the other on that axis alone, so this is a weak tie and the safe answer is the ambiguity
+        // error, never `Ship`.
+        let reply = "Analysis: two nits plus an unreviewed schema migration.\n\
+                     SHIP: not appropriate here — the migration has never been looked at by a DBA.\n\
+                     **ESCALATE: the schema migration in 003 is unreviewed**";
+        assert!(
+            !matches!(parse_verdict(reply), Ok(Verdict::Ship)),
+            "a plain `SHIP:` explanation must never resolve to ship: {:?}",
+            parse_verdict(reply)
+        );
+
+        // With an explicit label the same reply is unambiguous — and it is the escalation, with the
+        // model's own reason rather than any placeholder.
+        assert_eq!(
+            parse_verdict(
+                "SHIP: the nits do not block\nDecision: ESCALATE: the schema change is unreviewed"
+            ),
+            Ok(Verdict::Escalate {
+                reason: "the schema change is unreviewed".to_string()
+            })
+        );
+        assert_eq!(
+            parse_verdict(
+                "ESCALATE: would mean a human decides.\nSHIP: would mean the nits do not block.\n\
+                 **Decision: ESCALATE**"
+            ),
+            Ok(Verdict::Escalate {
+                reason: "the manager escalated without stating a reason".to_string()
+            })
         );
     }
 
