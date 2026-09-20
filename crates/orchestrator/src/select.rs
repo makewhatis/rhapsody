@@ -819,6 +819,16 @@ mod tests {
         re
     }
 
+    /// A running QUORUM review (STUDIO-950): a real tracker ticket wearing
+    /// [`crate::quorum::REVIEW_TICKET_LABEL`], which is how that path is identified — it carries no
+    /// `review` coordinates, because it HAS a ticket. It runs on the implementation ladder and is
+    /// deliberately outside the separate review pool.
+    fn quorum_review_run(id: &str) -> RunningEntry {
+        let mut iss = running_state(id, "In Progress");
+        iss.labels = Some(vec![crate::quorum::REVIEW_TICKET_LABEL.to_string()]);
+        running_entry(iss, "", "")
+    }
+
     // --- select_test.go (single-project) ------------------------------------------------------
 
     // Mirrors Go `TestSelectDispatchRespectsGlobalSlots`.
@@ -928,6 +938,51 @@ mod tests {
                 .len(),
             1,
             "the project cap admits once the review is gone"
+        );
+    }
+
+    /// STUDIO-950's OTHER scope boundary, the one the PR body names and nothing pinned: only the
+    /// TICKETLESS review path draws the separate pool. A quorum review is a real tracker ticket on
+    /// this very ladder, so it still spends an implementation slot.
+    ///
+    /// This is not cosmetic. `select`'s greedy pass shares one `global_remaining` between active
+    /// dispatch and the review-reopen branch, and the review-reopen tickets are themselves review
+    /// tickets — so widening the subtraction from `running_ticketless_reviews()` to every
+    /// [`crate::teams::is_review_run`] entry would leave the reopen path drawing against a budget
+    /// nothing puts back, silently unbounding it. The body says so; before this test the whole
+    /// crate stayed green under exactly that substitution.
+    ///
+    /// Mutation check: subtract `self.running.values().filter(|re| teams::is_review_run(re))` in
+    /// `implementation_pool_holders` instead of `running_ticketless_reviews()`, and the first
+    /// assertion reds (`left: 1, right: 0`) while the ticketless control below stays green.
+    #[test]
+    fn a_running_quorum_review_still_counts_against_the_implementation_budget() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-ticket".to_string(), quorum_review_run("rev-ticket"));
+
+        assert!(
+            o.select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .is_empty(),
+            "a quorum review ticket runs on the implementation ladder and still spends its slot: \
+             the separate pool is the ticketless path only"
+        );
+
+        // Control: the IDENTICAL fixture — key still set, one run in flight, one candidate — with a
+        // TICKETLESS review instead admits the implementation. So the refusal above is the KIND of
+        // run, not the key, the cap or the candidate.
+        let mut ticketless = orch_for_select(1, HashMap::new(), None);
+        ticketless.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        ticketless
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert_eq!(
+            ticketless
+                .select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .len(),
+            1,
+            "the ticketless review draws its own pool, so the implementation slot is free"
         );
     }
 
@@ -1530,7 +1585,6 @@ mod tests {
             Some("1")
         );
     }
-
     // STUDIO-949 round 7: a deliberate hold is NOT a capacity casualty, and the log must not say it
     // is. With a seat taken and a held candidate in the unexamined tail, reverting the `continue` in
     // the capacity branch pushes the held ticket into the tally, so the line blames the cap for a
