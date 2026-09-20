@@ -365,7 +365,11 @@ mod tests {
     }
 
     /// The one write a poke performs is a comment — the daemon never marks a pull request ready
-    /// itself, and this is the test that says so: the only seam a poke touches is `PrCommentSink`.
+    /// itself, and this is the test that says so: the only seam a poke touches is `PrCommentSink`,
+    /// and the body it posts is an INSTRUCTION to the author rather than a statement that the
+    /// daemon published it. `DraftPokeDeps` exposes no readiness seam to call; adding one would be
+    /// a new field here and a visible diff, and this assertion is what would notice the body
+    /// changed from asking to telling.
     #[tokio::test]
     async fn a_poke_posts_exactly_one_comment_and_touches_no_other_surface() {
         let comments = Arc::new(RecordingComments::default());
@@ -375,7 +379,13 @@ mod tests {
             room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
         };
         perform_nudge(&DraftNudge::Poke(plan("abc", 0)), &deps, Utc::now()).await;
-        assert_eq!(comments.0.lock().expect("lock").len(), 1);
+        let posted = comments.0.lock().expect("lock").clone();
+        assert_eq!(posted.len(), 1);
+        assert!(
+            posted[0].contains("mark it ready for review"),
+            "the author is asked to publish it, not told the daemon did: {}",
+            posted[0]
+        );
         assert!(
             room.0.lock().expect("lock").is_empty(),
             "a poke is a message to the author, not a room announcement"
