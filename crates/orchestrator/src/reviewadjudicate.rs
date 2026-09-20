@@ -366,31 +366,34 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 
 /// Reads `SHIP` or `ESCALATE: …` out of the turn's stdout.
 ///
-/// Lenient about punctuation and surrounding prose, strict about the decision: an answer naming
-/// neither is an error, and the caller re-asks rather than guessing a verdict.
+/// Lenient about surrounding prose and punctuation, strict about the decision: it scans every line
+/// and takes the first that NAMES one of the two, so a model that prefixes its answer with a
+/// sentence still parses; an answer naming neither is an error, and the caller re-asks rather than
+/// guessing a verdict.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let upper = line.to_ascii_uppercase();
-    let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
-    if bare == "SHIP" || bare.starts_with("SHIP:") || bare.starts_with("SHIP ") {
-        return Ok(Verdict::Ship);
-    }
-    if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
-        let rest = line
-            .get("ESCALATE:".len()..)
-            .map(str::trim)
-            .unwrap_or_default();
-        return Ok(Verdict::Escalate {
-            reason: if rest.is_empty() {
-                "the manager escalated without stating a reason".to_string()
-            } else {
-                rest.to_string()
-            },
-        });
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
+        if bare == "SHIP" || bare.starts_with("SHIP:") || bare.starts_with("SHIP ") {
+            return Ok(Verdict::Ship);
+        }
+        if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
+            let rest = line
+                .get("ESCALATE:".len()..)
+                .map(str::trim)
+                .unwrap_or_default();
+            return Ok(Verdict::Escalate {
+                reason: if rest.is_empty() {
+                    "the manager escalated without stating a reason".to_string()
+                } else {
+                    rest.to_string()
+                },
+            });
+        }
     }
     Err(format!(
         "adjudication reply named neither SHIP nor ESCALATE: {}",
@@ -461,6 +464,12 @@ mod tests {
         for reply in ["SHIP", "ship", "SHIP.", "  SHIP  ", "SHIP: go"] {
             assert_eq!(parse_verdict(reply), Ok(Verdict::Ship), "({reply:?})");
         }
+        // A model that prefixes its answer with a sentence still parses: the decision scans every
+        // line, not just the first.
+        assert_eq!(
+            parse_verdict("Here is my decision.\n\nSHIP"),
+            Ok(Verdict::Ship)
+        );
     }
 
     #[test]
