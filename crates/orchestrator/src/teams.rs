@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use rhapsody_config::memory::Fact;
 use rhapsody_config::room::MAX_ROOM_WINDOW;
 use rhapsody_config::teams::{Identity, ManagerMode, Teams};
-use rhapsody_core::Issue;
+use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store as store;
 
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
@@ -460,14 +460,15 @@ pub(crate) fn is_solo(iss: &Issue) -> bool {
 
 /// Whether `iss` carries [`HUMAN_LABEL`] — the human-only dispatch gate (STUDIO-949).
 ///
-/// Case-insensitive for [`is_solo`]'s reason, and consistent with
-/// [`has_any_label`](crate::dispatch::has_any_label), which normalizes at compare
-/// time: labels reach the daemon however the tracker spells them.
+/// Matching normalizes at compare time (`trim` + lowercase), exactly as
+/// [`has_any_label`](crate::dispatch::has_any_label) does: labels reach the daemon however the
+/// tracker spells them, and an operator who typed `Rhapsody:Human` (or padded it) meant the hold.
 pub(crate) fn is_human(iss: &Issue) -> bool {
+    let want = normalize_state(HUMAN_LABEL);
     iss.labels
         .iter()
         .flatten()
-        .any(|l| l.eq_ignore_ascii_case(HUMAN_LABEL))
+        .any(|l| normalize_state(l) == want)
 }
 
 /// Whether `iss` carries the `rhapsody:@<name>` label for exactly `name`.

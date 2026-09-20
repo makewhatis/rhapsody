@@ -828,11 +828,17 @@ mod tests {
         );
     }
 
-    // STUDIO-949: the label match is case-insensitive, consistent with `has_any_label`.
+    // STUDIO-949: the label match normalizes at compare time (`trim` + lowercase), exactly as
+    // `has_any_label` does.
     #[test]
     fn human_label_match_is_case_insensitive() {
         let g = GateData::standard();
-        for spelling in ["rhapsody:human", "Rhapsody:Human", "RHAPSODY:HUMAN"] {
+        for spelling in [
+            "rhapsody:human",
+            "Rhapsody:Human",
+            "RHAPSODY:HUMAN",
+            " rhapsody:human ",
+        ] {
             let mut human = base_issue();
             human.labels = Some(vec![spelling.into()]);
             assert!(
