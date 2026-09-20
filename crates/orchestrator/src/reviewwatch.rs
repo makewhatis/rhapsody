@@ -2116,6 +2116,15 @@ mod tests {
                 assert_eq!(e.identifier, "STUDIO-721", "the origin ticket is named");
                 assert_eq!(e.author, "alice");
                 assert_eq!(e.pokes, 1, "poked once; the head never moved");
+                // `pokes == 1` is the PRIMARY shape of this axis, not an edge case — it is the only
+                // count a static head can produce — so its singular render is pinned here as a
+                // PHRASE. The trailing `to` discriminates: the plural form renders "made 1 attempts
+                // to", which does not contain "made 1 attempt to".
+                assert!(
+                    crate::draftpoke::escalation_body(e).contains("made 1 attempt to"),
+                    "the singular count is named: {}",
+                    crate::draftpoke::escalation_body(e)
+                );
             }
             other => panic!("expected an escalation, got {other:?}"),
         }

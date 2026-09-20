@@ -1384,8 +1384,12 @@ one comment and then silence forever, which is the parking this feature exists t
 **In memory, and that is deliberate.** The per-head bookkeeping is a churn floor rather than an audit
 record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets the whole ledger — the escalation
 included — so a still-draft pull request already handed to a human is poked afresh and can earn a
-second escalation, once per restart for as long as the draft stands. Persisting the ladder is a
-larger decision than this feature.
+second escalation, once per restart for as long as the draft stands. The escalation latch has a
+second edge in the other direction: it is set when the escalation is PLANNED, before either write is
+attempted, so an escalation whose room post and pull-request comment both failed still silences the
+pull request while telling nobody — the WARN reads "the escalation reached no surface — no human was
+told", and a restart (or a human publishing by hand) is the only thing that clears the latch and
+re-arms the poke. Persisting the ladder is a larger decision than this feature.
 
 **An unstated `isDraft` is never acted on, in either direction.** `PrSnapshot::is_draft` is an
 `Option<bool>`, and its readers take an unstated answer in the safe direction each needs: the

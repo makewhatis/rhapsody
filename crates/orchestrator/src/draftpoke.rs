@@ -158,6 +158,14 @@ pub struct DraftPokeState {
     pub unanswered_sweeps: usize,
     /// Whether the human escalation has already been made. Once true, this pull request is silent
     /// until it stops being a draft.
+    ///
+    /// Latched when the escalation is PLANNED, before either of its writes is attempted, and
+    /// [`crate::draftpoke::perform_nudge`] cannot report a delivery failure back to the control
+    /// task. So the latch stands even when both writes failed: the terminal WARN says the
+    /// escalation "reached no surface — no human was told", and the pull request stays silent at
+    /// every head until the draft stops or the daemon restarts — a restart is the only thing that
+    /// clears this flag. An operator who greps that WARN should read it as "restart me or handle
+    /// this by hand", not as a note about a write that failed.
     pub escalated: bool,
 }
 
@@ -273,6 +281,10 @@ pub async fn perform_nudge(nudge: &DraftNudge, deps: &DraftPokeDeps, at: DateTim
             // Whether ANY surface actually accepted the escalation. The terminal log line below
             // must not claim a human now owns this pull request when neither write landed — the
             // one line an operator greps for would otherwise be false exactly when it matters.
+            // Note the asymmetry with the ledger: `DraftPokeState::escalated` was already latched
+            // when this nudge was planned and is not cleared by a failed write, so this line is the
+            // ONLY signal that the escalation reached nobody — "reached no surface" means the pull
+            // request stays silent until a restart (or a human publishing by hand) re-arms it.
             let mut told = false;
             if let Some(room) = deps.room.as_ref() {
                 let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());
@@ -571,9 +583,39 @@ mod tests {
         );
     }
 
-    /// The complement: ONE surface accepting is enough. A refusing comment sink must not suppress
-    /// the handoff line when the room took the escalation, or an operator would be told nobody was
-    /// informed of a pull request a human does in fact own.
+    /// The OTHER half of the `told` OR, which the two tests above cannot see by construction: a
+    /// comment that POSTED with no room at all. That is a shipped shape rather than a hypothetical —
+    /// `run.rs` passes `room: None` whenever Teams is off, and the ticketless review watch (and this
+    /// poke) run regardless — so on such an installation the comment is the escalation's only
+    /// surface. With the comment arm neutered, a daemon whose escalation comment did post would emit
+    /// "reached no surface — no human was told": jimmy's false line in the opposite direction.
+    #[tokio::test]
+    async fn an_escalation_that_reaches_only_the_pull_request_still_hands_it_to_a_human() {
+        let events = captured(|| async {
+            let deps = DraftPokeDeps {
+                comments: Some(Arc::new(RecordingComments::default()) as Arc<dyn PrCommentSink>),
+                room: None,
+            };
+            perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("handing it to a human")),
+            "the comment accepted the escalation, so a human was told: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("reached no surface")),
+            "a surface accepted; the no-surface line must not fire: {events:?}"
+        );
+    }
+
+    /// The complement of the test above: ONE surface accepting is enough. A refusing comment sink
+    /// must not suppress the handoff line when the room took the escalation, or an operator would be
+    /// told nobody was informed of a pull request a human does in fact own.
     #[tokio::test]
     async fn an_escalation_that_reaches_only_the_room_still_hands_it_to_a_human() {
         let events = captured(|| async {
