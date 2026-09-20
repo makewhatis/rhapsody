@@ -1030,8 +1030,12 @@ impl Orchestrator {
             return;
         }
 
-        // Eligibility excluding this issue's own pending claim. The label gate is proactive-pickup-only
-        // (nil labels here), so a required label stripped mid-run does not abandon in-flight work.
+        // Eligibility excluding this issue's own pending claim. The REQUIRED-label gate is
+        // proactive-pickup-only (nil labels here), so a required label stripped mid-run does not
+        // abandon in-flight work. The `rhapsody:human` hold is the deliberate exception: it is not
+        // label-config driven, so it is absolute here too — an operator who labels a retrying ticket
+        // `rhapsody:human` means to take it off the agents, and releasing the retry is the intended
+        // outcome rather than a dropped label (STUDIO-949).
         let claimed_except: HashSet<String> = self
             .claimed
             .iter()

@@ -17,9 +17,10 @@ the `Orchestrator` struct itself. Concretely:
 
 - Modules whose functions take `&mut self` / `&Orchestrator` and are called from the loop
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
-  `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
-  they never lock anything and must never be called from another task.
-- Eight exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+  `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined and
+  must never be called from another task. They hold no lock of their own; the one exception is that
+  `dispatch`/`select` take `HumanHoldLedger`'s lock on `&self` (see the seam list below).
+- Nine exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -91,10 +92,6 @@ the `Orchestrator` struct itself. Concretely:
     second write path here would need its own deliberate exception to "a refusal is not surfaced
     outside the log", which that module's doc still states and this read does not weaken.
 
-  If you need to touch orchestrator state from outside the loop task, route through one of these
-  eight seams; if none fits, that's a real design decision — don't reach for a ninth ad hoc
-  `Arc<Mutex<..>>` without updating this list.
-
   - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
     STUDIO-949) — a `Mutex`-guarded pair of sets behind a `&self`-callable handle: the ticket
     identifiers already ANNOUNCED (the once-per-ticket log dedupe) and the CURRENT `rhapsody:human`
@@ -103,6 +100,13 @@ the `Orchestrator` struct itself. Concretely:
     reads the same cell. Never held across an `.await` — two map operations and out. Unlike
     `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
     SURVIVE a pass, so the ledger owns it; `begin_pass` clears only the current set.
+    This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
+    both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
+
+  If you need to touch orchestrator state from outside the loop task, route through one of these
+  nine seams; if none fits, that's a real design decision — don't reach for a tenth ad hoc
+  `Arc<Mutex<..>>` without updating this list.
+
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.
