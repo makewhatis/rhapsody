@@ -319,6 +319,7 @@ mod tests {
             reviewer: "jimmy".to_string(),
             stale_secs: 21_600,
             auto_merge_reason: None,
+            capacity_held: None,
         }];
 
         let rendered = render(&o.build_snapshot());

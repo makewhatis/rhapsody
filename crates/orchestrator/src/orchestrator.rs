@@ -593,11 +593,14 @@ pub struct Orchestrator {
     /// CLEARS it wholesale at the top of each sweep and re-inserts only the rounds that sweep held —
     /// so it always means exactly "what the latest sweep held", never an accumulation.
     ///
-    /// It exists so the reconciliation sweep can tell a DELIBERATE capacity hold — a healthy wait the
-    /// operator can see in `reviewwatch`'s own log — from an unexplained stall. Without it the sweep
-    /// re-derives "a round is owed and nobody ran it" and pages a human for a round the daemon is
-    /// holding on purpose (the second instance of the STUDIO-923 class).
-    pub(crate) review_capacity_held: std::collections::HashSet<String>,
+    /// It exists so the reconciliation sweep can name a DELIBERATE capacity hold — a wait the
+    /// operator can see in `reviewwatch`'s own log — as the cause, instead of reporting an
+    /// unexplained stall (the second instance of the STUDIO-923 class). It ANNOTATES the sweep's
+    /// report; it never suppresses it, because under this module's own 90-minute threshold the only
+    /// hold that reaches the report is the one that has genuinely lasted an hour and a half — the
+    /// incident this ticket is about. Each value carries the sweep's own timestamp so the
+    /// reconciliation sweep ignores a hold no later sweep is refreshing.
+    pub(crate) review_capacity_held: crate::reviewwatch::CapacityHolds,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -872,7 +875,7 @@ impl Orchestrator {
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
             review_unassignable: HashMap::new(),
-            review_capacity_held: std::collections::HashSet::new(),
+            review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,

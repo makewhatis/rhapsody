@@ -89,6 +89,7 @@ use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
 use crate::review::review_key;
 use crate::reviewdone::origin_ticket;
+use crate::reviewwatch::{CAPACITY_HOLD_TTL, CapacityHold};
 
 /// How long a party may owe the next move before the sweep calls the pull request diverged.
 ///
@@ -195,6 +196,13 @@ pub struct Divergence {
     /// onto `/api/v1/state` (`snapshot_json::render` enumerates fields explicitly and this is not
     /// among them) — the ticket's ask is the human-facing log report, not a wire-shape change.
     pub auto_merge_reason: Option<&'static str>,
+    /// The capacity hold the review watcher recorded for THIS row's round, when one is fresh
+    /// (STUDIO-950). Like `auto_merge_reason` it is a fact this process already has, copied from
+    /// [`Orchestrator::review_capacity_held`] — the sweep invents nothing. It ANNOTATES: the row is
+    /// still reported, and [`Orchestrator::set_review_divergences`] names the hold and its holder
+    /// count instead of claiming nothing has reported it blocked. Also deliberately NOT rendered
+    /// onto `/api/v1/state`, for `auto_merge_reason`'s reason.
+    pub capacity_held: Option<CapacityHold>,
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -231,13 +239,12 @@ pub(crate) struct RowFacts {
     /// The row's `origin_ticket`, or `""` when its origin names none.
     pub ticket: String,
     pub open: bool,
-    /// Whether the review watcher deferred THIS row's round for want of a global slot on its most
-    /// recent sweep (STUDIO-950). A capacity hold is a deliberate, healthy wait — the budget is
-    /// spent, the round is re-considered next tick, and `reviewwatch` logs the reason — so it is
-    /// NOT the unexplained stall this sweep exists to catch, and [`row_divergence`] reports nothing
-    /// for it. Without this the sweep re-derived "a round is owed and no reviewer run has started"
-    /// and paged a human for work the daemon was holding on purpose.
-    pub capacity_held: bool,
+    /// The capacity hold the review watcher recorded for THIS row's round when it deferred it for
+    /// want of a global slot (STUDIO-950), `None` when there is none or the recorded hold has gone
+    /// stale. It does not suppress the row — the divergence is still reported — it is copied onto
+    /// it so [`Orchestrator::set_review_divergences`] can name the hold and its holder count rather
+    /// than claim nothing has reported it blocked.
+    pub capacity_held: Option<CapacityHold>,
     /// The newest run of `review_key(pr, reviewer)` — this row's own review round.
     pub reviewer_run: Option<RunMoment>,
     /// The newest run of `ticket`.
@@ -318,6 +325,9 @@ pub(crate) fn reconcile_pr(
                 // Filled in by the caller ([`Orchestrator::reconcile_review_divergence`]), which
                 // has the ledger this pure function deliberately does not.
                 auto_merge_reason: None,
+                // A capacity hold defers a ROUND; it has nothing to say about an approved-and-open
+                // pull request, whose next move is a merge.
+                capacity_held: None,
             });
         }
         return None;
@@ -336,13 +346,6 @@ fn row_divergence(
     now: DateTime<Utc>,
     stale_after: Duration,
 ) -> Option<Divergence> {
-    if row.capacity_held {
-        // A round the watcher is holding for want of a global slot (STUDIO-950). Nothing is owed
-        // and nothing is wrong: the budget frees and the next sweep of the watcher dispatches it.
-        // Reporting it would be the "nothing has reported it blocked" page the bottom of this
-        // module exists to retire, one tick after `reviewwatch` reported exactly why.
-        return None;
-    }
     match row.status.as_str() {
         // The reviewer posted findings, so the AUTHOR owes a run on the origin ticket.
         REVIEW_STATUS_REVIEWED => {
@@ -369,6 +372,7 @@ fn row_divergence(
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, anchor, stale_after)?,
                 auto_merge_reason: None,
+                capacity_held: row.capacity_held,
             })
         }
         // A round ENDED without the agent ever declaring it had finished, so the round is owed
@@ -388,6 +392,7 @@ fn row_divergence(
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, attempt.last_at(), stale_after)?,
                 auto_merge_reason: None,
+                capacity_held: row.capacity_held,
             })
         }
         // A round is owed and the REVIEWER owes it, and no run for this head has been recorded yet.
@@ -424,6 +429,7 @@ fn row_divergence(
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, anchor, stale_after)?,
                 auto_merge_reason: None,
+                capacity_held: row.capacity_held,
             })
         }
         // `approved` is decided above (and, with auto-merge off, is a healthy wait for a human);
@@ -474,6 +480,8 @@ impl Orchestrator {
                 return;
             }
         };
+        // Read once, before the rows, because the capacity-hold freshness test below needs it.
+        let now = (self.now)();
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
@@ -492,12 +500,15 @@ impl Orchestrator {
                 status: row.status.clone(),
                 ticket: ticket.clone(),
                 open: row.open,
-                capacity_held: self.review_capacity_held.contains(&review_key(
-                    &row.key.owner,
-                    &row.key.repo,
-                    row.key.number,
-                    &row.key.reviewer,
-                )),
+                capacity_held: self.fresh_capacity_hold(
+                    &review_key(
+                        &row.key.owner,
+                        &row.key.repo,
+                        row.key.number,
+                        &row.key.reviewer,
+                    ),
+                    now,
+                ),
                 reviewer_run: self.newest_run_moment(&review_key(
                     &row.key.owner,
                     &row.key.repo,
@@ -521,7 +532,6 @@ impl Orchestrator {
                 .rows
                 .push(facts);
         }
-        let now = (self.now)();
         let found: Vec<Divergence> = order
             .iter()
             .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
@@ -540,6 +550,22 @@ impl Orchestrator {
             })
             .collect();
         self.set_review_divergences(found);
+    }
+
+    /// The capacity hold recorded for one review key, or `None` when there is none or the record is
+    /// no longer FRESH (STUDIO-950).
+    ///
+    /// The freshness test is what keeps this sweep decoupled from the watcher, which its own module
+    /// docs treat as a design constraint (the sweep is local and must keep deciding when `gh` cannot
+    /// be reached). `review_capacity_held` is refreshed only by a watcher sweep, and a sweep that
+    /// cannot reach GitHub delivers nothing at all — so a hold from before such an outage would
+    /// otherwise linger and keep naming a fact no later sweep is refreshing. A hold older than
+    /// [`CAPACITY_HOLD_TTL`] — or one timestamped in the future, which no honest clock produces — is
+    /// dropped and the row reports under its ordinary wording.
+    fn fresh_capacity_hold(&self, id: &str, now: DateTime<Utc>) -> Option<CapacityHold> {
+        let hold = self.review_capacity_held.get(id)?;
+        let age = now.signed_duration_since(hold.recorded).to_std().ok()?;
+        (age < CAPACITY_HOLD_TTL).then_some(*hold)
     }
 
     /// The newest `runs` row for one issue identifier, or `None` when the ledger has none (a store
@@ -588,8 +614,39 @@ impl Orchestrator {
                 // tally as its own — trading the ticket's false negative for a false positive. No
                 // ledger entry (auto-merge off, or this head never reached a gate) falls back to the
                 // original wording unchanged.
-                match d.auto_merge_reason {
-                    Some(reason) => {
+                //
+                // STUDIO-950: a round the review watcher deferred for want of a global slot is the
+                // same shape of fact and takes the same slot — name it instead of claiming nothing
+                // has reported it blocked. It is checked first because it is the only annotation a
+                // `requested`/`truncated` row can carry (auto-merge's belongs to `approved`), and it
+                // states the holder COUNT, which the operator tuning the budget needs. The count is
+                // the watcher's own, from its most recent sweep, not this sweep's `sweeps`.
+                match (d.capacity_held, d.auto_merge_reason) {
+                    (Some(hold), _) => {
+                        let budget = if hold.separate {
+                            "agent.max_concurrent_reviews"
+                        } else {
+                            "agent.max_concurrent_agents"
+                        };
+                        tracing::warn!(
+                            pr = %d.pr,
+                            kind = d.kind.as_str(),
+                            ticket = %d.ticket,
+                            reviewer = %d.reviewer,
+                            stale_secs = d.stale_secs,
+                            sweeps,
+                            holding = hold.holders,
+                            budget,
+                            "review reconciliation: {} — {}. It is held for capacity: {} run(s) \
+                             hold the {} budget, so no reviewer run can start yet. This sweep only \
+                             reports, so it needs a human.",
+                            d.pr,
+                            d.kind.detail(),
+                            hold.holders,
+                            budget
+                        );
+                    }
+                    (None, Some(reason)) => {
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -605,7 +662,7 @@ impl Orchestrator {
                             reason
                         );
                     }
-                    None => {
+                    (None, None) => {
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -694,7 +751,7 @@ mod tests {
             status: status.to_string(),
             ticket: ticket.to_string(),
             open: true,
-            capacity_held: false,
+            capacity_held: None,
             reviewer_run,
             ticket_run,
         }
@@ -1233,6 +1290,38 @@ mod tests {
     #[test]
     fn a_pull_request_with_no_live_rows_reports_nothing() {
         assert_eq!(verdict(&pr(Vec::new(), true), "2026-09-14T00:00:00Z"), None);
+    }
+
+    /// STUDIO-950: a capacity hold ANNOTATES the report, it does not suppress it. A row the watcher
+    /// is holding for want of a global slot is STILL reported — the alarm STUDIO-898 exists to
+    /// raise, and at a budget spent for longer than the 90-minute threshold that is the incident —
+    /// carrying the hold so [`Orchestrator::set_review_divergences`] can name it and its holder
+    /// count. Pinned at the pure rule, which is where the field is copied onto the divergence.
+    #[test]
+    fn a_capacity_hold_annotates_the_divergence_instead_of_hiding_it() {
+        let mut held = row(
+            "alice",
+            REVIEW_STATUS_REQUESTED,
+            "STUDIO-950",
+            None,
+            // The authoring run, which armed the row; long stale against the real threshold.
+            ran("2026-09-14T13:00:00Z", "2026-09-14T13:30:00Z"),
+        );
+        let hold = CapacityHold {
+            holders: 4,
+            separate: false,
+            recorded: t("2026-09-14T21:00:00Z"),
+        };
+        held.capacity_held = Some(hold);
+        let facts = pr(vec![held], false);
+
+        let d = verdict(&facts, "2026-09-14T21:20:00Z").expect("still reported, not suppressed");
+        assert_eq!(d.kind, DivergenceKind::ReviewRequestedNoRun);
+        assert_eq!(
+            d.capacity_held,
+            Some(hold),
+            "the hold travels with the report"
+        );
     }
 }
 

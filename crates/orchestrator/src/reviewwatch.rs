@@ -529,8 +529,8 @@ impl Orchestrator {
         // PREVIOUS sweep is stale from here on. Cleared wholesale up front (rather than per row) so
         // `review_capacity_held` always means exactly "what THIS sweep held" — a round deferred for
         // a different reason this sweep, or one whose pull request the lookup did not even reach,
-        // cannot keep suppressing the reconciliation sweep under an old hold. The capacity branch
-        // below re-inserts each round the budget defers.
+        // cannot keep annotating the reconciliation sweep's row under an old hold. The capacity
+        // branch below re-inserts each round the budget defers.
         self.review_capacity_held.clear();
         // The count the ACTIVE pool is drawn against (STUDIO-950): the ticketless reviews once the
         // key gives them their own pool, else every running run on the shared budget. Used for BOTH
@@ -732,12 +732,26 @@ impl Orchestrator {
             }
             if *slots <= 0 {
                 // STUDIO-950: remember WHY this round is deferred, so the reconciliation sweep can
-                // tell a deliberate capacity hold from an unexplained stall. The count is the runs
-                // holding the ACTIVE pool — every running run in shared mode, the ticketless
-                // reviews once the key gives them their own — so the log a human reads when tuning
-                // the key names what actually spent it rather than always the reviews.
+                // report it as a deliberate capacity hold rather than the unexplained stall it
+                // would otherwise re-derive. The count is the runs holding the ACTIVE pool — every
+                // running run in shared mode, the ticketless reviews once the key gives them their
+                // own — so the log a human reads when tuning the key names what actually spent it
+                // rather than always the reviews. The record is timestamped so a hold from a sweep
+                // that has since stopped happening (a `gh` outage) cannot outlive its freshness.
                 let holding = self.review_pool_holders();
-                self.review_capacity_held.insert(id.clone());
+                let separate = self
+                    .eff
+                    .as_ref()
+                    .is_some_and(|e| e.max_concurrent_reviews.is_some());
+                let recorded = (self.now)();
+                self.review_capacity_held.insert(
+                    id.clone(),
+                    CapacityHold {
+                        holders: holding,
+                        separate,
+                        recorded,
+                    },
+                );
                 tracing::debug!(
                     pr = %pr, holding,
                     "ticketless review: the daemon-wide concurrency budget is spent; this round is \
@@ -1114,6 +1128,42 @@ pub type ReviewRounds = HashMap<String, usize>;
 /// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
 /// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
 pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
+
+/// One round the watcher deferred for want of a global slot, recorded so the reconciliation sweep
+/// can report it as a DELIBERATE capacity hold rather than an unexplained stall (STUDIO-950).
+///
+/// It annotates, it never suppresses: the sweep keeps reporting the pull request — the alarm that
+/// STUDIO-898 exists to raise — and names this as the cause instead of claiming nothing has
+/// reported it blocked, exactly as [`Divergence::auto_merge_reason`](crate::reviewreconcile::Divergence::auto_merge_reason)
+/// does for auto-merge (STUDIO-923). Under this module's own 90-minute threshold only a hold that
+/// has genuinely lasted an hour and a half reaches the report at all, which is the incident — a
+/// transient hold resolves long before the threshold and never pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityHold {
+    /// How many runs held the ACTIVE pool when the sweep deferred this round — every running run in
+    /// shared mode, the ticketless reviews once `agent.max_concurrent_reviews` gives them their own.
+    pub holders: i64,
+    /// Whether those runs held reviews' OWN budget (`agent.max_concurrent_reviews`) rather than the
+    /// shared `agent.max_concurrent_agents` one. Names which knob the operator would tune.
+    pub separate: bool,
+    /// When the holding sweep ran. The reconciliation sweep ignores a hold older than
+    /// [`CAPACITY_HOLD_TTL`], so a hold recorded before a `gh` outage cannot outlive the outage.
+    pub recorded: chrono::DateTime<chrono::Utc>,
+}
+
+/// The rounds the watcher held on its most recent sweep, keyed by the same
+/// `review:<owner>/<repo>#<n>@<reviewer>` id `running` and `claimed` use. See
+/// [`Orchestrator::review_capacity_held`]. STUDIO-950.
+pub(crate) type CapacityHolds = HashMap<String, CapacityHold>;
+
+/// How long a recorded [`CapacityHold`] stays meaningful. The watcher refreshes its holds on every
+/// sweep it actually runs, which is [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)
+/// apart; a hold older than two intervals is from a sweep that has since stopped happening — a `gh`
+/// outage, a cancelled watcher — and the reconciliation sweep must not keep naming a fact nothing is
+/// refreshing. The threshold keeps the two sweeps decoupled: the reconciliation sweep asks only
+/// whether a hold is FRESH, never whether the watcher is running.
+pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration =
+    std::time::Duration::from_secs(crate::prstate::PR_STATE_POLL_INTERVAL.as_secs() * 2);
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -2931,15 +2981,19 @@ mod tests {
     }
 
     /// STUDIO-950's second half: a round the watcher is HOLDING for capacity is not an unexplained
-    /// stall. `reviewwatch` recorded the hold when it deferred the round; the reconciliation sweep
-    /// must read it and stay silent, then report normally once the hold is gone.
+    /// stall — but it is still REPORTED. `reviewwatch` records the hold when it defers the round;
+    /// the reconciliation sweep copies it onto the divergence and its WARN names the hold and its
+    /// holder count instead of claiming nothing has reported the pull request blocked. That is the
+    /// STUDIO-923 shape (annotate, never suppress): at a budget spent for longer than the sweep's
+    /// own 90-minute threshold, this is the incident and a human should hear about it.
     ///
-    /// The positive control (`clear` then reconcile again, non-empty) is deliberate: without it the
-    /// test would still pass if the divergence rule stopped firing for everyone.
+    /// The positive control (forget the hold, reconcile again) is deliberate: without it the test
+    /// would pass if `capacity_held` came from anywhere, including an unconditional field.
     ///
-    /// Mutation check: revert the sweep's `capacity_held` exclusion and the first assertion reds.
+    /// Mutation check: drop the annotation (`RowFacts.capacity_held` always `None`) or revert the
+    /// WARN's capacity arm to the plain wording, and the assertions below red.
     #[test]
-    fn a_review_held_for_capacity_is_not_reported_as_a_divergence() {
+    fn a_review_held_for_capacity_names_the_hold_instead_of_nothing() {
         let (mut o, _d) = orch(ticketless(&["bob"]));
         o.eff.as_mut().expect("eff").max_concurrent = 4;
         for i in 0..4 {
@@ -2947,7 +3001,7 @@ mod tests {
         }
         introduce(&o, row(31, "bob"));
         // The row's origin ticket, so the `requested` rule has an author run to anchor on. Long
-        // stale, so the rule WOULD report without the hold.
+        // stale, so the rule would report with or without the hold.
         finished_run(
             &o,
             "STUDIO-721",
@@ -2961,26 +3015,100 @@ mod tests {
             "the fixture holds the round for capacity"
         );
         let id = review_key(OWNER, REPO, 31, "bob");
-        assert!(
-            o.review_capacity_held.contains(&id),
-            "the hold must be recorded for the sweep to read"
+        assert_eq!(
+            o.review_capacity_held
+                .get(&id)
+                .map(|h| (h.holders, h.separate)),
+            Some((4, false)),
+            "the hold must record the shared pool's four holders"
         );
 
-        o.reconcile_review_divergence();
+        let (_, events) = capture_events(|| o.reconcile_review_divergence());
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a held round is still reported, annotated"
+        );
+        assert_eq!(
+            o.review_divergences()[0].capacity_held.map(|h| h.holders),
+            Some(4),
+            "the hold travels with the report"
+        );
+        let warn = events
+            .iter()
+            .find(|e| e.message.contains("review reconciliation"))
+            .expect("the divergence must be logged");
         assert!(
-            o.review_divergences().is_empty(),
-            "a held round is a healthy wait, not a divergence: {:?}",
-            o.review_divergences()
+            warn.message.contains("held for capacity"),
+            "the report must name the hold, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "it must not claim nothing reported it, got: {}",
+            warn.message
         );
 
-        // Positive control: forget the hold and the SAME row is reported, so the silence above is
-        // the exclusion and not the rule failing to fire.
+        // Positive control: forget the hold and the SAME row reports under the plain wording, so
+        // the naming above is the annotation and not an unconditional message.
         o.review_capacity_held.clear();
         o.reconcile_review_divergence();
         assert_eq!(
             o.review_divergences().len(),
             1,
-            "without the hold the owed round IS a divergence"
+            "the row still reports without a hold"
+        );
+        assert!(
+            o.review_divergences()[0].capacity_held.is_none(),
+            "no hold, no annotation"
+        );
+    }
+
+    /// STUDIO-950 / the reconciliation sweep's decoupling: a hold recorded by a watcher sweep that
+    /// has since STOPPED HAPPENING must not keep naming the capacity budget. The watcher delivers no
+    /// sweep event at all when every `gh` lookup answers nothing — the outage case — so its hold map
+    /// is never refreshed, while the reconciliation sweep (local, `gh`-free, and deliberately so)
+    /// keeps running. It must stop trusting a record older than `CAPACITY_HOLD_TTL` and fall back to
+    /// the plain wording rather than name a fact nothing is refreshing.
+    ///
+    /// Mutation check: drop the freshness test in `fresh_capacity_hold` and the stale hold still
+    /// annotates, red.
+    #[test]
+    fn a_stale_capacity_hold_is_not_named_by_the_reconciliation_sweep() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        // One sweep records the hold; then the watcher goes quiet (a `gh` outage delivers no further
+        // sweep), so nothing refreshes it.
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1);
+
+        let later = chrono::Utc::now()
+            + chrono::Duration::seconds(
+                i64::try_from(CAPACITY_HOLD_TTL.as_secs()).expect("ttl") + 1,
+            );
+        o.now = Box::new(move || later);
+
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "the owed round still reports"
+        );
+        assert!(
+            o.review_divergences()[0].capacity_held.is_none(),
+            "a hold no live sweep is refreshing must not be named"
         );
     }
 

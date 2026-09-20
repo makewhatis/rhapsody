@@ -1199,6 +1199,15 @@ move, so has that party moved since the row started owing it? It **reports and n
 re-dispatching on a rule nobody has watched fire is how a stall becomes a loop, so acting is left to
 its own reviewed change.
 
+Detection stays cause-agnostic, but the report is not silent about a cause the daemon already knows.
+When the review watcher deferred a round for want of a global slot it records the hold (STUDIO-950),
+and the sweep names it — the holder count and which budget — instead of the unenriched "nothing has
+reported it blocked", exactly as it names auto-merge's decline reason (STUDIO-923). It annotates and
+never suppresses: the pull request is still reported, which matters because under the 90-minute
+threshold the only capacity hold that reaches the report is one that has genuinely lasted an hour and
+a half — the incident this sweep exists to surface. A recorded hold older than the watcher's own
+refresh window is ignored, so a hold from before a `gh` outage cannot keep being named.
+
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | detection | none (the feature does not exist) | a threshold sweep, 90 min, cause-agnostic |
@@ -1218,6 +1227,39 @@ operator's own store (n=197 completed runs) run durations were p50 7.3 min, p90 
 eleven hours the incidents actually cost. A pull request mid-round is silent, an in-flight run is
 activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
+
+
+### A separate global budget for review runs — `agent.max_concurrent_reviews` (STUDIO-950)
+
+Go v0.4.0 has one daemon-wide concurrency budget, `max_concurrent_agents`, and this port matched it
+exactly: implementation runs and the ticketless review rounds both drew from the same pool. Live on
+2026-09-20 that produced an inversion — four implementations held all four slots while a review round
+for `makewhatis/strava#31` waited over an hour for a turn — because a review is what CLEARS a pull
+request and thereby frees an implementation slot, so the work that creates capacity was queued behind
+the work that spends it. The per-role concurrency design (D2, "reviews are free") had already
+separated the two at the per-teammate cap; it was never extended to the global one.
+
+Rhapsody adds one optional key, `agent.max_concurrent_reviews`, giving review runs their own global
+pool. It is **opt-in and inert when unset**: with the key absent, reviews keep drawing the shared
+`max_concurrent_agents` budget, so an existing install observes no scheduling change on upgrade. It
+lives in `WORKFLOW.md` and hot-reloads with the rest of the file. When it IS set the two pools are
+separated in BOTH directions — the implementation ladders subtract the running ticketless reviews
+from their own draw, so a review in flight cannot cost an implementation a slot, and the review
+watcher draws only its own pool.
+
+Total live agents may therefore exceed `max_concurrent_agents` by up to `max_concurrent_reviews`.
+That is the intended "reviews are free" semantics rather than a leak: the implementation cap still
+bounds implementations, and the review cap bounds reviews.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| global review budget | shared with implementations | `agent.max_concurrent_reviews` — its own pool when set |
+| default | n/a | **unset ⇒ shared with implementations**, byte-identical to before the key |
+| hot reload | n/a | yes, with `WORKFLOW.md` |
+
+A review held for want of a slot is a deliberate wait, not a fault, and the reconciliation sweep
+names it as `held for capacity` rather than reporting it as an unexplained stall (see the STUDIO-898
+entry above).
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
