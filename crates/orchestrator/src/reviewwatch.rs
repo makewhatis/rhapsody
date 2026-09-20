@@ -1202,8 +1202,9 @@ impl Orchestrator {
         }
         // `rank_reviewers` only ever names roster members, so `peers` is the whole filter — a
         // teammate at their `max_concurrent` is a candidate like any other (D2).
+        let exclusions = self.reviewer_exclusions(teams);
         let candidates: Vec<String> =
-            crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts())
+            crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts(), &exclusions)
                 .into_iter()
                 .filter(|name| !peers.contains(name.as_str()))
                 .collect();
@@ -1213,8 +1214,28 @@ impl Orchestrator {
         // request's required reviews. A row with no last round has no such continuity, so it takes
         // the ranking's answer — which is what makes two same-tick introductions land on two
         // different reviewers.
+        //
+        // The one thing continuity does NOT outrank is a required reviewer (STUDIO-951). A row
+        // persisted before the operator added `review.required` still names its old reviewer, and
+        // letting continuity keep them would mean the required identity never reviews that pull
+        // request — the guarantee the config asks for, silently unmet, with no adoption or
+        // reconciliation sweep to repair it. So continuity holds only while the incumbent is itself
+        // required, or while the ranking offers no required reviewer at all (the unset case, which
+        // is byte-identical to before the feature).
+        //
+        // "Required" here is the EFFECTIVE pin set, not the configured list: a required name the
+        // ranking never promoted — off the roster, the author, `unpinnable` — is not a reviewer this
+        // round yields to, so it must not evict the incumbent either. Reading the raw list made an
+        // unpinnable pin break continuity for a teammate the ranking never selected, handing the
+        // round to whoever merely led on load (round 3).
         if !row.last_reviewed_sha.is_empty() && candidates.iter().any(|name| name == incumbent) {
-            return Some(incumbent.to_string());
+            let pinned =
+                crate::quorum::pinned_required_reviewers(teams, row.author.trim(), &exclusions);
+            let incumbent_required = pinned.iter().any(|name| name == incumbent);
+            let required_among_candidates = candidates.iter().any(|name| pinned.contains(name));
+            if incumbent_required || !required_among_candidates {
+                return Some(incumbent.to_string());
+            }
         }
         candidates.into_iter().next()
     }
@@ -1553,6 +1574,13 @@ mod tests {
 
     fn introduce(o: &Orchestrator, r: ReviewWatchRow) {
         o.store().save_review_watch(r).expect("introduce");
+    }
+
+    /// Writes a profile file under the orchestrator's profiles dir, creating the dir.
+    fn write_profile(dir: &crate::testsupport::TempDir, name: &str, text: &str) {
+        let p = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&p).expect("create profiles dir");
+        std::fs::write(p.join(format!("{name}.md")), text).expect("write profile");
     }
 
     /// A finished run of `issue` — the row the auto-Done transition reads the opaque tracker ids
@@ -2472,6 +2500,125 @@ mod tests {
         o.handle_review_sweep(&[open_at(12, HEAD_B)]);
 
         assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// STUDIO-951: a required reviewer outranks a NON-required incumbent. The persisted row names
+    /// `bob` — reviewing before the operator added `review.required: [carol]` — and continuity must
+    /// not keep him, or the pinned identity never reviews this pull request and nothing repairs it.
+    ///
+    /// Mutation check: remove the `required_among_candidates` guard and this goes red with `bob`,
+    /// which is exactly the defect the round-2 review found.
+    #[test]
+    fn a_required_reviewer_outranks_a_non_required_incumbent() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.required = vec!["carol".to_string()];
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["carol".to_string()],
+            "a required reviewer must win over an incumbent who is no longer pinned"
+        );
+    }
+
+    /// The counterpart, so the fix cannot simply disable continuity: with `review.required` unset a
+    /// non-required incumbent is still preferred over an idler (Decision B is unchanged).
+    #[test]
+    fn an_optional_incumbent_still_keeps_the_round() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol"]));
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// STUDIO-951 / round 3: continuity yields only to a required reviewer who is **actually
+    /// pinned**. `sol` is required but its profile names a harness this build cannot run, so
+    /// `rank_reviewers` drops it from the pinned prefix and keeps it a plain ranked candidate — a
+    /// name the guard must not treat as a pin. Reading the raw config list instead evicts the
+    /// incumbent for a teammate the ranking never promoted, and the round goes to whoever merely
+    /// leads on load: neither the incumbent nor the pin.
+    ///
+    /// `bob` is loaded and `carol` is idle, so with continuity broken the load leader `carol` wins;
+    /// the assertion is that the incumbent keeps the round.
+    ///
+    /// Mutation check: read `teams.review_required()` instead of the effective pinned set and this
+    /// goes red with `carol`.
+    #[test]
+    fn an_unpinnable_required_reviewer_does_not_break_continuity() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = ticketless(&["alice", "bob", "carol", "sol"]);
+        teams.roster[3].profile = "codexer".to_string();
+        teams.review.required = vec!["sol".to_string()];
+        let (mut o, dispatched) = orch(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+        let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+            id: "iss-9".to_string(),
+            identifier: "STUDIO-999".to_string(),
+            ..Default::default()
+        });
+        busy.identity = "bob".to_string();
+        o.running.insert("iss-9".to_string(), busy);
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["bob".to_string()],
+            "an unpinnable required reviewer must not evict the incumbent"
+        );
+    }
+
+    /// STUDIO-951 / round 4: a persisted incumbent that is a TAIL pin beyond `review.reviewers`
+    /// must not displace the declaration-order pin that actually survives the clamp. With
+    /// `reviewers: 1` and `required: [carol, bob]`, `carol` is the one pin selection keeps and the
+    /// tail pin `bob` is dropped — so a row persisted with `bob` before this config existed must
+    /// yield to `carol`, exactly as a non-required incumbent would. The continuity guard's
+    /// "required" set is the EFFECTIVE pin prefix, capped at the ticketless reviewer count, not the
+    /// untruncated configured list; otherwise the tail pin is treated as required and keeps the
+    /// round, contradicting both the clamp and the boot warning that says the tail is dropped.
+    ///
+    /// Mutation check: read the untruncated `plan_required_pins(..).pinned` (drop the
+    /// `effective_reviewers()` cap in `quorum::pinned_required_reviewers`) and this goes red with
+    /// `bob` — the tail pin that no longer survives selection.
+    #[test]
+    fn a_tail_required_pin_beyond_the_clamp_does_not_displace_the_surviving_pin() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 1;
+        teams.review.required = vec!["carol".to_string(), "bob".to_string()];
+        assert_eq!(teams.review.effective_reviewers(), 1);
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["carol".to_string()],
+            "the clamp keeps the first declaration-order pin; a persisted tail pin must not win"
+        );
     }
 
     /// A round with no eligible reviewer is DEFERRED, not forced onto somebody and not silently
