@@ -55,6 +55,35 @@
 //! who read the previous round. A row that has never been reviewed has no continuity to preserve,
 //! so it is selected fresh.
 //!
+//! # The head is re-read immediately before its OWN dispatch (STUDIO-953)
+//!
+//! The observation a tick decides from is a BATCH: up to
+//! [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) serial `gh`
+//! round-trips, so without a re-read the first pull request's head can be seconds older than the
+//! dispatch it feeds. [`run_review_watch_task`] therefore re-reads each OPEN observation's head
+//! once, off-loop, and hands THAT observation to the control task immediately — before re-reading
+//! the next — so no later pull request's blocking `gh` call can sit between a head and its
+//! dispatch. The fresh answer is ADOPTED: refusing on a move would let a short-cycle author starve
+//! the review entirely, which is strictly worse than reviewing slightly-stale code.
+//!
+//! **Why two passes.** They do different jobs: the sweep's read CLASSIFIES (a merged, closed, gone
+//! or untrusted answer dispatches nothing and leaves the watch set; only an OPEN one may be
+//! re-read) while the re-read PINS the head the dispatch records. One interleaved pass would do
+//! both from a single call — N `gh` requests per tick instead of 2N — at the cost of the re-read's
+//! FAILURE rule, which only exists when there are two answers to disagree: a failed read would
+//! simply be a failed read, counted and re-asked next tick. Doubling the requests buys that
+//! fallback, and is a deliberate price rather than an oversight (STUDIO-953).
+//!
+//! **What this closes, and what it does not.** It closes the window between the batched
+//! observation and the dispatch — on this deployment that is the ~2.4 s the tick body spends on
+//! its serial lookups. It does NOT close the window that produced makewhatis/rhapsody#185: there
+//! the summon named `59108fe`, the run began at 02:37:19, the author's `6a8ce86` landed at
+//! 02:41:31, and the daemon's own log shows the watcher still reading `59108fe` 4 m 10 s after the
+//! dispatch — the head was correct when the review fired, and the author pushed DURING the run.
+//! Closing that needs a check on the dispatch→verdict seam (`reviewnotify`), not here, and is out
+//! of this ticket's scope. The cost of this guard is honest and not free: one extra `gh` call per
+//! OPEN observation per tick, up to doubling this subsystem's share of GitHub's hourly budget.
+//!
 //! # Off the loop, then back onto it (§5, F3)
 //!
 //! Asking GitHub where a pull request stands is a `gh` call, and [`crate::ghsummons::GH`] shells out
@@ -63,10 +92,10 @@
 //! no `Orchestrator`, and the only lock it shares with the control task is
 //! [`crate::runautomerge::AutoMergeLedger`]'s — taken read-only by the control task through
 //! [`crate::runautomerge::AutoMergeLedger::peek`] (STUDIO-923) — the same structural containment
-//! [`crate::prstate`] was built for and documents. What comes back crosses to the
-//! control task as ONE [`Event::ReviewSweep`], where the watch set stays single-writer beside
-//! `dispatch_review` and `handle_review_introduce`, and where `running`/`claimed` can be read
-//! without a race.
+//! [`crate::prstate`] was built for and documents. What comes back crosses to the control task as
+//! a stream of [`Event::ReviewSweep`]s, one per observation, each handed over as soon as its head
+//! is re-read, where the watch set stays single-writer beside `dispatch_review` and
+//! `handle_review_introduce`, and where `running`/`claimed` can be read without a race.
 //!
 //! # Teams-gating (§16)
 //!
@@ -180,6 +209,17 @@ pub struct ReviewSweepReport {
     pub stalled: usize,
 }
 
+/// The carried-budget sentinel meaning "this hand-back reached no decision": it spent nothing and
+/// counted nothing, so the next hand-back's fresh count governs unchallenged (STUDIO-953).
+///
+/// `i64::MAX` rather than `0` because a hand-back that fails before the control task decides — a
+/// store read that errors, a dropped reply, a dead control channel — must not convert into a zero
+/// budget that retires every remaining observation of the tick. It never reaches the per-dispatch
+/// decrement: [`Orchestrator::handle_review_sweep_slots`] clamps any carry to that tick's fresh
+/// [`Orchestrator::review_dispatch_budget`] before spending it, so `MAX` only ever means "count
+/// afresh".
+const UNCAPPED_SLOTS: i64 = i64::MAX;
+
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
 /// the task must be testable without a control loop, and the seam is what lets a test assert on the
 /// coordinates handed over rather than on a side effect two hops away.
@@ -189,8 +229,19 @@ pub struct ReviewSweepReport {
 pub trait ReviewWatchSink: Send + Sync {
     /// The pull requests worth asking GitHub about this tick.
     async fn watched(&self) -> Vec<PrCoord>;
-    /// Hands one tick's observations to the control task and reports what it decided.
-    async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport;
+    /// Hands observations to the control task and reports what it decided.
+    ///
+    /// `slots` is the daemon-wide dispatch budget this call may spend: `None` on a tick's FIRST
+    /// hand-back, so the control task counts the budget then; `Some(left)` on every later one, so a
+    /// tick's per-observation hand-backs spend ONE budget rather than recomputing it each time
+    /// (STUDIO-953). The remaining budget comes back beside the report, ready to hand to the next
+    /// call. Recomputing per hand-back would let a review worker that exits mid-tick hand its slot
+    /// to a fresh round in the same tick, defeating the operator's `max_concurrent` for that tick.
+    async fn sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64);
     /// Merges ONE pull request whose gates the control task cleared (STUDIO-874).
     ///
     /// On the sink for [`Self::finish`]'s reason: the remaining gates are GitHub round trips and
@@ -244,8 +295,12 @@ impl ReviewWatchSink for ControlWatchSink {
     async fn watched(&self) -> Vec<PrCoord> {
         self.control.review_watch_list().await
     }
-    async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
-        self.control.review_sweep(observed).await
+    async fn sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
+        self.control.review_sweep(observed, slots).await
     }
     async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
         let Some(deps) = self.automerge.as_ref() else {
@@ -290,6 +345,66 @@ pub struct ReviewWatchDeps {
     pub teams: Teams,
     /// Where a tick's observations are handed back to the control task.
     pub sink: Arc<dyn ReviewWatchSink>,
+}
+
+/// Re-reads one OPEN observation's head once, off-loop, immediately before that observation is
+/// handed to the control task — the re-verification that closes the window between the batched `gh`
+/// lookup and the dispatch it feeds (STUDIO-953).
+///
+/// One observation at a time, not a second batch. A batch would re-create the very window it exists
+/// to close: the first pull request's re-read would still wait behind every later pull request's
+/// blocking `gh` call before its dispatch, which is the defect a reviewer reproduced on #189. Each
+/// caller therefore re-reads and hands over in the same step, so nothing blocking sits between a
+/// head and its dispatch.
+///
+/// The re-read is a READ, not a refusal: up to
+/// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) lookups precede it,
+/// so by the time the control task acts on the first pull request's answer its author may already
+/// have pushed past it.
+///
+/// Three deliberate choices, all about not replacing a stale review with no review:
+///
+/// * a moved head is ADOPTED, not refused. Refusing whenever the head moved would let an author
+///   pushing on a short cycle starve the review forever, which is strictly worse than reviewing
+///   slightly-stale code. Adopting also keeps the edge trigger intact: the review that fires is one
+///   review OF the new head, and `requested_sha` records it, so the next tick reads that head as
+///   asked about and arms nothing further.
+/// * a re-read that FAILS keeps the observed answer and says so once. A failed re-read is not
+///   evidence the head moved, and refusing on it would be the same livelock by another route.
+/// * a non-OPEN observation is not re-read at all: a merged, closed, gone or untrusted answer
+///   dispatches nothing, so its head does not matter.
+///
+/// §16 first: with Teams off the sweep has already observed nothing, and this refuses to spawn a
+/// process even if a stale watch set hands it one.
+async fn refresh_observed_head(
+    ctx: &CancelWait,
+    teams: &Teams,
+    src: &dyn PrStateSource,
+    allow: &HeadAllowlist,
+    obs: PrObservation,
+) -> PrObservation {
+    if !crate::prstate::pr_state_polling_enabled(teams) || ctx.is_cancelled() {
+        return obs;
+    }
+    let open = matches!(&obs.lookup, PrLookup::Found(snap) if snap.status == PrStatus::Open);
+    if !open {
+        return obs;
+    }
+    match src
+        .pr_state(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
+        .await
+    {
+        Ok(lookup) => PrObservation { pr: obs.pr, lookup },
+        Err(e) => {
+            tracing::warn!(
+                pr = %obs.pr,
+                error = %e,
+                "pr-state re-read before dispatch failed; the observed head stands and the \
+                 review dispatches from it"
+            );
+            obs
+        }
+    }
 }
 
 /// Polls the watch set on [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) until
@@ -342,7 +457,42 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         if sweep.observed.is_empty() {
             continue;
         }
-        let report = deps.sink.sweep(sweep.observed).await;
+        // Re-read each head and hand that observation over BEFORE re-reading the next (STUDIO-953).
+        // One at a time, not a second batch: the batch above is serial, so an author can push
+        // between the first lookup and the dispatch it leads to, and a second batch would leave the
+        // first pull request waiting behind every later re-read exactly as before. ADOPTS the fresh
+        // answer. The per-observation reports are folded back into one tick report so the log line
+        // and the merge/Done work lists keep their tick shape.
+        let mut report = ReviewSweepReport::default();
+        // One dispatch budget for the whole tick, carried across the per-observation hand-backs
+        // (STUDIO-953): a review worker that exits mid-tick must not hand its slot back to a fresh
+        // round in the SAME tick, which is what recomputing the budget per hand-back would do.
+        // `None` on the first hand-back tells the control task to count the budget then.
+        let mut slots: Option<i64> = None;
+        for obs in sweep.observed {
+            let fresh =
+                refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
+            let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
+            slots = Some(left);
+            // Destructured rather than field-by-field so a field added later cannot be silently
+            // dropped from the tick fold: the compiler flags the missing binding here.
+            let ReviewSweepReport {
+                dispatched,
+                retired,
+                deferred,
+                armed,
+                stalled,
+                done,
+                merge,
+            } = one;
+            report.dispatched += dispatched;
+            report.retired += retired;
+            report.deferred += deferred;
+            report.armed += armed;
+            report.stalled += stalled;
+            report.done.extend(done);
+            report.merge.extend(merge);
+        }
         if report != ReviewSweepReport::default() {
             tracing::info!(
                 dispatched = report.dispatched,
@@ -456,37 +606,59 @@ impl Orchestrator {
         out
     }
 
-    /// Turns one tick's observations into drops, re-arms and review dispatches. **The watcher's
-    /// whole decision**, on the control task, where the watch set is single-writer and
-    /// `running`/`claimed` cannot race.
+    /// Turns one tick's observations into drops, re-arms and review dispatches, counting a FRESH
+    /// dispatch budget for the call. **The watcher's whole decision**, on the control task, where
+    /// the watch set is single-writer and `running`/`claimed` cannot race.
+    ///
+    /// The one-shot shape is a test convenience: production always goes through
+    /// [`Self::handle_review_sweep_slots`] so a tick's per-observation hand-backs share one budget.
+    /// Kept as the batched contract because it is what most of this module's tests drive.
+    #[cfg(test)]
     pub(crate) fn handle_review_sweep(&mut self, observed: &[PrObservation]) -> ReviewSweepReport {
+        self.handle_review_sweep_slots(observed, None).0
+    }
+
+    /// [`Self::handle_review_sweep`]'s production shape, with the tick's dispatch budget carried
+    /// across the watcher's per-observation hand-backs (STUDIO-953).
+    ///
+    /// `slots` is `None` on a tick's FIRST hand-back — [`Self::review_dispatch_budget`] counts it —
+    /// and `Some(left)` on every later one, so a tick spends ONE budget however many hand-backs it
+    /// makes. Returning the leftover rather than recomputing is what keeps a review worker that
+    /// exits mid-tick from handing its slot to another round in the SAME tick.
+    pub(crate) fn handle_review_sweep_slots(
+        &mut self,
+        observed: &[PrObservation],
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
         let mut report = ReviewSweepReport::default();
         if !self.review_ticketless_enabled() {
-            return report; // §16
+            return (report, 0); // §16
         }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; this tick decides nothing");
-                return report;
+                // This hand-back decides nothing, so it must SPEND nothing either: a carried budget
+                // stands, and with none carried the next hand-back counts its own. Returning `0`
+                // would convert one failed WAL read into a zero budget for every remaining
+                // observation of the tick (STUDIO-953).
+                return (report, slots.unwrap_or(UNCAPPED_SLOTS));
             }
         };
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
-        // tick would otherwise spawn twenty agents past a cap the operator set. Counted ONCE for
-        // the tick and spent down as reviews are dispatched, so it composes with the per-identity
-        // `max_concurrent` rather than replacing it. No config loaded ⇒ no budget: a dispatch could
-        // not resolve a project to route with in any case.
-        let mut slots = self
-            .eff
-            .as_ref()
-            .map(|eff| {
-                crate::concurrency::global_slots(
-                    eff.max_concurrent,
-                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
-                )
-            })
-            .unwrap_or(0);
+        // tick would otherwise spawn twenty agents past a cap the operator set. TWO bounds compose
+        // here and both are load-bearing (STUDIO-953): the CARRIED leftover bounds REPLENISHMENT —
+        // a review worker that exits mid-tick cannot hand its slot to another round in the same
+        // tick — while a FRESH count bounds CONSUMPTION, because the control task can start an
+        // ordinary ticket run (`Event::Tick` → `on_tick`) between two hand-backs while the watcher
+        // sits in a blocking `gh` call, and a tick must not spend slots that no longer exist.
+        // Taking the smaller of the two keeps `running` at or below `max_concurrent` whichever
+        // direction moves; dropping either half is a regression.
+        let fresh_budget = self.review_dispatch_budget();
+        let mut slots = slots
+            .map(|left| left.min(fresh_budget))
+            .unwrap_or(fresh_budget);
         for obs in observed {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
@@ -519,7 +691,22 @@ impl Orchestrator {
                 }
             }
         }
-        report
+        (report, slots)
+    }
+
+    /// The daemon-wide dispatch budget available to one watcher tick: `max_concurrent` less what is
+    /// already running. No config loaded ⇒ no budget: a dispatch could not resolve a project to
+    /// route with in any case.
+    fn review_dispatch_budget(&self) -> i64 {
+        self.eff
+            .as_ref()
+            .map(|eff| {
+                crate::concurrency::global_slots(
+                    eff.max_concurrent,
+                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+                )
+            })
+            .unwrap_or(0)
     }
 
     /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
@@ -644,7 +831,7 @@ impl Orchestrator {
         // console and the room read the same fact the dispatch below acts on. It can only ever
         // touch rows that already exist, and it changes no field this function's decision reads —
         // `review_round_due` answers identically before and after it — which is why `rows` (loaded
-        // once for the whole tick) is still sound to decide from.
+        // fresh for this observation's hand-back) is still sound to decide from.
         report.armed += self.handle_review_head_advanced(pr, head);
 
         // How many dispatches one ROUND of this pull request costs — the unit the churn budget
@@ -657,8 +844,8 @@ impl Orchestrator {
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
-        // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
-        // go stale the moment one row is reassigned: the next row would still see the retired
+        // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly
+        // would go stale the moment one row is reassigned: the next row would still see the retired
         // reviewer as a peer and not see the substitute, and could hand that substitute a second
         // required review of the same pull request.
         let mut assigned: Vec<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
@@ -812,9 +999,9 @@ impl Orchestrator {
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
     /// (STUDIO-874), appending the plan to `report` if they do.
     ///
-    /// Decided from `mine` — the tick's OPENING snapshot of this pull request's rows — for the
-    /// same reason the dispatch loop above is: it is the state the control task owns, and nothing
-    /// this function reads is written by the loop it follows. A row re-armed by
+    /// Decided from `mine` — this hand-back's OPENING snapshot of this pull request's rows — for
+    /// the same reason the dispatch loop above is: it is the state the control task owns, and
+    /// nothing this function reads is written by the loop it follows. A row re-armed by
     /// [`Self::handle_review_head_advanced`] moved to `requested`, which this gate refuses on
     /// EITHER reading; a row the loop dispatched is `in_flight` on either; and a row whose verdict
     /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
@@ -1091,26 +1278,42 @@ impl ControlHandle {
         }
     }
 
-    /// Hands one tick's observations to the control task, which decides every drop, re-arm and
-    /// dispatch. The wait is bounded by the daemon lifetime rather than a timer, as every other
+    /// Hands observations to the control task, which decides every drop, re-arm and dispatch, and
+    /// returns the remaining daemon-wide dispatch budget for the tick beside the report.
+    ///
+    /// `slots` is `None` on the tick's first hand-back and `Some(left)` afterwards, so one tick
+    /// spends one budget: see [`ReviewWatchSink::sweep`].
+    ///
+    /// The wait is bounded by the daemon lifetime rather than a timer, as every other
     /// off-loop hand-back here is: nothing is answering an agent's MCP call, so a busy tick should
     /// delay this tick's decisions rather than turn them into a false failure.
-    pub(crate) async fn review_sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+    pub(crate) async fn review_sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .events
             .send(Event::ReviewSweep {
                 observed,
+                slots,
                 reply: tx,
             })
             .is_err()
         {
-            return ReviewSweepReport::default();
+            return (
+                ReviewSweepReport::default(),
+                slots.unwrap_or(UNCAPPED_SLOTS),
+            );
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
-            r = rx => r.unwrap_or_default(),
-            _ = lifetime.cancelled() => ReviewSweepReport::default(),
+            // A dropped reply is a control task that never decided: like the failed send above, it
+            // spent nothing, so the carry stands and the next hand-back counts its own rather than
+            // inheriting a zero that would retire the rest of the tick (STUDIO-953).
+            r = rx => r.unwrap_or_else(|_| (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS))),
+            _ = lifetime.cancelled() => (ReviewSweepReport::default(), slots.unwrap_or(UNCAPPED_SLOTS)),
         }
     }
 }
@@ -1118,6 +1321,7 @@ impl ControlHandle {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rhapsody_config::teams::{Identity, Review, ReviewMode};
     use rhapsody_store::{
@@ -2870,6 +3074,10 @@ mod tests {
     struct FakeSink {
         watched: Vec<PrCoord>,
         seen: Arc<Mutex<Vec<Vec<PrObservation>>>>,
+        /// `seen.len()` at the start of each tick, recorded by [`ReviewWatchSink::watched`] — which
+        /// the task calls exactly once per tick. A test can then slice `seen` into whole ticks
+        /// rather than approximating a tick boundary by a count.
+        boundaries: Arc<Mutex<Vec<usize>>>,
         done: Arc<tokio::sync::Notify>,
         /// What the control task pretends to have decided, handed back from every `sweep`.
         hand_back: ReviewSweepReport,
@@ -2882,12 +3090,18 @@ mod tests {
     #[async_trait]
     impl ReviewWatchSink for FakeSink {
         async fn watched(&self) -> Vec<PrCoord> {
+            let start = self.seen.lock().expect("seen lock").len();
+            self.boundaries.lock().expect("boundaries lock").push(start);
             self.watched.clone()
         }
-        async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            _slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
             self.seen.lock().expect("seen lock").push(observed);
             self.done.notify_one();
-            self.hand_back.clone()
+            (self.hand_back.clone(), 0)
         }
         async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
             self.merged.lock().expect("merged lock").push(plan);
@@ -2923,6 +3137,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_task_polls_the_watch_set_and_hands_the_answers_back() {
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
         let signal = CancelSignal::new();
         let deps = ReviewWatchDeps {
@@ -2932,21 +3147,31 @@ mod tests {
             sink: Arc::new(FakeSink {
                 watched: vec![coord(12), coord(13)],
                 seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
 
+        // Since STUDIO-953 the task hands each observation over on its own, immediately after its
+        // head is re-read, so the first tick is TWO hand-backs. Waking here does not preempt the
+        // tick, so the task's whole tick (both hand-backs) runs before it sleeps for the interval;
+        // the sleep below parks this task so the paused clock can advance at all.
         done.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         signal.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 
-        let seen = seen.lock().expect("seen lock");
+        let seen = seen.lock().expect("seen lock").clone();
+        let boundaries = boundaries.lock().expect("boundaries lock").clone();
         assert!(!seen.is_empty(), "the task never handed a tick back");
-        let first = &seen[0];
+        // Slice to the tick's END, not a fixed count: `take(2)` would hide a third hand-back in
+        // the same tick, which is exactly what this test claims cannot happen.
+        let end = boundaries.get(1).copied().unwrap_or(seen.len());
+        let handed: Vec<PrCoord> = seen[..end].iter().flatten().map(|o| o.pr.clone()).collect();
         assert_eq!(
-            first.iter().map(|o| o.pr.clone()).collect::<Vec<_>>(),
+            handed,
             vec![coord(12), coord(13)],
             "exactly the coordinates the control task named, and no others"
         );
@@ -2962,6 +3187,7 @@ mod tests {
         let total = budget + 5;
         let watched: Vec<PrCoord> = (0..total).map(|n| coord(n as i64 + 1)).collect();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
         let signal = CancelSignal::new();
         let deps = ReviewWatchDeps {
@@ -2971,6 +3197,7 @@ mod tests {
             sink: Arc::new(FakeSink {
                 watched: watched.clone(),
                 seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
             }),
@@ -2983,13 +3210,22 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 
         let ticks = seen.lock().expect("seen lock").clone();
+        let boundaries = boundaries.lock().expect("boundaries lock").clone();
         assert!(
-            ticks.len() >= 2,
+            boundaries.len() >= 2,
             "expected at least two ticks, got {}",
-            ticks.len()
+            boundaries.len()
         );
+        // Since STUDIO-953 a tick is a run of single-observation hand-backs, not one batch, so a
+        // tick boundary is no longer visible by counting to `budget` — the FakeSink records one at
+        // the start of each tick (`watched` is called exactly once per tick), and the first tick is
+        // the slice between the first two boundaries. Halving the budget reds this.
+        let first_tick: Vec<&PrObservation> = ticks[boundaries[0]..boundaries[1]]
+            .iter()
+            .flatten()
+            .collect();
         assert_eq!(
-            ticks[0].len(),
+            first_tick.len(),
             budget,
             "the first tick spends the whole budget"
         );
@@ -3072,6 +3308,700 @@ mod tests {
         assert!(
             seen.lock().expect("seen lock").is_empty(),
             "a Teams-off daemon must observe nothing and decide nothing"
+        );
+    }
+
+    // --- the pre-dispatch head re-read (STUDIO-953) ---------------------------------------------
+
+    /// The head of a `Found` observation, or `None` for every other answer.
+    fn head_of(obs: &PrObservation) -> Option<&str> {
+        match &obs.lookup {
+            PrLookup::Found(snap) => Some(snap.head_sha.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A [`PrStateSource`] answering its FIRST call with `first` and every later call with `rest` —
+    /// "the author pushed between the sweep's lookup and the pre-dispatch re-read".
+    struct OnceThenSource {
+        calls: AtomicUsize,
+        first: String,
+        rest: String,
+    }
+
+    #[async_trait]
+    impl PrStateSource for OnceThenSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let head = if call == 0 { &self.first } else { &self.rest };
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: head.clone(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }))
+        }
+    }
+
+    /// A [`PrStateSource`] whose head ADVANCES on every call — an author pushing continuously.
+    struct AdvancingSource {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PrStateSource for AdvancingSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: format!("{n:040}"),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }))
+        }
+    }
+
+    /// A [`PrStateSource`] replaying a scripted list of answers and counting how often it was asked.
+    struct ScriptedSource {
+        answers: Mutex<Vec<PrStateResult>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PrStateSource for ScriptedSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = self.answers.lock().expect("answers lock");
+            if answers.is_empty() {
+                Ok(PrLookup::Gone)
+            } else {
+                answers.remove(0)
+            }
+        }
+    }
+
+    /// A sink that runs the REAL control decision ([`Orchestrator::handle_review_sweep`]) behind a
+    /// `Mutex` standing in for the single control task, so a test can assert what the watcher's
+    /// hand-back actually caused to be dispatched rather than merely what it handed over.
+    struct ControlStubSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        done: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for ControlStubSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let (report, left) = self
+                .orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_sweep_slots(&observed, slots);
+            self.done.notify_one();
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// The re-read itself, driven directly: a moved head is ADOPTED, a non-open observation is
+    /// never re-asked about, and a FAILED re-read keeps the observed answer rather than dropping
+    /// the review.
+    #[tokio::test]
+    async fn the_pre_dispatch_re_read_adopts_a_moved_head_and_keeps_a_failed_one() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = ScriptedSource {
+            answers: Mutex::new(vec![
+                Ok(open_at(12, HEAD_B).lookup), // the head moved since the sweep
+                Err("gh: API rate limit exceeded".into()), // the re-read failed
+            ]),
+            calls: Arc::clone(&calls),
+        };
+        let teams = ticketless(&["alice", "bob"]);
+
+        let moved = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            open_at(12, HEAD_A),
+        )
+        .await;
+        let failed = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            open_at(13, HEAD_A),
+        )
+        .await;
+        let gone = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            observed(14, PrLookup::Gone),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "only the two OPEN observations may be re-read"
+        );
+        assert_eq!(
+            head_of(&moved),
+            Some(HEAD_B),
+            "the moved head is adopted, not the swept one"
+        );
+        assert_eq!(
+            head_of(&failed),
+            Some(HEAD_A),
+            "a failed re-read keeps the observed head; the review still dispatches"
+        );
+        assert_eq!(
+            gone.lookup,
+            PrLookup::Gone,
+            "a non-open observation dispatches nothing and is not re-read"
+        );
+    }
+
+    /// §16, the nit a reviewer flagged: the re-read carries the same master gate as every other
+    /// entry point in this subsystem — with Teams off it asks GitHub nothing and adopts nothing.
+    #[tokio::test]
+    async fn the_pre_dispatch_re_read_is_dormant_with_teams_off() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = ScriptedSource {
+            answers: Mutex::new(vec![Ok(open_at(12, HEAD_B).lookup)]),
+            calls: Arc::clone(&calls),
+        };
+        let teams = teams_with(false, ReviewMode::Ticketless, vec![ident("bob", 0)]);
+
+        let kept = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            open_at(12, HEAD_A),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a Teams-off re-read must ask GitHub nothing"
+        );
+        assert_eq!(head_of(&kept), Some(HEAD_A), "and must not adopt anything");
+    }
+
+    /// The ticket's acceptance case: the author pushes between the observation snapshot and the
+    /// dispatch. The review must be pinned to the head live when it fires, never to the superseded
+    /// snapshot. Removing [`refresh_observed_head`] reds this test.
+    ///
+    /// Deliberately NOT named after makewhatis/rhapsody#185: the log shows that incident's window
+    /// was dispatch→verdict, not observation→dispatch, so this guard would not have prevented it
+    /// (see the module doc). Naming the test after it would assert a causality the log refutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_that_moves_between_the_observation_and_its_dispatch_is_reviewed_at_the_new_head()
+     {
+        let (o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let sink = Arc::new(ControlStubSink {
+            watched: vec![coord(12)],
+            orch: Mutex::new(o),
+            done: Arc::clone(&done),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(OnceThenSource {
+                calls: AtomicUsize::new(0),
+                first: HEAD_A.to_string(),
+                rest: HEAD_B.to_string(),
+            })),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        let ticked =
+            tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, done.notified()).await;
+        assert!(
+            ticked.is_ok(),
+            "the watcher never handed a tick back at all"
+        );
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            watch_row(&guard, 12, "bob").requested_sha,
+            HEAD_B,
+            "the watch row was pinned to the superseded observation, not the live head"
+        );
+        let entries = dispatched.lock().expect("dispatched lock");
+        assert_eq!(entries.len(), 1, "exactly one review round fired");
+        assert_eq!(
+            entries[0].review.as_ref().map(|r| r.head_sha.as_str()),
+            Some(HEAD_B),
+            "the worker was sent to the head the author had NOT superseded"
+        );
+    }
+
+    /// A [`PrStateSource`] that records each pre-dispatch RE-READ (the first call per number is the
+    /// sweep's own lookup, every later one the re-read) and, when asked about `later`, advances
+    /// `earlier`'s head — "the first pull request's author pushes while the second is re-read".
+    struct InterleavingSource {
+        counts: Mutex<HashMap<i64, usize>>,
+        head: Mutex<HashMap<i64, String>>,
+        events: Arc<Mutex<Vec<String>>>,
+        earlier: i64,
+        later: i64,
+    }
+
+    #[async_trait]
+    impl PrStateSource for InterleavingSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            let call = {
+                let mut counts = self.counts.lock().expect("counts lock");
+                let call = counts.entry(number).or_insert(0);
+                *call += 1;
+                *call
+            };
+            if call > 1 {
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push(format!("refresh:{number}"));
+                if number == self.later {
+                    self.head
+                        .lock()
+                        .expect("head lock")
+                        .insert(self.earlier, HEAD_B.to_string());
+                }
+            }
+            let head = self
+                .head
+                .lock()
+                .expect("head lock")
+                .get(&number)
+                .cloned()
+                .unwrap_or_else(|| HEAD_A.to_string());
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: head,
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }))
+        }
+    }
+
+    /// A sink running the real control decision AND recording the order in which each observation
+    /// was handed over — so a test can assert the watcher interleaves re-read and hand-back rather
+    /// than batching the re-reads.
+    struct OrderRecordingSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        done: Arc<tokio::sync::Notify>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for OrderRecordingSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            for obs in &observed {
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push(format!("sweep:{}", obs.pr.number));
+            }
+            let (report, left) = self
+                .orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_sweep_slots(&observed, slots);
+            self.done.notify_one();
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// Sol's blocking finding on #189: a two-pull-request tick must hand each re-read head to the
+    /// control task BEFORE re-reading the next, or the first pull request waits behind the second's
+    /// blocking `gh` call exactly as it did when the re-read was a second batch. This asserts the
+    /// ORDER — the first pull request's hand-back sits between its own re-read and the later
+    /// re-read — which a batched implementation cannot satisfy (it would log
+    /// `refresh:12, refresh:13, sweep:12, sweep:13`).
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_pr_tick_hands_each_re_read_head_over_before_re_reading_the_next() {
+        let (o, _dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(13, "bob"));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(OrderRecordingSink {
+            watched: vec![coord(12), coord(13)],
+            orch: Mutex::new(o),
+            done: Arc::clone(&done),
+            events: Arc::clone(&events),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(InterleavingSource {
+                counts: Mutex::new(HashMap::new()),
+                head: Mutex::new(HashMap::from([
+                    (12, HEAD_A.to_string()),
+                    (13, HEAD_A.to_string()),
+                ])),
+                events: Arc::clone(&events),
+                earlier: 12,
+                later: 13,
+            })),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        let ticked =
+            tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, done.notified()).await;
+        assert!(
+            ticked.is_ok(),
+            "the watcher never handed a tick back at all"
+        );
+        // Let the rest of the tick (the second observation) finish before reading the log.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let events = events.lock().expect("events lock").clone();
+        assert_eq!(
+            events,
+            vec!["refresh:12", "sweep:12", "refresh:13", "sweep:13"],
+            "each re-read must be handed over before the next blocking re-read begins"
+        );
+    }
+
+    /// The livelock guard, as a test rather than a comment: an author who pushes on EVERY
+    /// observation must still get a review. A rule that refused to dispatch whenever the head moved
+    /// would leave the row untouched forever — strictly worse than reviewing slightly-stale code,
+    /// and the failure mode this subsystem has spent weeks eliminating. The re-read ADOPTS the new
+    /// head, so the round fires on the very first tick; a defer-on-every-move implementation would
+    /// leave `dispatched` empty here and red this assertion rather than hang.
+    #[tokio::test(start_paused = true)]
+    async fn an_author_pushing_on_every_observation_still_gets_a_review() {
+        let (o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let sink = Arc::new(ControlStubSink {
+            watched: vec![coord(12)],
+            orch: Mutex::new(o),
+            done: Arc::clone(&done),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(AdvancingSource {
+                calls: AtomicUsize::new(0),
+            })),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        // Bounded rather than a bare `notified().await`: an implementation that never hands a tick
+        // back must RED this test, not hang it (the ticket's mutation discipline).
+        let ticked =
+            tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, done.notified()).await;
+        assert!(
+            ticked.is_ok(),
+            "the watcher never handed a tick back at all"
+        );
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            dispatched.lock().expect("dispatched lock").len(),
+            1,
+            "a continuously-pushed head must still be reviewed within a bounded number of ticks"
+        );
+        assert!(
+            !watch_row(&guard, 12, "bob").requested_sha.is_empty(),
+            "the round must be recorded as requested, not silently dropped"
+        );
+    }
+
+    /// A sink running the real control decision and then simulating the just-dispatched review
+    /// worker exiting before the next observation is handed over — the seam sol reproduced on #189.
+    /// The control task processes that exit between hand-backs, so a budget recomputed per hand-back
+    /// would see the slot as free and let one tick exceed `max_concurrent`.
+    struct WorkerExitSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        /// One message per hand-back, so a test can await the tick without busy-waiting (which
+        /// would stop tokio's paused clock from advancing to the watcher's poll interval).
+        handed: tokio::sync::mpsc::UnboundedSender<()>,
+        /// Reviews the control task dispatched across the tick.
+        dispatched: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for WorkerExitSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let mut orch = self.orch.lock().expect("orchestrator lock");
+            let (report, left) = orch.handle_review_sweep_slots(&observed, slots);
+            if report.dispatched > 0 {
+                // The worker just dispatched exits before the next hand-back.
+                orch.running.clear();
+            }
+            drop(orch);
+            *self.dispatched.lock().expect("dispatched lock") += report.dispatched;
+            let _ = self.handed.send(());
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// The daemon-wide dispatch budget is counted ONCE per watcher tick, not once per observation.
+    /// Four due pull requests at `max_concurrent = 1`, with the dispatched worker exiting between
+    /// hand-backs, must still dispatch exactly one review: the slot is spent for the tick. This is
+    /// the shape production actually uses (`sink.sweep(vec![fresh])` per observation), which the
+    /// batched [`the_daemon_wide_concurrency_cap_bounds_one_tick`] no longer exercises.
+    ///
+    /// Mutation: drop the `slots` carry in `run_review_watch_task` (pass `None` every time) and this
+    /// reds with 4 against 1.
+    #[tokio::test(start_paused = true)]
+    async fn the_daemon_wide_cap_bounds_a_tick_of_single_observation_sweeps() {
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "bob", "carol", "dave"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 1;
+        for n in 12..16 {
+            introduce(&o, row(n, "bob"));
+        }
+        let (handed, mut hand_backs) = tokio::sync::mpsc::unbounded_channel();
+        let total = Arc::new(Mutex::new(0usize));
+        let sink = Arc::new(WorkerExitSink {
+            watched: (12..16).map(coord).collect(),
+            orch: Mutex::new(o),
+            handed,
+            dispatched: Arc::clone(&total),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        // All four observations of the first tick are handed over one at a time; wait for the tick
+        // to complete before cancelling, bounded so a never-firing implementation reds rather than
+        // hangs.
+        let whole_tick = async {
+            for _ in 0..4 {
+                if hand_backs.recv().await.is_none() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, whole_tick)
+            .await
+            .expect("the watcher never handed the whole tick back");
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        assert_eq!(
+            *total.lock().expect("dispatched lock"),
+            1,
+            "a worker exiting mid-tick must not replenish the tick's dispatch budget"
+        );
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            watch_row(&guard, 12, "bob").requested_sha,
+            format!("{:040}", 12),
+            "the one dispatch the budget allowed is the first pull request"
+        );
+        assert!(
+            watch_row(&guard, 13, "bob").requested_sha.is_empty(),
+            "the round past the spent budget must stay un-dispatched, re-considered next tick"
+        );
+    }
+
+    /// A sink running the real control decision and then simulating the control task starting an
+    /// unrelated TICKET run while the watcher sits in its blocking pre-dispatch `gh` read — the
+    /// opposite direction from [`WorkerExitSink`]. It starts exactly ONE such run, on the first
+    /// hand-back: a real control task starts no more once `running` is at its cap.
+    struct TicketStartSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        /// One message per hand-back, so a test can await the tick without busy-waiting (which
+        /// would stop tokio's paused clock from advancing to the watcher's poll interval).
+        handed: tokio::sync::mpsc::UnboundedSender<()>,
+        /// The most agents (reviews + the ticket run) ever live at once, read after each hand-back.
+        peak: Arc<Mutex<usize>>,
+        /// Reviews the control task dispatched across the tick.
+        dispatched: Arc<Mutex<usize>>,
+        started: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for TicketStartSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let mut orch = self.orch.lock().expect("orchestrator lock");
+            let (report, left) = orch.handle_review_sweep_slots(&observed, slots);
+            if self.started.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The control task started an ordinary ticket run while the watcher was blocked on
+                // `gh`, filling the last free slot. A later hand-back that keeps the carried budget
+                // would spend a slot this run already holds.
+                let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+                    id: "iss-ticket".to_string(),
+                    identifier: "STUDIO-999".to_string(),
+                    ..Default::default()
+                });
+                busy.identity = "carol".to_string();
+                orch.running.insert("iss-ticket".to_string(), busy);
+            }
+            let live = orch.running.len();
+            drop(orch);
+            let mut peak = self.peak.lock().expect("peak lock");
+            *peak = (*peak).max(live);
+            let _ = self.handed.send(());
+            *self.dispatched.lock().expect("dispatched lock") += report.dispatched;
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// The carried budget must compose with a FRESH count, not replace it (STUDIO-953, jimmy's
+    /// round-4 blocker). `max_concurrent = 2`; the first hand-back dispatches one review and the
+    /// control task then starts one ordinary ticket run, so `running` is at its cap. A later
+    /// hand-back must dispatch nothing: a budget counted before that run existed would spend a slot
+    /// that no longer exists and take `running` to 3. This is the START direction that
+    /// [`the_daemon_wide_cap_bounds_a_tick_of_single_observation_sweeps`] does not exercise — it
+    /// covers a worker EXITING mid-tick, which moves the budget the other way.
+    ///
+    /// Mutation: replace the `left.min(fresh_budget)` clamp in `handle_review_sweep_slots` with the
+    /// bare carry and this reds on peak 3 > 2.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_started_mid_tick_lowers_the_carried_review_budget() {
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "bob", "carol", "dave"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 2;
+        for n in 12..16 {
+            introduce(&o, row(n, "bob"));
+        }
+        let (handed, mut hand_backs) = tokio::sync::mpsc::unbounded_channel();
+        let peak = Arc::new(Mutex::new(0usize));
+        let total = Arc::new(Mutex::new(0usize));
+        let sink = Arc::new(TicketStartSink {
+            watched: (12..16).map(coord).collect(),
+            orch: Mutex::new(o),
+            handed,
+            peak: Arc::clone(&peak),
+            dispatched: Arc::clone(&total),
+            started: AtomicUsize::new(0),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        let whole_tick = async {
+            for _ in 0..4 {
+                if hand_backs.recv().await.is_none() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, whole_tick)
+            .await
+            .expect("the watcher never handed the whole tick back");
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        assert!(
+            *peak.lock().expect("peak lock") <= 2,
+            "a ticket run started mid-tick must lower the tick's remaining review budget, not be \
+             ignored: peak {} agents against max_concurrent 2",
+            *peak.lock().expect("peak lock")
+        );
+        assert_eq!(
+            *total.lock().expect("dispatched lock"),
+            1,
+            "only the first review fits before the ticket run fills the last slot"
+        );
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            watch_row(&guard, 12, "bob").requested_sha,
+            format!("{:040}", 12),
+            "the one dispatch the budget allowed is the first pull request"
+        );
+        assert!(
+            watch_row(&guard, 13, "bob").requested_sha.is_empty(),
+            "a head the budget can no longer afford must stay un-dispatched, re-considered next tick"
         );
     }
 }

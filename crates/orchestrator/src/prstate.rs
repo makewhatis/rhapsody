@@ -48,15 +48,24 @@ use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource};
 /// Two minutes is chosen against what is actually waiting on it: the answer drives a re-review of
 /// an author's pushed fixes, and a review run takes minutes, so shaving the detection latency below
 /// a couple of minutes buys nothing anybody can perceive. Against GitHub's 5,000-request hourly
-/// budget for an authenticated account it is deliberately cheap — a full budget every tick is 600
-/// requests an hour, roughly a tenth — because this daemon shares that budget with the summons
+/// budget for an authenticated account it is deliberately cheap — a full sweep budget every tick is
+/// 600 requests an hour, roughly a tenth — because this daemon shares that budget with the summons
 /// enrichment poll, the quorum's PR lookups and every `gh` call an agent makes inside a run.
+///
+/// Since STUDIO-953 the watcher also re-reads each OPEN observation's head immediately before its
+/// dispatch, so a full-budget tick makes up to TWICE [`MAX_PR_STATE_CALLS_PER_TICK`] requests —
+/// 1,200 an hour at most, roughly a quarter of the budget. The rate reasoning above is stated
+/// against that doubled number, not the sweep alone.
 pub const PR_STATE_POLL_INTERVAL: Duration = Duration::from_secs(120);
 
-/// How many pull requests ONE tick will ask about, the blast-radius bound on a blocking round-trip
-/// per call. Twenty is above any plausible number of simultaneously in-review pull requests for one
-/// team and far below the point where a tick could outlast its own cadence; the remainder is
-/// deferred to the next tick rather than dropped, so nothing is skipped — only spread.
+/// How many pull requests ONE tick's SWEEP will ask about, the blast-radius bound on a blocking
+/// round-trip per call. Twenty is above any plausible number of simultaneously in-review pull
+/// requests for one team and far below the point where a tick could outlast its own cadence; the
+/// remainder is deferred to the next tick rather than dropped, so nothing is skipped — only spread.
+///
+/// It bounds the sweep, not the whole tick: STUDIO-953's pre-dispatch re-read asks GitHub once more
+/// per OPEN observation the sweep returned, so a tick's total calls can reach twice this. The
+/// re-read is bounded by the same observation set, so it never exceeds this number.
 pub const MAX_PR_STATE_CALLS_PER_TICK: usize = 20;
 
 /// Whether the PR-state poll may run at all: Teams enabled (§16's master gate).
@@ -387,9 +396,9 @@ mod tests {
     ///
     /// `reviewwatch.rs` holds BOTH halves of the watcher, as `reviewintro.rs` holds both halves of
     /// introduction: an off-loop task and the `impl Orchestrator` handlers the control task runs.
-    /// Its single sweep call site is inside `run_review_watch_task`, which takes no `Orchestrator`
-    /// — so if you add a call, check which half you are adding it to; this list can no longer tell
-    /// you apart.
+    /// Its `gh` calls are the sweep (`sweep_pr_states`) and, since STUDIO-953, the per-observation
+    /// pre-dispatch re-read in `run_review_watch_task`'s own task — so if you add a call, check
+    /// which half you are adding it to; this list can no longer tell you apart.
     ///
     /// `runmerge.rs` (STUDIO-767) is the console merge action's off-loop half, and it is the one
     /// entry here that needs no such care: it holds no `Orchestrator` AT ALL — that is its module
