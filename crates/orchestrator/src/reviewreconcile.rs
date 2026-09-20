@@ -152,9 +152,20 @@ pub enum DivergenceKind {
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
-    /// Not a divergence of intent and activity but of a BOUND: the pull request's shared
-    /// review↔author round budget is spent, so neither the review half nor the author re-dispatch
-    /// the review's findings would summon can run, and nothing will resume on its own (STUDIO-956).
+    /// Not a divergence of intent and activity but of a BOUND: the pull request's REVIEW round
+    /// budget ([`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`] × reviewers) is spent, so no
+    /// further review round will be dispatched and nothing will resume on its own (STUDIO-956).
+    ///
+    /// **What it does NOT claim, and why (round-8 finding 3).** It used to say "no further review
+    /// or AUTHOR re-run will be dispatched". That is false in exactly the case where it prints
+    /// most: this rule is reached only when there is no manager decision, and on an installation
+    /// that sets no `review.adjudicate_after_rounds` the author half is deliberately unbounded —
+    /// so the author can and does keep running. (It is also false with a threshold ABOVE the legacy
+    /// cap, where the cap stops the review half before the threshold is anywhere near.) The fix is
+    /// the wording, NOT a gate on the threshold being set: gating it would restore the silent stop
+    /// on the default install, which is the incident that filed this ticket — three pull requests
+    /// sat unreviewable on 2026-09-20 because the cap stopped the review half at DEBUG and no
+    /// surface said so.
     ///
     /// It is a `DivergenceKind` and not a separate channel because it is exactly what this module
     /// exists to make visible: a pull request that has stopped progressing and is not blocked by
@@ -213,7 +224,7 @@ impl DivergenceKind {
                 "every required reviewer approved and the pull request is still open"
             }
             DivergenceKind::RoundBudgetExhausted => {
-                "the review↔author round budget is spent, so no further review or author re-run \
+                "the per-pull-request review round budget is spent, so no further review round \
                  will be dispatched until it is cleared"
             }
             DivergenceKind::ReviewEscalated => {
@@ -1906,7 +1917,7 @@ mod store_tests {
             .find(|e| e.level == "WARN")
             .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
         assert!(
-            warn.message.contains("review↔author round budget is spent"),
+            warn.message.contains("review round budget is spent"),
             "the line must name the reason, got: {}",
             warn.message
         );
@@ -1915,12 +1926,32 @@ mod store_tests {
             "the copy that was false about a capped pull request must not be reused: {}",
             warn.message
         );
+        // Round-8 finding 3: this fixture is an install with NO `review.adjudicate_after_rounds`,
+        // where the author half is deliberately unbounded. The line must not claim it is stopped —
+        // that sentence was false in exactly the incident it printed in.
+        //
+        // MUTATION: restore "no further review or author re-run will be dispatched" to
+        // `DivergenceKind::detail` and this reds.
+        assert!(
+            o.adjudication_threshold_for_test().is_none(),
+            "the fixture must be the unset install this assertion is about"
+        );
+        assert!(
+            !warn.message.contains("author"),
+            "an unset install's author half is unbounded; the line must not say otherwise: {}",
+            warn.message
+        );
 
         let found = o.review_divergences();
         assert_eq!(found.len(), 1, "one divergence, got {found:?}");
         assert_eq!(found[0].kind, DivergenceKind::RoundBudgetExhausted);
         assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
         assert_eq!(found[0].ticket, "STUDIO-170");
+        assert!(
+            !found[0].kind.detail().contains("author"),
+            "and neither must the console/`/api/v1/state` copy: {}",
+            found[0].kind.detail()
+        );
 
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();

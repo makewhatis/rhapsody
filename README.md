@@ -1328,6 +1328,14 @@ why an in-flight adjudication deliberately does not survive.
 author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×
 reviewers review-only cap and its stop behave exactly as before. Adjudication is opt-in.
 
+**What `round_budget_exhausted` claims, and what it does not.** That report fires when the legacy
+review-only cap has stopped the loop and no manager decision exists — including on an installation
+that sets no threshold. Its copy therefore says only that **no further REVIEW round** will be
+dispatched: on an unset installation the author half is deliberately unbounded, so the earlier
+wording ("no further review or author re-run") was false in exactly the incident it printed in. It is
+reworded rather than gated on the threshold: gating it would restore the silent stop on the default
+installation, which is the incident that filed this ticket.
+
 ### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
 
 Some tickets cannot be done by an agent at all — console work in a web dashboard, a purchase on a

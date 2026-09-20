@@ -142,7 +142,7 @@ describe("DivergenceBanner", () => {
           divergence({
             kind: "round_budget_exhausted",
             detail:
-              "the review↔author round budget is spent, so no further review or author re-run will be dispatched until it is cleared",
+              "the per-pull-request review round budget is spent, so no further review round will be dispatched until it is cleared",
             reviewer: "",
             stale_secs: 0,
           }),
