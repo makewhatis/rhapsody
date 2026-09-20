@@ -804,6 +804,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         drain: None,
         projects: Vec::new(),
         review_divergence: Vec::new(),
+        held_for_human: Vec::new(),
     }
 }
 

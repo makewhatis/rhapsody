@@ -67,9 +67,16 @@ impl Orchestrator {
         &self,
         mut issues: Vec<Issue>,
     ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
+        // The human-hold set is a per-PASS fact (STUDIO-949): clear it here so a ticket no longer
+        // held stops being reported, while the ledger's announced set keeps the log once-per-ticket.
+        // This ladder is reached only after a successful candidate fetch — its caller returns on the
+        // fetch error — so `read_the_board` is `true` by construction (STUDIO-949 round 13). The
+        // clear/prime is BELOW the `eff` check on purpose: a pass that returned without a config
+        // examined no candidate, so it must not mark the set known.
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
+        self.human_holds.begin_pass(true);
         crate::dispatch::sort_for_dispatch(&mut issues);
 
         let mut running = self.running_id_set();
@@ -97,17 +104,52 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut issues = issues.into_iter();
         while let Some(iss) = issues.next() {
+            // Observe the CURRENT label on every candidate, BEFORE any branch or filter — including
+            // one the daemon is running (STUDIO-949 round 8). The reporting rule below deliberately
+            // excludes live work from `held`, but the refusal is absolute and the handoff's review
+            // decision reads this observation on the run's OWN ticket, whose issue snapshot predates
+            // a label added mid-run. A label seen and then not reported is still a label we honour.
+            if crate::teams::is_human(&iss) {
+                self.human_holds.note_human_label(&iss.identifier);
+            }
             if global_remaining <= 0 {
                 // Name what the cap turned away before stopping (STUDIO-885). The candidates are
                 // sorted, so everything from `iss` onward is unexamined — and the fetch includes
                 // the daemon's OWN in-flight work, which `eligibility` would have dropped further
                 // down, so those are filtered out here rather than reported as waiting. Collected
                 // only on this branch, so a pass that never runs out of slots pays nothing.
-                let held: Vec<String> = std::iter::once(iss)
-                    .chain(issues.by_ref())
-                    .filter(|i| self.is_unworked_candidate(i, &running, &recovered_claims))
-                    .map(|i| i.identifier)
-                    .collect();
+                //
+                // A `rhapsody:human` hold among that tail is reported here too (STUDIO-949). The
+                // hold is a fact about the TICKET, not about this pass's remaining capacity: if the
+                // report only came from the eligibility branch below, a daemon with every seat taken
+                // would drop the hold from `/api/v1/state` and the console would lose the signal
+                // exactly when the board is busiest. The sort does not exempt the hold, so without
+                // this a fully-booked pass that happens to place a human ticket past the cap
+                // publishes nothing.
+                let mut held: Vec<String> = Vec::new();
+                for i in std::iter::once(iss).chain(issues.by_ref()) {
+                    // See the main loop: the current label is observed for every candidate, live
+                    // work included, independently of the reported hold set.
+                    if crate::teams::is_human(&i) {
+                        self.human_holds.note_human_label(&i.identifier);
+                    }
+                    if self.is_unworked_candidate(&i, &running, &recovered_claims) {
+                        // The human note takes the SAME filter as the capacity tally (STUDIO-949
+                        // round 3). The tail is dominated by the daemon's own in-flight work, and
+                        // `eligibility` reaches its human gate only AFTER the running/claimed test —
+                        // so noting it unfiltered would report a ticket an agent is RUNNING RIGHT
+                        // NOW as "held for a human" whenever the pool happens to be full, the two
+                        // paths disagreeing about the same ticket at the same instant.
+                        // A `rhapsody:human` hold is NOT a capacity casualty: it would be refused
+                        // with every seat free, so naming it in the cap line would blame the cap for
+                        // a deliberate hold. Report the hold and leave it out of the tally.
+                        if crate::teams::is_human(&i) {
+                            self.note_human_hold(&i, "");
+                            continue;
+                        }
+                        held.push(i.identifier);
+                    }
+                }
                 self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
             }
@@ -121,6 +163,25 @@ impl Orchestrator {
             // NOT applied here (an @symphony summons is an explicit human override of the proactive
             // label filter, scoped to this review-reopen branch).
             if eff.review_states.contains(&st) && !eff.active_states.contains(&st) {
+                // A `rhapsody:human` ticket is refused on this ladder too (STUDIO-949): the branch
+                // runs BEFORE `eligibility`, so `review_reopen_eligible` (which now also refuses it)
+                // is the gate, and the hold is reported here so it is not a silent skip.
+                //
+                // The refusal is unconditional — a human ticket must never reopen, running or not —
+                // but the REPORT must not claim an agent's LIVE work is a deliberate hold. A ticket
+                // can be parked in the tracker's review state while the daemon is mid-run on it (a
+                // mid-run handoff), and labelling it `rhapsody:human` then is how an operator says
+                // "I'll take this": the agent is still working, so it is not held for a person yet.
+                // `is_unworked_candidate` is the same filter the saturated branches apply, and
+                // `eligibility` mirrors it by reaching its human gate only AFTER the running/claimed
+                // test. The announced set is permanent for the process, so a spurious note here
+                // would spend the ticket's only log slot before the hold is ever real.
+                if crate::teams::is_human(&iss) {
+                    if self.is_unworked_candidate(&iss, &running, &recovered_claims) {
+                        self.note_human_hold(&iss, "");
+                    }
+                    continue;
+                }
                 if !self.review_reopen_eligible(&iss, &running) {
                     continue;
                 }
@@ -150,8 +211,14 @@ impl Orchestrator {
             };
             let elig = eligibility(&iss, &running, &self.claimed, &gate);
             if !elig.ok {
-                // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
-                self.log_blocked_skip(&iss, &elig.blocked_by);
+                // A `rhapsody:human` hold is a deliberate refusal, not an ordinary drop (STUDIO-949):
+                // report it (once per ticket) rather than as a blocker miss.
+                if elig.held_for_human {
+                    self.note_human_hold(&iss, "");
+                } else {
+                    // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
+                    self.log_blocked_skip(&iss, &elig.blocked_by);
+                }
                 continue;
             }
             // Work already materialized as a linked PR with no newer summons → don't fresh-dispatch
@@ -273,6 +340,13 @@ impl Orchestrator {
     /// issues; `reopen` holds review-state issues (tagged with their project) the loop must promote
     /// before dispatching. Mirrors Go `selectDispatchMultiWithReopens`.
     ///
+    /// This is the board-READ form: the caller is handing in a candidate list it fetched, so the
+    /// human-hold ledger is primed as a pass that saw the whole board. A production caller whose
+    /// fetch may have FAILED PARTIALLY (the multi-project poll `continue`s past a per-project error)
+    /// must use [`Self::select_dispatch_multi_after_fetch`] and pass the fetch verdict, or a candidate
+    /// list missing a failed project's holds would mark an unknown label set as known
+    /// (STUDIO-949 rounds 13-15).
+    ///
     /// `held_for_capacity` is the third return, carried out and stored by the `&mut self` caller
     /// exactly as in [`Orchestrator::select_dispatch_with_reopens`] (STUDIO-803) — the capacity
     /// hold applies to this pass too, and since this is the pass a multi-project installation
@@ -280,11 +354,32 @@ impl Orchestrator {
     /// Teams off.
     pub fn select_dispatch_multi_with_reopens(
         &self,
+        tagged: Vec<TaggedIssue>,
+    ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
+        self.select_dispatch_multi_after_fetch(tagged, true)
+    }
+
+    /// [`Self::select_dispatch_multi_with_reopens`] with the candidate FETCH VERDICT threaded in
+    /// (STUDIO-949 rounds 13-15). `read_the_board` is `true` when EVERY enabled project's candidate
+    /// fetch succeeded. When it is `false` — any project failed, or no project is enabled at all —
+    /// the ladder still runs (`poll_all_projects` `continue`s past each failed project rather than
+    /// returning) but the human-hold ledger is neither cleared nor primed: a partly-read board must
+    /// not look like an empty one, or every fail-closed decision gate a gated daemon has reopens on a
+    /// tracker outage that started before boot, and a wholly unpolled install (all projects paused)
+    /// would publish an empty set as a settled "no hold". The legacy single-project ladder has no
+    /// such parameter because its failed fetch returns BEFORE the ladder, so it is `true` by
+    /// construction.
+    pub fn select_dispatch_multi_after_fetch(
+        &self,
         mut tagged: Vec<TaggedIssue>,
+        read_the_board: bool,
     ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
+        // See the single-project ladder: the hold set is per-PASS. Skipped entirely when the fetch
+        // verdict says the board could not be read (STUDIO-949 round 13).
+        self.human_holds.begin_pass(read_the_board);
         sort_tagged_stable(&mut tagged);
 
         let mut running = self.running_id_set();
@@ -305,15 +400,41 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut tagged = tagged.into_iter();
         while let Some(ti) = tagged.next() {
+            // See the single-project ladder: observe the current label on every candidate before
+            // any branch, live work included (STUDIO-949 round 8).
+            if crate::teams::is_human(&ti.iss) {
+                self.human_holds.note_human_label(&ti.iss.identifier);
+            }
             if global_remaining <= 0 {
                 // See the single-project ladder: the same diagnostic, same filter, on the pass a
                 // `projects:` install actually runs. Two ladders means two call sites or the
-                // feature is silently absent for whichever one is missing it.
-                let held: Vec<String> = std::iter::once(ti)
-                    .chain(tagged.by_ref())
-                    .filter(|t| self.is_unworked_candidate(&t.iss, &running, &recovered_claims))
-                    .map(|t| t.iss.identifier)
-                    .collect();
+                // feature is silently absent for whichever one is missing it — and the human-hold
+                // report is collected on this branch for the same reason the capacity one is
+                // (STUDIO-949): a fully-booked pass must still name the deliberate holds.
+                let mut held: Vec<String> = Vec::new();
+                for t in std::iter::once(ti).chain(tagged.by_ref()) {
+                    // See the main loop: the current label is observed for every candidate, live
+                    // work included, independently of the reported hold set.
+                    if crate::teams::is_human(&t.iss) {
+                        self.human_holds.note_human_label(&t.iss.identifier);
+                    }
+                    if self.is_unworked_candidate(&t.iss, &running, &recovered_claims) {
+                        // See the single-project ladder: the human note shares the capacity
+                        // tally's filter so a ticket with a live run is never reported as held —
+                        // and, being a deliberate hold rather than a cap casualty, it is left OUT
+                        // of the cap line's tally.
+                        if crate::teams::is_human(&t.iss) {
+                            let slug = t
+                                .proj
+                                .and_then(|i| eff.projects.get(i))
+                                .map(|p| p.slug.as_str())
+                                .unwrap_or("");
+                            self.note_human_hold(&t.iss, slug);
+                            continue;
+                        }
+                        held.push(t.iss.identifier);
+                    }
+                }
                 self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
             }
@@ -329,6 +450,17 @@ impl Orchestrator {
             // Review-state branch (per the issue's owning project's review set); the label gate is
             // intentionally NOT applied (an @symphony summons is a manual override of the filter).
             if p.review_states.contains(&st) && !p.active_states.contains(&st) {
+                // See the single-project ladder: the human gate must be repeated on the reopen path,
+                // which bypasses `eligibility`, or a human ticket parked in review leaks back out.
+                // The refusal is unconditional; the REPORT is filtered so a ticket the daemon is
+                // running right now (mid-run handoff, labelled mid-run) is not called a human hold
+                // and does not spend its once-per-ticket log slot.
+                if crate::teams::is_human(&ti.iss) {
+                    if self.is_unworked_candidate(&ti.iss, &running, &recovered_claims) {
+                        self.note_human_hold(&ti.iss, &p.slug);
+                    }
+                    continue;
+                }
                 if !self.review_reopen_eligible(&ti.iss, &running) {
                     continue;
                 }
@@ -362,7 +494,12 @@ impl Orchestrator {
             };
             let elig = eligibility(&ti.iss, &running, &self.claimed, &gate);
             if !elig.ok {
-                self.log_blocked_skip(&ti.iss, &elig.blocked_by);
+                // A `rhapsody:human` hold is a deliberate refusal, not an ordinary drop (STUDIO-949).
+                if elig.held_for_human {
+                    self.note_human_hold(&ti.iss, &p.slug);
+                } else {
+                    self.log_blocked_skip(&ti.iss, &elig.blocked_by);
+                }
                 continue;
             }
             if self.pr_suppressed(&ti.iss) {
@@ -512,6 +649,7 @@ mod tests {
 
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use rhapsody_core::Issue;
+    use rhapsody_store::{RunEnd, RunStart, Sqlite, StorePath};
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
@@ -519,6 +657,8 @@ mod tests {
     use crate::testsupport::*;
 
     const SKIP_BLOCKED: &str = "skipping dispatch: blocked by non-terminal blocker";
+    const HELD_FOR_HUMAN: &str =
+        "skipping dispatch: held for a human (rhapsody:human); only a person can do this ticket";
     const HELD_FOR_CAPACITY: &str =
         "skipping dispatch: no global concurrency slot; candidates not considered this tick";
 
@@ -698,6 +838,43 @@ mod tests {
         );
     }
 
+    // STUDIO-949: a `rhapsody:human` ticket is refused and the refusal is reported ONCE per ticket,
+    // not once per tick — a refusal that repeats every poll interval is not a signal anyone reads.
+    //
+    // MUTATION: log on every pass (drop the ledger dedupe) and the second `count_messages` reds.
+    #[test]
+    fn select_dispatch_logs_human_hold_once_per_ticket() {
+        let o = orch_for_select(10, HashMap::new(), None);
+        let mut human = issue("1", "A-1", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        let (got, events) = capture_events(|| o.select_dispatch(vec![human.clone()]));
+        assert!(got.is_empty(), "a human-gated ticket must not dispatch");
+        assert_eq!(
+            count_messages(&events, HELD_FOR_HUMAN),
+            1,
+            "the hold is logged on the first pass"
+        );
+        assert_eq!(
+            count_messages(&events, SKIP_BLOCKED),
+            0,
+            "a human hold is not an ordinary blocker miss"
+        );
+
+        // A second tick over the same ticket is not news.
+        let (_got, events2) = capture_events(|| o.select_dispatch(vec![human]));
+        assert_eq!(
+            count_messages(&events2, HELD_FOR_HUMAN),
+            0,
+            "the hold must not be logged again"
+        );
+
+        // ...and it is carried for the console (the current hold set).
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].issue_identifier, "A-1");
+    }
+
     // Mirrors Go `TestSelectDispatchLogsUnknownBlockerState`.
     #[test]
     fn select_dispatch_logs_unknown_blocker_state() {
@@ -775,6 +952,275 @@ mod tests {
         );
     }
 
+    // STUDIO-949: the multi-project ladder refuses and reports a human hold too — two ladders means
+    // two call sites, and the one that is missing it is silently absent for the installs that use it.
+    #[test]
+    fn select_dispatch_multi_logs_human_hold() {
+        let o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], None);
+        let mut human = issue("1", "A-1", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let (got, events) = capture_events(|| o.select_dispatch_multi(tag_for(0, vec![human])));
+        assert!(got.is_empty(), "a human-gated ticket must not dispatch");
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-949 round 10: the multi-project ladder's own current-label note (`select.rs:376`) is
+    // the ONLY one a `projects:` install ever reaches, and it feeds every decision gate that reads
+    // `labelled()` — `plan_quorum`, the ticketless watcher, the auto-merge gate and the
+    // reconciliation sweep. The tests above pin the console's REPORT set (fed by `note_human_hold`),
+    // so none of them notices if this write is deleted: the report survives while the decision gates
+    // silently lose the mid-run hold shape on the ladder most installs run.
+    //
+    // MUTATION: delete the `note_human_label` from the multi ladder's main-loop branch and this
+    // reds while every other test in this file still passes.
+    #[test]
+    fn the_multi_project_ladder_observes_a_live_human_label() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+        let o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], Some(running));
+
+        o.select_dispatch_multi(tag_for(0, vec![live]));
+
+        assert!(
+            o.human_holds.labelled_and_primed().0.contains("studio-939"),
+            "the multi ladder must feed the current-label set the decision gates read"
+        );
+    }
+
+    // STUDIO-949: the hold must survive a SATURATED pass. `eligibility` is only reached while the
+    // global slot budget lasts, so a human ticket past the cap would otherwise drop out of
+    // `/api/v1/state` and the console would lose the signal exactly when every seat is taken —
+    // the seventh silent stall this feature exists to close. The LOG is pinned by
+    // `select_dispatch_logs_human_hold_once_per_ticket`; this asserts the console's hold set, which
+    // is the part a saturated pass used to wipe.
+    //
+    // MUTATION: delete the `is_human` note from the capacity branch and this reds while
+    // `select_dispatch_logs_human_hold_once_per_ticket` (room to spare) still passes.
+    #[test]
+    fn a_saturated_pass_still_reports_a_human_hold() {
+        // One seat, already taken by the running ticket, so the pass runs out of slots immediately.
+        let mut running = HashMap::new();
+        running.insert(
+            "run".to_string(),
+            running_entry(issue("run", "A-0", "In Progress"), "p", "p"),
+        );
+        let o = orch_for_select(1, HashMap::new(), Some(running));
+        let mut human = issue("1", "STUDIO-939", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        let got = o.select_dispatch(vec![human]);
+        assert!(got.is_empty(), "no slot, and the ticket is held besides");
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1, "the deliberate hold is still reported");
+        assert_eq!(held[0].issue_identifier, "STUDIO-939");
+    }
+
+    // The same on the multi-project ladder — the pass a `projects:` install actually runs.
+    #[test]
+    fn the_multi_project_saturated_pass_still_reports_a_human_hold() {
+        let mut running = HashMap::new();
+        running.insert(
+            "run".to_string(),
+            running_entry(issue("run", "A-0", "In Progress"), "p", "p"),
+        );
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], Some(running));
+        let mut human = issue("1", "STUDIO-939", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        let got = o.select_dispatch_multi(tag_for(0, vec![human]));
+        assert!(got.is_empty());
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-949 round 3: a labelled ticket an agent is RUNNING RIGHT NOW is not a deliberate hold.
+    // Labelling a ticket mid-run is the natural way an operator says "stop, I'll take this", and the
+    // saturated branch must not claim the agent's own live work is held for a person — the same
+    // `is_unworked_candidate` filter the capacity tally beside it already applies, which
+    // `eligibility` mirrors by reaching its human gate only AFTER the running/claimed test.
+    //
+    // MUTATION: note the hold unconditionally in the capacity branch and this reds
+    // (`held().len() == 1`) while `a_saturated_pass_still_reports_a_human_hold` still passes.
+    #[test]
+    fn a_saturated_pass_does_not_report_a_running_human_ticket_as_held() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "p", "p"));
+        // One seat, already taken by the labelled ticket's OWN run: the pass is saturated at once.
+        let o = orch_for_select(1, HashMap::new(), Some(running));
+
+        let got = o.select_dispatch(vec![live]);
+        assert!(got.is_empty(), "it is already running");
+        assert!(
+            o.human_holds.held().is_empty(),
+            "a ticket with a live run is not held for a human"
+        );
+    }
+
+    // The same on the multi-project ladder — the pass a `projects:` install actually runs.
+    #[test]
+    fn the_multi_project_saturated_pass_does_not_report_a_running_human_ticket_as_held() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], Some(running));
+
+        let got = o.select_dispatch_multi(tag_for(0, vec![live]));
+        assert!(got.is_empty());
+        assert!(o.human_holds.held().is_empty());
+    }
+
+    // A review-state orchestrator with an in-memory store seeded with a prior run of `identifier`,
+    // so `review_reopen_eligible` reaches its store half. Mirrors the reviewadopt test fixture.
+    fn orch_for_reopen(identifier: &str) -> Orchestrator {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+        }
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let store = o.store();
+        let run = store
+            .start_run(RunStart {
+                issue_identifier: identifier.to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        store.end_run(run, RunEnd::default()).expect("end run");
+        o
+    }
+
+    /// A review-state ticket with a summons far newer than the seeded run's start.
+    fn summoned_review_issue(human: bool) -> Issue {
+        let mut iss = issue("1", "A-1", "In Review");
+        iss.team_id = "team-1".into();
+        iss.latest_summon_at = Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap());
+        if human {
+            iss.labels = Some(vec!["rhapsody:human".into()]);
+        }
+        iss
+    }
+
+    // STUDIO-949: the reopen ladder bypasses `eligibility` entirely (a review-state issue is never
+    // active), so a `rhapsody:human` ticket parked in review with a fresh `@symphony` summons would
+    // otherwise move back to the active state and dispatch — the one path that could leak the label
+    // to an agent. The control below proves this fixture's reopen path is live without the label.
+    //
+    // MUTATION: delete the `is_human` gate from `review_reopen_eligible` (or the review-branch note)
+    // and this reds.
+    #[test]
+    fn a_human_ticket_is_not_reopened_from_review() {
+        let o = orch_for_reopen("A-1");
+        // Control: without the label the very same ticket IS reopened, so the refusal below is the
+        // label's work and not an unrelated gate's.
+        {
+            let (_a, reopen, _) =
+                o.select_dispatch_with_reopens(vec![summoned_review_issue(false)]);
+            assert_eq!(reopen.len(), 1, "the reopen path is otherwise live");
+        }
+        let (active, reopen) = {
+            let (a, r, _) = o.select_dispatch_with_reopens(vec![summoned_review_issue(true)]);
+            (a, r)
+        };
+        assert!(active.is_empty(), "never dispatched as active work");
+        assert!(reopen.is_empty(), "never reopened either");
+        assert_eq!(
+            o.human_holds.held().len(),
+            1,
+            "and the hold is reported rather than silently skipped"
+        );
+    }
+
+    /// The multi-project reopen ladder needs its own gate: two ladders, two call sites.
+    #[test]
+    fn the_multi_project_ladder_does_not_reopen_a_human_ticket() {
+        let mut projects = vec![proj("a", 10, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let mut o = orch_for_multi(10, projects, None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+
+        let (_active, reopen, _) =
+            o.select_dispatch_multi_with_reopens(tag_for(0, vec![summoned_review_issue(true)]));
+        assert!(reopen.is_empty(), "a human review ticket is never reopened");
+        let held = o.human_holds.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-949 round 4: the review-state branch is the THIRD site of the class round 3 fixed at the
+    // saturated branches. It sits twenty lines below the first of them and has no running/claimed
+    // test of its own, so a ticket parked in review while the daemon is mid-run on it was reported
+    // as a deliberate human hold — the chip drawn on live work, and (because `HumanHoldLedger`'s
+    // `announced` set is permanent) the ticket's only log slot spent before the hold was ever real.
+    //
+    // MUTATION: note the hold unconditionally in the review branch and this reds (`held().len() ==
+    // 1`) while `a_human_ticket_is_not_reopened_from_review` (an unworked ticket) still passes.
+    #[test]
+    fn a_running_human_review_ticket_is_not_reported_as_held() {
+        let mut o = orch_for_reopen("A-1");
+        // The ticket is in the tracker's review state AND the daemon is running it right now — a
+        // mid-run handoff, labelled mid-run, which is the natural "I'll take this" signal.
+        let live = summoned_review_issue(true);
+        o.running
+            .insert("1".to_string(), running_entry(live.clone(), "p", "p"));
+
+        let (_active, reopen, _) = o.select_dispatch_with_reopens(vec![live]);
+        assert!(
+            reopen.is_empty(),
+            "a human ticket is never reopened, running or not"
+        );
+        assert!(
+            o.human_holds.held().is_empty(),
+            "a ticket with a live run is not held for a human"
+        );
+    }
+
+    // The same on the multi-project ladder — the pass a `projects:` install actually runs.
+    #[test]
+    fn the_multi_project_ladder_does_not_report_a_running_human_review_ticket_as_held() {
+        let mut projects = vec![proj("a", 10, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let mut o = orch_for_multi(10, projects, None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+
+        let live = summoned_review_issue(true);
+        o.running
+            .insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+
+        let (_active, reopen, _) = o.select_dispatch_multi_with_reopens(tag_for(0, vec![live]));
+        assert!(reopen.is_empty(), "a human review ticket is never reopened");
+        assert!(o.human_holds.held().is_empty());
+    }
+
     // Mirrors Go `TestSelectDispatchSkipsPRSuppressed`.
     #[test]
     fn select_dispatch_skips_pr_suppressed() {
@@ -844,6 +1290,69 @@ mod tests {
             ev.fields.get("max_concurrent").map(String::as_str),
             Some("1")
         );
+    }
+
+    // STUDIO-949 round 7: a deliberate hold is NOT a capacity casualty, and the log must not say it
+    // is. With a seat taken and a held candidate in the unexamined tail, reverting the `continue` in
+    // the capacity branch pushes the held ticket into the tally, so the line blames the cap for a
+    // hold that would be refused with every seat free — the two causes an operator most needs to
+    // tell apart. Observed at `not_considered`; the human-hold LOG still fires, so the decision is
+    // "reported as a hold", not "not reported".
+    //
+    // MUTATION: delete the `continue` from the capacity branch (leaving `held.push`) and this reds
+    // (`not_considered` becomes "A-2, A-3") while every other select test stays green.
+    #[test]
+    fn a_capacity_hold_never_counts_a_human_held_ticket() {
+        let o = orch_for_select(1, HashMap::new(), None);
+        let mut human = issue("2", "A-2", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let input = vec![issue("1", "A-1", "Todo"), human, issue("3", "A-3", "Todo")];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(ids(&got), vec!["A-1"], "cap 1 admits exactly one");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-3"),
+            "only the genuine casualty; the deliberate hold is not billed to the cap"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
+    }
+
+    // The same decision on the multi-project ladder — the pass a `projects:` install actually runs,
+    // with its own `continue` to lose.
+    //
+    // MUTATION: delete the `continue` from the multi ladder's capacity branch and this reds
+    // (`not_considered` becomes "A-2, A-3").
+    #[test]
+    fn the_multi_project_capacity_hold_never_counts_a_human_held_ticket() {
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], None);
+        let mut human = issue("2", "A-2", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let input = tag_for(
+            0,
+            vec![issue("1", "A-1", "Todo"), human, issue("3", "A-3", "Todo")],
+        );
+        let (got, events) = capture_events(|| o.select_dispatch_multi(input));
+        assert_eq!(got.len(), 1, "global cap 1");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line on the multi ladder");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-3"),
+            "only the genuine casualty; the deliberate hold is not billed to the cap"
+        );
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
     }
 
     // The diagnostic is for a pass that ran OUT of slots, not for every pass: a board with room to

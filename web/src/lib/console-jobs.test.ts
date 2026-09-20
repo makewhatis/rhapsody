@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { IssueCountsResponse, IssueRun, TeamsOverview, TicketCostRow } from "@/lib/api";
+import type {
+  IssueCountsResponse,
+  IssueRun,
+  StateResponse,
+  TeamsOverview,
+  TicketCostRow,
+} from "@/lib/api";
+import { mergeJobs } from "@/lib/runs-model";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -111,6 +118,17 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("completed", undefined)).toBe("review");
     expect(consoleJobStatus("completed", "")).toBe("review");
     expect(consoleJobStatus("completed", "some_future_state")).toBe("review");
+  });
+
+  // STUDIO-949 — a hold on a ticket that never ran reaches this function as a synthetic `waiting`
+  // row, whose outcome would otherwise wear the BLOCKER's word. The hold, not the run that never
+  // happened, is the whole fact, so it reads `queued`. "Never ran" is decided by the caller from
+  // the row's own run (absence of one), never from whether the tracker resolved a lifecycle.
+  //
+  // MUTATION: delete the `heldNeverRan` arm and this reds (`expected 'blocked' to be 'queued'`).
+  it("names a hold on a never-run ticket queued rather than blocked", () => {
+    expect(consoleJobStatus("waiting", undefined, false, false, true)).toBe("queued");
+    expect(consoleJobStatus("waiting", "", false, false, true)).toBe("queued");
   });
 });
 
@@ -1340,5 +1358,128 @@ describe("consoleStoreCounts", () => {
     // A held ticket waits on its PREDECESSOR, not on the operator — the same rule `needsOperator`
     // applies to the row, reached through the same call.
     expect(withHeld?.needsYou).toBe(0);
+  });
+
+  // A `rhapsody:human` hold that never ran is the one client-side ADDITION the daemon owns
+  // (STUDIO-949): the refused ticket reads Queued, and having no stored row it is re-reported as
+  // `held_for_human`, which the strip adds to queued. The client must NOT compute this from
+  // `state.held_for_human` — a hold that has already run keeps its stored row's bucket (its card
+  // stays in the run's lane), and adding it again double-counted the STUDIO-939 shape.
+  it("adds the daemon's held-for-human count to queued, exactly once", () => {
+    // `held_for_human` names holds the daemon found NO stored row for, so the bucket below belongs
+    // to a different issue and this is the only place the never-ran holds are counted.
+    const payload: IssueCountsResponse = {
+      issues: 1,
+      buckets: [{ outcome: "completed", lifecycle: "done", count: 1 }],
+      held_for_human: 2,
+    };
+    const withHolds = consoleStoreCounts(payload);
+    expect(withHolds?.queued).toBe(2);
+    expect(withHolds?.review).toBe(0);
+    expect(withHolds?.blocked).toBe(0);
+    // A deliberate hold is not a failure, so it is not billed as needing the operator.
+    expect(withHolds?.needsYou).toBe(0);
+    // Absent (a daemon holding nothing) is the pre-STUDIO-949 payload: no queued invention.
+    expect(
+      consoleStoreCounts(counts([{ outcome: "completed", lifecycle: "done", count: 1 }]))?.queued,
+    ).toBe(0);
+  });
+});
+
+// The chain `JobsView` actually runs: `mergeJobs` → `buildConsoleJobs`. Both board-side tests fed
+// `rows: []` (or a pre-built row) and exercised only the board's own synthesis, so neither could see
+// the word the pill paints in production — the `waiting` outcome mapped to `blocked`, the BLOCKER's
+// word, while both tests asserted "queued". This pins the production shape end to end (STUDIO-949
+// round 3).
+describe("a held-for-human ticket through the production chain (STUDIO-949)", () => {
+  it("paints the pill 'queued', not the blocker's word", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [
+        { issue_identifier: "STUDIO-939", title: "store work", project: "booch" },
+      ],
+    };
+    const rows = buildConsoleJobs(mergeJobs(state, [], [], NOW), [], undefined, NOW, []);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue).toBe("STUDIO-939");
+    // A deliberate hold waits in Queued and says so; it does not wear "blocked".
+    expect(rows[0].status).toBe("queued");
+    expect(rows[0].statusLabel).toBe("queued");
+    expect(rows[0].subLabel).toBe("held for a human");
+    // ...and it is not billed as needing the operator, exactly as the strip counts it.
+    expect(rows[0].needsYou).toBe(false);
+  });
+
+  // STUDIO-949 round 5 — the STUDIO-939 shape (parked in review, then labelled) through the SAME
+  // production chain. The card must keep the run's lane (Review) while carrying the hold, because
+  // the watcher is at that instant deferring the rounds the ticket is owed; jimmy's round-5 probe
+  // showed the opposite word reaching the operator. The test pins the decision THROUGH
+  // `buildConsoleJobs` (a `lifecycle`-bearing `IssueRun`), because asserting on the `MergedRow`
+  // alone cannot see the word the pill paints.
+  //
+  // MUTATION: pass `job.heldForHuman` as the `heldNeverRan` argument (drop the `runId === 0` half)
+  // and `status` reds with `expected 'queued' to be 'review'`.
+  it("keeps a held ticket that HAS run in the Review lane, with the hold as its sub-label", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    };
+    const stored = [
+      issueRow({
+        id: 88,
+        issue_identifier: "STUDIO-939",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ];
+    const jobs = buildConsoleJobs(mergeJobs(state, stored, [], NOW), stored, undefined, NOW, []);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("review"); // the real run decides the lane
+    expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
+    expect(jobs[0].runId).toBe(88); // and the row stays openable on the real run
+  });
+
+  // STUDIO-949 round 7 — "no lifecycle" is NOT "never ran". `lifecycleByIssue` drops every row the
+  // daemon could not answer, and a cold TTL cache serves most rows that way, so a held ticket can
+  // carry a real FAILED run with no resolved state. The hold must not overwrite the run's word with
+  // `queued`: that erases the operator's cue that an agent flailed and splits the lane from the
+  // strip, which scores the ticket through its bucket. The discriminator is the RUN (`runId`), not
+  // the tracker's silence. jimmy's probe is this fixture with `lifecycle` absent and `failed`.
+  //
+  // MUTATION: restore `heldForHuman && lifecycle === undefined` as the guard and `status` reds with
+  // `expected 'queued' to be 'blocked'`.
+  it("does not repaint a held ticket's failed run as queued just because the tracker was silent", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    };
+    const stored = [
+      // No `lifecycle`: the daemon could not resolve one. But the run is real and it failed.
+      issueRow({ id: 88, issue_identifier: "STUDIO-939", outcome: "failed" }),
+    ];
+    const jobs = buildConsoleJobs(mergeJobs(state, stored, [], NOW), stored, undefined, NOW, []);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("blocked"); // the failed RUN's word, not the hold's
+    expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
+    expect(jobs[0].runId).toBe(88); // and it is a real run, not a synthetic hold row
   });
 });

@@ -346,7 +346,8 @@ serves the same per-row facts `GET /api/v1/history/issues` already serves, group
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
              {"outcome": "completed", "review_run": true, "count": 7},
-             {"outcome": "running", "count": 1}]}
+             {"outcome": "running", "count": 1}],
+ "held_for_human": 2}
 ```
 
 Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
@@ -355,6 +356,14 @@ as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@review
 `id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
 sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
 different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+
+**A hold the store has no row for is reported separately** (STUDIO-949). `held_for_human` counts the
+non-live `rhapsody:human` tickets the dispatcher is holding for which the run store has NO stored
+row — the never-ran hold, for which the console synthesizes a Queued card and which no bucket could
+otherwise carry. It is emitted only while that count is positive, so a daemon with no such hold
+serves the pre-STUDIO-949 payload byte-for-byte. A held ticket that HAS run keeps its stored row's
+bucket (its lane), so it is deliberately not reclassified and not included here; `issues` remains
+the number of issues the buckets cover and the sum of their counts.
 
 What it costs the tracker is stated rather than left to be found, and this is the first caller that
 asks the daemon's lifecycle memo about more ids than one lookup will refresh. A lookup refreshes at
@@ -1218,6 +1227,142 @@ operator's own store (n=197 completed runs) run durations were p50 7.3 min, p90 
 eleven hours the incidents actually cost. A pull request mid-round is silent, an in-flight run is
 activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
+
+
+### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
+
+Some tickets cannot be done by an agent at all — console work in a web dashboard, a purchase on a
+physical device, a legal form. The team had been saying so **in the title** (`(HUMAN-GATED)`,
+`[HUMAN — do not move to Todo]`, `— HUMAN, console work`), and the daemon cannot read a title. On
+2026-09-20 an audit found STUDIO-939 sitting in Backlog with its blocker already Done, so enabling
+`dependency_mode: dag` would have moved it straight to Todo and dispatched an agent at App Store
+Connect. Go Symphony v0.4.0 has no such label; this is Rhapsody-only.
+
+`rhapsody:human` is a constant beside `SOLO_LABEL`, matching the existing `rhapsody:*` family. The
+label is the entire opt-in: a ticket without it behaves byte-identically to today.
+
+| A `rhapsody:human` ticket | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| dispatch | n/a | refused in `eligible()` and, on the review-reopen ladder that bypasses it, in `review_reopen_eligible()` — both refuse, Teams on or off |
+| auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever), and reported as a hold from that pass |
+| triage | n/a | never assigned an identity, never spending a manager turn |
+| visibility | n/a | a once-per-ticket INFO log; `/api/v1/state`'s `held_for_human` key, and the counts endpoint's `held_for_human` field for the never-ran hold the buckets cannot carry (a Backlog dependent included when its project has `dependency_mode` enabled — auto-promote is the only pass that ever sees it) |
+| Teams | n/a | **not** gated on it — the refusal holds on any install |
+
+The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,
+never the all-default miss), so the selection pass can log it once per ticket rather than per tick,
+and the console board can read a held card as deliberately held rather than mysteriously idle. A
+ticket that has never run has no worklist row, so the board synthesizes a Queued card for it — a hold
+that is visible nowhere would be the same silent stall the label exists to end.
+
+The refusal is also enforced on the paths that do not go through `eligible()`, because each would
+otherwise reach an agent: the review-reopen ladder refuses it in `review_reopen_eligible()`, the
+review-adoption sweep refuses it in `adopt_verdict`, an in-flight retry re-reads the ticket's current
+labels so a label added while it was backing off releases it, and the ticketless review watcher
+refuses to dispatch a round for a watch row whose origin ticket is currently held (the row is left
+armed, so a later label removal still gets the review it is owed). The **ticket-mode** review path
+is its sibling and refuses for the same reason: `plan_quorum` does not fan out a review quorum for a
+held parent, and the room's `file_review` answers an explicit "review this" the way its
+`confirm_assignment` answers "assign this" — both refuse, so a held parent cannot mint a new,
+unlabelled review ticket that no hold on the parent could reach. That handoff decision, and the
+ticketless watcher, the auto-merge gate and the reconciliation sweep with it, read the
+`HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing the label,
+**live runs included** — because the only mid-run hold shape is a ticket labelled while the daemon is
+running it, whose `RunningEntry` carries only its dispatch-time snapshot. A held origin ticket also holds
+back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
+would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
+finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
+explicitly: a watch row whose origin ticket is held is dropped before the rules can date it, because
+a ticket labelled *after* it ran does have a row. The board reads a held ticket that has run as held
+too, independently of the historical run status, and keeps it in the run's lane (Review, with a
+"held for a human" sub-label) while the row stays openable on its real run; the hold key, the board
+and the Now strip all count such a ticket once, in that lane. The board's word for a hold keys on
+whether the ticket ever RAN (the row's own run), not on whether the tracker resolved a lifecycle: a
+cold lifecycle cache serves most rows without one, and a held ticket in that gap can still carry a
+real failed run, which must keep saying `failed` rather than being repainted `queued`.
+
+**How far the hold's reach extends is bounded by the candidate poll and the auto-promote pass.** The
+label that REFUSES dispatch is read from the candidate issue itself, so `eligible()`, the reopen
+ladder and the adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and
+a ticket that never becomes a candidate is never dispatched either. The ticket-mode quorum
+(`plan_quorum`), the ticketless review watcher, the auto-merge gate and the reconciliation sweep
+instead read the `HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing
+the label, deliberately including a ticket the daemon is running — while the console's
+`held_for_human` key reads the reported-hold subset of the same pass, which excludes live work.
+
+That current-label set has **two writers**, and the second is why the reach is not simply the
+candidate poll. The selection pass records every candidate it walks wearing the label (active ∪
+review states, narrowed by `claim_mode`). The DAG auto-promote pass records the Backlog dependent it
+refuses to move — a ticket the candidate fetch by construction never returns, since that fetch is
+active ∪ review and a Backlog ticket is neither. So under `dependency_mode` enabled the decision set
+reaches a class of ticket the candidate poll cannot. Under `claim_mode: pool` the pool claim ASSIGNS
+the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query and its
+label stops reaching the selection-pass half; in assignee mode the same happens the moment the ticket
+is reassigned to the person taking it over. And a project whose candidate fetch fails is skipped for
+that tick (`poll_all_projects`), so its tickets contribute nothing to that pass. `begin_pass` clears
+both current sets only when EVERY enabled project answered, so a partial read neither clears nor
+primes (`STUDIO-949` rounds 13-15): the failed project's holds SURVIVE from the last full pass and the
+previous answer stands rather than being emptied. The same holds when NO project is enabled — an
+all-paused install has nothing to poll, so the board has not been read and the gates stay closed
+instead of publishing an empty set as a settled "no hold". The cost is over-holding: one permanently
+unreadable project freezes the clear, so a label that comes OFF keeps refusing until every enabled
+project answers again — the conservative direction for a gate in front of an irreversible merge.
+These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
+here rather than implying the refusal holds while the daemon no longer owns the ticket.
+
+**Every one of those writers sits below `on_tick`'s three early-return gates** — a failed config
+validation, an armed drain, a dead agent credential — while **four** decision gates keep running
+anyway, none of them through the per-tick candidate pass: the reconciliation sweep is called from
+`on_tick` ABOVE those gates on purpose, the ticketless review watcher's **round** gate and its
+**auto-merge** gate are reached through the watcher's own 120s task, and the ticket-mode handoff
+quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not on `on_tick` at all.
+The handed-off run is LIVE, and on a gated daemon live runs come from the RETRY path, not from
+recovery: `boot_recovery` restores no running entry (it converts every interrupted claim into an
+immediate retry), and `on_retry` is gated by the drain only — not by `validate()`, which returns
+before dispatch on every tick. So a daemon whose config validation has failed **since boot** keeps
+dispatching healthy runs off the last-good config while no tick ever primes, and each of their
+handoffs reaches the quorum gate. On a daemon held by one of those gates **since boot**, no selection
+pass has ever read the board, so the current-label set is not "no hold" but "nothing has looked". An
+empty set read as the former is how a `rhapsody:human` ticket's approved pull request self-merges on
+a drained daemon, irreversibly, how a real review round is dispatched at its pull request, or how a
+held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
+therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
+ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
+both are re-offered — the watcher asks again in 120s), the reconciliation sweep reports nothing — a
+false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
+exists to prevent — and `plan_quorum` refuses the fan-out, logging at `warn!` and naming the ticket.
+That refusal is **one-shot and unrecoverable**: the handoff has already landed, the run winds down,
+and `request_quorum` is the only feeder of the fan-out, so the review is dropped for good. Because a
+`WARN` line alone is the state STUDIO-822 decided was not enough, the refusal also records a
+lost-review advisory on the project's status surface (`record_lost_review`, as `give_up` does for
+an exhausted fan-out) — but only once the review-state move it rides on has LANDED: `plan_quorum`
+runs at plan time, before the move is attempted, and a move the tracker refused is not a handoff.
+The advisory is keyed by ticket, so the refusal re-firing on every handoff attempt refreshes one
+line rather than letting one ticket's repeats evict the group's other lost reviews. A team-less
+ticket is refused above this branch — it was never reviewable, so no review was lost and no
+advisory is recorded. The quorum is the one that matters most for a TICKET-mode install, because
+it is the only `labelled()` gate such an install runs: `quorum_enabled()` is
+`teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
+auto-merge branch are simply absent there. Priming means a pass actually **read the WHOLE board**,
+not that a pass ran: the multi-project ladder is reached even when a project's candidate fetch
+failed, and even when no project is enabled at all, and the fetch verdict is threaded in so a pass
+that could not read every enabled project neither clears nor primes. This is a deliberate
+conservatism for a bounded window — though on a daemon gated since boot the window is the whole
+process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy daemon's
+first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act after it
+(the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation sweep —
+which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that first
+un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the board
+the set is real and the bounds above are the ones left. Those bounds are unchanged by this: after any
+pass the set is only as fresh as that pass, so a daemon gated *after* it dispatched freezes the set
+at the last one and a label that lands during the gate is unseen until dispatch resumes. That is the
+same "as fresh as the last pass" property the two-writer paragraph names; the fail-closed branch
+closes the strictly larger "never looked at all" case, not this one.
+
+**The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
+such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
+unchanged, and a second test asserts the key is ABSENT on a daemon with no hold so the conditional
+cannot decay into an unconditional `[]` on a Go-pinned surface.
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)

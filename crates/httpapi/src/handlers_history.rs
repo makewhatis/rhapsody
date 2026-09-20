@@ -377,6 +377,27 @@ pub(crate) async fn handle_history_costs(
 /// (Go's `state.blocked` held-dependent set has no Rhapsody counterpart — `Snapshot` carries no
 /// such field — so there is nothing to fold for it.)
 ///
+/// THE HUMAN-HOLD RECLASSIFICATION (STUDIO-949). Only a `rhapsody:human` ticket that has NEVER RUN
+/// reads "queued" on the console: the dispatcher refused it, no agent will ever touch it, and its
+/// row is the Queued card the worklist synthesizes for it. Such a ticket has no stored row, so this
+/// endpoint reports it once in `held_for_human`, which the client adds to `queued`.
+///
+/// A hold that HAS run is a different shape and keeps its stored row's bucket. The dispatcher can
+/// hold a ticket parked in review (labelled after an agent already ran it — the STUDIO-939 shape),
+/// and there the console's card stays in the run's lane and wears the hold as a SUB-LABEL: the
+/// watcher is deferring the review rounds that ticket is owed, so "in review, held for a human" is
+/// the honest reading, not "waiting to be picked up". Dropping that row and re-billing it `queued`
+/// (an earlier fix) moved the card out of Review while the daemon held its review, and it is the
+/// same row/lane disagreement this endpoint exists to remove, one lane over.
+///
+/// It cannot be a client-side increment either way: the buckets carry no identity, so the client
+/// cannot tell a hold absent from the store from one that is present, and adding to every hold
+/// over-counted the latter. The join of the store rows (which control the ROW) with the snapshot's
+/// hold set (which controls WHICH ticket) is only available here. A HELD ticket the daemon is
+/// mid-run on keeps its running bucket, matching the console's own exception for a live row. Like
+/// the live overlay, this is best-effort: a failed snapshot costs the reclassification, not the
+/// tally.
+///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
 pub(crate) async fn handle_issue_counts(
     method: Method,
@@ -410,12 +431,26 @@ pub(crate) async fn handle_issue_counts(
     // that failed or timed out yields none of it, which degrades the tally to the stored outcomes
     // rather than failing the request.
     let mut live_work: Vec<(String, String)> = Vec::new();
+    // The current `rhapsody:human` holds (STUDIO-949). A held ticket that has NEVER RUN is REFUSED
+    // by the dispatcher and has no stored row, so the console synthesizes a Queued card for it and
+    // the tally must report it once in `held_for_human`. Doing it here, by identity, is the whole
+    // point: the client sees only aggregate buckets and cannot tell such a ticket from one whose
+    // row is present. A held ticket that HAS run keeps its stored row's bucket (its lane), so it is
+    // deliberately NOT reclassified — see the doc above. The store controls a held ticket's ROW;
+    // the snapshot controls which ticket is held; neither alone can answer, so the daemon joins
+    // them.
+    let mut held: HashSet<String> = HashSet::new();
     if let Ok(Ok(snap)) = snap {
         for r in &snap.running {
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
         }
         for r in &snap.retrying {
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
+        }
+        for h in &snap.held_for_human {
+            if !h.issue_identifier.is_empty() {
+                held.insert(h.issue_identifier.clone());
+            }
         }
     }
     let live: HashSet<&str> = live_work
@@ -430,9 +465,14 @@ pub(crate) async fn handle_issue_counts(
     // identifier never groups on either, so it never joins this set.
     let mut counted: HashSet<&str> = HashSet::new();
     for r in &runs {
-        if !r.issue_identifier.is_empty() {
-            counted.insert(r.issue_identifier.as_str());
+        let ident = r.issue_identifier.as_str();
+        if !ident.is_empty() {
+            counted.insert(ident);
         }
+        // A stored row always lands in its lifecycle's bucket, held or not: a hold that has run
+        // keeps the run's lane on the console (its card is in Review, sub-labelled "held for a
+        // human"), so the strip must count it there. Only a hold with NO stored row is
+        // reclassified, below, in `held_for_human`.
         let outcome = if live.contains(r.issue_identifier.as_str()) {
             OUTCOME_RUNNING
         } else {
@@ -453,7 +493,18 @@ pub(crate) async fn handle_issue_counts(
             .entry(status_key(issue_id, OUTCOME_RUNNING, &lifecycles))
             .or_insert(0) += 1;
     }
-    write_json(StatusCode::OK, &issue_counts_response(&buckets))
+    // Every held ticket that is not live AND has no stored row — the never-ran hold, which the
+    // console synthesizes a Queued card for. A held ticket with a stored row is already counted in
+    // its own bucket above, and one the daemon is mid-run on keeps its running bucket, exactly as
+    // the console keeps a running row live rather than queued.
+    let held_for_human = held
+        .iter()
+        .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
+        .count() as i64;
+    write_json(
+        StatusCode::OK,
+        &issue_counts_response(&buckets, held_for_human),
+    )
 }
 
 /// The status inputs of one issue, in the vocabulary [`issue_counts_response`] groups by. `review_run`
@@ -2113,6 +2164,147 @@ mod tests {
         assert_eq!(
             tally(&body),
             std::collections::HashMap::from([("running/-".to_string(), 1)]),
+        );
+    }
+
+    // STUDIO-949 round 5 — a `rhapsody:human` hold on a ticket that HAS run keeps its stored row's
+    // bucket. The STUDIO-939 shape (parked in review, then labelled) reads "in review, held for a
+    // human" on the console, so the strip must count it as `review` and NOT also add it to
+    // `queued`. The client cannot tell the two hold shapes apart from the aggregate buckets; the
+    // daemon joins the store rows with the snapshot's hold set and reclassifies only the hold with
+    // no stored row (the next test).
+    //
+    // MUTATION: re-add the `continue` that drops a non-live held ticket's stored row and this reds
+    // (`held_for_human` present, bucket missing).
+    #[tokio::test]
+    async fn issue_counts_keep_a_non_live_human_hold_that_has_run_in_its_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-939", "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_other", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.held_for_human
+            .push(rhapsody_orchestrator::dispatch::HeldForHuman {
+                issue_identifier: "STUDIO-939".into(),
+                title: "wire the stores".into(),
+                project: "booch".into(),
+            });
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([
+                    (
+                        "iss_held".to_string(),
+                        IssueLifecycleRow {
+                            state: "In Review".into(),
+                            lifecycle: IssueLifecycle::InReview,
+                        },
+                    ),
+                    (
+                        "iss_other".to_string(),
+                        IssueLifecycleRow {
+                            state: "Done".into(),
+                            lifecycle: IssueLifecycle::Done,
+                        },
+                    ),
+                ])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([
+                ("completed/done".to_string(), 1),
+                ("completed/in_review".to_string(), 1),
+            ]),
+            "a hold that has run keeps its review bucket: {body}",
+        );
+        assert!(
+            body.get("held_for_human").is_none(),
+            "and is NOT billed a second time in queued: {body}",
+        );
+        assert_eq!(
+            body["issues"], 2,
+            "`issues` still equals the sum of the buckets: {body}",
+        );
+    }
+
+    // STUDIO-949 — a `rhapsody:human` hold that has NEVER RUN is absent from the store, so the
+    // console synthesizes a Queued card for it and there is no stored row for the tally to count.
+    // The daemon reports it once in `held_for_human`, which the client adds to queued. The client
+    // cannot make this call itself: the buckets carry no identity.
+    #[tokio::test]
+    async fn issue_counts_reclassify_a_never_run_human_hold_as_queued() {
+        let store = mem_store();
+        seed_run_for("iss_other", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.held_for_human
+            .push(rhapsody_orchestrator::dispatch::HeldForHuman {
+                issue_identifier: "STUDIO-939".into(),
+                title: "wire the stores".into(),
+                project: "booch".into(),
+            });
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_other".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["held_for_human"], 1,
+            "the never-ran hold is reported once, by the count the client adds to queued: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/done".to_string(), 1)]),
+            "only the stored row is in the buckets: {body}",
+        );
+        assert_eq!(
+            body["issues"], 1,
+            "`issues` still equals the sum of the buckets: {body}",
+        );
+    }
+
+    // STUDIO-949 — a held ticket the daemon is mid-run on is NOT reclassified: the console keeps a
+    // live row (it does not hold what it is running), so its running bucket is the one the strip and
+    // the card agree on, and `held_for_human` must not add a second queued for it.
+    #[tokio::test]
+    async fn issue_counts_keep_a_live_human_hold_in_its_running_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-939", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-939"));
+        snap.held_for_human
+            .push(rhapsody_orchestrator::dispatch::HeldForHuman {
+                issue_identifier: "STUDIO-939".into(),
+                title: "wire the stores".into(),
+                project: "booch".into(),
+            });
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["issues"], 1,
+            "a live held ticket is counted once, in its running bucket: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+        );
+        assert!(
+            body.get("held_for_human").is_none(),
+            "no second queued for a ticket the daemon is running: {body}",
         );
     }
 

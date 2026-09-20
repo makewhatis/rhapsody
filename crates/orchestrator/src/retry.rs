@@ -982,9 +982,14 @@ impl Orchestrator {
                     if is_continuation {
                         delay = CONTINUATION_DELAY_MS.max(delay);
                     }
-                    tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "requeue: in-flight issue absent from candidates; state recheck failed");
+                    tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "requeue: in-flight issue absent from candidates; state/labels recheck failed");
                     if re.recovered {
-                        self.requeue_recovered(&re, next, delay, "in-flight state recheck failed");
+                        self.requeue_recovered(
+                            &re,
+                            next,
+                            delay,
+                            "in-flight state/labels recheck failed",
+                        );
                     } else {
                         self.schedule_retry_for(
                             RetryTarget {
@@ -995,7 +1000,7 @@ impl Orchestrator {
                             },
                             next,
                             delay,
-                            "in-flight state recheck failed",
+                            "in-flight state/labels recheck failed",
                             re.issue.clone(),
                             re.identity.clone(),
                         );
@@ -1030,8 +1035,12 @@ impl Orchestrator {
             return;
         }
 
-        // Eligibility excluding this issue's own pending claim. The label gate is proactive-pickup-only
-        // (nil labels here), so a required label stripped mid-run does not abandon in-flight work.
+        // Eligibility excluding this issue's own pending claim. The REQUIRED-label gate is
+        // proactive-pickup-only (nil labels here), so a required label stripped mid-run does not
+        // abandon in-flight work. The `rhapsody:human` hold is the deliberate exception: it is not
+        // label-config driven, so it is absolute here too — an operator who labels a retrying ticket
+        // `rhapsody:human` means to take it off the agents, and releasing the retry is the intended
+        // outcome rather than a dropped label (STUDIO-949).
         let claimed_except: HashSet<String> = self
             .claimed
             .iter()
@@ -1162,6 +1171,16 @@ impl Orchestrator {
     /// refreshed honestly; the dispatch-time `blocked_by` is stale and cannot be re-verified, so it is
     /// DROPPED (the relocated path must not re-block work in flight on data it can no longer trust — the
     /// next full candidate poll re-applies the real blocker gate). Mirrors Go `recheckInFlight`.
+    ///
+    /// The LABELS are refreshed too (STUDIO-949), through the Rhapsody-only
+    /// [`Tracker::fetch_issue_labels_by_ids`] that exists for exactly this "whatever state" read. This
+    /// fallback is the normal POOL shape — claiming assigns the ticket, while the candidate query
+    /// returns only unassigned ones — so without it a `rhapsody:human` label added while the run was
+    /// active or backing off is invisible to the [`eligible`] call in `on_retry` and the retry
+    /// re-dispatches an agent at a ticket only a person may touch. The two reads are one round trip
+    /// each and this
+    /// path fires only when the candidate set has already lost the issue, so the extra cost is the
+    /// rare case's.
     async fn recheck_in_flight(
         &self,
         tr: &Arc<dyn Tracker>,
@@ -1180,6 +1199,22 @@ impl Orchestrator {
         let mut out = last; // last-known full issue (description / PR signals)
         out.state = cur.state.clone(); // refresh to the current state (the only field by-ids can refresh)
         out.blocked_by = None; // drop dispatch-time blockers we cannot re-verify (staleness contract)
+        // Refresh labels from the same by-id read, so the absolute `rhapsody:human` gate in
+        // `eligible` sees a label added since dispatch. A miss (the issue named by the state read but
+        // absent from the labels read, which the adapters should never do) keeps the stale snapshot
+        // rather than dropping the labels wholesale.
+        //
+        // A FAILED labels read is an ERROR (STUDIO-949 round 7). It must not fall through to the
+        // dispatch-time snapshot: that snapshot is exactly the thing this refresh exists to distrust,
+        // and it cannot carry a hold added while the run was active or backing off. `on_retry`'s
+        // existing `Err` arm keeps the claim and requeues on the failure backoff, so an unreadable
+        // label set PARKS the retry instead of opening the hold gate. Avoiding one backoff cycle
+        // cannot take precedence over never dispatching at a ticket a person may have taken over —
+        // absence of a hold we could not read is not evidence of absence.
+        let labels = tr.fetch_issue_labels_by_ids(&ids).await?;
+        if let Some(cur) = find_by_id(&labels, id) {
+            out.labels = cur.labels.clone();
+        }
         Ok(Recheck::Relocated(Box::new(out)))
     }
 }
@@ -2125,6 +2160,79 @@ mod tests {
             *dispatched.lock().unwrap(),
             vec!["1".to_string()],
             "must continue (re-dispatch)"
+        );
+    }
+
+    // STUDIO-949: the relocation fallback must refresh LABELS as well as state. In pool mode the
+    // claimed ticket is absent from the candidate query, so this is the normal shape — and the
+    // dispatch-time snapshot in `RetryEntry::issue` carries the labels as they were then. An
+    // operator who labels a retrying ticket `rhapsody:human` means to take it off the agents; the
+    // retry must observe that label and release rather than dispatch a second agent at it.
+    // MUTATION: drop the `fetch_issue_labels_by_ids` refresh from `recheck_in_flight` and this reds
+    // (the dispatch sink receives "1").
+    #[tokio::test]
+    async fn a_filtered_out_retry_observes_a_new_human_label() {
+        let mut f = Fake::new(); // issue NOT in the filtered candidate set...
+        let mut current = issue("1", "MT-1", "In Progress");
+        current.labels = Some(vec!["rhapsody:human".into()]); // ...but the current by-id row is held
+        f.by_id.insert("1".into(), current);
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(Arc::clone(&tr), 10);
+        o.claimed.insert("1".into());
+        let mut re = retry_entry("1", "MT-1", 1);
+        re.issue = issue("1", "MT-1", "In Progress"); // dispatch-time snapshot: no label
+        o.retry_attempts.insert("1".into(), re);
+        o.on_retry(EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(
+            !o.claimed.contains("1"),
+            "a rhapsody:human label added mid-flight must release the retry"
+        );
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "no agent may be dispatched at a ticket a person took over"
+        );
+    }
+
+    // STUDIO-949 round 7: a FAILED labels read must not dispatch. The state read succeeding proves
+    // only that the ticket is still active; the labels are exactly what this refresh exists to
+    // establish, and the dispatch-time snapshot predates any mid-flight `rhapsody:human` label. So an
+    // unreadable label set fails CLOSED — `on_retry`'s existing `Err` arm keeps the claim and parks
+    // the retry on the failure backoff — rather than continuing on a snapshot that cannot carry the
+    // hold. The earlier "do not cost a backoff cycle" test pinned the unsafe dispatch and is gone.
+    //
+    // MUTATION: swallow the labels-read error and continue on the dispatch-time snapshot, and this
+    // reds (an agent is dispatched at a held ticket).
+    #[tokio::test]
+    async fn a_failed_labels_recheck_parks_the_retry_without_dispatching() {
+        let mut f = Fake::new(); // filtered out of the candidate set, still active
+        let mut current = issue("1", "MT-1", "In Progress");
+        current.labels = Some(vec!["rhapsody:human".into()]); // ...and the current row is held
+        f.by_id.insert("1".into(), current);
+        f.labels_by_id_err = Some(TrackerError::Other("linear_api_request: boom".into()));
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(Arc::clone(&tr), 10);
+        o.claimed.insert("1".into());
+        let mut re = retry_entry("1", "MT-1", 1);
+        re.issue = issue("1", "MT-1", "In Progress"); // dispatch-time snapshot: no label
+        o.retry_attempts.insert("1".into(), re);
+        o.on_retry(EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "the current labels are unknown, so no agent may be dispatched"
+        );
+        assert!(
+            o.retry_attempts.contains_key("1"),
+            "the retry must stay parked until the hold can be established"
+        );
+        assert!(
+            o.claimed.contains("1"),
+            "the claim must survive the requeue, not be released"
         );
     }
 
