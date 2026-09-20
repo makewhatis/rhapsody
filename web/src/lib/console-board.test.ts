@@ -235,6 +235,20 @@ describe("the board regroup (STUDIO-925)", () => {
     );
   });
 
+  it("gives a synthesized card the project's display name, not its slug (STUDIO-949)", () => {
+    // The hold entry carries only the slug; `BoardView` renders `card.project` as the chip, and a
+    // row-built card puts the display NAME there. Recover it from any row of the same project so
+    // the synthesized card's chip is not the odd one out.
+    const board = buildConsoleBoard(
+      [row({ issue: "STUDIO-1000", project: "Booch App", projectSlug: "booch" })],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const card = cards(board).find((c) => c.issue === "STUDIO-939");
+    expect(card?.project).toBe("Booch App");
+    expect(card?.projectSlug).toBe("booch");
+  });
+
   it("carries assignee and provider onto the card", () => {
     const board = buildConsoleBoard([
       row({

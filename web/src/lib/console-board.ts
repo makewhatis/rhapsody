@@ -293,6 +293,16 @@ export function buildConsoleBoard(
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
   const held = new Set(heldForHuman.map((h) => h.issue_identifier));
+  // The hold entry carries only the project SLUG (the daemon's `HeldForHuman`), while a card's
+  // `project` is the display NAME. Recover the name from any row of the same project so a
+  // synthesized card's chip matches every other card; fall back to the slug when the project has no
+  // row at all. (Through `JobsView` this branch is unreachable — `mergeJobs` synthesizes a row per
+  // hold and `buildConsoleJobs` maps 1:1 — so this only matters to a caller that hands the board
+  // rows it did not build through that chain.)
+  const nameBySlug = new Map<string, string>();
+  for (const row of rows) {
+    if (row.projectSlug !== "" && row.project !== "") nameBySlug.set(row.projectSlug, row.project);
+  }
   for (const row of rows) {
     // A review run is never its own card: it belongs to the ticket it reviews, and an unattributed
     // run (no issue key) has no ticket to group under.
@@ -365,7 +375,7 @@ export function buildConsoleBoard(
       key: `held-${h.issue_identifier}`,
       issue: h.issue_identifier,
       title: h.title,
-      project: h.project,
+      project: nameBySlug.get(h.project) ?? h.project,
       projectSlug: h.project,
       status: "queued",
       statusLabel: "queued",
