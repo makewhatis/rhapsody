@@ -97,6 +97,30 @@ pub fn render(s: &Snapshot) -> Value {
             ),
         );
     }
+    // STUDIO-949: the held_for_human key is emitted ONLY while the dispatcher is holding at least
+    // one `rhapsody:human` ticket, for the `drain` key's reason above and under the same two guards
+    // — the golden comparison plus `a_daemon_with_no_human_hold_emits_no_held_for_human_key`, which
+    // asserts the ABSENCE directly so this cannot decay into an unconditional `[]` on a Go-pinned
+    // surface. Clients read `state.held_for_human?.length`.
+    if !s.held_for_human.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "held_for_human".to_string(),
+            Value::Array(
+                s.held_for_human
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "issue_identifier": h.issue_identifier,
+                            "title": h.title,
+                            "project": h.project,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
     out
 }
 
@@ -337,6 +361,46 @@ mod tests {
             rows[0]["detail"],
             "a reviewer asked for changes and the ticket has had no run since"
         );
+    }
+
+    // STUDIO-949, the same parity guard for the same reason: a daemon holding no `rhapsody:human`
+    // ticket emits NO `held_for_human` key. The hold is rare, so an unconditional `[]` here would be
+    // a Rhapsody-only key on every payload of a Go-pinned surface — and
+    // `state_json_matches_state_fixture` would keep passing if the golden were recaptured with it.
+    // This asserts the ABSENCE directly.
+    #[test]
+    fn a_daemon_with_no_human_hold_emits_no_held_for_human_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("held_for_human").is_none(),
+            "a daemon with no human hold must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // And the other half: a held ticket reaches `/api/v1/state`, so the console board can read it as
+    // deliberately held rather than mysteriously idle.
+    #[test]
+    fn a_held_ticket_reaches_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "STUDIO-939".to_string(),
+            title: "wire the stores to RevenueCat".to_string(),
+            project: "booch".to_string(),
+        });
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["held_for_human"]
+            .as_array()
+            .expect("held_for_human is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["issue_identifier"], "STUDIO-939");
+        assert_eq!(rows[0]["title"], "wire the stores to RevenueCat");
+        assert_eq!(rows[0]["project"], "booch");
     }
 
     // And the other half: while a drain IS armed the key appears, carrying the two annotations an

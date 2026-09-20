@@ -29,6 +29,30 @@ them, and a document that appears to is wrong.
 Judge the change against the repository's own conventions — its README, its
 contributor docs, the code already around the diff — not against your taste.
 
+# Which round this is
+
+The description above may name the round mode.
+
+If it names a **full review**, read the whole change between the base branch and
+the head, as you would the first time.
+
+If it names a **delta review**, you read this pull request before, at the commit
+it names. Start from the difference between that commit and the head, and from the
+findings listed there:
+
+* Confirm each of those findings is addressed, or say plainly why it is not.
+* Then review the delta itself for anything new — a fix that introduces a defect is
+  exactly what this pass exists to catch.
+
+The delta is where you START, not the limit of what you may read. If something in
+it makes a conclusion you reached earlier wrong, follow it wherever it leads and
+read whatever you need to; a change outside the delta can be invalidated by one
+inside it.
+
+A delta round is not a lighter review. For any test the delta touches, do the same
+thing a first review does: break what the test claims to protect and confirm the
+test goes red. If it stays green, the test protects nothing — say so.
+
 If you have reviewed this pull request on an earlier attempt, read what you
 already posted before you post anything, and add only what is missing: a second
 copy of a finding you have already made costs the author time and tells them

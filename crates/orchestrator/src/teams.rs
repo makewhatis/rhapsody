@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use rhapsody_config::memory::Fact;
 use rhapsody_config::room::MAX_ROOM_WINDOW;
 use rhapsody_config::teams::{Identity, ManagerMode, Teams};
-use rhapsody_core::Issue;
+use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store as store;
 
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
@@ -84,6 +84,27 @@ pub(crate) const IDENTITY_LABEL_PREFIX: &str = "rhapsody:@";
 /// capabilities registry, where an unknown name is a documented silent no-op —
 /// exactly as for `@`.
 pub(crate) const SOLO_LABEL: &str = "rhapsody:solo";
+
+/// The **human-only** gate: a ticket wearing `rhapsody:human` can never be done by an
+/// agent — console work in a web dashboard, a purchase on a physical device, a legal
+/// form — so the dispatcher refuses it outright (STUDIO-949).
+///
+/// Unlike [`SOLO_LABEL`] this is **not a Teams feature**: it lives in the shared
+/// `rhapsody:` namespace only for naming consistency, is enforced in
+/// [`eligible`](crate::dispatch::eligible) and — because the review-reopen ladder
+/// runs before `eligible` and would otherwise bypass it — in
+/// [`Orchestrator::review_reopen_eligible`](crate::orchestrator::Orchestrator::review_reopen_eligible),
+/// and must hold on any install, Teams enabled or not. It is the Rhapsody-only opt-in
+/// the frozen Go reference has no counterpart for (README Divergences).
+///
+/// Four consumers agree on it: the dispatch gate refuses it (distinguishably from
+/// ordinary ineligibility, via
+/// [`EligibilityResult::held_for_human`](crate::dispatch::EligibilityResult)), the
+/// review-reopen gate refuses it too,
+/// [`Orchestrator::promote_unblocked`](crate::orchestrator::Orchestrator::promote_unblocked)
+/// never moves one to Todo (and reports the hold), and triage never assigns it an
+/// identity ([`crate::triage::unlabelled_candidates`]).
+pub(crate) const HUMAN_LABEL: &str = "rhapsody:human";
 
 /// The `events` row kind for a routed run (§3.4). A **data** value in the
 /// existing `kind` column — no schema change, no new column, no golden move.
@@ -438,6 +459,19 @@ pub(crate) fn is_solo(iss: &Issue) -> bool {
         .iter()
         .flatten()
         .any(|l| l.eq_ignore_ascii_case(SOLO_LABEL))
+}
+
+/// Whether `iss` carries [`HUMAN_LABEL`] — the human-only dispatch gate (STUDIO-949).
+///
+/// Matching normalizes at compare time (`trim` + lowercase), exactly as
+/// [`has_any_label`](crate::dispatch::has_any_label) does: labels reach the daemon however the
+/// tracker spells them, and an operator who typed `Rhapsody:Human` (or padded it) meant the hold.
+pub(crate) fn is_human(iss: &Issue) -> bool {
+    let want = normalize_state(HUMAN_LABEL);
+    iss.labels
+        .iter()
+        .flatten()
+        .any(|l| normalize_state(l) == want)
 }
 
 /// Whether `iss` carries the `rhapsody:@<name>` label for exactly `name`.

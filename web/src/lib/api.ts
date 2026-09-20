@@ -76,6 +76,19 @@ export interface StateResponse {
   // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
   // mean the same thing.
   review_divergence?: ReviewDivergence[];
+  // Tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), or ABSENT
+  // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
+  // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.
+  held_for_human?: HeldForHuman[];
+}
+
+// HeldForHuman is one row of /api/v1/state's `held_for_human` key (STUDIO-949): a ticket the
+// dispatcher refuses because only a person can do it. The board reads it as deliberately held, not
+// mysteriously idle.
+export interface HeldForHuman {
+  issue_identifier: string;
+  title: string;
+  project: string;
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
@@ -324,6 +337,14 @@ export interface IssueStatusBucket {
 export interface IssueCountsResponse {
   issues: number;
   buckets: IssueStatusBucket[];
+  // STUDIO-949: how many non-live `rhapsody:human` tickets the dispatcher is holding for which the
+  // run store has NO stored row — the never-ran hold, which reads "queued" on the console (a
+  // deliberate hold, not a fault) and which no bucket carries. A held ticket that HAS run keeps its
+  // stored row's bucket and is NOT included here, so this is not a duplicate of anything above and
+  // the strip adds it to `queued`. It is the daemon's count, not `state.held_for_human.length`,
+  // because only the daemon can join its bucket rows to the snapshot's hold set; see
+  // `consoleStoreCounts`. Absent when the daemon holds nothing with no stored row.
+  held_for_human?: number;
 }
 
 // TicketCostRow is one entry of GET /api/v1/history/costs (STUDIO-926): the tokens EVERY run spent

@@ -140,6 +140,22 @@ impl Orchestrator {
             if self.running.contains_key(&iss.id) || self.claimed.contains(&iss.id) {
                 continue;
             }
+            // rhapsody:human (STUDIO-949): never promote a human-only ticket to Todo. Auto-promote
+            // moving it would strand it — the standard select's `eligible` refuses it outright, so it
+            // would sit in Todo dispatching nothing forever, strictly worse than leaving it in
+            // Backlog. Checked BEFORE the label gate because the hold is absolute.
+            //
+            // This pass is also the ONLY place a human-gated Backlog dependent is ever seen: the
+            // selection pass's candidate fetch is active ∪ review, so a Backlog ticket never reaches
+            // `eligibility` at all (STUDIO-939 — the motivating case — sits in Backlog with its
+            // blocker already Done). A bare `continue` here would therefore be the seventh silent
+            // stall: no INFO line, no `held_for_human` row, no console chip. Report it through the
+            // same once-per-ticket seam the active path uses, as loudly as the `cancelled_blocker`
+            // skip below.
+            if crate::teams::is_human(&iss) {
+                self.note_human_hold(&iss, &scope.slug);
+                continue;
+            }
             // Label gate: a project with required labels only proactively works tickets carrying one.
             // Apply it here too, so auto-promote never moves a label-less dependent to Todo where the
             // standard select's eligibility would then reject it — stranding it in Todo (INF-318).
@@ -1014,6 +1030,86 @@ mod tests {
             "a store read error must NOT promote"
         );
         assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // STUDIO-939 is the case this gate exists for: a human-gated Backlog dependent whose blocker is
+    // already Done (the 2026-09-20 audit found STUDIO-939 sitting in Backlog with its blocker Done).
+    // Under dag the naive auto-promote moves it Backlog→Todo, `eligible` then refuses it forever, and
+    // it sits in Todo dispatching nothing — strictly worse than leaving it in Backlog. It must stay
+    // put while an ordinary sibling is still promoted.
+    //
+    // It must ALSO be visible: auto-promote is the only pass that ever sees a Backlog dependent (the
+    // selection pass's candidate fetch is active ∪ review), so the skip has to reach the same hold
+    // ledger the active path feeds, or the ticket is a seventh silent stall with no log and no
+    // console chip.
+    //
+    // MUTATION: delete the `is_human` skip from `promote_unblocked_scope` and this reds (the hold
+    // never reaches `human_holds`) while `eligible_refuses_human_label` (dispatch.rs) still passes —
+    // two independent properties.
+    #[tokio::test]
+    async fn promote_unblocked_939_human_ticket_stays_in_backlog() {
+        let mut f = Fake::new();
+        let mut human = backlog_dep("Done");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let mut ordinary = backlog_dep("Done");
+        ordinary.id = "b3".into();
+        ordinary.identifier = "MT-3".into();
+        f.blocked_backlog = vec![human, ordinary];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+
+        o.promote_unblocked().await;
+
+        let moves = tr.move_to_type_calls();
+        assert_eq!(
+            moves.len(),
+            1,
+            "only the ordinary dependent is promoted; the human one stays in Backlog"
+        );
+        assert_eq!(moves[0].issue_id, "b3");
+        assert_eq!(dispatched_len(&dispatched), 0);
+        assert!(o.pending_stack.is_empty(), "dag stashes no stack hint");
+
+        let held = o.human_holds.held();
+        assert_eq!(
+            held.len(),
+            1,
+            "STUDIO-939 is a Backlog dependent; only auto-promote ever sees it, so the hold must be \
+             reported from here: {held:?}"
+        );
+        assert_eq!(held[0].issue_identifier, "MT-2");
+    }
+
+    // STUDIO-949 round 5 — auto-promote runs on a tick whose candidate fetch FAILED, and that path
+    // returns before either selection ladder calls `HumanHoldLedger::begin_pass` while
+    // `promote_unblocked` still notes the same Backlog dependent. The current hold set must therefore
+    // be unique by identifier on its own: before the dedupe, each outage tick appended another
+    // identical `/api/v1/state.held_for_human` row and the Now strip's `+held_for_human` grew with
+    // it, while the board still had one card.
+    //
+    // MUTATION: revert `HumanHoldLedger::hold` to an unconditional push and this reds (2 rows).
+    #[tokio::test]
+    async fn promote_unblocked_does_not_duplicate_a_backlog_hold_across_ticks() {
+        let mut f = Fake::new();
+        let mut human = backlog_dep("Done");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        f.blocked_backlog = vec![human];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, _dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+
+        // Two promote ticks with no `begin_pass` between them — the failed-candidate-fetch shape.
+        o.promote_unblocked().await;
+        o.promote_unblocked().await;
+
+        let held = o.human_holds.held();
+        assert_eq!(
+            held.len(),
+            1,
+            "one Backlog hold per ticket across promote ticks: {held:?}"
+        );
+        assert_eq!(held[0].issue_identifier, "MT-2");
     }
 
     // Never-run guard (durable): a ticket with a prior run row is NEVER re-promoted (Stop/park stays

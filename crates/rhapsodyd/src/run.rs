@@ -827,6 +827,13 @@ where
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
             teams: teams_cfg.clone(),
             sink: Arc::new(sink),
+            // The two reads that prove a head move carried no new work (STUDIO-960), on the same
+            // `gh` seam as the state lookup. Wired unconditionally: the decision it feeds is
+            // internally gated (the row's status, and a comparison that actually came back
+            // identical), so an installation that never sees a rebase pays nothing for it.
+            diff_source: Some(
+                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::ReviewDiffSource>
+            ),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewwatch::run_review_watch_task(watch_ctx, deps).await;
