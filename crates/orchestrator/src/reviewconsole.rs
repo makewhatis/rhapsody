@@ -348,6 +348,11 @@ impl Orchestrator {
             self.review_rounds.remove(&churn_key(pr));
             // ...and the unreadability record, keyed by coordinate for `retire_review_pr`'s reason:
             // left behind it would outlive the pull request it names (STUDIO-950 round 14).
+            //
+            // Sits under `dropped > 0`, unlike the per-row `review_capacity_held` removal above: a
+            // dismissal whose every store drop FAILED left the rows watched, so the failure count
+            // is still a live fact about a pull request the daemon still polls. Once a row is gone
+            // the operator has said they are not waiting on it, and the record goes with it.
             self.review_watch_unreadable.remove(pr);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
