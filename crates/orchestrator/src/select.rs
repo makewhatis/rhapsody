@@ -1667,9 +1667,9 @@ mod tests {
     }
 
     /// **STUDIO-956, at the multi-project ladder.** The single-project test above exercises the
-    /// active guard at `select.rs:177`; this is the pass a `projects:` install actually runs, and
-    /// without a test of its own that half of the author-side bound can be deleted with the whole
-    /// suite green — a `projects:` install regresses STUDIO-170 and nothing notices.
+    /// active ladder's guard; this is the pass a `projects:` install actually runs, and without a
+    /// test of its own that half of the author-side bound can be deleted with the whole suite green
+    /// — a `projects:` install regresses STUDIO-170 and nothing notices.
     #[test]
     fn select_dispatch_multi_refuses_an_author_redispatch_at_the_adjudication_threshold() {
         let mut o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], None);
