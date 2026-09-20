@@ -1426,6 +1426,155 @@ impl PrStateSource for GH {
     }
 }
 
+/// The fallible result of a [`ReviewDeltaSource`] read. Opaque like [`SummonResult`]: every caller
+/// treats a failure the same way — the round degrades to a full review — so the cause is only
+/// worth a log line.
+pub type DeltaResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// How many findings comments one delta round is handed, and how long each may be (STUDIO-959).
+///
+/// The round is told what was already found so it does not re-derive it; it is NOT handed the whole
+/// comment history of a long-lived pull request, which would grow without bound and crowd the
+/// change being reviewed out of the prompt. Twenty most-recent comments, each truncated to 2,000
+/// characters, is sized to hold a real review conversation and nothing more.
+pub const MAX_DELTA_FINDINGS: usize = 20;
+pub const MAX_DELTA_FINDING_CHARS: usize = 2000;
+
+/// The two reads a DELTA review round needs from GitHub (STUDIO-959): whether the commit the
+/// reviewer last read is an ancestor of the head, and the findings comments already on the pull
+/// request.
+///
+/// Kept out of [`PrStateSource`] deliberately — that trait answers "where does this pull request
+/// stand", a question the watcher asks every tick about every watched pull request, while these are
+/// asked once per delta round, by the run that is about to be dispatched. Folding them together
+/// would spend two extra `gh` calls per pull request per tick on an answer nobody is waiting for.
+///
+/// Object-safe (the worker holds it as `Option<Arc<dyn ReviewDeltaSource>>`), so it is declared via
+/// `async_trait`. A failure on EITHER method is the caller's cue to fall back to a full review: the
+/// cost of re-reading a small change is far below the cost of a delta taken across a rebase or of a
+/// reviewer asked to confirm findings the host could not retrieve.
+#[async_trait]
+pub trait ReviewDeltaSource: Send + Sync {
+    /// Whether `base` is an ancestor of `head` — `gh api repos/<o>/<r>/compare/<base>...<head>`.
+    ///
+    /// `false` for a rebase or force-push (the compare is `diverged` or `behind`) and for a base
+    /// commit GitHub no longer holds; an error is reserved for a lookup that could not be made.
+    async fn is_ancestor(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> DeltaResult<bool>;
+
+    /// The findings comments already on the pull request, oldest first, newest-first truncated to
+    /// [`MAX_DELTA_FINDINGS`].
+    ///
+    /// Both issue comments and inline review comments are read, because a reviewer may have used
+    /// either. No author filter is applied: reviewers post under the daemon's own `gh` identity, so
+    /// attributing a comment to a Teams teammate is not possible from GitHub. The delta round is
+    /// therefore handed the pull request's findings — a superset of its own — and told which commit
+    /// it last read.
+    async fn prior_findings(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> DeltaResult<Vec<String>>;
+}
+
+/// One comment body, trimmed and bounded to [`MAX_DELTA_FINDING_CHARS`], never splitting a UTF-8
+/// character (the `chars()` walk, not a byte slice).
+fn bounded_finding(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= MAX_DELTA_FINDING_CHARS {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(MAX_DELTA_FINDING_CHARS).collect();
+    format!("{head}…")
+}
+
+#[async_trait]
+impl ReviewDeltaSource for GH {
+    /// One bounded `gh api repos/<o>/<r>/compare/<base>...<head>`.
+    ///
+    /// GitHub's `status` answers the ancestor question directly: `ahead` means head is strictly
+    /// ahead of base (base is an ancestor), `identical` means the same commit, `behind` means the
+    /// reverse, and `diverged` means neither is an ancestor — a force-push or a rebase. Anything
+    /// else, including a body with no `status`, is an error rather than a `false`: an ancestor
+    /// question that was not answered must not be read as "rebased", because that would send every
+    /// round full on a parse regression and nobody would see the delta path disappear.
+    async fn is_ancestor(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> DeltaResult<bool> {
+        if owner.is_empty() || repo.is_empty() || base.is_empty() || head.is_empty() {
+            return Ok(false);
+        }
+        let path = format!("repos/{owner}/{repo}/compare/{base}...{head}");
+        let body = self.run_off_task(vec!["api".into(), path.clone()]).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh api {path}: {e}").into()
+            },
+        )?;
+        match v.get("status").and_then(serde_json::Value::as_str) {
+            Some("ahead" | "identical") => Ok(true),
+            Some("behind" | "diverged") => Ok(false),
+            other => Err(format!("gh api {path}: unrecognised compare status {other:?}").into()),
+        }
+    }
+
+    /// Two bounded `gh api` reads (issue comments + inline review comments), newest first, each
+    /// page capped at [`MAX_DELTA_FINDINGS`].
+    ///
+    /// A failure on either endpoint is an error, not a partial list: the caller degrades to a full
+    /// review, which is the safe direction. Silently handing a round half its findings would be
+    /// exactly the "verify a list you do not have" failure the delta round exists to avoid.
+    async fn prior_findings(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> DeltaResult<Vec<String>> {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<String> = Vec::new();
+        for endpoint in ["issues", "pulls"] {
+            let path = format!(
+                "repos/{owner}/{repo}/{endpoint}/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+            );
+            let body = self.run_off_task(vec!["api".into(), path.clone()]).await?;
+            let v: serde_json::Value = serde_json::from_slice(&body).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("decode gh api {path}: {e}").into()
+                },
+            )?;
+            let comments =
+                v.as_array()
+                    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("gh api {path}: expected a JSON array of comments").into()
+                    })?;
+            for c in comments {
+                if let Some(body) = c.get("body").and_then(serde_json::Value::as_str)
+                    && !body.trim().is_empty()
+                {
+                    out.push(bounded_finding(body));
+                }
+            }
+        }
+        // Both endpoints answered newest-first; keep the newest overall and restore chronological
+        // order so the round reads the conversation the way it happened.
+        out.truncate(MAX_DELTA_FINDINGS);
+        out.reverse();
+        Ok(out)
+    }
+}
+
 #[async_trait]
 impl SummonSource for GH {
     /// Makes exactly two `gh api` calls (issues/comments + pulls/comments), matches the summon
@@ -3225,5 +3374,129 @@ mod tests {
     #[test]
     fn the_shipped_exec_bound_is_the_named_constant() {
         assert_eq!(GH::new("@symphony", None).exec_timeout, GH_EXEC_TIMEOUT);
+    }
+
+    // ── STUDIO-959: the delta round's two reads ─────────────────────────────────────────────────
+
+    /// GitHub's `compare` status maps onto the ancestor question, and the argv is pinned: a wrong
+    /// path is a silently-failing ancestry check that sends every round full.
+    #[tokio::test]
+    async fn is_ancestor_maps_the_compare_status() {
+        let cases = [
+            ("ahead", Some(true)),
+            ("identical", Some(true)),
+            ("behind", Some(false)),
+            ("diverged", Some(false)),
+        ];
+        for (status, want) in cases {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let body = format!(r#"{{"status":"{status}"}}"#);
+            let run: RunFn = Box::new(move |args: &[&str]| {
+                sink.lock().expect("argv lock").push(args.join(" "));
+                Ok(body.clone().into_bytes())
+            });
+            let src = GH::new("@symphony", Some(run));
+            let got = src
+                .is_ancestor("o", "r", "base1", "head2")
+                .await
+                .expect("the compare answered");
+            assert_eq!(got, want.expect("a recognised status"), "status {status}");
+            assert_eq!(
+                seen.lock().expect("argv lock").as_slice(),
+                ["api repos/o/r/compare/base1...head2".to_string()],
+                "the compare is read at the pinned path"
+            );
+        }
+    }
+
+    /// Only `ahead`/`behind`/`diverged`/`identical` answer the question; anything else — including a
+    /// body with no status at all — is an ERROR, never a silent `false`. Reading an unrecognised
+    /// body as "rebased" would send every round full on a parse regression and hide the delta path.
+    #[tokio::test]
+    async fn is_ancestor_errors_on_an_unrecognised_status() {
+        let run: RunFn = Box::new(|_args| Ok(br#"{"status":"mystery"}"#.to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+
+        let run: RunFn = Box::new(|_args| Ok(b"{}".to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn is_ancestor_propagates_a_failed_read() {
+        let run: RunFn = Box::new(|_args| Err("gh: 404".into()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+    }
+
+    /// Both comment endpoints are read, empty bodies are skipped, and the list comes back oldest
+    /// first (the API answers newest first and the round should read it as it happened).
+    #[tokio::test]
+    async fn prior_findings_reads_both_endpoints_and_orders_them() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let ep = args.last().copied().unwrap_or_default();
+            let body = if ep.contains("/issues/comments") {
+                r#"[{"body":"newer issue finding"},{"body":"   "}]"#
+            } else {
+                r#"[{"body":"older review finding"}]"#
+            };
+            Ok(body.as_bytes().to_vec())
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src
+            .prior_findings("o", "r", 12)
+            .await
+            .expect("both endpoints answered");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one read per comment endpoint"
+        );
+        assert_eq!(got, vec!["older review finding", "newer issue finding"]);
+    }
+
+    /// A body longer than the cap is truncated on a CHARACTER boundary and marked with an ellipsis.
+    #[tokio::test]
+    async fn prior_findings_bounds_a_huge_comment() {
+        let long = "é".repeat(MAX_DELTA_FINDING_CHARS + 50);
+        let body = serde_json::json!([{ "body": long }]).to_string();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            // Answer the first endpoint with the long body and the second with nothing.
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/comments") {
+                Ok(body.clone().into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].chars().count(),
+            MAX_DELTA_FINDING_CHARS + 1,
+            "the truncated body is the cap plus the ellipsis, counted in chars"
+        );
+        assert!(got[0].ends_with('…'));
+    }
+
+    /// If EITHER endpoint fails, the read fails: half a findings list is exactly the "verify a list
+    /// you do not have" failure the round exists to avoid, and the caller must fall back to full.
+    #[tokio::test]
+    async fn prior_findings_fails_when_one_endpoint_fails() {
+        let run: RunFn = Box::new(|args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/pulls/comments") {
+                return Err("gh: boom".into());
+            }
+            Ok(b"[]".to_vec())
+        });
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.prior_findings("o", "r", 12).await.is_err());
     }
 }

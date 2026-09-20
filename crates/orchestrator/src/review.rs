@@ -75,6 +75,11 @@ pub struct ReviewRun {
     /// How this pull request entered the watch set, recorded rather than inferred (design §14.1
     /// F-SEC).
     pub introduced_by: String,
+    /// The commit THIS reviewer last read on this pull request, as the watch row recorded it at
+    /// completion (STUDIO-959). Empty for a reviewer's first round — no row, or no completion — and
+    /// the flag that makes that first round full. Read from the store BEFORE this dispatch
+    /// overwrites the row, so it is the prior round's, never this one's.
+    pub prior_sha: String,
 }
 
 /// The two coordinates the WORKER needs to provision a review checkout: which pull request's head
@@ -88,6 +93,22 @@ pub struct ReviewCheckout {
     /// The head SHA pinned at dispatch — what the worktree is detached at, and what the agent reads
     /// as `SYMPHONY_REVIEW_HEAD`.
     pub head_sha: String,
+    /// What the round needs to decide between a full and a delta read (STUDIO-959): the
+    /// coordinates, the commit the reviewer last read, and the head. `None` whenever there is no
+    /// prior commit to diff from — a first round — which is also the whole of the full-review
+    /// decision the worker can make without asking GitHub anything.
+    pub delta: Option<ReviewDeltaRequest>,
+}
+
+/// One delta-round's inputs: the pull request, the commit the reviewer last read, and the head
+/// (STUDIO-959). Plain owned data — the worker is what turns it into `gh` reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewDeltaRequest {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub prior_sha: String,
+    pub head_sha: String,
 }
 
 impl ReviewRun {
@@ -96,6 +117,15 @@ impl ReviewRun {
         ReviewCheckout {
             pr_number: self.number,
             head_sha: self.head_sha.clone(),
+            // Only a reviewer with a recorded prior commit can be a delta round (STUDIO-959); an
+            // empty `prior_sha` is a first round, and `None` is what carries that to the worker.
+            delta: (!self.prior_sha.is_empty()).then(|| ReviewDeltaRequest {
+                owner: self.owner.clone(),
+                repo: self.repo.clone(),
+                number: self.number,
+                prior_sha: self.prior_sha.clone(),
+                head_sha: self.head_sha.clone(),
+            }),
         }
     }
 
@@ -290,7 +320,7 @@ impl Orchestrator {
     /// and pointing a second agent at the first one's detached worktree (design §14.1 F-DUP). The
     /// running/claimed half of the eligibility check is therefore reproduced here, where the review
     /// path cannot forget it.
-    pub fn dispatch_review(&mut self, run: ReviewRun) -> ReviewDispatchOutcome {
+    pub fn dispatch_review(&mut self, mut run: ReviewRun) -> ReviewDispatchOutcome {
         // §16: gated on teams.enabled, structurally, before anything is observed or written.
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
             return ReviewDispatchOutcome::TeamsOff;
@@ -372,6 +402,18 @@ impl Orchestrator {
         // no `requested_sha` at all. `save_review_watch` preserves both SHAs on a row that already
         // exists, so re-arming an existing row cannot forget what was dispatched or reviewed.
         let watch_key = run.watch_key();
+        // The reviewer's PRIOR round (STUDIO-959), read BEFORE the writes below touch the row: the
+        // commit this reviewer last read is exactly what a delta round diffs from, and the
+        // dispatch's own `mark_review_requested` would otherwise be indistinguishable from it. A
+        // missing row (a first round) or a failed read both leave `prior_sha` empty, which is a full
+        // review — the safe direction, because a delta from an unknown commit is no delta at all.
+        run.prior_sha = self
+            .store()
+            .get_review_watch(&watch_key)
+            .ok()
+            .flatten()
+            .map(|row| row.last_reviewed_sha)
+            .unwrap_or_default();
         if let Err(e) = self.store().save_review_watch(ReviewWatchRow {
             key: watch_key.clone(),
             author: run.author.clone(),
@@ -680,6 +722,7 @@ mod tests {
             repo_url: REPO_URL.to_string(),
             head_sha: head.to_string(),
             introduced_by: "handoff".to_string(),
+            prior_sha: String::new(),
         }
     }
 
@@ -829,6 +872,81 @@ mod tests {
         assert!(
             row.last_reviewed_sha.is_empty(),
             "dispatch must not touch the reviewed SHA — that is the completion's to write"
+        );
+    }
+
+    /// STUDIO-959: dispatch reads the reviewer's PRIOR commit off the existing row BEFORE it writes
+    /// this head as requested.
+    ///
+    /// Mutation: reading `requested_sha` (which the dispatch itself is about to overwrite) or
+    /// reading AFTER the writes would name this head as its own prior commit and red the delta
+    /// assertions here. And a reviewer with no row at all must carry nothing — a first round is
+    /// full, so the worker must not be handed a delta request it cannot honour.
+    #[test]
+    fn dispatch_carries_the_reviewers_prior_commit_into_the_run() {
+        let (mut o, dispatched) = orch_with_review(true);
+        let prior = review_run("alice", HEAD_A);
+        // A COMPLETED first round at HEAD_A: the row records what was READ.
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: prior.watch_key(),
+                author: prior.author.clone(),
+                introduced_by: prior.introduced_by.clone(),
+                requested_sha: HEAD_A.to_string(),
+                last_reviewed_sha: HEAD_A.to_string(),
+                status: REVIEW_STATUS_REVIEWED.to_string(),
+                open: true,
+            })
+            .expect("seed the prior round's row");
+
+        let next = review_run("alice", HEAD_B);
+        assert_eq!(
+            o.dispatch_review(next.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        {
+            let entries = dispatched.lock().expect("dispatched lock");
+            let re = entries.first().expect("one dispatch");
+            let review = re.review.as_ref().expect("the entry carries its review");
+            assert_eq!(
+                review.prior_sha, HEAD_A,
+                "the prior round's commit must be carried into the run"
+            );
+            let delta = review
+                .checkout()
+                .delta
+                .expect("a prior commit makes a delta request for the worker");
+            assert_eq!(delta.prior_sha, HEAD_A);
+            assert_eq!(
+                delta.head_sha, HEAD_B,
+                "the delta runs to THIS round's head"
+            );
+        }
+        let row = o
+            .store()
+            .get_review_watch(&next.watch_key())
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.requested_sha, HEAD_B);
+        assert_eq!(
+            row.last_reviewed_sha, HEAD_A,
+            "dispatch must not advance the reviewed SHA"
+        );
+
+        // A reviewer with NO row is a first round: no prior commit, hence no delta request.
+        let first = review_run("bob", HEAD_A);
+        assert_eq!(o.dispatch_review(first), ReviewDispatchOutcome::Dispatched);
+        let entries = dispatched.lock().expect("dispatched lock");
+        let re = entries.last().expect("the second dispatch");
+        let review = re.review.as_ref().expect("the entry carries its review");
+        assert!(
+            review.prior_sha.is_empty(),
+            "a first round must carry no prior commit"
+        );
+        assert!(
+            review.checkout().delta.is_none(),
+            "a first round must not present a delta request"
         );
     }
 
