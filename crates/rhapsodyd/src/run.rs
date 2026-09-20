@@ -179,6 +179,8 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_over_pinned_reviewers(o.teams.as_ref());
+        report_unknown_required_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
@@ -1392,6 +1394,58 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
     );
 }
 
+/// Warns when more identities are pinned as required reviewers than the active review path can
+/// select (STUDIO-951). Selection clamps — pins are ranked first and the caller truncates to the
+/// reviewer count — which is the safe direction, but silently dropping a reviewer the operator
+/// explicitly required is the worst outcome the ticket names. The warning names both numbers so
+/// the fix (raise `reviewers`, or shorten `review.required`) is obvious, and the two are read from
+/// [`Teams::over_pinned_reviewers`], which knows which path is on, counts duplicates once, and
+/// counts **only on-roster** pins — so an inert name cannot make it claim a drop that will not
+/// happen. An off-roster name is [`report_unknown_required_reviewers`]'s job, not this one's.
+fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    let Some((required, total)) = teams.over_pinned_reviewers() else {
+        return;
+    };
+    tracing::warn!(
+        required,
+        reviewers = total,
+        "review.required pins {required} identities but the active review path selects only \
+         {total} reviewer(s): the extra pins are dropped, and the ones kept are the first {total} \
+         in `required:` order. Raise the reviewer count or shorten `review.required`."
+    );
+}
+
+/// Warns about every `review.required` name that is not on the roster (STUDIO-951). Such a pin is
+/// inert — selection can only ever name a roster member — so it silently does nothing, and the
+/// live warning in `rank_reviewers` only fires once a round is actually built. Naming the typo at
+/// boot is how the operator learns before the first pull request arrives.
+///
+/// Gated on `teams.enabled`, **not** on
+/// [`active_reviewer_count`](rhapsody_config::teams::Teams::active_reviewer_count) like
+/// [`report_over_pinned_reviewers`]: that count answers "how many reviewers does the ambient
+/// review path ask for", and there is a third selection path it does not know about. The ears
+/// pass's `file_review` (`orchestrator::teamsears`) is the operator's room lever, refuses only
+/// under `review.mode: ticketless`, and so selects a reviewer on the DEFAULT shape (`review.mode:
+/// off`, `quorum.enabled: false`) — exactly the config where `active_reviewer_count()` is `None`
+/// and the gate would have silenced this warning. An off-roster pin is a typo in a key the
+/// operator deliberately wrote; one boot line for it is not noise.
+fn report_unknown_required_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    if !teams.enabled {
+        return;
+    }
+    let unknown = teams.unknown_required_reviewers();
+    if unknown.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        names = %unknown.join(", "),
+        "review.required names identities that are not on the roster; a pin can only select a \
+         roster member, so these names never review anything. Fix or remove them in teams.yaml."
+    );
+}
+
 /// Warns about every `teams.yaml` `projects:` slug that matches no resolved project
 /// slug (STUDIO-927). The near-certain cause is a Linear project NAME where its
 /// `slugId` hex belongs (`slugs: [booch]` instead of `[4f4a2350682f]`), and the
@@ -1862,6 +1916,71 @@ mod tests {
         assert!(
             logged.contains("memory.endpoint") && logged.contains("no memory"),
             "the warning must name the missing key and say what it cost: {logged}"
+        );
+    }
+
+    // jimmy's round-2 finding: the unknown-pin boot warning must not be gated on the AMBIENT
+    // review path's reviewer count. `file_review` — the ears pass's "request a review" room lever —
+    // selects through `select_reviewers` too, and it refuses only under `review.mode: ticketless`.
+    // So on the DEFAULT review shape (`mode: off`, `quorum.enabled: false`) a mis-cased
+    // `review.required` entry is live, yet `active_reviewer_count()` is `None`. Gating on that
+    // count (the pre-fix behaviour) silenced the warning exactly there.
+    //
+    // Mutation check: restore `teams.active_reviewer_count().is_none()` as the gate and this test
+    // goes red — no line is logged.
+    #[test]
+    fn the_unknown_pin_boot_warning_fires_on_the_default_review_shape() {
+        use rhapsody_config::teams::{Identity, Teams};
+        use std::sync::{Arc as StdArc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Recorder(StdArc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push(format!("{}={value:?}", field.name()));
+                    }
+                }
+                if let Ok(mut got) = self.0.lock() {
+                    event.record(&mut V(&mut got));
+                }
+            }
+        }
+
+        let mut teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        teams.review.required = vec!["Sol".to_string()];
+        assert!(
+            teams.active_reviewer_count().is_none(),
+            "the default review shape (mode: off, quorum off) has no ambient reviewer count"
+        );
+
+        let rec = Recorder::default();
+        let subscriber = tracing_subscriber::registry().with(rec.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            report_unknown_required_reviewers(Some(&teams));
+        });
+        let logged = rec.0.lock().expect("logged").join(" | ");
+        assert!(
+            logged.contains("Sol"),
+            "a mis-cased name must be named at boot even with no ambient review path: {logged}"
         );
     }
 

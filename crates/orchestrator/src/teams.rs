@@ -49,6 +49,7 @@ use rhapsody_core::Issue;
 use rhapsody_store as store;
 
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
+use crate::quorum::ReviewerExclusions;
 use crate::teamscompose::{Prepend, catch_up, compose, recall_facts};
 
 /// The Tier-0 label prefix: `rhapsody:@alice` names an identity outright (§3.2).
@@ -756,6 +757,55 @@ impl Orchestrator {
             .identity
             .map_or_else(String::new, |id| self.identity_harness(teams, &id));
         self.harness_actually_run(&named)
+    }
+
+    /// The required reviewers ([`Teams::review_required`]) a review cannot use as pinned
+    /// specialists, for [`crate::quorum::rank_reviewers`] to skip so a pinned identity can never
+    /// block a round (STUDIO-951). Two sets, because the two conditions it finds have opposite
+    /// consequences for the ranked fill (see [`ReviewerExclusions`]).
+    ///
+    /// Neither question is visible to the pure selector, which is why the orchestrator answers
+    /// them here:
+    ///
+    /// * **An unimplemented harness** (`unpinnable`) — the identity's profile names a harness this
+    ///   build has no runner for. `spawn_worker` silently falls back to `agent.backend` for such a
+    ///   profile, so the specialist the operator pinned is not the one who would review. Dropping
+    ///   the pin keeps the guarantee honest; keeping the name a ranked candidate keeps the teammate
+    ///   reviewing, which an operator who pinned them plainly wants.
+    /// * **A `review.model` refusal** (`unselectable`) — on the ticketless path,
+    ///   [`Teams::review_model_for`] answers `Refuse` when the operator scoped `review.model` to
+    ///   other harnesses than this reviewer's. `dispatch_review` refuses that review before any
+    ///   watch write, so the row would be re-offered every tick and never complete — exactly the
+    ///   merge-stalling shape the ticket forbids. This one is removed from the ranked fill too.
+    ///
+    /// Off-roster names are **not** included: the selector drops them itself (it only ever names
+    /// roster members) and the daemon reports them at boot
+    /// ([`Teams::unknown_required_reviewers`]). Empty whenever nothing is pinned, so the ranked
+    /// selection is then byte-identical to before this feature existed.
+    pub(crate) fn reviewer_exclusions(&self, teams: &Teams) -> ReviewerExclusions {
+        let backend = self.configured_backend();
+        let mut exclusions = ReviewerExclusions::default();
+        for name in teams.review_required() {
+            if !teams.roster.iter().any(|i| i.name == name) {
+                continue;
+            }
+            // The harness the run would actually use, and separately the one its profile named: an
+            // explicit unimplemented name falls back to `backend`, which is real but is not the
+            // pinned specialist.
+            let profile_harness = self.identity_harness(teams, name);
+            let explicit_unimplemented = !profile_harness.is_empty()
+                && !crate::effective::harness_is_implemented(&profile_harness);
+            let harness = self.harness_actually_run(&profile_harness);
+            if matches!(
+                teams.review_model_for(&harness, &backend),
+                rhapsody_config::teams::ReviewModelChoice::Refuse(_)
+            ) {
+                exclusions.unselectable.insert(name.to_string());
+            } else if explicit_unimplemented {
+                exclusions.unpinnable.insert(name.to_string());
+            }
+        }
+        exclusions
     }
 
     /// Whether this candidate must be **held this tick** for want of a team assignment
@@ -3108,6 +3158,79 @@ mod tests {
             o.running["1"].model_override.is_empty(),
             "{:?}",
             o.running["1"].model_override
+        );
+    }
+
+    // ── required reviewers that cannot run (STUDIO-951) ─────────────────────────────────────────
+
+    /// Edge 3's live half: a pin whose profile names a harness this build cannot run is reported
+    /// **unpinnable** — dropped as the pinned specialist but still a ranked candidate, because
+    /// `spawn_worker` falls back to `agent.backend` and the teammate really does review. A
+    /// teammate with no profile is not excluded at all: it runs on `agent.backend` like any other.
+    /// An off-roster name is not reported here either — the pure selector drops it and the daemon
+    /// warns at boot.
+    ///
+    /// Mutation check: make `reviewer_exclusions` return the default and the first assertion goes
+    /// red; put the unimplemented name in `unselectable` instead and the second goes red.
+    #[test]
+    fn reviewer_exclusions_mark_an_unimplemented_harness_unpinnable_not_unselectable() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0), ident("sol", &[], 0)]);
+        teams.roster[1].profile = "codexer".to_string();
+        teams.review.required = vec!["sol".to_string(), "ghost".to_string(), "alice".to_string()];
+        let (mut o, _) = orch_with_teams(teams.clone());
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        let got = o.reviewer_exclusions(&teams);
+        assert!(
+            got.unpinnable.contains("sol"),
+            "a profile naming an unimplemented harness drops the pin: {got:?}"
+        );
+        assert!(
+            !got.unselectable.contains("sol"),
+            "but it still runs on the backend, so it stays a ranked candidate: {got:?}"
+        );
+        assert!(
+            !got.unpinnable.contains("ghost") && !got.unselectable.contains("ghost"),
+            "off the roster is the selector's own drop and the daemon's boot warning: {got:?}"
+        );
+        assert!(
+            !got.unpinnable.contains("alice") && !got.unselectable.contains("alice"),
+            "no profile ⇒ runs on the backend: {got:?}"
+        );
+    }
+
+    /// The refusal shape that would otherwise stall: on the ticketless path `review.model` scoped
+    /// to another harness makes `dispatch_review` REFUSE this reviewer before any watch write, so
+    /// the row is re-offered every tick and never completes. That identity is **unselectable** —
+    /// removed from the ranked fill too, unlike the unimplemented-harness case.
+    #[test]
+    fn reviewer_exclusions_mark_a_review_model_refusal_unselectable() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nharness: opencode\n---\nOC.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &[], 0), ident("sol", &[], 0)]);
+        teams.roster[1].profile = "oc".to_string();
+        teams.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+        teams.review.model = rhapsody_config::teams::HarnessScoped::bare("claude-opus-5");
+        teams.review.required = vec!["sol".to_string()];
+        let (mut o, _) = orch_with_teams(teams.clone());
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        let got = o.reviewer_exclusions(&teams);
+        assert!(
+            got.unselectable.contains("sol"),
+            "dispatch_review would refuse this review: {got:?}"
+        );
+        assert!(
+            !got.unpinnable.contains("sol"),
+            "a refusal removes the candidate, it does not merely drop the pin: {got:?}"
         );
     }
 

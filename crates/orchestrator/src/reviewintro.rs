@@ -462,7 +462,12 @@ impl Orchestrator {
         // counts what is actually in flight, review runs included (they are stamped with the
         // reviewer's identity), so a second introduction in the same tick sees the first one.
         let load = crate::teams::LoadSnapshot::from_running(&self.running);
-        let mut reviewers = crate::quorum::rank_reviewers(teams, &re.identity, load.counts());
+        let mut reviewers = crate::quorum::rank_reviewers(
+            teams,
+            &re.identity,
+            load.counts(),
+            &self.reviewer_exclusions(teams),
+        );
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() {
             tracing::warn!(
