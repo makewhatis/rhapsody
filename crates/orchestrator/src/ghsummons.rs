@@ -769,8 +769,8 @@ pub const MERGE_STATE_DIRTY: &str = "DIRTY";
 ///
 /// Not a state but the ABSENCE of one: GitHub recomputes mergeability whenever the base advances
 /// and answers `UNKNOWN` — or, briefly, nothing — until it has. Named beside [`MERGE_STATE_DIRTY`]
-/// for the conflict route-back (STUDIO-961), because the two are the settled values it must tell
-/// apart: `DIRTY` is the conflict, and `UNKNOWN` is a read that is neither the conflict nor
+/// for the conflict route-back (STUDIO-961), because the two values it must tell apart are the
+/// settled one (`DIRTY` is the conflict) and this one — a read that is neither the conflict nor
 /// evidence that it resolved, so it must act on nothing and forget nothing.
 pub const MERGE_STATE_UNKNOWN: &str = "UNKNOWN";
 

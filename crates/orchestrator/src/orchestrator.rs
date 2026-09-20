@@ -579,9 +579,10 @@ pub struct Orchestrator {
     /// refusals on the other side of the seam.
     pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
     /// The HEAD at which each watched pull request was last routed back to its author for a
-    /// CONFLICT (STUDIO-961), and when, keyed by coordinate. Written and read only by the watcher's
-    /// loop-side handler, and dropped when the pull request leaves the watch set, exactly as
-    /// [`auto_merge_announced`](Orchestrator::auto_merge_announced) is.
+    /// CONFLICT (STUDIO-961), and when, keyed by coordinate. Written by the watcher's loop-side
+    /// handler and read by both it and the reconciliation sweep — which uses the instant to keep
+    /// its own silence from outliving the transition — and dropped when the pull request leaves the
+    /// watch set, exactly as [`auto_merge_announced`](Orchestrator::auto_merge_announced) is.
     ///
     /// The HEAD is the once-per-conflicted-HEAD guard: the conflict persists across every poll
     /// until a push lands, so without it a naive trigger would re-route and re-summons the author

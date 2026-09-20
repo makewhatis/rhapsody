@@ -114,9 +114,7 @@ use rhapsody_store::{
 };
 
 use crate::control_loop::{CancelWait, Event};
-use crate::ghsummons::{
-    HeadAllowlist, MERGE_STATE_DIRTY, MERGE_STATE_UNKNOWN, PrLookup, PrStateSource, PrStatus,
-};
+use crate::ghsummons::{HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrStateSource, PrStatus};
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
@@ -1017,6 +1015,26 @@ impl Orchestrator {
         self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
     }
 
+    /// The `mergeStateStatus` values that are a SETTLED non-conflict — GitHub has finished
+    /// computing mergeability and answered with something other than the conflict.
+    ///
+    /// Deliberately an ALLOW-list, and deliberately here rather than in [`crate::ghsummons`]: it is
+    /// this one guard's question ("may I forget the head I routed for?"), not a second
+    /// classification of GitHub's vocabulary. [`crate::ghsummons::MergeStateResult`] is explicit
+    /// that the vocabulary is open and has grown before, so an unrecognised value is neither the
+    /// conflict nor evidence that it resolved — it must forget nothing, exactly as
+    /// [`crate::ghsummons::MERGE_STATE_UNKNOWN`] does. The cost of a rename is at most
+    /// [`crate::reviewreconcile::RECONCILE_STALE_AFTER`] of sweep silence; the cost of the
+    /// deny-list it replaces is re-summonsing an author on a vocabulary change.
+    const SETTLED_NON_CONFLICT_MERGE_STATES: [&str; 6] = [
+        "BEHIND",
+        "BLOCKED",
+        "CLEAN",
+        "DRAFT",
+        "HAS_HOOKS",
+        "UNSTABLE",
+    ];
+
     /// Routes a CONFLICTED watch row's ticket back to its author, once per conflicted head
     /// (STUDIO-961).
     ///
@@ -1031,8 +1049,9 @@ impl Orchestrator {
     /// * **Settled only.** GitHub computes mergeability lazily and answers `UNKNOWN` — or, briefly,
     ///   nothing — while it does, so only a positively-recognised [`MERGE_STATE_DIRTY`] acts. An
     ///   UNSETTLED read acts on nothing AND forgets nothing, because a mid-computation read is not
-    ///   evidence that a conflict resolved; only a settled value that is not the conflict clears the
-    ///   record, so a conflict that clears stops suppressing the reconciliation sweep.
+    ///   evidence that a conflict resolved; only a positively-recognised settled value that is not
+    ///   the conflict clears the record (see [`Self::SETTLED_NON_CONFLICT_MERGE_STATES`]), so a
+    ///   conflict that clears stops suppressing the reconciliation sweep.
     /// * **The ticket is in review.** A `reviewed` row is this daemon's own record that a findings
     ///   verdict already routed the ticket out; moving it again would be churn, and the author is
     ///   already engaged.
@@ -1048,15 +1067,21 @@ impl Orchestrator {
         merge_state: &str,
         report: &mut ReviewSweepReport,
     ) {
-        // The settled-state gate. `DIRTY` is the conflict and acts; a settled non-conflict
-        // (CLEAN/BLOCKED/BEHIND/DRAFT/…) is the conflict GONE, so its record — which also keeps the
-        // reconciliation sweep silent — must go with it. But an UNSETTLED read (`UNKNOWN`, or
-        // briefly nothing; GitHub recomputes mergeability whenever the base advances) is neither:
-        // it decides nothing and forgets nothing. Reading it as the conflict resolved would let
-        // `DIRTY → UNKNOWN → DIRTY` at one unchanged head re-route and re-summons the author into
-        // the very loop the once-per-head guard exists to prevent.
+        // The settled-state gate. `DIRTY` is the conflict and acts; a settled non-conflict is the
+        // conflict GONE, so its record — which also keeps the reconciliation sweep silent — must go
+        // with it. But an UNSETTLED read (`UNKNOWN`, or briefly nothing; GitHub recomputes
+        // mergeability whenever the base advances) is neither: it decides nothing and forgets
+        // nothing. Reading it as the conflict resolved would let `DIRTY → UNKNOWN → DIRTY` at one
+        // unchanged head re-route and re-summons the author into the very loop the once-per-head
+        // guard exists to prevent.
+        //
+        // An ALLOW-list, not "anything but `UNKNOWN`": this region's vocabulary is GitHub's own and
+        // has grown before, so a value this daemon does not recognise is no more evidence the
+        // conflict resolved than `UNKNOWN` is. The allow-list costs at most the sweep's own
+        // staleness horizon in the case where GitHub renames a settled value, and buys immunity
+        // from re-summonsing an author on a vocabulary change.
         if merge_state != MERGE_STATE_DIRTY {
-            if !merge_state.is_empty() && merge_state != MERGE_STATE_UNKNOWN {
+            if Self::SETTLED_NON_CONFLICT_MERGE_STATES.contains(&merge_state) {
                 self.conflict_routed.remove(pr);
             }
             return;
@@ -2601,9 +2626,12 @@ mod tests {
     /// → DIRTY` is the live sequence on any branch whose base is moving; reading the `UNKNOWN` tick as
     /// "the conflict resolved" re-sends the summons and moves the ticket a second time.
     ///
-    /// Mutation check: fold the unsettled read back into the clear (drop the `is_empty`/`UNKNOWN`
-    /// carve-out in `propose_conflict_route_back`) and the second `DIRTY` reds — routed 1, expected
-    /// 0.
+    /// `RECOMPUTING` stands in for the value this daemon has never seen: the clear is an ALLOW-list,
+    /// so an unrecognised value must forget nothing too. A deny-list ("anything but `UNKNOWN`")
+    /// re-opens the same loop on a vocabulary change.
+    ///
+    /// Mutation check: fold the unsettled read back into the clear (drop the carve-out in
+    /// `propose_conflict_route_back`) and the second `DIRTY` reds — routed 1, expected 0.
     #[test]
     fn an_unsettled_read_does_not_forget_the_head_it_routed_for() {
         let (mut o, mut rx) =
@@ -2615,7 +2643,7 @@ mod tests {
             1
         );
         // The base moved: GitHub has not recomputed, and the head is unchanged.
-        for unsettled in ["", "UNKNOWN"] {
+        for unsettled in ["", "UNKNOWN", "RECOMPUTING"] {
             assert_eq!(
                 o.handle_review_sweep(&[open_conflicted(12, HEAD_A, unsettled)])
                     .routed,
@@ -2639,6 +2667,38 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 1, "exactly one summons for one conflicted head");
+    }
+
+    /// ⚠️ The instant the watcher stamps on the record is the whole of the reconciliation sweep's
+    /// freshness bound, so it is pinned at the PRODUCER, not only at the sweep that reads it. If
+    /// this wrote a constant — ancient or future — every real route-back would either stop
+    /// suppressing the sweep or silence it forever, and the two hand-inserted reconcile tests would
+    /// not notice.
+    ///
+    /// Mutation check: date the record `DateTime::<Utc>::MIN_UTC` (or `MAX_UTC`) in
+    /// `propose_conflict_route_back` and this reds.
+    #[test]
+    fn a_conflict_route_back_is_stamped_with_the_clock_it_acted_on() {
+        let (mut o, _rx) = conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        let instant = chrono::DateTime::parse_from_rfc3339("2026-09-14T21:20:00Z")
+            .expect("test instant")
+            .with_timezone(&chrono::Utc);
+        o.now = Box::new(move || instant);
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        let routed = o
+            .conflict_routed
+            .get(&coord(12))
+            .expect("a recorded route-back");
+        assert_eq!(
+            routed.routed_at, instant,
+            "the freshness anchor must be the instant the tick acted on, not a constant"
+        );
+        assert_eq!(routed.head, HEAD_A);
     }
 
     /// Retiring a pull request drops its conflict record — a coordinate watched again later must
