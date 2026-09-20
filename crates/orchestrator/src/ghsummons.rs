@@ -1557,7 +1557,8 @@ impl ReviewDeltaSource for GH {
         // `(created_at, body)`, merged across the two endpoints rather than concatenated: taking the
         // newest overall must not mean "whichever endpoint was read first wins". `created_at` is
         // RFC3339 (`Z`), so a lexicographic sort is chronological; a comment with no timestamp sorts
-        // oldest, and is never dropped in favour of one that has a timestamp.
+        // oldest and is therefore the FIRST thing dropped when the cap binds (every real GitHub
+        // comment carries `created_at`, so this is a degenerate-input note, not a live case).
         let mut found: Vec<(String, String)> = Vec::new();
         // Per-PULL-REQUEST paths, not the repository-wide `repos/{o}/{r}/issues/comments` lists
         // (STUDIO-959, alice's round-1 blocker): the repo-wide form returns every pull request's
@@ -3519,9 +3520,14 @@ mod tests {
     /// documented behaviour — it returns the first `per_page` comments of an ascending 86-comment
     /// thread, wrapped for `--slurp` — and asserts the round still comes away with the newest 20.
     ///
-    /// A regression back to `per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc` (the shape
-    /// alice's round-2 blocker was about) makes this test red: the fake then yields the oldest 20,
-    /// and the newest body never appears.
+    /// What this pins is the IN-CODE selection, not `DELTA_FINDINGS_PAGE`. The code under test now
+    /// sends `--paginate`, and real `gh` follows the Link headers, so even a reverted
+    /// `per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc` query would come back with all 86
+    /// comments and the newest would still win — `--paginate` alone closed alice's round-2 defect,
+    /// and the page size is a request-count optimisation. The guard that actually matters is the
+    /// `sort_by`/`truncate`/`reverse` below, which THIS fake cannot page past (it honours `per_page`
+    /// and returns exactly one ascending page), so removing that selection reds this test even
+    /// though the literal is not load-bearing for correctness.
     #[tokio::test]
     async fn prior_findings_takes_the_newest_page_of_an_ascending_thread() {
         // 86 comments, ascending, one minute apart. The last is the newest.
