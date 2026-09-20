@@ -163,9 +163,10 @@ pub struct DraftPokeState {
     /// [`crate::draftpoke::perform_nudge`] cannot report a delivery failure back to the control
     /// task. So the latch stands even when both writes failed: the terminal WARN says the
     /// escalation "reached no surface — no human was told", and the pull request stays silent at
-    /// every head until the draft stops or the daemon restarts — a restart is the only thing that
-    /// clears this flag. An operator who greps that WARN should read it as "restart me or handle
-    /// this by hand", not as a note about a write that failed.
+    /// every head. The only things that clear it are the draft resolving (published, which drops
+    /// this entry, or retired) or a daemon restart — so on a draft that never resolves, a restart
+    /// is what re-arms the poke. An operator who greps that WARN should read it as "restart me or
+    /// handle this by hand", not as a note about a write that failed.
     pub escalated: bool,
 }
 
