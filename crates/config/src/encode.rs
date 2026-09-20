@@ -78,6 +78,9 @@ fn raw_from_config(c: &Config) -> Raw {
     r.tracker.capabilities = c.tracker.capabilities.clone();
     r.tracker.dependency_mode = c.tracker.dependency_mode.clone();
     r.tracker.dep_mode_prompt_file = c.tracker.dep_mode_prompt_file.clone();
+    // STUDIO-948 (Rhapsody-only): emit verbatim; an unset (empty) list prunes away, preserving the
+    // pre-948 default on the round-trip.
+    r.tracker.promote_from_states = c.tracker.promote_from_states.clone();
     r.tracker.claim_mode = c.tracker.claim_mode.clone();
     // claim_ttl / claim_settle_delay: emit the Go-duration string form only for a non-zero value,
     // so an unset knob (the assignee-mode common case) is pruned and re-decodes as "use the default".
@@ -223,6 +226,7 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.capabilities.is_empty()
         && p.dependency_mode.is_empty()
         && p.dep_mode_prompt_file.is_empty()
+        && p.promote_from_states.is_empty()
         && p.claim_mode.is_empty()
         && p.enabled.is_none()
 }
@@ -246,6 +250,7 @@ fn raw_project_from_project(p: &Project) -> RawProject {
         dependency_mode: p.dependency_mode.clone(),
         dep_mode_prompt_file: p.dep_mode_prompt_file.clone(),
         claim_mode: p.claim_mode.clone(),
+        promote_from_states: p.promote_from_states.clone(),
         claude: None,
         hooks: None,
         max_concurrent_agents: p.max_concurrent_agents,
@@ -952,5 +957,32 @@ mod tests {
         let c2 = re_encode_decode(&c1);
         assert_eq!(c2.tracker.claim_ttl, Duration::minutes(2));
         assert_eq!(c2.tracker.claim_settle_delay, Duration::seconds(1));
+    }
+
+    // STUDIO-948 (Rhapsody-only): a set `promote_from_states` survives an Encode->Decode round-trip at
+    // both the top level and per project; an UNSET one prunes away and re-decodes as empty (the
+    // pre-948 default), so an existing config never gains the key on a settings save.
+    #[test]
+    fn promote_from_states_round_trip() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n",
+            "  active_states: [Todo]\n  terminal_states: [Done]\n  dependency_mode: dag\n",
+            "  promote_from_states:\n    - Backlog\n",
+            "repo: \"git@github.com:o/r.git\"\n",
+            "projects:\n",
+            "  - slugs:\n      - a-1\n    promote_from_states:\n      - Staged\n",
+        );
+        let c1 = decode_map(front, "body");
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(c2.tracker.promote_from_states, vec!["Backlog".to_string()]);
+        assert_eq!(
+            c2.projects[0].promote_from_states,
+            vec!["Staged".to_string()]
+        );
+
+        // Unset stays unset through a round-trip.
+        let bare = "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n";
+        let c3 = re_encode_decode(&decode_map(bare, "body"));
+        assert!(c3.tracker.promote_from_states.is_empty());
     }
 }
