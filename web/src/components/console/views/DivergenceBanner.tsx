@@ -51,11 +51,13 @@ export function DivergenceBanner() {
  * second-accurate rendering would imply a precision the measurement does not have, and the decision
  * an operator makes from it ("is this minutes or is this all morning?") never needs more.
  *
- * The minutes branch is reachable: `round_budget_exhausted` has NO threshold and is reported the
- * moment the budget is spent, so a fresh exhaustion arrives as seconds since the newest run — often
- * `0`. The staleness-rule kinds floor at ninety minutes and therefore bottom out at "1 hour"; the
- * arithmetic still clamps to a minimum of one unit so a real divergence is never rendered as "0
- * minutes". Keep that whichever way the threshold moves.
+ * The minutes branch is reachable: the kinds with NO staleness threshold are reported the moment
+ * they happen, so a fresh one arrives as seconds since the newest run — often `0`. In an
+ * adjudicating install those are `review_escalated` and `review_shipped` (the threshold arm reports
+ * them regardless of age, and the legacy `round_budget_exhausted` no longer fires there because the
+ * threshold arm precedes it). The staleness-rule kinds floor at ninety minutes and therefore bottom
+ * out at "1 hour"; the arithmetic still clamps to a minimum of one unit so a real divergence is
+ * never rendered as "0 minutes". Keep that whichever way the threshold moves.
  */
 function humanStale(secs: number): string {
   const hours = Math.floor(secs / 3600);

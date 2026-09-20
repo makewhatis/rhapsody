@@ -1276,8 +1276,9 @@ task decides and hands a plan to the watcher, which performs the turn and the wr
 counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
 the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
 `MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
-turn per sweep forever. An operator can drop the decision — and the round budget — from the console
-(`POST /api/v1/reviews/clear`).
+turn per sweep forever — through the same room post and pull-request comment every other decision
+gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —
+and the round budget — from the console (`POST /api/v1/reviews/clear`).
 
 **Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
 author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×

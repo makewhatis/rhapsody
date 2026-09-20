@@ -133,7 +133,8 @@ use async_trait::async_trait;
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
 use rhapsody_store::{
-    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED,
+    ReviewWatchRow,
 };
 
 use crate::control_loop::{CancelWait, Event};
@@ -1072,20 +1073,65 @@ impl Orchestrator {
         self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) / self.reviewers_per_round()
     }
 
-    /// The open findings at `head`: every live row whose round posted findings against this exact
-    /// head. Named on an escalation, which must carry the specific findings rather than "needs a
-    /// human" (STUDIO-956).
+    /// The decision-relevant open facts at `head`, one human-readable line per live row. Named on an
+    /// escalation, which must carry the specific findings rather than "needs a human" (STUDIO-956).
+    ///
+    /// **Not "the verdicts at this exact head".** The row's status is transient: a head advance
+    /// re-arms `reviewed` to `requested` (preserving `last_reviewed_sha`) and an unfinished round
+    /// parks at `truncated`, so at the instant the loop reaches its threshold both halves of a
+    /// `status == reviewed && last_reviewed_sha == head` filter can fail at once and the plan would
+    /// carry no findings at all. That is the rule rather than the exception on an EVEN threshold,
+    /// which the author's own summoned dispatch is what crosses. Three shapes are named instead:
+    ///
+    /// * a row that posted findings at the current head — `{reviewer} asked for changes at {head}`;
+    /// * a row whose last read predates the head — the author has pushed since and nobody has read
+    ///   the new head, which is the single most decision-relevant fact available here and is stated
+    ///   verdict-neutrally because the re-arm preserved the SHA but not whether it was findings or
+    ///   an approval;
+    /// * a `truncated` row — the round was attempted and never finished, so it posted nothing.
+    ///
+    /// Skipped are the rows with nothing to say: one approved at the current head, and one that has
+    /// never been reviewed at all and is not in the unfinished-round state.
     fn open_findings(&self, mine: &[&ReviewWatchRow], head: &str) -> Vec<String> {
-        mine.iter()
-            .filter(|r| r.open && r.status == REVIEW_STATUS_REVIEWED && r.last_reviewed_sha == head)
-            .map(|r| {
-                format!(
-                    "{} asked for changes at {}",
+        let mut findings = Vec::new();
+        for r in mine
+            .iter()
+            .filter(|r| r.open && r.status != REVIEW_STATUS_DROPPED)
+        {
+            if r.last_reviewed_sha == head {
+                if r.status == REVIEW_STATUS_REVIEWED {
+                    findings.push(format!(
+                        "{} asked for changes at {}",
+                        r.key.reviewer,
+                        short_sha(head)
+                    ));
+                }
+                // An `approved` row at this head is the only genuinely closed one; every other
+                // status here (`truncated` after a completed read of the same head, say) falls
+                // through to the unfinished-round arm below.
+            } else if !r.last_reviewed_sha.is_empty() {
+                findings.push(format!(
+                    "{} last reviewed {}; the author has pushed {} since and no reviewer has read it",
                     r.key.reviewer,
+                    short_sha(&r.last_reviewed_sha),
                     short_sha(head)
-                )
-            })
-            .collect()
+                ));
+                continue;
+            }
+            if r.status == REVIEW_STATUS_TRUNCATED {
+                let attempted = if r.requested_sha.is_empty() {
+                    head
+                } else {
+                    &r.requested_sha
+                };
+                findings.push(format!(
+                    "{}'s review of {} did not finish; no findings were posted",
+                    r.key.reviewer,
+                    short_sha(attempted)
+                ));
+            }
+        }
+        findings
     }
 
     /// Whether any half of `pr`'s loop — a review round OR the author's summoned run — is live
@@ -1330,30 +1376,12 @@ impl Orchestrator {
                 }
                 let rounds = self.rounds_used(pr);
                 let findings = self.open_findings(&mine, head);
-                // A turn that has already failed its bounded attempts ESCALATES instead of being
-                // re-asked: a broken `manager.model` or `claude` must not buy one turn spawn per
-                // pull request per sweep, forever. The escalation names the failure so the operator
-                // knows the bound was the model, not the review.
-                if let Some(ledger) = self.adjudication_ledger.as_ref() {
-                    let attempts = ledger.failures(pr);
-                    if attempts >= crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS {
-                        ledger.record(
-                            pr,
-                            crate::reviewadjudicate::Adjudication::Escalate {
-                                head: head.to_string(),
-                                rounds,
-                                findings,
-                                reason: format!(
-                                    "the manager turn failed {attempts} times; no decision could be \
-                                     made"
-                                ),
-                            },
-                        );
-                        report.deferred += 1;
-                        self.propose_auto_merge(&mine, pr, head, report);
-                        return;
-                    }
-                }
+                // A turn that has failed its bounded attempts ESCALATES rather than being re-asked,
+                // but that escalation is recorded where its two audit writes happen — off the
+                // control task, in `reviewadjudicate::perform_adjudication`. The settled entry it
+                // lands there is what this branch reads back on the next sweep (the
+                // `self.adjudication(pr)` check above) to stop handing out plans, so the bound is
+                // enforced without a second, comment-less escalation path here.
                 let plan = crate::reviewadjudicate::ReviewAdjudicationPlan {
                     pr: pr.clone(),
                     head: head.to_string(),
@@ -3776,45 +3804,34 @@ mod tests {
         assert!(dispatched.lock().expect("lock").is_empty());
     }
 
-    /// **A failing turn is bounded.** A failed adjudication clears the in-flight marker so the next
-    /// sweep re-asks — correct — but a misconfigured `manager.model` must not buy one turn spawn per
-    /// pull request per sweep forever: after [`MAX_ADJUDICATION_ATTEMPTS`] failures the control task
-    /// ESCALATES instead of handing out another plan.
-    ///
-    /// Mutation: removing the failure bound re-arms a plan here and reds this.
+    /// **A settled escalation stops the loop and is never re-asked.** The bound on a failing turn is
+    /// enforced where the turn runs and its audit writes happen
+    /// (`reviewadjudicate::perform_adjudication`, pinned in that module's tests); what the control
+    /// task owes is to honour the settled ledger entry — arm nothing, hand out no further plan.
     #[test]
-    fn a_turn_that_failed_its_attempts_escalates_instead_of_re_asking() {
+    fn a_settled_escalation_stops_the_loop_and_is_not_re_asked() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let l = ledger(&mut o);
         introduce(&o, row(12, "bob"));
         o.review_rounds
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
-        for _ in 0..crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS {
-            l.note_failure(&coord(12));
-        }
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec![format!("bob asked for changes at {}", &HEAD_A[..7])],
+                reason: "the manager turn failed 3 times; no decision could be made".to_string(),
+            },
+        );
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
 
         assert!(
             report.adjudicate.is_empty(),
-            "the manager must not be asked again once its turn has failed its attempts"
+            "a settled escalation must not be re-asked"
         );
-        match l.peek(&coord(12)) {
-            Some(Adjudication::Escalate {
-                head,
-                rounds,
-                reason,
-                ..
-            }) => {
-                assert_eq!(head, HEAD_A);
-                assert_eq!(rounds, 3);
-                assert!(
-                    reason.contains("failed 3 times"),
-                    "the escalation must name the failure, got: {reason}"
-                );
-            }
-            other => panic!("expected an escalation, got {other:?}"),
-        }
+        assert_eq!(report.dispatched, 0, "and no round may arm");
         assert!(dispatched.lock().expect("lock").is_empty());
     }
 
@@ -3975,6 +3992,89 @@ mod tests {
         assert_eq!(
             plan.findings,
             vec![format!("bob asked for changes at {}", &HEAD_A[..7])]
+        );
+    }
+
+    /// **The EVEN-threshold shape, where a blank prompt was the rule rather than the exception.**
+    ///
+    /// With the loop alternating review→author, an even threshold is crossed by the AUTHOR's own
+    /// summoned dispatch, and the deferral then holds the decision until their run ends — which is
+    /// after they have pushed. By then every row has been re-armed to `requested`, so a finding
+    /// filter keyed on `status == reviewed && last_reviewed_sha == head` names nothing at all and
+    /// the manager is asked to decide on a blank prompt. The plan must instead name the head that
+    /// was actually read and the unread head the author pushed.
+    ///
+    /// Mutation check: restoring the exact-head/`reviewed`-only filter reds this test.
+    #[test]
+    fn the_plan_names_the_unread_head_on_an_even_threshold() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 4));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // bob read HEAD_A and asked for changes; three rounds are charged through the real site.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        // The author's summoned re-dispatch charges the fourth (even) round, and the author's run
+        // pushes HEAD_B before it ends.
+        let iss = author_issue("STUDIO-956", 12);
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "at three of four the author's summon is still allowed"
+        );
+        o.note_author_round(&iss);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
+        let plan = &report.adjudicate[0];
+        assert_eq!(plan.head, HEAD_B);
+        assert!(
+            !plan.findings.is_empty(),
+            "the manager must not be handed a blank prompt when the head has moved: {:?}",
+            plan.findings
+        );
+        assert!(
+            plan.findings
+                .iter()
+                .any(|f| f.contains(&HEAD_A[..7]) && f.contains(&HEAD_B[..7])),
+            "the finding names the head that was last read AND the unread head: {:?}",
+            plan.findings
+        );
+    }
+
+    /// A TRUNCATED round at the threshold is a review that never happened; the plan must say that
+    /// rather than hand the manager "none recorded" over a round nobody completed.
+    #[test]
+    fn a_truncated_round_at_the_threshold_names_the_review_that_never_finished() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_TRUNCATED)
+            .expect("completed");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        let plan = &report.adjudicate[0];
+        assert!(
+            !plan.findings.is_empty(),
+            "a truncated round is not 'nothing open': {:?}",
+            plan.findings
+        );
+        assert!(
+            plan.findings[0].contains(&HEAD_A[..7]),
+            "the unfinished review names the head it was attempted at: {:?}",
+            plan.findings
         );
     }
 

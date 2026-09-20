@@ -89,8 +89,12 @@ pub struct ReviewAdjudicationPlan {
     pub head: String,
     /// How many review↔author rounds the pull request ran before the threshold.
     pub rounds: usize,
-    /// The open findings at the threshold — one human-readable line per reviewer round that asked
-    /// for changes, e.g. `alice asked for changes at a324d2d`. The manager names these on an
+    /// The decision-relevant open facts at the threshold, one human-readable line per live watch
+    /// row. Not only "verdicts at this exact head": the head may have moved since the last review
+    /// (the author's own summoned dispatch is what crosses an EVEN threshold, and they push before
+    /// their run ends), in which case the line says which head was last read and that nobody has
+    /// read the new one. It is verdict-neutral there because a head advance re-arms the row without
+    /// preserving whether the old read was findings or an approval. The manager names these on an
     /// escalation, so an operator gets the specific findings rather than "needs a human".
     pub findings: Vec<String>,
 }
@@ -223,9 +227,12 @@ impl AdjudicationLedger {
     /// finally landed is not a decision that is still failing.
     pub fn record(&self, pr: &PrCoord, adjudication: Adjudication) {
         let key = churn_key(pr);
-        // Lock `entries` before `failures`, exactly as `note_failure` and `clear` do: the control
-        // task and the watcher task both reach this ledger, and taking the two locks in opposite
-        // orders would deadlock.
+        // The two maps are locked one after the other, never at once: `self.map()` is a
+        // statement-temporary whose guard drops at the semicolon, so the same `entries`-then-
+        // `failures` order here as in `note_failure` and `clear` is a consistency of reading rather
+        // than a deadlock rule. Holding one guard across the other would CREATE the deadlock the
+        // old comment claimed to prevent — don't "tidy" this into a single expression expecting the
+        // guards to stay ordered.
         self.map().insert(key.clone(), adjudication);
         self.failures
             .lock()
@@ -319,18 +326,38 @@ pub async fn perform_adjudication(
     let verdict = match deps.adjudicator.adjudicate(&req).await {
         Ok(v) => v,
         Err(e) => {
-            // Not a decision: clear the in-flight marker so the next sweep re-asks, and count the
-            // attempt so a turn that can never succeed is bounded rather than re-spawned forever
-            // (the control task escalates once the count reaches MAX_ADJUDICATION_ATTEMPTS).
+            // Not a decision yet: clear the in-flight marker so the next sweep re-asks, and count
+            // the attempt so a turn that can never succeed is bounded rather than re-spawned
+            // forever.
             let attempts = deps.ledger.note_failure(&plan.pr);
+            if attempts < MAX_ADJUDICATION_ATTEMPTS {
+                tracing::warn!(
+                    pr = %plan.pr,
+                    err = %e,
+                    attempts,
+                    "review adjudication: the manager turn failed; the loop stays stopped and the \
+                     decision is re-asked on a later sweep"
+                );
+                return;
+            }
+            // Bounded: stop re-asking and escalate to a human, through the SAME audit path every
+            // other decision takes. A control-task-only escalation existed before this and reached
+            // neither the room nor the pull request — the one escalation an operator most needs
+            // pushed at them, because its cause is "your manager turn is broken", not "this review
+            // is hard". Recording it here means the ledger, the room post and the comment can never
+            // disagree, and the control task's settled-entry check stops arming on its own.
             tracing::warn!(
                 pr = %plan.pr,
                 err = %e,
                 attempts,
-                "review adjudication: the manager turn failed; the loop stays stopped and the \
-                 decision is re-asked on a later sweep"
+                "review adjudication: the manager turn failed its bounded attempts; escalating the \
+                 decision to a human"
             );
-            return;
+            Verdict::Escalate {
+                reason: format!(
+                    "the manager turn failed {attempts} times; no decision could be made"
+                ),
+            }
         }
     };
 
@@ -432,11 +459,16 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 ///   the word. The prompt shows the model "SHIP means …" verbatim, and a line of prose beginning
 ///   `SHIP ` is an explanation, not an answer.
 ///
+/// Leading markdown decoration and an optional `Decision:`/`Verdict:` label are stripped first
+/// ([`strip_answer_decoration`]), because they carry no decision content but otherwise pushed an
+/// obviously-correct reply into the error path.
+///
 /// An answer naming neither decision is an error, and the caller re-asks rather than guessing.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
     let mut decided: Option<Verdict> = None;
-    for line in stdout.lines() {
-        let line = line.trim();
+    for raw in stdout.lines() {
+        let line = strip_answer_decoration(raw);
+        let line = line.as_str();
         if line.is_empty() {
             continue;
         }
@@ -449,7 +481,7 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
         if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
             let rest = line
                 .get("ESCALATE:".len()..)
-                .map(str::trim)
+                .map(|r| r.trim().trim_end_matches(['*', '`', ' ']).trim())
                 .unwrap_or_default();
             decided = Some(Verdict::Escalate {
                 reason: if rest.is_empty() {
@@ -466,6 +498,31 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
             snippet(stdout)
         )
     })
+}
+
+/// Strips the leading markdown/quoting decoration and an optional `Decision:`/`Verdict:` label a
+/// model routinely wraps its one-line answer in, so `**SHIP**`, `- SHIP` and `Decision: SHIP` are
+/// read as the decisions they are.
+///
+/// Deliberately not a prose scanner: it removes LEADING decoration only, so a line that begins
+/// `SHIP ` still carries its explanation and is still not a decision. Three such replies used to be
+/// Err, which the caller counts as a failed turn and blames the model for being unreachable when it
+/// answered clearly — a misdiagnosis, not a safety property.
+fn strip_answer_decoration(line: &str) -> String {
+    // Decoration can sit on either side of the label (`**Decision: SHIP**`), so this is applied
+    // again after the label comes off.
+    fn undecorate(s: &str) -> &str {
+        s.trim().trim_start_matches(['*', '_', '#', '>', '-', ' '])
+    }
+    let s = undecorate(line);
+    let upper = s.to_ascii_uppercase();
+    for label in ["DECISION:", "VERDICT:"] {
+        if upper.starts_with(label) {
+            // Byte-slicing is safe here: `starts_with` proved the prefix is these ASCII bytes.
+            return undecorate(s.get(label.len()..).unwrap_or("")).to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// A short, single-line excerpt of a reply for an error message, so a long transcript does not land
@@ -566,6 +623,39 @@ mod tests {
     #[test]
     fn a_line_beginning_with_ship_but_continuing_in_prose_is_not_a_decision() {
         assert!(parse_verdict("SHIP means the remaining open findings do not block.").is_err());
+    }
+
+    /// The decorations a model routinely wraps its one-line answer in carry no decision content.
+    /// Each of these used to be an `Err`, which the caller counts as a failed turn and eventually
+    /// auto-escalates with "the manager turn failed 3 times" — blaming an unreachable model for a
+    /// reply that answered clearly. Pinned so the strictness is a stated contract rather than an
+    /// accident of `trim_end_matches`.
+    #[test]
+    fn decorated_answers_parse_as_their_decision() {
+        for reply in [
+            "Decision: SHIP",
+            "Verdict: SHIP",
+            "**SHIP**",
+            "- SHIP",
+            "> SHIP",
+            "### SHIP",
+            "Decision: **SHIP**",
+            "**Decision: SHIP**",
+        ] {
+            assert_eq!(parse_verdict(reply), Ok(Verdict::Ship), "({reply:?})");
+        }
+        assert_eq!(
+            parse_verdict("Decision: ESCALATE: the migration needs a DBA"),
+            Ok(Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string()
+            })
+        );
+        assert_eq!(
+            parse_verdict("**ESCALATE: needs a security owner**"),
+            Ok(Verdict::Escalate {
+                reason: "needs a security owner".to_string()
+            })
+        );
     }
 
     #[test]
@@ -863,6 +953,60 @@ mod tests {
                 head: plan.head.clone(),
                 rounds: 3,
             })
+        );
+    }
+
+    /// **A turn that can never succeed escalates through the SAME audit path as a real decision.**
+    /// The escalation the old control-task-only path recorded reached neither the room nor the pull
+    /// request — the one escalation an operator most needs pushed at them, since its cause is "your
+    /// manager turn is broken". This pins both writes and the settled ledger entry.
+    #[tokio::test]
+    async fn a_turn_that_failed_its_attempts_escalates_and_is_recorded_both_ways() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = plan();
+        let deps = deps(
+            Arc::new(BrokenVerdict),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        for _ in 0..MAX_ADJUDICATION_ATTEMPTS {
+            perform_adjudication(&plan, &deps, Utc::now()).await;
+        }
+
+        assert_eq!(
+            room.0.lock().unwrap().len(),
+            1,
+            "exactly one escalation post for the bounded failure"
+        );
+        assert!(
+            room.0.lock().unwrap()[0].body.contains("escalate"),
+            "the room post says it went that way"
+        );
+        let on_pr = comments.0.lock().unwrap().clone();
+        assert_eq!(on_pr.len(), 1, "and one pull-request comment");
+        assert!(on_pr[0].3.contains("escalate"));
+        match ledger.peek(&plan.pr) {
+            Some(Adjudication::Escalate {
+                head,
+                rounds,
+                reason,
+                findings,
+            }) => {
+                assert_eq!(head, plan.head);
+                assert_eq!(rounds, 3);
+                assert!(reason.contains("failed 3 times"), "{reason}");
+                assert_eq!(findings, plan.findings);
+            }
+            other => panic!("expected a settled escalation, got {other:?}"),
+        }
+        assert_eq!(
+            ledger.failures(&plan.pr),
+            0,
+            "a landed escalation resets the failure tally"
         );
     }
 
