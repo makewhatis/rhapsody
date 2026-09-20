@@ -1155,11 +1155,21 @@ pub(crate) fn pinned_required_reviewers(
     author: &str,
     exclusions: &ReviewerExclusions,
 ) -> Vec<String> {
-    plan_required_pins(teams, author, exclusions)
+    // The pinned prefix `rank_reviewers` emits, clamped exactly as the caller's selection clamps
+    // it. [`Teams::review_required`] is classified in declaration order and a caller selects at
+    // most `review.effective_reviewers()` reviewers from the front, so only the first that many
+    // pins survive — the tail is what a `truncate` drops, never a ranked fill. The continuity guard
+    // serves the ticketless path, so this uses that path's count. Without the clamp a persisted
+    // incumbent sitting on a tail pin was read as required and kept the round, displacing the
+    // declaration-order pin selection says survives (STUDIO-951, round 4).
+    let cap = teams.review.effective_reviewers();
+    let mut pinned: Vec<String> = plan_required_pins(teams, author, exclusions)
         .pinned
         .into_iter()
         .map(str::to_string)
-        .collect()
+        .collect();
+    pinned.truncate(cap);
+    pinned
 }
 
 /// One bucket per reason a configured pin does not become an effective one, so

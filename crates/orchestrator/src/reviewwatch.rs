@@ -2243,6 +2243,39 @@ mod tests {
         );
     }
 
+    /// STUDIO-951 / round 4: a persisted incumbent that is a TAIL pin beyond `review.reviewers`
+    /// must not displace the declaration-order pin that actually survives the clamp. With
+    /// `reviewers: 1` and `required: [carol, bob]`, `carol` is the one pin selection keeps and the
+    /// tail pin `bob` is dropped — so a row persisted with `bob` before this config existed must
+    /// yield to `carol`, exactly as a non-required incumbent would. The continuity guard's
+    /// "required" set is the EFFECTIVE pin prefix, capped at the ticketless reviewer count, not the
+    /// untruncated configured list; otherwise the tail pin is treated as required and keeps the
+    /// round, contradicting both the clamp and the boot warning that says the tail is dropped.
+    ///
+    /// Mutation check: read the untruncated `plan_required_pins(..).pinned` (drop the
+    /// `effective_reviewers()` cap in `quorum::pinned_required_reviewers`) and this goes red with
+    /// `bob` — the tail pin that no longer survives selection.
+    #[test]
+    fn a_tail_required_pin_beyond_the_clamp_does_not_displace_the_surviving_pin() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 1;
+        teams.review.required = vec!["carol".to_string(), "bob".to_string()];
+        assert_eq!(teams.review.effective_reviewers(), 1);
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["carol".to_string()],
+            "the clamp keeps the first declaration-order pin; a persisted tail pin must not win"
+        );
+    }
+
     /// A round with no eligible reviewer is DEFERRED, not forced onto somebody and not silently
     /// lost — the next tick considers it again.
     ///
