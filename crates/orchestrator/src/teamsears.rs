@@ -1357,9 +1357,20 @@ async fn file_review(
         .clone()
         .filter(|a| a != &author)
         .or_else(|| {
-            crate::quorum::select_reviewers(teams, &author, cycle.load)
-                .into_iter()
-                .next()
+            // The off-loop triage task holds no `Orchestrator`, so it cannot ask the live harness
+            // question `unavailable_required_reviewers` answers; a required reviewer is pinned here
+            // as long as it is a roster member and not the author. That is safe rather than lossy:
+            // a pin whose harness is unimplemented still runs (on `agent.backend`), and one whose
+            // `review.model` is scoped elsewhere is refused at dispatch and degrades on the next
+            // round through a path that does have the answer.
+            crate::quorum::select_reviewers(
+                teams,
+                &author,
+                cycle.load,
+                &std::collections::HashSet::new(),
+            )
+            .into_iter()
+            .next()
         }) {
         Some(r) => r,
         None => {

@@ -179,6 +179,7 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_over_pinned_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
@@ -1389,6 +1390,26 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
          triage turn needs: a turn spawns a subprocess and waits on a model, so every turn will \
          time out and every ticket will be assigned by the deterministic fallback. The value is \
          honoured as written — raise manager.timeout_ms in teams.yaml to use the model at all."
+    );
+}
+
+/// Warns when more identities are pinned as required reviewers than the active review path can
+/// select (STUDIO-951). Selection clamps — pins are ranked first and the caller truncates to the
+/// reviewer count — which is the safe direction, but silently dropping a reviewer the operator
+/// explicitly required is the worst outcome the ticket names. The warning names both numbers so
+/// the fix (raise `reviewers`, or shorten `review.required`) is obvious, and the two are read from
+/// [`Teams::over_pinned_reviewers`], which knows which path is on and counts duplicates once.
+fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    let Some((required, total)) = teams.over_pinned_reviewers() else {
+        return;
+    };
+    tracing::warn!(
+        required,
+        reviewers = total,
+        "review.required pins {required} identities but the active review path selects only \
+         {total} reviewer(s): the extra pins are dropped, and the ones kept are the first {total} \
+         in `required:` order. Raise the reviewer count or shorten `review.required`."
     );
 }
 

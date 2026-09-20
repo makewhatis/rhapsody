@@ -927,11 +927,15 @@ impl Orchestrator {
         }
         // `rank_reviewers` only ever names roster members, so `peers` is the whole filter — a
         // teammate at their `max_concurrent` is a candidate like any other (D2).
-        let candidates: Vec<String> =
-            crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts())
-                .into_iter()
-                .filter(|name| !peers.contains(name.as_str()))
-                .collect();
+        let candidates: Vec<String> = crate::quorum::rank_reviewers(
+            teams,
+            row.author.trim(),
+            load.counts(),
+            &self.unavailable_required_reviewers(teams),
+        )
+        .into_iter()
+        .filter(|name| !peers.contains(name.as_str()))
+        .collect();
         // Decision B, applied where it earns its keep: a reviewer who READ the previous round knows
         // the pull request and their own findings, so they keep it as long as they are still a
         // candidate — on the roster, not the author, not already holding another of this pull

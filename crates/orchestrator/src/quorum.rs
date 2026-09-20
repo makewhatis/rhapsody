@@ -1096,9 +1096,10 @@ fn post<TF>(deps: &QuorumDeps<TF>, msg: Message) {
     }
 }
 
-/// Chooses who reviews: the roster **minus the author**, least-loaded first, capped at
-/// `quorum.reviewers` (§0.12). Pure — the whole selection is a comparison over data already in
-/// hand, which is what lets it run on the control task.
+/// Chooses who reviews: the roster **minus the author and the pinned names that cannot run**,
+/// required reviewers first, then least-loaded, capped at `quorum.reviewers` (§0.12). Pure — the
+/// whole selection is a comparison over data already in hand, which is what lets it run on the
+/// control task.
 ///
 /// Ties break on roster order, exactly as [`crate::teams::route`]'s label-overlap fallback does, so
 /// the choice is deterministic and a test can pin it. `load` is §0.11.1's load: open tickets
@@ -1109,29 +1110,82 @@ pub(crate) fn select_reviewers(
     teams: &Teams,
     author: &str,
     load: &HashMap<String, i64>,
+    unavailable: &HashSet<String>,
 ) -> Vec<String> {
-    let mut picked = rank_reviewers(teams, author, load);
+    let mut picked = rank_reviewers(teams, author, load, unavailable);
     picked.truncate(teams.quorum.effective_reviewers());
     picked
 }
 
-/// The whole roster minus `author`, least-loaded first with roster order as the tie-break — the
-/// ranking [`select_reviewers`] truncates to the quorum's count and the ticketless path truncates
-/// to its own (STUDIO-721).
+/// The whole roster minus `author`, **required reviewers first** and then least-loaded with roster
+/// order as the tie-break — the ranking [`select_reviewers`] truncates to the quorum's count and
+/// the ticketless path truncates to its own (STUDIO-721; pinning STUDIO-951).
 ///
 /// Split out because the two review paths ask for different numbers of reviewers from the same
 /// order, and a second ranking function would be a second place for "never the author" and "ties
-/// break on roster order" to drift.
+/// break on roster order" to drift. Pinning for the same reason: both paths call THIS, so a
+/// required reviewer is selected on both without a second implementation of the rule.
+///
+/// The pinned names ([`Teams::review_required`]) are emitted first, in declaration order, and the
+/// rest of the roster follows the existing `(load, roster_index)` order. Because the required half
+/// comes first, a caller's `truncate(reviewers)` clamps an over-long pin list for free: the tail
+/// of the pins is what is dropped, never a ranked fill, and `reviewers` stays the TOTAL rather
+/// than a count of the fill.
+///
+/// **Every pin is only a candidate, not a mandate.** A pinned name is skipped — degraded, so the
+/// ranked fill still yields reviewers — when it
+///
+/// * is not a roster member (`rank_reviewers` only ever names roster members), or
+/// * is the author (the existing non-author filter outranks the pin: nobody reviews their own pull
+///   request), or
+/// * appears in `unavailable` — the orchestrator's live answer for pins whose harness cannot serve
+///   the operator's `review.model` ([`Orchestrator::unavailable_required_reviewers`]). A pin that
+///   cannot be dispatched must not empty or block a round; a hard pin that stalls a merge forever
+///   is strictly worse than the load-ranked behaviour it replaces.
+///
+/// When any pin is dropped this way, a single warning names every dropped name — one line per
+/// selection, never one per reviewer — so a degraded round is visible rather than silent. The
+/// static cases (off-roster, an unimplemented harness) are also reported once at boot by the
+/// daemon; this is the live answer at the moment the round is actually built.
 pub(crate) fn rank_reviewers(
     teams: &Teams,
     author: &str,
     load: &HashMap<String, i64>,
+    unavailable: &HashSet<String>,
 ) -> Vec<String> {
+    let on_roster = |name: &str| teams.roster.iter().any(|i| i.name == name);
+    // Declaration order, trimmed and deduped, with every non-candidate dropped rather than
+    // emitted. `unavailable` is consulted first only because it also covers an off-roster name;
+    // the roster and author checks are repeated so a caller that passes an empty set still cannot
+    // pin an impossible reviewer.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut pinned: Vec<&str> = Vec::new();
+    let mut dropped: Vec<&str> = Vec::new();
+    for name in teams.review_required() {
+        if !seen.insert(name) {
+            continue;
+        }
+        if name == author || !on_roster(name) || unavailable.contains(name) {
+            dropped.push(name);
+            continue;
+        }
+        pinned.push(name);
+    }
+    if !dropped.is_empty() {
+        tracing::warn!(
+            required = %dropped.join(", "),
+            author = %author,
+            "teams review: a required reviewer cannot run and was skipped — it is off the roster, \
+             is this pull request's author, or its harness cannot serve review.model. The round \
+             proceeds with the remaining reviewers; fix `review.required` in teams.yaml to silence \
+             this."
+        );
+    }
     let mut ranked: Vec<(i64, usize, &str)> = teams
         .roster
         .iter()
         .enumerate()
-        .filter(|(_, i)| i.name != author)
+        .filter(|(_, i)| i.name != author && !pinned.contains(&i.name.as_str()))
         .map(|(idx, i)| {
             (
                 load.get(&i.name).copied().unwrap_or(0),
@@ -1141,9 +1195,10 @@ pub(crate) fn rank_reviewers(
         })
         .collect();
     ranked.sort_unstable();
-    ranked
+    pinned
         .into_iter()
-        .map(|(_, _, name)| name.to_string())
+        .chain(ranked.into_iter().map(|(_, _, name)| name))
+        .map(str::to_string)
         .collect()
 }
 
@@ -1365,7 +1420,12 @@ impl Orchestrator {
             pr_head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
             link,
             author: re.identity.clone(),
-            reviewers: select_reviewers(teams, &re.identity, &self.quorum_load),
+            reviewers: select_reviewers(
+                teams,
+                &re.identity,
+                &self.quorum_load,
+                &self.unavailable_required_reviewers(teams),
+            ),
             state_name: self.quorum_create_state(&re.project_slug),
             summon_token: self.quorum_summon_token(),
         })
@@ -1670,7 +1730,7 @@ mod tests {
             ("dave".to_string(), 3),
         ]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &load),
+            select_reviewers(&teams, "alice", &load, &HashSet::new()),
             vec!["carol".to_string(), "dave".to_string()],
             "least-loaded first, author excluded, capped at reviewers"
         );
@@ -1682,7 +1742,10 @@ mod tests {
     fn an_absent_load_entry_counts_as_idle() {
         let teams = teams_quorum(&["alice", "bob", "carol"], 1);
         let load = HashMap::from([("bob".to_string(), 4)]);
-        assert_eq!(select_reviewers(&teams, "alice", &load), vec!["carol"]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            vec!["carol"]
+        );
     }
 
     // Ties break on ROSTER ORDER, exactly as `teams::route`'s label-overlap fallback does, so the
@@ -1692,7 +1755,7 @@ mod tests {
         let teams = teams_quorum(&["alice", "bob", "carol", "dave"], 2);
         let load = HashMap::new();
         assert_eq!(
-            select_reviewers(&teams, "alice", &load),
+            select_reviewers(&teams, "alice", &load, &HashSet::new()),
             vec!["bob".to_string(), "carol".to_string()]
         );
     }
@@ -1702,14 +1765,133 @@ mod tests {
     fn a_short_roster_degrades_to_as_many_as_exist() {
         let teams = teams_quorum(&["alice", "bob"], 2);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new()),
+            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
             vec!["bob"]
         );
 
         let solo = teams_quorum(&["alice"], 2);
         assert!(
-            select_reviewers(&solo, "alice", &HashMap::new()).is_empty(),
+            select_reviewers(&solo, "alice", &HashMap::new(), &HashSet::new()).is_empty(),
             "a roster of one has nobody to ask"
+        );
+    }
+
+    /// Teams ON, quorum ON, with `required` pinned. The rest is [`teams_quorum`]'s config.
+    fn teams_quorum_pinning(names: &[&str], reviewers: i64, required: &[&str]) -> Teams {
+        let mut teams = teams_quorum(names, reviewers);
+        teams.review.required = required.iter().map(|n| (*n).to_string()).collect();
+        teams
+    }
+
+    // STUDIO-951 acceptance 1: the case that fails today. With EVERY teammate idle the pin ties
+    // with everyone else at load 0 and, without the feature, loses to roster order — `sol` sits
+    // after `bob`/`carol` and is never reached at `reviewers: 2`. It must be chosen first.
+    #[test]
+    fn a_required_reviewer_is_selected_with_every_teammate_idle() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            vec!["sol".to_string(), "bob".to_string()],
+            "the pin is first and the single remaining slot is the ranked fill"
+        );
+    }
+
+    // STUDIO-951 acceptance 2 — THE guarantee test. Give the pinned identity a load that would rank
+    // it LAST (`sol` at 9, everyone else at 0) and assert it is still chosen. Without this the
+    // feature is indistinguishable from moving `sol` to the front of the roster, which reordering
+    // already achieves.
+    #[test]
+    fn a_required_reviewer_is_selected_even_when_it_carries_more_load_than_everyone() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
+        let load = HashMap::from([
+            ("bob".to_string(), 0),
+            ("carol".to_string(), 1),
+            ("sol".to_string(), 9),
+        ]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            vec!["sol".to_string(), "bob".to_string()],
+            "the pin outranks load; the fill is still least-loaded first"
+        );
+    }
+
+    // Edge 1: never review your own pull request. The author filter outranks the pin, and the round
+    // still fills from the ranked roster rather than going empty. (Not reachable from a roster-only
+    // pin shape, which is why it is guarded rather than assumed.)
+    #[test]
+    fn a_required_reviewer_that_is_the_author_is_skipped_and_never_selected() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
+        assert_eq!(
+            select_reviewers(&teams, "sol", &HashMap::new(), &HashSet::new()),
+            vec!["alice".to_string(), "bob".to_string()],
+            "the author pin is dropped; the fill proceeds"
+        );
+    }
+
+    // Edge 3 (the degrade path): a pin that cannot run is skipped and the round proceeds with the
+    // reviewers that can — never blocked. Mutation check: remove the `unavailable` filter and this
+    // goes red, because `sol` is emitted first.
+    #[test]
+    fn a_required_reviewer_that_cannot_run_degrades_to_the_ranked_fill() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
+        let unavailable = HashSet::from(["sol".to_string()]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &unavailable),
+            vec!["bob".to_string(), "carol".to_string()],
+            "the unrunnable pin is dropped and the round is filled by ranking"
+        );
+    }
+
+    // A pin naming nobody on the roster is inert rather than fatal — the selector can only ever
+    // name roster members, and the round proceeds. It is reported by the warning, not by failing.
+    #[test]
+    fn an_off_roster_required_name_is_ignored() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol"], 2, &["ghost"]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            vec!["bob".to_string(), "carol".to_string()]
+        );
+    }
+
+    // Edge 2: more pins than `reviewers` clamps the TAIL of the pin list (declaration order), never
+    // a ranked fill, and the total stays `reviewers`. The boot warning naming both numbers is
+    // `Teams::over_pinned_reviewers`, tested in the config crate.
+    #[test]
+    fn more_required_reviewers_than_reviewers_clamps_the_tail() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 1, &["sol", "bob"]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            vec!["sol".to_string()],
+            "one reviewer: the first pin, and nothing else"
+        );
+    }
+
+    // A repeated pin occupies one slot, not two — it must not crowd out a fill.
+    #[test]
+    fn a_duplicate_required_name_is_counted_once() {
+        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol", "sol"]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            vec!["sol".to_string(), "bob".to_string()]
+        );
+    }
+
+    // STUDIO-951 acceptance: UNSET means selection is exactly the pre-feature order, so an
+    // installation that never writes `review.required` is byte-identical to one built before the
+    // key existed. The expected vector is the old `(load, roster_index)` result verbatim, which is
+    // what makes this test meaningful against both old and new code.
+    #[test]
+    fn an_unset_required_list_leaves_the_original_ranking() {
+        let teams = teams_quorum(&["alice", "bob", "carol", "dave"], 3);
+        let load = HashMap::from([
+            ("bob".to_string(), 4),
+            ("carol".to_string(), 1),
+            ("dave".to_string(), 4),
+        ]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            vec!["carol".to_string(), "bob".to_string(), "dave".to_string()],
+            "least-loaded first, roster order breaking the bob/dave tie"
         );
     }
 

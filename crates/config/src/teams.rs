@@ -541,6 +541,26 @@ pub struct Review {
     /// reject a model, so the "refuse rather than run on the wrong value" rule is `model`'s alone.
     #[serde(default)]
     pub effort: HarnessScoped,
+    /// Identities pinned as **required reviewers** (STUDIO-951): selected first on EVERY pull
+    /// request, regardless of load or roster order, and never counted as a ranked fill.
+    ///
+    /// The gap this closes: reviewer selection is roster-minus-author sorted by
+    /// `(load, roster_index)` (`quorum::rank_reviewers`), so whether a teammate reviews anything
+    /// depends on how busy everyone else happens to be. That is fine while reviewers are
+    /// interchangeable, and stops being fine the moment a teammate exists **for** reviewing — a
+    /// different model family, a specialist, a second opinion wanted on every change. Such a
+    /// teammate's participation was decided by unrelated scheduling, and moving it to the front of
+    /// the roster only won the tie until one labelled ticket gave it load.
+    ///
+    /// A LIST of names on the review block rather than a `review_only: true` flag on a roster
+    /// entry (the other credible shape): selection is the whole of what these names do, and a
+    /// roster flag would also have to gate implementation dispatch, which is a second behaviour
+    /// with its own blast radius and no acceptance criterion here. Pinning is exactly this key.
+    ///
+    /// Read through [`Teams::review_required`], never raw, so the trim / empty / unknown-name rules
+    /// live in one place. An unset list leaves selection byte-identical to before the key existed.
+    #[serde(default)]
+    pub required: Vec<String>,
 }
 
 impl Default for Review {
@@ -553,6 +573,7 @@ impl Default for Review {
             auto_merge: false,
             model: HarnessScoped::default(),
             effort: HarnessScoped::default(),
+            required: Vec::new(),
         }
     }
 }
@@ -968,6 +989,75 @@ impl Teams {
             return None;
         }
         self.review.effort.for_harness(harness, fallback)
+    }
+
+    /// The identities pinned as required reviewers (STUDIO-951), in declaration order.
+    ///
+    /// **Ungated by design.** Every other `review.*` accessor gates on
+    /// [`review_ticketless`](Self::review_ticketless) because the value it reads is written by the
+    /// ticketless path alone. Pinning is not: both review paths choose reviewers through the same
+    /// `quorum::rank_reviewers`, and the ticket's whole point is that a required reviewer is
+    /// selected whichever path an installation runs. So this answers on `mode: tickets` and
+    /// `mode: offline` alike.
+    ///
+    /// Entries are trimmed and blanks dropped, so a `required: [""]` or a whitespace-only entry is
+    /// "unset" rather than a name no roster could ever hold. Duplicates are left to the selector to
+    /// dedupe (it already scans the list) — a repeated name is harmless there and a parse error
+    /// here would disable Teams over a typo, which §2.1 forbids.
+    pub fn review_required(&self) -> Vec<&str> {
+        self.review
+            .required
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// How many reviewers the review path this installation actually runs asks for, or `None` when
+    /// no review path is on (Teams off, or neither `quorum.enabled` nor `mode: ticketless`).
+    ///
+    /// The two paths count differently and are mutually exclusive (`validate` rejects a config
+    /// that sets both), so there is exactly one right answer per installation: `review.reviewers`
+    /// on the ticketless path, `quorum.reviewers` on the fan-out path. [`over_pinned_reviewers`]
+    /// and the boot warning need that ONE number to compare a pin list against; naming the wrong
+    /// path's count would warn about a value nothing reads.
+    ///
+    /// [`over_pinned_reviewers`]: Self::over_pinned_reviewers
+    pub fn active_reviewer_count(&self) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
+        if self.review_ticketless() {
+            Some(self.review.effective_reviewers())
+        } else if self.quorum.enabled {
+            Some(self.quorum.effective_reviewers())
+        } else {
+            None
+        }
+    }
+
+    /// `Some((required, total))` when more identities are pinned than the active review path can
+    /// select (STUDIO-951), else `None`. The daemon's boot turns this into ONE warning naming both
+    /// numbers.
+    ///
+    /// Selection **clamps** rather than refusing: pins are ranked first and the caller truncates to
+    /// `total`, so a list longer than `total` simply drops the tail. That is the safe direction —
+    /// the alternative, disabling Teams over an over-long pin list, loses every reviewer, not the
+    /// extra ones. But silently dropping a reviewer the operator explicitly required is the worst
+    /// outcome the ticket names, so the drop is reported at boot where it cannot be missed, and the
+    /// two numbers are named so the fix (raise `reviewers` or shorten `required`) is obvious.
+    pub fn over_pinned_reviewers(&self) -> Option<(usize, usize)> {
+        let total = self.active_reviewer_count()?;
+        // Counted the way the selector consumes them: trimmed, blanks dropped, duplicates folded.
+        // A repeated name occupies one reviewer slot, not two, so counting it twice would warn
+        // about a clamp that does not happen.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let required = self
+            .review_required()
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .count();
+        (required > total).then_some((required, total))
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -2582,6 +2672,84 @@ mod tests {
         }
     }
 
+    /// `review.required` is read on BOTH review paths, unlike every other `review.*` accessor: a
+    /// required reviewer is pinned whichever path an installation runs, so an installation on the
+    /// quorum (`mode: off`/`tickets`) must still answer the list. Blanks and surrounding whitespace
+    /// are dropped, so a `required: [""]` reads as unset rather than as a name no roster can hold.
+    #[test]
+    fn review_required_is_ungated_and_trims() {
+        let t = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\nreview:\n  required:\n    - ' sol '\n    - ''\n    - bob\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert!(!t.review_ticketless(), "this is the quorum path");
+        assert_eq!(t.review_required(), vec!["sol", "bob"]);
+    }
+
+    /// An absent key is the empty list — the state every pre-STUDIO-951 file is already in, and
+    /// what makes selection byte-identical to before the key existed.
+    #[test]
+    fn an_unset_required_list_is_empty() {
+        let t = Teams::parse("enabled: true\nroster:\n  - name: alice\n").expect("parses");
+        assert!(t.review_required().is_empty());
+        assert!(t.over_pinned_reviewers().is_none());
+    }
+
+    /// The active path's count is the one an over-long pin list is compared against, and it
+    /// follows which path is actually on: `review.reviewers` on ticketless, `quorum.reviewers` on
+    /// the fan-out, and `None` when neither is enabled.
+    #[test]
+    fn active_reviewer_count_follows_the_path_that_is_on() {
+        let quorum = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 3\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(quorum.active_reviewer_count(), Some(3));
+
+        let ticketless = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  reviewers: 2\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(ticketless.active_reviewer_count(), Some(2));
+
+        // Teams enabled but no review path on: `review.required` is dead config, not a warning.
+        let neither = Teams::parse("enabled: true\nroster:\n  - name: alice\n").expect("parses");
+        assert_eq!(neither.active_reviewer_count(), None);
+
+        // Teams off is not on any path whatever else is set.
+        let off =
+            Teams::parse("enabled: false\nquorum:\n  enabled: true\nroster:\n  - name: alice\n")
+                .expect("parses");
+        assert_eq!(off.active_reviewer_count(), None);
+    }
+
+    /// Edge 2's diagnostic: fewer reviewer slots than pins is `Some((required, total))`, the two
+    /// numbers the boot warning names. Duplicates occupy one slot, so they are not counted twice.
+    #[test]
+    fn over_pinned_reviewers_reports_both_numbers() {
+        let over = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 1\nreview:\n  required: [sol, bob]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert_eq!(over.over_pinned_reviewers(), Some((2, 1)));
+
+        let fits = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 2\nreview:\n  required: [sol]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert_eq!(fits.over_pinned_reviewers(), None);
+
+        let duplicated = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 2\nreview:\n  required: [sol, sol]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            duplicated.over_pinned_reviewers(),
+            None,
+            "a repeated name is one reviewer, not two"
+        );
+    }
+
     /// **jimmy/alice round-1 finding 2 on PR #168.** `review_model_for`/`review_effort` must not
     /// claim an override that cannot fire — scoped to the ticketless path exactly as
     /// `review_done_state`/`review_changes_state`/`review_auto_merge` already are, on the SAME
@@ -2781,6 +2949,7 @@ mod tests {
                 auto_merge: true,
                 model: HarnessScoped::bare("claude-opus-5"),
                 effort: HarnessScoped::bare("high"),
+                required: vec!["jimmy".to_string()],
             },
             // Four, because `reviewers: 3` must be a config the ceiling accepts
             // (STUDIO-891: a roster of N satisfies at most N−1). The property

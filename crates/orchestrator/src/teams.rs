@@ -758,6 +758,54 @@ impl Orchestrator {
         self.harness_actually_run(&named)
     }
 
+    /// The required reviewers ([`Teams::review_required`]) that cannot run a review right now, for
+    /// [`crate::quorum::rank_reviewers`] to skip so a pinned identity can never block a round
+    /// (STUDIO-951).
+    ///
+    /// Pinning is a guarantee only while the pinned teammate can actually be dispatched. Three
+    /// conditions make one unrunnable, and none of them is visible to the pure selector:
+    ///
+    /// * **Off the roster** — there is no identity to dispatch under, so the pin is inert. The
+    ///   selector would drop it anyway (it only ever names roster members); naming it here keeps the
+    ///   warning it emits honest about why.
+    /// * **An unimplemented harness** — the identity's profile names a harness this build has no
+    ///   runner for. `spawn_worker` silently falls back to `agent.backend` for such a profile, so
+    ///   the specialist the operator pinned is not the one who would review. Degrading to the ranked
+    ///   fill keeps the round's reviewers real.
+    /// * **A `review.model` refusal** — on the ticketless path, [`Teams::review_model_for`] answers
+    ///   `Refuse` when the operator scoped `review.model` to other harnesses than this reviewer's.
+    ///   `dispatch_review` refuses that review before any watch write, so the row would be
+    ///   re-offered every tick and never complete — exactly the merge-stalling shape the ticket
+    ///   forbids.
+    ///
+    /// Empty whenever nothing is pinned, so the ranked selection is then byte-identical to before
+    /// this feature existed.
+    pub(crate) fn unavailable_required_reviewers(&self, teams: &Teams) -> HashSet<String> {
+        let backend = self.configured_backend();
+        teams
+            .review_required()
+            .into_iter()
+            .filter(|name| {
+                if !teams.roster.iter().any(|i| i.name == *name) {
+                    return true;
+                }
+                // The harness the run would actually use, and separately the one its profile named:
+                // an explicit unimplemented name falls back to `backend`, which is real but is not
+                // the pinned specialist.
+                let profile_harness = self.identity_harness(teams, name);
+                let explicit_unimplemented = !profile_harness.is_empty()
+                    && !crate::effective::harness_is_implemented(&profile_harness);
+                let harness = self.harness_actually_run(&profile_harness);
+                explicit_unimplemented
+                    || matches!(
+                        teams.review_model_for(&harness, &backend),
+                        rhapsody_config::teams::ReviewModelChoice::Refuse(_)
+                    )
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Whether this candidate must be **held this tick** for want of a team assignment
     /// (STUDIO-669; design record `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.1).
     ///
@@ -3108,6 +3156,64 @@ mod tests {
             o.running["1"].model_override.is_empty(),
             "{:?}",
             o.running["1"].model_override
+        );
+    }
+
+    // ── required reviewers that cannot run (STUDIO-951) ─────────────────────────────────────────
+
+    /// Edge 3's live half: a pin whose identity is off the roster, or whose profile names a harness
+    /// this build cannot run, is reported unavailable so `rank_reviewers` degrades past it. A
+    /// teammate with no profile is NOT unavailable — it runs on `agent.backend` like any other.
+    ///
+    /// Mutation check: make `unavailable_required_reviewers` return the empty set and the first two
+    /// assertions go red.
+    #[test]
+    fn unavailable_required_reviewers_flags_off_roster_and_unimplemented_harness() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0), ident("sol", &[], 0)]);
+        teams.roster[1].profile = "codexer".to_string();
+        teams.review.required = vec!["sol".to_string(), "ghost".to_string(), "alice".to_string()];
+        let (mut o, _) = orch_with_teams(teams.clone());
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        let got = o.unavailable_required_reviewers(&teams);
+        assert!(
+            got.contains("sol"),
+            "a profile naming an unimplemented harness must degrade: {got:?}"
+        );
+        assert!(got.contains("ghost"), "off the roster: {got:?}");
+        assert!(
+            !got.contains("alice"),
+            "no profile ⇒ runs on the backend: {got:?}"
+        );
+    }
+
+    /// The refusal shape that would otherwise stall: on the ticketless path `review.model` scoped
+    /// to another harness makes `dispatch_review` REFUSE this reviewer before any watch write, so
+    /// the row is re-offered every tick and never completes. The pin is degraded instead.
+    #[test]
+    fn unavailable_required_reviewers_flags_a_review_model_scoped_to_another_harness() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nharness: opencode\n---\nOC.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &[], 0), ident("sol", &[], 0)]);
+        teams.roster[1].profile = "oc".to_string();
+        teams.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+        teams.review.model = rhapsody_config::teams::HarnessScoped::bare("claude-opus-5");
+        teams.review.required = vec!["sol".to_string()];
+        let (mut o, _) = orch_with_teams(teams.clone());
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        let got = o.unavailable_required_reviewers(&teams);
+        assert!(
+            got.contains("sol"),
+            "dispatch_review would refuse this review: {got:?}"
         );
     }
 

@@ -323,7 +323,12 @@ impl Orchestrator {
         // Ranked over a LIVE load snapshot, exactly as `plan_review_intro` ranks: `quorum_load` is
         // always empty under `ticketless`, so ranking against it would name the same first teammate
         // for every pull request in the sweep.
-        let mut reviewers = crate::quorum::rank_reviewers(teams, &author, load);
+        let mut reviewers = crate::quorum::rank_reviewers(
+            teams,
+            &author,
+            load,
+            &self.unavailable_required_reviewers(teams),
+        );
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() {
             return Verdict::Refuse("the roster holds nobody but the author");
