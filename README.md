@@ -1285,14 +1285,14 @@ real failed run, which must keep saying `failed` rather than being repainted `qu
 dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the
 adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and a ticket that
 never becomes a candidate is never dispatched either. The ticket-mode quorum (`plan_quorum`), the
-ticketless review watcher, the reconciliation sweep and the auto-merge gate instead read the
-`HumanHoldLedger`'s current-**label** set, built as the selection pass walks the candidate fetch
-(active ∪ review states, narrowed by `claim_mode`) and deliberately including a ticket the daemon is
-running; the console's `held_for_human` key reads the reported-hold subset of the same pass, which
-excludes live work. Under
-`claim_mode: pool` the pool claim ASSIGNS the ticket and nothing ever clears it, so a ticket that
-has run leaves the candidate query and its label stops reaching those readers; in assignee mode the
-same happens the moment the ticket is reassigned to the person taking it over. Those readers
+ticketless review watcher and the auto-merge gate instead read the `HumanHoldLedger`'s
+current-**label** set — every candidate the last pass saw wearing the label, deliberately including
+a ticket the daemon is running — while the reconciliation sweep and the console's `held_for_human`
+key read the reported-hold subset of the same pass, which excludes live work. Both sets are built as
+the selection pass walks the candidate fetch (active ∪ review states, narrowed by `claim_mode`).
+Under `claim_mode: pool` the pool claim ASSIGNS the ticket and nothing ever clears it, so a ticket
+that has run leaves the candidate query and its label stops reaching those readers; in assignee mode
+the same happens the moment the ticket is reassigned to the person taking it over. Those readers
 are therefore best-effort off the candidate path rather than
 guarantees, and they say so here rather than implying the refusal holds while the daemon no longer
 owns the ticket.
