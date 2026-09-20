@@ -1162,10 +1162,21 @@ impl Orchestrator {
     /// The author's run is a normal ticket run, so it is keyed by the tracker's opaque ID rather
     /// than by the identifier this reads; `RunningEntry` carries its own `Issue` and is the one
     /// place the two are available together.
+    ///
+    /// A run parked in BACKOFF is live work too, and it is `claimed` without being `running` for
+    /// the whole backoff delay. `schedule_retry_for` records its `RetryEntry` (which carries the
+    /// identifier) at the same instant it claims the id, so reading `retry_attempts` covers that
+    /// window — without it a flaky agent's mid-loop retry would be decided over, the same harm as
+    /// deciding over a running fix. `LoadSnapshot::from_running_and_retries` counts the state
+    /// against its owner for exactly this reason.
     fn author_run_live(&self, identifier: &str) -> bool {
         self.running
             .values()
             .any(|entry| entry.issue.identifier == identifier)
+            || self
+                .retry_attempts
+                .values()
+                .any(|entry| entry.identifier == identifier)
     }
 
     /// Charges one AUTHOR round to every linked pull request of `iss` that already carries a budget,
@@ -1990,7 +2001,9 @@ mod tests {
     use crate::control_loop::CancelSignal;
     use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult};
     use crate::orchestrator::RunningEntry;
-    use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project, set_of};
+    use crate::testsupport::{
+        DispatchedEntries, empty_effective, empty_resolved_project, retry_entry, set_of,
+    };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OWNER: &str = "makewhatis";
@@ -3832,6 +3845,91 @@ mod tests {
         assert!(
             report.adjudicate.is_empty(),
             "the manager must not decide while the author's run is still fixing"
+        );
+        assert_eq!(
+            report.deferred, 1,
+            "the decision is deferred to a later sweep, not dropped"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "no plan was handed out, so nothing was marked in flight"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// **A decision is never made over a live REVIEW round either.** The guard's own doc says why:
+    /// new findings could still land and the head is about to move. The author half was pinned by
+    /// `an_in_flight_author_run_defers_the_adjudication`; the review half had no test, so setting
+    /// `review_live = false` left the whole crate green. Pinned for both states it reads — a
+    /// running round and one merely claimed.
+    #[test]
+    fn a_live_review_round_defers_the_adjudication() {
+        for claimed_only in [false, true] {
+            let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+            let l = ledger(&mut o);
+            let r = row(12, "bob");
+            let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+            introduce(&o, r);
+            o.claimed.insert(id.clone());
+            if !claimed_only {
+                o.running.insert(
+                    id,
+                    RunningEntry::empty(rhapsody_core::Issue {
+                        id: "iss-review".to_string(),
+                        identifier: "STUDIO-721".to_string(),
+                        ..Default::default()
+                    }),
+                );
+            }
+            o.review_rounds
+                .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+            let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+            assert!(
+                report.adjudicate.is_empty(),
+                "the manager must not decide while a review round is live (claimed_only={claimed_only})"
+            );
+            assert_eq!(
+                report.deferred, 1,
+                "the decision is deferred to a later sweep, not dropped (claimed_only={claimed_only})"
+            );
+            assert_eq!(
+                l.peek(&coord(12)),
+                None,
+                "no plan was handed out, so nothing was marked in flight (claimed_only={claimed_only})"
+            );
+            assert!(dispatched.lock().expect("lock").is_empty());
+        }
+    }
+
+    /// **A decision is never made over an author run parked in BACKOFF.** A run that failed and is
+    /// waiting out its retry is `claimed` but not `running` for the whole backoff delay, and the
+    /// retry then re-dispatches (`attempt` is `Some`, so nothing is charged) against a decision the
+    /// manager already made — the same harm as deciding over a running fix, reached through the
+    /// state the running-only guard did not cover. `LoadSnapshot::from_running_and_retries` counts
+    /// this state as live work for the same reason.
+    #[test]
+    fn an_author_run_parked_in_backoff_defers_the_adjudication() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // `schedule_retry_for` leaves exactly this: the id claimed, the entry carrying the
+        // identifier, and no `running` entry.
+        o.claimed.insert("iss-author".to_string());
+        o.retry_attempts.insert(
+            "iss-author".to_string(),
+            retry_entry("iss-author", "STUDIO-721", 1),
+        );
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not decide while the author's run is parked in backoff"
         );
         assert_eq!(
             report.deferred, 1,
