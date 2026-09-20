@@ -1038,7 +1038,7 @@ mod tests {
     /// GitHub for a delta when the checkout said there was no prior round.
     struct FakeDelta {
         ancestor: Result<bool, String>,
-        findings: Result<Vec<String>, String>,
+        findings: Result<crate::ghsummons::PriorFindings, String>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -1062,12 +1062,20 @@ mod tests {
             _owner: &str,
             _repo: &str,
             _number: i64,
-        ) -> crate::ghsummons::DeltaResult<Vec<String>> {
+        ) -> crate::ghsummons::DeltaResult<crate::ghsummons::PriorFindings> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.findings {
                 Ok(v) => Ok(v.clone()),
                 Err(e) => Err(e.clone().into()),
             }
+        }
+    }
+
+    /// A findings read whose bodies all arrived whole.
+    fn whole_findings(items: &[&str]) -> crate::ghsummons::PriorFindings {
+        crate::ghsummons::PriorFindings {
+            bodies: items.iter().map(|s| s.to_string()).collect(),
+            clipped: false,
         }
     }
 
@@ -1114,7 +1122,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let src = FakeDelta {
             ancestor: Ok(true),
-            findings: Ok(vec!["the parser drops the last line".to_string()]),
+            findings: Ok(whole_findings(&["the parser drops the last line"])),
             calls: Arc::clone(&calls),
         };
         let ag = fake_agent(vec![succeeded_turn()]);
@@ -1175,7 +1183,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let src = FakeDelta {
             ancestor: Ok(true),
-            findings: Ok(vec!["must not be read".to_string()]),
+            findings: Ok(whole_findings(&["must not be read"])),
             calls: Arc::clone(&calls),
         };
         let ag = fake_agent(vec![succeeded_turn()]);

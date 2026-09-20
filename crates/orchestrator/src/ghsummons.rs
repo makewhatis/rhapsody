@@ -1431,14 +1431,25 @@ impl PrStateSource for GH {
 /// worth a log line.
 pub type DeltaResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// How many findings comments one delta round is handed, and how long each may be (STUDIO-959).
+/// How many findings comments one delta round is handed, and how much the WHOLE list may weigh
+/// (STUDIO-959).
 ///
 /// The round is told what was already found so it does not re-derive it; it is NOT handed the whole
 /// comment history of a long-lived pull request, which would grow without bound and crowd the
-/// change being reviewed out of the prompt. Twenty most-recent comments, each truncated to 2,000
-/// characters, is sized to hold a real review conversation and nothing more.
+/// change being reviewed out of the prompt.
+///
+/// The cap is a budget on the LIST, not on each comment (jimmy's round-4 blocker). Bounding each
+/// comment to a fixed size silently deleted the TAIL of every long comment, and a review comment
+/// puts its verdict and reasoning first and its smaller findings LAST — so a per-comment head-clip
+/// systematically dropped exactly the findings the round was told to confirm, on the majority of
+/// this repository's real review comments (54–67% of the text at a 2,000-char cap). Instead the
+/// newest comments are taken WHOLE, in order, until the total budget is spent; fewer complete
+/// comments beats twenty half-comments. At most one comment — the newest, when it alone exceeds the
+/// budget — is ever clipped, and [`PriorFindings::clipped`] says so out loud.
 pub const MAX_DELTA_FINDINGS: usize = 20;
-pub const MAX_DELTA_FINDING_CHARS: usize = 2000;
+/// The total characters the findings list may weigh, `MAX_DELTA_FINDINGS * 2,000`: the same ceiling
+/// the per-comment cap used to imply, now spent on whole bodies instead of on twenty fragments.
+pub const MAX_DELTA_FINDINGS_CHARS: usize = 40_000;
 
 /// The `per_page` a delta round's comment reads ask for, paired with `--paginate --slurp`.
 ///
@@ -1478,8 +1489,8 @@ pub trait ReviewDeltaSource: Send + Sync {
         head: &str,
     ) -> DeltaResult<bool>;
 
-    /// The findings comments already on the pull request, oldest first, capped at
-    /// [`MAX_DELTA_FINDINGS`].
+    /// The findings comments already on the pull request, oldest first, whole bodies taken until
+    /// [`MAX_DELTA_FINDINGS_CHARS`] or [`MAX_DELTA_FINDINGS`] is spent.
     ///
     /// BOTH issue comments and inline review comments are read, because a reviewer may have used
     /// either. No author filter is applied: reviewers post under the daemon's own `gh` identity, so
@@ -1491,17 +1502,38 @@ pub trait ReviewDeltaSource: Send + Sync {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> DeltaResult<Vec<String>>;
+    ) -> DeltaResult<PriorFindings>;
 }
 
-/// One comment body, trimmed and bounded to [`MAX_DELTA_FINDING_CHARS`], never splitting a UTF-8
-/// character (the `chars()` walk, not a byte slice).
-fn bounded_finding(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.chars().count() <= MAX_DELTA_FINDING_CHARS {
-        return trimmed.to_string();
+/// The findings a delta round is handed, and whether the newest had to be cut (STUDIO-959).
+///
+/// A struct rather than a bare `Vec<String>` because the round has to be told when it is holding a
+/// fragment: a comment presented as whole while it is not would have the round confirm a list it
+/// only half has — the exact failure the delta path exists to prevent. Only the newest comment can
+/// be clipped (it alone may exceed the list budget), so one flag for the list is exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorFindings {
+    /// The comment bodies, oldest first.
+    pub bodies: Vec<String>,
+    /// True when the newest comment exceeded [`MAX_DELTA_FINDINGS_CHARS`] on its own and only its
+    /// start is in [`Self::bodies`], marked with a trailing `…`.
+    pub clipped: bool,
+}
+
+impl PriorFindings {
+    /// An empty list — no comments on the pull request, or none worth handing over.
+    fn none() -> Self {
+        PriorFindings {
+            bodies: Vec::new(),
+            clipped: false,
+        }
     }
-    let head: String = trimmed.chars().take(MAX_DELTA_FINDING_CHARS).collect();
+}
+
+/// The head of `body`, bounded to `budget` characters and marked with an ellipsis, never splitting
+/// a UTF-8 character (the `chars()` walk, not a byte slice).
+fn clip_finding(body: &str, budget: usize) -> String {
+    let head: String = body.chars().take(budget).collect();
     format!("{head}…")
 }
 
@@ -1539,8 +1571,8 @@ impl ReviewDeltaSource for GH {
         }
     }
 
-    /// Two `gh api --paginate --slurp` reads (issue comments + inline review comments), merged into
-    /// one oldest-first list capped at [`MAX_DELTA_FINDINGS`].
+    /// Two `gh api --paginate --slurp` reads (issue comments + inline review comments), merged and
+    /// then reduced to the newest comments that fit [`MAX_DELTA_FINDINGS_CHARS`] whole.
     ///
     /// A failure on either endpoint is an error, not a partial list: the caller degrades to a full
     /// review, which is the safe direction. Silently handing a round half its findings would be
@@ -1550,9 +1582,9 @@ impl ReviewDeltaSource for GH {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> DeltaResult<Vec<String>> {
+    ) -> DeltaResult<PriorFindings> {
         if owner.is_empty() || repo.is_empty() || number <= 0 {
-            return Ok(Vec::new());
+            return Ok(PriorFindings::none());
         }
         // `(created_at, body)`, merged across the two endpoints rather than concatenated: taking the
         // newest overall must not mean "whichever endpoint was read first wins". `created_at` is
@@ -1596,15 +1628,40 @@ impl ReviewDeltaSource for GH {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        found.push((at, bounded_finding(raw)));
+                        found.push((at, raw.trim().to_string()));
                     }
                 }
             }
         }
+        // Newest first, so the budget below is spent from the most recent comment backwards.
         found.sort_by(|a, b| b.0.cmp(&a.0));
-        found.truncate(MAX_DELTA_FINDINGS);
-        found.reverse();
-        Ok(found.into_iter().map(|(_, body)| body).collect())
+        // Walk newest-first taking WHOLE bodies until the list budget is spent, then stop. Skipping a
+        // comment that does not fit to reach an older one that would would leave a gap in the
+        // conversation, so the walk ends at the first non-fitting body. The ONE exception is the
+        // newest body when it alone exceeds the whole budget: dropping it would hand the round no
+        // findings at all, so it is clipped and `clipped` says so.
+        let mut bodies: Vec<String> = Vec::new();
+        let mut spent = 0usize;
+        let mut clipped = false;
+        for (_at, body) in &found {
+            if bodies.len() >= MAX_DELTA_FINDINGS {
+                break;
+            }
+            let len = body.chars().count();
+            if spent + len <= MAX_DELTA_FINDINGS_CHARS {
+                bodies.push(body.clone());
+                spent += len;
+            } else if bodies.is_empty() {
+                bodies.push(clip_finding(body, MAX_DELTA_FINDINGS_CHARS));
+                clipped = true;
+                break;
+            } else {
+                break;
+            }
+        }
+        // Back to oldest-first: the round should read the conversation as it happened.
+        bodies.reverse();
+        Ok(PriorFindings { bodies, clipped })
     }
 }
 
@@ -3498,7 +3555,11 @@ mod tests {
             2,
             "exactly one read per comment endpoint"
         );
-        assert_eq!(got, vec!["older review finding", "newer issue finding"]);
+        assert_eq!(
+            got.bodies,
+            vec!["older review finding", "newer issue finding"]
+        );
+        assert!(!got.clipped, "a short thread is delivered whole");
         let argv = seen.lock().expect("argv lock").clone();
         assert_eq!(
             argv,
@@ -3561,21 +3622,27 @@ mod tests {
         });
         let src = GH::new("@symphony", Some(run));
         let got = src.prior_findings("o", "r", 12).await.expect("answered");
-        assert_eq!(got.len(), MAX_DELTA_FINDINGS);
-        assert_eq!(got.last().map(String::as_str), Some(newest));
+        assert_eq!(got.bodies.len(), MAX_DELTA_FINDINGS);
+        assert_eq!(got.bodies.last().map(String::as_str), Some(newest));
         assert!(
-            !got.iter().any(|c| c == oldest),
+            !got.bodies.iter().any(|c| c == oldest),
             "the oldest page must not be what a delta round is handed"
         );
     }
 
-    /// A body longer than the cap is truncated on a CHARACTER boundary and marked with an ellipsis.
+    /// THE pin for jimmy's round-4 blocker: a single long comment is handed over WHOLE, tail
+    /// included. A real review comment puts its verdict first and its smaller findings LAST, so a
+    /// per-comment head-clip silently deleted the findings the round is ordered to confirm. A
+    /// 9,000-char body (alice's own round-3 review is 9,518) must arrive complete.
+    ///
+    /// Mutation: reintroduce a per-comment cap below 9,000 and the `tail` assertion reds.
     #[tokio::test]
-    async fn prior_findings_bounds_a_huge_comment() {
-        let long = "é".repeat(MAX_DELTA_FINDING_CHARS + 50);
+    async fn prior_findings_delivers_a_long_comment_whole() {
+        let tail = "⚪ Minor: the last finding, which a head-clip would delete";
+        let mut long = "x".repeat(9_000 - tail.chars().count());
+        long.push_str(tail);
         let body = serde_json::json!([[{ "body": long }]]).to_string();
         let run: RunFn = Box::new(move |args: &[&str]| {
-            // Answer the first endpoint with the long body and the second with nothing.
             let ep = args.last().copied().unwrap_or_default();
             if ep.contains("/issues/12/comments") {
                 Ok(body.clone().into_bytes())
@@ -3585,13 +3652,94 @@ mod tests {
         });
         let src = GH::new("@symphony", Some(run));
         let got = src.prior_findings("o", "r", 12).await.expect("answered");
-        assert_eq!(got.len(), 1);
-        assert_eq!(
-            got[0].chars().count(),
-            MAX_DELTA_FINDING_CHARS + 1,
-            "the truncated body is the cap plus the ellipsis, counted in chars"
+        assert_eq!(got.bodies.len(), 1);
+        assert!(
+            !got.clipped,
+            "a 9,000-char comment fits well inside the list budget, so nothing is cut"
         );
-        assert!(got[0].ends_with('…'));
+        assert!(
+            got.bodies[0].ends_with(tail),
+            "the whole comment, tail included, must reach the round"
+        );
+        assert!(!got.bodies[0].ends_with('…'), "nothing was truncated");
+    }
+
+    /// The budget is spent on the LIST, not on each comment: the newest comments are taken whole
+    /// until the total is spent, then the walk stops — fewer complete comments instead of many
+    /// fragments. Nothing that fits is clipped, and the total stays inside the budget.
+    #[tokio::test]
+    async fn prior_findings_spends_the_budget_on_the_list_not_each_comment() {
+        // 30 comments of 3,000 chars each = 90,000, more than the 40,000 budget. Bodies are
+        // distinguishable so the newest retained one can be named.
+        let all: Vec<String> = (0..30)
+            .map(|i| {
+                let body = format!("body-{i:02}-{}", "y".repeat(2_990));
+                format!(
+                    r#"{{"body":{},"created_at":"2026-09-20T{:02}:00:00Z"}}"#,
+                    serde_json::to_string(&body).expect("encode"),
+                    i
+                )
+            })
+            .collect();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/12/comments") {
+                // The endpoint answers oldest-first; the code selects the newest.
+                Ok(format!("[[{}]]", all.join(",")).into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert!(!got.clipped, "the newest body fits the whole budget");
+        assert!(
+            got.bodies.len() < MAX_DELTA_FINDINGS,
+            "the budget, not the count cap, is what binds here"
+        );
+        let total: usize = got.bodies.iter().map(|b| b.chars().count()).sum();
+        assert!(
+            total <= MAX_DELTA_FINDINGS_CHARS,
+            "the list as a whole must fit the budget: {total}"
+        );
+        assert!(
+            got.bodies.iter().all(|b| !b.ends_with('…')),
+            "every retained comment is complete"
+        );
+        assert!(
+            got.bodies
+                .last()
+                .map(|b| b.starts_with("body-29"))
+                .unwrap_or(false),
+            "the NEWEST comment must survive the budget"
+        );
+    }
+
+    /// The one comment that can be clipped: the newest body is larger than the whole list budget.
+    /// Dropping it would hand the round no findings at all, so its head is kept and `clipped` says
+    /// so, in a form the description renders as host-written words.
+    #[tokio::test]
+    async fn prior_findings_clips_only_a_body_larger_than_the_whole_budget() {
+        let long = "é".repeat(MAX_DELTA_FINDINGS_CHARS + 50);
+        let body = serde_json::json!([[{ "body": long }]]).to_string();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/12/comments") {
+                Ok(body.clone().into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.bodies.len(), 1);
+        assert!(got.clipped, "an over-budget body must be flagged as cut");
+        assert_eq!(
+            got.bodies[0].chars().count(),
+            MAX_DELTA_FINDINGS_CHARS + 1,
+            "the clipped body is the budget plus the ellipsis, counted in chars"
+        );
+        assert!(got.bodies[0].ends_with('…'));
     }
 
     /// If EITHER endpoint fails, the read fails: half a findings list is exactly the "verify a list
