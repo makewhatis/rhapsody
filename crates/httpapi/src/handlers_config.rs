@@ -620,6 +620,42 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    claude:\n      mo
         );
     }
 
+    // STUDIO-948 (Rhapsody-only): `promote_from_states` is NOT surfaced in the typed view, so it is
+    // carried forward from the base project (like `hooks`) and must survive a GET→POST(verbatim)→GET.
+    // Before the fix it resolved to `Project::default()` (empty), so any Settings save reset the
+    // project's deliberately narrower auto-promote scope back to "every backlog-type state" — the
+    // exact STUDIO-749 shape the key exists to prevent, triggered by an unrelated edit.
+    #[tokio::test]
+    async fn config_post_typed_preserves_per_project_promote_from_states() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  dependency_mode: dag\n  promote_from_states:\n    - Backlog\n\
+repo: git@github.com:o/infra.git\n\
+agent:\n  backend: claude\n\
+projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    promote_from_states:\n      - Staged\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let got1 = get_config_ok(&base).await;
+        assert_eq!(
+            got1["config"]["projects"][0]["promote_from_states"],
+            json!(["Staged"]),
+            "precondition: the fixture must set the key per project"
+        );
+        let resp = post_config(&base, &got1).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+        let after = get_config_ok(&base).await;
+        assert_eq!(
+            after["config"]["projects"][0]["promote_from_states"],
+            json!(["Staged"]),
+            "per-project promote_from_states dropped on Settings save (STUDIO-948)"
+        );
+        assert_eq!(
+            after["config"]["tracker"]["promote_from_states"],
+            json!(["Backlog"]),
+            "top-level promote_from_states dropped on Settings save (STUDIO-948)"
+        );
+    }
+
     // Mirrors Go `TestConfigTypedClaudeOverridesRoundTrip` (the INF-239 acceptance): the four
     // newly-surfaced per-project claude knobs (turn/stall timeouts, billing_guard, command) round-trip
     // as overrides on the overriding project and stay ABSENT (inherited) on the inheriting one.
