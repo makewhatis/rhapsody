@@ -1868,6 +1868,24 @@ mod store_tests {
                 .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
             "it must not also claim nothing has reported it blocked, got {projects:?}"
         );
+
+        // Alice's round-22 finding: the rendered row is where "the two annotations are never both"
+        // is a real question, because this sweep sets a hold AND a denial. `fresh_capacity_hold`
+        // refuses a coordinate whose lookups have been failing, so the row must carry the denial and
+        // no `capacity_held` — pinned end-to-end (sweep -> render) on the production path, which the
+        // hand-built fixture in `snapshot_json` could not exercise.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["capacity_unreadable"]["attempts"],
+            UNREADABLE_ATTEMPTS_TO_DROP_HOLD,
+            "the denial reaches the state row, got: {rendered}"
+        );
+        assert!(
+            rendered["review_divergence"][0]
+                .get("capacity_held")
+                .is_none(),
+            "a denied hold is not a live hold — the row must not carry both, got: {rendered}"
+        );
     }
 
     /// STUDIO-950 (round 21, sol's blocking finding at `71c02b3`, re-derived from alice's round 20):
@@ -1908,6 +1926,12 @@ mod store_tests {
         });
         o.review_divergent.clear();
         o.review_watch_unreadable.clear();
+        // Sol's round-22 finding: the warm-up's last call left the unreadable annotation on
+        // `review_divergence`, so without this the real "sweep 1" would see `prev_unreadable == true`
+        // and log because the annotation DISAPPEARS — passing for the wrong reason. Clear it so sweep
+        // 1 crosses genuinely clean, and the test pins the fresh crossing (mutating
+        // `annotation_changed` to the hold-only compare reds it) rather than an annotation's removal.
+        o.review_divergence.clear();
 
         let (_, events) = crate::testsupport::capture_events(|| {
             // Sweep 1: stale, with no annotation of any kind — the plain line.

@@ -457,11 +457,6 @@ mod tests {
             row["capacity_unreadable"]["attempts"], 3,
             "the attempt count the watcher recorded"
         );
-        // The two annotations are mutually exclusive: a denied hold is not a hold.
-        assert!(
-            row.get("capacity_held").is_none(),
-            "an unreadable denial must not also read as a live hold, got: {row}"
-        );
         // It is still reported in full — the annotation never suppresses.
         assert!(row.get("detail").is_some());
         assert_eq!(row["stale_secs"], 21_600);
