@@ -23,7 +23,6 @@
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type {
   BlockedEntry,
-  HeldForHuman,
   IssueCountsResponse,
   IssueLifecycle,
   IssueRun,
@@ -890,15 +889,20 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  * `/api/v1/state` never sends one — and it is here so that the strip and the table cannot disagree
  * about a row the table already knows how to draw, rather than as a feature.
  *
- * `heldForHuman` (STUDIO-949) is the second such client-side set, and unlike `held` it IS live on a
- * Rhapsody daemon: a `rhapsody:human` ticket has been refused, so it never ran and the store never
- * counted it. It is folded into `queued` — a deliberate hold is not a fault — so the lane header
- * and the card beside it cannot disagree.
+ * `held_for_human` (STUDIO-949) is NOT a client-side set like `held`, and it is the one figure the
+ * client cannot compute: it is a COUNT the daemon serves beside the buckets. Only the daemon can
+ * tell a held ticket that never ran (absent from the store) from one that already did (present,
+ * usually as `review` — the STUDIO-939 shape: parked in review, then labelled), and the daemon
+ * drops each non-live held ticket's stored row from the buckets before reporting the count here,
+ * so adding it to `queued` counts each hold exactly once. A held ticket the daemon is mid-run on
+ * keeps its running bucket and is not in this count, matching the console's own exception for a
+ * live row. The never-run hold is why the fold is needed at all: the dispatcher refused it, so no
+ * stored row exists for the tally to carry, and the card beside this number is a synthesized
+ * Queued card. Reading `state.held_for_human.length` here instead would reopen the double-count.
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
   held: readonly BlockedEntry[] = [],
-  heldForHuman: readonly HeldForHuman[] = [],
 ): ConsoleJobCounts | undefined {
   if (payload === undefined) return undefined;
   // A held dependent's status inputs are exactly a `waiting` outcome and nothing else, so it goes
@@ -923,8 +927,9 @@ export function consoleStoreCounts(
       ] as const;
     }),
   );
-  if (heldForHuman.length === 0) return counts;
-  return { ...counts, queued: counts.queued + heldForHuman.length };
+  const heldForHuman = payload.held_for_human ?? 0;
+  if (heldForHuman === 0) return counts;
+  return { ...counts, queued: counts.queued + heldForHuman };
 }
 
 /** One teammate's live state in the Now strip (§3). */

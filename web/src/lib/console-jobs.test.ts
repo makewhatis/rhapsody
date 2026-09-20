@@ -1349,20 +1349,29 @@ describe("consoleStoreCounts", () => {
     expect(withHeld?.needsYou).toBe(0);
   });
 
-  // A `rhapsody:human` hold is the one live client-side addition (STUDIO-949): the refused ticket
-  // never ran, so the store's tally cannot carry it, and it must read as Queued so the lane header
-  // and the card beside it cannot disagree.
-  it("adds the live snapshot's held-for-human tickets to queued", () => {
-    const payload = counts([{ outcome: "completed", lifecycle: "done", count: 1 }]);
-    const holds = [
-      { issue_identifier: "STUDIO-939", title: "store work", project: "booch" },
-      { issue_identifier: "STUDIO-940", title: "legal form", project: "studio" },
-    ];
-    const withHolds = consoleStoreCounts(payload, [], holds);
+  // A `rhapsody:human` hold is the one client-side ADDITION the daemon owns (STUDIO-949): the
+  // refused ticket reads Queued, so whatever bucket its stored row would have landed in is dropped
+  // and re-reported as `held_for_human`, which the strip adds to queued. The client must NOT compute
+  // this from `state.held_for_human` — a hold that has already run is in the buckets too, and adding
+  // it again double-counted the STUDIO-939 shape (parked in review, then labelled).
+  it("adds the daemon's held-for-human count to queued, exactly once", () => {
+    // The daemon has already dropped the held ticket's stored row, so the bucket below belongs to a
+    // different issue and `held_for_human` names the reclassified one.
+    const payload: IssueCountsResponse = {
+      issues: 1,
+      buckets: [{ outcome: "completed", lifecycle: "done", count: 1 }],
+      held_for_human: 2,
+    };
+    const withHolds = consoleStoreCounts(payload);
     expect(withHolds?.queued).toBe(2);
+    expect(withHolds?.review).toBe(0);
     expect(withHolds?.blocked).toBe(0);
     // A deliberate hold is not a failure, so it is not billed as needing the operator.
     expect(withHolds?.needsYou).toBe(0);
+    // Absent (a daemon holding nothing) is the pre-STUDIO-949 payload: no queued invention.
+    expect(
+      consoleStoreCounts(counts([{ outcome: "completed", lifecycle: "done", count: 1 }]))?.queued,
+    ).toBe(0);
   });
 });
 

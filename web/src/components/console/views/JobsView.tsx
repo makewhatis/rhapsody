@@ -133,12 +133,10 @@ export function JobsView({
   // as "—" — the same answer it already gives for a number it cannot know.
   // `state.blocked` rides along because it is the one part of the worklist the daemon's tally
   // cannot see — and, being the live snapshot rather than a page, adding it keeps the numbers
-  // paging-invariant. See `consoleStoreCounts`.
-  const counts = consoleStoreCounts(
-    issueCounts.data,
-    state.data?.blocked,
-    state.data?.held_for_human,
-  );
+  // paging-invariant. The `rhapsody:human` hold is NOT passed here: the daemon reclassifies it into
+  // `payload.held_for_human` itself, by identity, which is the only way to avoid counting a hold
+  // that already ran twice. See `consoleStoreCounts`.
+  const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
   // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:
