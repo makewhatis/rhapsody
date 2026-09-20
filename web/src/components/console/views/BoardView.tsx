@@ -343,13 +343,13 @@ function ReviewerChipView({ chip }: { chip: ReviewerChip }) {
   const on = chip.pr === undefined ? "" : ` on ${pullRequestLabel(chip.pr)}`;
   // The provider is metadata, not status: it reuses the List view's harness chip treatment (quiet
   // mono text on the shared `.provbadge`) rather than a status colour, so it never competes with the
-  // pill or the chip's own tone (STUDIO-952). A run that recorded none (STUDIO-909's predecessor)
-  // renders no chip at all rather than a placeholder.
-  const harness = chip.provider === "" ? "" : ` on ${chip.provider}`;
+  // pill or the chip's own tone (STUDIO-952). A run predating STUDIO-909's provider field records
+  // none, so it renders no chip at all rather than a placeholder.
+  const onProvider = chip.provider === "" ? "" : ` · ${chip.provider}`;
   return (
     <span
       className={cn("rchip", reviewerTone(chip.status))}
-      title={`${chip.reviewer}${on}${harness} · review ${chip.outcome}`}
+      title={`${chip.reviewer}${on}${onProvider} · review ${chip.outcome}`}
     >
       <span className="d" aria-hidden="true" />
       {chip.reviewer}
