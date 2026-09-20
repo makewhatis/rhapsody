@@ -2953,6 +2953,11 @@ mod tests {
 
     /// With the key set, review runs never exceed their OWN budget — four rounds due in one tick and
     /// a budget of two dispatch two and defer two, whatever the implementation budget is doing.
+    ///
+    /// It also pins the SEPARATE-mode capacity hold, the only place `CapacityHold::separate` and its
+    /// holder count are recorded — and therefore which budget knob the reconciliation WARN tells the
+    /// operator to turn. Inverting the `separate` mapping or reporting the reviews-only count in the
+    /// wrong arm reds here.
     #[test]
     fn review_runs_never_exceed_their_own_budget() {
         let (mut o, dispatched) = orch(ticketless(&["bob"]));
@@ -2978,6 +2983,44 @@ mod tests {
         );
         assert_eq!(report.deferred, 2);
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
+
+        // The two deferred rounds each record a hold in SEPARATE mode, naming the review pool's own
+        // holders (the two reviews just dispatched, not the implementation count) and the knob that
+        // would actually free a review slot.
+        for n in [33, 34] {
+            let hold = o
+                .review_capacity_held
+                .get(&review_key(OWNER, REPO, n, "bob"))
+                .copied()
+                .unwrap_or_else(|| panic!("round {n} must record a capacity hold"));
+            assert_eq!(
+                (hold.holders, hold.separate),
+                (2, true),
+                "a separate-mode hold names the review pool's holders and its own budget knob"
+            );
+        }
+
+        // ...and the reconciliation WARN names `agent.max_concurrent_reviews`, not the implementation
+        // knob — the whole point of the `separate` bit. It needs a dated origin run to reach the
+        // report at all.
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+        let (_, events) = capture_events(|| o.reconcile_review_divergence());
+        let warn = events
+            .iter()
+            .find(|e| {
+                e.message.contains("review reconciliation") && e.message.contains("held for capacity")
+            })
+            .expect("a capacity-held round must be reported");
+        assert!(
+            warn.message.contains("agent.max_concurrent_reviews"),
+            "an operator with the key set must be told the review budget is the knob, got: {}",
+            warn.message
+        );
     }
 
     /// STUDIO-950's second half: a round the watcher is HOLDING for capacity is not an unexplained
