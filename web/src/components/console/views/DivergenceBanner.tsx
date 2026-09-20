@@ -2,7 +2,9 @@ import { Note } from "@/components/console/Note";
 import { useStateQuery } from "@/hooks/useStateQuery";
 
 /**
- * The console's view of a pull request whose board state and activity disagree (STUDIO-898).
+ * The console's view of a pull request whose review loop has stopped moving — either neither
+ * progressing nor reported blocked, or stopped with a stated cause and remedy (STUDIO-898,
+ * STUDIO-950, STUDIO-956).
  *
  * Six separate defects between 2026-09-12 and 2026-09-14 all presented as an idle board, and each
  * cost hours only because nobody could SEE it — eleven on STUDIO-875, six on STUDIO-893. The daemon
@@ -26,8 +28,8 @@ import { useStateQuery } from "@/hooks/useStateQuery";
  * names the budget — the banner never implies a held round is an unexplained stall. A hold the
  * watcher DENIED because GitHub stopped answering for the coordinate carries `capacity_unreadable`
  * instead, and the banner names that silence for the same reason. The heading claims only what is
- * always true of every row ("board state and activity disagree"); the old "neither progressing nor
- * reported blocked" would have been false the moment either annotation was known.
+ * always true of every row ("needs attention"); the original "neither progressing nor reported
+ * blocked" would have been false the moment either annotation was known.
  */
 export function DivergenceBanner() {
   const state = useStateQuery();
@@ -37,8 +39,8 @@ export function DivergenceBanner() {
     <div role="status" className="setuperr">
       <Note variant="warn">
         {rows.length === 1
-          ? "1 pull request's board state and activity disagree:"
-          : `${rows.length} pull requests' board state and activity disagree:`}{" "}
+          ? "1 pull request needs attention:"
+          : `${rows.length} pull requests need attention:`}{" "}
         {rows.map((d) => (
           <span key={`${d.pr}:${d.reviewer}`} style={{ display: "block" }}>
             {d.pr}
@@ -59,13 +61,20 @@ export function DivergenceBanner() {
 /**
  * How long the obligation has been outstanding, in the coarsest honest unit.
  *
- * Coarse on purpose: the daemon only reports past a ninety-minute threshold, so a second-accurate
- * rendering would imply a precision the measurement does not have, and the decision an operator
- * makes from it ("is this minutes or is this all morning?") never needs more.
+ * Coarse on purpose: the staleness rules only report past a ninety-minute threshold, so a
+ * second-accurate rendering would imply a precision the measurement does not have, and the decision
+ * an operator makes from it ("is this minutes or is this all morning?") never needs more.
  *
- * That same threshold means the minutes branch cannot be reached by anything the daemon sends today —
- * it is the floor for a future lower threshold, and for the arithmetic never to render a real
- * divergence as "0 hours". Keep it whichever way the threshold moves.
+ * The minutes branch is reachable: the kinds with NO staleness threshold are reported the moment
+ * they happen, so a fresh one arrives as seconds since the newest run — often `0`. Those are
+ * `review_escalated`, `review_shipped` and `round_budget_exhausted`: the adjudication arm reports the
+ * two decider kinds regardless of age, and the legacy cap reports the budget kind as soon as it is
+ * spent. (`round_budget_exhausted` still fires in an adjudicating install whenever the threshold is
+ * ABOVE `REVIEW_ROUNDS_PER_PR_CAP` — `review.adjudicate_after_rounds` deliberately has no upper
+ * clamp, so a threshold of 9 never fires and the cap stops the loop first.) The staleness-rule kinds
+ * floor at ninety minutes and therefore bottom out at "1 hour"; the arithmetic still clamps to a
+ * minimum of one unit so a real divergence is never rendered as "0 minutes". Keep that whichever way
+ * the threshold moves.
  */
 function humanStale(secs: number): string {
   const hours = Math.floor(secs / 3600);
@@ -74,5 +83,6 @@ function humanStale(secs: number): string {
     return `for ${days} ${days === 1 ? "day" : "days"}`;
   }
   if (hours >= 1) return `for ${hours} ${hours === 1 ? "hour" : "hours"}`;
-  return `for ${Math.max(1, Math.floor(secs / 60))} minutes`;
+  const minutes = Math.max(1, Math.floor(secs / 60));
+  return `for ${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
 }

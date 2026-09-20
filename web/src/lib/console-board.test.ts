@@ -210,6 +210,52 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(cards(board)[0].dependencies).toEqual(["STUDIO-900 · In Progress"]);
   });
 
+  it("attaches a held-for-human flag from the live snapshot's held set (STUDIO-949)", () => {
+    const board = buildConsoleBoard(
+      [
+        row({ issue: "STUDIO-939", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+        row({ issue: "STUDIO-940", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+      ],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const byIssue = new Map(cards(board).map((c) => [c.issue, c]));
+    expect(byIssue.get("STUDIO-939")?.heldForHuman).toBe(true);
+    // A ticket without the hold is untouched — the label is the entire opt-in.
+    expect(byIssue.get("STUDIO-940")?.heldForHuman).toBe(false);
+  });
+
+  it("synthesizes a Queued card for a held ticket with no row at all (STUDIO-949)", () => {
+    // The production shape: a fresh `rhapsody:human` ticket has never run, so it has no worklist
+    // row. Annotating existing rows alone would leave it invisible on the board; the hold itself
+    // must produce a card, exactly as a held dependent's synthetic row does upstream.
+    const board = buildConsoleBoard(
+      [],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const card = cards(board).find((c) => c.issue === "STUDIO-939");
+    expect(card?.heldForHuman).toBe(true);
+    expect(card?.title).toBe("store work");
+    expect(board.find((l) => l.id === "queued")?.cards.map((c) => c.issue)).toContain(
+      "STUDIO-939",
+    );
+  });
+
+  it("gives a synthesized card the project's display name, not its slug (STUDIO-949)", () => {
+    // The hold entry carries only the slug; `BoardView` renders `card.project` as the chip, and a
+    // row-built card puts the display NAME there. Recover it from any row of the same project so
+    // the synthesized card's chip is not the odd one out.
+    const board = buildConsoleBoard(
+      [row({ issue: "STUDIO-1000", project: "Booch App", projectSlug: "booch" })],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const card = cards(board).find((c) => c.issue === "STUDIO-939");
+    expect(card?.project).toBe("Booch App");
+    expect(card?.projectSlug).toBe("booch");
+  });
+
   it("carries assignee and provider onto the card", () => {
     const board = buildConsoleBoard([
       row({

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   fetchReviews,
+  postReviewClear,
   postReviewDismiss,
   postReviewRerun,
   type ReviewActionResponse,
@@ -57,6 +58,19 @@ export function useDismissReview() {
   const qc = useQueryClient();
   return useMutation<ReviewActionResponse, Error, ReviewJob>({
     mutationFn: postReviewDismiss,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: REVIEWS_QUERY_KEY });
+    },
+  });
+}
+
+// useClearReview drops a pull request's shared review↔author round budget (STUDIO-956) — the bound
+// that otherwise clears only on a daemon restart or a pull-request close. Same refresh as the other
+// two, since the row's next poll may now show a round in flight that the budget had been refusing.
+export function useClearReview() {
+  const qc = useQueryClient();
+  return useMutation<ReviewActionResponse, Error, ReviewJob>({
+    mutationFn: postReviewClear,
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: REVIEWS_QUERY_KEY });
     },

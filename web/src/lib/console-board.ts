@@ -24,7 +24,7 @@
 // THE LANE SET IS FIXED. Lanes are never built from the cards present: the board is quietest exactly
 // when the pipeline is idle or starved, and an absent lane would hide the very condition the console
 // most needs to shout about. All four always exist, empty ones included.
-import type { BlockedEntry } from "@/lib/api";
+import type { BlockedEntry, HeldForHuman } from "@/lib/api";
 import { runOutcomeLabel } from "@/lib/console-job-detail";
 import type { ConsoleJobRow, ConsoleJobStatus } from "@/lib/console-jobs";
 
@@ -123,6 +123,12 @@ export interface BoardCard {
   reviewers: ReviewerChip[];
   /** Blockers holding this ticket, each "X · State" (`state.blocked`, INF-318/INF-320). */
   dependencies: string[];
+  /**
+   * True when the dispatcher is deliberately holding this ticket for a person (`rhapsody:human`,
+   * STUDIO-949). Distinct from `dependencies`: nobody is blocking it and no agent will ever run it —
+   * it is console/legal/physical work, so the board must read it as held, not as mysteriously idle.
+   */
+  heldForHuman: boolean;
 }
 
 /** The four lanes, left to right — the order a ticket travels them. */
@@ -346,14 +352,27 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
  *
  * `rows` is exactly what the table renders (one per issue key, review rows included); `blocked` is
  * the live snapshot's held-dependent set, which is the only dependency edge the state payload
- * carries.
+ * carries. `heldForHuman` is the live snapshot's `rhapsody:human` hold set (STUDIO-949): it both
+ * flags a card the rows already carry and synthesizes a Queued card for a hold that has never run.
  */
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
   blocked: readonly BlockedEntry[] = [],
+  heldForHuman: readonly HeldForHuman[] = [],
 ): BoardLane[] {
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
+  const held = new Set(heldForHuman.map((h) => h.issue_identifier));
+  // The hold entry carries only the project SLUG (the daemon's `HeldForHuman`), while a card's
+  // `project` is the display NAME. Recover the name from any row of the same project so a
+  // synthesized card's chip matches every other card; fall back to the slug when the project has no
+  // row at all. (Through `JobsView` this branch is unreachable — `mergeJobs` synthesizes a row per
+  // hold and `buildConsoleJobs` maps 1:1 — so this only matters to a caller that hands the board
+  // rows it did not build through that chain.)
+  const nameBySlug = new Map<string, string>();
+  for (const row of rows) {
+    if (row.projectSlug !== "" && row.project !== "") nameBySlug.set(row.projectSlug, row.project);
+  }
   for (const row of rows) {
     // A review run is never its own card: it belongs to the ticket it reviews, and an unattributed
     // run (no issue key) has no ticket to group under.
@@ -373,6 +392,7 @@ export function buildConsoleBoard(
       pr: undefined,
       reviewers: [],
       dependencies: [],
+      heldForHuman: held.has(row.issue),
     };
     cards.push(card);
     byIssue.set(row.issue, card);
@@ -410,6 +430,42 @@ export function buildConsoleBoard(
     heldBy.set(b.issue_identifier, list);
   }
   for (const card of cards) card.dependencies = heldBy.get(card.issue) ?? [];
+
+  // A held-for-human ticket has usually NEVER RUN, so it has no worklist row at all — rows come from
+  // run history plus the live snapshot's running/retrying/blocked sets, and a ticket the dispatcher
+  // refuses never reaches any of them. Annotating an existing row would therefore leave the hold
+  // invisible on the board: the exact silent stall the hold exists to end (STUDIO-949). Synthesize a
+  // Queued card for any hold the rows did not already surface, as `mergeJobs` synthesizes a held
+  // dependent's row. The chip is the deliberate-hold marker; the pill stays the lane's own word.
+  //
+  // LOAD-BEARING NOTE: through `JobsView` this loop is unreachable. `mergeJobs` synthesizes a row
+  // for every hold (`runs-model.ts`) and `buildConsoleJobs` is a 1:1 map, so `byIssue.has(...)` is
+  // always true by the time this runs — a held ticket is surfaced by the ROW, and its status word is
+  // decided in `consoleJobStatus`. This branch is belt-and-braces for a caller that hands the board
+  // rows it did not build through that chain, and its own test is the only thing that exercises it.
+  // Do not delete the `mergeJobs` half believing this one covers it.
+  for (const h of heldForHuman) {
+    if (h.issue_identifier === "" || byIssue.has(h.issue_identifier)) continue;
+    const card: BoardCard = {
+      key: `held-${h.issue_identifier}`,
+      issue: h.issue_identifier,
+      title: h.title,
+      project: nameBySlug.get(h.project) ?? h.project,
+      projectSlug: h.project,
+      status: "queued",
+      statusLabel: "queued",
+      trackerState: "",
+      assignee: "",
+      provider: "",
+      live: false,
+      pr: undefined,
+      reviewers: [],
+      dependencies: [],
+      heldForHuman: true,
+    };
+    cards.push(card);
+    byIssue.set(h.issue_identifier, card);
+  }
 
   const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));
   for (const card of cards) {

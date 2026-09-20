@@ -553,6 +553,16 @@ pub struct Orchestrator {
     /// Loop-confined, like every other scheduling map here: the ladder takes `&self` and returns
     /// this tally, and the `&mut self` caller stores it.
     pub(crate) held_for_capacity: HashMap<String, i64>,
+    /// The `rhapsody:human` hold ledger (STUDIO-949): the once-per-ticket log dedupe and the
+    /// CURRENT hold set the console reads off `/api/v1/state`.
+    ///
+    /// Shared behind an [`Arc`] rather than loop-confined because the selection pass that discovers
+    /// the holds takes `&self` by design; the control task assembles the snapshot from the same cell.
+    /// Unlike [`held_for_capacity`](Orchestrator::held_for_capacity) the announced set must SURVIVE
+    /// a pass, so the ledger is not simply overwritten by the caller. See
+    /// [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger) and the seam list in
+    /// `crates/orchestrator/CLAUDE.md`.
+    pub(crate) human_holds: Arc<crate::dispatch::HumanHoldLedger>,
     /// Issue ids whose work has completed this process lifetime, a set.
     pub completed: HashSet<String>,
     /// Graphite-mode stacking facts carried from the auto-promote pass to the next tick's dispatch
@@ -684,6 +694,14 @@ pub struct Orchestrator {
     /// composition root (`rhapsodyd::run`) sets it before `o.run()` moves the orchestrator into the
     /// control task, the same inject-before-`run()` pattern that crate's `CLAUDE.md` documents.
     pub automerge_ledger: Option<Arc<crate::runautomerge::AutoMergeLedger>>,
+    /// Shared with the review watcher's off-loop adjudication half (STUDIO-956): the control task
+    /// READS what the manager decided about a pull request that reached its round threshold, and the
+    /// watcher's task WRITES it after the turn. `None` whenever the threshold is unset or the
+    /// watcher never spawned, in which case no adjudication is ever requested.
+    ///
+    /// `pub` for [`Orchestrator::automerge_ledger`]'s reason: the composition root sets it before
+    /// `o.run()` moves the orchestrator into the control task.
+    pub adjudication_ledger: Option<Arc<crate::reviewadjudicate::AdjudicationLedger>>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -925,6 +943,7 @@ impl Orchestrator {
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
             held_for_capacity: HashMap::new(),
+            human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
@@ -937,6 +956,7 @@ impl Orchestrator {
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,
+            adjudication_ledger: None,
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),

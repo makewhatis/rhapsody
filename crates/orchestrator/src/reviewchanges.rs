@@ -313,6 +313,7 @@ mod tests {
             repo_url: "git@github.com:makewhatis/rhapsody.git".to_string(),
             head_sha: HEAD.to_string(),
             introduced_by: introduced_by.to_string(),
+            prior_sha: String::new(),
         }
     }
 

@@ -316,7 +316,8 @@ pub(crate) struct IssueStatusKey {
     pub review_run: bool,
 }
 
-/// `{issues, buckets:[…]}` — the `GET /api/v1/history/issues/counts` payload (STUDIO-828).
+/// `{issues, buckets:[…], held_for_human?}` — the `GET /api/v1/history/issues/counts` payload
+/// (STUDIO-828).
 ///
 /// `issues` is how many issues the tally covers, and equals the sum of the buckets' counts; it is
 /// carried rather than left to be summed because "the whole store" is the claim this endpoint
@@ -327,8 +328,20 @@ pub(crate) struct IssueStatusKey {
 /// one vocabulary and a client reads a bucket with the code it already has for a row. The array is
 /// ordered by the key, so the payload is stable for a given store.
 ///
+/// `held_for_human` (STUDIO-949) is emitted only while the dispatcher holds at least one non-live
+/// `rhapsody:human` ticket for which the run store has NO stored row — the never-ran hold, for
+/// which the console synthesizes a Queued card. It is deliberately NOT every non-live hold: a held
+/// ticket that HAS run keeps its stored row's bucket (its lane), so it is already counted there and
+/// [`handle_issue_counts`] never removes it. The daemon is the only side that can join the store's
+/// rows to the snapshot's hold set, which is why the increment is not the client's. Omitted when
+/// zero on the same terms as `lifecycle` and `review_run`, so a daemon with no such hold serves the
+/// pre-STUDIO-949 payload byte-for-byte.
+///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
-pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> Value {
+pub(crate) fn issue_counts_response(
+    buckets: &BTreeMap<IssueStatusKey, i64>,
+    held_for_human: i64,
+) -> Value {
     let mut issues: i64 = 0;
     let mut out: Vec<Value> = Vec::with_capacity(buckets.len());
     for (key, count) in buckets {
@@ -344,10 +357,13 @@ pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> 
         obj.insert("count".to_string(), json!(count));
         out.push(Value::Object(obj));
     }
-    json!({
-        "issues": issues,
-        "buckets": Value::Array(out),
-    })
+    let mut body = serde_json::Map::new();
+    body.insert("issues".to_string(), json!(issues));
+    body.insert("buckets".to_string(), Value::Array(out));
+    if held_for_human > 0 {
+        body.insert("held_for_human".to_string(), json!(held_for_human));
+    }
+    Value::Object(body)
 }
 
 /// The `GET /api/v1/history/summary` payload (TRA-320): whole-store totals over the runs that

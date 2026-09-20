@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import type { BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import type { BoardCardFields } from "@/hooks/useBoardCardFields";
 import { teammateColor } from "@/theme/teammates";
-import type { BlockedEntry } from "@/lib/api";
+import type { BlockedEntry, HeldForHuman } from "@/lib/api";
 import {
   boardLaneTally,
   buildConsoleBoard,
@@ -61,6 +61,8 @@ export interface BoardViewProps {
   rows: readonly ConsoleJobRow[];
   /** The live snapshot's held dependents — the board's only dependency edge. */
   blocked: readonly BlockedEntry[];
+  /** The live snapshot's `rhapsody:human` holds (STUDIO-949) — cards that no agent will ever run. */
+  heldForHuman: readonly HeldForHuman[];
   /** The project Select's value ("" = all projects). */
   project: string;
   /** The daemon's whole-store tally, so the footer agrees with the Now strip above it. */
@@ -86,6 +88,7 @@ export interface BoardViewProps {
 export function BoardView({
   rows,
   blocked,
+  heldForHuman,
   project,
   counts,
   maxConcurrent,
@@ -104,7 +107,10 @@ export function BoardView({
   // `buildConsoleBoard`. A review row filtered away before the regroup would silently strip a
   // surviving card of its chips, which is the one thing the board exists to show. Status is NOT
   // applied: the lanes are that axis (STUDIO-932).
-  const lanes = useMemo(() => buildConsoleBoard(rows, blocked), [rows, blocked]);
+  const lanes = useMemo(
+    () => buildConsoleBoard(rows, blocked, heldForHuman),
+    [rows, blocked, heldForHuman],
+  );
   // The Running lane's contents are RUNS, not only tickets (STUDIO-955): a live review's ticket is
   // parked in In Review, so the review has no card and the lane would otherwise read `5 / 6` beside
   // nothing. One compact row per live review run closes that gap. The project Select narrows these
@@ -346,6 +352,16 @@ function BoardCardView({
           ))}
         </div>
       )}
+      {card.heldForHuman ? (
+        <div className="bchips" aria-label="Held for a human">
+          <span
+            className="dchip hchip"
+            title="rhapsody:human — the dispatcher refuses this ticket; only a person can do it"
+          >
+            held for a human
+          </span>
+        </div>
+      ) : null}
       {!fields.pullRequest || card.pr === undefined ? null : (
         // The anchor is wrapped rather than given its own `onClick`: `ExternalLink` deliberately
         // does not accept one (so its open-seam cannot be replaced), and the card underneath must not

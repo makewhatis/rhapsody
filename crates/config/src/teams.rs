@@ -561,6 +561,25 @@ pub struct Review {
     /// live in one place. An unset list leaves selection byte-identical to before the key existed.
     #[serde(default)]
     pub required: Vec<String>,
+    /// How many review↔author ROUNDS a watched pull request may run before the loop stops arming
+    /// rounds and hands the pull request to the MANAGER for one adjudication — ship it, or escalate
+    /// (STUDIO-956). `0` — the default — leaves the loop exactly as it was: the hard
+    /// `REVIEW_ROUNDS_PER_PR_CAP` × reviewers cap and its current stop.
+    ///
+    /// The maintainer's number is **3**: "we do 3 rounds at work, after three rounds, we escalate."
+    /// At the threshold the daemon dispatches no further review or author round and instead runs one
+    /// manager turn that adjudicates the OPEN FINDINGS (never the merge gates — see the ticket's
+    /// first ⚠️) and records the outcome in the room and on the pull request. `Unset` is
+    /// byte-identical to an install built before this key existed.
+    ///
+    /// **Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no
+    /// manager ASSIGNMENT turn today — assignment is deterministic and spends nothing — so an
+    /// adjudication cannot silently inherit that mode. It does not have to: adjudication is a turn
+    /// of its own, gated by THIS key, and it runs through the daemon's one model-turn path with
+    /// `manager.model` / `manager.timeout_ms`. A `labels`-mode install that sets this key therefore
+    /// DOES get adjudication; one that does not set it gets nothing, exactly as before.
+    #[serde(default)]
+    pub adjudicate_after_rounds: i64,
 }
 
 impl Default for Review {
@@ -574,6 +593,7 @@ impl Default for Review {
             model: HarnessScoped::default(),
             effort: HarnessScoped::default(),
             required: Vec::new(),
+            adjudicate_after_rounds: 0,
         }
     }
 }
@@ -853,6 +873,26 @@ impl Teams {
         }
         let name = self.review.changes_state.trim();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// How many review↔author ROUNDS a watched pull request may run before the manager adjudicates
+    /// it, or `None` when adjudication is off (STUDIO-956).
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: the round counters this reads live
+    /// only on the ticketless watcher's watch set, so on any other installation the key is dead
+    /// config and must read as off rather than promise a decision that can never fire.
+    ///
+    /// Floored at one: a non-positive value is "off", and the smallest meaningful threshold is one
+    /// round. There is deliberately no upper clamp — a threshold above the hard cap simply never
+    /// fires, because the legacy cap stops the loop first, which is the same behaviour an install
+    /// that never set the key gets.
+    pub fn review_adjudicate_after_rounds(&self) -> Option<usize> {
+        if !self.review_ticketless() {
+            return None;
+        }
+        let n = self.review.adjudicate_after_rounds;
+        (n > 0).then(|| usize::try_from(n).unwrap_or(usize::MAX))
     }
 
     /// Whether a watched pull request that has cleared every gate may be MERGED
@@ -3011,6 +3051,7 @@ mod tests {
                 model: HarnessScoped::bare("claude-opus-5"),
                 effort: HarnessScoped::bare("high"),
                 required: vec!["jimmy".to_string()],
+                adjudicate_after_rounds: 3,
             },
             // Four, because `reviewers: 3` must be a config the ceiling accepts
             // (STUDIO-891: a roster of N satisfies at most N−1). The property
@@ -3051,6 +3092,11 @@ mod tests {
                 .effort
                 .for_harness("claude", "claude"),
             Some("high")
+        );
+        assert_eq!(
+            Teams::load(&path).review_adjudicate_after_rounds(),
+            Some(3),
+            "the opt-in adjudication threshold must survive a save/load round-trip"
         );
     }
 

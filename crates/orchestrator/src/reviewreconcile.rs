@@ -45,6 +45,21 @@
 //!   owes a merge. This is what found the STUDIO-881 draft loop and the `BEHIND` decline by hand.
 //! * `in_flight` — a round is happening RIGHT NOW. Never divergence.
 //!
+//! # A human-gated ticket is deliberately NOT this sweep's business (STUDIO-949)
+//!
+//! `rhapsody:human` is the one hold the dispatcher applies on purpose: the ticket can only be done by
+//! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep must
+//! never report it as a stall, and it cannot rely on such a ticket having no watch row: a ticket
+//! labelled AFTER an agent already ran has one, which is the likeliest way the label is ever applied.
+//! So a row whose origin ticket currently WEARS the label is dropped before the rules see it (see
+//! [`Orchestrator::reconcile_review_divergence`]) — the exclusion is explicit, not by construction,
+//! and it reads the live-inclusive current-label set so a label added while the origin run is still
+//! live is honoured too. The dispatch refusal itself lives on the review watcher
+//! ([`crate::reviewwatch`]), so a row that is held arms nothing new either; this filter is what keeps
+//! the ALREADY-ARMED row from reporting the deliberate hold as a stalled obligation. A future change
+//! that made this sweep range over tickets rather than watch rows would have to add the hold back
+//! deliberately.
+//!
 //! # It reports and it does NOT act
 //!
 //! Nothing here re-dispatches, re-arms, merges or moves a ticket. That is a decision, not an
@@ -158,6 +173,48 @@ pub enum DivergenceKind {
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
+    /// Not a divergence of intent and activity but of a BOUND: the pull request's REVIEW round
+    /// budget ([`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`] × reviewers) is spent, so no
+    /// further review round will be dispatched and nothing will resume on its own (STUDIO-956).
+    ///
+    /// **What it does NOT claim, and why (round-8 finding 3).** It used to say "no further review
+    /// or AUTHOR re-run will be dispatched". That is false in exactly the case where it prints
+    /// most: this rule is reached only when there is no manager decision, and on an installation
+    /// that sets no `review.adjudicate_after_rounds` the author half is deliberately unbounded —
+    /// so the author can and does keep running. (It is also false with a threshold ABOVE the legacy
+    /// cap, where the cap stops the review half before the threshold is anywhere near.) The fix is
+    /// the wording, NOT a gate on the threshold being set: gating it would restore the silent stop
+    /// on the default install, which is the incident that filed this ticket — three pull requests
+    /// sat unreviewable on 2026-09-20 because the cap stopped the review half at DEBUG and no
+    /// surface said so.
+    ///
+    /// It is a `DivergenceKind` and not a separate channel because it is exactly what this module
+    /// exists to make visible: a pull request that has stopped progressing and is not blocked by
+    /// anything a later tick will clear. Reported the moment the budget is spent — the staleness
+    /// threshold [`RECONCILE_STALE_AFTER`] is for obligations that might yet resolve, and a spent
+    /// budget never does — and cleared, with the recovery line, the moment an operator clears the
+    /// budget or the pull request leaves the watch set.
+    RoundBudgetExhausted,
+    /// A BOUND of the opt-in kind: the manager reached its configured round threshold and decided
+    /// that a human is needed (STUDIO-956). Not a stall — it is a decision, and the line names the
+    /// specific open findings and the head the loop stopped at.
+    ///
+    /// A separate kind from [`DivergenceKind::RoundBudgetExhausted`] because the two are opposite
+    /// outcomes of the same bound: that one is "the legacy cap stopped the loop and nothing
+    /// decided", this one is "the manager decided, and it says a human is needed".
+    ReviewEscalated,
+    /// The manager SHIPPED the loop and the pull request still cannot merge on its own (STUDIO-956):
+    /// no further review or author round will ever arm, and the merge gate is still holding it —
+    /// typically because a row still records findings rather than an approval at the head.
+    ///
+    /// A `ship` is not a stall the manager owns; it is a decision the MERGE GATES now own. But a
+    /// decision the daemon acts on must not be a decision the daemon hides: without this kind, a
+    /// shipped pull request that cannot merge is reported nowhere at all — strictly worse than the
+    /// silent stop the ticket replaced. Reported as soon as the gate is known to be stuck (an
+    /// unapproved live row), because that will never clear by itself; a shipped pull request whose
+    /// rows are all approved is not reported here, since auto-merge either merges it or
+    /// [`DivergenceKind::ApprovedStillOpen`] reports the stuck gate after the staleness threshold.
+    ReviewShipped,
 }
 
 impl DivergenceKind {
@@ -168,9 +225,11 @@ impl DivergenceKind {
             DivergenceKind::ChangesRequestedNoRun => "changes_requested_no_run",
             DivergenceKind::ReviewRequestedNoRun => "review_requested_no_run",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
+            DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
+            DivergenceKind::ReviewEscalated => "review_escalated",
+            DivergenceKind::ReviewShipped => "review_shipped",
         }
     }
-
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
     /// observation rather than a diagnosis — the sweep genuinely does not know the cause, and
     /// guessing one in the message is how an operator is sent down the wrong path.
@@ -184,6 +243,18 @@ impl DivergenceKind {
             }
             DivergenceKind::ApprovedStillOpen => {
                 "every required reviewer approved and the pull request is still open"
+            }
+            DivergenceKind::RoundBudgetExhausted => {
+                "the per-pull-request review round budget is spent, so no further review round \
+                 will be dispatched until it is cleared"
+            }
+            DivergenceKind::ReviewEscalated => {
+                "the manager adjudicated the review loop and escalated it: the open findings need \
+                 a human"
+            }
+            DivergenceKind::ReviewShipped => {
+                "the manager shipped the review loop and no further review or author round will be \
+                 dispatched; the merge gate still holds the pull request"
             }
         }
     }
@@ -203,8 +274,11 @@ pub struct Divergence {
     /// The row whose obligation is outstanding, or `""` for [`DivergenceKind::ApprovedStillOpen`],
     /// which is a property of EVERY row rather than of one.
     pub reviewer: String,
-    /// Seconds since the party owing the next move started owing it. Always greater than
-    /// [`RECONCILE_STALE_AFTER`] — it IS the staleness the threshold was crossed by.
+    /// Seconds since the party owing the next move started owing it. For every staleness-rule kind
+    /// it is greater than [`RECONCILE_STALE_AFTER`] — it IS the staleness the threshold was crossed
+    /// by. [`DivergenceKind::RoundBudgetExhausted`] is the one exception: it has no threshold and is
+    /// reported as soon as the budget is spent, so its value is seconds since the newest activity
+    /// the sweep can date (and `0` when it can date none) rather than a crossed bound.
     pub stale_secs: i64,
     /// What [`crate::runautomerge::AutoMergeLedger`] has most recently SAID about this pull request,
     /// `None` unless [`DivergenceKind::ApprovedStillOpen`] and the ledger holds an entry for it
@@ -242,6 +316,21 @@ pub struct Divergence {
     /// determination is unaffected: it still reports the divergence under its ordinary kind, this
     /// only states a fact the daemon already has — GitHub was refusing the coordinate.
     pub capacity_unreadable: Option<u32>,
+    /// The head the manager stopped at — only meaningful for [`DivergenceKind::ReviewEscalated`],
+    /// `""` otherwise. Read by [`Orchestrator::set_review_divergences`] to name where the loop
+    /// stopped, never rendered onto `/api/v1/state`.
+    pub adjudicated_head: String,
+    /// How many review↔author rounds the loop ran before the escalation — `0` for every kind but
+    /// [`DivergenceKind::ReviewEscalated`]. Rendered onto the escalation log line, not the wire.
+    pub rounds: usize,
+    /// The open findings the manager escalated on — empty for every kind but
+    /// [`DivergenceKind::ReviewEscalated`]. Named on the log line so the escalation is actionable.
+    pub findings: Vec<String>,
+    /// The manager's OWN words for an escalation — empty for every kind but
+    /// [`DivergenceKind::ReviewEscalated`]. Read by [`Orchestrator::set_review_divergences`] so the
+    /// WARN carries the reason rather than only the room post and the pull-request comment; like
+    /// [`Divergence::adjudicated_head`] it is not rendered onto `/api/v1/state`.
+    pub reason: String,
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -377,6 +466,10 @@ pub(crate) fn reconcile_pr(
                 // alarming, for a pull request whose next move is a merge. Filled in by the caller
                 // (which has the per-coordinate count [`reconcile_pr`] deliberately does not).
                 capacity_unreadable: None,
+                adjudicated_head: String::new(),
+                rounds: 0,
+                findings: Vec::new(),
+                reason: String::new(),
             });
         }
         return None;
@@ -395,6 +488,36 @@ fn row_divergence(
     now: DateTime<Utc>,
     stale_after: Duration,
 ) -> Option<Divergence> {
+    let (kind, anchor) = row_owed(row)?;
+    Some(Divergence {
+        pr: pr.to_string(),
+        kind,
+        ticket: row.ticket.clone(),
+        reviewer: row.reviewer.clone(),
+        stale_secs: stale_secs(now, anchor, stale_after)?,
+        auto_merge_reason: None,
+        // Copied onto every row kind `row_owed` reports (STUDIO-950). The three per-arm
+        // constructions this replaces each carried them; STUDIO-959 factored those into this one
+        // site, and the fields are a property of the ROW, not of the kind, so one fill serves all
+        // three arms.
+        capacity_held: row.capacity_held,
+        capacity_unreadable: row.capacity_unreadable,
+        adjudicated_head: String::new(),
+        rounds: 0,
+        findings: Vec::new(),
+        reason: String::new(),
+    })
+}
+
+/// The instant this row's obligation started, and which divergence it is — `None` when the row owes
+/// nothing RIGHT NOW.
+///
+/// Factored out of [`row_divergence`] so [`round_budget_owed`] can ask the same question without
+/// re-deriving the discharge rules (the two must never disagree about whether a row still owes a
+/// round), and without a staleness threshold: a spent budget is reported the moment it is spent, not
+/// after [`RECONCILE_STALE_AFTER`]. Every `None` here is answered by `row_divergence` as "no
+/// divergence", so the table of discharge rules lives in exactly one place.
+fn row_owed(row: &RowFacts) -> Option<(DivergenceKind, DateTime<Utc>)> {
     match row.status.as_str() {
         // The reviewer posted findings, so the AUTHOR owes a run on the origin ticket.
         REVIEW_STATUS_REVIEWED => {
@@ -414,16 +537,7 @@ fn row_divergence(
             {
                 return None; // the author moved, or is moving
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ChangesRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, anchor, stale_after)?,
-                auto_merge_reason: None,
-                capacity_held: row.capacity_held,
-                capacity_unreadable: row.capacity_unreadable,
-            })
+            Some((DivergenceKind::ChangesRequestedNoRun, anchor))
         }
         // A round ENDED without the agent ever declaring it had finished, so the round is owed
         // AGAIN. Its own arm rather than sharing `requested`'s below, because the reviewer's run is
@@ -435,16 +549,7 @@ fn row_divergence(
             if attempt.in_flight() {
                 return None; // the retry is running
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ReviewRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, attempt.last_at(), stale_after)?,
-                auto_merge_reason: None,
-                capacity_held: row.capacity_held,
-                capacity_unreadable: row.capacity_unreadable,
-            })
+            Some((DivergenceKind::ReviewRequestedNoRun, attempt.last_at()))
         }
         // A round is owed and the REVIEWER owes it, and no run for this head has been recorded yet.
         REVIEW_STATUS_REQUESTED => {
@@ -473,16 +578,7 @@ fn row_divergence(
             {
                 return None; // the reviewer moved after the row was armed
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ReviewRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, anchor, stale_after)?,
-                auto_merge_reason: None,
-                capacity_held: row.capacity_held,
-                capacity_unreadable: row.capacity_unreadable,
-            })
+            Some((DivergenceKind::ReviewRequestedNoRun, anchor))
         }
         // `approved` is decided above (and, with auto-merge off, is a healthy wait for a human);
         // `in_flight` and `dropped` are filtered out by the caller. Spelled as a catch-all rather
@@ -517,6 +613,61 @@ fn same_capacity(a: Option<CapacityHold>, b: Option<CapacityHold>) -> bool {
     }
 }
 
+/// Whether any LIVE row of a pull request still OWES a round — a review, or the author's run a
+/// verdict bought (STUDIO-956).
+///
+/// Scoped to these three statuses on purpose. An `approved` pull request is waiting on the merge
+/// gate rather than on this budget, and reporting it here would cry wolf on every healthy approval.
+/// A row that has left the watch set says nothing at all.
+///
+/// A round still `in_flight` silences the whole pull request, matching [`reconcile_pr`]: a second
+/// reviewer reading the same head is activity ON THIS PULL REQUEST, and a spent budget beside a
+/// running agent is not a stall — the report would be premature and would flicker off when that
+/// round finished. That is a mixed-row case (one reviewer mid-round, another's findings outstanding)
+/// and it is exactly why this cannot be a per-row predicate.
+///
+/// Whether a row owes a round is [`row_owed`]'s question, asked UNCONDITIONALLY and through the very
+/// same table `reconcile_pr` uses, so the two can never disagree about a row. That matters most for
+/// the author's own run, which the first cut of this predicate ignored: the budget is charged at
+/// DISPATCH, so the summoned author run that spent it is `in_flight` for its whole duration, and a
+/// per-status predicate reported `round_budget_exhausted` over a running agent — premature by an
+/// entire agent run. A `ticket_run` that started at or after the reviewer's verdict discharges the
+/// row the same way `reconcile_pr`'s `reviewed` arm says it does, so an author who answered and
+/// deliberately held without pushing is not a stall either.
+fn round_budget_owed(facts: &PrFacts) -> bool {
+    let live = || {
+        facts
+            .rows
+            .iter()
+            .filter(|r| r.open && r.status != REVIEW_STATUS_DROPPED)
+    };
+    if live().any(|r| r.status == REVIEW_STATUS_IN_FLIGHT) {
+        return false;
+    }
+    live().any(|r| row_owed(r).is_some())
+}
+
+/// Seconds since the newest activity this sweep can see on the pull request — the latest of its
+/// rows' reviewer and ticket runs, or `0` when it can date none.
+///
+/// The budget is a counter with no timestamp, so when it was SPENT cannot be read off it. The newest
+/// run is the closest honest anchor for "how long has this been stuck"; a negative elapsed is
+/// clamped to zero for [`stale_secs`]'s reason.
+fn newest_activity_secs(facts: &PrFacts, now: DateTime<Utc>) -> i64 {
+    let newest = facts
+        .rows
+        .iter()
+        .flat_map(|r| {
+            [
+                r.reviewer_run.as_ref().map(RunMoment::last_at),
+                r.ticket_run.as_ref().map(RunMoment::last_at),
+            ]
+        })
+        .flatten()
+        .max();
+    newest.map_or(0, |n| now.signed_duration_since(n).num_seconds().max(0))
+}
+
 impl Orchestrator {
     /// Runs one reconciliation sweep: reads the live watch set, dates each row against the `runs`
     /// ledger, and records what diverged. **Reports only** — nothing here dispatches, arms, merges
@@ -530,6 +681,29 @@ impl Orchestrator {
     /// exactly a daemon whose board may have quietly stopped.
     pub(crate) fn reconcile_review_divergence(&mut self) {
         if !self.review_ticketless_enabled() {
+            self.set_review_divergences(Vec::new());
+            return;
+        }
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
+        // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
+        // selection pass has ever READ THE BOARD, leaving `labelled` empty for the whole process
+        // lifetime. The held-row filter below would then match nothing, and this sweep would publish
+        // a `review_divergence` WARN for the very ticket the operator deliberately took over — the
+        // false alarm the filter exists to prevent, on every tick. With no pass having looked, an
+        // empty set is "unknown", not "no hold", so report NOTHING rather than a verdict the sweep
+        // cannot stand behind. (Once a pass has run the set is a real answer and the filter is
+        // exact; a false stall for a held ticket is strictly worse than a deferred report, and this
+        // sweep is a report, not a control.)
+        //
+        // The set and the latch are read together, under one lock (STUDIO-949 round 13): read
+        // separately, a pass landing between the two calls would let this sweep hold an un-primed
+        // empty set and then read `primed == true`, treating "nothing has looked" as "no hold".
+        //
+        // MUTATION: drop this branch and
+        // `an_unprimed_hold_ledger_reports_no_divergence` reds (the held row is reported).
+        let (labelled, ledger_primed) = self.human_holds.labelled_and_primed();
+        if !ledger_primed {
             self.set_review_divergences(Vec::new());
             return;
         }
@@ -548,11 +722,31 @@ impl Orchestrator {
         };
         // Read once, before the rows, because the capacity-hold freshness test below needs it.
         let now = (self.now)();
+        // The current `rhapsody:human` LABEL set (STUDIO-949), already lowercased for the
+        // case-insensitive comparison below. A row whose origin ticket wears the label is a
+        // DELIBERATE hold, not a stalled obligation, so it is dropped before the rules can date it —
+        // the module doc's "a held ticket never arms a watch row" is false (a label applied after a
+        // run leaves one), so this is a filter, not a construction. Read with the priming latch,
+        // above, under one lock.
+        //
+        // This reads the CURRENT-LABEL set, not the reported-hold subset the console reads. The
+        // reported set deliberately excludes a ticket the daemon is RUNNING right now (a live run is
+        // not yet a deliberate hold for an operator), but the sweep must honour a label added to a
+        // run that is still live — the likeliest way the label is ever applied, and precisely the
+        // shape the ticketless watcher and the auto-merge gate already read this same set for. Using
+        // the reported subset instead let the sweep publish a `review_divergence` WARN for a ticket
+        // this feature had deliberately blocked. Empty on a daemon with no hold, so the default path
+        // is byte-identical.
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
         for row in &rows {
+            if let Some(ticket) = origin_ticket(&row.introduced_by)
+                && labelled.contains(&ticket.to_ascii_lowercase())
+            {
+                continue; // a deliberate hold, not this sweep's business
+            }
             let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
             // Per project (STUDIO-927): each pull request reads the override for the project
             // that owns its repo, so one repo can be held back while a sibling still merges.
@@ -604,7 +798,116 @@ impl Orchestrator {
             .iter()
             .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
             .filter_map(|(pr, facts)| {
-                let mut d = reconcile_pr(facts, now, RECONCILE_STALE_AFTER)?;
+                // STUDIO-956, first because it is the cause and the staleness rules below would only
+                // report the resulting silence an hour and a half later, without naming the bound. A
+                // spent shared review↔author budget stops BOTH halves of the loop, so a round that is
+                // still owed will never be dispatched; an in-flight round is progressing and an
+                // approved pull request is the merge gate's business, so neither is reported here.
+                //
+                // A manager adjudication suppresses the row rules entirely: an ESCALATE is reported
+                // as the decision it is (with its findings and rounds), a SHIP is reported only
+                // while the merge gate is still stuck on an unapproved row, and a pull request the
+                // manager is still deciding is not a stall at all.
+                let mut d = match self.adjudication(pr) {
+                    Some(crate::reviewadjudicate::Adjudication::Escalate {
+                        head,
+                        rounds,
+                        findings,
+                        reason,
+                    }) => Some(Divergence {
+                        pr: pr.to_string(),
+                        kind: DivergenceKind::ReviewEscalated,
+                        ticket: facts
+                            .rows
+                            .iter()
+                            .find(|r| !r.ticket.is_empty())
+                            .map(|r| r.ticket.clone())
+                            .unwrap_or_default(),
+                        reviewer: String::new(),
+                        stale_secs: newest_activity_secs(facts, now),
+                        auto_merge_reason: None,
+                        // A manager decision, not a slot: the loop is stopped because the
+                        // adjudication settled it, and this kind's WARN arm names that cause and
+                        // returns before the capacity wording is ever reached (STUDIO-950).
+                        capacity_held: None,
+                        capacity_unreadable: None,
+                        adjudicated_head: head,
+                        rounds,
+                        findings,
+                        reason,
+                    }),
+                    // A `ship` adjudicates the OPEN FINDINGS, never the gates — so if a live row
+                    // still records findings rather than an approval at the head, the merge gate
+                    // will never clear on its own and the pull request would otherwise be silent
+                    // forever. Report it as the decision it is; a shipped pull request whose rows
+                    // are ALL approved falls through below, where auto-merge either merges it or
+                    // `ApprovedStillOpen` reports the gate holding it after the staleness threshold.
+                    Some(crate::reviewadjudicate::Adjudication::Ship { head, rounds })
+                        if facts.rows.iter().any(|r| {
+                            r.open
+                                && r.status != REVIEW_STATUS_DROPPED
+                                && r.status != REVIEW_STATUS_APPROVED
+                        }) =>
+                    {
+                        Some(Divergence {
+                            pr: pr.to_string(),
+                            kind: DivergenceKind::ReviewShipped,
+                            ticket: facts
+                                .rows
+                                .iter()
+                                .find(|r| !r.ticket.is_empty())
+                                .map(|r| r.ticket.clone())
+                                .unwrap_or_default(),
+                            reviewer: String::new(),
+                            stale_secs: newest_activity_secs(facts, now),
+                            auto_merge_reason: None,
+                            // Same as the escalation above (STUDIO-950): a shipped loop is stopped
+                            // by the manager's decision, which its own WARN arm names.
+                            capacity_held: None,
+                            capacity_unreadable: None,
+                            adjudicated_head: head,
+                            rounds,
+                            findings: Vec::new(),
+                            reason: String::new(),
+                        })
+                    }
+                    // A shipped pull request whose rows are ALL approved is not this rule's: it is
+                    // the merge gate's business, and the gate either merges it or
+                    // `ApprovedStillOpen` reports it after the staleness threshold.
+                    Some(crate::reviewadjudicate::Adjudication::Ship { .. }) => {
+                        reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
+                    }
+                    // Still deciding: the loop is deliberately stopped while the manager's turn
+                    // runs, so the row and budget rules must not report it.
+                    Some(crate::reviewadjudicate::Adjudication::InFlight { .. }) => None,
+                    None if self.round_budget_spent(pr) && round_budget_owed(facts) => {
+                        Some(Divergence {
+                            pr: pr.to_string(),
+                            kind: DivergenceKind::RoundBudgetExhausted,
+                            ticket: facts
+                                .rows
+                                .iter()
+                                .find(|r| !r.ticket.is_empty())
+                                .map(|r| r.ticket.clone())
+                                .unwrap_or_default(),
+                            reviewer: String::new(),
+                            stale_secs: newest_activity_secs(facts, now),
+                            // Filled in below only for `ApprovedStillOpen`; a spent budget has
+                            // nothing for the auto-merge ledger to say.
+                            auto_merge_reason: None,
+                            // Nor the capacity annotations (STUDIO-950): a spent round budget is
+                            // not a slot wait, and its own WARN arm states the cause and the
+                            // remedy before the capacity wording is reached.
+                            capacity_held: None,
+                            capacity_unreadable: None,
+                            adjudicated_head: String::new(),
+                            rounds: 0,
+                            findings: Vec::new(),
+                            reason: String::new(),
+                        })
+                    }
+                    None => reconcile_pr(facts, now, RECONCILE_STALE_AFTER),
+                }?;
                 // The one place this sweep reads the auto-merge ledger (STUDIO-923): only for
                 // `ApprovedStillOpen`, the one divergence auto-merge would itself be attempting a
                 // merge against — the ledger has nothing meaningful to say about a pull request
@@ -765,6 +1068,81 @@ impl Orchestrator {
             // The crossing sweep, an annotation transition, and the rate-limited repeats in ONE
             // condition: at the crossing the count is 1, and `1 - 1` is a multiple of everything.
             if annotation_changed || (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
+                // STUDIO-956: the spent budget HAS a cause and a remedy, so it must not wear the
+                // "nothing has reported it blocked" wording the other rules use — that copy being
+                // false about a capped pull request is the defect this ticket's first ⚠️ names. The
+                // line says what stopped the loop and how an operator resumes it.
+                if d.kind == DivergenceKind::RoundBudgetExhausted {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        reviewer = %d.reviewer,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Nothing will resume it on its own; an \
+                         operator can clear the budget from the console (`POST \
+                         /api/v1/reviews/clear`) or close the pull request.",
+                        d.pr,
+                        d.kind.detail()
+                    );
+                    continue;
+                }
+                // STUDIO-956's decider: the manager reached the round threshold and escalated. The
+                // line carries the decision, the head it stopped at, the round count and the
+                // specific findings — an escalation an operator can act on, not "needs a human".
+                if d.kind == DivergenceKind::ReviewEscalated {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        head = %d.adjudicated_head,
+                        rounds = d.rounds,
+                        findings = ?d.findings,
+                        reason = %d.reason,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Head {}, {} rounds. Reason: {}. Open \
+                         findings: {}",
+                        d.pr,
+                        d.kind.detail(),
+                        d.adjudicated_head,
+                        d.rounds,
+                        if d.reason.trim().is_empty() {
+                            "not stated"
+                        } else {
+                            d.reason.trim()
+                        },
+                        if d.findings.is_empty() {
+                            "none recorded".to_string()
+                        } else {
+                            d.findings.join("; ")
+                        }
+                    );
+                    continue;
+                }
+                // STUDIO-956's decider: the manager SHIPPED the loop and the merge gate still holds
+                // it. The generic copy below would be false here — something HAS reported it
+                // blocked — so name the decision, the head it stopped at and the round count. A
+                // human merges it, approves the head, or clears the adjudication from the console.
+                if d.kind == DivergenceKind::ReviewShipped {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        head = %d.adjudicated_head,
+                        rounds = d.rounds,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Head {}, {} rounds. A human must merge it \
+                         or clear the adjudication from the console (`POST /api/v1/reviews/clear`).",
+                        d.pr,
+                        d.kind.detail(),
+                        d.adjudicated_head,
+                        d.rounds
+                    );
+                    continue;
+                }
                 // STUDIO-923: when auto-merge has already said something about this exact pull
                 // request, name it instead of claiming nothing has. The sentence states no count:
                 // auto-merge's own attempts run on the review watcher's separate
@@ -1534,7 +1912,18 @@ mod store_tests {
             .with_timezone(&Utc)
     }
 
+    /// An enabled ticketless daemon with one project. Primed by a selection pass, because every
+    /// sweep test after this one simulates a running daemon whose dispatch half has executed; the
+    /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(auto_merge: bool, now: &str) -> Orchestrator {
+        let o = orch_before_first_pass(auto_merge, now);
+        o.human_holds.begin_pass(true);
+        o
+    }
+
+    /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so its
+    /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
+    fn orch_before_first_pass(auto_merge: bool, now: &str) -> Orchestrator {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo"]);
@@ -1625,6 +2014,18 @@ mod store_tests {
         o.store()
             .mark_review_completed(&key, HEAD, REVIEW_STATUS_APPROVED)
             .expect("completed");
+    }
+
+    /// Records one run of `identifier` that has STARTED and not yet ended — the shape of the
+    /// summoned author run the budget was just spent on.
+    fn run_in_flight(o: &Orchestrator, identifier: &str, started: &str) -> i64 {
+        o.store()
+            .start_run(RunStart {
+                issue_identifier: identifier.to_string(),
+                started_at: started.to_string(),
+                ..Default::default()
+            })
+            .expect("start_run")
     }
 
     /// Records one finished run of `identifier`.
@@ -2155,6 +2556,511 @@ mod store_tests {
                 .iter()
                 .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
             "the unexplained stall must keep its warning alongside the capacity one, got {projects:?}"
+        );
+    }
+
+    /// STUDIO-949: the shape above, but with the origin ticket CURRENTLY held for a human. The row
+    /// exists (it was armed by an earlier run) yet the obligation is a deliberate hold, not a stall,
+    /// so the sweep must report nothing — on either surface.
+    ///
+    /// The fixture seeds the CURRENT-LABEL-only state (`note_human_label`, which is what the
+    /// selection pass records for a candidate wearing the label while its run is still live) rather
+    /// than `hold` (which feeds the reported subset too). That is the state the two sets disagree
+    /// on, so only this fixture pins the sweep to the live-inclusive signal; seeding `hold` passes
+    /// against either reader.
+    ///
+    /// MUTATION: delete the held-origin filter from `reconcile_review_divergence` and this reds;
+    /// read the reported `held()` set instead of `labelled()` and this reds too.
+    #[test]
+    fn a_held_ticket_is_not_reported_as_a_stall() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        // The authoring run ended BEFORE the review, which is the divergence the test above pins.
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        o.human_holds.note_human_label("STUDIO-893");
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a held ticket is a deliberate hold, not a stalled obligation"
+        );
+        assert!(
+            o.project_statuses()
+                .iter()
+                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
+        );
+    }
+
+    /// ⚠️ STUDIO-949 round 11: while the human-hold ledger has never been primed by a selection
+    /// pass, the sweep reports NOTHING — even a genuinely diverged row with no hold on it. The
+    /// current-label set has no writer above `on_tick`'s three early gates, and this sweep runs
+    /// ABOVE them on purpose, so on a daemon held by a bad config, an armed drain or a dead
+    /// credential the set is empty for the whole process lifetime. With no pass having looked, "the
+    /// row is not held" is not a fact the sweep can assert, and publishing a `review_divergence` WARN
+    /// for a held ticket is the false alarm the filter exists to prevent.
+    ///
+    /// `a_diverged_pull_request_is_reported_on_both_surfaces` is the live control: the SAME fixture
+    /// through a primed daemon reports on both surfaces.
+    ///
+    /// MUTATION: drop the un-primed (`!ledger_primed`) branch from `reconcile_review_divergence` and this reds (a
+    /// divergence is published).
+    #[test]
+    fn an_unprimed_hold_ledger_reports_no_divergence() {
+        let o = &mut orch_before_first_pass(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "with no pass having looked, the sweep cannot tell a hold from a stall"
+        );
+
+        // Once a pass has run, the same row is reported again.
+        o.human_holds.begin_pass(true);
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a primed sweep reports the divergence"
+        );
+    }
+
+    /// **STUDIO-956.** A watched pull request whose shared review↔author budget is spent is
+    /// reported, with its reason, immediately — not after [`RECONCILE_STALE_AFTER`], because a spent
+    /// budget never resolves on its own, and not as the "nothing has reported it blocked" copy,
+    /// which is false here.
+    ///
+    /// Mutation check (the ticket's ⚠️): demoting the exhausted-budget line to DEBUG leaves no WARN
+    /// for this capture and reds it. That is deliberate — the ticket asks for a stop the sweep
+    /// SURFACES, and a DEBUG line is the silent cap that already pages a human as an idle board.
+    #[test]
+    fn a_spent_round_budget_is_reported_on_both_surfaces() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        // The findings that would summon the author, landed a MINUTE ago: far inside the staleness
+        // threshold, so the staleness rules report nothing and only the budget rule can.
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // The loop has spent its whole shared budget.
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        // See the sibling tests above for why the warm-up call exists: this WARN callsite is new,
+        // and an uncaptured first hit can race a test running on another thread.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("review round budget is spent"),
+            "the line must name the reason, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the copy that was false about a capped pull request must not be reused: {}",
+            warn.message
+        );
+        // Round-8 finding 3: this fixture is an install with NO `review.adjudicate_after_rounds`,
+        // where the author half is deliberately unbounded. The line must not claim it is stopped —
+        // that sentence was false in exactly the incident it printed in.
+        //
+        // MUTATION: restore "no further review or author re-run will be dispatched" to
+        // `DivergenceKind::detail` and this reds.
+        assert!(
+            o.adjudication_threshold_for_test().is_none(),
+            "the fixture must be the unset install this assertion is about"
+        );
+        assert!(
+            !warn.message.contains("author"),
+            "an unset install's author half is unbounded; the line must not say otherwise: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::RoundBudgetExhausted);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+        assert!(
+            !found[0].kind.detail().contains("author"),
+            "and neither must the console/`/api/v1/state` copy: {}",
+            found[0].kind.detail()
+        );
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["kind"],
+            "round_budget_exhausted"
+        );
+    }
+
+    /// **Acceptance.** An ESCALATE decision is reported by the sweep as an ESCALATION carrying the
+    /// open findings, the round count and the head the loop stopped at — not as an unexplained
+    /// stall, and not with the "nothing has reported it blocked" copy.
+    ///
+    /// Mutation check (the ticket's ⚠️): making the escalation log-only (so the divergence is not
+    /// recorded) leaves no WARN here and reds it.
+    #[test]
+    fn an_escalated_review_is_reported_with_its_findings_and_rounds() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            3,
+        );
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::Escalate {
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes at aaaaaaa".to_string()],
+                reason: "the migration needs a DBA".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        // Warm-up for the new WARN callsite, then capture.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("escalated"),
+            "the line must name the decision, got: {}",
+            warn.message
+        );
+        assert!(
+            warn.message.contains("alice asked for changes at aaaaaaa"),
+            "the specific open findings must be named, got: {}",
+            warn.message
+        );
+        assert!(
+            warn.message.contains("the migration needs a DBA"),
+            "the manager's own reason must reach the WARN, not only the room and the pull request: \
+             {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::ReviewEscalated);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+        assert_eq!(found[0].rounds, 3);
+        assert_eq!(found[0].adjudicated_head, HEAD);
+        assert_eq!(found[0].reason, "the migration needs a DBA");
+        assert_eq!(
+            found[0].findings,
+            vec!["alice asked for changes at aaaaaaa".to_string()]
+        );
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
+    }
+
+    /// **A shipped pull request the merge gate cannot clear is REPORTED, not hidden.** A `ship`
+    /// adjudicates the open findings, never the gates — so if a live row still records findings
+    /// rather than an approval at the head, the gate will never clear on its own and the loop is
+    /// stopped: with the decision suppressed, nothing would ever mention it again.
+    ///
+    /// Mutation check (the ticket's ⚠️): making the shipped decision log-only (returning `None`
+    /// here, as the first cut did) reds this.
+    #[test]
+    fn a_shipped_pull_request_the_merge_gate_cannot_clear_is_reported() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            3,
+        );
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::Ship {
+                head: HEAD.to_string(),
+                rounds: 3,
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        // Warm-up for the new WARN callsite, then capture.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("shipped"),
+            "the line must name the decision, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the copy that is false about a decided pull request must not be reused: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::ReviewShipped);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+        assert_eq!(found[0].rounds, 3);
+        assert_eq!(found[0].adjudicated_head, HEAD);
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(rendered["review_divergence"][0]["kind"], "review_shipped");
+    }
+
+    /// A shipped pull request whose live rows are ALL approved is the merge gate's business, not a
+    /// `review_shipped` report: auto-merge merges it, or `ApprovedStillOpen` reports the stuck gate
+    /// after the staleness threshold. Pinned so the shipped rule cannot widen into crying wolf on
+    /// every successful ship.
+    #[test]
+    fn a_shipped_pull_request_with_every_row_approved_is_not_reported_shipped() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        // The reviewer approved the head after the loop ran out.
+        approved_row(o, "alice", "STUDIO-170");
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::Ship {
+                head: HEAD.to_string(),
+                rounds: 3,
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a shipped pull request every row approved is not a stall, got {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// A decision still being made is not a stall: the loop is stopped deliberately while the
+    /// manager's turn runs, so the row and budget rules must not report it.
+    #[test]
+    fn a_deciding_pull_request_is_not_reported_as_a_stall() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::InFlight { rounds: 3 },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a pull request the manager is still deciding must not be reported, got {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// The budget is spent at DISPATCH, so the summoned author run that spent it is in flight for
+    /// its WHOLE duration. Reporting the pull request then would be premature by an entire agent run
+    /// and would flicker off when the run finished — the same defect this feature's first cut fixed
+    /// for the review half, on the author half.
+    #[test]
+    fn a_spent_budget_reports_nothing_while_the_summoned_author_runs() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        // The reviewer's round finished at 21:19...
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // ...and the author's summoned run STARTED 21:19:30 and has not ended. This is the run the
+        // spent budget was charged for: the loop is progressing, not stalled.
+        run_in_flight(o, "STUDIO-170", "2026-09-14T21:19:30Z");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "an author run in flight must silence the pull request, got {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// The other half of the same gap: an author who ran, answered and deliberately held without
+    /// pushing leaves the row `reviewed`, but `ticket_run.started_at >= anchor` is a shape
+    /// [`reconcile_pr`] calls healthy — so the budget report must not call it a stall either.
+    #[test]
+    fn a_spent_budget_reports_nothing_when_the_author_answered_and_held() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // The author answered the findings after the verdict landed and pushed nothing.
+        run(
+            o,
+            "STUDIO-170",
+            "2026-09-14T21:19:30Z",
+            "2026-09-14T21:19:40Z",
+        );
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "a row the author already answered is not a stall, got {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// The budget rule is scoped: an in-flight round beside a spent budget is progressing, an
+    /// approved pull request is the merge gate's business, and neither is reported. This is what
+    /// keeps the report from crying wolf on a healthy (if expensive) loop.
+    #[test]
+    fn a_spent_budget_reports_nothing_while_a_round_is_in_flight_or_approved() {
+        // A MIXED pull request: one reviewer's findings are outstanding (reviewed) while a second
+        // reviewer's round is in flight. The running agent silences the whole pull request — a spent
+        // budget beside it is not a stall — which a per-row rule would get wrong.
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        let running_key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 164,
+            reviewer: "bob".to_string(),
+        };
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: running_key.clone(),
+                author: "jimmy".to_string(),
+                introduced_by: "handoff:STUDIO-170".to_string(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: String::new(),
+                open: true,
+            })
+            .expect("seed the second row");
+        // `mark_review_requested` moves it to `in_flight`.
+        o.store()
+            .mark_review_requested(&running_key, HEAD)
+            .expect("in-flight");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "a round in flight silences the pull request, got {:?}",
+            o.review_divergences()
+        );
+
+        // Every live row approved, auto-merge off.
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-170");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "with auto-merge off an approved pull request waits for a human, got {:?}",
+            o.review_divergences()
         );
     }
 
