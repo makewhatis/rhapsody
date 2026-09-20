@@ -1262,16 +1262,17 @@ too, independently of the historical run status, and keeps it in the run's lane 
 and the Now strip all count such a ticket once, in that lane.
 
 **How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
-dispatch is read from the candidate issue itself, so `eligible()` and the reopen ladder refuse it
-wherever the daemon can see the ticket, and a ticket that never becomes a candidate is never
-dispatched either. The watcher, adoption, reconciliation and auto-merge gates, and the console's
-`held_for_human` key, instead read dispatcher state built as the selection pass walks the candidate
-fetch (active ∪ review states, narrowed by `claim_mode`). Under `claim_mode: pool` the pool claim
-ASSIGNS the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query
-and its label stops reaching those readers; in assignee mode the same happens the moment the ticket
-is reassigned to the person taking it over. Those four readers are therefore best-effort off the
-candidate path rather than guarantees, and they say so here rather than implying the refusal holds
-while the daemon no longer owns the ticket.
+dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the
+adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and a ticket that
+never becomes a candidate is never dispatched either. The ticketless review watcher, the
+reconciliation sweep, the auto-merge gate and the console's `held_for_human` key instead read
+dispatcher state built as the selection pass walks the candidate fetch (active ∪ review states,
+narrowed by `claim_mode`). Under `claim_mode: pool` the pool claim ASSIGNS the ticket and nothing
+ever clears it, so a ticket that has run leaves the candidate query and its label stops reaching
+those readers; in assignee mode the same happens the moment the ticket is reassigned to the person
+taking it over. Those four readers are therefore best-effort off the candidate path rather than
+guarantees, and they say so here rather than implying the refusal holds while the daemon no longer
+owns the ticket.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
