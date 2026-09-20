@@ -139,6 +139,10 @@ pub struct Agent {
     /// so a review round can dispatch while every implementation slot is occupied (the inversion D2
     /// fixed per teammate, never at the global cap). Anything ≤ 0 is treated as unset.
     ///
+    /// When set, total live agents may exceed `max_concurrent_agents` by up to this value: the
+    /// implementation cap still bounds implementations and this bounds reviews. That is the
+    /// intended "reviews are free" semantics, not a leak.
+    ///
     /// **Rhapsody-only** (no Go reference): decoded, carried on `Effective`, and preserved by
     /// `encode` (so a console Save keeps it), but deliberately NOT rendered by `effective_json`,
     /// whose response is byte-pinned to the Go config goldens — the same pattern as
