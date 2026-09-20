@@ -403,10 +403,12 @@ impl Orchestrator {
         // exists, so re-arming an existing row cannot forget what was dispatched or reviewed.
         let watch_key = run.watch_key();
         // The reviewer's PRIOR round (STUDIO-959), read BEFORE the writes below touch the row: the
-        // commit this reviewer last read is exactly what a delta round diffs from, and the
-        // dispatch's own `mark_review_requested` would otherwise be indistinguishable from it. A
-        // missing row (a first round) or a failed read both leave `prior_sha` empty, which is a full
-        // review — the safe direction, because a delta from an unknown commit is no delta at all.
+        // commit this reviewer last read is exactly what a delta round diffs from. Today neither
+        // write can move `last_reviewed_sha` (`mark_review_completed` alone owns it), so this read
+        // would see the same value after them; the placement is defensive, not a guard the suite
+        // pins. A missing row (a first round) or a failed read both leave `prior_sha` empty, which
+        // is a full review — the safe direction, because a delta from an unknown commit is no delta
+        // at all.
         run.prior_sha = self
             .store()
             .get_review_watch(&watch_key)

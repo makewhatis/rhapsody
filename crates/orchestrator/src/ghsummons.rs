@@ -1548,9 +1548,13 @@ impl ReviewDeltaSource for GH {
         // RFC3339 (`Z`), so a lexicographic sort is chronological; a comment with no timestamp sorts
         // oldest, and is never dropped in favour of one that has a timestamp.
         let mut found: Vec<(String, String)> = Vec::new();
+        // Per-PULL-REQUEST paths, not the repository-wide `repos/{o}/{r}/issues/comments` lists
+        // (STUDIO-959, alice's round-1 blocker): the repo-wide form returns every pull request's
+        // comments, so a delta round would be handed some other review's findings. The number is
+        // the path segment here, which is why it is not merely a positivity guard above.
         for endpoint in ["issues", "pulls"] {
             let path = format!(
-                "repos/{owner}/{repo}/{endpoint}/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                "repos/{owner}/{repo}/{endpoint}/{number}/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
             );
             let body = self.run_off_task(vec!["api".into(), path.clone()]).await?;
             let v: serde_json::Value = serde_json::from_slice(&body).map_err(
@@ -3441,14 +3445,22 @@ mod tests {
 
     /// Both comment endpoints are read, empty bodies are skipped, and the list comes back oldest
     /// first (the API answers newest first and the round should read it as it happened).
+    ///
+    /// The argv is pinned in full, like `is_ancestor_maps_the_compare_status`: the repository-wide
+    /// `repos/{o}/{r}/issues/comments` list is the shape `SummonSource` wants, and handing a delta
+    /// round comments from OTHER pull requests is a defect no assertion on the returned bodies can
+    /// see (STUDIO-959, alice's round-1 blocker).
     #[tokio::test]
     async fn prior_findings_reads_both_endpoints_and_orders_them() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
         let run: RunFn = Box::new(move |args: &[&str]| {
             counter.fetch_add(1, Ordering::SeqCst);
+            sink.lock().expect("argv lock").push(args.join(" "));
             let ep = args.last().copied().unwrap_or_default();
-            let body = if ep.contains("/issues/comments") {
+            let body = if ep.contains("/issues/12/comments") {
                 r#"[{"body":"newer issue finding","created_at":"2026-09-20T12:00:00Z"},{"body":"   "}]"#
             } else {
                 r#"[{"body":"older review finding","created_at":"2026-09-20T09:00:00Z"}]"#
@@ -3466,6 +3478,19 @@ mod tests {
             "exactly one read per comment endpoint"
         );
         assert_eq!(got, vec!["older review finding", "newer issue finding"]);
+        let argv = seen.lock().expect("argv lock").clone();
+        assert_eq!(
+            argv,
+            [
+                format!(
+                    "api repos/o/r/issues/12/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                ),
+                format!(
+                    "api repos/o/r/pulls/12/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                ),
+            ],
+            "the comments are read at the pull request's OWN endpoints"
+        );
     }
 
     /// A body longer than the cap is truncated on a CHARACTER boundary and marked with an ellipsis.
@@ -3476,7 +3501,7 @@ mod tests {
         let run: RunFn = Box::new(move |args: &[&str]| {
             // Answer the first endpoint with the long body and the second with nothing.
             let ep = args.last().copied().unwrap_or_default();
-            if ep.contains("/issues/comments") {
+            if ep.contains("/issues/12/comments") {
                 Ok(body.clone().into_bytes())
             } else {
                 Ok(b"[]".to_vec())
@@ -3499,7 +3524,7 @@ mod tests {
     async fn prior_findings_fails_when_one_endpoint_fails() {
         let run: RunFn = Box::new(|args: &[&str]| {
             let ep = args.last().copied().unwrap_or_default();
-            if ep.contains("/pulls/comments") {
+            if ep.contains("/pulls/12/comments") {
                 return Err("gh: boom".into());
             }
             Ok(b"[]".to_vec())

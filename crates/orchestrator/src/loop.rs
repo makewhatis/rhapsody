@@ -1475,8 +1475,8 @@ impl Orchestrator {
         // A delta review round's `gh` reads (STUDIO-959), built only for a review dispatch and
         // handed to the worker's own off-loop task. The summon token is `GH::new`'s only
         // construction input and the compare/comments reads do not use it, so a daemon with no
-        // readable workflow still gets a working seam. A build failure is `None`, and every round
-        // is then FULL — the safe direction, since a delta is only taken when GitHub answers.
+        // readable workflow still gets a working seam. Every round is FULL the moment any read
+        // fails — the safe direction, since a delta is only taken when GitHub answers.
         if deps.review.is_some() {
             deps.review_delta = Some(std::sync::Arc::new(crate::ghsummons::GH::new(
                 &eff.cfg.tracker.summon_token,

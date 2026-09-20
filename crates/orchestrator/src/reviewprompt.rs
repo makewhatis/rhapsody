@@ -86,8 +86,8 @@ pub enum ReviewRoundMode {
 pub enum FullReviewReason {
     /// No prior round this reviewer read, or no record of one: the ordinary first review.
     NoPriorRound,
-    /// A prior attempt at this SAME head did not record a verdict (a truncated round), so the whole
-    /// change is read again rather than diffed against itself.
+    /// A verdict was already recorded at this commit, and the review was re-armed for another
+    /// look at the same head — the operator's re-run. There is no delta between them to review.
     SameHead,
     /// The prior commit is not an ancestor of the head — a rebase or force-push — so a delta between
     /// them would be meaningless.
@@ -108,8 +108,8 @@ impl ReviewRoundMode {
 ///
 /// `is_ancestor`/`findings` are `Option` because each is a `gh` read that can fail: `None` means the
 /// read did not answer, and every `None` falls back to a FULL review. `prior_sha == head` is a
-/// round at a head already read — a truncated round re-armed at the same commit — and is full too,
-/// because there is no delta to review.
+/// round at a head already read — an operator re-run of a finished round — and is full too, because
+/// there is no delta to review.
 ///
 /// Pure and side-effect-free on purpose: the five acceptance cases (first round, rebase, fetch
 /// failure, delta, same head) are all driveable through this one function, which is what makes the
@@ -160,7 +160,9 @@ pub fn review_round_description(mode: &ReviewRoundMode, head: &str) -> String {
                      a round you read at an earlier commit"
                 }
                 FullReviewReason::SameHead => {
-                    "an earlier attempt at this same commit did not record a verdict"
+                    "a verdict was already recorded at this commit and this round was re-armed \
+                     for another look at the same head, so there is no delta between them to \
+                     review"
                 }
                 FullReviewReason::Rebase => {
                     "the commit you last read is not an ancestor of the head (the branch was rebased \
@@ -188,11 +190,15 @@ pub fn review_round_description(mode: &ReviewRoundMode, head: &str) -> String {
             );
             if findings.is_empty() {
                 out.push_str(
-                    "\n**Your prior findings:** the daemon found no findings comments on this pull \
-                     request from that round.\n",
+                    "\n**Comments on this pull request:** the daemon found no findings comments to \
+                     hand you.\n",
                 );
             } else {
-                out.push_str("\n**Your prior findings from that round:**\n");
+                out.push_str(
+                    "\n**Comments already on this pull request** — the most recent ones, which \
+                     include findings filed earlier but also the author's replies and the daemon's \
+                     own notices, so they are not all yours:\n",
+                );
                 for f in findings {
                     out.push_str("\n---\n");
                     out.push_str(f);
@@ -200,7 +206,7 @@ pub fn review_round_description(mode: &ReviewRoundMode, head: &str) -> String {
                 }
             }
             out.push_str(
-                "\nConfirm each of those is addressed, or say why it is not, and review the delta \
+                "\nConfirm each finding is addressed, or say why it is not, and review the delta \
                  itself for anything new.\n",
             );
             out
@@ -223,7 +229,7 @@ pub async fn resolve_review_round(
     };
     // Nothing to ask when there is no prior commit, or the prior commit IS the head: both are full
     // rounds by construction, and spending two `gh` calls to learn that would be waste on the one
-    // path (a truncated round re-armed at its own head) that reaches it.
+    // path (an operator re-run of a finished round at its own head) that reaches it.
     if request.prior_sha.is_empty()
         || request.head_sha.is_empty()
         || request.prior_sha == request.head_sha
@@ -475,13 +481,37 @@ mod tests {
         assert!(review_round_description(&unreadable, HEAD).contains("full review"));
     }
 
-    /// A round at the SAME commit is not a delta against itself: a truncated round re-armed at its
-    /// own head is a full re-read.
+    /// A round at the SAME commit is not a delta against itself: an operator re-run of a finished
+    /// round, at its own head, is a full re-read — and the description does not claim the earlier
+    /// round failed to record a verdict (it did; the re-run is the reason there is another round).
     #[test]
     fn a_prior_commit_equal_to_the_head_is_a_full_review() {
-        assert_eq!(
-            review_round_mode(HEAD, HEAD, Some(true), Some(vec![])),
-            ReviewRoundMode::Full(FullReviewReason::SameHead)
+        let mode = review_round_mode(HEAD, HEAD, Some(true), Some(vec![]));
+        assert_eq!(mode, ReviewRoundMode::Full(FullReviewReason::SameHead));
+        let text = review_round_description(&mode, HEAD);
+        assert!(text.contains("full review"), "{text}");
+        assert!(
+            text.contains("re-armed") || text.contains("another look"),
+            "a same-head round must say a verdict was already recorded here:\n{text}"
+        );
+        assert!(
+            !text.contains("did not record a verdict"),
+            "the earlier round did record a verdict; this is a re-run:\n{text}"
+        );
+    }
+
+    /// The findings section is headed honestly: the list the daemon reads back is the pull
+    /// request's own comment thread, so it also holds the author's replies and the daemon's notices.
+    /// Calling them "your prior findings" would have the round treat all of it as its own. Mutation:
+    /// dropping the findings from the description reds
+    /// `an_ancestor_prior_commit_is_a_delta_given_its_findings` above.
+    #[test]
+    fn a_delta_does_not_call_the_whole_thread_the_reviewers_own() {
+        let mode = review_round_mode(PRIOR, HEAD, Some(true), Some(vec!["a finding".into()]));
+        let text = review_round_description(&mode, HEAD);
+        assert!(
+            text.contains("not all yours"),
+            "the heading must not claim the whole comment thread is this reviewer's:\n{text}"
         );
     }
 
