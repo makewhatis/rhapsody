@@ -333,14 +333,12 @@ export function jobStatus(
   // a ticket that is live/retrying (handled above) or has a real finished segment is no longer purely
   // waiting, so its real run status wins and the run stays openable.
   //
-  // The `every(waiting)` half is NOT merely defensive (STUDIO-949 round 4). The dispatcher's
-  // review-state branch holds `rhapsody:human` tickets that HAVE run — parked in review, then
-  // labelled — so one group can hold both a real history row and a synthetic held row. When it does,
-  // the real run status wins here and this row loses `heldForHuman`. That is a KNOWN divergence, not
-  // an oversight: the board's card still carries the chip (`console-board.ts` sets `heldForHuman`
-  // from the hold set directly, independently of the row), so the board is the surface that reports a
-  // hold on a ticket that has run. This function deliberately does not, because a worklist row's
-  // click target and run detail must stay the real run.
+  // The `every(waiting)` half is NOT merely defensive: the dispatcher can hold a `rhapsody:human`
+  // ticket that HAS run (parked in review, then labelled), so one group can hold both a real history
+  // row and a synthetic held row. When it does, the real run status wins HERE — the lane must stay
+  // the run's, and the row must stay openable on it (STUDIO-949). But the HOLD is not lost: `mergeJobs`
+  // carries `heldForHuman` and the "held for a human" sub-label independently of this status, so the
+  // default List view still reads the ticket as deliberately held rather than merely completed.
   if (group.some((r) => r.waiting) && group.every((r) => r.waiting)) return "waiting";
   const newest = group[0];
   switch (newest?.outcome) {
@@ -524,10 +522,20 @@ export function mergeJobs(
     const status = jobStatus(g);
     const liveRow = g.find((r) => r.live);
     const waitingRow = g.find((r) => r.waiting);
+    const heldRow = g.find((r) => r.heldForHuman === true);
     const newestReal = g.find((r) => !r.queued && !r.waiting); // a live or history row (never synthetic)
     const isWaiting = status === "waiting";
-    // For a held job the waiting row owns the display (its title/project come from BlockedEntry) and
-    // the row is never clickable (it has never run → runId 0). Otherwise the live/newest-real row wins.
+    // A current hold outlives a prior run (STUDIO-949). The dispatcher can hold a ticket that HAS
+    // run — parked in review, then labelled — so a held row and a real history row can share one
+    // group. The real run still decides the lane and keeps the row openable, but `heldForHuman` is
+    // carried INDEPENDENTLY of the historical status, so the default List view never presents
+    // deliberately held work as merely completed/stopped. A live group is the one exception: the
+    // daemon does not hold a ticket it is mid-run on, so a hold beside a running row would be a
+    // stale pass's ghost (and `consoleJobStatus` would wrongly repaint a live run "queued").
+    const heldForHuman = heldRow !== undefined && status !== "running";
+    // For a held job that has never run, the waiting row owns the display (its title/project come
+    // from the hold entry) and the row is never clickable (runId 0). Otherwise the live/newest-real
+    // row wins, so a held ticket that HAS run stays openable on its real run.
     const rep = liveRow ?? (isWaiting ? waitingRow : undefined) ?? newestReal ?? g[0];
     out.push({
       key: rep.key,
@@ -545,14 +553,14 @@ export function mergeJobs(
       durationAccent: rep.durationAccent,
       live: !!liveRow,
       startedAtMs: rep.startedAtMs,
-      subLabel: isWaiting
-        ? waitingRow?.heldForHuman
-          ? "held for a human"
-          : `waiting on ${waitingRow?.waitingOn ?? ""}`
-        : status === "failed"
-          ? failureSubLabel(newestReal?.error ?? "") || undefined
-          : undefined,
-      heldForHuman: isWaiting && waitingRow?.heldForHuman === true,
+      subLabel: heldForHuman
+        ? "held for a human"
+        : isWaiting
+          ? `waiting on ${waitingRow?.waitingOn ?? ""}`
+          : status === "failed"
+            ? failureSubLabel(newestReal?.error ?? "") || undefined
+            : undefined,
+      heldForHuman,
     });
   }
 
