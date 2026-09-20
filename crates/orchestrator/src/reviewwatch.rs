@@ -2035,6 +2035,54 @@ mod tests {
         );
     }
 
+    /// ⚠️ Acceptance (alice's round-3 blocker): the unanswered-sweep clock counts CONSECUTIVE sweeps
+    /// at the SAME head, so a pushed head RESTARTS it. Without the reset, the clock carried across a
+    /// push would escalate an author who demonstrably just acted a few sweeps into the new head — at
+    /// poke 2 of 3, not the `MAX_DRAFT_POKES` the distinct-head axis promises.
+    #[test]
+    fn a_new_head_restarts_the_unanswered_sweep_clock() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // Poke HEAD_A, then sit at it for half the window — far enough that a carried clock would
+        // cross the bound soon after a push, but never crossing it at A.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        for _ in 0..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2 {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty()
+            );
+        }
+        let spent = crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2;
+        assert_eq!(
+            poke_state(&o, 12).map(|s| s.unanswered_sweeps),
+            Some(spent),
+            "the clock has advanced at the head that never moved"
+        );
+
+        // The author pushes but leaves it a draft: the new head is a fresh poke AND a fresh clock.
+        let moved = o.handle_review_sweep(&[draft_at(12, HEAD_B)]);
+        assert_eq!(poked_heads(&moved), vec![HEAD_B.to_string()]);
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.pokes, s.unanswered_sweeps)),
+            Some((2, 0)),
+            "a pushed head restarts the unanswered-sweep clock"
+        );
+        // And the new head gets the WHOLE window: a carried clock would escalate within a few sweeps.
+        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_B)])
+                    .nudges
+                    .is_empty(),
+                "sweep {sweep} at the new head: the clock restarted and the bound is not crossed"
+            );
+        }
+    }
+
     /// ⚠️ Acceptance (jimmy's round-1 blocker): a draft IGNORED at a static head — the shape
     /// booch#537 actually had — escalates to a human instead of parking in silence forever. The
     /// distinct-head ceiling alone poked once and then heard from nobody, so this pins the SECOND

@@ -1361,7 +1361,7 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 | detection | none (the feature does not exist) | the ticketless review watch set: a row carrying an origin ticket is one a run HANDED OVER (or the adoption sweep adopted), which is what "finished" means here; a console-introduced row has none and is never poked |
 | action | n/a | a summons comment naming the pull request and the action; the daemon never marks it ready |
 | frequency | n/a | **once per head** — the same head is never poked twice, and a per-tick poke is the re-dispatch loop STUDIO-956 bounds |
-| if ignored | n/a | **two bounds**: after three distinct heads, or after an hour at one static head, it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
+| if ignored | n/a | **two bounds**: after three distinct heads, or after about an hour at one static head, it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
 | default | n/a | **inert**: silent with Teams off, off the ticketless path (there is no watch set to observe), and on a healthy board |
 
 **The trigger is the handoff, not the process exiting.** A watch row comes from a run handing its
@@ -1382,8 +1382,10 @@ and ESCALATES to a human. Without the second axis an ignored draft at a fixed he
 one comment and then silence forever, which is the parking this feature exists to end.
 
 **In memory, and that is deliberate.** The per-head bookkeeping is a churn floor rather than an audit
-record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets it, and the worst that costs is
-one more poke at a head already poked.
+record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets the whole ledger — the escalation
+included — so a still-draft pull request already handed to a human is poked afresh and can earn a
+second escalation, once per restart for as long as the draft stands. Persisting the ladder is a
+larger decision than this feature.
 
 **An unstated `isDraft` is never acted on, in either direction.** `PrSnapshot::is_draft` is an
 `Option<bool>`, and its readers take an unstated answer in the safe direction each needs: the

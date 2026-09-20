@@ -94,9 +94,8 @@ pub const MAX_DRAFT_POKES: usize = 3;
 /// on a rotating cursor, so a larger watch set or a flaky `gh` makes an hour a floor rather than a
 /// promise. Either way it is long enough that a re-engaged run has time to start, push and publish,
 /// and far shorter than the 4h55m the incident sat refused. Counted in sweeps rather than a
-/// `Duration` for
-/// [`crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS`]'s reason: the state is already in sweeps, and
-/// a clock here would be a second unit to keep honest.
+/// `Duration` for [`crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS`]'s reason: the state is already
+/// in sweeps, and a clock here would be a second unit to keep honest.
 pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
 
 /// One pull request the daemon must poke: a run has finished, and its pull request is still a draft.
@@ -136,9 +135,10 @@ pub enum DraftNudge {
 /// `churn_key` on the control task.
 ///
 /// In memory rather than a column, for [`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`]'s reason:
-/// it is a churn floor, not an audit record. A restart forgets it, which for an operator who
-/// restarted the daemon to unstick something is the correct outcome — the worst it costs is one
-/// more poke at a head already poked.
+/// it is a churn floor, not an audit record. A restart forgets the WHOLE ledger — `escalated`
+/// included — so a still-draft pull request already handed to a human is poked afresh, and can earn
+/// a second human escalation, once per restart for as long as the draft stands. That is the cost of
+/// not persisting a churn floor; persisting the ladder is a larger decision than this feature.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DraftPokeState {
     /// The head last poked. A DIFFERENT head is a new poke; the same head is the same poke.
@@ -146,8 +146,9 @@ pub struct DraftPokeState {
     /// How many distinct heads this pull request has been poked at.
     pub pokes: usize,
     /// How many CONSECUTIVE sweeps the [`Self::poked_head`] has been observed still a draft since it
-    /// was poked. Reset when the head moves (a new head is a fresh poke) and never advanced while
-    /// the author's run is live; the escalation fires at [`MAX_DRAFT_POKE_SWEEPS`].
+    /// was poked. Reset when the head moves (a new head is a fresh poke); never advanced while the
+    /// author's run is live; and never advanced on a tick GitHub could not answer, since an unstated
+    /// `isDraft` is not an observation. The escalation fires at [`MAX_DRAFT_POKE_SWEEPS`].
     pub unanswered_sweeps: usize,
     /// Whether the human escalation has already been made. Once true, this pull request is silent
     /// until it stops being a draft.
@@ -338,6 +339,12 @@ mod tests {
         );
         assert!(body.contains("draft"), "{body}");
         assert!(body.contains("mark it ready"), "{body}");
+        // The count the poke reports, pinned as a PHRASE: a bare digit would be satisfied by the
+        // pull request number (537 contains a 3), so it could not see the sentence being deleted.
+        assert!(
+            body.contains(&format!("poke 1 of at most {MAX_DRAFT_POKES}")),
+            "the poke says which poke it is: {body}"
+        );
     }
 
     /// The escalation is NOT a summons — it must not reopen the author's run a fourth time.
@@ -352,7 +359,12 @@ mod tests {
             !crate::reviewnotify::summons_author(&body, "@symphony"),
             "the escalation must not summon: {body}"
         );
-        assert!(body.contains('3'), "the count is named: {body}");
+        // A PHRASE, not a bare digit: `537` in the pull request name would satisfy `contains('3')`,
+        // leaving the assertion vacuous exactly when the count sentence is deleted.
+        assert!(
+            body.contains("made 3 attempts"),
+            "the count is named: {body}"
+        );
         assert!(
             body.contains("makewhatis/rhapsody#537"),
             "the pull request is named: {body}"
