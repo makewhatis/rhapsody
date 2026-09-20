@@ -123,8 +123,12 @@ impl Orchestrator {
                         // so noting it unfiltered would report a ticket an agent is RUNNING RIGHT
                         // NOW as "held for a human" whenever the pool happens to be full, the two
                         // paths disagreeing about the same ticket at the same instant.
+                        // A `rhapsody:human` hold is NOT a capacity casualty: it would be refused
+                        // with every seat free, so naming it in the cap line would blame the cap for
+                        // a deliberate hold. Report the hold and leave it out of the tally.
                         if crate::teams::is_human(&i) {
                             self.note_human_hold(&i, "");
+                            continue;
                         }
                         held.push(i.identifier);
                     }
@@ -363,7 +367,9 @@ impl Orchestrator {
                 for t in std::iter::once(ti).chain(tagged.by_ref()) {
                     if self.is_unworked_candidate(&t.iss, &running, &recovered_claims) {
                         // See the single-project ladder: the human note shares the capacity
-                        // tally's filter so a ticket with a live run is never reported as held.
+                        // tally's filter so a ticket with a live run is never reported as held —
+                        // and, being a deliberate hold rather than a cap casualty, it is left OUT
+                        // of the cap line's tally.
                         if crate::teams::is_human(&t.iss) {
                             let slug = t
                                 .proj
@@ -371,6 +377,7 @@ impl Orchestrator {
                                 .map(|p| p.slug.as_str())
                                 .unwrap_or("");
                             self.note_human_hold(&t.iss, slug);
+                            continue;
                         }
                         held.push(t.iss.identifier);
                     }

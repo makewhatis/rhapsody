@@ -18,8 +18,10 @@ the `Orchestrator` struct itself. Concretely:
 - Modules whose functions take `&mut self` / `&Orchestrator` and are called from the loop
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined and
-  must never be called from another task. They hold no lock of their own; the one exception is that
-  `dispatch`/`select` take `HumanHoldLedger`'s lock on `&self` (see the seam list below).
+  must never be called from another task. They hold no lock of their own; the one exception is
+  `HumanHoldLedger`'s lock, taken on `&self` by every module in that list that touches the
+  `rhapsody:human` hold — `dispatch` and `select` (write it), `promote` (write it) and `snapshot`
+  (read it) (see the seam list below).
 - Nine exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the

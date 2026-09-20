@@ -107,8 +107,12 @@ pub(crate) struct AdoptSweep {
     pub(crate) planned: Vec<ReviewIntroRequest>,
     /// `(project group, ticket identifier, why)` for each candidate that could not be adopted.
     pub(crate) refused: Vec<(String, String, &'static str)>,
-    /// `(project group, ticket identifier)` for each candidate that IS adoptable — the input to
-    /// retiring an advisory an earlier sweep filed against it.
+    /// `(project group, ticket identifier)` for each candidate whose stale orphan advisory must be
+    /// retired — the ADOPTABLE ones, and (STUDIO-949) a `rhapsody:human` one this daemon now skips.
+    /// The name is about the EFFECT, not adoptability: the field is the input to
+    /// [`clear_orphaned_review`](Self::clear_orphaned_review), which is the only thing that retires
+    /// a recorded advisory, so a held ticket whose advisory predates the label is repaired here
+    /// rather than left standing forever.
     ///
     /// Reported separately from [`planned`](Self::planned) rather than derived from it, because the
     /// advisory is keyed by (group, ticket) and a `ReviewIntroRequest` carries neither: it names a
