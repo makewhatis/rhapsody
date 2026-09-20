@@ -91,6 +91,10 @@ pub struct ResolvedProject {
     /// always non-empty post-resolve). `dep_mode_prompt_file` is the mode-on prompt path. INF-318.
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// The project's effective set of backlog-state names auto-promote may promote FROM (STUDIO-948),
+    /// normalized (case/whitespace-folded). EMPTY ⇒ unset: every backlog-type state is promotable —
+    /// the safety-critical default byte-identical to pre-948 behavior. Rhapsody-only.
+    pub promote_from_states: HashSet<String>,
     /// The project's effective ticket-claim policy (`"assignee"` | `"pool"`; always non-empty
     /// post-resolve). INF-477.
     pub claim_mode: String,
@@ -160,6 +164,10 @@ pub struct Effective {
     /// `dep_mode_prompt_file` is the legacy mode-on prompt path. INF-318.
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// The top-level/legacy set of backlog-state names auto-promote may promote FROM (STUDIO-948),
+    /// normalized. EMPTY ⇒ unset: every backlog-type state is promotable (the pre-948 default).
+    /// Per-project sets live on [`ResolvedProject::promote_from_states`]. Rhapsody-only.
+    pub promote_from_states: HashSet<String>,
     /// The top-level/legacy effective ticket-claim policy (`"assignee"` | `"pool"`; always
     /// non-empty post-resolve). `claim_ttl` / `claim_settle_delay` are the pool-mode election timing
     /// knobs, materialized to [`DEFAULT_CLAIM_TTL`] / [`DEFAULT_CLAIM_SETTLE_DELAY`] when unset.
@@ -631,6 +639,7 @@ pub fn build_effective_with_runner(
             workspace_mode: rp.eff.workspace_mode.clone(),
             dependency_mode: rp.eff.dependency_mode.clone(),
             dep_mode_prompt_file: rp.eff.dep_mode_prompt_file.clone(),
+            promote_from_states: normalize_set(&rp.eff.promote_from_states),
             claim_mode: rp.eff.claim_mode.clone(),
             model: rp.eff.claude.model.clone(),
             stall_timeout: stall_timeout_for(&mcfg),
@@ -653,6 +662,7 @@ pub fn build_effective_with_runner(
         pr_label: cfg.pr_label.clone(),
         dependency_mode: top_eff.dependency_mode.clone(),
         dep_mode_prompt_file: top_eff.dep_mode_prompt_file.clone(),
+        promote_from_states: normalize_set(&top_eff.promote_from_states),
         claim_mode: top_eff.claim_mode.clone(),
         claim_ttl: claim_ttl_or_default(cfg.tracker.claim_ttl),
         claim_settle_delay: claim_settle_or_default(cfg.tracker.claim_settle_delay),

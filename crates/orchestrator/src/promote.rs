@@ -35,6 +35,7 @@ use rhapsody_tracker::Tracker;
 use crate::dispatch::{
     blocker_cleared, blocker_identifier, dependency_mode_enabled, has_any_label,
 };
+use crate::effective::Effective;
 use crate::orchestrator::{Orchestrator, StackHint};
 
 /// One project's owned auto-promote scope, snapshotted from a [`ResolvedProject`](crate::effective::ResolvedProject)
@@ -48,6 +49,9 @@ struct PromoteScope {
     terminal: HashSet<String>,
     canceled: HashSet<String>,
     labels: HashSet<String>,
+    /// Normalized backlog-state names auto-promote may promote FROM (STUDIO-948). EMPTY ⇒ unset:
+    /// every backlog-type state is promotable (the pre-948 default). Non-empty ⇒ the fifth gate.
+    promote_from: HashSet<String>,
     slug: String,
 }
 
@@ -84,6 +88,7 @@ impl Orchestrator {
                     terminal: p.terminal_states.clone(),
                     canceled: p.canceled_states.clone(),
                     labels: p.labels.clone(),
+                    promote_from: p.promote_from_states.clone(),
                     slug: p.slug.clone(),
                 })
                 .collect();
@@ -99,6 +104,7 @@ impl Orchestrator {
             terminal: eff.terminal_states.clone(),
             canceled: eff.canceled_states.clone(),
             labels: eff.labels.clone(),
+            promote_from: eff.promote_from_states.clone(),
             slug: String::new(),
         }]
     }
@@ -116,6 +122,18 @@ impl Orchestrator {
             // SAFETY: only edge-bearing tickets are ever auto-promoted (a standalone Backlog ticket is
             // never touched).
             if iss.blocked_by.iter().flatten().next().is_none() {
+                continue;
+            }
+            // Fifth gate (STUDIO-948): the ticket's state must be one auto-promote was told it may
+            // promote FROM. An EMPTY set is the safety-critical unset default — preserve pre-948
+            // behavior exactly, treating every backlog-type state as promotable. A named set narrows
+            // the pass to staged states, leaving every other backlog-type state (a `Deferred`, an
+            // `Evaluating`) a deliberate judgement queue regardless of its edges — the STUDIO-749
+            // regression. Matching is case/whitespace-insensitive via `normalize_state`, the same
+            // helper `blocker_cleared` uses; a state differing only by case or padding still matches.
+            if !scope.promote_from.is_empty()
+                && !scope.promote_from.contains(&normalize_state(&iss.state))
+            {
                 continue;
             }
             // Cheap within-tick idempotency (short-circuits before the store read).
@@ -280,6 +298,44 @@ fn is_canceled_blocker(b: &BlockerRef, canceled: &HashSet<String>) -> bool {
     }
 }
 
+/// Emits one boot warning per ENABLED-mode scope whose `promote_from_states` is unset (STUDIO-948).
+///
+/// The unset default is safety-critical — every backlog-type state is promotable — but silently so:
+/// that is exactly how STUDIO-749 (a ticket parked as `Deferred`) was auto-promoted forty seconds
+/// after `dependency_mode: dag` went live. An operator who never reads this ticket must still be
+/// told, by the daemon, that dag will treat their entire backlog as ready work. Same style as the
+/// INF-277 unmatched-slug advisory: `tracing::warn!` naming the project.
+///
+/// Disabled-mode scopes are silent — they issue no tracker call and promote nothing, so there is no
+/// risk to name. Called from `reload_from_disk` (boot AND every hot reload). Mirrors no Go function:
+/// Rhapsody-only (the frozen Go reference has no `promote_from_states`).
+pub(crate) fn warn_unset_promote_from_states(eff: &Effective) {
+    if !eff.projects.is_empty() {
+        for p in eff
+            .projects
+            .iter()
+            .filter(|p| !p.disabled && dependency_mode_enabled(&p.dependency_mode))
+        {
+            if p.promote_from_states.is_empty() {
+                warn_promote_from_unset(&p.slug, &p.dependency_mode);
+            }
+        }
+        return;
+    }
+    if dependency_mode_enabled(&eff.dependency_mode) && eff.promote_from_states.is_empty() {
+        warn_promote_from_unset("", &eff.dependency_mode);
+    }
+}
+
+/// The single warning line, so the multi-project and legacy paths name the same risk and key.
+fn warn_promote_from_unset(project_slug: &str, mode: &str) {
+    tracing::warn!(
+        project_slug = %project_slug,
+        dependency_mode = %mode,
+        "auto-promote: promote_from_states is unset, so every backlog-type state (Backlog, Evaluating, Deferred, …) is treated as ready work and may be auto-promoted when its blockers clear; set tracker.promote_from_states to name the states dag may promote from"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -338,6 +394,14 @@ mod tests {
 
     fn dispatched_len(d: &DispatchedEntries) -> usize {
         d.lock().expect("dispatched lock").len()
+    }
+
+    /// A Backlog dependent MT-2 (`b2`) in the given Linear state, blocked by MT-1 (`a1`) in the given
+    /// blocker state. STUDIO-948: the dependent's own state is what the fifth gate filters.
+    fn backlog_dep_in(iss_state: &str, blocker_state: &str) -> Issue {
+        let mut i = backlog_dep(blocker_state);
+        i.state = iss_state.into();
+        i
     }
 
     // disabled-is-noop: a disabled-mode (and unset-mode) project issues ZERO backlog fetches and ZERO
@@ -419,6 +483,96 @@ mod tests {
             tr.branch_by_id_calls(),
             0,
             "dag must not look up a predecessor branch"
+        );
+    }
+
+    // STUDIO-749 REGRESSION (the reason STUDIO-948 exists). A never-run, edge-bearing ticket parked
+    // in `Deferred` — a backlog-TYPE state — whose blocker has long been Done must NOT be promoted
+    // when `promote_from_states: [Backlog]` names only staged work. Before the fifth gate, the pass
+    // promoted it forty seconds after `dependency_mode: dag` went live. This is the negative half of
+    // the direction pair: deleting the state gate must red it, and inverting the gate must red it too.
+    #[tokio::test]
+    async fn promote_unblocked_deferred_not_promoted_studio_749() {
+        let mut f = Fake::new();
+        f.blocked_backlog = vec![backlog_dep_in("Deferred", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+        o.eff.as_mut().expect("eff").promote_from_states = set_of(&["backlog"]);
+
+        o.promote_unblocked().await;
+
+        assert_eq!(
+            tr.move_to_type_calls().len(),
+            0,
+            "a parked Deferred ticket (backlog type, not a promote_from state) must never be promoted"
+        );
+        assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // The positive half: the SAME never-run, edge-bearing ticket in `Backlog` — a named
+    // promote_from state — IS promoted, so the feature still works.
+    #[tokio::test]
+    async fn promote_unblocked_staged_state_is_promoted() {
+        let mut f = Fake::new();
+        f.blocked_backlog = vec![backlog_dep_in("Backlog", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+        o.eff.as_mut().expect("eff").promote_from_states = set_of(&["backlog"]);
+
+        o.promote_unblocked().await;
+
+        assert_eq!(
+            tr.move_to_type_calls().len(),
+            1,
+            "a Backlog ticket in promote_from_states must still be promoted"
+        );
+        assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // Behaviour preservation: with `promote_from_states` UNSET (empty), the pre-948 rule stands — a
+    // ticket in ANY backlog-type state with all blockers cleared is promoted. This test passes against
+    // both the old (no gate) and new (empty ⇒ no filter) code; making the unset default "promote
+    // nothing" must red it.
+    #[tokio::test]
+    async fn promote_unblocked_unset_promotes_every_backlog_type_state() {
+        let mut f = Fake::new();
+        // `Evaluating` is a never-named backlog-type state; unset must still promote it.
+        f.blocked_backlog = vec![backlog_dep_in("Evaluating", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+        // promote_from_states deliberately left at the empty default.
+
+        o.promote_unblocked().await;
+
+        assert_eq!(
+            tr.move_to_type_calls().len(),
+            1,
+            "unset promote_from_states must preserve the pre-948 promote-every-backlog-state default"
+        );
+        assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // The fifth gate matches case- and whitespace-insensitively (normalize_state), exactly as
+    // blocker_cleared does: a named `backlog` still matches an issue state of `"  BACKLOG  "`. An
+    // operator's `Backlog` must not silently mean "promote nothing".
+    #[tokio::test]
+    async fn promote_unblocked_state_match_is_case_and_whitespace_insensitive() {
+        let mut f = Fake::new();
+        f.blocked_backlog = vec![backlog_dep_in("  BACKLOG  ", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, _) = new_promote_orch(Arc::clone(&tr), "dag");
+        o.eff.as_mut().expect("eff").promote_from_states = set_of(&["backlog"]);
+
+        o.promote_unblocked().await;
+
+        assert_eq!(
+            tr.move_to_type_calls().len(),
+            1,
+            "state matching must fold case and whitespace"
         );
     }
 

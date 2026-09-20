@@ -69,6 +69,10 @@ pub struct EffectiveConfig {
     pub dependency_mode: String,
     /// Resolved mode-on prompt path (default [`DEFAULT_DEP_MODE_PROMPT_FILE`]).
     pub dep_mode_prompt_file: String,
+    /// Backlog-state names auto-promote may promote FROM (STUDIO-948). May be empty, which is the
+    /// safety-critical unset default: every backlog-type state is then promotable. Not defaulted — the
+    /// empty value IS the default, so no materialization step exists for it.
+    pub promote_from_states: Vec<String>,
     /// Resolved ticket-claim policy: always non-empty after resolve (`"assignee"` default).
     pub claim_mode: String,
 }
@@ -183,6 +187,8 @@ fn effective_of(config: &Config, project: Option<&Project>) -> EffectiveConfig {
         workspace_mode: config.workspace_mode.clone(),
         dependency_mode: config.tracker.dependency_mode.clone(),
         dep_mode_prompt_file: config.tracker.dep_mode_prompt_file.clone(),
+        // Unset ⇒ empty ⇒ the pre-948 "promote every backlog-type state" default. No materialization.
+        promote_from_states: config.tracker.promote_from_states.clone(),
         claim_mode: config.tracker.claim_mode.clone(),
     };
     if let Some(p) = project {
@@ -259,6 +265,9 @@ fn apply_project_overrides(eff: &mut EffectiveConfig, config: &Config, p: &Proje
     }
     if !p.dep_mode_prompt_file.is_empty() {
         eff.dep_mode_prompt_file = p.dep_mode_prompt_file.clone();
+    }
+    if !p.promote_from_states.is_empty() {
+        eff.promote_from_states = p.promote_from_states.clone();
     }
     if !p.claim_mode.is_empty() {
         eff.claim_mode = p.claim_mode.clone();
@@ -819,8 +828,59 @@ mod tests {
         );
     }
 
-    // ---- claim_mode_test.go mirrors (the EffectiveFor halves) ----
+    // ---- promote_from_states_test.go mirrors (STUDIO-948; Rhapsody-only) ----
 
+    // A per-project `promote_from_states` override wins; an empty one inherits the top-level value.
+    // Both directions: override-but-global-set, and inherit-but-empty.
+    #[test]
+    fn effective_promote_from_states_inherit_vs_override() {
+        let mut c = cfg_from(
+            "tracker:\n  project_slug: top\n  active_states:\n    - Todo\n  dependency_mode: dag\n  promote_from_states:\n    - Backlog\n    - Ready\n",
+            "",
+        );
+        c.projects = vec![
+            Project {
+                slugs: vec!["a-1".to_string()],
+                promote_from_states: vec!["Staged".to_string()],
+                ..Default::default()
+            }, // explicit override
+            Project {
+                slugs: vec!["b-1".to_string()],
+                ..Default::default()
+            }, // inherits global
+        ];
+        assert_eq!(
+            effective_for(&c, Some(&c.projects[0])).promote_from_states,
+            vec!["Staged".to_string()],
+            "project[0] own set"
+        );
+        assert_eq!(
+            effective_for(&c, Some(&c.projects[1])).promote_from_states,
+            vec!["Backlog".to_string(), "Ready".to_string()],
+            "project[1] inherits the global set"
+        );
+        assert_eq!(
+            effective_for(&c, None).promote_from_states,
+            vec!["Backlog".to_string(), "Ready".to_string()],
+            "top-level set is the legacy scope's value"
+        );
+    }
+
+    // Unset on BOTH levels resolves to empty — the safety-critical pre-948 default (promote every
+    // backlog-type state), with no materialization step inventing a value.
+    #[test]
+    fn effective_promote_from_states_unset_is_empty() {
+        let c = cfg_from(
+            "tracker:\n  project_slug: top\n  active_states:\n    - Todo\n  dependency_mode: dag\n",
+            "",
+        );
+        assert!(
+            effective_for(&c, None).promote_from_states.is_empty(),
+            "unset top-level must stay empty (promote-every-backlog-state default)"
+        );
+    }
+
+    // ---- claim_mode_test.go mirrors (the EffectiveFor halves) ----
     // Mirrors Go `TestEffectiveClaimModeDefaultsToAssignee`.
     #[test]
     fn effective_claim_mode_defaults_to_assignee() {
