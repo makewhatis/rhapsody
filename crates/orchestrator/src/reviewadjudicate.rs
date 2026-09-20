@@ -267,14 +267,19 @@ impl AdjudicationLedger {
     }
 
     /// Forgets `pr` — used when a pull request leaves the watch set and by the operator's Clear, so
-    /// the failure tally goes with it and a fresh adjudication may be attempted.
-    pub fn clear(&self, pr: &PrCoord) {
+    /// the failure tally goes with it and a fresh adjudication may be attempted. Returns whether
+    /// anything was there to forget, which the operator's Clear uses to answer `Applied` when it
+    /// dropped a decision (or a failure tally) but no counter.
+    pub fn clear(&self, pr: &PrCoord) -> bool {
         let key = churn_key(pr);
-        self.map().remove(&key);
-        self.failures
+        let had_entry = self.map().remove(&key).is_some();
+        let had_failure = self
+            .failures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
+            .remove(&key)
+            .is_some();
+        had_entry || had_failure
     }
 }
 

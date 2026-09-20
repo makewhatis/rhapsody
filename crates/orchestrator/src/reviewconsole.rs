@@ -312,9 +312,21 @@ impl Orchestrator {
         if let Some(why) = check_coords(pr) {
             return ReviewControlOutcome::Refused(why);
         }
+        // The ledger is cleared BEFORE the counter is read, so the two writes this function's doc
+        // binds together can never come apart. A decision genuinely can land after a Clear: the
+        // turn runs off-loop, `mark_in_flight` is on the control task, and `record` fires only after
+        // an un-timed comment POST. An operator who clears inside that window leaves a settled
+        // decision and no counter, and the old ordering then refused every later Clear as "no
+        // budget" — with the only stated recovery (the WARN and the README both name this POST) a
+        // `409`. Dropping a decision is as much a clear as dropping a counter.
+        let cleared_decision = self
+            .adjudication_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.clear(pr));
         // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
         // which is a different fact from "the budget is now clear" and worth saying.
-        if self.review_rounds.remove(&churn_key(pr)).is_none() {
+        let cleared_counter = self.review_rounds.remove(&churn_key(pr)).is_some();
+        if !cleared_counter && !cleared_decision {
             return ReviewControlOutcome::Refused(
                 "no review budget to clear for that pull request",
             );
@@ -322,9 +334,6 @@ impl Orchestrator {
         // The manager's adjudication of this pull request goes with the counter (STUDIO-956): a
         // settled decision keeps the loop stopped on its own, so clearing the budget WITHOUT this
         // would leave the operator's lever looking applied while nothing could dispatch.
-        if let Some(ledger) = self.adjudication_ledger.as_ref() {
-            ledger.clear(pr);
-        }
         tracing::info!(
             pr = %pr,
             "ticketless review: operator cleared the pull request's review budget and any manager \
