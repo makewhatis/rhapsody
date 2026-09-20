@@ -1265,10 +1265,10 @@ is its sibling and refuses for the same reason: `plan_quorum` does not fan out a
 held parent, and the room's `file_review` answers an explicit "review this" the way its
 `confirm_assignment` answers "assign this" — both refuse, so a held parent cannot mint a new,
 unlabelled review ticket that no hold on the parent could reach. That handoff decision, and the
-ticketless watcher and auto-merge gates with it, read the `HumanHoldLedger`'s current-**label** set —
-every candidate the selection pass saw wearing the label, **live runs included** — because the only
-mid-run hold shape is a ticket labelled while the daemon is running it, whose `RunningEntry` carries
-only its dispatch-time snapshot. A held origin ticket also holds
+ticketless watcher, the auto-merge gate and the reconciliation sweep with it, read the
+`HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing the label,
+**live runs included** — because the only mid-run hold shape is a ticket labelled while the daemon is
+running it, whose `RunningEntry` carries only its dispatch-time snapshot. A held origin ticket also holds
 back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
 would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
 finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
@@ -1281,21 +1281,29 @@ whether the ticket ever RAN (the row's own run), not on whether the tracker reso
 cold lifecycle cache serves most rows without one, and a held ticket in that gap can still carry a
 real failed run, which must keep saying `failed` rather than being repainted `queued`.
 
-**How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
-dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the
-adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and a ticket that
-never becomes a candidate is never dispatched either. The ticket-mode quorum (`plan_quorum`), the
-ticketless review watcher and the auto-merge gate instead read the `HumanHoldLedger`'s
-current-**label** set — every candidate the last pass saw wearing the label, deliberately including
-a ticket the daemon is running — while the reconciliation sweep and the console's `held_for_human`
-key read the reported-hold subset of the same pass, which excludes live work. Both sets are built as
-the selection pass walks the candidate fetch (active ∪ review states, narrowed by `claim_mode`).
-Under `claim_mode: pool` the pool claim ASSIGNS the ticket and nothing ever clears it, so a ticket
-that has run leaves the candidate query and its label stops reaching those readers; in assignee mode
-the same happens the moment the ticket is reassigned to the person taking it over. Those readers
-are therefore best-effort off the candidate path rather than
-guarantees, and they say so here rather than implying the refusal holds while the daemon no longer
-owns the ticket.
+**How far the hold's reach extends is bounded by the candidate poll and the auto-promote pass.** The
+label that REFUSES dispatch is read from the candidate issue itself, so `eligible()`, the reopen
+ladder and the adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and
+a ticket that never becomes a candidate is never dispatched either. The ticket-mode quorum
+(`plan_quorum`), the ticketless review watcher, the auto-merge gate and the reconciliation sweep
+instead read the `HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing
+the label, deliberately including a ticket the daemon is running — while the console's
+`held_for_human` key reads the reported-hold subset of the same pass, which excludes live work.
+
+That current-label set has **two writers**, and the second is why the reach is not simply the
+candidate poll. The selection pass records every candidate it walks wearing the label (active ∪
+review states, narrowed by `claim_mode`). The DAG auto-promote pass records the Backlog dependent it
+refuses to move — a ticket the candidate fetch by construction never returns, since that fetch is
+active ∪ review and a Backlog ticket is neither. So under `dependency_mode` enabled the decision set
+reaches a class of ticket the candidate poll cannot. Under `claim_mode: pool` the pool claim ASSIGNS
+the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query and its
+label stops reaching the selection-pass half; in assignee mode the same happens the moment the ticket
+is reassigned to the person taking it over. And a project whose candidate fetch fails is skipped for
+that tick (`poll_all_projects`), so its tickets contribute nothing to either current set until a
+later fetch succeeds — which, because `begin_pass` clears both sets at the top of the next selection
+pass, is the window in which a label that was live a tick ago stops reaching the decision readers.
+These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
+here rather than implying the refusal holds while the daemon no longer owns the ticket.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes

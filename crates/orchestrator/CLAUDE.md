@@ -18,11 +18,12 @@ the `Orchestrator` struct itself. Concretely:
 - Modules whose functions take `&mut self` / `&Orchestrator` and are called from the loop
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined and
-  must never be called from another task. They hold no lock of their own; the one exception is
-  `HumanHoldLedger`'s lock, taken on `&self` by every module in that list that touches the
-  `rhapsody:human` hold — `dispatch` and `select` (write it), `promote` (write it) and `snapshot`
-  (read it) (see the seam list below).
-- Nine exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+  must never be called from another task. They hold no lock of their own; the one exception is the
+  `HumanHoldLedger`'s lock, taken on `&self` by every module that touches the `rhapsody:human` hold:
+  `dispatch` and `select` (write it), `promote` (write it), `snapshot` (read the reported set), and
+  the decision readers `quorum`, `reviewwatch` and `reviewreconcile` (read the current-label set)
+  (see the seam list below).
+- Eight exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -99,7 +100,8 @@ the `Orchestrator` struct itself. Concretely:
     identifiers already ANNOUNCED (the once-per-ticket log dedupe), the CURRENT `rhapsody:human`
     **reported**-hold set the console reads (`held`, unworked tickets only), and the CURRENT-**label**
     set (`labelled`, every candidate the last pass saw wearing the label, live runs included) that
-    the decision gates read — the handoff review quorum, the ticketless watcher and auto-merge.
+    the decision gates read — the handoff review quorum, the ticketless watcher, auto-merge and the
+    reconciliation sweep.
     Keeping the last two apart is deliberate: a running ticket is not yet a deliberate hold for an
     operator, but its label must still refuse a decision made on that running ticket. It is a seam
     because the selection pass (`select.rs`, both ladders)
@@ -111,7 +113,7 @@ the `Orchestrator` struct itself. Concretely:
     both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  nine seams; if none fits, that's a real design decision — don't reach for a tenth ad hoc
+  eight seams; if none fits, that's a real design decision — don't reach for a ninth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
