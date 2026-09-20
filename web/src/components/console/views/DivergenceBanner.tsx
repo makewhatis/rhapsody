@@ -2,8 +2,9 @@ import { Note } from "@/components/console/Note";
 import { useStateQuery } from "@/hooks/useStateQuery";
 
 /**
- * The console's view of a pull request that is neither progressing nor reported blocked
- * (STUDIO-898).
+ * The console's view of a pull request whose review loop has stopped moving — either neither
+ * progressing nor reported blocked, or stopped with a stated cause and remedy (STUDIO-898,
+ * STUDIO-956).
  *
  * Six separate defects between 2026-09-12 and 2026-09-14 all presented as an idle board, and each
  * cost hours only because nobody could SEE it — eleven on STUDIO-875, six on STUDIO-893. The daemon
@@ -30,8 +31,8 @@ export function DivergenceBanner() {
     <div role="status" className="setuperr">
       <Note variant="warn">
         {rows.length === 1
-          ? "1 pull request is neither progressing nor reported blocked:"
-          : `${rows.length} pull requests are neither progressing nor reported blocked:`}{" "}
+          ? "1 pull request needs attention:"
+          : `${rows.length} pull requests need attention:`}{" "}
         {rows.map((d) => (
           <span key={`${d.pr}:${d.reviewer}`} style={{ display: "block" }}>
             {d.pr}
@@ -52,12 +53,15 @@ export function DivergenceBanner() {
  * an operator makes from it ("is this minutes or is this all morning?") never needs more.
  *
  * The minutes branch is reachable: the kinds with NO staleness threshold are reported the moment
- * they happen, so a fresh one arrives as seconds since the newest run — often `0`. In an
- * adjudicating install those are `review_escalated` and `review_shipped` (the threshold arm reports
- * them regardless of age, and the legacy `round_budget_exhausted` no longer fires there because the
- * threshold arm precedes it). The staleness-rule kinds floor at ninety minutes and therefore bottom
- * out at "1 hour"; the arithmetic still clamps to a minimum of one unit so a real divergence is
- * never rendered as "0 minutes". Keep that whichever way the threshold moves.
+ * they happen, so a fresh one arrives as seconds since the newest run — often `0`. Those are
+ * `review_escalated`, `review_shipped` and `round_budget_exhausted`: the adjudication arm reports the
+ * two decider kinds regardless of age, and the legacy cap reports the budget kind as soon as it is
+ * spent. (`round_budget_exhausted` still fires in an adjudicating install whenever the threshold is
+ * ABOVE `REVIEW_ROUNDS_PER_PR_CAP` — `review.adjudicate_after_rounds` deliberately has no upper
+ * clamp, so a threshold of 9 never fires and the cap stops the loop first.) The staleness-rule kinds
+ * floor at ninety minutes and therefore bottom out at "1 hour"; the arithmetic still clamps to a
+ * minimum of one unit so a real divergence is never rendered as "0 minutes". Keep that whichever way
+ * the threshold moves.
  */
 function humanStale(secs: number): string {
   const hours = Math.floor(secs / 3600);

@@ -114,7 +114,7 @@ describe("DivergenceBanner", () => {
     );
     renderBanner();
     const banner = await screen.findByRole("status");
-    expect(banner.textContent).toContain("2 pull requests are neither progressing nor reported");
+    expect(banner.textContent).toContain("2 pull requests need attention");
     expect(banner.textContent).toContain("makewhatis/rhapsody#164");
     expect(banner.textContent).toContain("makewhatis/strava#21");
     expect(banner.textContent).toContain("for 3 days");
