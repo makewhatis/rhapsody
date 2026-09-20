@@ -17,9 +17,11 @@ import {
   FILTERED_LANE_EMPTY,
   TRUNCATED_LANE_EMPTY,
   pullRequestLabel,
+  runningRuns,
   type BoardCard,
   type BoardLane,
   type ReviewerChip,
+  type RunningRun,
 } from "@/lib/console-board";
 import {
   relativeSince,
@@ -103,6 +105,15 @@ export function BoardView({
   // surviving card of its chips, which is the one thing the board exists to show. Status is NOT
   // applied: the lanes are that axis (STUDIO-932).
   const lanes = useMemo(() => buildConsoleBoard(rows, blocked), [rows, blocked]);
+  // The Running lane's contents are RUNS, not only tickets (STUDIO-955): a live review's ticket is
+  // parked in In Review, so the review has no card and the lane would otherwise read `5 / 6` beside
+  // nothing. One compact row per live review run closes that gap. The project Select narrows these
+  // rows exactly as it narrows the cards, so a lane never mixes filtered cards with unfiltered runs.
+  const allRuns = useMemo(() => runningRuns(rows), [rows]);
+  const runs = useMemo(
+    () => allRuns.filter((run) => project === "" || run.projectSlug === project),
+    [allRuns, project],
+  );
   const filtered = project !== "";
   const visible = useMemo(
     () =>
@@ -117,8 +128,13 @@ export function BoardView({
   const capped = maxConcurrent > 0 && (running ?? 0) >= maxConcurrent;
   const refreshed = relativeSince(refreshedAtMs, nowMs);
   // Occupancy is the daemon's whole-store tally, not the filtered lane: a project filter must not
-  // make a full pool look idle. Before the tally lands, fall back to the unfiltered Running lane.
-  const occupied = running ?? lanes.find((l) => l.id === "running")?.cards.length ?? 0;
+  // make a full pool look idle. Before the tally lands, fall back to what the lane actually shows —
+  // its running cards PLUS its run rows, so the count cannot disagree with the contents (STUDIO-955).
+  // Both halves are whole-store: `lanes` here is the unfiltered board and `allRuns` is every live
+  // review run, because the filter narrows what the lane RENDERS, never the seats those runs hold.
+  const occupied =
+    (running ?? lanes.find((l) => l.id === "running")?.cards.length ?? 0) +
+    (running === undefined ? allRuns.length : 0);
 
   return (
     <div className="boardwrap">
@@ -133,6 +149,7 @@ export function BoardView({
             // filter it would be a number about a different question — the card count is right there.
             tally={filtered || counts === undefined ? undefined : boardLaneTally(lane.id, counts)}
             occupied={occupied}
+            runs={lane.id === "running" ? runs : []}
             truncated={hasMore}
             maxConcurrent={maxConcurrent}
             roster={roster}
@@ -176,6 +193,7 @@ function LaneView({
   filtered,
   tally,
   occupied,
+  runs,
   truncated,
   maxConcurrent,
   roster,
@@ -187,6 +205,8 @@ function LaneView({
   /** The lane's whole-store total from the daemon's tally, or `undefined` when it is not known. */
   tally: number | undefined;
   occupied: number;
+  /** The live review runs this lane renders as compact rows (Running only; [] elsewhere). */
+  runs: readonly RunningRun[];
   /** The listing is one page of a longer one, so an empty lane says nothing about the pipeline. */
   truncated: boolean;
   maxConcurrent: number;
@@ -200,12 +220,15 @@ function LaneView({
   // while its rows are only on the loaded page, say. The Running lane is exempt: its occupancy
   // header and idle slots already say everything a shortfall would (STUDIO-931).
   const gap = !isRunning && tally !== undefined ? Math.max(0, tally - lane.cards.length) : 0;
-  // A held seat with no card in this lane is a live review (folded onto its ticket in In Review) or
-  // an unattributed run; "No agent is running." would contradict the `n / max` beside it.
+  // The lane is empty only when it renders NOTHING — cards AND run rows (STUDIO-955). A live review
+  // is a run row now, so the lane no longer claims an agent is busy elsewhere while showing five.
+  const rendered = lane.cards.length + runs.length;
+  // A held seat with no card and no row in this lane is a live run the page has not loaded yet;
+  // "No agent is running." would contradict the `n / max` beside it.
   const emptyLine = filtered
     ? FILTERED_LANE_EMPTY
     : isRunning && occupied > 0
-      ? "Agents are busy on reviews and other runs, shown on their tickets in other lanes."
+      ? "Agents are busy on runs not among the jobs loaded."
       : gap > 0
         ? `${tally} in this lane, but not among the jobs loaded.`
         : truncated && !(isRunning && occupied === 0)
@@ -216,7 +239,7 @@ function LaneView({
       <header className="bcolhd">
         <span className="bname">{lane.name}</span>
         <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
-          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? lane.cards.length)}
+          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? rendered)}
         </span>
         <span className="bsub">{lane.caption}</span>
       </header>
@@ -224,7 +247,10 @@ function LaneView({
         {lane.cards.map((card) => (
           <BoardCardView key={card.key} card={card} roster={roster} fields={fields} onOpen={onOpen} />
         ))}
-        {lane.cards.length === 0 ? <div className="bempty">{emptyLine}</div> : null}
+        {runs.map((run) => (
+          <RunningRunView key={run.key} run={run} roster={roster} onOpen={onOpen} />
+        ))}
+        {rendered === 0 ? <div className="bempty">{emptyLine}</div> : null}
         {gap > 0 && lane.cards.length > 0 ? (
           <div className="bempty">{`${gap} more in this lane not among the jobs loaded.`}</div>
         ) : null}
@@ -307,7 +333,7 @@ function BoardCardView({
       {!fields.reviews || card.reviewers.length === 0 ? null : (
         <div className="bchips" aria-label="Reviews">
           {card.reviewers.map((r) => (
-            <ReviewerChipView key={r.key} chip={r} harness={fields.harness} />
+            <ReviewerChipView key={r.key} chip={r} ticket={card.issue} harness={fields.harness} onOpen={onOpen} />
           ))}
         </div>
       )}
@@ -337,7 +363,24 @@ function BoardCardView({
 // A reviewer's chip: who reviewed, and how that run ended. The tone is the chip's whole point — two
 // green chips on an in-review card is the two-gate state at a glance — so it keys off the review
 // RUN's status rather than reusing the status Pill, whose `done` is the tracker-blue `--info`.
-function ReviewerChipView({ chip, harness }: { chip: ReviewerChip; harness: boolean }) {
+//
+// The chip is a navigation target in its own right (STUDIO-955): it represents ONE review RUN, so
+// activating it opens THAT run — not the card's ticket, whose own implementation run is a different
+// (and usually finished) run. It is therefore keyboard reachable with its own accessible name, and
+// it stops propagation so the card underneath does not also open. The PR link above is the
+// precedent; this chip lacked both and bubbled to the card, which is the observed defect.
+function ReviewerChipView({
+  chip,
+  ticket,
+  harness,
+  onOpen,
+}: {
+  chip: ReviewerChip;
+  /** The card's ticket — the work this review is of, for the chip's accessible name. */
+  ticket: string;
+  harness: boolean;
+  onOpen: (issue: string) => void;
+}) {
   // Two reviewers can be on different pull requests, so the chip names its own PR in the tooltip
   // rather than assuming the card's primary one.
   const on = chip.pr === undefined ? "" : ` on ${pullRequestLabel(chip.pr)}`;
@@ -349,16 +392,68 @@ function ReviewerChipView({ chip, harness }: { chip: ReviewerChip; harness: bool
   // badge and tooltip text alike — rather than leaving the reviews' behind.
   const showProvider = harness && chip.provider !== "";
   const onProvider = showProvider ? ` · ${chip.provider}` : "";
+  const open = () => onOpen(chip.issue);
   return (
     <span
       className={cn("rchip", reviewerTone(chip.status))}
+      role="link"
+      tabIndex={0}
+      aria-label={`Open ${chip.reviewer}'s review${ticket === "" ? "" : ` of ${ticket}`}`}
       title={`${chip.reviewer}${on}${onProvider} · review ${chip.outcome}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        open();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          open();
+        }
+      }}
     >
       <span className="d" aria-hidden="true" />
       {chip.reviewer}
       {showProvider ? <span className="provbadge">{chip.provider}</span> : null}
       <span className="o">{chip.outcome}</span>
     </span>
+  );
+}
+
+// A running RUN, drawn compactly in the Running lane (STUDIO-955). A ticket whose review is in
+// flight sits in the In Review lane, so the review has no card here; this row is what the lane's
+// count counts. Like a card, it opens its own trace.
+function RunningRunView({
+  run,
+  roster,
+  onOpen,
+}: {
+  run: RunningRun;
+  roster: readonly string[];
+  onOpen: (issue: string) => void;
+}) {
+  const open = () => onOpen(run.issue);
+  const label = run.ticket === "" ? `${run.reviewer}'s review run` : `${run.reviewer}'s review of ${run.ticket}`;
+  return (
+    <div
+      className="brun"
+      role="link"
+      tabIndex={0}
+      aria-label={`Open ${label}`}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      }}
+    >
+      <TeammateAvatar color={teammateColor(roster, run.reviewer)} size={7} />
+      <span className="rwho">{run.reviewer}</span>
+      {run.ticket === "" ? null : <span className="rtk">{run.ticket}</span>}
+      {run.provider === "" ? null : <span className="provbadge">{run.provider}</span>}
+      {run.elapsed === "" ? null : <span className="rel">{run.elapsed}</span>}
+    </div>
   );
 }
 

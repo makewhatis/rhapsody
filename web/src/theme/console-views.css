@@ -151,6 +151,11 @@
    is "two green chips = two gates passed" — so it deliberately does not reuse the status Pill's
    blue `done`. */
 .rh-console .rchip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; border-radius: 99px; padding: 2px 8px; background: var(--panel); border: 1px solid var(--line-soft); color: var(--ink-3); }
+/* A reviewer chip opens its OWN run (STUDIO-955), so it is a real target: pointer, hover and a
+   focus ring, exactly like the card it sits inside. */
+.rh-console .rchip[role="link"] { cursor: pointer; }
+.rh-console .rchip[role="link"]:hover { border-color: #34343c; }
+.rh-console .rchip[role="link"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .rh-console .rchip .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .rh-console .rchip .o { font-family: var(--mono); font-size: 10px; opacity: .8; }
 .rh-console .rchip.ok { color: var(--ok); }
@@ -161,6 +166,16 @@
 .rh-console .bpr { display: flex; }
 .rh-console .bpr .tk.pr { cursor: pointer; }
 .rh-console .bpr .tk.pr:hover { border-color: var(--ok); }
+/* The compact row a live review run draws in the Running lane (STUDIO-955): a ticket parked in In
+   Review has no card there, so the lane counts runs and shows runs. Quieter than a card — it is a
+   seat being held, not a work item — but still a target that opens the run's own trace. */
+.rh-console .brun { display: flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); font-size: 11px; color: var(--ink-3); cursor: pointer; }
+.rh-console .brun:hover { border-color: #34343c; background: var(--raise); }
+.rh-console .brun:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.rh-console .brun .rwho { color: var(--ink-2); }
+.rh-console .brun .rtk { font-family: var(--mono); font-size: 10.5px; color: var(--ticket); }
+.rh-console .brun .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.rh-console .brun .rel { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
 
 /* The board footer: utilization against the cap, the three counts that need a person or a seat, and
    when the view was last answered. Replaces a bare running counter with the question the operator
