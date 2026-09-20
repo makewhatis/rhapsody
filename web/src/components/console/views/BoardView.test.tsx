@@ -359,3 +359,47 @@ describe("the board (STUDIO-925)", () => {
     expect(document.querySelector(".board")?.getAttribute("data-lane-width")).toBe("wide");
   });
 });
+
+// STUDIO-952 — the card's harness chip is the AUTHOR's, and each review chip carries its own row's
+// provider. The STUDIO-949 fixture is the observed misread: the maintainer read one unlabelled chip
+// as "sol running on fireworks-ai" when sol had in fact reviewed on openai.
+describe("the card's harness chips (STUDIO-952)", () => {
+  it("shows jerry's fireworks-ai on the meta row and sol's openai on the review chip (STUDIO-949)", () => {
+    mount([
+      row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" }),
+      review("pr:makewhatis/rhapsody#186@sol", "STUDIO-949", { provider: "openai" }),
+    ]);
+
+    // The card's own chip is the implementation run's — jerry's.
+    expect(document.querySelector(".bcard .bmeta .provbadge")?.textContent).toBe("fireworks-ai");
+    // The review chip is the review run's — sol's, a DIFFERENT provider, rendered distinctly.
+    expect(document.querySelector(".bcard .rchip .provbadge")?.textContent).toBe("openai");
+  });
+
+  it("attaches the meta-row harness chip to the author, not the card", () => {
+    mount([row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" })]);
+    // Nested in `.who2`, the author's own element, so it cannot be read as the card's.
+    const who = document.querySelector(".bcard .who2");
+    expect(who?.textContent).toContain("jerry");
+    expect(who?.querySelector(".provbadge")?.textContent).toBe("fireworks-ai");
+    expect(who?.querySelector(".provbadge")?.getAttribute("title")).toBe("jerry ran on fireworks-ai");
+  });
+
+  it("renders no harness chip, and no placeholder, when a run recorded no provider", () => {
+    mount([row({ issue: "LEGACY-1", assignee: "jerry", provider: "" })]);
+    expect(document.querySelector(".bcard .provbadge")).toBeNull();
+    // The author slot itself survives — only the absent provider is skipped.
+    expect(document.querySelector(".bcard .who2")?.textContent).toContain("jerry");
+  });
+
+  it("keeps a providerless review chip showing who and how it ended", () => {
+    mount([
+      row({ issue: "LEGACY-1", assignee: "jerry", provider: "fireworks-ai" }),
+      review("pr:makewhatis/rhapsody#1@sol", "LEGACY-1", { provider: "" }),
+    ]);
+    const chip = document.querySelector(".bcard .rchip");
+    expect(chip?.textContent).toContain("sol");
+    expect(chip?.querySelector(".o")?.textContent).toBe("done");
+    expect(chip?.querySelector(".provbadge")).toBeNull();
+  });
+});

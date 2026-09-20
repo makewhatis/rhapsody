@@ -257,10 +257,14 @@ function BoardCardView({
 }) {
   const open = () => onOpen(card.issue);
   // Hiding every meta element drops the row rather than leaving an empty flex line with a gap.
-  const showMeta =
-    (fields.assignee && card.assignee !== "") ||
-    (fields.project && card.project !== "") ||
-    (fields.harness && card.provider !== "");
+  const showAssignee = fields.assignee && card.assignee !== "";
+  const showProject = fields.project && card.project !== "";
+  const showHarness = fields.harness && card.provider !== "";
+  const showMeta = showAssignee || showProject || showHarness;
+  // The harness chip belongs to the AUTHOR (STUDIO-952): it is the implementation run's provider, so
+  // it renders beside the assignee inside `.who2` rather than as a bare peer of the project, which
+  // read as the whole card's. With no assignee it keeps the slot and names the author in its title.
+  const author = showAssignee ? card.assignee : "the author";
   return (
     <article
       className={cn("bcard", card.live && "live")}
@@ -282,18 +286,22 @@ function BoardCardView({
       {card.title === "" ? null : <div className="btitle">{card.title}</div>}
       {showMeta ? (
         <div className="bmeta">
-          {!fields.assignee || card.assignee === "" ? null : (
+          {!showAssignee && !showHarness ? null : (
             <span className="who2">
-              <TeammateAvatar color={teammateColor(roster, card.assignee)} size={7} />
-              {card.assignee}
+              {!showAssignee ? null : (
+                <>
+                  <TeammateAvatar color={teammateColor(roster, card.assignee)} size={7} />
+                  {card.assignee}
+                </>
+              )}
+              {!showHarness ? null : (
+                <span className="provbadge" title={`${author} ran on ${card.provider}`}>
+                  {card.provider}
+                </span>
+              )}
             </span>
           )}
-          {!fields.project || card.project === "" ? null : <span className="bproj">{card.project}</span>}
-          {!fields.harness || card.provider === "" ? null : (
-            <span className="provbadge" title={`ran on ${card.provider}`}>
-              {card.provider}
-            </span>
-          )}
+          {!showProject ? null : <span className="bproj">{card.project}</span>}
         </div>
       ) : null}
       {!fields.reviews || card.reviewers.length === 0 ? null : (
@@ -333,13 +341,19 @@ function ReviewerChipView({ chip }: { chip: ReviewerChip }) {
   // Two reviewers can be on different pull requests, so the chip names its own PR in the tooltip
   // rather than assuming the card's primary one.
   const on = chip.pr === undefined ? "" : ` on ${pullRequestLabel(chip.pr)}`;
+  // The provider is metadata, not status: it reuses the List view's harness chip treatment (quiet
+  // mono text on the shared `.provbadge`) rather than a status colour, so it never competes with the
+  // pill or the chip's own tone (STUDIO-952). A run that recorded none (STUDIO-909's predecessor)
+  // renders no chip at all rather than a placeholder.
+  const harness = chip.provider === "" ? "" : ` on ${chip.provider}`;
   return (
     <span
       className={cn("rchip", reviewerTone(chip.status))}
-      title={`${chip.reviewer}${on} · review ${chip.outcome}`}
+      title={`${chip.reviewer}${on}${harness} · review ${chip.outcome}`}
     >
       <span className="d" aria-hidden="true" />
       {chip.reviewer}
+      {chip.provider === "" ? null : <span className="provbadge">{chip.provider}</span>}
       <span className="o">{chip.outcome}</span>
     </span>
   );
