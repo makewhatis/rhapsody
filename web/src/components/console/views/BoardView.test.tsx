@@ -538,4 +538,49 @@ describe("the reviewer chip and the Running lane (STUDIO-955)", () => {
     expect(running.querySelectorAll(".brun")).toHaveLength(1);
     expect(running.querySelector(".brun")?.textContent).toContain("jimmy");
   });
+
+  // The lane's count must describe what it SHOWS in every branch, not just once the tally and the
+  // typed config have both landed. `maxConcurrent` is 0 for the whole of every first paint — the
+  // config query has not resolved — so the `maxConcurrent === 0` header branch is the window the
+  // operator actually sees on load, and it must count the run rows the lane renders beneath it.
+  it("counts the run rows it shows while the agent cap is still unknown", () => {
+    mount(
+      [
+        row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+        liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949"),
+        liveReview("pr:makewhatis/rhapsody#187@jimmy", "STUDIO-949"),
+      ],
+      vi.fn(),
+      COUNTS,
+      0,
+      { counts: undefined },
+    );
+
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelectorAll(".brun")).toHaveLength(2);
+    expect(running.querySelector(".bcount")?.textContent).toBe("2");
+  });
+
+  // The pre-tally occupancy fallback must be whole-pool, exactly as the comment above it says the
+  // card half already is. Under a project filter the run rows ARE narrowed — that is what the lane
+  // shows — but the seats they hold are not, so a filter must not make a full pool look idle.
+  it("keeps occupancy whole-pool while the tally is unknown, even under a project filter", () => {
+    mount(
+      [
+        row({ issue: "R-1", status: "review", trackerState: "In Review" }),
+        liveReview("pr:makewhatis/rhapsody#1@alice", "R-1", { projectSlug: "rhapsody" }),
+        liveReview("pr:makewhatis/booch#2@jimmy", "R-1", { projectSlug: "booch" }),
+      ],
+      vi.fn(),
+      COUNTS,
+      6,
+      { project: "booch", counts: undefined },
+    );
+
+    const running = document.querySelector('[data-lane="running"]')!;
+    // One rule is shown (the filter narrows the rows), but both hold a seat.
+    expect(running.querySelectorAll(".brun")).toHaveLength(1);
+    expect(running.querySelector(".bcount")?.textContent).toBe("2 / 6");
+    expect(running.querySelectorAll(".bslot")).toHaveLength(4);
+  });
 });

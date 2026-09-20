@@ -109,9 +109,10 @@ export function BoardView({
   // parked in In Review, so the review has no card and the lane would otherwise read `5 / 6` beside
   // nothing. One compact row per live review run closes that gap. The project Select narrows these
   // rows exactly as it narrows the cards, so a lane never mixes filtered cards with unfiltered runs.
+  const allRuns = useMemo(() => runningRuns(rows), [rows]);
   const runs = useMemo(
-    () => runningRuns(rows).filter((run) => project === "" || run.projectSlug === project),
-    [rows, project],
+    () => allRuns.filter((run) => project === "" || run.projectSlug === project),
+    [allRuns, project],
   );
   const filtered = project !== "";
   const visible = useMemo(
@@ -129,9 +130,11 @@ export function BoardView({
   // Occupancy is the daemon's whole-store tally, not the filtered lane: a project filter must not
   // make a full pool look idle. Before the tally lands, fall back to what the lane actually shows —
   // its running cards PLUS its run rows, so the count cannot disagree with the contents (STUDIO-955).
+  // Both halves are whole-store: `lanes` here is the unfiltered board and `allRuns` is every live
+  // review run, because the filter narrows what the lane RENDERS, never the seats those runs hold.
   const occupied =
     (running ?? lanes.find((l) => l.id === "running")?.cards.length ?? 0) +
-    (running === undefined ? runs.length : 0);
+    (running === undefined ? allRuns.length : 0);
 
   return (
     <div className="boardwrap">
@@ -236,7 +239,7 @@ function LaneView({
       <header className="bcolhd">
         <span className="bname">{lane.name}</span>
         <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
-          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? lane.cards.length)}
+          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? rendered)}
         </span>
         <span className="bsub">{lane.caption}</span>
       </header>
