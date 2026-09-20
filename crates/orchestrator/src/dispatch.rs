@@ -110,6 +110,12 @@ const HUMAN_HOLD_CAPACITY: usize = 256;
 /// current set (a ticket no longer held stops being reported), while the announced set survives so
 /// re-holding it the next tick is not news again.
 ///
+/// Unlike [`Orchestrator::held_for_capacity`](crate::orchestrator::Orchestrator), the current set is
+/// deliberately NOT retired on the tick's three early returns (a failed preflight, an armed drain, a
+/// dead credential). A leftover capacity tally would be a stale claim about a pass that no longer
+/// ran; a deliberate human hold does not depend on dispatch being enabled at all — the ticket still
+/// needs a person while the daemon is gated — so keeping it is the honest answer.
+///
 /// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
 /// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
 /// and never across an `.await`; see `crates/orchestrator/CLAUDE.md`'s seam list.
