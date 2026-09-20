@@ -79,7 +79,9 @@ export interface StateResponse {
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
-// that is neither progressing nor reported blocked.
+// whose board state and activity disagree. Usually that means nothing is progressing it and nothing
+// reported it blocked; when `capacity_held` is present it is instead a deliberate wait the daemon can
+// name, so never render the row as an unexplained stall without checking that field.
 //
 // `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
 // of the wording is how the two drift apart. `kind` is still given because it is stable and a client
