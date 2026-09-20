@@ -469,6 +469,10 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 /// * A `SHIP` line must BE the decision — bare `SHIP` or a `SHIP:` prefix — not merely begin with
 ///   the word. The prompt shows the model "SHIP means …" verbatim, and a line of prose beginning
 ///   `SHIP ` is an explanation, not an answer.
+/// * A decision stated on an UNDECORATED line outranks a later decorated one. A model that closes
+///   a decision by listing what it rejected produces a plain `ESCALATE` above a bulleted
+///   `SHIP`; pure last-match would read the bullet and ship the escalation. The plain line is the
+///   answer wherever it sits, so the result no longer depends on line order.
 ///
 /// Leading markdown decoration and an optional `Decision:`/`Verdict:` label are stripped first
 /// ([`strip_answer_decoration`]), because they carry no decision content but otherwise pushed an
@@ -482,6 +486,11 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 /// An answer naming neither decision is an error, and the caller re-asks rather than guessing.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
     let mut decided: Option<Verdict> = None;
+    // The last decision stated on an UNDECORATED line. A plain line is an answer; a decorated one
+    // is as likely a bulleted mention of the option the reply rejected. Preferring the plain line
+    // keeps the answer independent of line order — otherwise a plainly-stated `ESCALATE` above a
+    // bulleted `SHIP` resolved by position to `Ship`, shipping a reply that escalated.
+    let mut decided_plain: Option<Verdict> = None;
     let mut saw_ship = false;
     let mut saw_escalate = false;
     // Whether any decision-shaped line was written WITHOUT decoration. A reply that states one of
@@ -498,6 +507,9 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
         let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
         if bare == "SHIP" || upper.starts_with("SHIP:") {
             decided = Some(Verdict::Ship);
+            if !decorated {
+                decided_plain = Some(Verdict::Ship);
+            }
             saw_ship = true;
             any_undecorated |= !decorated;
             continue;
@@ -507,13 +519,17 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
                 .get("ESCALATE:".len()..)
                 .map(|r| r.trim().trim_end_matches(['*', '`', ' ']).trim())
                 .unwrap_or_default();
-            decided = Some(Verdict::Escalate {
+            let verdict = Verdict::Escalate {
                 reason: if rest.is_empty() {
                     "the manager escalated without stating a reason".to_string()
                 } else {
                     rest.to_string()
                 },
-            });
+            };
+            decided = Some(verdict.clone());
+            if !decorated {
+                decided_plain = Some(verdict);
+            }
             saw_escalate = true;
             any_undecorated |= !decorated;
         }
@@ -525,7 +541,7 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
             snippet(stdout)
         ));
     }
-    decided.ok_or_else(|| {
+    decided_plain.or(decided).ok_or_else(|| {
         format!(
             "adjudication reply named neither SHIP nor ESCALATE: {}",
             snippet(stdout)
@@ -714,6 +730,40 @@ mod tests {
         // …but one decision stated plainly still wins, even beside a bulleted mention of the other.
         assert_eq!(
             parse_verdict("- ESCALATE: risky\n- SHIP: fine\nMy decision:\nSHIP"),
+            Ok(Verdict::Ship)
+        );
+    }
+
+    /// **The mixed shape.** A decorated list item beside a plain decision resolves to the plain
+    /// one, wherever it sits — the ordinary way a model states a call and then lists what it
+    /// rejected. Pure last-match read the bullet, so a plainly-stated `ESCALATE` above a bulleted
+    /// `SHIP` parsed as `Ship` and the escalation shipped. Pinned in this ordering specifically:
+    /// the trailing-plain variant above passes under either rule and so does not discriminate.
+    #[test]
+    fn a_plain_decision_outranks_a_later_decorated_mention() {
+        assert_eq!(
+            parse_verdict("ESCALATE: the migration needs a DBA\n- SHIP: would be the alternative"),
+            Ok(Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string()
+            })
+        );
+        assert_eq!(
+            parse_verdict("ESCALATE: needs a human\n**SHIP: not my call**"),
+            Ok(Verdict::Escalate {
+                reason: "needs a human".to_string()
+            })
+        );
+        assert_eq!(
+            parse_verdict(
+                "My decision:\nESCALATE: the migration needs a DBA\n- SHIP: the alternative I rejected"
+            ),
+            Ok(Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string()
+            })
+        );
+        // …and the plain `SHIP` above a bulleted `ESCALATE` still ships.
+        assert_eq!(
+            parse_verdict("SHIP\n- ESCALATE: the alternative"),
             Ok(Verdict::Ship)
         );
     }
