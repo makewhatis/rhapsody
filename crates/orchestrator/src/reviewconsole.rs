@@ -358,9 +358,13 @@ impl Orchestrator {
             // left behind it would outlive the pull request it names (STUDIO-950 round 14).
             //
             // Sits under `dropped > 0`, unlike the per-row `review_capacity_held` removal above: a
-            // dismissal whose every store drop FAILED left the rows watched, so the failure count
-            // is still a live fact about a pull request the daemon still polls. Once a row is gone
-            // the operator has said they are not waiting on it, and the record goes with it.
+            // dismissal whose every store drop FAILED left every row watched, so the failure count
+            // is still a live fact about a pull request the daemon still polls and nothing is
+            // removed. Once AT LEAST one row is gone the operator has said they are not waiting on
+            // it. In the mixed case — some rows dropped, some failed — the surviving row is still
+            // polled but loses the record, restarting its one-attempt grace period; that can only
+            // delay a denial, never invent one, so it is preferred to keeping a dismissed pull
+            // request's record named forever.
             self.review_watch_unreadable.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }

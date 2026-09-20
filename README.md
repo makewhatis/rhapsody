@@ -1209,11 +1209,12 @@ just the log — the `/api/v1/state` row carries the holder count and the budget
 rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
 sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
 watcher's own liveness is re-stamped on every tick and a hold is refreshed whenever the rotating
-cursor next evaluates its pull request. A hold older than the watcher's liveness stamp is ignored, and
-one whose pull request has failed enough consecutive lookups is dropped outright — and that denial is
-reported, with the attempt count, as an unreadable coordinate rather than falling back to the false
-"nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being named and a
-coordinate GitHub has stopped answering for cannot read as an unexplained stall.
+cursor next evaluates its pull request. A hold stops being named once the watcher's liveness stamp is
+more than `CAPACITY_HOLD_TTL` old — measured against the sweep's own clock, not the hold's age — and
+one whose pull request has failed enough consecutive lookups is no longer reported as a hold — and
+that denial is reported, with the attempt count, as an unreadable coordinate rather than falling back
+to the false "nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being
+named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
