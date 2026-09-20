@@ -1502,6 +1502,17 @@ async fn confirm_assignment(
             iss.identifier
         ));
     }
+    // The room is the OTHER writer of `rhapsody:@<name>` — §0.13's "labelling now IS the
+    // assignment" — so the absolute human hold has to sit beside `is_solo` here too. Without it a
+    // `rhapsody:human` ticket gets a tracker write it can never earn and the room is told a
+    // teammate took work no agent will ever run; the label is durable and occupied labels are
+    // never edited (§0.11.1), so a person would have to remove it by hand.
+    if crate::teams::is_human(iss) {
+        return Done::say(format!(
+            "{} is held for a human, so the team does not route it.",
+            iss.identifier
+        ));
+    }
     let Some((tracker, _)) = client_for(cycle, iss) else {
         return Done::say(format!(
             "{}: I lost track of which project it came from, so I wrote nothing.",
@@ -3387,6 +3398,48 @@ mod tests {
         assert_eq!(report.relayed, 0);
         assert!(relay.calls().is_empty(), "nothing was relayed");
         assert_eq!(report.assigned, 1, "the floor read it as the Todo it is");
+    }
+
+    /// **The room never assigns a human-held ticket.** The room is the OTHER writer of the
+    /// `rhapsody:@<name>` identity label (§0.13's "labelling now IS the assignment"), so the
+    /// absolute `rhapsody:human` hold has to sit beside `is_solo` here too. Without it the ticket
+    /// earns a tracker write it can never justify and the room is told a teammate took work no
+    /// agent will ever run — and since the label is durable and an occupied one is never edited
+    /// (§0.11.1), a person would have to remove it by hand.
+    #[tokio::test]
+    async fn the_room_never_assigns_a_human_held_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("MT-2 needs somebody");
+        let t = teams(&["alice"], ManagerMode::Labels);
+        let mut iss = todo("MT-2");
+        iss.labels = Some(vec![crate::teams::HUMAN_LABEL.to_string()]);
+        let issues = vec![iss];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let ears = fx.ears(FakeArbiter::never());
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert_eq!(report.assigned, 0, "{:?}", fx.reply_bodies());
+        assert!(
+            fx.tracker.add_label_calls().is_empty(),
+            "a human-held ticket earns no identity label: {:?}",
+            fx.tracker.add_label_calls()
+        );
+        assert!(
+            fx.reply_bodies()
+                .iter()
+                .any(|b| b.contains("held for a human")),
+            "{:?}",
+            fx.reply_bodies()
+        );
     }
 
     // ── §0.11.1: an occupied identity label is never edited ─────────────────────────────────────
