@@ -579,16 +579,17 @@ pub struct Orchestrator {
     /// refusals on the other side of the seam.
     pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
     /// The HEAD at which each watched pull request was last routed back to its author for a
-    /// CONFLICT (STUDIO-961), keyed by coordinate. Written and read only by the watcher's
+    /// CONFLICT (STUDIO-961), and when, keyed by coordinate. Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set, exactly as
     /// [`auto_merge_announced`](Orchestrator::auto_merge_announced) is.
     ///
-    /// It is the once-per-conflicted-HEAD guard: the conflict persists across every poll until a
-    /// push lands, so without it a naive trigger would re-route and re-summons the author into a
-    /// loop. It also carries the fact the reconciliation sweep reads to stop reporting the pull
+    /// The HEAD is the once-per-conflicted-HEAD guard: the conflict persists across every poll
+    /// until a push lands, so without it a naive trigger would re-route and re-summons the author
+    /// into a loop. The instant is what lets the reconciliation sweep stop reporting the pull
     /// request as needing a human while the author has been handed it — the transition IS the
-    /// progress, so the sweep must not cry wolf for it.
-    pub(crate) conflict_routed: HashMap<crate::prstate::PrCoord, String>,
+    /// progress — without that silence outliving the transition: a route-back the author never
+    /// answers stops being progress once it is itself stale.
+    pub(crate) conflict_routed: HashMap<crate::prstate::PrCoord, crate::reviewwatch::ConflictRoute>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment

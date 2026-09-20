@@ -1,9 +1,17 @@
 //! reviewchanges — routing a ticket BACK out of the review state when its review round files
-//! findings (STUDIO-839).
+//! findings (STUDIO-839), and — the same route-back on a second edge — when its pull request is
+//! observed CONFLICTED (STUDIO-961).
 //!
 //! **No Go v0.4.0 counterpart, and a deliberate DIVERGENCE rather than new surface**, exactly as
 //! [`crate::reviewdone`] is: the frozen reference never moves a ticket into a state at all except
 //! through the handoff, and `README.md`'s Divergences section carries the entry.
+//!
+//! The two triggers share [`Orchestrator::resolve_route_back`] and the perform below; they differ
+//! in what fires them and in the comment the author is sent. The findings trigger refuses the
+//! approved arm ([`Orchestrator::plan_review_changes`]); the conflict trigger deliberately does not
+//! ([`Orchestrator::plan_conflict_route_back`]), because a conflicted pull request is unfinished
+//! work rather than work awaiting a decision — so the pairing's approved-arm guard stays exactly
+//! where it was and the second trigger goes around it rather than through it.
 //!
 //! # The gap this closes
 //!
@@ -67,7 +75,12 @@ use crate::review::ReviewRun;
 use crate::reviewdone::origin_ticket;
 use crate::stop::ControlHandle;
 
-/// One findings verdict's implementation ticket, and the state it is going back to.
+/// One route-back's implementation ticket, and the state it is going back to.
+///
+/// Two triggers resolve one of these — a findings verdict ([`Orchestrator::plan_review_changes`])
+/// and a conflicted pull request ([`Orchestrator::plan_conflict_route_back`], STUDIO-961) — so the
+/// plan carries the pull request and the ticket, never the reason: the reason selects the comment
+/// the author is sent (see [`crate::reviewnotify::CompletionReason`]) and nothing about the move.
 ///
 /// Resolved BEFORE it leaves the control task — the identifier off the run's recorded origin, the
 /// opaque ids off the run row — so the off-loop half makes one call and has no decision left to get
@@ -76,7 +89,7 @@ use crate::stop::ControlHandle;
 /// the other.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewChangesPlan {
-    /// `owner/repo#number` — the pull request whose review filed the findings, for the log line.
+    /// `owner/repo#number` — the pull request this route-back is for, for the log line.
     pub pr: String,
     /// The tracker's opaque issue id.
     pub issue_id: String,
@@ -88,7 +101,7 @@ pub struct ReviewChangesPlan {
     pub state: String,
 }
 
-/// Performs one findings route-back, off the control task.
+/// Performs one route-back, off the control task.
 ///
 /// A trait for [`crate::reviewwatch::ReviewWatchSink`]'s reason: the notification task must be
 /// testable without a control loop, and the seam is what lets a test assert on the move that was
@@ -98,9 +111,9 @@ pub trait ReviewChangesSink: Send + Sync {
     /// Moves ONE ticket out of the review state.
     ///
     /// `re_engaged` is what the notification task observed of the OTHER consequence of this same
-    /// verdict: the completion comment was posted and carries the summon token. It is not a gate —
-    /// the move happens either way, because a ticket whose review filed findings is not waiting for
-    /// a reviewer whether or not the author's run reopened — it is what makes the disagreement
+    /// route-back: the completion comment was posted and carries the summon token. It is not a gate —
+    /// the move happens either way, because a ticket being routed back to its author is not waiting
+    /// for a reviewer whether or not the author's run reopened — it is what makes the disagreement
     /// visible instead of silent.
     ///
     /// Infallible by contract, like [`crate::reviewwatch::ReviewWatchSink::finish`]: a failed move
@@ -236,7 +249,7 @@ impl Orchestrator {
 }
 
 impl ControlHandle {
-    /// Moves one findings verdict's ticket out of the review state, off the control loop — the same
+    /// Moves one route-back's ticket out of the review state, off the control loop — the same
     /// by-NAME `MoveIssueState` [`ControlHandle::handoff_run`] and
     /// [`ControlHandle::finish_review_ticket`] use, resolving the tracker the same way.
     ///
@@ -244,7 +257,7 @@ impl ControlHandle {
     /// it: the round is over, there is no second edge to retry against, and the ticket stays in
     /// review — exactly where it was before this feature existed.
     ///
-    /// **The disagreement is the log line's job.** A findings verdict has two consequences and they
+    /// **The disagreement is the log line's job.** A route-back has two consequences and they
     /// can come apart: the state move is this daemon's own write and always happens, while the run
     /// re-engagement additionally needs the completion comment to have been posted with its token
     /// AND the pull request to be among the ticket's `linked_prs` in the poller's snapshot — the
@@ -272,7 +285,7 @@ impl ControlHandle {
                 pr = %plan.pr,
                 issue_identifier = %plan.identifier,
                 state = %plan.state,
-                "review route-back: the review filed findings, so its ticket was moved out of review; the author's run reopens when the poller sees this pull request among the ticket's linked pull requests"
+                "review route-back: its ticket was moved out of review; the author's run reopens when the poller sees this pull request among the ticket's linked pull requests"
             );
         } else {
             tracing::warn!(

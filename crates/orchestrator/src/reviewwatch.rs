@@ -114,7 +114,9 @@ use rhapsody_store::{
 };
 
 use crate::control_loop::{CancelWait, Event};
-use crate::ghsummons::{HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrStateSource, PrStatus};
+use crate::ghsummons::{
+    HeadAllowlist, MERGE_STATE_DIRTY, MERGE_STATE_UNKNOWN, PrLookup, PrStateSource, PrStatus,
+};
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
@@ -1027,9 +1029,10 @@ impl Orchestrator {
     /// Four guards, each of which the ticket names:
     ///
     /// * **Settled only.** GitHub computes mergeability lazily and answers `UNKNOWN` — or, briefly,
-    ///   nothing — while it does, so only a positively-recognised [`MERGE_STATE_DIRTY`] acts. Any
-    ///   other value (including a resolved conflict) CLEARS the record for this pull request, so a
-    ///   conflict that clears stops suppressing the reconciliation sweep.
+    ///   nothing — while it does, so only a positively-recognised [`MERGE_STATE_DIRTY`] acts. An
+    ///   UNSETTLED read acts on nothing AND forgets nothing, because a mid-computation read is not
+    ///   evidence that a conflict resolved; only a settled value that is not the conflict clears the
+    ///   record, so a conflict that clears stops suppressing the reconciliation sweep.
     /// * **The ticket is in review.** A `reviewed` row is this daemon's own record that a findings
     ///   verdict already routed the ticket out; moving it again would be churn, and the author is
     ///   already engaged.
@@ -1045,11 +1048,17 @@ impl Orchestrator {
         merge_state: &str,
         report: &mut ReviewSweepReport,
     ) {
-        // The settled-state guard and the clear, in one condition: anything that is not a settled
-        // conflict is not this trigger's business, and a record left standing would keep the sweep
-        // silent about a pull request whose conflict has gone away.
+        // The settled-state gate. `DIRTY` is the conflict and acts; a settled non-conflict
+        // (CLEAN/BLOCKED/BEHIND/DRAFT/…) is the conflict GONE, so its record — which also keeps the
+        // reconciliation sweep silent — must go with it. But an UNSETTLED read (`UNKNOWN`, or
+        // briefly nothing; GitHub recomputes mergeability whenever the base advances) is neither:
+        // it decides nothing and forgets nothing. Reading it as the conflict resolved would let
+        // `DIRTY → UNKNOWN → DIRTY` at one unchanged head re-route and re-summons the author into
+        // the very loop the once-per-head guard exists to prevent.
         if merge_state != MERGE_STATE_DIRTY {
-            self.conflict_routed.remove(pr);
+            if !merge_state.is_empty() && merge_state != MERGE_STATE_UNKNOWN {
+                self.conflict_routed.remove(pr);
+            }
             return;
         }
         if head.is_empty() {
@@ -1064,7 +1073,7 @@ impl Orchestrator {
         if self
             .conflict_routed
             .get(pr)
-            .is_some_and(|routed| routed == head)
+            .is_some_and(|routed| routed.head == head)
         {
             return;
         }
@@ -1076,8 +1085,15 @@ impl Orchestrator {
         }
         // Recorded BEFORE the send, exactly as `auto_merge_announced` is recorded when the plan is
         // formed: the plan is what the tick acted on, and a notification task that dies between here
-        // and the perform leaves the ticket where a findings route-back would have left it too.
-        self.conflict_routed.insert(pr.clone(), head.to_string());
+        // and the perform leaves the ticket where a findings route-back would have left it too. The
+        // instant is carried so the sweep's silence can expire (see `ConflictRoute`).
+        self.conflict_routed.insert(
+            pr.clone(),
+            ConflictRoute {
+                head: head.to_string(),
+                routed_at: (self.now)(),
+            },
+        );
         let completion = crate::reviewnotify::ReviewCompletion {
             reason: crate::reviewnotify::CompletionReason::Conflict,
             owner: pr.owner.clone(),
@@ -1356,6 +1372,23 @@ pub type ReviewRounds = HashMap<String, usize>;
 /// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
 /// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
 pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
+
+/// One pull request's record of the conflict route-back the watcher has already fired
+/// (STUDIO-961), keyed by coordinate. See [`Orchestrator::conflict_routed`].
+///
+/// Two facts with two different lifetimes, which is why they are named rather than folded into one
+/// value: the HEAD is the debounce and lives until the head moves (or the conflict resolves), while
+/// the instant lets the reconciliation sweep's silence expire independently of it.
+#[derive(Debug, Clone)]
+pub(crate) struct ConflictRoute {
+    /// The head the route-back was fired at — the once-per-conflicted-head guard.
+    pub head: String,
+    /// When it was fired. A conflict route-back keeps the reconciliation sweep silent, but only
+    /// while it is FRESH: past [`crate::reviewreconcile::RECONCILE_STALE_AFTER`] the transition has
+    /// stopped being progress — the author never answered it, or the tracker move never landed —
+    /// and the pull request needs the human signal again.
+    pub routed_at: chrono::DateTime<chrono::Utc>,
+}
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -2561,6 +2594,51 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 2);
+    }
+
+    /// ⚠️ An UNSETTLED read between two DIRTY reads at one head must not re-route. GitHub recomputes
+    /// mergeability whenever the base moves and answers `UNKNOWN` until it has, so `DIRTY → UNKNOWN
+    /// → DIRTY` is the live sequence on any branch whose base is moving; reading the `UNKNOWN` tick as
+    /// "the conflict resolved" re-sends the summons and moves the ticket a second time.
+    ///
+    /// Mutation check: fold the unsettled read back into the clear (drop the `is_empty`/`UNKNOWN`
+    /// carve-out in `propose_conflict_route_back`) and the second `DIRTY` reds — routed 1, expected
+    /// 0.
+    #[test]
+    fn an_unsettled_read_does_not_forget_the_head_it_routed_for() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        // The base moved: GitHub has not recomputed, and the head is unchanged.
+        for unsettled in ["", "UNKNOWN"] {
+            assert_eq!(
+                o.handle_review_sweep(&[open_conflicted(12, HEAD_A, unsettled)])
+                    .routed,
+                0,
+                "({unsettled:?}) must act on nothing"
+            );
+            assert!(
+                o.conflict_routed.contains_key(&coord(12)),
+                "({unsettled:?}) must forget nothing: it is not evidence the conflict resolved"
+            );
+        }
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "the same conflicted head must not be routed back twice"
+        );
+
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 1, "exactly one summons for one conflicted head");
     }
 
     /// Retiring a pull request drops its conflict record — a coordinate watched again later must

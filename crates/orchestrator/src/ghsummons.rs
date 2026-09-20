@@ -765,6 +765,15 @@ pub const MERGE_STATE_BEHIND: &str = "BEHIND";
 /// transient `UNKNOWN` — GitHub still computing mergeability — moves nothing.
 pub const MERGE_STATE_DIRTY: &str = "DIRTY";
 
+/// GitHub's `mergeStateStatus` for a pull request whose mergeability it has not computed yet.
+///
+/// Not a state but the ABSENCE of one: GitHub recomputes mergeability whenever the base advances
+/// and answers `UNKNOWN` — or, briefly, nothing — until it has. Named beside [`MERGE_STATE_DIRTY`]
+/// for the conflict route-back (STUDIO-961), because the two are the settled values it must tell
+/// apart: `DIRTY` is the conflict, and `UNKNOWN` is a read that is neither the conflict nor
+/// evidence that it resolved, so it must act on nothing and forget nothing.
+pub const MERGE_STATE_UNKNOWN: &str = "UNKNOWN";
+
 /// The fallible result of a [`MergeStateSource`] lookup: GitHub's own `mergeStateStatus`
 /// upper-cased, or empty when GitHub states none.
 ///

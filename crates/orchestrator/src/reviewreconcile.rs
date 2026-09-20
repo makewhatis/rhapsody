@@ -519,7 +519,16 @@ impl Orchestrator {
                     // owns the next move. Reporting it as needing a human would be the false
                     // positive the divergence's own docs warn against, so it is dropped entirely
                     // (and logged as recovered, once, by `set_review_divergences`).
-                    if self.conflict_routed.contains_key(pr) {
+                    //
+                    // While it is FRESH. The transition is the progress at the moment it fires, and
+                    // only for so long: a route-back the author never answers — or a tracker move
+                    // that never landed — stops being progress once it is itself older than this
+                    // sweep's own staleness horizon, and the pull request needs the human signal
+                    // again. Suppressing it forever would trade a false positive for a false
+                    // negative, which is the worse of the two.
+                    if let Some(routed) = self.conflict_routed.get(pr)
+                        && stale_secs(now, routed.routed_at, RECONCILE_STALE_AFTER).is_none()
+                    {
                         return None;
                     }
                     d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
@@ -1669,7 +1678,10 @@ mod store_tests {
         // The watcher routed it back for a conflict at HEAD, so the sweep must fall silent.
         o.conflict_routed.insert(
             crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD.to_string(),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T21:20:00Z"),
+            },
         );
         o.reconcile_review_divergence();
 
@@ -1687,6 +1699,53 @@ mod store_tests {
         assert!(
             rendered.get("review_divergence").is_none(),
             "nor may it reach /api/v1/state"
+        );
+    }
+
+    /// STUDIO-961: the sweep's silence about a conflict route-back EXPIRES. A route-back the author
+    /// never answers — or whose tracker move never landed — is progress only while it is fresh; past
+    /// the sweep's own staleness horizon the pull request needs the human signal again, rather than
+    /// being suppressed forever.
+    ///
+    /// Mutation check: drop the `stale_secs` fresh-check in `reconcile_review_divergence` (suppress
+    /// on the record alone) and this test reds — the stale record would keep the divergence silent.
+    #[test]
+    fn a_stale_conflict_route_back_is_reported_as_needing_a_human_again() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+
+        // Routed back four hours and twenty minutes ago: older than the ninety-minute horizon, so
+        // the transition has stopped being progress.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T17:00:00Z"),
+            },
+        );
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a stale route-back must not silence the human signal forever"
+        );
+        assert_eq!(
+            o.review_divergences()[0].kind,
+            DivergenceKind::ApprovedStillOpen
         );
     }
 }

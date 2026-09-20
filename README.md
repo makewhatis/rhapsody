@@ -1445,9 +1445,13 @@ It is deliberately **independent of the review verdict** — an approved-but-con
 still needs its author — so it does not take the findings trigger's approved-arm refusal. It fires
 **once per conflicted head**, the review edge trigger's discipline: the conflict persists across
 every tick until a push lands, and a naive trigger would re-summons the author into a loop. An
-unsettled read (`UNKNOWN`, or nothing) moves nothing, because GitHub computes mergeability lazily.
+unsettled read (`UNKNOWN`, or nothing) moves nothing **and forgets nothing**, because GitHub
+computes mergeability lazily whenever the base advances — reading that mid-computation tick as "the
+conflict resolved" would let `DIRTY → UNKNOWN → DIRTY` at one unchanged head re-summons the author.
 And because the transition IS the progress, the reconciliation sweep stops reporting such a pull
-request as needing a human while the route-back is in flight.
+request as needing a human while the route-back is FRESH; past the sweep's own staleness horizon — an
+author who never answers, or a tracker move that never landed — the human signal comes back rather
+than being silenced forever.
 
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 
