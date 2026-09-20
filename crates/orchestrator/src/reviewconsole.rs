@@ -346,6 +346,9 @@ impl Orchestrator {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
+            // ...and the unreadability record, keyed by coordinate for `retire_review_pr`'s reason:
+            // left behind it would outlive the pull request it names (STUDIO-950 round 14).
+            self.review_watch_unreadable.remove(pr);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
