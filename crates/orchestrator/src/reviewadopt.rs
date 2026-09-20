@@ -162,6 +162,16 @@ impl Orchestrator {
                     // here. The refusal itself stays in `adopt_verdict`; this only feeds the same
                     // `clear_orphaned_review` the Adopt arm uses.
                     if crate::teams::is_human(iss) {
+                        // The pace memo must go with the advisory (STUDIO-949 round 5). This ticket
+                        // may carry a `review_adopt_probed` entry from an earlier sweep — the
+                        // quarter-hour memo that keeps a parked-but-unadoptable ticket from costing
+                        // a `gh` lookup every tick. Retiring the advisory while leaving the memo
+                        // armed means: the label is removed, the orphan warning is already gone, and
+                        // `adopt_verdict` still hits the stale timestamp and skips BEFORE it
+                        // reconsiders — adoption silently suppressed for the balance of the
+                        // interval, which is the state the repair exists to eliminate. Dropping the
+                        // memo here makes the label's removal take effect on the very next sweep.
+                        self.review_adopt_probed.remove(&iss.identifier);
                         out.repaired
                             .push((self.adopt_group(proj), iss.identifier.clone()));
                     }
@@ -882,6 +892,68 @@ mod tests {
             got.repaired,
             vec![("rhapsody".to_string(), "STUDIO-836".to_string())],
             "the hold feeds the advisory's retirement instead of stranding it"
+        );
+    }
+
+    /// STUDIO-949 round 5. Retiring the advisory is not enough: the ticket's `review_adopt_probed`
+    /// pace memo must be retired with it. The memo is armed by the very refusal that filed the
+    /// advisory, and it survives the label's arrival — `adopt_verdict` returns at the human gate
+    /// BEFORE the pace gate, so the walk below never touches it. Without this clearing, an operator
+    /// who labels the ticket and then removes the label a second later is left with: no orphan
+    /// warning (the hold's repair deleted it), and adoption silently suppressed by the stale
+    /// timestamp for the balance of `REVIEW_ADOPT_PROBE_INTERVAL`. This drives the whole transition
+    /// through `sweep_review_adoptions`, because asserting only on `plan_review_adoptions`'s
+    /// `repaired` cannot see the interval.
+    ///
+    /// MUTATION: drop the `review_adopt_probed.remove` from the human Skip arm and the third sweep
+    /// reds (refused empty, advisory not re-filed).
+    #[test]
+    fn removing_a_human_hold_immediately_restores_the_orphan_advisory() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let _rx = o.open_review_intro_channel();
+        let t0 = Instant::now();
+
+        // Tick 1: no label, and the roster holds nobody but the author — so the sweep REFUSES and
+        // files the advisory, arming the pace memo on the way through.
+        o.sweep_review_adoptions([(&parked("STUDIO-836"), Some(0))].into_iter(), t0);
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-836")),
+            "the orphan is reported before the hold exists"
+        );
+        assert!(
+            o.review_adopt_probed.contains_key("STUDIO-836"),
+            "the refusal armed the pace memo"
+        );
+
+        // Tick 2, one second later: the label lands. The hold retires the advisory and the memo.
+        let mut held = parked("STUDIO-836");
+        held.labels = Some(vec!["rhapsody:human".to_string()]);
+        o.sweep_review_adoptions([(&held, Some(0))].into_iter(), t0 + Duration::from_secs(1));
+        assert!(
+            o.warnings.merged_for("rhapsody").is_empty(),
+            "the hold retires the advisory"
+        );
+        assert!(
+            !o.review_adopt_probed.contains_key("STUDIO-836"),
+            "the pace memo must be retired with the advisory"
+        );
+
+        // Tick 3, one second after that: the label is gone and the ticket is still an orphan. It must
+        // be visible again at once, not suppressed for the rest of the interval.
+        o.sweep_review_adoptions(
+            [(&parked("STUDIO-836"), Some(0))].into_iter(),
+            t0 + Duration::from_secs(2),
+        );
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-836")),
+            "once the human hold is removed, the still-orphaned review must be visible again"
         );
     }
 
