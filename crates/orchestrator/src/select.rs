@@ -185,6 +185,17 @@ impl Orchestrator {
                 if !self.review_reopen_eligible(&iss, &running) {
                     continue;
                 }
+                // STUDIO-956: a summons re-engages a review-state ticket, which is the author's
+                // half of the review↔author loop. A spent shared budget refuses it here, BEFORE the
+                // promote write below, so the ticket is not moved out of review for a run that will
+                // not happen.
+                if self.author_round_budget_spent(&iss) {
+                    tracing::info!(
+                        issue_identifier = %iss.identifier,
+                        "skipping dispatch: the pull request's shared review↔author round budget is spent"
+                    );
+                    continue;
+                }
                 let pst = normalize_state(&eff.review_promote_state);
                 if count(&state_counts, &pst)
                     >= state_limit(
@@ -227,6 +238,18 @@ impl Orchestrator {
                 tracing::info!(
                     issue_identifier = %iss.identifier,
                     "skipping dispatch: issue has a linked PR and no newer summons"
+                );
+                continue;
+            }
+            // STUDIO-956: the other half of that guard. A summons DID lift the suppression, but the
+            // pull request's shared review↔author budget is spent, so this re-dispatch is the loop
+            // the budget exists to bound. Refused here rather than left to the review cap because
+            // the author's run is one half of the loop and neither side may run alone past it. The
+            // reconciliation sweep reports the spent budget in a form an operator can act on.
+            if self.author_round_budget_spent(&iss) {
+                tracing::info!(
+                    issue_identifier = %iss.identifier,
+                    "skipping dispatch: the pull request's shared review↔author round budget is spent"
                 );
                 continue;
             }
@@ -464,6 +487,15 @@ impl Orchestrator {
                 if !self.review_reopen_eligible(&ti.iss, &running) {
                     continue;
                 }
+                // STUDIO-956: the multi-project ladder's half of the author-side budget guard —
+                // mirrored here or the feature is silently absent on every `projects:` install.
+                if self.author_round_budget_spent(&ti.iss) {
+                    tracing::info!(
+                        issue_identifier = %ti.iss.identifier,
+                        "skipping dispatch: the pull request's shared review↔author round budget is spent"
+                    );
+                    continue;
+                }
                 if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
                     continue;
                 }
@@ -506,6 +538,14 @@ impl Orchestrator {
                 tracing::info!(
                     issue_identifier = %ti.iss.identifier,
                     "skipping dispatch: issue has a linked PR and no newer summons"
+                );
+                continue;
+            }
+            // STUDIO-956: the multi-project ladder's half of the author-side budget guard.
+            if self.author_round_budget_spent(&ti.iss) {
+                tracing::info!(
+                    issue_identifier = %ti.iss.identifier,
+                    "skipping dispatch: the pull request's shared review↔author round budget is spent"
                 );
                 continue;
             }
@@ -1256,6 +1296,68 @@ mod tests {
         );
     }
 
+    /// **STUDIO-956, at the ladder.** A summons lifts `pr_suppressed`, but when the pull request has
+    /// reached the opt-in adjudication threshold the author re-dispatch is refused all the same —
+    /// the half of the loop that ran unbounded.
+    #[test]
+    fn select_dispatch_refuses_an_author_redispatch_at_the_adjudication_threshold() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                adjudicate_after_rounds: 3,
+                ..rhapsody_config::teams::Review::default()
+            },
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        let pr = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        let linked = || rhapsody_core::LinkedPRRef {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            merged: false,
+        };
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&crate::prstate::PrCoord::new("o", "r", 7)),
+            3 * o.reviewers_per_round(),
+        );
+
+        let input = vec![
+            {
+                // A summons newer than the activity, so `pr_suppressed` does NOT stop it...
+                let mut i = issue("1", "A-1", "In Progress");
+                i.linked_pr = true;
+                i.linked_prs = Some(vec![linked()]);
+                i.latest_pr_activity_at = Some(pr);
+                i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                i
+            },
+            {
+                // ...while a linked pull request with budget left still dispatches.
+                let mut i = issue("2", "A-2", "In Progress");
+                i.linked_pr = true;
+                i.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+                    number: 8,
+                    ..linked()
+                }]);
+                i.latest_pr_activity_at = Some(pr);
+                i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                i
+            },
+        ];
+        let got = o.select_dispatch(input);
+        let ids: HashSet<String> = got.iter().map(|i| i.id.clone()).collect();
+        assert!(
+            !ids.contains("1"),
+            "A-1's pull request has spent its shared budget; the summons must not re-dispatch it"
+        );
+        assert!(
+            ids.contains("2"),
+            "A-2's pull request has budget left → dispatched (the guard is per pull request)"
+        );
+    }
+
     // --- select_multi_test.go -----------------------------------------------------------------
 
     // STUDIO-885: "the board is full" and "this ticket is correctly suppressed" were
@@ -1561,6 +1663,71 @@ mod tests {
             o.select_dispatch_multi(input).len(),
             2,
             "project cap=2 bounds the whole group (both slugs) to 2 total"
+        );
+    }
+
+    /// **STUDIO-956, at the multi-project ladder.** The single-project test above exercises the
+    /// active ladder's guard; this is the pass a `projects:` install actually runs, and without a
+    /// test of its own that half of the author-side bound can be deleted with the whole suite green
+    /// — a `projects:` install regresses STUDIO-170 and nothing notices.
+    #[test]
+    fn select_dispatch_multi_refuses_an_author_redispatch_at_the_adjudication_threshold() {
+        let mut o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                adjudicate_after_rounds: 3,
+                ..rhapsody_config::teams::Review::default()
+            },
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        let pr = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        let linked = || rhapsody_core::LinkedPRRef {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            merged: false,
+        };
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&crate::prstate::PrCoord::new("o", "r", 7)),
+            3 * o.reviewers_per_round(),
+        );
+
+        let input = tag_for(
+            0,
+            vec![
+                {
+                    // A summons newer than the activity, so `pr_suppressed` does NOT stop it...
+                    let mut i = issue("1", "A-1", "In Progress");
+                    i.linked_pr = true;
+                    i.linked_prs = Some(vec![linked()]);
+                    i.latest_pr_activity_at = Some(pr);
+                    i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                    i
+                },
+                {
+                    // ...while a linked pull request with budget left still dispatches.
+                    let mut i = issue("2", "A-2", "In Progress");
+                    i.linked_pr = true;
+                    i.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+                        number: 8,
+                        ..linked()
+                    }]);
+                    i.latest_pr_activity_at = Some(pr);
+                    i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                    i
+                },
+            ],
+        );
+        let ids = picked_ids(&o.select_dispatch_multi(input));
+        assert!(
+            !ids.contains("1"),
+            "A-1's pull request has spent its shared budget; the multi ladder must not re-dispatch it"
+        );
+        assert!(
+            ids.contains("2"),
+            "A-2's pull request has budget left → dispatched (the guard is per pull request)"
         );
     }
 

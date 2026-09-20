@@ -304,6 +304,15 @@ impl Orchestrator {
                  armed mid-tick; the run will wind down at its first turn boundary"
             );
         }
+        // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
+        // AUTHOR round to that pull request's shared review↔author budget. Charged here rather than
+        // in `select` because this is the one funnel every dispatch path shares, so no path can
+        // dispatch an author round the budget never saw. Retries and continuations (`attempt` is
+        // `Some`) are the SAME round and must not charge twice; a ticket whose pull request has
+        // never been reviewed carries no budget entry, so an ordinary first dispatch pays nothing.
+        if attempt.is_none() {
+            self.note_author_round(&iss);
+        }
         // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
         // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
         // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
@@ -1029,6 +1038,18 @@ impl Orchestrator {
         // retries are never suppressed by a PR they themselves opened.
         if re.recovered && self.pr_suppressed(&iss) {
             tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: issue has a linked PR and no newer summons");
+            self.claimed.remove(&e.issue_id);
+            self.completed.remove(&e.issue_id);
+            self.persist_release(&re.identifier);
+            return;
+        }
+        // STUDIO-956: and the author-side half. A recovered SUMMONS-DRIVEN re-dispatch whose pull
+        // request has spent its shared review↔author budget is released rather than run — the loop
+        // has reached its bound and needs a human (reported by the reconciliation sweep). Only
+        // reached when a summons lifted the suppression above, so a ticket whose work is merely
+        // linked was already released there.
+        if re.recovered && self.author_round_budget_spent(&iss) {
+            tracing::warn!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: the pull request's shared review↔author round budget is spent");
             self.claimed.remove(&e.issue_id);
             self.completed.remove(&e.issue_id);
             self.persist_release(&re.identifier);

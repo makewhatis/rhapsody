@@ -131,8 +131,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use rhapsody_config::teams::Teams;
+use rhapsody_core::Issue;
 use rhapsody_store::{
-    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED,
+    ReviewWatchRow,
 };
 
 use crate::control_loop::{CancelWait, Event};
@@ -143,8 +145,8 @@ use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
 use crate::stop::ControlHandle;
 use crate::teams::LoadSnapshot;
 
-/// How many review ROUNDS one pull request may be given, ever, in one daemon lifetime — the floor
-/// against force-push churn (§14.2, "no approval terminal → unbounded re-review").
+/// How many ROUNDS one pull request's review↔author loop may run, ever, in one daemon lifetime —
+/// the floor against force-push churn (§14.2, "no approval terminal → unbounded re-review").
 ///
 /// A ROUND, not a dispatch. `review_rounds` counts dispatches, and one round costs one dispatch per
 /// required reviewer, so the check multiplies this by `teams.review.effective_reviewers()` before
@@ -152,16 +154,41 @@ use crate::teams::LoadSnapshot;
 /// reviewer count — at `reviewers: 8` a pull request would get its first round and never be
 /// re-reviewed again, with nothing above `debug!` to say so.
 ///
+/// **This cap bounds REVIEW rounds only, and that is deliberate.** Since the STUDIO-956 rewrite the
+/// author side is bounded by the opt-in manager adjudication
+/// ([`Orchestrator::adjudication_threshold`], `review.adjudicate_after_rounds`), not by this
+/// constant: an install that sets no threshold keeps exactly the behaviour it had before this
+/// ticket — this cap and its current stop — while the adjudication is opt-in. Charging author runs
+/// to this counter unconditionally would shrink the review cap and stop the author loop on a
+/// default install, which is not the byte-identical behaviour the ticket requires.
+///
+/// Eight is far above any honest review conversation (a review, fixes, a re-review, more fixes) so
+/// a converging loop does not reach it, and far below a runaway.
+///
 /// The edge trigger already bounds the RATE: a round cannot start while one is in flight, so a
 /// pull request costs at most one review per review's duration however fast its author pushes. What
 /// it does not bound is the TOTAL, and an author amending in a loop — a rebase chain, a CI-driven
-/// force-push, a `--fixup` habit — would otherwise buy a full agent run per amendment forever.
-/// Eight rounds is far above any honest review conversation (a review, fixes, a re-review, more
-/// fixes) and far below a runaway.
+/// force-push, a `--fixup` habit, or a reviewer who keeps summoning — would otherwise buy a full
+/// agent run per amendment forever. The adjudication threshold is the bound for that half.
 ///
-/// Deliberately in memory rather than a column: it is a churn floor, not an audit record, and the
-/// churn it guards against happens over minutes inside one daemon lifetime. A restart resets it,
-/// which is the correct outcome for an operator who restarted the daemon to unstick something.
+/// **The counter is DURABLE, and a restart does not refund it** (STUDIO-956). It is written to
+/// `rhapsody_review_bound` at every charge and rehydrated at boot
+/// ([`Orchestrator::rehydrate_review_bounds`]), keyed by the PULL REQUEST, so it means "rounds spent
+/// on this pull request" rather than "rounds since this daemon booted".
+///
+/// This replaces an earlier claim that keeping it in memory was right because "a restart clears it
+/// too, which is the correct outcome for an operator who restarted the daemon to unstick something".
+/// That was measured wrong. On 2026-09-20 there were five restarts, every one of them to apply a
+/// boot-only `teams.yaml` change — i.e. caused by tuning the review configuration — and each one
+/// handed seven in-flight pull requests a fresh budget: 46 review runs on one pull request against a
+/// nominal cap of 16, 264 review runs that day. The effective bound was 16 PER RESTART, which is no
+/// bound at all, and a pull request the manager had already escalated forgot the decision and
+/// resumed the loop from zero.
+///
+/// The deliberate clear is still there and is now the only thing that lifts a bound in place:
+/// [`Orchestrator::handle_review_clear`], `POST /api/v1/reviews/clear`. A pull request that leaves
+/// the watch set — merged, closed, dismissed — has its row deleted, so a re-introduced, reopened or
+/// rebuilt pull request never inherits a spent budget.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
 /// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
@@ -235,6 +262,12 @@ pub struct ReviewSweepReport {
     /// sweeps (STUDIO-891) — a SUBSET of [`ReviewSweepReport::deferred`], and the part of it that
     /// is not going to resolve itself. Always `<= deferred`.
     pub stalled: usize,
+    /// The pull requests whose round threshold was reached this tick and which the MANAGER must
+    /// adjudicate (STUDIO-956). A work LIST for [`ReviewSweepReport::done`]'s reason: the decision
+    /// is a model turn and a pair of writes, which must not happen on the control task. Empty on
+    /// every installation that has not set `review.adjudicate_after_rounds`, and on every tick
+    /// where no pull request reached it.
+    pub adjudicate: Vec<crate::reviewadjudicate::ReviewAdjudicationPlan>,
 }
 
 /// The carried-budget sentinel meaning "this hand-back reached no decision": it spent nothing and
@@ -317,6 +350,15 @@ pub trait ReviewWatchSink: Send + Sync {
     /// control task only ever decides. Infallible by contract: a failed move is logged where it
     /// happens and the ticket stays in review — there is no caller with anything to do about it.
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan);
+
+    /// Asks the MANAGER to adjudicate ONE pull request that has reached its round threshold
+    /// (STUDIO-956) — ship it, or escalate.
+    ///
+    /// On the sink for [`Self::merge`]'s reason: the decision is a model turn plus a room write and
+    /// a GitHub comment, none of which may happen on the control task. Infallible by contract: a
+    /// failed turn is logged and the decision is re-asked on a later sweep, and there is no caller
+    /// to return to.
+    async fn adjudicate(&self, plan: crate::reviewadjudicate::ReviewAdjudicationPlan);
 }
 
 /// The production [`ReviewWatchSink`]: the control channel, through the same [`ControlHandle`] seam
@@ -328,6 +370,11 @@ pub struct ControlWatchSink {
     /// merge needs no loop-owned state at all, so routing it through the control channel would
     /// queue an irreversible network call behind the current tick for no benefit.
     automerge: Option<Arc<crate::runautomerge::AutoMergeDeps>>,
+    /// The manager's adjudication turn and its two audit writes (STUDIO-956), or `None` when
+    /// `review.adjudicate_after_rounds` is unset. Held here for [`Self::automerge`]'s reason: the
+    /// turn is a model call and the writes are a room append and a `gh` comment, none of which the
+    /// control task may block on.
+    adjudication: Option<crate::reviewadjudicate::AdjudicationDeps>,
 }
 
 impl ControlWatchSink {
@@ -335,6 +382,7 @@ impl ControlWatchSink {
         ControlWatchSink {
             control,
             automerge: None,
+            adjudication: None,
         }
     }
 
@@ -346,6 +394,17 @@ impl ControlWatchSink {
         deps: Arc<crate::runautomerge::AutoMergeDeps>,
     ) -> ControlWatchSink {
         self.automerge = Some(deps);
+        self
+    }
+
+    /// Gives the sink the manager adjudication turn and its audit writes (STUDIO-956). Without this
+    /// a plan is still emitted by the control task and this side says so once per plan — which is
+    /// also what a daemon whose threshold is unset never reaches, because no plan is emitted.
+    pub fn with_adjudication(
+        mut self,
+        deps: crate::reviewadjudicate::AdjudicationDeps,
+    ) -> ControlWatchSink {
+        self.adjudication = Some(deps);
         self
     }
 }
@@ -389,6 +448,18 @@ impl ReviewWatchSink for ControlWatchSink {
     }
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
         self.control.finish_review_ticket(plan).await
+    }
+    async fn adjudicate(&self, plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {
+        let Some(deps) = self.adjudication.as_ref() else {
+            tracing::warn!(
+                pr = %plan.pr,
+                "review adjudication: no manager turn is configured; the loop stays stopped"
+            );
+            return;
+        };
+        // Infallible by contract: `perform_adjudication` logs every failure and records what it
+        // decided, so there is nothing here to propagate.
+        crate::reviewadjudicate::perform_adjudication(&plan, deps, chrono::Utc::now()).await;
     }
 }
 
@@ -662,6 +733,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 stalled,
                 done,
                 merge,
+                adjudicate,
             } = one;
             report.dispatched += dispatched;
             report.retired += retired;
@@ -671,6 +743,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             report.stalled += stalled;
             report.done.extend(done);
             report.merge.extend(merge);
+            report.adjudicate.extend(adjudicate);
         }
         if report != ReviewSweepReport::default() {
             tracing::info!(
@@ -710,6 +783,16 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 return;
             }
             deps.sink.finish(plan).await;
+        }
+        // The manager adjudications (STUDIO-956), out here because each is a bounded model turn plus
+        // a room append and a GitHub comment. Serially and with a cancellation check between them,
+        // for the same reasons as the two loops above: a shutdown stops after at most one more turn,
+        // and a decision that goes unmade is re-asked on a later sweep rather than lost.
+        for plan in report.adjudicate {
+            if ctx.is_cancelled() {
+                return;
+            }
+            deps.sink.adjudicate(plan).await;
         }
     }
 }
@@ -751,6 +834,13 @@ pub(crate) fn review_round_due(row: &ReviewWatchRow, head: &str, in_flight_now: 
 /// watcher's.
 pub(crate) fn churn_key(pr: &PrCoord) -> String {
     format!("{}/{}#{}", pr.owner, pr.repo, pr.number).to_ascii_lowercase()
+}
+
+/// The first seven characters of a SHA, for a human-readable finding line. Character-safe rather
+/// than byte-sliced: a head is hex in practice, but a malformed value must not panic a production
+/// path.
+fn short_sha(head: &str) -> String {
+    head.chars().take(7).collect()
 }
 
 impl Orchestrator {
@@ -918,6 +1008,315 @@ impl Orchestrator {
             .unwrap_or(0)
     }
 
+    /// How many dispatches one review ROUND costs for this installation — the unit the shared
+    /// review↔author budget ([`REVIEW_ROUNDS_PER_PR_CAP`]) is counted in.
+    ///
+    /// The floor of one matches `service_review_pr`'s own `.max(1)`: a misconfigured
+    /// `review.reviewers: 0` must still cost a round rather than make the budget free.
+    pub(crate) fn reviewers_per_round(&self) -> usize {
+        self.teams
+            .as_ref()
+            .map_or(1, |t| t.review.effective_reviewers().max(1))
+    }
+
+    /// The shared review↔author round budget for one pull request, in dispatches.
+    fn shared_round_budget(&self) -> usize {
+        REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(self.reviewers_per_round())
+    }
+
+    /// Whether `pr`'s legacy REVIEW round budget ([`REVIEW_ROUNDS_PER_PR_CAP`]) is spent.
+    ///
+    /// A pull request the watcher has never charged (no entry) is not spent: nothing about it is
+    /// bounded, which is what makes a daemon with ticketless review off byte-identical to one built
+    /// before this budget existed. The author side does NOT read this — see
+    /// [`Orchestrator::author_round_budget_spent`].
+    pub(crate) fn round_budget_spent(&self, pr: &PrCoord) -> bool {
+        self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) >= self.shared_round_budget()
+    }
+
+    /// The linked pull requests of `iss` that already carry a shared budget — ones a review round
+    /// has charged. A ticket whose pull request was never reviewed has none, so an ordinary fresh
+    /// dispatch can neither create a budget nor charge one.
+    fn charged_linked_prs(&self, iss: &Issue) -> Vec<PrCoord> {
+        iss.linked_prs
+            .iter()
+            .flatten()
+            .map(|r| PrCoord::new(&r.owner, &r.repo, r.number))
+            .filter(|pr| self.review_rounds.contains_key(&churn_key(pr)))
+            .collect()
+    }
+
+    /// Whether a summons-driven AUTHOR re-dispatch of `iss` must be refused because the adjudication
+    /// threshold of one of its pull requests is reached, or the manager has already decided
+    /// (STUDIO-956).
+    ///
+    /// **Only armed under the opt-in threshold.** With `review.adjudicate_after_rounds` unset the
+    /// answer is `false` unconditionally: the legacy cap bounds REVIEW rounds only, and the author
+    /// side is exactly as unbounded as it was before this ticket. That is the byte-identical-when-
+    /// unset property the revised ticket's last ⚠️ requires.
+    pub(crate) fn author_round_budget_spent(&self, iss: &Issue) -> bool {
+        let Some(threshold) = self.adjudication_threshold() else {
+            return false;
+        };
+        let charged = self.charged_linked_prs(iss);
+        if charged.is_empty() {
+            return false;
+        }
+        // A manager decision — settled or still in flight — stops the author half on its own.
+        if charged.iter().any(|pr| self.adjudication(pr).is_some()) {
+            return true;
+        }
+        // A pull request that CONVERGED at the threshold is not bounded. The review half declines to
+        // adjudicate it (`service_review_pr` lets every-live-row-approved fall to the ordinary
+        // auto-merge path), so refusing the author here would freeze a healthy pull request with no
+        // decision in the ledger and nothing reporting it. Read the same live rows the review half
+        // reads to make that call — an author summoned after convergence is asking to move the head,
+        // which re-arms the review half and re-opens the budget.
+        let rows = self.store().load_live_review_watch().unwrap_or_default();
+        charged
+            .iter()
+            .any(|pr| self.rounds_used(pr) >= threshold && !converged(&rows, pr))
+    }
+
+    /// The configured adjudication threshold, or `None` when adjudication is off (STUDIO-956).
+    fn adjudication_threshold(&self) -> Option<usize> {
+        self.teams
+            .as_ref()
+            .and_then(|t| t.review_adjudicate_after_rounds())
+    }
+
+    /// [`Self::adjudication_threshold`] for tests in sibling modules — the reconciliation sweep's
+    /// budget-copy test asserts that its fixture really is an install with no threshold, which is
+    /// the whole premise of the sentence it pins.
+    #[cfg(test)]
+    pub(crate) fn adjudication_threshold_for_test(&self) -> Option<usize> {
+        self.adjudication_threshold()
+    }
+
+    /// What the manager has decided (or is deciding) about `pr`, if anything (STUDIO-956).
+    pub(crate) fn adjudication(
+        &self,
+        pr: &PrCoord,
+    ) -> Option<crate::reviewadjudicate::Adjudication> {
+        self.adjudication_ledger.as_ref().and_then(|l| l.peek(pr))
+    }
+
+    /// How many review↔author ROUNDS `pr` has run — the dispatch counter in
+    /// [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit, so the configured threshold and the hard cap are the
+    /// same number of rounds. Under the threshold both sides charge this counter; unset, only
+    /// reviews do.
+    fn rounds_used(&self, pr: &PrCoord) -> usize {
+        self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) / self.reviewers_per_round()
+    }
+
+    /// Writes `key`'s round counter through to `rhapsody_review_bound`, so the bound survives the
+    /// restart that used to refund it (STUDIO-956). Call it after EVERY change to
+    /// [`Orchestrator::review_rounds`] that is not a wholesale forget (which is
+    /// [`Orchestrator::forget_review_bound`]).
+    ///
+    /// The in-memory figure is what is written, not an increment: the counter has exactly one
+    /// writer — the control task — and it is rehydrated at boot, so memory is authoritative and a
+    /// dropped write is repaired by the next charge rather than compounding.
+    ///
+    /// A store error is a WARN and nothing else. Persistence is best-effort everywhere in this
+    /// daemon, and the alternative — refusing to charge a round the store could not record — would
+    /// turn a disk problem into an unbounded review loop, which is the failure this ticket exists
+    /// to end.
+    pub(crate) fn persist_review_rounds(&self, key: &str) {
+        let spent = self.review_rounds.get(key).copied().unwrap_or(0);
+        if let Err(e) = self.store().set_review_rounds(key, spent as i64) {
+            tracing::warn!(
+                pr = %key, err = %e,
+                "ticketless review: the round counter could not be persisted; this pull request's \
+                 bound is per-boot until a later charge writes it"
+            );
+        }
+    }
+
+    /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
+    /// request that has left the watch set or that an operator has deliberately cleared
+    /// (STUDIO-956). The durability trap the ticket names: a bound that outlived its pull request
+    /// would hand a rebuilt or reopened one a spent budget it never earned.
+    pub(crate) fn forget_review_bound(&self, pr: &PrCoord) {
+        if let Err(e) = self.store().clear_review_bound(&churn_key(pr)) {
+            tracing::warn!(pr = %pr, err = %e, "ticketless review: the durable round bound could not be cleared");
+        }
+    }
+
+    /// Rebuilds the per-pull-request review bounds from the store at boot — the round counters into
+    /// [`Orchestrator::review_rounds`] and the manager's settled decisions into the adjudication
+    /// ledger (STUDIO-956). Called by [`Orchestrator::boot_recovery`], before the first tick.
+    ///
+    /// Only SETTLED decisions come back: an in-flight marker is never persisted (see
+    /// [`crate::reviewadjudicate::Adjudication`]), so an adjudication a restart interrupted is
+    /// simply re-asked rather than left stopping the loop forever with no turn anywhere to land it.
+    ///
+    /// Best-effort, like every other step of boot recovery: a failed read is logged and the daemon
+    /// starts with the per-boot behaviour it had before this ticket rather than refusing to boot.
+    pub(crate) fn rehydrate_review_bounds(&mut self) {
+        let rows = match self.store().load_review_bounds() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "recovery: the review round bounds could not be read; the bound is per-boot this lifetime");
+                return;
+            }
+        };
+        let (mut counters, mut decisions) = (0usize, 0usize);
+        for row in rows {
+            if row.dispatches > 0 {
+                // `row.pr` IS `churn_key`'s spelling — it is what wrote the row — so no second
+                // place derives the key and the two can never disagree about what one budget is.
+                self.review_rounds
+                    .insert(row.pr.clone(), row.dispatches as usize);
+                counters += 1;
+            }
+            if let Some(stored) = row.adjudication.as_ref()
+                && let Some(ledger) = self.adjudication_ledger.as_ref()
+                && let Some(decision) = crate::reviewadjudicate::Adjudication::from_stored(stored)
+            {
+                ledger.seed(&row.pr, decision);
+                decisions += 1;
+            }
+        }
+        if counters > 0 || decisions > 0 {
+            tracing::info!(
+                counters,
+                decisions,
+                "recovery: rehydrated the review round bounds; a restart no longer refunds a spent \
+                 budget or forgets a manager decision"
+            );
+        }
+    }
+
+    /// The decision-relevant open facts at `head`, one human-readable line per live row. Named on an
+    /// escalation, which must carry the specific findings rather than "needs a human" (STUDIO-956).
+    ///
+    /// **Not "the verdicts at this exact head".** The row's status is transient: a head advance
+    /// re-arms `reviewed` to `requested` (preserving `last_reviewed_sha`) and an unfinished round
+    /// parks at `truncated`, so at the instant the loop reaches its threshold both halves of a
+    /// `status == reviewed && last_reviewed_sha == head` filter can fail at once and the plan would
+    /// carry no findings at all. That is the rule rather than the exception on an EVEN threshold,
+    /// which the author's own summoned dispatch is what crosses. Three shapes are named instead:
+    ///
+    /// * a row that posted findings at the current head — `{reviewer} asked for changes at {head}`;
+    /// * a row whose last read predates the head — the author has pushed since and nobody has read
+    ///   the new head, which is the single most decision-relevant fact available here and is stated
+    ///   verdict-neutrally because the re-arm preserved the SHA but not whether it was findings or
+    ///   an approval;
+    /// * a `truncated` row — the round was attempted and never finished, so it posted nothing.
+    ///
+    /// Skipped are the rows with nothing to say: one approved at the current head, and one that has
+    /// never been reviewed at all and is not in the unfinished-round state.
+    fn open_findings(&self, mine: &[&ReviewWatchRow], head: &str) -> Vec<String> {
+        let mut findings = Vec::new();
+        for r in mine
+            .iter()
+            .filter(|r| r.open && r.status != REVIEW_STATUS_DROPPED)
+        {
+            if r.last_reviewed_sha == head {
+                if r.status == REVIEW_STATUS_REVIEWED {
+                    findings.push(format!(
+                        "{} asked for changes at {}",
+                        r.key.reviewer,
+                        short_sha(head)
+                    ));
+                }
+                // An `approved` row at this head is the only genuinely closed one; every other
+                // status here (`truncated` after a completed read of the same head, say) falls
+                // through to the unfinished-round arm below.
+            } else if !r.last_reviewed_sha.is_empty() {
+                findings.push(format!(
+                    "{} last reviewed {}; the author has pushed {} since and no reviewer has read it",
+                    r.key.reviewer,
+                    short_sha(&r.last_reviewed_sha),
+                    short_sha(head)
+                ));
+                continue;
+            }
+            if r.status == REVIEW_STATUS_TRUNCATED {
+                let attempted = if r.requested_sha.is_empty() {
+                    head
+                } else {
+                    &r.requested_sha
+                };
+                findings.push(format!(
+                    "{}'s review of {} did not finish; no findings were posted",
+                    r.key.reviewer,
+                    short_sha(attempted)
+                ));
+            }
+        }
+        findings
+    }
+
+    /// Whether any half of `pr`'s loop — a review round OR the author's summoned run — is live
+    /// right now.
+    ///
+    /// A decision must not be made over a round mid-flight: new findings could still land, and a fix
+    /// the author is actively writing is about to supersede the head the manager would decide
+    /// against. The author half is easy to miss because the counter is charged at DISPATCH
+    /// ([`crate::retry`]), so an author run is in flight from the very instant its charge lands —
+    /// and with the loop alternating review→author, any EVEN threshold is crossed by the author's
+    /// own dispatch. [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an
+    /// in-flight run as activity that silences the whole pull request; this is the same rule on the
+    /// decision path.
+    fn review_round_in_flight(&self, mine: &[&ReviewWatchRow]) -> bool {
+        let review_live = mine.iter().any(|r| {
+            let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+            self.running.contains_key(&id) || self.claimed.contains(&id)
+        });
+        review_live
+            || mine.iter().any(|r| {
+                crate::reviewdone::origin_ticket(&r.introduced_by)
+                    .is_some_and(|ticket| self.author_run_live(ticket))
+            })
+    }
+
+    /// Whether the ticket `identifier` — a watched pull request's author — has a live run.
+    ///
+    /// The author's run is a normal ticket run, so it is keyed by the tracker's opaque ID rather
+    /// than by the identifier this reads; `RunningEntry` carries its own `Issue` and is the one
+    /// place the two are available together.
+    ///
+    /// A run parked in BACKOFF is live work too, and it is `claimed` without being `running` for
+    /// the whole backoff delay. `schedule_retry_for` records its `RetryEntry` (which carries the
+    /// identifier) at the same instant it claims the id, so reading `retry_attempts` covers that
+    /// window — without it a flaky agent's mid-loop retry would be decided over, the same harm as
+    /// deciding over a running fix. `LoadSnapshot::from_running_and_retries` counts the state
+    /// against its owner for exactly this reason.
+    fn author_run_live(&self, identifier: &str) -> bool {
+        self.running
+            .values()
+            .any(|entry| entry.issue.identifier == identifier)
+            || self
+                .retry_attempts
+                .values()
+                .any(|entry| entry.identifier == identifier)
+    }
+
+    /// Charges one AUTHOR round to every linked pull request of `iss` that already carries a budget,
+    /// so the author half of the loop counts toward the adjudication threshold (STUDIO-956).
+    ///
+    /// **A no-op unless the threshold is set.** Under an unset threshold the counter bounds REVIEW
+    /// rounds only, and charging author runs to it would change what a default install does — the
+    /// byte-identical property the revised ticket's last ⚠️ requires. Also a no-op for a ticket
+    /// whose pull requests have never been reviewed, so an ordinary first dispatch is free.
+    ///
+    /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
+    /// run its review's findings bought is the loop's other half, so it costs the same as the review
+    /// round did at any reviewer count.
+    pub(crate) fn note_author_round(&mut self, iss: &Issue) {
+        if self.adjudication_threshold().is_none() {
+            return;
+        }
+        let round = self.reviewers_per_round();
+        for pr in self.charged_linked_prs(iss) {
+            let key = churn_key(&pr);
+            *self.review_rounds.entry(key.clone()).or_default() += round;
+            self.persist_review_rounds(&key);
+        }
+    }
+
     /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
     /// true for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps.
     ///
@@ -1014,6 +1413,16 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // Durably too (STUDIO-956) — counter and decision in one delete, so a pull request that is
+        // rebuilt or reopened under the same number starts from zero rather than inheriting a
+        // budget the pull request it replaced had spent.
+        self.forget_review_bound(pr);
+        // And the manager's adjudication of it (STUDIO-956), for the same reasons: a re-introduced
+        // pull request must be adjudicated afresh, and an entry for a gone pull request would keep
+        // a divergence reported for a review nobody is waiting on any more.
+        if let Some(ledger) = self.adjudication_ledger.as_ref() {
+            ledger.clear(pr);
+        }
         // And what was announced about its auto-merge plan, for the first two of those reasons.
         self.auto_merge_announced.remove(&churn_key(pr));
         for id in retired_ids {
@@ -1049,10 +1458,7 @@ impl Orchestrator {
         // How many dispatches one ROUND of this pull request costs — the unit the churn budget
         // below has to be expressed in. Read from config rather than from `mine.len()`, which is
         // the rows that happen to exist right now and would let a retired row shrink the budget.
-        let reviewers_per_round = self
-            .teams
-            .as_ref()
-            .map_or(1, |t| t.review.effective_reviewers().max(1));
+        let reviewers_per_round = self.reviewers_per_round();
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
@@ -1072,6 +1478,72 @@ impl Orchestrator {
         // reviewer as a peer and not see the substitute, and could hand that substitute a second
         // required review of the same pull request.
         let mut assigned: Vec<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
+
+        // STUDIO-956: at the configured round threshold the loop stops ARMING and the MANAGER
+        // decides — ship it, or escalate — instead of the loop silently stopping at the hard cap.
+        // Checked before the dispatch loop so no row of this pull request is dispatched once the
+        // threshold is reached.
+        if !mine.is_empty()
+            && let Some(threshold) = self.adjudication_threshold()
+        {
+            if let Some(decision) = self.adjudication(pr) {
+                // A decision already exists (or is being made): arm nothing, here or on the author
+                // half (`author_round_budget_spent` reads the same ledger).
+                if !decision.settled() {
+                    report.deferred += 1;
+                }
+                // The gates keep their say either way: a `ship` verdict adjudicates the open
+                // findings, never CI, approval-at-head, a draft, a conflict, or any other merge
+                // gate.
+                self.propose_auto_merge(&mine, pr, head, report);
+                return;
+            }
+            if self.rounds_used(pr) >= threshold {
+                // A pull request that CONVERGED on its last allowed round is not a failure for the
+                // manager to decide. `auto_merge_verdict` is the head-exact "every live row approved
+                // at this head" predicate the merge gate already uses; `is_ok()` is the convergence
+                // question. Sending a converged pull request to the manager would ask it to decide a
+                // loop that already did — on a prompt that asserts it did NOT converge and names no
+                // findings — and an `ESCALATE` answer would post a false alarm and freeze the author
+                // half for a pull request every reviewer approved. Let it fall to the ordinary
+                // auto-merge path below, which re-applies every gate.
+                if crate::automerge::auto_merge_verdict(&mine, head).is_ok() {
+                    self.propose_auto_merge(&mine, pr, head, report);
+                    return;
+                }
+                // Never decide over a round mid-flight: findings could still land, and the author's
+                // own fix may be about to supersede the head this would decide against.
+                if self.review_round_in_flight(&mine) {
+                    report.deferred += 1;
+                    self.propose_auto_merge(&mine, pr, head, report);
+                    return;
+                }
+                let rounds = self.rounds_used(pr);
+                let findings = self.open_findings(&mine, head);
+                // A turn that has failed its bounded attempts ESCALATES rather than being re-asked,
+                // but that escalation is recorded where its two audit writes happen — off the
+                // control task, in `reviewadjudicate::perform_adjudication`. The settled entry it
+                // lands there is what this branch reads back on the next sweep (the
+                // `self.adjudication(pr)` check above) to stop handing out plans, so the bound is
+                // enforced without a second, comment-less escalation path here.
+                let plan = crate::reviewadjudicate::ReviewAdjudicationPlan {
+                    pr: pr.clone(),
+                    head: head.to_string(),
+                    rounds,
+                    findings,
+                };
+                if let Some(ledger) = self.adjudication_ledger.as_ref() {
+                    // Marks it in flight so the next tick does not hand out a second plan while the
+                    // manager is still deciding.
+                    ledger.mark_in_flight(pr, rounds);
+                }
+                report.adjudicate.push(plan);
+                report.deferred += 1;
+                self.propose_auto_merge(&mine, pr, head, report);
+                return;
+            }
+        }
+
         for (idx, row) in mine.iter().enumerate() {
             // A row whose verdict was just carried across an unchanged head move (STUDIO-960). The
             // advance above wrote the NEW head into its `last_reviewed_sha`, but `rows` is this
@@ -1243,11 +1715,16 @@ impl Orchestrator {
                             tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
                         }
                     }
-                    let counter = self.review_rounds.entry(churn_key(pr)).or_default();
+                    let key = churn_key(pr);
+                    let counter = self.review_rounds.entry(key.clone()).or_default();
                     *counter += 1;
-                    if *counter == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
+                    let spent = *counter;
+                    // Durable from the instant it is charged (STUDIO-956): a round the daemon spent
+                    // and then forgot across a restart is how one pull request ran 46 of them.
+                    self.persist_review_rounds(&key);
+                    if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
                         tracing::warn!(
-                            pr = %pr, rounds = *counter,
+                            pr = %pr, rounds = spent,
                             "ticketless review: this pull request has now had its whole re-review \
                              budget; further pushes will not be reviewed"
                         );
@@ -1565,6 +2042,28 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
         && row.key.number == pr.number
 }
 
+/// Whether every LIVE row of `pr` is an APPROVAL — the convergence question
+/// [`crate::automerge::auto_merge_verdict`] answers from a live head, reduced here to the rows' own
+/// verdicts so the author half (which holds no GitHub observation) can ask it too.
+///
+/// A row that is `approved` has stated a verdict about the commit it read, and a head advance
+/// re-arms it to `requested` on the next sweep — so at the moment an author is summoned after a
+/// changes-requested round, "all approved" cannot be a stale pre-push verdict. A pull request with
+/// no live row is NOT converged: nothing has reviewed it.
+fn converged(rows: &[ReviewWatchRow], pr: &PrCoord) -> bool {
+    let mut any = false;
+    for r in rows
+        .iter()
+        .filter(|r| row_is(r, pr) && r.open && r.status != REVIEW_STATUS_DROPPED)
+    {
+        any = true;
+        if r.status != REVIEW_STATUS_APPROVED {
+            return false;
+        }
+    }
+    any
+}
+
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
 pub type ReviewRounds = HashMap<String, usize>;
 
@@ -1639,6 +2138,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rhapsody_config::teams::{Identity, Review, ReviewMode};
+    use rhapsody_core::LinkedPRRef;
     use rhapsody_store::{
         REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_TRUNCATED, ReviewWatchKey,
         Sqlite, StorePath,
@@ -1649,7 +2149,9 @@ mod tests {
     use crate::control_loop::CancelSignal;
     use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult};
     use crate::orchestrator::RunningEntry;
-    use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project, set_of};
+    use crate::testsupport::{
+        DispatchedEntries, empty_effective, empty_resolved_project, retry_entry, set_of,
+    };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OWNER: &str = "makewhatis";
@@ -1705,9 +2207,32 @@ mod tests {
         (o, dispatched)
     }
 
+    /// [`orch`] against a store the CALLER owns — the restart shape (STUDIO-956).
+    fn orch_on(
+        teams: Teams,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> (Orchestrator, DispatchedEntries) {
+        let (o, dispatched) = orch_on_store(teams, store);
+        o.human_holds.begin_pass(true);
+        (o, dispatched)
+    }
+
     /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so the ledger's
     /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
     fn orch_before_first_pass(teams: Teams) -> (Orchestrator, DispatchedEntries) {
+        orch_on_store(
+            teams,
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store")),
+        )
+    }
+
+    /// [`orch_before_first_pass`] against a store the CALLER owns — the restart shape. Two
+    /// orchestrators built over one `Arc<Sqlite>` are two daemon lifetimes over one database file
+    /// (STUDIO-956).
+    fn orch_on_store(
+        teams: Teams,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> (Orchestrator, DispatchedEntries) {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo", "in progress"]);
@@ -1719,9 +2244,7 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         o.teams = Some(teams);
-        o.set_store(Arc::new(
-            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
-        ));
+        o.set_store(store);
         let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&dispatched);
         o.spawn = Some(Box::new(move |_iss, _attempt, re| {
@@ -3340,6 +3863,938 @@ mod tests {
         assert_eq!((over.dispatched, over.deferred), (0, 1));
     }
 
+    // --- the shared review↔author budget (STUDIO-956) ----------------------------------------
+
+    /// A summons-driven author ticket whose work is on pull-request `number` — the shape
+    /// `pr_suppressed` stops suppressing once a review's findings summon the author.
+    fn author_issue(identifier: &str, number: i64) -> Issue {
+        Issue {
+            id: format!("ID-{identifier}"),
+            identifier: identifier.to_string(),
+            title: "t".to_string(),
+            state: "In Progress".to_string(),
+            linked_pr: true,
+            linked_prs: Some(vec![LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number,
+                merged: false,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// **Unset ⇒ the author side is untouched.** The legacy cap bounds review rounds only; with no
+    /// threshold, an author re-dispatch is never refused and never charges the counter — exactly the
+    /// behaviour a daemon built before STUDIO-956 had, which is what makes the whole feature opt-in.
+    #[test]
+    fn an_unset_threshold_leaves_the_author_side_unbounded() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let iss = author_issue("STUDIO-170", 12);
+        // The review half is already deep into — and past — the legacy cap.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), REVIEW_ROUNDS_PER_PR_CAP);
+
+        let mut author_rounds = 0;
+        for _ in 0..11 {
+            if o.author_round_budget_spent(&iss) {
+                break;
+            }
+            o.note_author_round(&iss);
+            author_rounds += 1;
+        }
+
+        assert_eq!(
+            author_rounds, 11,
+            "with no threshold the author half must be exactly as unbounded as it was before \
+             STUDIO-956"
+        );
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&REVIEW_ROUNDS_PER_PR_CAP),
+            "and an author round must not consume the legacy review-only cap"
+        );
+    }
+
+    /// An author round costs one ROUND, not one dispatch: the budget is counted in rounds at every
+    /// reviewer count (STUDIO-727), so a two-reviewer pull request charges two dispatches per author
+    /// round exactly as it charges two per review round. Under the opt-in threshold, where author
+    /// rounds count at all.
+    #[test]
+    fn an_author_round_charges_one_round_at_every_reviewer_count() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let iss = author_issue("STUDIO-1", 12);
+        o.review_rounds.insert(churn_key(&coord(12)), 1);
+
+        o.note_author_round(&iss);
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&3));
+    }
+
+    /// **Acceptance.** Once the adjudication threshold is reached, BOTH sides stop: the review sweep
+    /// refuses the round and the author re-dispatch is refused, on the same counter.
+    #[test]
+    fn a_reached_threshold_stops_the_review_side_and_the_author_side() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        let iss = author_issue("STUDIO-170", 12);
+        // Three rounds reached.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            (report.dispatched, report.adjudicate.len()),
+            (0, 1),
+            "the review half stops arming and the manager is asked instead"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "and the author half, on the same threshold"
+        );
+    }
+
+    /// **A decided pull request refuses the author even below the threshold.** A settled decision is
+    /// itself a reason to stop the loop, so `author_round_budget_spent` reads the ledger as well as
+    /// the counter. The two agree today — a decision is only ever recorded at or above the threshold,
+    /// which is exactly why dropping the ledger half of the predicate leaves every other test green.
+    #[test]
+    fn a_settled_decision_refuses_the_author_side_below_the_threshold() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        let iss = author_issue("STUDIO-170", 12);
+        // One round charged — below the threshold of three — but the manager has already escalated.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 1,
+                findings: vec![],
+                reason: "needs a human".to_string(),
+            },
+        );
+
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "a decided pull request stops the author half even below the threshold"
+        );
+    }
+
+    /// **A decision is never made over an in-flight AUTHOR run.** The counter is charged at
+    /// DISPATCH, so the summoned author's run is live from the instant its charge lands — and with
+    /// the loop alternating review→author, every EVEN threshold is crossed by that dispatch. The
+    /// guard used to look only at review rows, so the manager was handed findings somebody was
+    /// actively fixing and a head about to be superseded.
+    #[test]
+    fn an_in_flight_author_run_defers_the_adjudication() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // `row(12, _)`'s origin ticket is `handoff:STUDIO-721`; its author is mid-fix.
+        o.running.insert(
+            "iss-author".to_string(),
+            RunningEntry::empty(rhapsody_core::Issue {
+                id: "iss-author".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                ..Default::default()
+            }),
+        );
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not decide while the author's run is still fixing"
+        );
+        assert_eq!(
+            report.deferred, 1,
+            "the decision is deferred to a later sweep, not dropped"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "no plan was handed out, so nothing was marked in flight"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// **A decision is never made over a live REVIEW round either.** The guard's own doc says why:
+    /// new findings could still land and the head is about to move. The author half was pinned by
+    /// `an_in_flight_author_run_defers_the_adjudication`; the review half had no test, so setting
+    /// `review_live = false` left the whole crate green. Pinned for both states it reads — a
+    /// running round and one merely claimed.
+    #[test]
+    fn a_live_review_round_defers_the_adjudication() {
+        for claimed_only in [false, true] {
+            let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+            let l = ledger(&mut o);
+            let r = row(12, "bob");
+            let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+            introduce(&o, r);
+            o.claimed.insert(id.clone());
+            if !claimed_only {
+                o.running.insert(
+                    id,
+                    RunningEntry::empty(rhapsody_core::Issue {
+                        id: "iss-review".to_string(),
+                        identifier: "STUDIO-721".to_string(),
+                        ..Default::default()
+                    }),
+                );
+            }
+            o.review_rounds
+                .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+            let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+            assert!(
+                report.adjudicate.is_empty(),
+                "the manager must not decide while a review round is live (claimed_only={claimed_only})"
+            );
+            assert_eq!(
+                report.deferred, 1,
+                "the decision is deferred to a later sweep, not dropped (claimed_only={claimed_only})"
+            );
+            assert_eq!(
+                l.peek(&coord(12)),
+                None,
+                "no plan was handed out, so nothing was marked in flight (claimed_only={claimed_only})"
+            );
+            assert!(dispatched.lock().expect("lock").is_empty());
+        }
+    }
+
+    /// **A decision is never made over an author run parked in BACKOFF.** A run that failed and is
+    /// waiting out its retry is `claimed` but not `running` for the whole backoff delay, and the
+    /// retry then re-dispatches (`attempt` is `Some`, so nothing is charged) against a decision the
+    /// manager already made — the same harm as deciding over a running fix, reached through the
+    /// state the running-only guard did not cover. `LoadSnapshot::from_running_and_retries` counts
+    /// this state as live work for the same reason.
+    #[test]
+    fn an_author_run_parked_in_backoff_defers_the_adjudication() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // `schedule_retry_for` leaves exactly this: the id claimed, the entry carrying the
+        // identifier, and no `running` entry.
+        o.claimed.insert("iss-author".to_string());
+        o.retry_attempts.insert(
+            "iss-author".to_string(),
+            retry_entry("iss-author", "STUDIO-721", 1),
+        );
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not decide while the author's run is parked in backoff"
+        );
+        assert_eq!(
+            report.deferred, 1,
+            "the decision is deferred to a later sweep, not dropped"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "no plan was handed out, so nothing was marked in flight"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// **A settled escalation stops the loop and is never re-asked.** The bound on a failing turn is
+    /// enforced where the turn runs and its audit writes happen
+    /// (`reviewadjudicate::perform_adjudication`, pinned in that module's tests); what the control
+    /// task owes is to honour the settled ledger entry — arm nothing, hand out no further plan.
+    #[test]
+    fn a_settled_escalation_stops_the_loop_and_is_not_re_asked() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec![format!("bob asked for changes at {}", &HEAD_A[..7])],
+                reason: "the manager turn failed 3 times; no decision could be made".to_string(),
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "a settled escalation must not be re-asked"
+        );
+        assert_eq!(report.dispatched, 0, "and no round may arm");
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// …and one short of the bound still re-asks: the retry is real, not a first-failure give-up.
+    #[test]
+    fn a_turn_short_of_its_attempts_re_asks() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        for _ in 0..(crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS - 1) {
+            l.note_failure(&coord(12));
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.adjudicate.len(),
+            1,
+            "a turn inside its attempt bound is re-asked"
+        );
+    }
+
+    /// **A default daemon is byte-identical to today.** A ticket whose pull request no review has
+    /// ever charged carries no budget, so a fresh dispatch is never refused and never charged —
+    /// which is what keeps a Teams-off (or never-reviewed) installation exactly as it was.
+    #[test]
+    fn a_pull_request_no_review_has_charged_is_never_bounded() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let iss = author_issue("STUDIO-1", 12);
+
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "no budget entry ⇒ nothing is bounded"
+        );
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "a ticket whose pull request was never reviewed must not create a budget"
+        );
+    }
+
+    // --- the manager adjudication decider (STUDIO-956) ---------------------------------------
+
+    use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+    /// [`ticketless`] with the opt-in adjudication threshold set.
+    fn adjudicating(names: &[&str], threshold: i64) -> Teams {
+        let mut teams = ticketless(names);
+        teams.review.adjudicate_after_rounds = threshold;
+        teams
+    }
+
+    fn ledger(o: &mut Orchestrator) -> Arc<AdjudicationLedger> {
+        let l = Arc::new(AdjudicationLedger::default());
+        o.adjudication_ledger = Some(Arc::clone(&l));
+        l
+    }
+
+    /// [`ledger`] whose settled decisions are written through to the orchestrator's own store — the
+    /// shape `rhapsodyd::run` builds (STUDIO-956).
+    fn durable_ledger(
+        o: &mut Orchestrator,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> Arc<AdjudicationLedger> {
+        let l = Arc::new(AdjudicationLedger::with_store(store));
+        o.adjudication_ledger = Some(Arc::clone(&l));
+        l
+    }
+
+    /// **Acceptance, and the round-8 blocker.** *"The threshold and the recorded decision survive a
+    /// daemon restart — assert it by writing rounds, dropping and rebuilding the Orchestrator from
+    /// the same store, and reading the count back."*
+    ///
+    /// The rounds are charged through the REAL path (`handle_review_sweep`'s dispatch), not by
+    /// poking the map, so what is pinned is that charging a round persists it — and the decision is
+    /// recorded through the real ledger the off-loop turn writes.
+    ///
+    /// Why it mattered: `review_rounds` was a bare `HashMap` nothing ever rehydrated, so every
+    /// restart refunded every pull request's whole budget. On 2026-09-20 five restarts (each one to
+    /// apply a boot-only `teams.yaml` change) produced 46 review runs on one pull request against a
+    /// nominal cap of 16, and a pull request the manager had already escalated forgot the decision
+    /// and resumed the loop from zero.
+    ///
+    /// ⚠️ MUTATION (the ticket's): make the round counter in-memory again — drop the
+    /// `persist_review_rounds` call from the dispatch site, or the `rehydrate_review_bounds` call
+    /// from `boot_recovery` — and this reds. Dropping the ledger's durable write reds the decision
+    /// half.
+    #[test]
+    fn the_round_counter_and_the_decision_survive_a_daemon_restart() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        // --- daemon lifetime one ---
+        let (mut o, dispatched) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            1,
+            "one round is dispatched, and charged"
+        );
+        assert!(!dispatched.lock().expect("lock").is_empty());
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&1));
+        // And the manager decides, off-loop, exactly as `perform_adjudication` does.
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaa".to_string()],
+                reason: "the reviewers disagree about the schema".to_string(),
+            },
+        );
+        drop(o);
+
+        // --- daemon lifetime two, same store ---
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "a fresh Orchestrator knows nothing until boot recovery runs"
+        );
+
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            Some(&1),
+            "the round this pull request spent must survive the restart that used to refund it"
+        );
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            Some(Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaa".to_string()],
+                reason: "the reviewers disagree about the schema".to_string(),
+            }),
+            "and so must the manager's decision, with the findings and the reason it named"
+        );
+    }
+
+    /// The other half of durability: an IN-FLIGHT marker must NOT survive, because the turn that
+    /// was going to land it does not. Persisted, it would stop every further round for that pull
+    /// request forever with no turn left anywhere to clear it — a permanent freeze in place of the
+    /// temporary refund this ticket fixes. So the restarted daemon sees no decision and the next
+    /// sweep re-asks.
+    ///
+    /// MUTATION: make `AdjudicationLedger::mark_in_flight` write through to the store the way
+    /// `record` does, and this reds. (`Adjudication::to_stored` already refuses an `InFlight`, which
+    /// is why `record` itself cannot be mutated into this defect.)
+    #[test]
+    fn an_in_flight_decision_does_not_survive_the_restart_that_killed_its_turn() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        l.mark_in_flight(&coord(12), 3);
+        assert!(o.adjudication(&coord(12)).is_some());
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "an interrupted adjudication is re-asked, never left stopping the loop forever"
+        );
+    }
+
+    /// The durability trap the ticket names: a pull request that LEAVES the watch set must not hand
+    /// a spent budget to the one that replaces it. A merged, closed or dismissed pull request
+    /// deletes its durable row, so a re-introduced, reopened or rebuilt one under the same number
+    /// boots with nothing.
+    ///
+    /// MUTATION: drop the `forget_review_bound` call from `retire_review_pr` and this reds — the
+    /// rebuilt pull request boots already at the threshold, its author half frozen, with no
+    /// decision anywhere and nothing to clear.
+    #[test]
+    fn a_reopened_pull_request_does_not_inherit_the_spent_budget() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&1));
+
+        // The pull request is merged: the watcher retires it.
+        o.handle_review_sweep(&[observed(12, merged_at(HEAD_A))]);
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "the retired pull request's budget must not outlive it"
+        );
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "nor the decision that was made about it"
+        );
+    }
+
+    /// The operator's deliberate clear (`POST /api/v1/reviews/clear`) is the escape hatch now that a
+    /// restart is not one. It must clear DURABLY: a clear the next boot undoes is worse than no
+    /// clear, because the operator watched it succeed.
+    ///
+    /// MUTATION: drop the `forget_review_bound` call from `handle_review_clear` and this reds.
+    #[test]
+    fn an_operator_clear_survives_the_restart_too() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "a human is needed".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            o.handle_review_clear(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(_)
+        ));
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(o2.review_rounds.get(&churn_key(&coord(12))), None);
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "the operator cleared it; a restart must not bring the decision back"
+        );
+    }
+
+    /// **Acceptance.** With the threshold set to 3, a pull request reaching round 3 dispatches NO
+    /// further review or author round, and instead produces a manager decision naming the head and
+    /// the round count.
+    #[test]
+    fn a_threshold_of_three_stops_the_loop_and_produces_a_manager_decision() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // Three rounds already run (one reviewer per round, so three dispatches).
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "no further review round may be dispatched"
+        );
+        assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
+        let plan = &report.adjudicate[0];
+        assert_eq!(plan.pr, coord(12));
+        assert_eq!(plan.rounds, 3);
+        assert_eq!(plan.head, HEAD_A);
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "nothing reached a worker"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            Some(Adjudication::InFlight { rounds: 3 }),
+            "the decision is marked in flight so the next tick does not re-ask"
+        );
+
+        // The author half is stopped too, on the same threshold.
+        let iss = author_issue("STUDIO-12", 12);
+        assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **The threshold is not a failure when the loop CONVERGED.** A pull request whose last allowed
+    /// round ended with every live row approved at the head has finished; handing it to the manager
+    /// would spawn a turn whose prompt falsely asserts "reached its limit without converging" and
+    /// lists no findings, and an `ESCALATE` answer would post a false alarm and freeze the author
+    /// half for a pull request every reviewer approved. Pinned on the default (`auto_merge: false`)
+    /// config, where the turn is the only effect of this branch.
+    #[test]
+    fn a_converged_pull_request_at_the_threshold_is_not_sent_to_the_manager() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "every reviewer approved at the head: the loop converged and the manager has nothing to \
+             decide"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "and no decision is even marked in flight"
+        );
+        assert_eq!(report.dispatched, 0, "an approved row owes no round");
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "nothing reached a worker"
+        );
+    }
+
+    /// Once a decision has LANDED, the loop stays stopped and is not re-asked — and a `ship` verdict
+    /// does NOT clear the findings gate: a pull request whose reviewer asked for changes still does
+    /// not propose a merge (the merge gates are the merge gates; see the ticket's first ⚠️).
+    #[test]
+    fn a_settled_ship_verdict_stops_arming_and_leaves_the_merge_gate_alone() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, dispatched) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // The reviewer's round at HEAD_A posted findings.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0);
+        assert!(
+            report.adjudicate.is_empty(),
+            "a settled decision must not be re-asked"
+        );
+        assert!(
+            report.merge.is_empty(),
+            "a `ship` verdict adjudicates the FINDINGS, never the gates: a changes-requested row \
+             still holds the merge back"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// The other half of the README's claim: a settled `ship` whose rows ARE all approved at the head
+    /// still reaches `report.merge`. The decision stops the loop; it does not stop a pull request the
+    /// gates have cleared. Without this the `propose_auto_merge` call in the settled-decision branch
+    /// can be deleted with the whole suite green — the sibling test above only pins the refusal.
+    #[test]
+    fn a_settled_ship_verdict_still_proposes_the_merge_once_every_row_approved() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0, "a settled decision arms nothing");
+        assert!(
+            report.adjudicate.is_empty(),
+            "a settled decision must not be re-asked"
+        );
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_A.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "a shipped pull request whose rows are all approved still reaches the merge gate"
+        );
+    }
+
+    /// The escalation carries the open findings, so a human gets the specific findings rather than
+    /// "needs a human". Pinned at the plan the control task hands over.
+    #[test]
+    fn the_plan_names_the_open_findings_at_the_head() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        let plan = &report.adjudicate[0];
+        assert_eq!(
+            plan.findings,
+            vec![format!("bob asked for changes at {}", &HEAD_A[..7])]
+        );
+    }
+
+    /// **The EVEN-threshold shape, where a blank prompt was the rule rather than the exception.**
+    ///
+    /// With the loop alternating review→author, an even threshold is crossed by the AUTHOR's own
+    /// summoned dispatch, and the deferral then holds the decision until their run ends — which is
+    /// after they have pushed. By then every row has been re-armed to `requested`, so a finding
+    /// filter keyed on `status == reviewed && last_reviewed_sha == head` names nothing at all and
+    /// the manager is asked to decide on a blank prompt. The plan must instead name the head that
+    /// was actually read and the unread head the author pushed.
+    ///
+    /// Mutation check: restoring the exact-head/`reviewed`-only filter reds this test.
+    #[test]
+    fn the_plan_names_the_unread_head_on_an_even_threshold() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 4));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // bob read HEAD_A and asked for changes; three rounds are charged through the real site.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        // The author's summoned re-dispatch charges the fourth (even) round, and the author's run
+        // pushes HEAD_B before it ends.
+        let iss = author_issue("STUDIO-956", 12);
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "at three of four the author's summon is still allowed"
+        );
+        o.note_author_round(&iss);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
+        let plan = &report.adjudicate[0];
+        assert_eq!(plan.head, HEAD_B);
+        assert!(
+            !plan.findings.is_empty(),
+            "the manager must not be handed a blank prompt when the head has moved: {:?}",
+            plan.findings
+        );
+        assert!(
+            plan.findings
+                .iter()
+                .any(|f| f.contains(&HEAD_A[..7]) && f.contains(&HEAD_B[..7])),
+            "the finding names the head that was last read AND the unread head: {:?}",
+            plan.findings
+        );
+    }
+
+    /// A TRUNCATED round at the threshold is a review that never happened; the plan must say that
+    /// rather than hand the manager "none recorded" over a round nobody completed.
+    #[test]
+    fn a_truncated_round_at_the_threshold_names_the_review_that_never_finished() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_TRUNCATED)
+            .expect("completed");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        let plan = &report.adjudicate[0];
+        assert!(
+            !plan.findings.is_empty(),
+            "a truncated round is not 'nothing open': {:?}",
+            plan.findings
+        );
+        assert!(
+            plan.findings[0].contains(&HEAD_A[..7]),
+            "the unfinished review names the head it was attempted at: {:?}",
+            plan.findings
+        );
+    }
+
+    /// **Unset ⇒ today's behaviour, byte-identical.** No threshold means no plan is ever emitted,
+    /// whatever the counter says, and the review and author halves fall back to the legacy cap.
+    #[test]
+    fn an_unset_threshold_never_adjudicates() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            report.adjudicate.is_empty(),
+            "an install that never set the threshold must see no adjudication"
+        );
+        assert_eq!(
+            report.dispatched, 1,
+            "and rounds still dispatch exactly as before, up to the legacy cap"
+        );
+        let iss = author_issue("STUDIO-12", 12);
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "three rounds is far inside the legacy cap, so the author half is still open"
+        );
+    }
+
+    /// **Acceptance, named for the incident:** the STUDIO-170 shape — eleven summons-driven author
+    /// rounds — is bounded at the configured threshold. The author half in isolation, for the reason
+    /// the sibling test gives: charging whole cycles would let the review cap stop the loop even if
+    /// the author half were removed.
+    ///
+    /// Mutation check (the ticket's ⚠️): removing the author-side threshold count (letting
+    /// [`Orchestrator::author_round_budget_spent`] consult only the legacy cap) makes this run all
+    /// eleven rounds and reds it.
+    #[test]
+    fn the_studio_170_shape_stops_at_the_adjudication_threshold() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        let iss = author_issue("STUDIO-170", 12);
+        // The review round that first armed the loop.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.reviewers_per_round());
+
+        let mut author_rounds = 0;
+        for _ in 0..11 {
+            if o.author_round_budget_spent(&iss) {
+                break;
+            }
+            o.note_author_round(&iss);
+            author_rounds += 1;
+        }
+
+        assert_eq!(
+            author_rounds, 2,
+            "one review round plus two author rounds reaches the threshold of three; eleven must \
+             not all run"
+        );
+        assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **A converged pull request is not bounded.** The review half declines to adjudicate a pull
+    /// request whose every live row approved at the head — it falls to the ordinary auto-merge path
+    /// — so the author half must not refuse a summons on the count alone. That would freeze a
+    /// healthy pull request with no decision in the ledger and nothing reporting it.
+    ///
+    /// Mutation check: refusing on `rounds_used(pr) >= threshold` alone reds this test.
+    #[test]
+    fn a_converged_pull_request_at_the_threshold_does_not_freeze_the_author_half() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        let iss = author_issue("STUDIO-1", 12);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "every live row approved at the head: the loop converged, so the author half stays open"
+        );
+        assert!(
+            o.adjudication(&coord(12)).is_none(),
+            "and nothing recorded a decision that could explain a refusal"
+        );
+    }
+
+    /// …but the convergence exemption must not become an unbounded author half: a threshold reached
+    /// with a row still holding changes-requested findings still refuses the re-dispatch.
+    #[test]
+    fn a_churning_pull_request_at_the_threshold_still_refuses_the_author_half() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        let iss = author_issue("STUDIO-1", 12);
+        let mut r = row(12, "bob");
+        r.status = REVIEW_STATUS_REVIEWED.to_string();
+        r.last_reviewed_sha = HEAD_A.to_string();
+        introduce(&o, r);
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "a live row still holds changes-requested findings, so the loop has not converged"
+        );
+    }
+
+    /// The author guard is per PULL REQUEST: a ticket linked to a pull request that has reached the
+    /// threshold is refused even while a sibling pull request of the same ticket still has budget,
+    /// because one loop needing a decision is enough.
+    #[test]
+    fn a_reached_threshold_on_any_linked_pull_request_refuses_the_author_round() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let mut iss = author_issue("STUDIO-1", 12);
+        iss.linked_prs = Some(vec![
+            LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number: 12,
+                merged: false,
+            },
+            LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number: 13,
+                merged: false,
+            },
+        ]);
+        // #12 has reached the threshold; #13 has barely started.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        o.review_rounds
+            .insert(churn_key(&coord(13)), o.reviewers_per_round());
+
+        assert!(o.author_round_budget_spent(&iss));
+    }
+
     /// …and the budget is counted in ROUNDS at every reviewer count, not in dispatches (STUDIO-727).
     ///
     /// The counter increments once per dispatch, and one round of a two-reviewer pull request costs
@@ -3808,6 +5263,7 @@ mod tests {
         async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
             self.finished.lock().expect("finished lock").push(plan);
         }
+        async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
     /// A [`ReviewDiffSource`] whose two patches are fixed, so a test can drive the watcher's
@@ -4400,6 +5856,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
     /// The re-read itself, driven directly: a moved head is ADOPTED, a non-open observation is
@@ -4639,6 +6096,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
     /// Sol's blocking finding on #189: a two-pull-request tick must hand each re-read head to the
@@ -4786,6 +6244,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
     /// The daemon-wide dispatch budget is counted ONCE per watcher tick, not once per observation.
@@ -4905,6 +6364,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
     /// The carried budget must compose with a FRESH count, not replace it (STUDIO-953, jimmy's

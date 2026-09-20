@@ -624,6 +624,14 @@ pub struct Orchestrator {
     /// composition root (`rhapsodyd::run`) sets it before `o.run()` moves the orchestrator into the
     /// control task, the same inject-before-`run()` pattern that crate's `CLAUDE.md` documents.
     pub automerge_ledger: Option<Arc<crate::runautomerge::AutoMergeLedger>>,
+    /// Shared with the review watcher's off-loop adjudication half (STUDIO-956): the control task
+    /// READS what the manager decided about a pull request that reached its round threshold, and the
+    /// watcher's task WRITES it after the turn. `None` whenever the threshold is unset or the
+    /// watcher never spawned, in which case no adjudication is ever requested.
+    ///
+    /// `pub` for [`Orchestrator::automerge_ledger`]'s reason: the composition root sets it before
+    /// `o.run()` moves the orchestrator into the control task.
+    pub adjudication_ledger: Option<Arc<crate::reviewadjudicate::AdjudicationLedger>>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -875,6 +883,7 @@ impl Orchestrator {
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,
+            adjudication_ledger: None,
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),

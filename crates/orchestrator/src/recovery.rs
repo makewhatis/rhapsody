@@ -11,6 +11,10 @@
 //!  3. Convert interrupted-running claims (no live worker) to immediate retries (kept claimed).
 //!  4. `load_totals`: seed `o.totals` so dashboard aggregates continue across restarts.
 //!
+//! Plus one Rhapsody-only step ahead of them: `rehydrate_review_bounds` (STUDIO-956) restores each
+//! watched pull request's review round counter and the manager's settled adjudication of it, so a
+//! restart neither refunds a spent budget nor forgets a decision.
+//!
 //! KEY HANDLING (the load-bearing recovery fix): the live maps key by opaque issue ID, but at boot we
 //! have ONLY the identifier (the store PK). So recovered entries are keyed by IDENTIFIER with
 //! `issue_id == ""` and `recovered == true`; [`Orchestrator::on_retry`] resolves their candidate via
@@ -41,6 +45,11 @@ impl Orchestrator {
             Ok(_) => {}
             Err(e) => tracing::error!(error = %e, "recovery: mark interrupted failed"),
         }
+
+        // STUDIO-956: the per-pull-request review bounds, before anything else reads them. A
+        // restart that refunded a spent review budget was measured running one pull request 46
+        // rounds against a cap of 16, so this is as much a part of boot recovery as the retries are.
+        self.rehydrate_review_bounds();
 
         let rec = match self.store.load_recovery() {
             Ok(r) => r,

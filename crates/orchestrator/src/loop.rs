@@ -383,6 +383,13 @@ pub enum Event {
         pr: crate::prstate::PrCoord,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
+    /// The operator clearing a pull request's shared review↔author round budget from the
+    /// authenticated console (STUDIO-956; NEW beyond Go v0.4.0). The deliberate reset of a bound
+    /// that otherwise clears only on a restart or a close.
+    ReviewClear {
+        pr: crate::prstate::PrCoord,
+        reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
+    },
     /// The operator asking, from the console, to merge a run's pull request — phase 1, the
     /// control task's verdict on the request (STUDIO-767; NEW beyond Go v0.4.0).
     ///
@@ -693,6 +700,9 @@ impl Orchestrator {
             }
             Event::ReviewDismiss { pr, reply } => {
                 let _ = reply.send(self.handle_review_dismiss(&pr));
+            }
+            Event::ReviewClear { pr, reply } => {
+                let _ = reply.send(self.handle_review_clear(&pr));
             }
             Event::RunMergePlan {
                 run_id,

@@ -307,6 +307,10 @@ impl StateProvider for DaemonState {
         self.handle.dismiss_review(pr).await
     }
 
+    async fn review_clear(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.handle.clear_review(pr).await
+    }
+
     /// `POST /api/v1/runs/{id}/merge` (STUDIO-767). Unlike the three above it does NOT simply
     /// round-trip the control task: the handle plans on the loop, performs the blocking `gh` half
     /// HERE — on this HTTP task, so a stalled merge parks this request and the daemon keeps

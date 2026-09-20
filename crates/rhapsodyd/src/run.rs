@@ -124,7 +124,9 @@ where
     // failed open. Only the one reader that would ACT on an absence uses it (the Teams
     // identity-label reconcile, STUDIO-672); everything else is guard-free by design.
     let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
-    o.set_store(store);
+    // Cloned rather than moved: the adjudication ledger below is built with the SAME handle, so the
+    // manager's decision and the round counter it belongs beside land in one row (STUDIO-956).
+    o.set_store(Arc::clone(&store));
     // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
     // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
     // failure — or no on-disk store home (--no-store / off / :memory:) — leaves the registry `None`, so
@@ -777,6 +779,32 @@ where
         .then(|| Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeLedger::default()));
     o.automerge_ledger = automerge_ledger.clone();
 
+    // The manager adjudication ledger (STUDIO-956), built HERE beside the auto-merge ledger and for
+    // the same reason: the SAME `Arc` goes to two consumers — the off-loop adjudication half below,
+    // which writes what the manager decided, and `o.adjudication_ledger`, which the control task's
+    // watcher handler reads to stop arming rounds and which the reconciliation sweep reads to report
+    // an escalation.
+    //
+    // Built on exactly `spawn_watcher`'s condition, matching the auto-merge ledger: a ledger nothing
+    // ever writes has nothing to read either, and the threshold gate keeps it inert until an
+    // operator asks for adjudication.
+    // Built WITH the store (STUDIO-956), so a settled decision survives the restart that used to
+    // forget it — measured: 2026-09-20, five restarts, a pull request that had already been
+    // escalated resumed its loop from zero. `Orchestrator::rehydrate_review_bounds` seeds it back
+    // at boot, before the first tick, from the same rows.
+    let adjudication_ledger = spawn_watcher.then(|| {
+        Arc::new(
+            rhapsody_orchestrator::reviewadjudicate::AdjudicationLedger::with_store(Arc::clone(
+                &store,
+            )),
+        )
+    });
+    o.adjudication_ledger = adjudication_ledger.clone();
+    // One room handle for this process (see `triage_room` above): the adjudication posts its
+    // decision there, and a second `LocalRoom` over the same directory would mint a second append
+    // lock. Taken before `o` moves into the control task.
+    let adjudication_room = o.teams_room.clone();
+
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
@@ -817,6 +845,45 @@ where
         });
         let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
             .with_auto_merge(automerge);
+        // The manager adjudication turn (STUDIO-956), wired on its OWN gate —
+        // `review.adjudicate_after_rounds` — and not on `manager.mode`, so a `labels`-mode install
+        // that asks for it still gets a decision. Its turn runs under `manager.model` /
+        // `manager.timeout_ms` through the daemon's one model-turn path.
+        let sink = if teams_cfg.review_adjudicate_after_rounds().is_some() {
+            let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
+            sink.with_adjudication(rhapsody_orchestrator::reviewadjudicate::AdjudicationDeps {
+                adjudicator: Arc::new(
+                    rhapsody_orchestrator::reviewadjudicate::ClaudeReviewAdjudicator,
+                ),
+                room: adjudication_room
+                    .clone()
+                    .map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+                comments: Some(
+                    Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrCommentSink>
+                ),
+                ledger: adjudication_ledger.clone().unwrap_or_default(),
+                turn: rhapsody_orchestrator::reviewadjudicate::AdjudicationTurn {
+                    command,
+                    billing_guard,
+                    tracker_api_key,
+                    // NOT `manager.model` raw (STUDIO-956, round-8 finding 4): it is empty by
+                    // default, and an empty model means `claude -p` with no `--model` — the
+                    // decision would run on the CLI default while the reviews it is adjudicating
+                    // ran on the pinned `review.model`. The resolver falls back to that review
+                    // model, and says so in the README.
+                    model: rhapsody_orchestrator::reviewadjudicate::adjudication_model(
+                        &teams_cfg,
+                        &resolved
+                            .as_ref()
+                            .map(|c| c.agent.backend.clone())
+                            .unwrap_or_default(),
+                    ),
+                    timeout: rhapsody_orchestrator::triage::manager_turn_timeout(&teams_cfg),
+                },
+            })
+        } else {
+            sink
+        };
         let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
             pr_source: Some(
                 Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
