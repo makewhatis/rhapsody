@@ -429,6 +429,11 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.set_store(Arc::clone(&store));
         o.eff = Some(eff);
+        // A handoff is reached from a run the daemon is running; on a real daemon a selection pass
+        // has therefore run and primed the human-hold ledger. Prime it here so the un-primed
+        // fail-closed branch in `plan_quorum` (STUDIO-949 round 12) is exercised by its own test
+        // rather than being what every handoff fixture happens to trip.
+        o.human_holds.begin_pass();
         let cancelled = Arc::new(Mutex::new(HashMap::<String, CancelWait>::new()));
         let cancelled2 = Arc::clone(&cancelled);
         o.spawn = Some(Box::new(move |iss, _attempt, re| {

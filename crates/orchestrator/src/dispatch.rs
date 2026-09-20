@@ -124,8 +124,9 @@ const HUMAN_HOLD_CAPACITY: usize = 256;
 /// The converse is also load-bearing: on a daemon held by one of those gates since boot, NO pass has
 /// ever run, so an empty set is not "no hold" but "nothing has looked", and reading it as the former
 /// is how a `rhapsody:human` ticket's pull request self-merges on a drained daemon (STUDIO-949 round
-/// 11). [`HumanHoldState::primed`] carries that distinction; the two decision gates that run on
-/// their own schedules fail closed while it is `false`.
+/// 11). [`HumanHoldState::primed`] carries that distinction; every `labelled()` decision gate that
+/// does not flow through the per-tick candidate pass — the auto-merge refusal, the reconciliation
+/// sweep and the ticket-mode handoff quorum — fails closed while it is `false`.
 ///
 /// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
 /// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
@@ -159,12 +160,13 @@ struct HumanHoldState {
     /// `on_tick`'s three early-return gates (a failed config validation, an armed drain, a dead
     /// agent credential). On a daemon held by one of those gates `labelled` is therefore empty for
     /// the WHOLE process lifetime, and a decision gate reading it would see "no hold" rather than
-    /// "no information". The two gates that turn on it — the auto-merge refusal and the
-    /// reconciliation sweep's held-row filter — run on their own schedules (`Event::ReviewSweep`
-    /// from the watcher's 120s task; the sweep from `on_tick` ABOVE the gates) and so keep
-    /// executing while dispatch is gated.
+    /// "no information". Three gates turn on it and none flows through the per-tick candidate pass:
+    /// the auto-merge refusal (`Event::ReviewSweep` from the watcher's 120s task), the reconciliation
+    /// sweep's held-row filter (from `on_tick` ABOVE the gates) and the ticket-mode handoff quorum
+    /// (from the `evHandoffRun` handler, which is not on `on_tick` at all). All three keep executing
+    /// while dispatch is gated.
     ///
-    /// `primed` is that distinction: `false` until a pass has actually looked, so those two gates
+    /// `primed` is that distinction: `false` until a pass has actually looked, so those three gates
     /// fail CLOSED instead of silently open. `begin_pass` is the only writer on purpose — the
     /// auto-promote pass observes only Backlog dependents, a partial view, and must not be able to
     /// make an unknown label set look known.
@@ -184,8 +186,8 @@ impl HumanHoldLedger {
     /// wearing the label — or left the candidate set — stops being reported. The announced set is
     /// deliberately NOT touched, and the **primed** flag is set: this is the first moment the
     /// process can be said to have looked at all, which is what lets the fail-closed decision gates
-    /// (the auto-merge refusal, the reconciliation sweep's held-row filter) read an answer. No other
-    /// method sets it; see [`HumanHoldState::primed`].
+    /// (the auto-merge refusal, the reconciliation sweep's held-row filter, the ticket-mode handoff
+    /// quorum) read an answer. No other method sets it; see [`HumanHoldState::primed`].
     pub(crate) fn begin_pass(&self) {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         st.held.clear();

@@ -1334,6 +1334,31 @@ impl Orchestrator {
             );
             return None;
         }
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11): on a daemon held since boot no selection pass has ever run, so `labelled` is
+        // empty for the whole process lifetime. Unlike the ticketless watcher and the reconciliation
+        // sweep, which run on their own schedules and each carry their own fail-closed branch, this is
+        // the ONLY `labelled()` gate a TICKET-mode install ever runs — `quorum_enabled()` is
+        // `teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the two readers
+        // that gate covers are simply absent here (STUDIO-949 round 12). The path stays live while the
+        // dispatch gates return early: `plan_quorum` is reached from the `evHandoffRun` control
+        // handler, which is not on `on_tick` at all, so a live run restored by recovery on a gated
+        // boot can hand off before any pass has looked. An empty set read as "no hold" then fans out a
+        // review for a held parent whose label landed mid-run — and the fan-out mints a NEW,
+        // unlabelled review ticket that no hold on the parent can reach. With no pass having looked,
+        // empty is "unknown", not "no hold": fail CLOSED and refuse the fan-out. Once a pass has run
+        // the set is a real answer and the gate behaves exactly as before.
+        //
+        // MUTATION: drop this branch and
+        // `an_unprimed_hold_ledger_refuses_a_quorum_fan_out` reds (the un-primed daemon fans out).
+        if !self.human_holds.is_primed() {
+            tracing::debug!(
+                issue = %re.issue.identifier,
+                "teams quorum: no selection pass has run yet, so the human-hold label set is \
+                 unknown; no review is requested"
+            );
+            return None;
+        }
         // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
         // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
         // and, because the parent would then stay unmarked, fail again on the next handoff, and the
@@ -2716,6 +2741,9 @@ mod tests {
                 ..Review::default()
             };
             let mut o = orch_with(teams);
+            // A real daemon has run a selection pass before a run exists; prime the ledger so the
+            // un-primed fail-closed branch is not what this mode test is measuring.
+            o.human_holds.begin_pass();
             let mut re = crate::orchestrator::RunningEntry::empty(Issue {
                 id: "iss-1".to_string(),
                 identifier: "MT-1".to_string(),
@@ -2922,6 +2950,7 @@ mod tests {
     async fn a_re_handoff_at_a_new_head_fans_out_a_second_review() {
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
+        o.human_holds.begin_pass();
         let req = o
             .plan_quorum(&running_entry(marked_parent(), "alice"))
             .expect("a parent already marked must still plan a fan-out");
@@ -2958,6 +2987,7 @@ mod tests {
     async fn a_re_handoff_at_the_same_head_fans_out_nothing() {
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
+        o.human_holds.begin_pass();
         let req = o
             .plan_quorum(&running_entry(marked_parent(), "alice"))
             .expect("planned");
@@ -2999,6 +3029,11 @@ mod tests {
     // request, and the hold cannot reach that new ticket. Two in-memory sources are read, because
     // neither alone sees every shape (see the gate's own comment), so both are pinned here.
     //
+    // Each part PRIMES the ledger first: without that, the un-primed fail-closed branch (STUDIO-949
+    // round 12) would refuse both cases and hide whichever arm was deleted, so the test would pass
+    // for the wrong reason. The fail-closed branch has its own test
+    // (`an_unprimed_hold_ledger_refuses_a_quorum_fan_out`).
+    //
     // MUTATION: delete either half of the gate from `plan_quorum` and this reds (`plan_quorum`
     // returns `Some`, and `run_handoffs` would create a review ticket for the held parent).
     #[tokio::test(flavor = "multi_thread")]
@@ -3006,6 +3041,7 @@ mod tests {
         // (a) The hold is in the current set the selection ladders build — the live signal.
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&marked_parent()));
+        o.human_holds.begin_pass();
         o.human_holds.hold(crate::dispatch::HeldForHuman {
             issue_identifier: "MT-1".to_string(),
             title: "do the thing".to_string(),
@@ -3025,6 +3061,7 @@ mod tests {
             .push(crate::teams::HUMAN_LABEL.to_string());
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
         o.record_quorum_state(std::iter::once(&held_parent));
+        o.human_holds.begin_pass();
         assert!(
             o.plan_quorum(&running_entry(held_parent, "alice"))
                 .is_none(),
@@ -3090,6 +3127,40 @@ mod tests {
         assert!(
             o.plan_quorum(&re).is_none(),
             "a label added while the run was live must prevent its handoff from fanning out a review"
+        );
+    }
+
+    // STUDIO-949 round 12 — the ticket-mode sibling of the un-primed fail-closed branch. The
+    // current-label set has no writer above `on_tick`'s three early-return gates; a daemon held
+    // since boot that RECOVERY restores a live run onto can hand that run off before any pass has
+    // looked. `plan_quorum` is reached from the handoff handler, not from `on_tick`, and it is the
+    // ONLY `labelled()` gate a ticket-mode install has — `quorum_enabled()` excludes the ticketless
+    // watcher, and the sweep carries its own branch — so an un-primed empty set read as "no hold"
+    // fans out a review for a held parent whose label landed mid-run, minting a NEW unlabelled
+    // review ticket the hold cannot reach.
+    //
+    // MUTATION: drop the `is_primed()` fail-closed branch in `plan_quorum` and this reds (the
+    // un-primed daemon plans a fan-out).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_a_quorum_fan_out() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        o.record_quorum_state(std::iter::once(&marked_parent()));
+        let re = running_entry(marked_parent(), "alice");
+
+        // No selection pass has run: the ledger's label set is not an answer, so the fan-out is
+        // refused even though this parent wears no hold...
+        assert!(!o.human_holds.is_primed());
+        assert!(
+            o.plan_quorum(&re).is_none(),
+            "an un-primed ledger must fail closed rather than fan out a review it cannot prove unheld"
+        );
+
+        // ...and once a pass has looked the SAME unlabelled parent fans out, so the refusal above is
+        // the missing pass and not some unrelated gate.
+        o.human_holds.begin_pass();
+        assert!(
+            o.plan_quorum(&re).is_some(),
+            "a primed daemon with no hold plans the fan-out exactly as before"
         );
     }
 
