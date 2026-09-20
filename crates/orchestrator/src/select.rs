@@ -275,6 +275,12 @@ impl Orchestrator {
     /// ([`on_retry`](Orchestrator::on_retry)) is a third implementation draw that dispatches straight
     /// from itself, bypassing both ladders above — it must ask the same question or a due retry is
     /// refused a slot `select` would have given it.
+    ///
+    /// This is the GLOBAL draw only. The per-project ceiling
+    /// ([`running_in_project_group`](Orchestrator::running_in_project_group)) is a separate budget
+    /// and still counts ticketless reviews, so on a `projects:` install whose project cap is or
+    /// inherits `max_concurrent_agents` the project gate can bind first — see the README's
+    /// STUDIO-950 entry, which says so.
     pub(crate) fn implementation_pool_holders(&self) -> i64 {
         let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
@@ -707,6 +713,39 @@ mod tests {
                 .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
                 .is_empty(),
             "unset must keep the shared draw"
+        );
+    }
+
+    /// STUDIO-950: the review/implementation separation is GLOBAL only, and this pins that boundary
+    /// so the README entry and `Agent::max_concurrent_reviews`'s doc cannot drift from it. A
+    /// project's own `max_concurrent` ceiling still counts a running ticketless review against
+    /// implementations in its project (`running_in_project_group` mirrors Go and is untouched), so
+    /// on a `projects:` install whose project cap is or inherits `max_concurrent_agents` the project
+    /// gate binds before the global one — even with the key set. The control is the identical
+    /// fixture with nothing running, so the refusal is the review and not the fixture.
+    #[test]
+    fn a_ticketless_review_still_counts_against_its_projects_own_cap() {
+        let mut o = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        let mut re = ticketless_review_run("rev-1");
+        re.project_slug = "rhapsody".to_string();
+        re.project_group = "rhapsody".to_string();
+        o.running.insert("rev-1".to_string(), re);
+
+        assert!(
+            o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .is_empty(),
+            "a ticketless review still spends its project's own cap: the separation is global only"
+        );
+
+        // Control: the same fixture with nothing running admits the implementation.
+        let clean = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        assert_eq!(
+            clean
+                .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .len(),
+            1,
+            "the project cap admits once the review is gone"
         );
     }
 

@@ -1243,9 +1243,15 @@ Rhapsody adds one optional key, `agent.max_concurrent_reviews`, giving review ru
 pool. It is **opt-in and inert when unset**: with the key absent, reviews keep drawing the shared
 `max_concurrent_agents` budget, so an existing install observes no scheduling change on upgrade. It
 lives in `WORKFLOW.md` and hot-reloads with the rest of the file. When it IS set the two pools are
-separated in BOTH directions — every implementation draw (the two `select` ladders and the retry
-path) subtracts the running ticketless reviews from its own count, so a review in flight cannot cost
-an implementation a slot, and the review watcher draws only its own pool.
+separated in BOTH directions — the two `select` ladders and the retry path subtract the running
+ticketless reviews from their global implementation draw, so a review in flight cannot cost an
+implementation a GLOBAL slot, and the review watcher draws only its own pool.
+
+The separation is **global only**. A project's own `max_concurrent` ceiling is a separate budget and
+still counts a running ticketless review against implementations in its project
+(`running_in_project_group` mirrors Go and is deliberately untouched), so on a `projects:` install
+whose project cap is or inherits `max_concurrent_agents`, raise that project's `max_concurrent` too —
+otherwise the project gate binds before the global one and the key buys that project nothing.
 
 Total live agents may therefore exceed `max_concurrent_agents` by up to `max_concurrent_reviews`.
 That is the intended "reviews are free" semantics rather than a leak: the implementation cap still

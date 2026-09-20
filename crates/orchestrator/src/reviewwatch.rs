@@ -3108,6 +3108,20 @@ mod tests {
             "it must not claim nothing reported it, got: {}",
             warn.message
         );
+        // ...and it names the knob the operator would actually turn. `max_concurrent_reviews` is
+        // UNSET here, so naming it would point a default install at a key its WORKFLOW.md does not
+        // contain; the shared draw's knob is `max_concurrent_agents`. Pinning both polarities is
+        // what survives a constant fold of the `separate` mapping to either arm.
+        assert!(
+            warn.message.contains("agent.max_concurrent_agents"),
+            "the shared hold must name the implementation knob, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("agent.max_concurrent_reviews"),
+            "an unset key must not be named as the knob, got: {}",
+            warn.message
+        );
 
         // Positive control: forget the hold and the SAME row reports under the plain wording, so
         // the naming above is the annotation and not an unconditional message.

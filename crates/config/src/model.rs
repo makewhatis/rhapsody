@@ -143,6 +143,11 @@ pub struct Agent {
     /// implementation cap still bounds implementations and this bounds reviews. That is the
     /// intended "reviews are free" semantics, not a leak.
     ///
+    /// The separation is **global only**: a project's own `max_concurrent` ceiling still counts a
+    /// running ticketless review against implementations in its project, so on a `projects:` install
+    /// whose project cap is or inherits `max_concurrent_agents`, raise that project's `max_concurrent`
+    /// as well or the project gate binds before this global one.
+    ///
     /// **Rhapsody-only** (no Go reference): decoded, carried on `Effective`, and preserved by
     /// `encode` (so a console Save keeps it), but deliberately NOT rendered by `effective_json`,
     /// whose response is byte-pinned to the Go config goldens — the same pattern as
