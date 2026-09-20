@@ -5,9 +5,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReviewJob, ReviewsResponse } from "@/lib/api";
 
 // STUDIO-722, slice 8 — the console Reviews surface, driven through the real view against the
-// three routes it has: `GET /api/v1/reviews` and the two `POST /api/v1/reviews/*` controls.
+// routes it has: `GET /api/v1/reviews` and the `POST /api/v1/reviews/*` controls.
 //
-// The two controls are the ones worth exercising through the DOM rather than the model: they are
+// The controls are the ones worth exercising through the DOM rather than the model: they are
 // the design's §15-e operator lever, the TRUSTED replacement for room-based control that §14.1's
 // F-SEC finding forced, so what matters is that a click sends the pull request's own coordinate to
 // the daemon's own route — and that a row nobody may act on offers no button to click.
@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   fetchReviews: vi.fn(),
   postReviewRerun: vi.fn(),
   postReviewDismiss: vi.fn(),
+  postReviewClear: vi.fn(),
   openExternal: vi.fn(),
 }));
 
@@ -26,6 +27,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchReviews: h.fetchReviews,
     postReviewRerun: h.postReviewRerun,
     postReviewDismiss: h.postReviewDismiss,
+    postReviewClear: h.postReviewClear,
   };
 });
 
@@ -136,6 +138,27 @@ describe("the Reviews surface", () => {
     // The write invalidates the watch-set query, so the row moves under the operator's hand rather
     // than on the next poll tick.
     await waitFor(() => expect(h.fetchReviews).toHaveBeenCalledTimes(2));
+  });
+
+  /**
+   * **STUDIO-956.** Clear budget POSTs to its own route with the row's coordinate — the deliberate
+   * lift of a shared review↔author budget the daemon had stopped dispatching at.
+   */
+  it("clears a review budget through the daemon's own control", async () => {
+    h.postReviewClear.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Clear the review budget of makewhatis/rhapsody#12"));
+
+    await waitFor(() => expect(h.postReviewClear).toHaveBeenCalledTimes(1));
+    expect(h.postReviewClear.mock.calls[0][0]).toMatchObject({
+      owner: "makewhatis",
+      repo: "rhapsody",
+      number: 12,
+    });
+    // It is a distinct route: clearing must not ride the re-run or dismiss controls.
+    expect(h.postReviewRerun).not.toHaveBeenCalled();
+    expect(h.postReviewDismiss).not.toHaveBeenCalled();
   });
 
   /** **Acceptance 3.** Dismiss POSTs to the drop route with the same coordinate. */

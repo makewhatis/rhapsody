@@ -1656,7 +1656,14 @@ export async function postReviewDismiss(job: ReviewJob): Promise<ReviewActionRes
   return postJSON<ReviewActionResponse>("/api/v1/reviews/dismiss", prBody(job));
 }
 
-// Both controls act on the PULL REQUEST, so the body carries the coordinate and NOT the reviewer:
+// postReviewClear drops a pull request's shared review↔author round budget (STUDIO-956), so a bound
+// that otherwise clears only on a daemon restart or a pull-request close can be lifted in place. It
+// re-arms nothing: unlike a re-run, it dispatches only a round that was already due.
+export async function postReviewClear(job: ReviewJob): Promise<ReviewActionResponse> {
+  return postJSON<ReviewActionResponse>("/api/v1/reviews/clear", prBody(job));
+}
+
+// Every control acts on the PULL REQUEST, so the body carries the coordinate and NOT the reviewer:
 // a two-reviewer round is one round, and re-running half of it is not a thing to offer.
 function prBody(job: ReviewJob) {
   return { owner: job.owner, repo: job.repo, number: job.number };

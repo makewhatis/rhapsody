@@ -152,6 +152,17 @@ pub enum DivergenceKind {
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
+    /// Not a divergence of intent and activity but of a BOUND: the pull request's shared
+    /// review↔author round budget is spent, so neither the review half nor the author re-dispatch
+    /// the review's findings would summon can run, and nothing will resume on its own (STUDIO-956).
+    ///
+    /// It is a `DivergenceKind` and not a separate channel because it is exactly what this module
+    /// exists to make visible: a pull request that has stopped progressing and is not blocked by
+    /// anything a later tick will clear. Reported the moment the budget is spent — the staleness
+    /// threshold [`RECONCILE_STALE_AFTER`] is for obligations that might yet resolve, and a spent
+    /// budget never does — and cleared, with the recovery line, the moment an operator clears the
+    /// budget or the pull request leaves the watch set.
+    RoundBudgetExhausted,
 }
 
 impl DivergenceKind {
@@ -162,6 +173,7 @@ impl DivergenceKind {
             DivergenceKind::ChangesRequestedNoRun => "changes_requested_no_run",
             DivergenceKind::ReviewRequestedNoRun => "review_requested_no_run",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
+            DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
         }
     }
 
@@ -178,6 +190,10 @@ impl DivergenceKind {
             }
             DivergenceKind::ApprovedStillOpen => {
                 "every required reviewer approved and the pull request is still open"
+            }
+            DivergenceKind::RoundBudgetExhausted => {
+                "the review↔author round budget is spent, so no further review or author re-run \
+                 will be dispatched until it is cleared"
             }
         }
     }
@@ -197,8 +213,11 @@ pub struct Divergence {
     /// The row whose obligation is outstanding, or `""` for [`DivergenceKind::ApprovedStillOpen`],
     /// which is a property of EVERY row rather than of one.
     pub reviewer: String,
-    /// Seconds since the party owing the next move started owing it. Always greater than
-    /// [`RECONCILE_STALE_AFTER`] — it IS the staleness the threshold was crossed by.
+    /// Seconds since the party owing the next move started owing it. For every staleness-rule kind
+    /// it is greater than [`RECONCILE_STALE_AFTER`] — it IS the staleness the threshold was crossed
+    /// by. [`DivergenceKind::RoundBudgetExhausted`] is the one exception: it has no threshold and is
+    /// reported as soon as the budget is spent, so its value is seconds since the newest activity
+    /// the sweep can date (and `0` when it can date none) rather than a crossed bound.
     pub stale_secs: i64,
     /// What [`crate::runautomerge::AutoMergeLedger`] has most recently SAID about this pull request,
     /// `None` unless [`DivergenceKind::ApprovedStillOpen`] and the ledger holds an entry for it
@@ -446,6 +465,44 @@ fn stale_secs(now: DateTime<Utc>, anchor: DateTime<Utc>, stale_after: Duration) 
     (elapsed > threshold).then_some(elapsed)
 }
 
+/// Whether any LIVE row of a pull request still OWES a round — a review, or the author's run a
+/// verdict bought (STUDIO-956).
+///
+/// Scoped to these three statuses on purpose. An `in_flight` round is progressing and a spent budget
+/// beside it is not a stall; an `approved` pull request is waiting on the merge gate rather than on
+/// this budget, and reporting it here would cry wolf on every healthy approval. A row that has left
+/// the watch set says nothing at all.
+fn round_budget_owed(facts: &PrFacts) -> bool {
+    facts.rows.iter().any(|r| {
+        r.open
+            && matches!(
+                r.status.as_str(),
+                REVIEW_STATUS_REVIEWED | REVIEW_STATUS_REQUESTED | REVIEW_STATUS_TRUNCATED
+            )
+    })
+}
+
+/// Seconds since the newest activity this sweep can see on the pull request — the latest of its
+/// rows' reviewer and ticket runs, or `0` when it can date none.
+///
+/// The budget is a counter with no timestamp, so when it was SPENT cannot be read off it. The newest
+/// run is the closest honest anchor for "how long has this been stuck"; a negative elapsed is
+/// clamped to zero for [`stale_secs`]'s reason.
+fn newest_activity_secs(facts: &PrFacts, now: DateTime<Utc>) -> i64 {
+    let newest = facts
+        .rows
+        .iter()
+        .flat_map(|r| {
+            [
+                r.reviewer_run.as_ref().map(RunMoment::last_at),
+                r.ticket_run.as_ref().map(RunMoment::last_at),
+            ]
+        })
+        .flatten()
+        .max();
+    newest.map_or(0, |n| now.signed_duration_since(n).num_seconds().max(0))
+}
+
 impl Orchestrator {
     /// Runs one reconciliation sweep: reads the live watch set, dates each row against the `runs`
     /// ledger, and records what diverged. **Reports only** — nothing here dispatches, arms, merges
@@ -564,7 +621,30 @@ impl Orchestrator {
             .iter()
             .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
             .filter_map(|(pr, facts)| {
-                let mut d = reconcile_pr(facts, now, RECONCILE_STALE_AFTER)?;
+                // STUDIO-956, first because it is the cause and the staleness rules below would only
+                // report the resulting silence an hour and a half later, without naming the bound. A
+                // spent shared review↔author budget stops BOTH halves of the loop, so a round that is
+                // still owed will never be dispatched; an in-flight round is progressing and an
+                // approved pull request is the merge gate's business, so neither is reported here.
+                let mut d = if self.round_budget_spent(pr) && round_budget_owed(facts) {
+                    Some(Divergence {
+                        pr: pr.to_string(),
+                        kind: DivergenceKind::RoundBudgetExhausted,
+                        ticket: facts
+                            .rows
+                            .iter()
+                            .find(|r| !r.ticket.is_empty())
+                            .map(|r| r.ticket.clone())
+                            .unwrap_or_default(),
+                        reviewer: String::new(),
+                        stale_secs: newest_activity_secs(facts, now),
+                        // Filled in below only for `ApprovedStillOpen`; a spent budget has nothing
+                        // for the auto-merge ledger to say.
+                        auto_merge_reason: None,
+                    })
+                } else {
+                    reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
+                }?;
                 // The one place this sweep reads the auto-merge ledger (STUDIO-923): only for
                 // `ApprovedStillOpen`, the one divergence auto-merge would itself be attempting a
                 // merge against — the ledger has nothing meaningful to say about a pull request
@@ -618,6 +698,26 @@ impl Orchestrator {
             // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
             // count is 1, and `1 - 1` is a multiple of everything.
             if (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
+                // STUDIO-956: the spent budget HAS a cause and a remedy, so it must not wear the
+                // "nothing has reported it blocked" wording the other rules use — that copy being
+                // false about a capped pull request is the defect this ticket's first ⚠️ names. The
+                // line says what stopped the loop and how an operator resumes it.
+                if d.kind == DivergenceKind::RoundBudgetExhausted {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        reviewer = %d.reviewer,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Nothing will resume it on its own; an \
+                         operator can clear the budget from the console (`POST \
+                         /api/v1/reviews/clear`) or close the pull request.",
+                        d.pr,
+                        d.kind.detail()
+                    );
+                    continue;
+                }
                 // STUDIO-923: when auto-merge has already said something about this exact pull
                 // request, name it instead of claiming nothing has. The sentence states no count:
                 // auto-merge's own attempts run on the review watcher's separate
@@ -1558,6 +1658,117 @@ mod store_tests {
             o.review_divergences().len(),
             1,
             "a primed sweep reports the divergence"
+        );
+    }
+
+    /// **STUDIO-956.** A watched pull request whose shared review↔author budget is spent is
+    /// reported, with its reason, immediately — not after [`RECONCILE_STALE_AFTER`], because a spent
+    /// budget never resolves on its own, and not as the "nothing has reported it blocked" copy,
+    /// which is false here.
+    ///
+    /// Mutation check (the ticket's ⚠️): demoting the exhausted-budget line to DEBUG leaves no WARN
+    /// for this capture and reds it. That is deliberate — the ticket asks for a stop the sweep
+    /// SURFACES, and a DEBUG line is the silent cap that already pages a human as an idle board.
+    #[test]
+    fn a_spent_round_budget_is_reported_on_both_surfaces() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        // The findings that would summon the author, landed a MINUTE ago: far inside the staleness
+        // threshold, so the staleness rules report nothing and only the budget rule can.
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // The loop has spent its whole shared budget.
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        // See the sibling tests above for why the warm-up call exists: this WARN callsite is new,
+        // and an uncaptured first hit can race a test running on another thread.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("review↔author round budget is spent"),
+            "the line must name the reason, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the copy that was false about a capped pull request must not be reused: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::RoundBudgetExhausted);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["kind"],
+            "round_budget_exhausted"
+        );
+    }
+
+    /// The budget rule is scoped: an in-flight round beside a spent budget is progressing, an
+    /// approved pull request is the merge gate's business, and neither is reported. This is what
+    /// keeps the report from crying wolf on a healthy (if expensive) loop.
+    #[test]
+    fn a_spent_budget_reports_nothing_while_a_round_is_in_flight_or_approved() {
+        // A round in flight: `mark_review_requested` moves the row to `in_flight`.
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        let key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 164,
+            reviewer: "alice".to_string(),
+        };
+        o.store().mark_review_requested(&key, HEAD).expect("re-arm");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "a round in flight is progressing, got {:?}",
+            o.review_divergences()
+        );
+
+        // Every live row approved, auto-merge off.
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-170");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "with auto-merge off an approved pull request waits for a human, got {:?}",
+            o.review_divergences()
         );
     }
 

@@ -12,9 +12,10 @@ import {
   Stat,
   TicketChip,
 } from "@/components/console";
-import { useDismissReview, useReviews, useRerunReview } from "@/hooks/useReviews";
+import { useClearReview, useDismissReview, useReviews, useRerunReview } from "@/hooks/useReviews";
 import { errText } from "@/lib/teams-model";
 import {
+  clearNotice,
   dismissNotice,
   rerunNotice,
   retiredCount,
@@ -43,7 +44,7 @@ import "@/theme/console-reviews.css";
 // sent (including the watched-repo allowlist) and can only ever re-arm a row that already exists,
 // so nothing here can introduce a pull request into the watch set.
 //
-// It reads exactly three routes — `GET /api/v1/reviews` and the two `POST /api/v1/reviews/*`
+// It reads exactly four routes — `GET /api/v1/reviews` and the three `POST /api/v1/reviews/*`
 // controls — through `hooks/useReviews`, and adds no model: `lib/reviews-model.ts` owns everything
 // derived, so the rules are assertable without a DOM.
 
@@ -76,6 +77,7 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
   const reviews = useReviews(true, pollMs);
   const rerun = useRerunReview();
   const dismiss = useDismissReview();
+  const clear = useClearReview();
   const [filter, setFilter] = React.useState<ReviewFilter>("active");
   // The outcome of the last control, held HERE rather than read off `rerun.error` / `dismiss.error`.
   // React Query keeps a mutation's error until that same mutation next runs, so reading the banner
@@ -97,6 +99,14 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
     setConfirming(null);
     rerun.mutate(job, {
       onSuccess: (res) => setNotice({ role: "status", ...rerunNotice(res) }),
+      onError: (e) => setNotice(refused(e)),
+    });
+  };
+
+  const onClear = (job: ReviewJob) => {
+    setConfirming(null);
+    clear.mutate(job, {
+      onSuccess: (res) => setNotice({ role: "status", ...clearNotice(res) }),
       onError: (e) => setNotice(refused(e)),
     });
   };
@@ -149,8 +159,9 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
     <Page onNavigate={onNavigate}>
       <p className="lead">
         Every pull request the team is reviewing, one row per reviewer. Re-run asks for another
-        round of the current head; dismiss takes the pull request out of the watch set for good —
-        only a new hand-off puts it back. Neither control is available from the team room: an
+        round of the current head; clear budget lifts a spent review↔author round budget the
+        daemon had stopped at; dismiss takes the pull request out of the watch set for good — only a
+        new hand-off puts it back. None of these controls is available from the team room: an
         operator control over what gets checked out belongs to this console.
       </p>
 
@@ -208,9 +219,10 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
               <ReviewsRow
                 key={row.key}
                 row={row}
-                busy={rerun.isPending || dismiss.isPending}
+                busy={rerun.isPending || dismiss.isPending || clear.isPending}
                 confirming={confirming === row.key}
                 onRerun={onRerun}
+                onClear={onClear}
                 onArm={() => setConfirming(row.key)}
                 onDisarm={() => setConfirming(null)}
                 onDismiss={onDismiss}
@@ -235,15 +247,16 @@ function emptyMessage(total: number, loading: boolean): string {
 /**
  * One watch-set row.
  *
- * Unlike a Jobs row this is NOT itself an activation target: it holds two buttons, and a row that
- * also navigated would make every click ambiguous. There is no review-detail route to navigate to
- * in this slice either — the pull request itself is where a review is read, and that is the link.
+ * Unlike a Jobs row this is NOT itself an activation target: it holds three buttons, and a row
+ * that also navigated would make every click ambiguous. There is no review-detail route to navigate
+ * to in this slice either — the pull request itself is where a review is read, and that is the link.
  */
 function ReviewsRow({
   row,
   busy,
   confirming,
   onRerun,
+  onClear,
   onArm,
   onDisarm,
   onDismiss,
@@ -253,6 +266,7 @@ function ReviewsRow({
   /** Whether THIS row's dismissal is armed and awaiting a second, explicit click. */
   confirming: boolean;
   onRerun: (job: ReviewJob) => void;
+  onClear: (job: ReviewJob) => void;
   onArm: () => void;
   onDisarm: () => void;
   onDismiss: (job: ReviewJob) => void;
@@ -319,6 +333,17 @@ function ReviewsRow({
                 aria-label={`Re-run the review of ${row.pr}`}
               >
                 Re-run
+              </Button>
+              {/* The deliberate lift of the shared review↔author budget (STUDIO-956). It clears the
+                  counter and re-arms nothing, so unlike Re-run it cannot start a round that was not
+                  already due — it only lets a pull request the bound had stopped move again. */}
+              <Button
+                variant="link"
+                disabled={busy}
+                onClick={() => onClear(row.job)}
+                aria-label={`Clear the review budget of ${row.pr}`}
+              >
+                Clear budget
               </Button>
               <Button
                 variant="link"

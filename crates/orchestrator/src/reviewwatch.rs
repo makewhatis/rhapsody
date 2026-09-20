@@ -131,6 +131,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use rhapsody_config::teams::Teams;
+use rhapsody_core::Issue;
 use rhapsody_store::{
     REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, ReviewWatchRow,
 };
@@ -143,8 +144,9 @@ use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
 use crate::stop::ControlHandle;
 use crate::teams::LoadSnapshot;
 
-/// How many review ROUNDS one pull request may be given, ever, in one daemon lifetime — the floor
-/// against force-push churn (§14.2, "no approval terminal → unbounded re-review").
+/// How many ROUNDS one pull request's review↔author loop may run, ever, in one daemon lifetime —
+/// the floor against force-push churn (§14.2, "no approval terminal → unbounded re-review") and,
+/// since STUDIO-956, against a review↔author loop neither side can end.
 ///
 /// A ROUND, not a dispatch. `review_rounds` counts dispatches, and one round costs one dispatch per
 /// required reviewer, so the check multiplies this by `teams.review.effective_reviewers()` before
@@ -152,16 +154,27 @@ use crate::teams::LoadSnapshot;
 /// reviewer count — at `reviewers: 8` a pull request would get its first round and never be
 /// re-reviewed again, with nothing above `debug!` to say so.
 ///
+/// **One budget, both sides of the loop** (STUDIO-956). The loop is a review round and the author
+/// run its findings summon, alternating; bounding only the review half leaves the other unbounded
+/// whenever a reviewer keeps finding something, which is what ran STUDIO-170 to eleven author rounds
+/// and 34 agent runs. So the AUTHOR re-dispatch charges this same budget
+/// ([`Orchestrator::note_author_round`]), and a spent budget refuses it too
+/// ([`Orchestrator::author_round_budget_spent`]). Both sides are counted in the same unit — one
+/// round per side — so eight rounds is roughly four review→fix cycles whatever `reviewers` is.
+/// Eight is far above any honest review conversation (a review, fixes, a re-review, more fixes) so
+/// a converging loop does not reach it, and far below a runaway.
+///
 /// The edge trigger already bounds the RATE: a round cannot start while one is in flight, so a
 /// pull request costs at most one review per review's duration however fast its author pushes. What
 /// it does not bound is the TOTAL, and an author amending in a loop — a rebase chain, a CI-driven
-/// force-push, a `--fixup` habit — would otherwise buy a full agent run per amendment forever.
-/// Eight rounds is far above any honest review conversation (a review, fixes, a re-review, more
-/// fixes) and far below a runaway.
+/// force-push, a `--fixup` habit, or a reviewer who keeps summoning — would otherwise buy a full
+/// agent run per amendment forever.
 ///
 /// Deliberately in memory rather than a column: it is a churn floor, not an audit record, and the
-/// churn it guards against happens over minutes inside one daemon lifetime. A restart resets it,
-/// which is the correct outcome for an operator who restarted the daemon to unstick something.
+/// churn it guards against happens over minutes inside one daemon lifetime. An operator can clear
+/// it deliberately without a restart ([`Orchestrator::handle_review_clear`], `POST
+/// /api/v1/reviews/clear`); a restart clears it too, which is the correct outcome for an operator
+/// who restarted the daemon to unstick something.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
 /// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
@@ -918,6 +931,69 @@ impl Orchestrator {
             .unwrap_or(0)
     }
 
+    /// How many dispatches one review ROUND costs for this installation — the unit the shared
+    /// review↔author budget ([`REVIEW_ROUNDS_PER_PR_CAP`]) is counted in.
+    ///
+    /// The floor of one matches `service_review_pr`'s own `.max(1)`: a misconfigured
+    /// `review.reviewers: 0` must still cost a round rather than make the budget free.
+    pub(crate) fn reviewers_per_round(&self) -> usize {
+        self.teams
+            .as_ref()
+            .map_or(1, |t| t.review.effective_reviewers().max(1))
+    }
+
+    /// The shared review↔author round budget for one pull request, in dispatches.
+    fn shared_round_budget(&self) -> usize {
+        REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(self.reviewers_per_round())
+    }
+
+    /// Whether `pr`'s shared review↔author budget is spent.
+    ///
+    /// A pull request the watcher has never charged (no entry) is not spent: nothing about it is
+    /// bounded, which is what makes a daemon with ticketless review off byte-identical to one built
+    /// before this budget existed.
+    pub(crate) fn round_budget_spent(&self, pr: &PrCoord) -> bool {
+        self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) >= self.shared_round_budget()
+    }
+
+    /// The linked pull requests of `iss` that already carry a shared budget — ones a review round
+    /// has charged. A ticket whose pull request was never reviewed has none, so an ordinary fresh
+    /// dispatch can neither create a budget nor charge one.
+    fn charged_linked_prs(&self, iss: &Issue) -> Vec<PrCoord> {
+        iss.linked_prs
+            .iter()
+            .flatten()
+            .map(|r| PrCoord::new(&r.owner, &r.repo, r.number))
+            .filter(|pr| self.review_rounds.contains_key(&churn_key(pr)))
+            .collect()
+    }
+
+    /// Whether a summons-driven AUTHOR re-dispatch of `iss` must be refused because the shared
+    /// review↔author budget of one of its pull requests is spent (STUDIO-956).
+    ///
+    /// The author's half of the one loop: a review round already charged this budget, so the run
+    /// its findings summon draws from the same pot. Dormant on a daemon with ticketless review off
+    /// (the ledger is empty), and false for a ticket with no reviewed pull request.
+    pub(crate) fn author_round_budget_spent(&self, iss: &Issue) -> bool {
+        self.charged_linked_prs(iss)
+            .iter()
+            .any(|pr| self.round_budget_spent(pr))
+    }
+
+    /// Charges one AUTHOR round to every linked pull request of `iss` that already carries a budget.
+    /// A no-op for a ticket whose pull requests have never been reviewed, so an ordinary first
+    /// dispatch is free.
+    ///
+    /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
+    /// run its review's findings bought is the loop's other half, so it costs the same as the review
+    /// round did at any reviewer count.
+    pub(crate) fn note_author_round(&mut self, iss: &Issue) {
+        let round = self.reviewers_per_round();
+        for pr in self.charged_linked_prs(iss) {
+            *self.review_rounds.entry(churn_key(&pr)).or_default() += round;
+        }
+    }
+
     /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
     /// true for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps.
     ///
@@ -1049,10 +1125,7 @@ impl Orchestrator {
         // How many dispatches one ROUND of this pull request costs — the unit the churn budget
         // below has to be expressed in. Read from config rather than from `mine.len()`, which is
         // the rows that happen to exist right now and would let a retired row shrink the budget.
-        let reviewers_per_round = self
-            .teams
-            .as_ref()
-            .map_or(1, |t| t.review.effective_reviewers().max(1));
+        let reviewers_per_round = self.reviewers_per_round();
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
@@ -1639,6 +1712,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rhapsody_config::teams::{Identity, Review, ReviewMode};
+    use rhapsody_core::LinkedPRRef;
     use rhapsody_store::{
         REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_TRUNCATED, ReviewWatchKey,
         Sqlite, StorePath,
@@ -3338,6 +3412,160 @@ mod tests {
         );
         let over = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!((over.dispatched, over.deferred), (0, 1));
+    }
+
+    // --- the shared review↔author budget (STUDIO-956) ----------------------------------------
+
+    /// A summons-driven author ticket whose work is on pull-request `number` — the shape
+    /// `pr_suppressed` stops suppressing once a review's findings summon the author.
+    fn author_issue(identifier: &str, number: i64) -> Issue {
+        Issue {
+            id: format!("ID-{identifier}"),
+            identifier: identifier.to_string(),
+            title: "t".to_string(),
+            state: "In Progress".to_string(),
+            linked_pr: true,
+            linked_prs: Some(vec![LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number,
+                merged: false,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// **The STUDIO-170 shape, reconstructed.** Eleven summons-driven author rounds ran on one
+    /// ticket — two of them over 6M tokens — because only the REVIEW half of the loop was bounded.
+    /// Here the author's half is charged to the same budget, and the loop must stop well before the
+    /// eleven rounds the incident measured.
+    ///
+    /// Driven against the author half IN ISOLATION on purpose: charging whole review→author cycles
+    /// would let the pre-existing review cap stop the loop even if the author side were removed, and
+    /// the test would then be pinning the cap that already existed rather than the half this ticket
+    /// adds. The initial charge is the review round that first armed the loop; every round after it
+    /// is an author re-dispatch, and deleting [`Orchestrator::note_author_round`] or
+    /// [`Orchestrator::author_round_budget_spent`] makes the count reach eleven and this test red.
+    #[test]
+    fn the_studio_170_shape_stops_before_eleven_summons_driven_author_rounds() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let iss = author_issue("STUDIO-170", 12);
+        // The first review round of the loop, charged by the watcher before any author round.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.reviewers_per_round());
+
+        let mut author_rounds = 0;
+        for _ in 0..11 {
+            if o.author_round_budget_spent(&iss) {
+                break;
+            }
+            o.note_author_round(&iss);
+            author_rounds += 1;
+        }
+
+        assert!(
+            author_rounds < 11,
+            "eleven summons-driven author rounds must not all run; ran {author_rounds}"
+        );
+        // Strictly fewer than the review cap ALONE would have allowed: if the author half were not
+        // charged, the review cap still leaves room for this many, and the assertion must catch it.
+        assert!(
+            author_rounds < REVIEW_ROUNDS_PER_PR_CAP,
+            "the author half must charge the shared budget (ran {author_rounds})"
+        );
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "the loop ended because the shared budget was spent"
+        );
+    }
+
+    /// An author round costs one ROUND, not one dispatch: the budget is counted in rounds at every
+    /// reviewer count (STUDIO-727), so a two-reviewer pull request charges two dispatches per author
+    /// round exactly as it charges two per review round.
+    #[test]
+    fn an_author_round_charges_one_round_at_every_reviewer_count() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let iss = author_issue("STUDIO-1", 12);
+        o.review_rounds.insert(churn_key(&coord(12)), 1);
+
+        o.note_author_round(&iss);
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&3));
+    }
+
+    /// **Acceptance: BOTH sides stop.** Once the shared budget is spent, the review sweep refuses
+    /// the round as well — the author's charges are the same counter the review cap reads, so
+    /// neither half of one loop can run past the bound.
+    #[test]
+    fn a_spent_shared_budget_stops_the_review_side_too() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        let iss = author_issue("STUDIO-170", 12);
+        o.review_rounds
+            .insert(churn_key(&coord(12)), REVIEW_ROUNDS_PER_PR_CAP);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            (report.dispatched, report.deferred),
+            (0, 1),
+            "a spent shared budget must stop the review half too"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "and the author half, on the same counter"
+        );
+    }
+
+    /// **A default daemon is byte-identical to today.** A ticket whose pull request no review has
+    /// ever charged carries no budget, so a fresh dispatch is never refused and never charged —
+    /// which is what keeps a Teams-off (or never-reviewed) installation exactly as it was.
+    #[test]
+    fn a_pull_request_no_review_has_charged_is_never_bounded() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let iss = author_issue("STUDIO-1", 12);
+
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "no budget entry ⇒ nothing is bounded"
+        );
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "a ticket whose pull request was never reviewed must not create a budget"
+        );
+    }
+
+    /// The author guard is per PULL REQUEST: a ticket linked to a spent pull request is refused even
+    /// while a sibling pull request of the same ticket still has budget, because one spent loop is
+    /// enough to need a human.
+    #[test]
+    fn a_spent_budget_on_any_linked_pull_request_refuses_the_author_round() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let mut iss = author_issue("STUDIO-1", 12);
+        iss.linked_prs = Some(vec![
+            LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number: 12,
+                merged: false,
+            },
+            LinkedPRRef {
+                owner: OWNER.to_string(),
+                repo: REPO.to_string(),
+                number: 13,
+                merged: false,
+            },
+        ]);
+        // #12 has spent its whole budget; #13 has barely started.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), REVIEW_ROUNDS_PER_PR_CAP);
+        o.review_rounds
+            .insert(churn_key(&coord(13)), o.reviewers_per_round());
+
+        assert!(o.author_round_budget_spent(&iss));
     }
 
     /// …and the budget is counted in ROUNDS at every reviewer count, not in dispatches (STUDIO-727).

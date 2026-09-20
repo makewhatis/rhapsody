@@ -1476,7 +1476,8 @@ console armed an auto-merge on a behind branch that could never land. A behind b
 for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
 otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
 approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
-which already caps the review dispatches one pull request may draw.
+which caps both sides of the review↔author loop — the review dispatches a pull request may draw and
+the author re-dispatches their findings summon (STUDIO-956).
 
 **Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
 sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's

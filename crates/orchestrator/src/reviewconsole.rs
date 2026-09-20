@@ -14,7 +14,7 @@
 //! all demand a fetched Linear issue, so a `pr:` key resolves to nothing there — and making it
 //! understand pull requests would be a second addressing subsystem whose targets come out of
 //! forgeable post text (§14.2, "room control is Linear-anchored"). So **this slice adds no `pr:`
-//! room Intent at all**; the two operator actions arrive as in-process control [`Event`]s from the
+//! room Intent at all**; the operator's controls arrive as in-process control [`Event`]s from the
 //! loopback HTTP API instead, which is the trusted path §15-e means.
 //!
 //! [`Event`]: crate::Event
@@ -22,7 +22,7 @@
 //! # Trusted in-process, still re-validated
 //!
 //! Being an in-process type is not the same as being a validated one — the rule
-//! [`crate::reviewintro`] states and this module inherits. Both handlers re-check the coordinates
+//! [`crate::reviewintro`] states and this module inherits. Every handler re-checks the coordinates
 //! they are handed, and [`Orchestrator::handle_review_rerun`] re-checks the watched-repo allowlist
 //! as well, because a re-run is a step towards checking that repository out.
 //!
@@ -33,7 +33,7 @@
 //!
 //! # Everything is loop-confined
 //!
-//! All three entry points run on the control task, for the reason
+//! All four entry points run on the control task, for the reason
 //! [`Orchestrator::handle_review_introduce`] does: the watch set stays single-writer, and the
 //! in-flight guard the two writers depend on reads `running`/`claimed`, which only the control task
 //! owns. The read is loop-confined too, following [`crate::Event::ReviewWatchList`] — the console's
@@ -283,6 +283,46 @@ impl Orchestrator {
         ReviewControlOutcome::Applied(armed)
     }
 
+    /// **Clear the round budget** (`Event::ReviewClear`) — the operator's deliberate reset of a
+    /// pull request's shared review↔author budget (STUDIO-956).
+    ///
+    /// §15-e's third lever, and the answer to that lever's own failure mode. A spent budget defers
+    /// every further review AND every author re-dispatch "until the daemon restarts or the pull
+    /// request closes" — which is a bound an operator cannot lift in place, and which is why three
+    /// pull requests sat unreviewable until an upgrade forced a restart. Re-run *refunds one round*
+    /// (its own test pins that), which is the right size for a pull request the cap merely reached;
+    /// this is for the one an operator has decided the budget itself was wrong about.
+    ///
+    /// It clears the COUNTER and touches no row: unlike re-run it does not re-arm anything, so
+    /// nothing is dispatched that was not already due. Dropping the entry is the whole of it, so a
+    /// cleared pull request starts its next round from zero exactly as a re-introduced one does.
+    ///
+    /// Deliberately NOT allowlist-gated, for [`Self::handle_review_dismiss`]'s reason: it performs
+    /// no checkout and no dispatch (dispatch re-checks the allowlist itself), and gating it would
+    /// make the budgets an operator most wants gone — the ones a paused or repointed project left
+    /// behind — the only ones that could never be cleared.
+    pub(crate) fn handle_review_clear(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
+        if !self.review_ticketless_enabled() {
+            return ReviewControlOutcome::Dormant; // §16
+        }
+        if let Some(why) = check_coords(pr) {
+            return ReviewControlOutcome::Refused(why);
+        }
+        // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
+        // which is a different fact from "the budget is now clear" and worth saying.
+        if self.review_rounds.remove(&churn_key(pr)).is_none() {
+            return ReviewControlOutcome::Refused(
+                "no review budget to clear for that pull request",
+            );
+        }
+        tracing::info!(
+            pr = %pr,
+            "ticketless review: operator cleared the pull request's shared review↔author round \
+             budget"
+        );
+        ReviewControlOutcome::Applied(1)
+    }
+
     /// **Dismiss** (`Event::ReviewDismiss`) — the operator taking a pull request out of the watch
     /// set, §15-e's other lever. Drops every row of `pr` through
     /// [`rhapsody_store::Store::drop_review_watch`], the same terminal the watcher uses for a merged
@@ -381,6 +421,14 @@ impl ControlHandle {
     /// reason.
     pub async fn dismiss_review(&self, pr: PrCoord) -> ReviewControlOutcome {
         self.review_control(|reply| Event::ReviewDismiss { pr, reply })
+            .await
+    }
+
+    /// The operator's **clear** (`POST /api/v1/reviews/clear`) — drop a pull request's shared
+    /// review↔author round budget so both halves of the loop may run again, without a restart
+    /// (STUDIO-956). The same trusted path as the other two.
+    pub async fn clear_review(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.review_control(|reply| Event::ReviewClear { pr, reply })
             .await
     }
 
@@ -862,6 +910,85 @@ mod tests {
         assert_eq!(
             o.handle_review_rerun(&PrCoord::new("makewhatis", "rhapsody", 0)),
             ReviewControlOutcome::Refused("pull-request number is not positive")
+        );
+    }
+
+    // ── clear the round budget (STUDIO-956) ─────────────────────────────────────────────────────
+
+    /// **Acceptance: the budget is clearable without a daemon restart.** An operator clears a spent
+    /// shared review↔author budget and the pull request is unbounded again.
+    #[test]
+    fn an_operator_clear_lifts_a_spent_round_budget() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.review_rounds.insert(
+            "makewhatis/rhapsody#12".to_string(),
+            REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        assert!(o.round_budget_spent(&pr()));
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.review_rounds.get("makewhatis/rhapsody#12"),
+            None,
+            "a clear drops the counter outright, unlike re-run's one-round refund"
+        );
+        assert!(!o.round_budget_spent(&pr()));
+    }
+
+    /// Clear touches no row: unlike re-run it re-arms nothing, so it dispatches only what was
+    /// already due. An approved pull request stays approved after its budget is cleared.
+    #[test]
+    fn an_operator_clear_does_not_re_arm_a_row() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            row_of(&o, "bob").status,
+            REVIEW_STATUS_APPROVED,
+            "clearing a budget is not a re-run"
+        );
+    }
+
+    /// Clearing a pull request with no budget is a REFUSAL, not an `Applied(0)`: "there was nothing
+    /// to clear" is a different fact from "the budget is now clear".
+    #[test]
+    fn clearing_an_unbudgeted_pull_request_is_refused() {
+        let mut o = ticketless();
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Refused("no review budget to clear for that pull request")
+        );
+    }
+
+    /// Coordinates are re-validated even though the caller is in-process, and a dormant daemon
+    /// refuses without touching anything — the same rules the other two controls obey.
+    #[test]
+    fn a_clear_revalidates_its_coordinates_and_is_dormant_when_off() {
+        let mut o = ticketless();
+        assert_eq!(
+            o.handle_review_clear(&PrCoord::new("", "rhapsody", 12)),
+            ReviewControlOutcome::Refused("pull request has no owner/repo")
+        );
+        assert_eq!(
+            o.handle_review_clear(&PrCoord::new("makewhatis", "rhapsody", 0)),
+            ReviewControlOutcome::Refused("pull-request number is not positive")
+        );
+
+        o.teams = Some(teams_with(true, ReviewMode::Off));
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Dormant,
+            "mode off ⇒ dormant, even with a budget sitting in the counter"
         );
     }
 

@@ -38,7 +38,9 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
-use crate::handlers_reviews::{handle_review_dismiss, handle_review_rerun, handle_reviews};
+use crate::handlers_reviews::{
+    handle_review_clear, handle_review_dismiss, handle_review_rerun, handle_reviews,
+};
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_rundiff::handle_run_diff;
 use crate::handlers_runmerge::{handle_run_merge, handle_run_mergeability};
@@ -380,6 +382,13 @@ pub trait StateProvider: Send + Sync {
         ReviewControlOutcome::Dormant
     }
 
+    /// `POST /api/v1/reviews/clear` — the operator clearing a pull request's shared review↔author
+    /// round budget, so a bound that otherwise clears only on a restart may be lifted in place
+    /// (STUDIO-956). Dormant by default for the sibling controls' reason.
+    async fn review_clear(&self, _pr: PrCoord) -> ReviewControlOutcome {
+        ReviewControlOutcome::Dormant
+    }
+
     /// `POST /api/v1/runs/{id}/merge` — the operator merging a run's pull request from the console
     /// (STUDIO-767). `confirm` is the head SHA being confirmed, empty for the handshake's first
     /// leg; it is the ONLY value the request body contributes, and the coordinate is derived from
@@ -567,12 +576,13 @@ where
         // human door, an operator post the daemon stamps `operator` on.
         .route("/api/v1/teams/room", any(handle_teams_room))
         // The ticketless review console (STUDIO-722, slice 8; Rhapsody-only, no Go v0.4.0
-        // counterpart). One read and the two operator controls §15-e moves off the room and onto
+        // counterpart). One read and the operator controls §15-e moves off the room and onto
         // the authenticated console — see `handlers_reviews` for why that move is a security fix.
-        // Static paths, so `/api/v1/reviews` and its two children never contend.
+        // Static paths, so `/api/v1/reviews` and its children never contend.
         .route("/api/v1/reviews", any(handle_reviews))
         .route("/api/v1/reviews/rerun", any(handle_review_rerun))
         .route("/api/v1/reviews/dismiss", any(handle_review_dismiss))
+        .route("/api/v1/reviews/clear", any(handle_review_clear))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
