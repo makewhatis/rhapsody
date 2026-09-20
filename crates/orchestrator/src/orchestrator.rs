@@ -598,8 +598,10 @@ pub struct Orchestrator {
     /// given, because not being re-evaluated is not evidence the hold ended; clearing it wholesale
     /// made a continuously-held round's annotation blink present/absent every tick, which re-logged
     /// the reconciliation sweep's capacity line and half the time its false "nothing has reported it
-    /// blocked" one (STUDIO-950 round 10). Only the watcher's `CAPACITY_HOLD_TTL` expires such a
-    /// hold. Two paths return before any clearing and likewise leave the previous records in place:
+    /// blocked" one (STUDIO-950 round 10). Only the watcher's own liveness — [`Orchestrator::review_watch_swept`]
+    /// aged against the watcher's `CAPACITY_HOLD_TTL` — expires such a hold, so it is retained for
+    /// exactly as long as the watcher keeps sweeping, however many rotations that takes. Two paths
+    /// return before any clearing and likewise leave the previous records in place:
     /// the watcher not ticketless-enabled, and a store read of the watch set that FAILED. For the
     /// store-read failure that is DELIBERATE — a round that really is held keeps its annotation
     /// instead of paging a human with "nothing has reported it blocked" because the watcher could
@@ -611,10 +613,21 @@ pub struct Orchestrator {
     /// operator can see in `reviewwatch`'s own log — as the cause, instead of reporting an
     /// unexplained stall (the second instance of the STUDIO-923 class). It ANNOTATES the sweep's
     /// report; it never suppresses it, because a row held for capacity is still a pull request whose
-    /// board state and activity disagree — the signal this sweep exists to raise. Each value carries
-    /// the sweep's own timestamp so the reconciliation sweep ignores a hold no later sweep is
-    /// refreshing.
+    /// board state and activity disagree — the signal this sweep exists to raise.
     pub(crate) review_capacity_held: crate::reviewwatch::CapacityHolds,
+    /// When the review watcher last SWEPT (STUDIO-950), stamped once at the top of every
+    /// [`Orchestrator::handle_review_sweep_slots`] call. The reconciliation sweep ages THIS against
+    /// `CAPACITY_HOLD_TTL` — not each hold's own `recorded` — to decide whether a capacity hold is
+    /// still being refreshed.
+    ///
+    /// It has to be the watcher's own clock, not the hold's. The watcher's cursor visits only
+    /// `MAX_PR_STATE_CALLS_PER_TICK` pull requests per tick, so on a watch set larger than that a
+    /// continuously-held round is re-evaluated once per ROTATION, not once per tick. Ageing the
+    /// individual hold against a one-tick TTL expired a hold a healthy watcher was still carrying,
+    /// blinking its annotation off and re-emitting the false "nothing has reported it blocked" page
+    /// this ticket exists to stop. A hold's own `recorded` is retained only as the fallback for a
+    /// hold that predates any sweep.
+    pub(crate) review_watch_swept: Option<DateTime<Utc>>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -890,6 +903,7 @@ impl Orchestrator {
             auto_merge_announced: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
+            review_watch_swept: None,
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,

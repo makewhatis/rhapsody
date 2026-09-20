@@ -674,6 +674,14 @@ impl Orchestrator {
         if !self.review_ticketless_enabled() {
             return (report, 0); // §16
         }
+        // The watcher is alive and deciding THIS tick (STUDIO-950 round 11). The reconciliation
+        // sweep ages this stamp against `CAPACITY_HOLD_TTL` to tell a hold a healthy watcher is
+        // still carrying from one left by a sweep that has stopped happening. It is stamped here —
+        // before the store read, so a local read failure still counts as a live tick — rather than
+        // per hold, because the cursor reaches only `MAX_PR_STATE_CALLS_PER_TICK` pull requests a
+        // tick and a held round re-evaluated once per rotation would otherwise age out while the
+        // watcher is sweeping every tick.
+        self.review_watch_swept = Some((self.now)());
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -714,8 +722,10 @@ impl Orchestrator {
         // `Orchestrator::review_capacity_held`), so each blink re-logged its capacity line and
         // alternating sweeps re-logged the false "nothing has reported it blocked" one — defeating
         // the log's rate limit and re-emitting the very page this ticket closes. An unreached round
-        // therefore KEEPS its hold, still bounded by `CAPACITY_HOLD_TTL` so a hold nothing refreshes
-        // cannot linger.
+        // therefore KEEPS its hold, bounded only by the watcher's own liveness: while the watcher
+        // keeps sweeping, `review_watch_swept` keeps advancing and the hold stays fresh however many
+        // rotations it takes to revisit the round; when the watcher stops, the stamp stops and
+        // `CAPACITY_HOLD_TTL` retires every hold.
         //
         // The clear is deliberately NOT before the store read above (it now lives inside the
         // per-observation servicing): a first hand-back whose WAL read failed decided nothing, so
@@ -1076,11 +1086,11 @@ impl Orchestrator {
                         );
                         if let Err(e) = self.store().drop_review_watch(&row.key) {
                             tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
-                        } else {
-                            // Its round moved to the substitute, so a hold recorded for the
-                            // incumbent has no row left to annotate (STUDIO-950).
-                            self.review_capacity_held.remove(&id);
                         }
+                        // No capacity hold to drop here: this row's key was already removed at the
+                        // top of THIS call, and the only site that inserts a hold `continue`s before
+                        // reaching the reassignment, so the incumbent can never hold one by now
+                        // (STUDIO-950 round 11). The top-of-call removal is the guard for it.
                     }
                     let counter = self.review_rounds.entry(churn_key(pr)).or_default();
                     *counter += 1;
@@ -1397,8 +1407,11 @@ pub struct CapacityHold {
     /// Whether those runs held reviews' OWN budget (`agent.max_concurrent_reviews`) rather than the
     /// shared `agent.max_concurrent_agents` one. Names which knob the operator would tune.
     pub separate: bool,
-    /// When the holding sweep ran. The reconciliation sweep ignores a hold older than
-    /// [`CAPACITY_HOLD_TTL`], so a hold recorded before a `gh` outage cannot outlive the outage.
+    /// When the holding sweep ran. Retained as the reconciliation sweep's FALLBACK freshness
+    /// reference for a hold that predates any sweep; the live reference is the watcher's own
+    /// [`Orchestrator::review_watch_swept`] liveness, because the cursor may not revisit this round
+    /// for several ticks and ageing the hold itself expired rounds a healthy watcher still held
+    /// (STUDIO-950 round 11).
     pub recorded: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1421,22 +1434,27 @@ impl CapacityHold {
 /// [`Orchestrator::review_capacity_held`]. STUDIO-950.
 pub(crate) type CapacityHolds = HashMap<String, CapacityHold>;
 
-/// How long a recorded [`CapacityHold`] stays meaningful. The watcher refreshes its holds on every
-/// sweep it actually runs, and a healthy sweep-to-sweep gap is NOT one
-/// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL): the interval is the sleep
-/// BEFORE each sweep, and the tick then makes TWO serial phases of `gh` lookups, each bounded by
+/// How long the watcher's liveness ([`Orchestrator::review_watch_swept`]) may go un-refreshed
+/// before a recorded [`CapacityHold`] stops being meaningful. The watcher stamps its liveness on
+/// EVERY sweep it runs — not once per hold — so the thing this bounds is the sweep-to-sweep gap, and
+/// a healthy gap is NOT one [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL): the
+/// interval is the sleep BEFORE each sweep, and the tick then makes TWO serial phases of `gh`
+/// lookups, each bounded by
 /// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) calls at
 /// [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT) apiece. The FIRST is the batched sweep
 /// ([`sweep_pr_states`](crate::prstate::sweep_pr_states)); the SECOND is STUDIO-953's
 /// per-observation pre-dispatch re-read ([`refresh_observed_head`]), which asks GitHub once more for
 /// every OPEN observation the sweep returned — the same bound, spent again. Counting only the first
-/// phase understates a healthy tick by half, so a hold could be called stale while the watcher is
-/// still working through the very sweep that recorded it. Three slow lookups already put a healthy
-/// watcher past two intervals, so the bound is the worst case — the sleep plus both lookup phases —
-/// rather than the cadence alone. A hold older than that is from a sweep that has since stopped
-/// happening (a `gh` outage, a cancelled watcher), and the reconciliation sweep must not keep naming
-/// a fact nothing is refreshing. The threshold keeps the two sweeps decoupled: the reconciliation
-/// sweep asks only whether a hold is FRESH, never whether the watcher is running.
+/// phase understates a healthy tick by half, so the watcher's liveness could be called stale while
+/// it is still working through the very sweep that stamped it. Three slow lookups already put a
+/// healthy watcher past two intervals, so the bound is the worst case — the sleep plus both lookup
+/// phases — rather than the cadence alone. Liveness older than that is from a watcher that has since
+/// stopped happening (a `gh` outage, a cancelled watcher), and the reconciliation sweep must not keep
+/// naming a hold nothing is refreshing. The threshold keeps the two sweeps decoupled: the
+/// reconciliation sweep asks only whether the watcher's liveness is FRESH, never whether the watcher
+/// is running. Because liveness — not the individual hold — is what ages, a round the rotating cursor
+/// has not revisited for several ticks stays fresh for exactly as long as the watcher keeps sweeping
+/// (STUDIO-950 round 11).
 pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::from_secs(
     crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
         + 2 * crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
@@ -3806,6 +3824,129 @@ mod tests {
             warns[0].message.contains("held for capacity"),
             "and it names the hold rather than the false page, got: {}",
             warns[0].message
+        );
+    }
+
+    /// STUDIO-950 (round 11): freshness is the WATCHER's liveness, not the age of an individual
+    /// hold.
+    ///
+    /// The sibling test above freezes the clock and so pins only "does not blink within one
+    /// `CAPACITY_HOLD_TTL`". The cursor rotates `MAX_PR_STATE_CALLS_PER_TICK` pull requests a tick,
+    /// so a round the cursor reaches once is re-evaluated once per ROTATION — under the earlier
+    /// per-hold freshness the hold aged out after one TTL while the watcher was healthy and
+    /// sweeping every tick, blinking its annotation off and re-emitting the false "nothing has
+    /// reported it blocked" page this ticket exists to stop. Here the clock advances one nominal
+    /// `PR_STATE_POLL_INTERVAL` per tick for 22 ticks (past the 21 it takes to exceed
+    /// `CAPACITY_HOLD_TTL`), and only tick 0 reaches `#31`.
+    ///
+    /// Mutation check: age `hold.recorded` instead of `review_watch_swept` in `fresh_capacity_hold`
+    /// and the hold drops at tick 21 — a second WARN, the plain-wording one, reds both assertions.
+    #[test]
+    fn a_continuously_held_round_survives_a_full_rotation_on_a_large_watch_set() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        // The row's origin ticket, so the `requested` rule has an author run to anchor on.
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        let id31 = review_key(OWNER, REPO, 31, "bob");
+        let base = chrono::Utc::now();
+
+        // TRA-243: register both callsites against a capturing subscriber before the real run, then
+        // reset so the real run starts from `#31` newly reported with a hold.
+        let _ = capture_events(|| {
+            o.now = Box::new(move || base);
+            o.reconcile_review_divergence(); // the plain callsite, no hold yet
+            o.handle_review_sweep_slots(&[open_at(31, HEAD_A)], None);
+            o.reconcile_review_divergence(); // the capacity callsite
+        });
+        o.review_divergent.clear();
+        o.review_divergence.clear();
+        o.review_capacity_held.clear();
+
+        let interval = chrono::Duration::from_std(crate::prstate::PR_STATE_POLL_INTERVAL)
+            .expect("the poll interval fits a chrono duration");
+        let (holds, events) = capture_events(|| {
+            let mut holds = Vec::new();
+            for i in 0..22 {
+                let at = base + interval * i;
+                o.now = Box::new(move || at);
+                // Only the first tick's cursor reaches `#31`; the rest reach `#32`, which has no
+                // watch row and so re-evaluates nothing.
+                let obs = if i == 0 {
+                    open_at(31, HEAD_A)
+                } else {
+                    open_at(32, HEAD_A)
+                };
+                o.handle_review_sweep_slots(&[obs], None);
+                holds.push(o.review_capacity_held.get(&id31).map(|h| h.holders));
+                o.reconcile_review_divergence();
+            }
+            holds
+        });
+
+        assert_eq!(
+            holds,
+            vec![Some(4); 22],
+            "a hold a healthy watcher keeps carrying must survive a full rotation"
+        );
+        let warns: Vec<&crate::testsupport::CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message.contains("review reconciliation"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "a continuously-held round reports once, not once per rotation: {warns:?}"
+        );
+        assert!(
+            warns[0].message.contains("held for capacity"),
+            "and it names the hold rather than the false page, got: {}",
+            warns[0].message
+        );
+    }
+
+    /// STUDIO-950 (round 11, non-blocking B): retirement drops the retired round's capacity hold.
+    /// Under the per-pull-request refresh a leaked hold no longer lives one tick — it lives until the
+    /// watcher stops sweeping — so a closed-and-reopened pull request could inherit a stale "held
+    /// for capacity" annotation before any sweep re-evaluates it, a WRONG named cause (the class this
+    /// ticket exists to remove). Pin the removal on the retirement path.
+    ///
+    /// Mutation check: drop the `review_capacity_held.remove(&id)` in `retire_review_pr` and this
+    /// reds.
+    #[test]
+    fn a_retirement_drops_a_capacity_hold() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1, "the fixture holds the round");
+        let id = review_key(OWNER, REPO, 31, "bob");
+        assert!(
+            o.review_capacity_held.contains_key(&id),
+            "precondition: the round is held for capacity"
+        );
+
+        assert_eq!(
+            o.handle_review_sweep(&[observed(31, PrLookup::Gone)])
+                .retired,
+            1
+        );
+        assert!(
+            !o.review_capacity_held.contains_key(&id),
+            "a retired pull request must not keep a capacity hold for its round"
         );
     }
 

@@ -1013,6 +1013,37 @@ mod tests {
         assert!(!o.review_rounds_stalled());
     }
 
+    /// STUDIO-950 (round 11, non-blocking B): a dismissal drops the dismissed round's capacity hold.
+    /// The hold survives unreached ticks by design, so a dismissed pull request would otherwise keep
+    /// naming a capacity wait until the watcher stops sweeping — a WRONG named cause for a pull
+    /// request nobody is waiting on. Pin the removal on the dismissal path.
+    ///
+    /// Mutation check: drop the `review_capacity_held.remove(&id)` in `handle_review_dismiss` and
+    /// this reds.
+    #[test]
+    fn a_dismissal_drops_a_capacity_hold() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let id = review_key("makewhatis", "rhapsody", 12, "bob");
+        o.review_capacity_held.insert(
+            id.clone(),
+            crate::reviewwatch::CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: chrono::Utc::now(),
+            },
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_capacity_held.contains_key(&id),
+            "a dismissed pull request must not keep a capacity hold"
+        );
+    }
+
     /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls without
     /// reading or writing anything — and says `Dormant`, which is not the same fact as a refusal.
     #[test]

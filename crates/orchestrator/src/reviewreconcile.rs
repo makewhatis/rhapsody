@@ -583,14 +583,20 @@ impl Orchestrator {
     ///
     /// The freshness test is what keeps this sweep decoupled from the watcher, which its own module
     /// docs treat as a design constraint (the sweep is local and must keep deciding when `gh` cannot
-    /// be reached). `review_capacity_held` is refreshed only by a watcher sweep, and a sweep that
-    /// cannot reach GitHub delivers nothing at all — so a hold from before such an outage would
-    /// otherwise linger and keep naming a fact no later sweep is refreshing. A hold older than
-    /// [`CAPACITY_HOLD_TTL`] — or one timestamped in the future, which no honest clock produces — is
-    /// dropped and the row reports under its ordinary wording.
+    /// be reached). A watcher that is still sweeping stamps `review_watch_swept` on every tick, so a
+    /// hold it is still carrying stays fresh however many rotations pass before the cursor revisits
+    /// that pull request; a watcher that has STOPPED — a `gh` outage delivers no sweep event at all,
+    /// so the stamp stops advancing — leaves every hold to age out. The age is measured on the
+    /// WATCHER's liveness, not on the hold's own `recorded`, because the cursor reaches only
+    /// `MAX_PR_STATE_CALLS_PER_TICK` pull requests a tick and per-hold ageing expired rounds a
+    /// healthy watcher was still holding (STUDIO-950 round 11). A hold older than
+    /// [`CAPACITY_HOLD_TTL`] — or one whose watcher stamp is in the future, which no honest clock
+    /// produces — is dropped and the row reports under its ordinary wording. A hold that predates
+    /// any sweep (no liveness stamp yet) falls back to its own `recorded`.
     fn fresh_capacity_hold(&self, id: &str, now: DateTime<Utc>) -> Option<CapacityHold> {
         let hold = self.review_capacity_held.get(id)?;
-        let age = now.signed_duration_since(hold.recorded).to_std().ok()?;
+        let swept = self.review_watch_swept.unwrap_or(hold.recorded);
+        let age = now.signed_duration_since(swept).to_std().ok()?;
         (age < CAPACITY_HOLD_TTL).then_some(*hold)
     }
 
