@@ -1076,6 +1076,10 @@ impl Orchestrator {
                         );
                         if let Err(e) = self.store().drop_review_watch(&row.key) {
                             tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
+                        } else {
+                            // Its round moved to the substitute, so a hold recorded for the
+                            // incumbent has no row left to annotate (STUDIO-950).
+                            self.review_capacity_held.remove(&id);
                         }
                     }
                     let counter = self.review_rounds.entry(churn_key(pr)).or_default();

@@ -330,6 +330,11 @@ impl Orchestrator {
             // left standing it would keep `REVIEW_UNASSIGNABLE_WARNING` lit on every project for
             // the rest of the daemon's life, which is a warning that only ever latches.
             self.review_unassignable.remove(&id);
+            // STUDIO-950: same reasoning for the capacity hold, whose job is to annotate the
+            // reconciliation sweep's report of an OWED round. A dismissed pull request owes none,
+            // and the hold survives unreached ticks by design, so it must be dropped here rather
+            // than left to the TTL.
+            self.review_capacity_held.remove(&id);
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
