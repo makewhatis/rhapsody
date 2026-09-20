@@ -1281,10 +1281,12 @@ impl Orchestrator {
         // decides — ship it, or escalate — instead of the loop silently stopping at the hard cap.
         // Checked before the dispatch loop so no row of this pull request is dispatched once the
         // threshold is reached.
-        if let Some(threshold) = self.adjudication_threshold() {
+        if !mine.is_empty()
+            && let Some(threshold) = self.adjudication_threshold()
+        {
             if let Some(decision) = self.adjudication(pr) {
-                // A decision already exists (or is being made): arm nothing. A settled verdict also
-                // silences the author half, through `loop_stopped`.
+                // A decision already exists (or is being made): arm nothing, here or on the author
+                // half (`author_round_budget_spent` reads the same ledger).
                 if !decision.settled() {
                     report.deferred += 1;
                 }
