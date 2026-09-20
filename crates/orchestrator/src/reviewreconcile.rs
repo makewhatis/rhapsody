@@ -702,32 +702,47 @@ impl Orchestrator {
 
     /// Replaces the reported set, logging the transitions and rate-limiting the steady state.
     fn set_review_divergences(&mut self, found: Vec<Divergence>) {
-        // The capacity annotation each pull request carried on the PREVIOUS sweep, so a hold that
-        // APPEARS (or one whose holder count/budget changes) is a transition that logs on the sweep
-        // that learned it rather than waiting out the steady-state rate limit. A pull request newly
-        // reported simply has none, which is why the crossing sweep's `sweeps == 1` still logs.
-        let previous: HashMap<&str, Option<CapacityHold>> = self
+        // The capacity annotations each pull request carried on the PREVIOUS sweep, so an annotation
+        // that APPEARS is a transition that logs on the sweep that learned it rather than waiting out
+        // the steady-state rate limit. A pull request newly reported simply has none, which is why
+        // the crossing sweep's `sweeps == 1` still logs. BOTH annotations are carried, not just the
+        // hold (STUDIO-950 round 21): the unreadable denial is likewise filled by
+        // [`Orchestrator::reconcile_review_divergence`] and compared by PRESENCE here, and a row that
+        // first crossed WITHOUT it and only later had its coordinate go unreadable would otherwise
+        // update the advisory while the log said nothing for a full `RECONCILE_LOG_EVERY` window —
+        // the same false page on the second sweep. The count is deliberately NOT compared, only its
+        // presence: it climbs on every failed lookup, so comparing the number would make every
+        // outage sweep a transition and defeat the rate limit.
+        let previous: HashMap<&str, (Option<CapacityHold>, bool)> = self
             .review_divergence
             .iter()
-            .map(|d| (d.pr.as_str(), d.capacity_held))
+            .map(|d| {
+                (
+                    d.pr.as_str(),
+                    (d.capacity_held, d.capacity_unreadable.is_some()),
+                )
+            })
             .collect();
         for d in &found {
             let sweeps = self.review_divergent.entry(d.pr.clone()).or_insert(0);
             *sweeps += 1;
             let sweeps = *sweeps;
-            // A newly added or CHANGED capacity annotation is its own report transition. The
-            // generic repeat clock alone would let a row that first crossed the threshold WITHOUT a
-            // hold keep the plain "nothing has reported it blocked" wording for a full
-            // `RECONCILE_LOG_EVERY` window (~30 min at the default cadence) after the watcher
-            // started holding it — the false page this ticket exists to close, reintroduced on the
-            // second sweep instead of the first. `recorded` is excluded from the comparison (see
-            // [`same_capacity`]): it is re-stamped when the rotating cursor next evaluates the pull
-            // request, not every sweep, so comparing it would log a rotation as a transition and
-            // defeat the rate limit.
-            let annotation_changed = !same_capacity(
-                previous.get(d.pr.as_str()).copied().flatten(),
-                d.capacity_held,
-            );
+            // A newly added or CHANGED capacity annotation is its own report transition — whether it
+            // is a hold appearing/changing or the unreadable denial appearing. The generic repeat
+            // clock alone would let a row that first crossed the threshold WITHOUT an annotation keep
+            // the plain "nothing has reported it blocked" wording for a full `RECONCILE_LOG_EVERY`
+            // window (~30 min at the default cadence) after the watcher learned the cause — the false
+            // page this ticket exists to close, reintroduced on the second sweep instead of the
+            // first. `recorded` is excluded from the hold comparison (see [`same_capacity`]): it is
+            // re-stamped when the rotating cursor next evaluates the pull request, not every sweep,
+            // so comparing it would log a rotation as a transition and defeat the rate limit; the
+            // unreadable count is likewise reduced to presence for the same reason.
+            let (prev_hold, prev_unreadable) = previous
+                .get(d.pr.as_str())
+                .copied()
+                .unwrap_or((None, false));
+            let annotation_changed = !same_capacity(prev_hold, d.capacity_held)
+                || prev_unreadable != d.capacity_unreadable.is_some();
             // The crossing sweep, an annotation transition, and the rate-limited repeats in ONE
             // condition: at the crossing the count is 1, and `1 - 1` is a multiple of everything.
             if annotation_changed || (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
@@ -1833,6 +1848,81 @@ mod store_tests {
                 .iter()
                 .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
             "it must not also claim nothing has reported it blocked, got {projects:?}"
+        );
+    }
+
+    /// STUDIO-950 (round 21, sol's blocking finding at `71c02b3`, re-derived from alice's round 20):
+    /// the unreadable denial is a REPORT TRANSITION too. A row that first crosses the sweep's
+    /// threshold with NO annotation logs the plain "nothing has reported it blocked" line; when the
+    /// NEXT sweep learns its coordinate has gone unreadable, the advisory flips to the unreadable
+    /// string but the log said nothing — the false page, reintroduced on the second sweep. `sweeps`
+    /// is 2 there, so the repeat clock is no help; the transition test must see the annotation.
+    ///
+    /// Mutation check: compare only the hold in `annotation_changed` (as at `71c02b3`) and the
+    /// second sweep emits no WARN at all, because `RECONCILE_LOG_EVERY` is 60 and `sweeps - 1` is 1.
+    #[test]
+    fn an_unreadable_denial_learned_on_a_later_sweep_is_logged() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        // TRA-243: register BOTH the plain and the unreadable callsites against a capturing
+        // subscriber before the real run, then start from a clean crossing with no annotation.
+        let _ = crate::testsupport::capture_events(|| {
+            o.reconcile_review_divergence(); // the plain callsite and the crossing
+            o.review_watch_unreadable.insert(
+                PrCoord::new("makewhatis", "rhapsody", 164),
+                UNREADABLE_ATTEMPTS_TO_DROP_HOLD,
+            );
+            o.reconcile_review_divergence(); // the unreadable callsite
+        });
+        o.review_divergent.clear();
+        o.review_watch_unreadable.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            // Sweep 1: stale, with no annotation of any kind — the plain line.
+            o.reconcile_review_divergence();
+            // GitHub stops answering for the coordinate before the next sweep.
+            o.review_watch_unreadable.insert(
+                PrCoord::new("makewhatis", "rhapsody", 164),
+                UNREADABLE_ATTEMPTS_TO_DROP_HOLD,
+            );
+            // Sweep 2: the denial is newly known, so it must be reported NOW — not one
+            // `RECONCILE_LOG_EVERY` window later.
+            o.reconcile_review_divergence();
+        });
+
+        let review_warns: Vec<&crate::testsupport::CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message.contains("review reconciliation"))
+            .collect();
+        assert_eq!(
+            review_warns.len(),
+            2,
+            "every transition must report, got: {review_warns:?}"
+        );
+        assert!(
+            review_warns[0]
+                .message
+                .contains("nothing has reported it blocked"),
+            "the first sweep knows of nothing, got: {}",
+            review_warns[0].message
+        );
+        assert!(
+            review_warns[1].message.contains("could not be read"),
+            "the sweep that LEARNED the denial must say so immediately, got: {}",
+            review_warns[1].message
         );
     }
 

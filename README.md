@@ -1203,7 +1203,7 @@ Detection stays cause-agnostic, but the report is not silent about a cause the d
 When the review watcher deferred a round for want of a global slot it records the hold (STUDIO-950),
 and the sweep names it — the holder count and which budget — instead of the unenriched "nothing has
 reported it blocked", exactly as it names auto-merge's decline reason (STUDIO-923). It annotates and
-never suppresses: the pull request is still reported. The annotation reaches all three surfaces, not
+never suppresses: the pull request is still reported. BOTH capacity annotations reach the surfaces, not
 just the log — the `/api/v1/state` row carries the holder count and the budget key under
 `capacity_held`, the console banner renders them, and the per-project advisory names a capacity hold
 rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
@@ -1212,9 +1212,12 @@ watcher's own liveness is re-stamped on every tick and a hold is refreshed whene
 cursor next evaluates its pull request. A hold stops being named once the watcher's liveness stamp is
 more than `CAPACITY_HOLD_TTL` old — measured against the sweep's own clock, not the hold's age — and
 one whose pull request has failed enough consecutive lookups is no longer reported as a hold — and
-that denial is reported, with the attempt count, as an unreadable coordinate rather than falling back
+that denial is reported as an unreadable coordinate, with the attempt count, rather than falling back
 to the false "nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being
-named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall.
+named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall. The
+denial takes the same route to the surfaces: the state row carries it under `capacity_unreadable` and
+the console banner names it, so an operator following the advisory's own pointer to
+`review_divergence` can tell the row it is about from an ordinary divergence.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |

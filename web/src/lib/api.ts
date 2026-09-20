@@ -80,8 +80,8 @@ export interface StateResponse {
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
 // whose board state and activity disagree. Usually that means nothing is progressing it and nothing
-// reported it blocked; when `capacity_held` is present it is instead a deliberate wait the daemon can
-// name, so never render the row as an unexplained stall without checking that field.
+// reported it blocked; when `capacity_held` or `capacity_unreadable` is present it is instead a wait
+// the daemon can name, so never render the row as an unexplained stall without checking them.
 //
 // `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
 // of the wording is how the two drift apart. `kind` is still given because it is stable and a client
@@ -99,6 +99,11 @@ export interface ReviewDivergence {
   // rather than repeating the daemon's general "not reported blocked" framing. `budget` is the
   // config key (`agent.max_concurrent_reviews` or `agent.max_concurrent_agents`).
   capacity_held?: { holders: number; budget: string };
+  // The other capacity annotation (STUDIO-950), present when a round's hold was DENIED because
+  // GitHub stopped answering for the coordinate: the consecutive failed lookups the watcher has
+  // recorded. Mutually exclusive with `capacity_held`. Without it, an operator following the
+  // advisory's own "see review_divergence" pointer could not tell this row from an ordinary stall.
+  capacity_unreadable?: { attempts: number };
 }
 
 // DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking

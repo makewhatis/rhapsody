@@ -144,6 +144,31 @@ describe("DivergenceBanner", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 
+  // STUDIO-950 round 21: the hold can be DENIED because GitHub stopped answering for the coordinate.
+  // That row carries `capacity_unreadable` instead, and the banner must name the silence for the same
+  // reason it names a hold — the advisory's own pointer to `review_divergence` cannot otherwise tell
+  // this row from an ordinary divergence.
+  it("names an unreadable coordinate rather than an unexplained stall", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_requested_no_run",
+            detail: "a review round is owed and no reviewer run has started",
+            capacity_unreadable: { attempts: 3 },
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("could not be read");
+    expect(banner.textContent).toContain("3 consecutive attempt(s)");
+    expect(banner.textContent).not.toContain("held for capacity");
+    // Still a report, not a control.
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
   // The shortest staleness the daemon can actually report — just past its ninety-minute threshold —
   // reads as "1 hour" and not "0 hours". The coarse rendering must never round a real report down to
   // nothing, which is the one way it could make a reported divergence look like a non-event.

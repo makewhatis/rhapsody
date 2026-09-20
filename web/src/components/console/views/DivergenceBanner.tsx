@@ -23,9 +23,11 @@ import { useStateQuery } from "@/hooks/useStateQuery";
  *
  * A row the review watcher is HOLDING for want of a global slot carries a `capacity_held`
  * annotation (STUDIO-950). That wait is deliberate and the daemon knows why, so the row says so and
- * names the budget — the banner never implies a held round is an unexplained stall. The heading
- * claims only what is always true of every row ("board state and activity disagree"); the old
- * "neither progressing nor reported blocked" would have been false the moment a hold was known.
+ * names the budget — the banner never implies a held round is an unexplained stall. A hold the
+ * watcher DENIED because GitHub stopped answering for the coordinate carries `capacity_unreadable`
+ * instead, and the banner names that silence for the same reason. The heading claims only what is
+ * always true of every row ("board state and activity disagree"); the old "neither progressing nor
+ * reported blocked" would have been false the moment either annotation was known.
  */
 export function DivergenceBanner() {
   const state = useStateQuery();
@@ -43,7 +45,9 @@ export function DivergenceBanner() {
             {d.ticket ? ` (${d.ticket})` : ""} — {d.detail}, {humanStale(d.stale_secs)}.
             {d.capacity_held
               ? ` It is held for capacity: ${d.capacity_held.holders} run(s) hold the ${d.capacity_held.budget} budget, so no reviewer run can start yet.`
-              : ""}
+              : d.capacity_unreadable
+                ? ` Its GitHub state could not be read for ${d.capacity_unreadable.attempts} consecutive attempt(s), so the daemon cannot confirm it is still progressing.`
+                : ""}
           </span>
         ))}
         Nothing has been changed on your behalf — this is a report.

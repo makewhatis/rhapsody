@@ -110,6 +110,23 @@ pub fn render(s: &Snapshot) -> Value {
                                 }),
                             );
                         }
+                        // STUDIO-950 round 21: the OTHER capacity annotation, conditional on the
+                        // same key and row. When the hold was DENIED because GitHub stopped
+                        // answering for the coordinate, the advisory ends "see `review_divergence`
+                        // on /api/v1/state" — and without this the row it points at is
+                        // indistinguishable from an ordinary divergence, so the operator cannot map
+                        // the advisory to the pull request it is about. Mutually exclusive with
+                        // `capacity_held` (the denial is what suppresses the hold), so a row never
+                        // carries both. The count is what the operator needs to see; presence is
+                        // what identifies the row.
+                        if let (Some(attempts), Some(obj)) =
+                            (d.capacity_unreadable, row.as_object_mut())
+                        {
+                            obj.insert(
+                                "capacity_unreadable".to_string(),
+                                json!({ "attempts": attempts }),
+                            );
+                        }
                         row
                     })
                     .collect::<Vec<_>>(),
@@ -365,6 +382,12 @@ mod tests {
             "a divergence with no hold must not carry the annotation, got: {}",
             rows[0]
         );
+        // ...and neither capacity annotation is unconditional (STUDIO-950 round 21).
+        assert!(
+            rows[0].get("capacity_unreadable").is_none(),
+            "a readable coordinate must not carry the denial, got: {}",
+            rows[0]
+        );
     }
 
     // STUDIO-950: when the review watcher IS holding the reported round for want of a global slot,
@@ -404,6 +427,42 @@ mod tests {
             "the annotation names the budget an operator would loosen"
         );
         // It is still reported in full — the hold ANNOTATES, it never suppresses.
+        assert!(row.get("detail").is_some());
+        assert_eq!(row["stale_secs"], 21_600);
+    }
+
+    // STUDIO-950 round 21: the unreadable denial is the other capacity annotation, and it must reach
+    // the state row for the same reason the hold does — the advisory whose wording ends "see
+    // `review_divergence` on /api/v1/state" would otherwise point an operator at a row they cannot
+    // tell apart from an ordinary divergence.
+    #[test]
+    fn an_unreadable_denial_carries_its_attempts_on_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.review_divergence = vec![crate::reviewreconcile::Divergence {
+            pr: "makewhatis/rhapsody#164".to_string(),
+            kind: crate::reviewreconcile::DivergenceKind::ReviewRequestedNoRun,
+            ticket: "STUDIO-950".to_string(),
+            reviewer: "alice".to_string(),
+            stale_secs: 21_600,
+            auto_merge_reason: None,
+            capacity_held: None,
+            capacity_unreadable: Some(3),
+        }];
+
+        let rendered = render(&o.build_snapshot());
+        let row = &rendered["review_divergence"][0];
+        assert_eq!(
+            row["capacity_unreadable"]["attempts"], 3,
+            "the attempt count the watcher recorded"
+        );
+        // The two annotations are mutually exclusive: a denied hold is not a hold.
+        assert!(
+            row.get("capacity_held").is_none(),
+            "an unreadable denial must not also read as a live hold, got: {row}"
+        );
+        // It is still reported in full — the annotation never suppresses.
         assert!(row.get("detail").is_some());
         assert_eq!(row["stale_secs"], 21_600);
     }
