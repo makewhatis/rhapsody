@@ -348,16 +348,27 @@ impl Orchestrator {
         // `/api/v1/state`'s `review_divergence`, which says WHICH pull request and how. Empty while
         // healthy → the wire shape and the status fixtures are unaffected.
         //
-        // STUDIO-950: the cause it does NOT name is the one the daemon already knows. When the
-        // review watcher is holding a reported round for want of a global slot the plain "nothing
-        // has reported it blocked" is false, so the advisory names the deliberate wait instead
-        // (`REVIEW_DIVERGENCE_CAPACITY_WARNING`). The per-row holder count and the budget an
-        // operator would turn are on the state row; this fixed string cannot carry them.
-        let review_diverged = !self.review_divergences().is_empty();
+        // STUDIO-950: one cause it does NOT have to invent is the capacity hold the review watcher
+        // already reports. When the watcher is holding a reported round for want of a global slot
+        // the plain "nothing has reported it blocked" is false FOR THAT ROW, so the advisory names
+        // the deliberate wait instead (`REVIEW_DIVERGENCE_CAPACITY_WARNING`). The per-row holder
+        // count and the budget an operator would turn are on the state row; the fixed string cannot
+        // carry them.
+        //
+        // The two advisories are INDEPENDENT, not alternatives: a reported set can hold both a
+        // deliberately-waited round AND a genuinely unexplained stall at once, and collapsing the
+        // set onto one string re-labels the stall as a capacity wait — the mirror image of the false
+        // claim this closes (the STUDIO-898 incident is exactly the stall with no known cause, and
+        // it must not lose its warning to a hold in a sibling row). Each string is pushed on its own
+        // evidence, so a mixed set carries both.
         let review_held = self
             .review_divergences()
             .iter()
             .any(|d| d.capacity_held.is_some());
+        let review_unexplained = self
+            .review_divergences()
+            .iter()
+            .any(|d| d.capacity_held.is_none());
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -386,12 +397,12 @@ impl Orchestrator {
             if review_stalled {
                 warnings.push(crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING.to_string());
             }
-            if review_diverged {
-                warnings.push(if review_held {
-                    crate::reviewreconcile::REVIEW_DIVERGENCE_CAPACITY_WARNING.to_string()
-                } else {
-                    crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string()
-                });
+            if review_held {
+                warnings
+                    .push(crate::reviewreconcile::REVIEW_DIVERGENCE_CAPACITY_WARNING.to_string());
+            }
+            if review_unexplained {
+                warnings.push(crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string());
             }
             out.push(ProjectStatus {
                 slug: group.clone(),

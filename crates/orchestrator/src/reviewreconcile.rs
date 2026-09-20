@@ -129,8 +129,9 @@ pub const REVIEW_DIVERGENCE_WARNING: &str = "a pull request's board state and it
 /// of a global slot (STUDIO-950). The plain string's "nothing has reported it blocked" is false
 /// there — the watcher reports the hold every tick — so the project advisory names the deliberate
 /// wait instead, and still points at the surface that says WHICH pull request and with what holder
-/// count. Selected whenever any reported divergence carries a hold, so a project never reads a
-/// held round as the unexplained stall [`REVIEW_DIVERGENCE_WARNING`] describes.
+/// count. It is pushed alongside [`REVIEW_DIVERGENCE_WARNING`], never instead of it: a reported set
+/// can hold both a deliberately-waited round and a genuinely unexplained one, and the two
+/// conditions are independent (see `snapshot.rs`'s `project_statuses`).
 pub const REVIEW_DIVERGENCE_CAPACITY_WARNING: &str = "a pull request's board state and its activity disagree because it is held \
      for capacity — no reviewer run can start yet; see `review_divergence` on /api/v1/state";
 
@@ -1431,10 +1432,16 @@ mod store_tests {
 
     /// Seeds one watch row that has been REVIEWED (findings posted) at `HEAD`.
     fn reviewed_row(o: &Orchestrator, reviewer: &str, ticket: &str) {
+        reviewed_row_at(o, 164, reviewer, ticket);
+    }
+
+    /// As [`reviewed_row`] for an explicit pull request number — the mixed-set advisory test drives
+    /// two divergences at once and needs them on distinct pull requests.
+    fn reviewed_row_at(o: &Orchestrator, number: i64, reviewer: &str, ticket: &str) {
         let key = ReviewWatchKey {
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
-            number: 164,
+            number,
             reviewer: reviewer.to_string(),
         };
         o.store()
@@ -1649,6 +1656,72 @@ mod store_tests {
         );
     }
 
+    /// STUDIO-950 (round 10): [`same_capacity`] deliberately EXCLUDES [`CapacityHold::recorded`],
+    /// because the watcher re-stamps it on every sweep — comparing it would make every sweep look
+    /// like a transition and defeat the reconciliation log's rate limit. That decision was
+    /// documented but UNPINNED: adding `&& x.recorded == y.recorded` left the whole suite green.
+    ///
+    /// Mutation check: add `&& x.recorded == y.recorded` to `same_capacity` and this logs a third
+    /// WARN, red.
+    #[test]
+    fn a_restamped_hold_with_an_unchanged_count_is_not_a_transition() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        let id = review_key("makewhatis", "rhapsody", 164, "alice");
+        let hold_at = |recorded: &str| CapacityHold {
+            holders: 4,
+            separate: false,
+            recorded: t(recorded),
+        };
+
+        // Register both callsites before the real run (TRA-243), then start from a clean crossing.
+        let _ = crate::testsupport::capture_events(|| {
+            o.reconcile_review_divergence(); // the plain callsite
+            o.review_capacity_held
+                .insert(id.clone(), hold_at("2026-09-14T21:00:00Z"));
+            o.reconcile_review_divergence(); // the capacity callsite
+        });
+        o.review_divergent.clear();
+        o.review_capacity_held.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            // Sweep 1: no hold — the plain line.
+            o.reconcile_review_divergence();
+            // Sweep 2: the watcher records the hold — the capacity line.
+            o.review_capacity_held
+                .insert(id.clone(), hold_at("2026-09-14T21:00:00Z"));
+            o.reconcile_review_divergence();
+            // Sweep 3: the watcher RE-STAMPS the hold with the same holder count (its every-sweep
+            // refresh). Not a transition — the number an operator reads is unchanged.
+            o.review_capacity_held
+                .insert(id.clone(), hold_at("2026-09-14T21:10:00Z"));
+            o.reconcile_review_divergence();
+        });
+
+        let warns: Vec<&crate::testsupport::CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message.contains("review reconciliation"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            2,
+            "a re-stamped hold with an unchanged count is not a transition, got: {warns:?}"
+        );
+    }
+
     /// STUDIO-950: when the reported divergence is HELD for capacity, the project advisory must stop
     /// claiming nothing has reported it blocked. It names the deliberate wait instead, while the
     /// state row says which pull request and with what holder count — the two surfaces the ticket
@@ -1702,6 +1775,73 @@ mod store_tests {
         assert_eq!(
             rendered["review_divergence"][0]["capacity_held"]["holders"],
             4
+        );
+    }
+
+    /// STUDIO-950 (round 10): the two divergence advisories are INDEPENDENT. A reported set can hold
+    /// both a capacity-held round AND a genuinely unexplained stall at once, and selecting one
+    /// string for the whole set would re-label the stall as a deliberate capacity wait — the mirror
+    /// image of the false claim this ticket closes, and exactly what the STUDIO-898 surface exists
+    /// to avoid. Each string is pushed on its own evidence, so a mixed set carries both.
+    ///
+    /// Mutation check: restore the either/or selection (`if review_held { capacity } else { plain }`)
+    /// and the plain-warning assertion reds while the capacity one stays green.
+    #[test]
+    fn a_mixed_divergence_set_carries_both_advisories() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        // #164: held for capacity by the review watcher.
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        o.review_capacity_held.insert(
+            review_key("makewhatis", "rhapsody", 164, "alice"),
+            CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: t("2026-09-14T21:20:00Z"),
+            },
+        );
+        // #165: the same stale shape, holding nothing — the unexplained stall with no known cause.
+        reviewed_row_at(o, 165, "jimmy", "STUDIO-899");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 165, "jimmy"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-899",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        o.reconcile_review_divergence();
+        assert_eq!(o.review_divergences().len(), 2, "both rows report");
+
+        let projects = o.project_statuses();
+        assert!(
+            projects.iter().any(|p| p
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_DIVERGENCE_CAPACITY_WARNING)),
+            "the held round's advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the unexplained stall must keep its warning alongside the capacity one, got {projects:?}"
         );
     }
 

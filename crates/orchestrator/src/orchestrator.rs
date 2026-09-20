@@ -589,22 +589,23 @@ pub struct Orchestrator {
     pub(crate) review_unassignable: HashMap<String, usize>,
     /// The ticketless review rounds the watcher deferred for want of a global slot on its most
     /// recent sweep (STUDIO-950), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id
-    /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler, which
-    /// clears it ONCE per tick — on the tick's first hand-back — and re-inserts only the rounds that
-    /// tick held, so on a healthy tick it means exactly "what this tick's sweep held" rather than an
-    /// accumulation. The exception is a first hand-back that returns before reaching the clear — the
-    /// watcher not ticketless-enabled, or a store read of the watch set that FAILED. It decided
-    /// neither a dispatch nor a defer, so the tick's holds are unknown and the previous tick's (still
-    /// fresh under the watcher's `CAPACITY_HOLD_TTL`) records are left in place rather than blanked.
-    /// For the store-read failure that is DELIBERATE: a round that really is held keeps its
-    /// annotation instead of paging a human with "nothing has reported it blocked" because the
-    /// watcher could not read its own watch set. On such a path the map IS an accumulation, so a
-    /// future reader must not iterate it expecting only this tick's rows; `fresh_capacity_hold` reads
-    /// it by key. A sweep only
-    /// visits the rotated slice of the watch set (`MAX_PR_STATE_CALLS_PER_TICK` pull requests per
-    /// tick), so with more watched pull requests than that a round's hold can blink out for one
-    /// sweep and return on the next; an absent entry means "not held by the most RECENT sweep", not
-    /// "not held".
+    /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler.
+    ///
+    /// It is refreshed PER PULL REQUEST, not cleared wholesale: processing a pull request's
+    /// observation drops the holds for its rounds, and the capacity branch re-records every round
+    /// that tick still defers. A pull request the cursor did NOT reach — a sweep visits only
+    /// `MAX_PR_STATE_CALLS_PER_TICK` of the watch set per tick — therefore KEEPS the hold it was last
+    /// given, because not being re-evaluated is not evidence the hold ended; clearing it wholesale
+    /// made a continuously-held round's annotation blink present/absent every tick, which re-logged
+    /// the reconciliation sweep's capacity line and half the time its false "nothing has reported it
+    /// blocked" one (STUDIO-950 round 10). Only the watcher's `CAPACITY_HOLD_TTL` expires such a
+    /// hold. Two paths return before any clearing and likewise leave the previous records in place:
+    /// the watcher not ticketless-enabled, and a store read of the watch set that FAILED. For the
+    /// store-read failure that is DELIBERATE — a round that really is held keeps its annotation
+    /// instead of paging a human with "nothing has reported it blocked" because the watcher could
+    /// not read its own watch set. So an absent entry means "the last sweep that RE-EVALUATED this
+    /// round did not defer it", never merely "we did not look"; a future reader must not iterate
+    /// this map expecting only the current tick's rows, and `fresh_capacity_hold` reads it by key.
     ///
     /// It exists so the reconciliation sweep can name a DELIBERATE capacity hold — a wait the
     /// operator can see in `reviewwatch`'s own log — as the cause, instead of reporting an
