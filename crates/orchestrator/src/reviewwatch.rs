@@ -66,6 +66,14 @@
 //! dispatch. The fresh answer is ADOPTED: refusing on a move would let a short-cycle author starve
 //! the review entirely, which is strictly worse than reviewing slightly-stale code.
 //!
+//! **STUDIO-960 sits inside that window, deliberately.** When a head move might be carryable the
+//! diff comparison ([`unchanged_reviewed_shas`]) runs AFTER the re-read and before the hand-back,
+//! so a head's dispatch now waits behind up to `1 + 1 + N` bounded `gh` execs — all on this task,
+//! none on the control task. That does not reopen the #189 window it looks like: the proof is
+//! pinned to the SHA the re-read just returned, so an author pushing DURING the comparison lands on
+//! a head whose diff was never compared; the next tick sees that head, comparison fails to prove it,
+//! and a normal round is armed. The saving can be lost to a race; a review cannot.
+//!
 //! **Why two passes.** They do different jobs: the sweep's read CLASSIFIES (a merged, closed, gone
 //! or untrusted answer dispatches nothing and leaves the watch set; only an OPEN one may be
 //! re-read) while the re-read PINS the head the dispatch records. One interleaved pass would do
@@ -248,25 +256,38 @@ pub struct ReviewSweepReport {
 /// afresh".
 const UNCAPPED_SLOTS: i64 = i64::MAX;
 
-/// One pull request the watcher should ask GitHub about this tick, with the head SHAs its watch
-/// rows have already had READ (STUDIO-960).
+/// One live watch row's head state for a polled pull request (STUDIO-960).
 ///
-/// The reviewed SHAs travel beside the coordinate rather than being re-read by the watcher, which
+/// Carried per ROW rather than as a union of the two SHA columns, because whether the diff
+/// comparison is worth its `gh` calls depends on the PAIR: a row already dispatched at the new head
+/// cannot consume a proof, however far behind another row's `last_reviewed_sha` sits. A union loses
+/// that pairing and lets one reviewer's in-flight round suppress the proof a PEER still needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedRow {
+    /// The head this row's verdict was recorded at (`last_reviewed_sha`), or empty when it never
+    /// completed a round.
+    pub reviewed_sha: String,
+    /// The head a round was DISPATCHED against (`requested_sha`), or empty.
+    pub requested_sha: String,
+    /// The row's status. Only a `reviewed`/`approved` row can carry a verdict, so the comparison is
+    /// spent only where one of those exists — a `requested`/`in_flight`/`truncated` row cannot
+    /// consume any proof and would otherwise buy two `gh` reads per tick for as long as it sits
+    /// there.
+    pub status: String,
+}
+
+/// One pull request the watcher should ask GitHub about this tick, with the head state of each of
+/// its live rows (STUDIO-960).
+///
+/// The row states travel beside the coordinate rather than being re-read by the watcher, which
 /// holds no store: the control task is what reads the watch set, and this is the one fact the
 /// off-loop diff comparison needs from it. The watcher keeps no row state of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedPr {
     /// The pull request's repository and number.
     pub pr: PrCoord,
-    /// Distinct non-empty `last_reviewed_sha` values across this pull request's live rows. A head
-    /// equal to one of these is already read; a head different from all of them may have MOVED, and
-    /// only then is a diff comparison worth its `gh` calls.
-    pub reviewed_shas: Vec<String>,
-    /// Distinct non-empty `requested_sha` values across the same rows — the heads a round has been
-    /// DISPATCHED against. A head equal to one of these already has a round in flight, so the edge
-    /// trigger arms nothing and the comparison is not needed either; carrying these is what keeps a
-    /// long review from re-spending two `gh` calls per tick for its whole duration.
-    pub requested_shas: Vec<String>,
+    /// One entry per live watch row, in the store's stable order.
+    pub rows: Vec<WatchedRow>,
 }
 
 impl WatchedPr {
@@ -274,10 +295,52 @@ impl WatchedPr {
     pub fn new(pr: PrCoord) -> WatchedPr {
         WatchedPr {
             pr,
-            reviewed_shas: Vec::new(),
-            requested_shas: Vec::new(),
+            rows: Vec::new(),
         }
     }
+
+    /// Distinct non-empty `last_reviewed_sha` values across this pull request's rows, de-duplicated
+    /// — the heads the diff comparison must be able to prove unchanged.
+    ///
+    /// The comparison is asked to fingerprint the union, not one row's head at a time: it filters
+    /// out any SHA equal to the new head itself, so the caller may hand it every reviewed head it
+    /// has and spend one `gh` read per distinct one.
+    pub fn reviewed_shas(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for row in &self.rows {
+            let sha = row.reviewed_sha.trim();
+            if !sha.is_empty() && !out.iter().any(|s| s == sha) {
+                out.push(sha.to_string());
+            }
+        }
+        out
+    }
+
+    /// Whether any row holds a verdict at a head other than `head` with no round in flight at
+    /// `head` — the exact rows
+    /// [`handle_review_head_advanced`](crate::orchestrator::Orchestrator::handle_review_head_advanced)
+    /// could carry across, and therefore the only case worth spending the comparison on.
+    ///
+    /// Per ROW, not per union: a peer already at `head` (reviewed there or dispatched there) does
+    /// not excuse the comparison for a row still behind it, and a non-terminal row cannot consume a
+    /// proof at all.
+    pub fn has_carry_candidate(&self, head: &str) -> bool {
+        let head = head.trim();
+        !head.is_empty()
+            && self.rows.iter().any(|row| {
+                matches!(
+                    row.status.as_str(),
+                    REVIEW_STATUS_REVIEWED | REVIEW_STATUS_APPROVED
+                ) && is_carry_candidate(&row.reviewed_sha, &row.requested_sha, head)
+            })
+    }
+}
+
+/// Whether one row's verdict could be carried from its recorded head to `head`: it read at a
+/// different, non-empty head, and no round of it is already in flight at `head`.
+fn is_carry_candidate(reviewed_sha: &str, requested_sha: &str, head: &str) -> bool {
+    let reviewed = reviewed_sha.trim();
+    !reviewed.is_empty() && reviewed != head && requested_sha.trim() != head
 }
 
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
@@ -419,8 +482,15 @@ pub struct ReviewWatchDeps {
 /// One observation at a time, not a second batch. A batch would re-create the very window it exists
 /// to close: the first pull request's re-read would still wait behind every later pull request's
 /// blocking `gh` call before its dispatch, which is the defect a reviewer reproduced on #189. Each
-/// caller therefore re-reads and hands over in the same step, so nothing blocking sits between a
-/// head and its dispatch.
+/// caller therefore re-reads, compares if a carry is possible, and hands over in the same step, so
+/// no LATER pull request's `gh` call sits between a head and its dispatch.
+///
+/// The caller's STUDIO-960 diff comparison runs after this re-read on purpose, and that is the one
+/// `gh` work that does sit between a head and its dispatch (module doc: the proof is pinned to the
+/// freshly re-read SHA, so a push racing it loses the saving and never the review). Putting the
+/// comparison BEFORE the re-read would spend up to `1 + 1 + N` reads proving a SHA the re-read then
+/// replaces, and would need the proof dropped whenever the two disagree — strictly more work for a
+/// strictly worse answer.
 ///
 /// The re-read is a READ, not a refusal: up to
 /// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) lookups precede it,
@@ -623,29 +693,22 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
             // STUDIO-960: prove the head move carried no new work before the control task decides
             // whether to arm a round. Off-loop, bounded by GH_EXEC_TIMEOUT like every other read
-            // here, and only when a head move is even possible: a head equal to one of this pull
-            // request's reviewed SHAs is already read and costs nothing.
+            // here, and only when a carry is even possible. The test is per ROW
+            // (`WatchedPr::has_carry_candidate`): a union of the reviewed/requested SHAs would let
+            // one reviewer already at the new head suppress the proof for a peer still behind it,
+            // billing that peer the full round this feature exists to avoid.
             if let Some(diff) = deps.diff_source.as_ref()
                 && let PrLookup::Found(snap) = &fresh.lookup
                 && snap.status == PrStatus::Open
                 && let Some(known) = recorded.get(&fresh.pr)
-                && !snap.head_sha.is_empty()
-                // Nothing to prove with no reviewed head to compare against, and nothing to prove
-                // when the head is already read or already dispatched: in every one of those cases
-                // the edge trigger arms nothing, so the `gh` calls would be pure waste.
-                && !known.reviewed_shas.is_empty()
-                && !known
-                    .reviewed_shas
-                    .iter()
-                    .chain(known.requested_shas.iter())
-                    .any(|s| !s.is_empty() && s == &snap.head_sha)
+                && known.has_carry_candidate(&snap.head_sha)
             {
                 fresh.unchanged_from = unchanged_reviewed_shas(
                     &ctx,
                     diff.as_ref(),
                     &fresh.pr,
                     &snap.head_sha,
-                    &known.reviewed_shas,
+                    &known.reviewed_shas(),
                 )
                 .await;
             }
@@ -755,14 +818,12 @@ pub(crate) fn churn_key(pr: &PrCoord) -> String {
 
 impl Orchestrator {
     /// The pull requests the watcher asks GitHub about this tick: every distinct coordinate the
-    /// watch set still considers live, each beside the head SHAs its rows have already had READ
-    /// (STUDIO-960).
+    /// watch set still considers live, each beside the head state of its rows (STUDIO-960).
     ///
     /// Distinct by coordinate rather than by row: N reviewers of one pull request share one head,
     /// and asking GitHub N times for it would spend the per-tick call budget on an answer already
-    /// in hand. The reviewed SHAs are UNIONED across those rows and de-duplicated, because two
-    /// reviewers can be at two different reviewed heads and each is a head the diff comparison must
-    /// be able to prove against.
+    /// in hand. Each row's own head state travels so the comparison can tell a row already at the
+    /// head from a peer still behind it — the pairing a union of the two SHA columns cannot keep.
     pub(crate) fn review_watch_coords(&self) -> Vec<WatchedPr> {
         if !self.review_ticketless_enabled() {
             return Vec::new(); // §16
@@ -798,14 +859,11 @@ impl Orchestrator {
                     i
                 }
             };
-            let reviewed = row.last_reviewed_sha.trim();
-            if !reviewed.is_empty() && !out[idx].reviewed_shas.iter().any(|s| s == reviewed) {
-                out[idx].reviewed_shas.push(reviewed.to_string());
-            }
-            let requested = row.requested_sha.trim();
-            if !requested.is_empty() && !out[idx].requested_shas.iter().any(|s| s == requested) {
-                out[idx].requested_shas.push(requested.to_string());
-            }
+            out[idx].rows.push(WatchedRow {
+                reviewed_sha: row.last_reviewed_sha.trim().to_string(),
+                requested_sha: row.requested_sha.trim().to_string(),
+                status: row.status,
+            });
         }
         out
     }
@@ -1888,6 +1946,39 @@ mod tests {
 
         // And it stays carried: the next tick at the same head has nothing to do.
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 0);
+    }
+
+    /// The round-1 review's blocker, at the orchestrator level (STUDIO-960): the proof is spent for
+    /// a row even when a PEER already sits at the new head, and the still-behind peer is CARRIED
+    /// rather than billed. The state falls out of an ordinary rebase: bob reached `HEAD_B` while
+    /// carol's round was in flight, so carol completed at her pinned `HEAD_A` — and a union of the
+    /// reviewed SHAs then hid `HEAD_A` behind bob's `HEAD_B`, suppressing the comparison and billing
+    /// carol a full round.
+    #[test]
+    fn a_staggered_peer_is_carried_across_an_unchanged_head_move() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol"]));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "carol"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        approve(&mut o, 12, "bob", HEAD_B);
+        approve(&mut o, 12, "carol", HEAD_A);
+        let before = dispatched.lock().expect("lock").len();
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+
+        assert_eq!(report.skipped, 1, "carol's verdict is carried");
+        assert_eq!(report.dispatched, 0, "nobody is billed a round");
+        assert_eq!(dispatched.lock().expect("lock").len(), before);
+        assert_eq!(
+            watch_row(&o, 12, "carol").last_reviewed_sha,
+            HEAD_B,
+            "carol's approval now stands at the new head"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "bob").last_reviewed_sha,
+            HEAD_B,
+            "bob's row was already there and is untouched"
+        );
     }
 
     /// Acceptance, the dangerous direction: a head move whose diff CHANGED is real work and a
@@ -3455,11 +3546,12 @@ mod tests {
         assert_eq!(prs, vec![coord(12), coord(13)]);
     }
 
-    /// Each polled coordinate carries the UNION of its rows' reviewed SHAs, de-duplicated
-    /// (STUDIO-960): two reviewers can sit at two different reviewed heads and the comparison must
-    /// be able to prove either. A row that has never completed contributes nothing.
+    /// Each polled coordinate carries each of its rows' OWN head state, not a union of the SHA
+    /// columns (STUDIO-960): two reviewers can sit at two different reviewed heads, a dispatched
+    /// row's head must be kept distinct from a reviewed one, and the comparison's per-row gate
+    /// needs the pairing. A never-reviewed row contributes nothing.
     #[test]
-    fn the_poll_list_carries_the_union_of_its_rows_reviewed_shas() {
+    fn the_poll_list_carries_each_rows_own_head_state() {
         let (o, _d) = orch(ticketless(&["alice", "bob", "carol"]));
         introduce(&o, row(12, "bob"));
         introduce(&o, row(12, "carol"));
@@ -3475,26 +3567,42 @@ mod tests {
             .expect("bob dispatched");
 
         let got = o.review_watch_coords();
-        let mut twelve = got
+        let twelve = got
             .iter()
             .find(|w| w.pr == coord(12))
-            .expect("the pull request is polled")
-            .reviewed_shas
-            .clone();
-        twelve.sort();
-        assert_eq!(twelve, vec![HEAD_A.to_string(), HEAD_B.to_string()]);
+            .expect("the pull request is polled");
+        let mut reviewed = twelve.reviewed_shas();
+        reviewed.sort();
+        assert_eq!(
+            reviewed,
+            vec![HEAD_A.to_string(), HEAD_B.to_string()],
+            "the union across rows, de-duplicated, is what the comparison fingerprints"
+        );
+        assert_eq!(twelve.rows.len(), 2, "one entry per live row");
+        assert!(
+            twelve.rows.iter().any(|r| r.reviewed_sha == HEAD_A
+                && r.requested_sha.is_empty()
+                && r.status == REVIEW_STATUS_APPROVED),
+            "bob's row keeps its own head pairing"
+        );
+        assert!(
+            twelve.rows.iter().any(|r| r.reviewed_sha == HEAD_B
+                && r.requested_sha.is_empty()
+                && r.status == REVIEW_STATUS_REVIEWED),
+            "carol's row keeps its own head pairing"
+        );
 
         let thirteen = got
             .iter()
             .find(|w| w.pr == coord(13))
             .expect("the pull request is polled");
         assert!(
-            thirteen.reviewed_shas.is_empty(),
+            thirteen.reviewed_shas().is_empty(),
             "a never-reviewed row contributes no reviewed SHA"
         );
+        assert_eq!(thirteen.rows.len(), 1);
         assert_eq!(
-            thirteen.requested_shas,
-            vec![HEAD_C.to_string()],
+            thirteen.rows[0].requested_sha, HEAD_C,
             "a dispatched head is carried so the comparison can tell it apart from a move"
         );
     }
@@ -3751,7 +3859,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_watcher_proves_an_unchanged_head_move_before_handing_it_over() {
         let handed =
-            run_one_watch_tick(watched_pr(&[HEAD_A], &[]), Arc::new(FakeDiffSource::same())).await;
+            run_one_watch_tick(watched_pr(HEAD_A, ""), Arc::new(FakeDiffSource::same())).await;
         assert_eq!(handed.len(), 1);
         assert_eq!(
             handed[0].unchanged_from,
@@ -3765,11 +3873,8 @@ mod tests {
     /// comparison it did not complete turns this red.
     #[tokio::test(start_paused = true)]
     async fn the_watcher_proves_nothing_when_the_diff_changed() {
-        let handed = run_one_watch_tick(
-            watched_pr(&[HEAD_A], &[]),
-            Arc::new(FakeDiffSource::changed()),
-        )
-        .await;
+        let handed =
+            run_one_watch_tick(watched_pr(HEAD_A, ""), Arc::new(FakeDiffSource::changed())).await;
         assert_eq!(handed.len(), 1);
         assert!(
             handed[0].unchanged_from.is_empty(),
@@ -3779,16 +3884,23 @@ mod tests {
 
     /// The comparison costs `gh` reads, so it is spent only when a head move is even possible
     /// (STUDIO-960): a head already read, a head already dispatched, and a pull request with no
-    /// reviewed head at all all cost ZERO calls.
+    /// reviewed head at all all cost ZERO calls. The last two cases are the ones that make the GATE
+    /// observable rather than the helper's own short-circuit — each has a non-empty reviewed head,
+    /// so only the gate keeps the `gh` reads from being spent.
     #[tokio::test(start_paused = true)]
     async fn the_watcher_compares_only_when_a_head_move_is_possible() {
         for watched in [
             // Already read at this head: no move.
-            watched_pr(&[HEAD_B], &[]),
-            // A round is already dispatched at this head: the edge trigger arms nothing.
-            watched_pr(&[], &[HEAD_B]),
+            watched_pr(HEAD_B, ""),
+            // A round is already dispatched at this head, on a row that cannot consume a proof.
+            watched_pr_rows(&[(HEAD_A, HEAD_B, REVIEW_STATUS_REQUESTED)]),
+            // A non-terminal row behind the head: it still OWES a review of the new head, so no
+            // verdict could be carried and the comparison is not worth its reads.
+            watched_pr_rows(&[(HEAD_A, "", REVIEW_STATUS_IN_FLIGHT)]),
+            // A terminal row whose head is the new one — reviewed there, not moved to it.
+            watched_pr_rows(&[(HEAD_A, HEAD_B, REVIEW_STATUS_REVIEWED)]),
             // Nothing has ever been reviewed, so there is nothing to compare against.
-            watched_pr(&[], &[]),
+            watched_pr("", ""),
         ] {
             let calls = Arc::new(Mutex::new(0usize));
             let handed =
@@ -3806,12 +3918,62 @@ mod tests {
         }
     }
 
-    /// A watched pull request at the fixed head [`HEAD_B`] with the given reviewed/requested SHAs.
-    fn watched_pr(reviewed: &[&str], requested: &[&str]) -> WatchedPr {
+    /// The gate is per ROW, not per union of the SHA columns (STUDIO-960, round-1 review blocker):
+    /// one reviewer already at the new head must not suppress the proof for a PEER still behind it.
+    /// A union of `reviewed_shas` let the peer's old head be hidden behind the other's new one, and
+    /// the peer was then billed the full round this feature exists to avoid.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_already_at_the_new_head_does_not_suppress_the_proof() {
+        let watched = watched_pr_rows(&[
+            (HEAD_B, "", REVIEW_STATUS_REVIEWED),
+            (HEAD_A, "", REVIEW_STATUS_APPROVED),
+        ]);
+        let handed = run_one_watch_tick(watched, Arc::new(FakeDiffSource::same())).await;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(
+            handed[0].unchanged_from,
+            vec![HEAD_A.to_string()],
+            "the peer's old head is still compared against the new one"
+        );
+    }
+
+    /// The same blocker from the other side: a peer whose round is DISPATCHED at the new head has
+    /// `requested_sha == head`, but that is the PEER's row — it must not excuse the still-behind
+    /// row. The union gate conflated the two and suppressed the proof for the behind row.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_in_flight_at_the_new_head_does_not_suppress_the_proof() {
+        let watched = watched_pr_rows(&[
+            ("", HEAD_B, REVIEW_STATUS_REQUESTED),
+            (HEAD_A, "", REVIEW_STATUS_APPROVED),
+        ]);
+        let handed = run_one_watch_tick(watched, Arc::new(FakeDiffSource::same())).await;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(
+            handed[0].unchanged_from,
+            vec![HEAD_A.to_string()],
+            "a peer's in-flight round does not hide the behind row's old head"
+        );
+    }
+
+    /// A watched pull request at the fixed head [`HEAD_B`] whose SINGLE terminal row records
+    /// `reviewed`/`requested` — the shape most gate tests need.
+    fn watched_pr(reviewed: &str, requested: &str) -> WatchedPr {
+        watched_pr_rows(&[(reviewed, requested, REVIEW_STATUS_REVIEWED)])
+    }
+
+    /// A watched pull request at the fixed head [`HEAD_B`] with one row per `(reviewed, requested,
+    /// status)` triple, in the given order.
+    fn watched_pr_rows(rows: &[(&str, &str, &str)]) -> WatchedPr {
         WatchedPr {
             pr: coord(12),
-            reviewed_shas: reviewed.iter().map(|s| (*s).to_string()).collect(),
-            requested_shas: requested.iter().map(|s| (*s).to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|(reviewed, requested, status)| WatchedRow {
+                    reviewed_sha: (*reviewed).to_string(),
+                    requested_sha: (*requested).to_string(),
+                    status: (*status).to_string(),
+                })
+                .collect(),
         }
     }
 

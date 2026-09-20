@@ -716,7 +716,7 @@ impl Orchestrator {
                         advance.skipped.push(key);
                     }
                     Err(e) => {
-                        tracing::warn!(review = %id, err = %e, "ticketless review: carrying a verdict across an unchanged head move failed; a normal round is armed")
+                        tracing::warn!(review = %id, err = %e, "ticketless review: carrying a verdict across an unchanged head move failed; a normal round is dispatched from the unchanged row")
                     }
                 }
                 continue;
