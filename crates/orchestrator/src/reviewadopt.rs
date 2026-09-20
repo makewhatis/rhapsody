@@ -149,7 +149,19 @@ impl Orchestrator {
                 break;
             }
             match self.adopt_verdict(iss, proj, &origins, &running, load.counts(), now) {
-                Verdict::Skip => {}
+                Verdict::Skip => {
+                    // A `rhapsody:human` ticket is HELD, not orphaned (STUDIO-949 round 4). The gate
+                    // returns Skip, so it never reaches the Adopt arm that retires an advisory filed
+                    // against it — and an advisory recorded BEFORE the label landed ("parked in a
+                    // review state ... and cannot be adopted") would then outlive the hold forever,
+                    // telling an operator to fix work that is now deliberately theirs. Retire it
+                    // here. The refusal itself stays in `adopt_verdict`; this only feeds the same
+                    // `clear_orphaned_review` the Adopt arm uses.
+                    if crate::teams::is_human(iss) {
+                        out.repaired
+                            .push((self.adopt_group(proj), iss.identifier.clone()));
+                    }
+                }
                 Verdict::Considered => probed.push(iss.identifier.clone()),
                 Verdict::Adopt(req) => {
                     probed.push(iss.identifier.clone());
@@ -832,7 +844,41 @@ mod tests {
         let mut iss = parked("STUDIO-836");
         iss.labels = Some(vec!["rhapsody:human".to_string()]);
 
-        assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
+        let got = sweep(&mut o, &[iss], Instant::now());
+        assert!(got.planned.is_empty(), "a human ticket is never adopted");
+        assert!(
+            got.refused.is_empty(),
+            "and is not filed as an orphan either — the hold is deliberate"
+        );
+        // It IS retired, though: an advisory filed before the label landed must not outlive the
+        // hold. See `a_pre_existing_orphan_advisory_is_retired_when_the_human_label_lands`.
+        assert_eq!(
+            got.repaired,
+            vec![("rhapsody".to_string(), "STUDIO-836".to_string())]
+        );
+    }
+
+    /// STUDIO-949 round 4. The scenario the round-3 gate created: a ticket parked in review with no
+    /// watch row is REFUSED and an advisory is filed against it; the operator reads that advisory,
+    /// concludes only a person can finish the ticket, and labels it `rhapsody:human`. The gate now
+    /// SKIPS it — so without this repair the advisory `clear_orphaned_review` retires would never be
+    /// called again, and the message that prompted the label would persist forever.
+    #[test]
+    fn a_pre_existing_orphan_advisory_is_retired_when_the_human_label_lands() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        o.warnings
+            .record_orphaned_review("rhapsody", "STUDIO-836", "no branch resolved");
+
+        let mut iss = parked("STUDIO-836");
+        iss.labels = Some(vec!["rhapsody:human".to_string()]);
+
+        let got = sweep(&mut o, &[iss], Instant::now());
+        assert_eq!(
+            got.repaired,
+            vec![("rhapsody".to_string(), "STUDIO-836".to_string())],
+            "the hold feeds the advisory's retirement instead of stranding it"
+        );
     }
 
     /// The memo holds only what still paces something. An entry older than the probe interval can

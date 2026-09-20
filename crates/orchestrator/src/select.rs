@@ -145,8 +145,20 @@ impl Orchestrator {
                 // A `rhapsody:human` ticket is refused on this ladder too (STUDIO-949): the branch
                 // runs BEFORE `eligibility`, so `review_reopen_eligible` (which now also refuses it)
                 // is the gate, and the hold is reported here so it is not a silent skip.
+                //
+                // The refusal is unconditional — a human ticket must never reopen, running or not —
+                // but the REPORT must not claim an agent's LIVE work is a deliberate hold. A ticket
+                // can be parked in the tracker's review state while the daemon is mid-run on it (a
+                // mid-run handoff), and labelling it `rhapsody:human` then is how an operator says
+                // "I'll take this": the agent is still working, so it is not held for a person yet.
+                // `is_unworked_candidate` is the same filter the saturated branches apply, and
+                // `eligibility` mirrors it by reaching its human gate only AFTER the running/claimed
+                // test. The announced set is permanent for the process, so a spurious note here
+                // would spend the ticket's only log slot before the hold is ever real.
                 if crate::teams::is_human(&iss) {
-                    self.note_human_hold(&iss, "");
+                    if self.is_unworked_candidate(&iss, &running, &recovered_claims) {
+                        self.note_human_hold(&iss, "");
+                    }
                     continue;
                 }
                 if !self.review_reopen_eligible(&iss, &running) {
@@ -380,8 +392,13 @@ impl Orchestrator {
             if p.review_states.contains(&st) && !p.active_states.contains(&st) {
                 // See the single-project ladder: the human gate must be repeated on the reopen path,
                 // which bypasses `eligibility`, or a human ticket parked in review leaks back out.
+                // The refusal is unconditional; the REPORT is filtered so a ticket the daemon is
+                // running right now (mid-run handoff, labelled mid-run) is not called a human hold
+                // and does not spend its once-per-ticket log slot.
                 if crate::teams::is_human(&ti.iss) {
-                    self.note_human_hold(&ti.iss, &p.slug);
+                    if self.is_unworked_candidate(&ti.iss, &running, &recovered_claims) {
+                        self.note_human_hold(&ti.iss, &p.slug);
+                    }
                     continue;
                 }
                 if !self.review_reopen_eligible(&ti.iss, &running) {
@@ -1062,6 +1079,61 @@ mod tests {
         let held = o.human_holds.held();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-949 round 4: the review-state branch is the THIRD site of the class round 3 fixed at the
+    // saturated branches. It sits twenty lines below the first of them and has no running/claimed
+    // test of its own, so a ticket parked in review while the daemon is mid-run on it was reported
+    // as a deliberate human hold — the chip drawn on live work, and (because `HumanHoldLedger`'s
+    // `announced` set is permanent) the ticket's only log slot spent before the hold was ever real.
+    //
+    // MUTATION: note the hold unconditionally in the review branch and this reds (`held().len() ==
+    // 1`) while `a_human_ticket_is_not_reopened_from_review` (an unworked ticket) still passes.
+    #[test]
+    fn a_running_human_review_ticket_is_not_reported_as_held() {
+        let mut o = orch_for_reopen("A-1");
+        // The ticket is in the tracker's review state AND the daemon is running it right now — a
+        // mid-run handoff, labelled mid-run, which is the natural "I'll take this" signal.
+        let live = summoned_review_issue(true);
+        o.running
+            .insert("1".to_string(), running_entry(live.clone(), "p", "p"));
+
+        let (_active, reopen, _) = o.select_dispatch_with_reopens(vec![live]);
+        assert!(
+            reopen.is_empty(),
+            "a human ticket is never reopened, running or not"
+        );
+        assert!(
+            o.human_holds.held().is_empty(),
+            "a ticket with a live run is not held for a human"
+        );
+    }
+
+    // The same on the multi-project ladder — the pass a `projects:` install actually runs.
+    #[test]
+    fn the_multi_project_ladder_does_not_report_a_running_human_review_ticket_as_held() {
+        let mut projects = vec![proj("a", 10, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let mut o = orch_for_multi(10, projects, None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+
+        let live = summoned_review_issue(true);
+        o.running
+            .insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+
+        let (_active, reopen, _) = o.select_dispatch_multi_with_reopens(tag_for(0, vec![live]));
+        assert!(reopen.is_empty(), "a human review ticket is never reopened");
+        assert!(o.human_holds.held().is_empty());
     }
 
     // Mirrors Go `TestSelectDispatchSkipsPRSuppressed`.
