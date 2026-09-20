@@ -1361,7 +1361,7 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 | detection | none (the feature does not exist) | the ticketless review watch set: a row carrying an origin ticket is one a run HANDED OVER (or the adoption sweep adopted), which is what "finished" means here; a console-introduced row has none and is never poked |
 | action | n/a | a summons comment naming the pull request and the action; the daemon never marks it ready |
 | frequency | n/a | **once per head** — a head is never poked twice consecutively (the ledger remembers the head last poked, so a force-push back to an earlier head is a fresh poke, still bounded by the row below), and a per-tick poke is the re-dispatch loop STUDIO-956 bounds |
-| if ignored | n/a | **two bounds**: after three distinct heads, or after about an hour at one static head, it stops poking and escalates to a human (a room post naming the origin ticket and a tokenless comment) naming the count |
+| if ignored | n/a | **two bounds**: after three pokes (the ledger remembers only the head poked last, so a force-push back to an earlier head is a fresh poke — two distinct heads revisited, `A → B → A`, spend the budget), or after about an hour at one static head, it stops poking and escalates to a human (a room post naming the origin ticket and a tokenless comment) naming the count |
 | default | n/a | **inert**: silent with Teams off, off the ticketless path (there is no watch set to observe), and on a healthy board |
 
 **The trigger is the handoff, not the process exiting.** A watch row comes from a run handing its
@@ -1373,7 +1373,9 @@ run: a draft is entirely normal mid-run, so a pull request whose author is runni
 re-engaged run a review's findings reopened) is never poked.
 
 **The poking is bounded on two axes, because the incident shape is a static head.** An author who
-keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` distinct heads; an author who does
+keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` pokes — an attempt counter, not a
+distinct-head counter: the ledger remembers only the head poked last, so `A → B → A` reaches the
+bound on two distinct heads. An author who does
 nothing at all — booch#537 never moved its head — is bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive
 sweeps at the same head (thirty, about an hour at the two-minute poll when every watched pull request
 answers every tick; the clock counts observations, so a larger watch set or a flaky `gh` makes an hour

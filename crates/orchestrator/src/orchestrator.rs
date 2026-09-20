@@ -583,9 +583,10 @@ pub struct Orchestrator {
     /// them when the pull request leaves the watch set. Written and read only by the watcher's
     /// loop-side handler.
     ///
-    /// It remembers which HEAD was last poked, how many distinct heads have been poked, and whether
-    /// a human has already been handed the pull request — the state that makes the poke once per
-    /// head and the escalation once ever, rather than once per tick.
+    /// It remembers which HEAD was last poked, how many times the pull request has been poked
+    /// (attempts, not distinct heads), and whether a human has already been handed the pull request
+    /// — the state that makes the poke once per head consecutively and the escalation once ever,
+    /// rather than once per tick.
     pub(crate) draft_pokes: HashMap<String, crate::draftpoke::DraftPokeState>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and

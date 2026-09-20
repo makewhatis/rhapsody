@@ -797,7 +797,8 @@ impl Orchestrator {
     /// ever rather than once per tick.
     ///
     /// The poking is bounded on two axes (STUDIO-962, jimmy's round-1 finding): after
-    /// [`crate::draftpoke::MAX_DRAFT_POKES`] DISTINCT heads, and after
+    /// [`crate::draftpoke::MAX_DRAFT_POKES`] pokes (ATTEMPTS — the ledger remembers only the head
+    /// poked last, so `A → B → A` spends the budget), and after
     /// [`crate::draftpoke::MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head. The second
     /// is the one that matters for the incident this was filed on — a head that never moves would
     /// otherwise get one poke and then silence, which is the parking the ticket names.
@@ -2217,6 +2218,49 @@ mod tests {
                     .nudges
                     .is_empty()
             );
+        }
+    }
+
+    /// ⚠️ `MAX_DRAFT_POKES` counts ATTEMPTS, not distinct heads (alice's round-5 finding): the
+    /// ledger remembers only the head poked LAST, so a force-push back to an earlier head is a fresh
+    /// poke and `A → B → A` spends the whole budget on two distinct heads. This is the test the four
+    /// doc sites that used to say "distinct heads" were corrected to describe; without it the
+    /// "returning to an earlier head is a fresh poke" sentence is a claim nothing drives.
+    #[test]
+    fn a_force_push_back_to_an_earlier_head_is_a_fresh_poke() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // A → B → A: each move is a new head and so a new poke, even though the last one returns to
+        // a head already poked. Only TWO distinct heads are involved.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_B)])),
+            vec![HEAD_B.to_string()]
+        );
+        let back = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(
+            poked_heads(&back),
+            vec![HEAD_A.to_string()],
+            "returning to an earlier head is a fresh poke"
+        );
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
+            Some((HEAD_A.to_string(), 3)),
+            "three ATTEMPTS across two distinct heads"
+        );
+
+        // The budget is now spent: the NEXT head escalates rather than being poked a fourth time.
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_C)]);
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Escalate(e) => {
+                assert_eq!(e.pokes, crate::draftpoke::MAX_DRAFT_POKES);
+            }
+            other => panic!("expected an escalation, got {other:?}"),
         }
     }
 

@@ -44,8 +44,9 @@
 //! An author who deliberately keeps a pull request in draft needs an out, so the poking is bounded
 //! on TWO axes, because the incident this feature was filed for was a STATIC head:
 //!
-//! * [`MAX_DRAFT_POKES`] distinct heads — the bound for an author who keeps pushing without ever
-//!   publishing.
+//! * [`MAX_DRAFT_POKES`] pokes — the bound for an author who keeps pushing without ever publishing.
+//!   The ledger remembers only the head poked LAST, so this counts attempts, not distinct heads: a
+//!   force-push back to an earlier head is a fresh poke, and `A → B → A` spends the whole budget.
 //! * [`MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head — the bound for the shape that
 //!   actually happens (booch#537 never moved its head). A done-nothing author would otherwise be
 //!   poked once and then heard from never again, which is the parking this ticket's title names.
@@ -70,23 +71,24 @@ use crate::ghsummons::PrCommentSink;
 use crate::prstate::PrCoord;
 use crate::triage::MANAGER_IDENTITY;
 
-/// How many distinct HEADS one pull request may be poked at before the daemon stops poking and asks
-/// a human.
+/// How many times one pull request may be poked before the daemon stops poking and asks a human.
 ///
-/// In HEADS and not attempts: a poke is once per head ([`DraftPokeState`]), so this bounds how many
-/// times an author who keeps it a draft but keeps pushing may be asked. Three is enough for an
-/// author who simply forgot once, and far below the point where a machine repeating itself at a
-/// human is noise.
+/// In ATTEMPTS and not distinct heads: a poke is once per head CONSECUTIVELY ([`DraftPokeState`]),
+/// so the ledger suppresses a repeat only of the head poked last. A force-push back to an earlier
+/// head is a fresh poke, and `A → B → A` reaches this bound just as `A → B → C` does. Three is
+/// enough for an author who simply forgot once or twice, and far below the point where a machine
+/// repeating itself at a human is noise.
 pub const MAX_DRAFT_POKES: usize = 3;
 
 /// How many CONSECUTIVE watcher sweeps the SAME poked head may stay a draft before the daemon stops
 /// poking and asks a human.
 ///
 /// This is the second bound, and it is the one that makes the human backstop reachable in the shape
-/// the ticket was filed for. [`MAX_DRAFT_POKES`] bounds DISTINCT heads, so an author who does
-/// nothing — the head never moves — would be poked once and then heard from never again, and the
-/// pull request would park exactly as makewhatis/booch#537 did. A draft that stays at one head
-/// across this many sweeps is not an author mid-push; it is an author who is not coming.
+/// the ticket was filed for. [`MAX_DRAFT_POKES`] is only ever reached by a head that MOVES (the
+/// consecutive rule suppresses a repeat of the head last poked), so an author who does nothing —
+/// the head never moves — would be poked once and then heard from never again, and the pull request
+/// would park exactly as makewhatis/booch#537 did. A draft that stays at one head across this many
+/// sweeps is not an author mid-push; it is an author who is not coming.
 ///
 /// Thirty sweeps is about an hour at [`crate::prstate::PR_STATE_POLL_INTERVAL`] (120s) WHEN EVERY
 /// WATCHED PULL REQUEST ANSWERS EVERY TICK — the count advances only on a sweep that actually
@@ -102,7 +104,7 @@ pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftPokePlan {
     pub pr: PrCoord,
-    /// The head being poked — the same head is never poked twice ([`DraftPokeState`]).
+    /// The head being poked — a head is never poked twice consecutively ([`DraftPokeState`]).
     pub head: String,
     /// The teammate who authored it. Named in the comment so the author knows who is being asked;
     /// empty means unknown, and the prose degrades to a role.
@@ -147,9 +149,12 @@ pub enum DraftNudge {
 /// not persisting a churn floor; persisting the ladder is a larger decision than this feature.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DraftPokeState {
-    /// The head last poked. A DIFFERENT head is a new poke; the same head is the same poke.
+    /// The head last poked. A DIFFERENT head is a new poke; the same head as the LAST poke is the
+    /// same poke. Only one head is remembered, so a force-push back to an earlier head is a fresh
+    /// poke.
     pub poked_head: String,
-    /// How many distinct heads this pull request has been poked at.
+    /// How many times this pull request has been poked — ATTEMPTS, not distinct heads. The ledger
+    /// remembers only the head poked last, so `A → B → A` reaches three here with two distinct heads.
     pub pokes: usize,
     /// How many CONSECUTIVE sweeps the [`Self::poked_head`] has been observed still a draft since it
     /// was poked. Reset when the head moves (a new head is a fresh poke); never advanced while the
