@@ -1368,9 +1368,23 @@ async fn file_review(
         .clone()
         .filter(|a| a != &author)
         .or_else(|| {
-            crate::quorum::select_reviewers(teams, &author, cycle.load)
-                .into_iter()
-                .next()
+            // The off-loop triage task holds no `Orchestrator`, so it cannot ask the live harness
+            // question `reviewer_exclusions` answers; a required reviewer is pinned here as long as
+            // it is a roster member and not the author. That is safe rather than lossy: a pin whose
+            // profile names a harness this build cannot run falls back to `agent.backend` and still
+            // reviews, and the one reason a reviewer is removed from selection entirely — the
+            // ticketless `review.model` refusal — cannot arise here, because `review_model_for`
+            // self-gates on `review_ticketless` and `validate` makes `quorum.enabled` and
+            // `mode: ticketless` mutually exclusive, so this path never runs on a config where
+            // that refusal exists.
+            crate::quorum::select_reviewers(
+                teams,
+                &author,
+                cycle.load,
+                &crate::quorum::ReviewerExclusions::default(),
+            )
+            .into_iter()
+            .next()
         }) {
         Some(r) => r,
         None => {

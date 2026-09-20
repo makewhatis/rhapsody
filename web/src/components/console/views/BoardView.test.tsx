@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ConsoleJobRow, ConsoleJobCounts } from "@/lib/console-jobs";
 import { DEFAULT_BOARD_CARD_FIELDS } from "@/hooks/useBoardCardFields";
 import { BoardView, type BoardViewProps } from "./BoardView";
@@ -268,10 +268,23 @@ describe("the board (STUDIO-925)", () => {
     expect(document.querySelector(".bcard .bproj")).toBeNull();
     cleanup();
 
-    mount([row({ issue: "R-1", provider: "fireworks" })], vi.fn(), COUNTS, 4, {
-      fields: { ...DEFAULT_BOARD_CARD_FIELDS, harness: false },
-    });
+    // Harness off hides the author's chip AND every review chip's, so the control means one thing
+    // across the card. Without the review row here the review provider still leaked through.
+    mount(
+      [
+        row({ issue: "R-1", provider: "fireworks" }),
+        review("pr:makewhatis/booch#540@jimmy", "R-1", { provider: "openai" }),
+      ],
+      vi.fn(),
+      COUNTS,
+      4,
+      { fields: { ...DEFAULT_BOARD_CARD_FIELDS, harness: false } },
+    );
     expect(document.querySelector(".bcard .provbadge")).toBeNull();
+    // The review chip itself survives — only its provider is gated.
+    expect(document.querySelector(".bcard .rchip")?.textContent).toContain("jimmy");
+    // …and the provider is gone from the tooltip too, not just the badge.
+    expect(document.querySelector(".bcard .rchip")?.getAttribute("title")).toBe("jimmy on #540 · review done");
     cleanup();
 
     mount([row({ issue: "R-1" }), review("pr:makewhatis/booch#540@jimmy", "R-1")], vi.fn(), COUNTS, 4, {
@@ -301,7 +314,7 @@ describe("the board (STUDIO-925)", () => {
     expect(screen.getByText("No agent is running.")).toBeTruthy();
   });
 
-  it("does not claim the pool is idle while a live review holds a seat with no Running card", () => {
+  it("shows a live review holding a seat as a run row in Running, not as an idle pool", () => {
     const rows = [
       row({ issue: "R-1", status: "review", trackerState: "In Review" }),
       review("R-1#5@jimmy", "R-1", { status: "reviewing", statusLabel: "reviewing", live: true }),
@@ -311,7 +324,9 @@ describe("the board (STUDIO-925)", () => {
     expect(lane?.querySelector(".bcount")?.textContent).toBe("1 / 4");
     expect(lane?.querySelectorAll(".bslot")).toHaveLength(3);
     expect(screen.queryByText("No agent is running.")).toBeNull();
-    expect(lane?.querySelector(".bempty")?.textContent).toMatch(/reviews/);
+    // The seat is held by a REVIEW run, so it shows as a run row (STUDIO-955) rather than only being
+    // asserted in words while the lane renders nothing.
+    expect(lane?.querySelectorAll(".brun")).toHaveLength(1);
   });
 
   it("does not claim an empty lane is empty when the listing is a truncated page", () => {
@@ -389,5 +404,215 @@ describe("the board (STUDIO-925)", () => {
   it("carries the lane width to the track", () => {
     mount([], vi.fn(), COUNTS, 4, { laneWidth: "wide" });
     expect(document.querySelector(".board")?.getAttribute("data-lane-width")).toBe("wide");
+  });
+});
+
+// STUDIO-952 — the card's harness chip is the AUTHOR's, and each review chip carries its own row's
+// provider. The STUDIO-949 fixture is the observed misread: the maintainer read one unlabelled chip
+// as "sol running on fireworks-ai" when sol had in fact reviewed on openai.
+describe("the card's harness chips (STUDIO-952)", () => {
+  it("shows jerry's fireworks-ai on the meta row and sol's openai on the review chip (STUDIO-949)", () => {
+    mount([
+      row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" }),
+      review("pr:makewhatis/rhapsody#186@sol", "STUDIO-949", { provider: "openai" }),
+    ]);
+
+    // The card's own chip is the implementation run's — jerry's.
+    expect(document.querySelector(".bcard .bmeta .provbadge")?.textContent).toBe("fireworks-ai");
+    // The review chip is the review run's — sol's, a DIFFERENT provider, rendered distinctly.
+    expect(document.querySelector(".bcard .rchip .provbadge")?.textContent).toBe("openai");
+    // The chip's tooltip names that same provider, so the fact is reachable without the badge too.
+    expect(document.querySelector(".bcard .rchip")?.getAttribute("title")).toBe(
+      "sol on #186 · openai · review done",
+    );
+  });
+
+  it("names the author in the meta-row tooltip even when the assignee chip is toggled off", () => {
+    mount([row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, assignee: false },
+    });
+    expect(document.querySelector(".bcard .provbadge")?.getAttribute("title")).toBe(
+      "jerry ran on fireworks-ai",
+    );
+  });
+
+  it("attaches the meta-row harness chip to the author, not the card", () => {
+    mount([row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" })]);
+    // Nested in `.who2`, the author's own element, so it cannot be read as the card's.
+    const who = document.querySelector(".bcard .who2");
+    expect(who?.textContent).toContain("jerry");
+    expect(who?.querySelector(".provbadge")?.textContent).toBe("fireworks-ai");
+    expect(who?.querySelector(".provbadge")?.getAttribute("title")).toBe("jerry ran on fireworks-ai");
+  });
+
+  it("renders no harness chip, and no placeholder, when a run recorded no provider", () => {
+    mount([row({ issue: "LEGACY-1", assignee: "jerry", provider: "" })]);
+    expect(document.querySelector(".bcard .provbadge")).toBeNull();
+    // The author slot itself survives — only the absent provider is skipped.
+    expect(document.querySelector(".bcard .who2")?.textContent).toContain("jerry");
+  });
+
+  it("keeps a providerless review chip showing who and how it ended", () => {
+    mount([
+      row({ issue: "LEGACY-1", assignee: "jerry", provider: "fireworks-ai" }),
+      review("pr:makewhatis/rhapsody#1@sol", "LEGACY-1", { provider: "" }),
+    ]);
+    const chip = document.querySelector(".bcard .rchip");
+    expect(chip?.textContent).toContain("sol");
+    expect(chip?.querySelector(".o")?.textContent).toBe("done");
+    expect(chip?.querySelector(".provbadge")).toBeNull();
+  });
+});
+
+// STUDIO-955 — two defects from one tension: a card is a ticket, a lane's count is runs.
+//
+// 1. A reviewer chip is one RUN. The observed case: a chip reading `running` opened the ticket's
+//    own implementation run, which was `done`. The chip bubbles to the card's onClick because it
+//    had no handler and no stopPropagation (the PR link at `:327` is the precedent that does).
+// 2. The Running lane counted runs but rendered ticket cards, so five live reviews left it reading
+//    `5 / 6` beside zero cards and a caption asserting an agent had the ticket.
+describe("the reviewer chip and the Running lane (STUDIO-955)", () => {
+  const liveReview = (pr: string, of: string, over: Partial<ConsoleJobRow> = {}) =>
+    review(pr, of, {
+      status: "reviewing",
+      statusLabel: "reviewing",
+      runOutcome: "running",
+      live: true,
+      ...over,
+    });
+
+  it("a chip reading running opens that review's run, not the ticket's done one", () => {
+    const onOpen = mount([
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949"),
+    ]);
+
+    const chip = within(document.querySelector(".bcard")!).getByRole("link", { name: /alice/ });
+    expect(chip.getAttribute("aria-label")).toBe("Open alice's review of STUDIO-949");
+
+    fireEvent.click(chip);
+    // Exactly once, with the REVIEW's key: without the chip's stopPropagation the click also
+    // bubbles to the card and opens STUDIO-949, the author's finished implementation run.
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/rhapsody#186@alice");
+  });
+
+  it("activates the reviewer chip from the keyboard without also opening the card", () => {
+    const onOpen = mount([
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949"),
+    ]);
+
+    const chip = within(document.querySelector(".bcard")!).getByRole("link", { name: /alice/ });
+    chip.focus();
+    fireEvent.keyDown(chip, { key: "Enter" });
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/rhapsody#186@alice");
+    onOpen.mockClear();
+    fireEvent.keyDown(chip, { key: " " });
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/rhapsody#186@alice");
+  });
+
+  it("counts what it shows: five running reviews render five rows, not an empty lane", () => {
+    const rows = [
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      ...["alice", "jimmy", "sol", "jerry", "kim"].map((who, i) =>
+        liveReview(`pr:makewhatis/rhapsody#${186 + i}@${who}`, "STUDIO-949"),
+      ),
+    ];
+    mount(rows, vi.fn(), { ...COUNTS, running: 5, review: 1 }, 6);
+
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelector(".bcount")?.textContent).toBe("5 / 6");
+    expect(running.querySelectorAll(".brun")).toHaveLength(5);
+    expect(running.querySelector(".bempty")).toBeNull();
+    // The free-slot rack is untouched: five seats of six are taken.
+    expect(running.querySelectorAll(".bslot")).toHaveLength(1);
+  });
+
+  it("names each running run's reviewer, ticket and clock", () => {
+    mount([
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949", {
+        provider: "anthropic",
+        elapsed: "4m",
+      }),
+    ]);
+
+    const run = document.querySelector('[data-lane="running"] .brun')!;
+    expect(run.textContent).toContain("alice");
+    expect(run.textContent).toContain("STUDIO-949");
+    expect(run.textContent).toContain("anthropic");
+    expect(run.textContent).toContain("4m");
+  });
+
+  it("opens a running run's own trace when its row is clicked or keyed", () => {
+    const onOpen = mount([
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949"),
+    ]);
+    const run = document.querySelector('[data-lane="running"] .brun')!;
+    fireEvent.click(run);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/rhapsody#186@alice");
+  });
+
+  it("narrows the running run rows with the project Select, exactly as it narrows cards", () => {
+    mount(
+      [
+        row({ issue: "R-1", status: "review", trackerState: "In Review" }),
+        liveReview("pr:makewhatis/rhapsody#1@alice", "R-1", { projectSlug: "rhapsody" }),
+        liveReview("pr:makewhatis/booch#2@jimmy", "R-1", { projectSlug: "booch" }),
+      ],
+      vi.fn(),
+      { ...COUNTS, running: 2 },
+      4,
+      { project: "booch" },
+    );
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelectorAll(".brun")).toHaveLength(1);
+    expect(running.querySelector(".brun")?.textContent).toContain("jimmy");
+  });
+
+  // The lane's count must describe what it SHOWS in every branch, not just once the tally and the
+  // typed config have both landed. `maxConcurrent` is 0 for the whole of every first paint — the
+  // config query has not resolved — so the `maxConcurrent === 0` header branch is the window the
+  // operator actually sees on load, and it must count the run rows the lane renders beneath it.
+  it("counts the run rows it shows while the agent cap is still unknown", () => {
+    mount(
+      [
+        row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+        liveReview("pr:makewhatis/rhapsody#186@alice", "STUDIO-949"),
+        liveReview("pr:makewhatis/rhapsody#187@jimmy", "STUDIO-949"),
+      ],
+      vi.fn(),
+      COUNTS,
+      0,
+      { counts: undefined },
+    );
+
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelectorAll(".brun")).toHaveLength(2);
+    expect(running.querySelector(".bcount")?.textContent).toBe("2");
+  });
+
+  // The pre-tally occupancy fallback must be whole-pool, exactly as the comment above it says the
+  // card half already is. Under a project filter the run rows ARE narrowed — that is what the lane
+  // shows — but the seats they hold are not, so a filter must not make a full pool look idle.
+  it("keeps occupancy whole-pool while the tally is unknown, even under a project filter", () => {
+    mount(
+      [
+        row({ issue: "R-1", status: "review", trackerState: "In Review" }),
+        liveReview("pr:makewhatis/rhapsody#1@alice", "R-1", { projectSlug: "rhapsody" }),
+        liveReview("pr:makewhatis/booch#2@jimmy", "R-1", { projectSlug: "booch" }),
+      ],
+      vi.fn(),
+      COUNTS,
+      6,
+      { project: "booch", counts: undefined },
+    );
+
+    const running = document.querySelector('[data-lane="running"]')!;
+    // One rule is shown (the filter narrows the rows), but both hold a seat.
+    expect(running.querySelectorAll(".brun")).toHaveLength(1);
+    expect(running.querySelector(".bcount")?.textContent).toBe("2 / 6");
+    expect(running.querySelectorAll(".bslot")).toHaveLength(4);
   });
 });

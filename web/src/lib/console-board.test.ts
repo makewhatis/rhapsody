@@ -8,6 +8,7 @@ import {
   boardLaneOf,
   mergeIssueRows,
   parsePullRequest,
+  runningRuns,
 } from "@/lib/console-board";
 
 // STUDIO-925 — the board is a client-side regroup of rows the console already holds: a CARD is a
@@ -107,6 +108,12 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(card.issue).toBe("STUDIO-924");
     expect(card.reviewers.map((r) => r.reviewer)).toEqual(["jimmy", "alice"]);
     expect(card.reviewers.map((r) => r.outcome)).toEqual(["done", "done"]);
+    // Each chip carries the RUN it represents (STUDIO-955), so clicking it can open that review
+    // rather than the ticket's own (finished) implementation run.
+    expect(card.reviewers.map((r) => r.issue)).toEqual([
+      "pr:makewhatis/booch#539@jimmy",
+      "pr:makewhatis/booch#540@alice",
+    ]);
     // ...and the card carries the PR its reviews are on.
     expect(card.pr?.number).toBe(539);
     expect(card.pr?.url).toBe("https://github.com/makewhatis/booch/pull/539");
@@ -262,6 +269,78 @@ describe("the board regroup (STUDIO-925)", () => {
     ]);
     expect(cards(board)[0].assignee).toBe("jerry");
     expect(cards(board)[0].provider).toBe("fireworks-ai");
+  });
+});
+
+// STUDIO-952 — one card can hold runs on several providers on purpose, so each reviewer chip must
+// carry its OWN row's provider rather than the card's. The [STUDIO-949] fixture is the real case:
+// jerry implemented on fireworks-ai and sol reviewed on openai.
+describe("a review's own provider on the chip (STUDIO-952)", () => {
+  const studio949 = () =>
+    buildConsoleBoard([
+      row({
+        issue: "STUDIO-949",
+        trackerState: "In Review",
+        assignee: "jerry",
+        provider: "fireworks-ai",
+      }),
+      review("pr:makewhatis/rhapsody#186@sol", "STUDIO-949", { provider: "openai" }),
+    ]);
+
+  it("keeps the review's openai off the card's fireworks-ai", () => {
+    const card = cards(studio949())[0];
+    expect(card.provider).toBe("fireworks-ai");
+    expect(card.reviewers.map((r) => r.provider)).toEqual(["openai"]);
+  });
+
+  it("gives a chip whose run recorded no provider an empty string, not the card's", () => {
+    const card = cards(
+      buildConsoleBoard([
+        row({ issue: "LEGACY-1", assignee: "jerry", provider: "fireworks-ai" }),
+        review("pr:makewhatis/rhapsody#1@sol", "LEGACY-1", { provider: "" }),
+      ]),
+    )[0];
+    expect(card.reviewers[0].provider).toBe("");
+  });
+});
+
+// STUDIO-955 — the Running lane's UNIT. A lane's count is a count of RUNS, so its contents must
+// be runs: a review run belongs to a ticket parked in another lane, so it has no card anywhere and
+// used to leave the lane simultaneously `5` and empty. `runningRuns` is the compact row per live
+// review run that closes the gap.
+describe("the Running lane's run rows (STUDIO-955)", () => {
+  it("gives every live review run its own row, with the reviewer, ticket, provider and elapsed", () => {
+    const runs = runningRuns([
+      row({ issue: "STUDIO-949", status: "review", trackerState: "In Review" }),
+      review("pr:makewhatis/rhapsody#186@alice", "STUDIO-949", {
+        status: "reviewing",
+        statusLabel: "reviewing",
+        runOutcome: "running",
+        live: true,
+        provider: "anthropic",
+        elapsed: "4m",
+      }),
+    ]);
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      issue: "pr:makewhatis/rhapsody#186@alice",
+      reviewer: "alice",
+      ticket: "STUDIO-949",
+      provider: "anthropic",
+      projectSlug: "rhapsody",
+      elapsed: "4m",
+    });
+  });
+
+  it("leaves a finished review and a running ticket out of the rows", () => {
+    const runs = runningRuns([
+      row({ issue: "STUDIO-949", status: "run", statusLabel: "running", live: true }),
+      review("pr:makewhatis/rhapsody#186@alice", "STUDIO-949", { status: "done", runOutcome: "completed" }),
+    ]);
+    // A running TICKET is already a card in the Running lane; a finished review shows as a chip on
+    // its ticket. Neither is a run the lane is missing.
+    expect(runs).toEqual([]);
   });
 });
 

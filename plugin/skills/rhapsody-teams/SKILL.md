@@ -131,6 +131,19 @@ mechanism that would assign a reviewer. Current daemons repair this: the poll ti
 sweep **adopts** an orphan without re-dispatching its ticket, and reports the ones it may not
 repair as a per-project advisory on `GET /api/v1/projects`.
 
+**Who reviews can be pinned, not only arranged.** `review.required` (a list of roster names,
+default empty) names identities selected on **every** pull request regardless of load or roster
+order — the case a review-only or specialist teammate otherwise loses to a busy roster. Required
+reviewers are chosen first and the remaining slots are filled by the usual least-loaded ranking,
+so on both paths `reviewers` stays the **total**: `reviewers: 2` with one required means one
+pinned plus one ranked. A pinned teammate is still never handed its own authored pull request. A
+pin the daemon cannot use **degrades rather than blocking** — the round always proceeds with the
+reviewers that can run: an off-roster name (a typo, or one written in the wrong case) is reported
+at boot by name; a profile naming a harness this build cannot run drops the pin and keeps the
+teammate a ranked candidate, since it reviews on `agent.backend`; and a ticketless `review.model`
+refusal removes it from the round entirely with one warning. More pins than `reviewers` clamps to
+the first `reviewers` in `required:` order, with one boot warning naming both numbers.
+
 **Ticket state follows the verdict, when configured** (both empty-means-off):
 
 - `review.done_state` — a merged PR moves its ticket to that terminal state.
