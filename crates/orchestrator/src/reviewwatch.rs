@@ -464,7 +464,13 @@ impl Orchestrator {
     /// [`service_review_pr`](Self::service_review_pr) dispatches; a quorum review is a real tracker
     /// ticket on the implementation ladder, drawing the implementation budget, and counting it here
     /// would let it silently consume ticketless review capacity it never drew from.
-    fn running_ticketless_reviews(&self) -> i64 {
+    ///
+    /// `pub(crate)` because the implementation ladders
+    /// ([`select_dispatch_with_reopens`](Self::select_dispatch_with_reopens) and
+    /// [`select_dispatch_multi_with_reopens`](Self::select_dispatch_multi_with_reopens)) subtract
+    /// it from their own draw when the key is set — see
+    /// [`implementation_pool_holders`](Self::implementation_pool_holders).
+    pub(crate) fn running_ticketless_reviews(&self) -> i64 {
         i64::try_from(
             self.running
                 .values()
@@ -472,6 +478,22 @@ impl Orchestrator {
                 .count(),
         )
         .unwrap_or(i64::MAX)
+    }
+
+    /// How many running entries currently SPEND the global pool the review watcher draws against
+    /// (STUDIO-950). When `agent.max_concurrent_reviews` gives reviews their own pool that is the
+    /// ticketless review runs alone; unset, it is EVERY running run on the shared
+    /// `max_concurrent_agents` budget the watcher shared before the key existed.
+    ///
+    /// The count the watcher both DRAWS from and names in its capacity-hold log, so the log reports
+    /// what actually spent the pool instead of always the reviews — in shared mode the pool is held
+    /// by implementations too, and `holding=0` while four implementations spend it is a lie the
+    /// operator tuning the key cannot act on.
+    fn review_pool_holders(&self) -> i64 {
+        match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
+            Some(_) => self.running_ticketless_reviews(),
+            None => i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+        }
     }
 
     /// Turns one tick's observations into drops, re-arms and review dispatches. **The watcher's
@@ -510,17 +532,16 @@ impl Orchestrator {
         // cannot keep suppressing the reconciliation sweep under an old hold. The capacity branch
         // below re-inserts each round the budget defers.
         self.review_capacity_held.clear();
+        // The count the ACTIVE pool is drawn against (STUDIO-950): the ticketless reviews once the
+        // key gives them their own pool, else every running run on the shared budget. Used for BOTH
+        // the draw and the `holding` count in the capacity-hold log, so the two cannot disagree.
+        let pool_holding = self.review_pool_holders();
         let mut slots = self
             .eff
             .as_ref()
             .map(|eff| match eff.max_concurrent_reviews {
-                Some(max_reviews) => {
-                    crate::concurrency::global_slots(max_reviews, self.running_ticketless_reviews())
-                }
-                None => crate::concurrency::global_slots(
-                    eff.max_concurrent,
-                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
-                ),
+                Some(max_reviews) => crate::concurrency::global_slots(max_reviews, pool_holding),
+                None => crate::concurrency::global_slots(eff.max_concurrent, pool_holding),
             })
             .unwrap_or(0);
         for obs in observed {
@@ -712,8 +733,10 @@ impl Orchestrator {
             if *slots <= 0 {
                 // STUDIO-950: remember WHY this round is deferred, so the reconciliation sweep can
                 // tell a deliberate capacity hold from an unexplained stall. The count is the runs
-                // holding the pool, for the log a human reads when tuning the key.
-                let holding = self.running_ticketless_reviews();
+                // holding the ACTIVE pool — every running run in shared mode, the ticketless
+                // reviews once the key gives them their own — so the log a human reads when tuning
+                // the key names what actually spent it rather than always the reviews.
+                let holding = self.review_pool_holders();
                 self.review_capacity_held.insert(id.clone());
                 tracing::debug!(
                     pr = %pr, holding,
@@ -1150,8 +1173,9 @@ mod tests {
     use crate::control_loop::CancelSignal;
     use crate::ghsummons::{PrSnapshot, PrStateResult};
     use crate::orchestrator::RunningEntry;
-    use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project, set_of};
-
+    use crate::testsupport::{
+        DispatchedEntries, capture_events, empty_effective, empty_resolved_project, set_of,
+    };
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OWNER: &str = "makewhatis";
     const REPO: &str = "rhapsody";
@@ -2842,6 +2866,39 @@ mod tests {
             "an unset key must keep reviews on the shared global budget"
         );
         assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// STUDIO-950: the capacity-hold log names the count for the ACTIVE pool. In shared mode (the
+    /// key unset) that is every running run, not just the reviews — four implementations spending
+    /// the budget must read `holding=4`, not the misleading `0` a reviews-only count produced.
+    ///
+    /// Mutation check: make `holding` unconditionally `running_ticketless_reviews()` and the
+    /// assertion reds (`Some("0")` vs `Some("4")`).
+    #[test]
+    fn a_capacity_hold_in_shared_mode_names_the_shared_holders() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        // `max_concurrent_reviews` deliberately left `None` — the shared budget.
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+
+        let (report, events) = capture_events(|| o.handle_review_sweep(&[open_at(31, HEAD_A)]));
+
+        assert_eq!(report.deferred, 1);
+        let hold = events
+            .iter()
+            .find(|e| {
+                e.message
+                    .contains("daemon-wide concurrency budget is spent")
+            })
+            .expect("the capacity hold must be logged");
+        assert_eq!(
+            hold.fields.get("holding").map(String::as_str),
+            Some("4"),
+            "the hold log must name what actually spent the shared pool"
+        );
     }
 
     /// With the key set, review runs never exceed their OWN budget — four rounds due in one tick and

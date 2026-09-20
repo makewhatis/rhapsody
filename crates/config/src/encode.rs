@@ -520,6 +520,42 @@ mod tests {
         assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
     }
 
+    // ⚠️ A DATA-LOSS class, not a formatting one (STUDIO-950). `agent.max_concurrent_reviews` is
+    // Rhapsody-only and deliberately kept out of `effective_json` (so the Go config goldens stay
+    // byte-identical), which makes the console's typed Save the ONLY path that can carry it back to
+    // disk. That write path starts from the on-disk `Config` and overwrites only what the request
+    // carries, so the key survives a Save only if Encode writes back what Decode read. Without this
+    // test the assignment in `raw_from_config` can vanish and every other test stays green.
+    #[test]
+    fn max_concurrent_reviews_survives_an_encode_decode_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n\
+             agent:\n  max_concurrent_agents: 4\n  max_concurrent_reviews: 2\n",
+            "body",
+        );
+        assert_eq!(c1.agent.max_concurrent_reviews, Some(2));
+        let def = encode(&c1).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_concurrent_reviews"),
+            Some(&Value::from(2i64)),
+            "the key must be emitted so a Settings save does not drop it"
+        );
+        assert_eq!(re_encode_decode(&c1).agent.max_concurrent_reviews, Some(2));
+
+        // An untouched workflow (never wrote the key) materializes nothing — the shared budget.
+        let absent = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n",
+            "body",
+        );
+        let def = encode(&absent).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_concurrent_reviews"),
+            None,
+            "an unset key must not be materialized"
+        );
+        assert_eq!(re_encode_decode(&absent).agent.max_concurrent_reviews, None);
+    }
+
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.
     fn nested<'a>(cfg: &'a YamlMap, outer: &str, inner: &str) -> Option<&'a Value> {
         cfg.get(outer)

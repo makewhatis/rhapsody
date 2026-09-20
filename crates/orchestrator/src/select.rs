@@ -74,7 +74,8 @@ impl Orchestrator {
 
         let mut running = self.running_id_set();
         let mut state_counts = self.running_state_counts();
-        let mut global_remaining = global_slots(eff.max_concurrent, self.running.len() as i64);
+        let mut global_remaining =
+            global_slots(eff.max_concurrent, self.implementation_pool_holders());
         // Boot-recovery guard: never dispatch an issue a pending recovered retry already owns by
         // IDENTIFIER (invisible to the opaque-ID-keyed `claimed`), or the recovered on-retry would
         // later release+delete the live run's claim row.
@@ -259,6 +260,24 @@ impl Orchestrator {
             .count() as i64
     }
 
+    /// How many running entries currently spend the IMPLEMENTATION global pool (STUDIO-950). With
+    /// `agent.max_concurrent_reviews` set, ticketless review runs draw their own pool and must NOT
+    /// occupy an implementation slot: leaving them in this count would admit one fewer
+    /// implementation for every review in flight, contradicting D2 ("reviews are free") at the
+    /// global cap it was never applied to — the inversion this ticket exists to fix. Unset ⇒ every
+    /// running entry, the shared `max_concurrent_agents` budget byte-identical to before the key.
+    ///
+    /// A quorum review is a real tracker ticket on this same ladder and is deliberately NOT
+    /// subtracted: only [`running_ticketless_reviews`](Orchestrator::running_ticketless_reviews)
+    /// (the entries carrying `review` coordinates) belong to the separate pool.
+    fn implementation_pool_holders(&self) -> i64 {
+        let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
+        match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
+            Some(_) => (total - self.running_ticketless_reviews()).max(0),
+            None => total,
+        }
+    }
+
     /// Sorts tagged candidates by the global dispatch order and greedily admits eligible issues while
     /// (a) a GLOBAL slot remains, (b) the issue's PROJECT cap is free, and (c) the per-STATE cap is
     /// free — accounting for issues admitted earlier in this pass. Per-state accounting is GLOBAL
@@ -288,7 +307,8 @@ impl Orchestrator {
         sort_tagged_stable(&mut tagged);
 
         let mut running = self.running_id_set();
-        let mut global_remaining = global_slots(eff.max_concurrent, self.running.len() as i64);
+        let mut global_remaining =
+            global_slots(eff.max_concurrent, self.implementation_pool_holders());
         let mut per_project: HashMap<String, i64> = HashMap::new(); // group -> remaining slots this pass
         let mut state_counts = self.running_state_counts(); // normState -> running-in-state across ALL projects
         let recovered_claims = self.recovered_claim_identifiers();
@@ -600,6 +620,14 @@ mod tests {
         }
     }
 
+    /// A running TICKETLESS review (STUDIO-950): the `review` coordinates are what mark it as
+    /// drawing the separate review pool, matching production's `pr:` dispatch.
+    fn ticketless_review_run(id: &str) -> RunningEntry {
+        let mut re = running_entry(running_state(id, "In Progress"), "", "");
+        re.review = Some(crate::review::ReviewRun::default());
+        re
+    }
+
     // --- select_test.go (single-project) ------------------------------------------------------
 
     // Mirrors Go `TestSelectDispatchRespectsGlobalSlots`.
@@ -612,6 +640,69 @@ mod tests {
             issue("3", "A-3", "Todo"),
         ];
         assert_eq!(o.select_dispatch(input).len(), 2, "global slots");
+    }
+
+    /// STUDIO-950: with `agent.max_concurrent_reviews` set, a ticketless review run draws its OWN
+    /// pool and must NOT occupy an implementation slot. `max_concurrent_agents: 1` with one review
+    /// in flight still admits one implementation; the unset control keeps the shared budget, so the
+    /// same review consumes the only slot and nothing dispatches.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw and the first assertion reds.
+    #[test]
+    fn a_ticketless_review_does_not_consume_an_implementation_slot() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+
+        assert_eq!(
+            o.select_dispatch(vec![issue("1", "A-1", "Todo")]).len(),
+            1,
+            "a review on its own pool must not hold the implementation slot"
+        );
+
+        // Control: unset ⇒ the review spends the shared `max_concurrent_agents` budget.
+        let mut unset = orch_for_select(1, HashMap::new(), None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert!(
+            unset
+                .select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .is_empty(),
+            "unset must keep the shared draw"
+        );
+    }
+
+    /// STUDIO-950: the multi-project ladder excludes the ticketless review from the implementation
+    /// draw too — two ladders, two call sites, or the fix is silently absent for whichever one is
+    /// missing it.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw and this reds.
+    #[test]
+    fn a_ticketless_review_does_not_consume_a_multi_project_implementation_slot() {
+        let mut o = orch_for_multi(1, vec![proj("rhapsody", 10, HashMap::new())], None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+
+        let got = o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]));
+        assert_eq!(
+            got.len(),
+            1,
+            "the multi-project ladder must leave reviews out of the implementation draw"
+        );
+
+        let mut unset = orch_for_multi(1, vec![proj("rhapsody", 10, HashMap::new())], None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert!(
+            unset
+                .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .is_empty(),
+            "unset must keep the shared draw"
+        );
     }
 
     // Mirrors Go `TestSelectDispatchRespectsPerStateSlots`.
