@@ -698,13 +698,17 @@ impl Orchestrator {
         //
         // STUDIO-950: the FRESH count is the pool the active key selects — reviews' own
         // `max_concurrent_reviews` when it is set, the shared `max_concurrent_agents` otherwise —
-        // and this sweep is about to re-evaluate every round, so a hold recorded by a PREVIOUS
-        // sweep is stale from here on. Cleared wholesale up front (rather than per row) so
-        // `review_capacity_held` always means exactly "what THIS sweep held": a round deferred for
-        // a different reason this sweep, or one whose pull request the lookup did not even reach,
-        // cannot keep annotating the reconciliation sweep's row under an old hold. The capacity
-        // branch below re-inserts each round the budget defers.
-        self.review_capacity_held.clear();
+        // and this tick is about to re-evaluate every round, so a hold recorded by a PREVIOUS tick
+        // is stale from here on. Cleared wholesale ONCE per tick, on its first hand-back
+        // (`slots.is_none()` — STUDIO-953 hands observations over one at a time, so a clear per
+        // hand-back would wipe the holds already recorded for the pull requests seen earlier this
+        // tick), so `review_capacity_held` always means exactly "what THIS tick's sweep held": a
+        // round deferred for a different reason, or one whose pull request the lookup did not even
+        // reach, cannot keep annotating the reconciliation sweep's row under an old hold. The
+        // capacity branch below re-inserts each round the budget defers.
+        if slots.is_none() {
+            self.review_capacity_held.clear();
+        }
         let fresh_budget = self.review_dispatch_budget();
         let mut slots = slots
             .map(|left| left.min(fresh_budget))
@@ -3336,6 +3340,52 @@ mod tests {
         assert!(
             o.review_divergences()[0].capacity_held.is_none(),
             "no hold, no annotation"
+        );
+    }
+
+    /// STUDIO-950: the capacity-hold map is cleared once per TICK, not once per hand-back.
+    /// STUDIO-953 hands the watcher's observations to the control task ONE at a time (`slots` is
+    /// `None` only on the tick's first hand-back), so an unguarded clear would wipe the hold recorded
+    /// for a pull request seen earlier in the same tick — and the reconciliation sweep would then
+    /// drop its annotation for that row.
+    ///
+    /// Mutation check: drop the `slots.is_none()` guard (clear on every hand-back) and the first
+    /// round's hold is gone once the second hand-back lands.
+    #[test]
+    fn a_capacity_hold_survives_a_later_hand_back_in_the_same_tick() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        introduce(&o, row(32, "bob"));
+
+        // First hand-back of the tick: the budget is spent, so round 31 is held.
+        let (_, left) = o.handle_review_sweep_slots(&[open_at(31, HEAD_A)], None);
+        assert_eq!(
+            o.review_capacity_held
+                .get(&review_key(OWNER, REPO, 31, "bob"))
+                .map(|h| h.holders),
+            Some(4),
+            "the first hand-back records its hold"
+        );
+
+        // A later hand-back in the SAME tick must not clear it.
+        let _ = o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], Some(left));
+        assert_eq!(
+            o.review_capacity_held
+                .get(&review_key(OWNER, REPO, 31, "bob"))
+                .map(|h| h.holders),
+            Some(4),
+            "a hold from an earlier hand-back must survive the rest of the tick"
+        );
+        assert_eq!(
+            o.review_capacity_held
+                .get(&review_key(OWNER, REPO, 32, "bob"))
+                .map(|h| h.holders),
+            Some(4),
+            "the later hand-back records its own hold too"
         );
     }
 
