@@ -513,6 +513,8 @@ describe("mergeJobs", () => {
     expect(w.agent).toBe("Infrastructure"); // resolved from the Linear project list (via entry.project)
     expect(w.projectShort).toBe("Infrastructure");
     expect(w.subLabel).toBe("waiting on INF-1 · In Review");
+    // A blocker hold is NOT a human hold — the two must not collapse into one flag (STUDIO-949).
+    expect(w.heldForHuman).toBe(false);
   });
 
   it("collapses a blocked issue that is ALSO live to running (live wins; no longer waiting)", () => {
@@ -567,6 +569,9 @@ describe("mergeJobs", () => {
     expect(h.runId).toBe(0); // never ran → not clickable
     expect(h.title).toBe("store work");
     expect(h.subLabel).toBe("held for a human");
+    // Carried as a fact, so the console can paint a deliberate hold Queued while a blocker-held row
+    // stays Blocked, without re-parsing the sub-label's wording (STUDIO-949 round 3).
+    expect(h.heldForHuman).toBe(true);
   });
 });
 

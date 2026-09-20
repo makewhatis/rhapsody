@@ -153,14 +153,24 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * It changes nothing about a ticket-based review row, which keeps STUDIO-780's behaviour entirely:
  * the two flags mark different subjects, the daemon sets them on different rows, and only the live
  * arm is shared between them.
+ *
+ * The fifth rule is `heldForHuman` (STUDIO-949), and it names the word deliberately. A
+ * `rhapsody:human` ticket reaches this function as a synthetic `waiting` row, whose outcome maps to
+ * `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong: the dispatcher has
+ * deliberately refused it and no agent will ever run it, so painting it "blocked" puts a deliberate
+ * hold one pill away from a real fault, which is the confusion the board's own chip styling exists
+ * to prevent. It reads `queued` — waiting for a person rather than mysteriously idle — and it is
+ * checked before the run arms because the hold, not the run that never happened, is the whole fact.
  */
 export function consoleJobStatus(
   status: string,
   lifecycle?: string,
   reviewTicket = false,
   reviewRun = false,
+  heldForHuman = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
+  if (heldForHuman) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
   // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
@@ -647,7 +657,13 @@ export function buildConsoleJobs(
     const ticket = lifecycles.get(job.issue);
     const reviewTicket = reviewTickets.has(job.issue);
     const reviewRun = reviewRuns.has(job.issue);
-    const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket, reviewRun);
+    const status = consoleJobStatus(
+      job.status,
+      ticket?.lifecycle,
+      reviewTicket,
+      reviewRun,
+      job.heldForHuman ?? false,
+    );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
     // has one; a plain ticket key never matches the parser.

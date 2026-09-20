@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { IssueCountsResponse, IssueRun, TeamsOverview, TicketCostRow } from "@/lib/api";
+import type {
+  IssueCountsResponse,
+  IssueRun,
+  StateResponse,
+  TeamsOverview,
+  TicketCostRow,
+} from "@/lib/api";
+import { mergeJobs } from "@/lib/runs-model";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -1356,5 +1363,36 @@ describe("consoleStoreCounts", () => {
     expect(withHolds?.blocked).toBe(0);
     // A deliberate hold is not a failure, so it is not billed as needing the operator.
     expect(withHolds?.needsYou).toBe(0);
+  });
+});
+
+// The chain `JobsView` actually runs: `mergeJobs` → `buildConsoleJobs`. Both board-side tests fed
+// `rows: []` (or a pre-built row) and exercised only the board's own synthesis, so neither could see
+// the word the pill paints in production — the `waiting` outcome mapped to `blocked`, the BLOCKER's
+// word, while both tests asserted "queued". This pins the production shape end to end (STUDIO-949
+// round 3).
+describe("a held-for-human ticket through the production chain (STUDIO-949)", () => {
+  it("paints the pill 'queued', not the blocker's word", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [
+        { issue_identifier: "STUDIO-939", title: "store work", project: "booch" },
+      ],
+    };
+    const rows = buildConsoleJobs(mergeJobs(state, [], [], NOW), [], undefined, NOW, []);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue).toBe("STUDIO-939");
+    // A deliberate hold waits in Queued and says so; it does not wear "blocked".
+    expect(rows[0].status).toBe("queued");
+    expect(rows[0].statusLabel).toBe("queued");
+    expect(rows[0].subLabel).toBe("held for a human");
+    // ...and it is not billed as needing the operator, exactly as the strip counts it.
+    expect(rows[0].needsYou).toBe(false);
   });
 });

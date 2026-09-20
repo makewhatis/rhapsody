@@ -209,6 +209,13 @@ export interface JobRow {
   startedAtMs: number;
   /** Secondary label under the row; today only set for `failed` jobs (the failure reason). */
   subLabel?: string;
+  /**
+   * True when this row is a `rhapsody:human` HOLD (from `state.held_for_human`, STUDIO-949), not a
+   * blocker. Carried as a fact rather than re-derived from `subLabel`'s wording, because the console
+   * must paint a deliberate hold as Queued while a predecessor-held row stays Blocked, and a string
+   * comparison is how the two words would silently drift apart.
+   */
+  heldForHuman?: boolean;
 }
 
 export interface ProjectMeta {
@@ -537,6 +544,7 @@ export function mergeJobs(
         : status === "failed"
           ? failureSubLabel(newestReal?.error ?? "") || undefined
           : undefined,
+      heldForHuman: isWaiting && waitingRow?.heldForHuman === true,
     });
   }
 

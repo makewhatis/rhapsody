@@ -1237,7 +1237,7 @@ label is the entire opt-in: a ticket without it behaves byte-identically to toda
 | dispatch | n/a | refused in `eligible()` and, on the review-reopen ladder that bypasses it, in `review_reopen_eligible()` — both refuse, Teams on or off |
 | auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever), and reported as a hold from that pass |
 | triage | n/a | never assigned an identity, never spending a manager turn |
-| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key (a Backlog dependent included — auto-promote is the only pass that sees it) |
+| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key (a Backlog dependent included when its project has `dependency_mode` enabled — auto-promote is the only pass that ever sees it) |
 | Teams | n/a | **not** gated on it — the refusal holds on any install |
 
 The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,

@@ -352,6 +352,13 @@ export function buildConsoleBoard(
   // invisible on the board: the exact silent stall the hold exists to end (STUDIO-949). Synthesize a
   // Queued card for any hold the rows did not already surface, as `mergeJobs` synthesizes a held
   // dependent's row. The chip is the deliberate-hold marker; the pill stays the lane's own word.
+  //
+  // LOAD-BEARING NOTE: through `JobsView` this loop is unreachable. `mergeJobs` synthesizes a row
+  // for every hold (`runs-model.ts`) and `buildConsoleJobs` is a 1:1 map, so `byIssue.has(...)` is
+  // always true by the time this runs — a held ticket is surfaced by the ROW, and its status word is
+  // decided in `consoleJobStatus`. This branch is belt-and-braces for a caller that hands the board
+  // rows it did not build through that chain, and its own test is the only thing that exercises it.
+  // Do not delete the `mergeJobs` half believing this one covers it.
   for (const h of heldForHuman) {
     if (h.issue_identifier === "" || byIssue.has(h.issue_identifier)) continue;
     const card: BoardCard = {
