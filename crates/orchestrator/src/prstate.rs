@@ -107,6 +107,12 @@ impl std::fmt::Display for PrCoord {
 pub struct PrObservation {
     pub pr: PrCoord,
     pub lookup: PrLookup,
+    /// The previously-REVIEWED head SHAs whose diff against the pull request's base is
+    /// byte-identical to this observation's head (STUDIO-960). Filled in by the off-loop watcher,
+    /// which is the only place that can spend the `gh` comparison; empty means "no proof", and the
+    /// control task then arms a normal round exactly as before. A `gh` read that failed, timed out
+    /// or could not fingerprint the whole diff leaves this empty on purpose.
+    pub unchanged_from: Vec<String>,
 }
 
 /// What one tick learned. `deferred` and `failed` are reported rather than logged-and-forgotten so
@@ -155,6 +161,9 @@ pub async fn sweep_pr_states(
             Ok(lookup) => sweep.observed.push(PrObservation {
                 pr: pr.clone(),
                 lookup,
+                // The diff comparison is the off-loop watcher's, not this sweep's: it needs the
+                // watch rows' reviewed SHAs, which live on the control task (STUDIO-960).
+                unchanged_from: Vec::new(),
             }),
             Err(e) => {
                 sweep.failed += 1;
