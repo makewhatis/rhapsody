@@ -400,6 +400,13 @@ fn project_from_json(base: &Config, pj: &ProjectReq) -> Project {
     {
         p.hooks = Some(hooks.clone());
     }
+    // promote_from_states is not surfaced in the typed `projects[]` view (STUDIO-948), so it round-trips
+    // nowhere and a Settings save would silently widen this project's auto-promote scope back to the
+    // unset default ("every backlog-type state is ready work"). Carry it forward from the base project,
+    // like `hooks` above, so the deliberately narrower set survives an unrelated edit.
+    if let Some(bp) = base_project {
+        p.promote_from_states = bp.promote_from_states.clone();
+    }
     // Seed the override from the base project's claude block (preserving unmanaged knobs), then
     // overwrite ONLY the managed knobs from the DTO (a None clears that managed knob).
     let mut ov = base_project
