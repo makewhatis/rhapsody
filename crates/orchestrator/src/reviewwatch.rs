@@ -2024,7 +2024,7 @@ mod tests {
             let again = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
             assert!(
                 again.nudges.is_empty(),
-                "the same head must never be poked twice"
+                "the same head must never be poked twice consecutively"
             );
         }
 
@@ -2106,7 +2106,7 @@ mod tests {
                 o.handle_review_sweep(&[draft_at(12, HEAD_A)])
                     .nudges
                     .is_empty(),
-                "sweep {sweep}: the same head is never poked twice"
+                "sweep {sweep}: the same head is never poked twice consecutively"
             );
         }
         let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);

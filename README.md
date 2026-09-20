@@ -1375,13 +1375,12 @@ re-engaged run a review's findings reopened) is never poked.
 **The poking is bounded on two axes, because the incident shape is a static head.** An author who
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` pokes — an attempt counter, not a
 distinct-head counter: the ledger remembers only the head poked last, so `A → B → A` reaches the
-bound on two distinct heads. An author who does
-nothing at all — booch#537 never moved its head — is bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive
-sweeps at the same head (thirty, about an hour at the two-minute poll when every watched pull request
-answers every tick; the clock counts observations, so a larger watch set or a flaky `gh` makes an hour
-a floor). Either bound stops the poking
-and ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly
-one comment and then silence forever, which is the parking this feature exists to end.
+bound on two distinct heads. An author who does nothing at all — booch#537 never moved its head — is
+bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps at the same head (thirty, about an hour at the
+two-minute poll when every watched pull request answers every tick; the clock counts observations, so
+a larger watch set or a flaky `gh` makes an hour a floor). Either bound stops the poking and
+ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly one
+comment and then silence forever, which is the parking this feature exists to end.
 
 **In memory, and that is deliberate.** The per-head bookkeeping is a churn floor rather than an audit
 record, exactly as `REVIEW_ROUNDS_PER_PR_CAP` is: a restart forgets the whole ledger — the escalation
