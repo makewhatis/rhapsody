@@ -210,8 +210,19 @@ pub struct ReviewSweepReport {
 pub trait ReviewWatchSink: Send + Sync {
     /// The pull requests worth asking GitHub about this tick.
     async fn watched(&self) -> Vec<PrCoord>;
-    /// Hands one tick's observations to the control task and reports what it decided.
-    async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport;
+    /// Hands observations to the control task and reports what it decided.
+    ///
+    /// `slots` is the daemon-wide dispatch budget this call may spend: `None` on a tick's FIRST
+    /// hand-back, so the control task counts the budget then; `Some(left)` on every later one, so a
+    /// tick's per-observation hand-backs spend ONE budget rather than recomputing it each time
+    /// (STUDIO-953). The remaining budget comes back beside the report, ready to hand to the next
+    /// call. Recomputing per hand-back would let a review worker that exits mid-tick hand its slot
+    /// to a fresh round in the same tick, defeating the operator's `max_concurrent` for that tick.
+    async fn sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64);
     /// Merges ONE pull request whose gates the control task cleared (STUDIO-874).
     ///
     /// On the sink for [`Self::finish`]'s reason: the remaining gates are GitHub round trips and
@@ -265,8 +276,12 @@ impl ReviewWatchSink for ControlWatchSink {
     async fn watched(&self) -> Vec<PrCoord> {
         self.control.review_watch_list().await
     }
-    async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
-        self.control.review_sweep(observed).await
+    async fn sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
+        self.control.review_sweep(observed, slots).await
     }
     async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
         let Some(deps) = self.automerge.as_ref() else {
@@ -430,17 +445,34 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // answer. The per-observation reports are folded back into one tick report so the log line
         // and the merge/Done work lists keep their tick shape.
         let mut report = ReviewSweepReport::default();
+        // One dispatch budget for the whole tick, carried across the per-observation hand-backs
+        // (STUDIO-953): a review worker that exits mid-tick must not hand its slot back to a fresh
+        // round in the SAME tick, which is what recomputing the budget per hand-back would do.
+        // `None` on the first hand-back tells the control task to count the budget then.
+        let mut slots: Option<i64> = None;
         for obs in sweep.observed {
             let fresh =
                 refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
-            let one = deps.sink.sweep(vec![fresh]).await;
-            report.dispatched += one.dispatched;
-            report.retired += one.retired;
-            report.deferred += one.deferred;
-            report.armed += one.armed;
-            report.stalled += one.stalled;
-            report.done.extend(one.done);
-            report.merge.extend(one.merge);
+            let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
+            slots = Some(left);
+            // Destructured rather than field-by-field so a field added later cannot be silently
+            // dropped from the tick fold: the compiler flags the missing binding here.
+            let ReviewSweepReport {
+                dispatched,
+                retired,
+                deferred,
+                armed,
+                stalled,
+                done,
+                merge,
+            } = one;
+            report.dispatched += dispatched;
+            report.retired += retired;
+            report.deferred += deferred;
+            report.armed += armed;
+            report.stalled += stalled;
+            report.done.extend(done);
+            report.merge.extend(merge);
         }
         if report != ReviewSweepReport::default() {
             tracing::info!(
@@ -555,37 +587,47 @@ impl Orchestrator {
         out
     }
 
-    /// Turns one tick's observations into drops, re-arms and review dispatches. **The watcher's
-    /// whole decision**, on the control task, where the watch set is single-writer and
-    /// `running`/`claimed` cannot race.
+    /// Turns one tick's observations into drops, re-arms and review dispatches, counting a FRESH
+    /// dispatch budget for the call. **The watcher's whole decision**, on the control task, where
+    /// the watch set is single-writer and `running`/`claimed` cannot race.
+    ///
+    /// The one-shot shape is a test convenience: production always goes through
+    /// [`Self::handle_review_sweep_slots`] so a tick's per-observation hand-backs share one budget.
+    /// Kept as the batched contract because it is what most of this module's tests drive.
+    #[cfg(test)]
     pub(crate) fn handle_review_sweep(&mut self, observed: &[PrObservation]) -> ReviewSweepReport {
+        self.handle_review_sweep_slots(observed, None).0
+    }
+
+    /// [`Self::handle_review_sweep`]'s production shape, with the tick's dispatch budget carried
+    /// across the watcher's per-observation hand-backs (STUDIO-953).
+    ///
+    /// `slots` is `None` on a tick's FIRST hand-back — [`Self::review_dispatch_budget`] counts it —
+    /// and `Some(left)` on every later one, so a tick spends ONE budget however many hand-backs it
+    /// makes. Returning the leftover rather than recomputing is what keeps a review worker that
+    /// exits mid-tick from handing its slot to another round in the SAME tick.
+    pub(crate) fn handle_review_sweep_slots(
+        &mut self,
+        observed: &[PrObservation],
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
         let mut report = ReviewSweepReport::default();
         if !self.review_ticketless_enabled() {
-            return report; // §16
+            return (report, 0); // §16
         }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; this tick decides nothing");
-                return report;
+                return (report, slots.unwrap_or(0));
             }
         };
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
-        // tick would otherwise spawn twenty agents past a cap the operator set. Counted ONCE for
-        // the tick and spent down as reviews are dispatched, so it composes with the per-identity
-        // `max_concurrent` rather than replacing it. No config loaded ⇒ no budget: a dispatch could
-        // not resolve a project to route with in any case.
-        let mut slots = self
-            .eff
-            .as_ref()
-            .map(|eff| {
-                crate::concurrency::global_slots(
-                    eff.max_concurrent,
-                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
-                )
-            })
-            .unwrap_or(0);
+        // tick would otherwise spawn twenty agents past a cap the operator set. Counted ONCE by the
+        // tick's first hand-back and spent down as reviews are dispatched, so it composes with the
+        // per-identity `max_concurrent` rather than replacing it.
+        let mut slots = slots.unwrap_or_else(|| self.review_dispatch_budget());
         for obs in observed {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
@@ -618,7 +660,22 @@ impl Orchestrator {
                 }
             }
         }
-        report
+        (report, slots)
+    }
+
+    /// The daemon-wide dispatch budget available to one watcher tick: `max_concurrent` less what is
+    /// already running. No config loaded ⇒ no budget: a dispatch could not resolve a project to
+    /// route with in any case.
+    fn review_dispatch_budget(&self) -> i64 {
+        self.eff
+            .as_ref()
+            .map(|eff| {
+                crate::concurrency::global_slots(
+                    eff.max_concurrent,
+                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+                )
+            })
+            .unwrap_or(0)
     }
 
     /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
@@ -743,7 +800,7 @@ impl Orchestrator {
         // console and the room read the same fact the dispatch below acts on. It can only ever
         // touch rows that already exist, and it changes no field this function's decision reads —
         // `review_round_due` answers identically before and after it — which is why `rows` (loaded
-        // once for the whole tick) is still sound to decide from.
+        // fresh for this observation's hand-back) is still sound to decide from.
         report.armed += self.handle_review_head_advanced(pr, head);
 
         // How many dispatches one ROUND of this pull request costs — the unit the churn budget
@@ -756,7 +813,7 @@ impl Orchestrator {
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
-        // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
+        // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly would
         // go stale the moment one row is reassigned: the next row would still see the retired
         // reviewer as a peer and not see the substitute, and could hand that substitute a second
         // required review of the same pull request.
@@ -911,7 +968,7 @@ impl Orchestrator {
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
     /// (STUDIO-874), appending the plan to `report` if they do.
     ///
-    /// Decided from `mine` — the tick's OPENING snapshot of this pull request's rows — for the
+    /// Decided from `mine` — this hand-back's OPENING snapshot of this pull request's rows — for the
     /// same reason the dispatch loop above is: it is the state the control task owns, and nothing
     /// this function reads is written by the loop it follows. A row re-armed by
     /// [`Self::handle_review_head_advanced`] moved to `requested`, which this gate refuses on
@@ -1169,26 +1226,36 @@ impl ControlHandle {
         }
     }
 
-    /// Hands one tick's observations to the control task, which decides every drop, re-arm and
-    /// dispatch. The wait is bounded by the daemon lifetime rather than a timer, as every other
+    /// Hands observations to the control task, which decides every drop, re-arm and dispatch, and
+    /// returns the remaining daemon-wide dispatch budget for the tick beside the report.
+    ///
+    /// `slots` is `None` on the tick's first hand-back and `Some(left)` afterwards, so one tick
+    /// spends one budget: see [`ReviewWatchSink::sweep`].
+    ///
+    /// The wait is bounded by the daemon lifetime rather than a timer, as every other
     /// off-loop hand-back here is: nothing is answering an agent's MCP call, so a busy tick should
     /// delay this tick's decisions rather than turn them into a false failure.
-    pub(crate) async fn review_sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+    pub(crate) async fn review_sweep(
+        &self,
+        observed: Vec<PrObservation>,
+        slots: Option<i64>,
+    ) -> (ReviewSweepReport, i64) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .events
             .send(Event::ReviewSweep {
                 observed,
+                slots,
                 reply: tx,
             })
             .is_err()
         {
-            return ReviewSweepReport::default();
+            return (ReviewSweepReport::default(), slots.unwrap_or(0));
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
             r = rx => r.unwrap_or_default(),
-            _ = lifetime.cancelled() => ReviewSweepReport::default(),
+            _ = lifetime.cancelled() => (ReviewSweepReport::default(), slots.unwrap_or(0)),
         }
     }
 }
@@ -2823,6 +2890,10 @@ mod tests {
     struct FakeSink {
         watched: Vec<PrCoord>,
         seen: Arc<Mutex<Vec<Vec<PrObservation>>>>,
+        /// `seen.len()` at the start of each tick, recorded by [`ReviewWatchSink::watched`] — which
+        /// the task calls exactly once per tick. A test can then slice `seen` into whole ticks
+        /// rather than approximating a tick boundary by a count.
+        boundaries: Arc<Mutex<Vec<usize>>>,
         done: Arc<tokio::sync::Notify>,
         /// What the control task pretends to have decided, handed back from every `sweep`.
         hand_back: ReviewSweepReport,
@@ -2835,12 +2906,18 @@ mod tests {
     #[async_trait]
     impl ReviewWatchSink for FakeSink {
         async fn watched(&self) -> Vec<PrCoord> {
+            let start = self.seen.lock().expect("seen lock").len();
+            self.boundaries.lock().expect("boundaries lock").push(start);
             self.watched.clone()
         }
-        async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            _slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
             self.seen.lock().expect("seen lock").push(observed);
             self.done.notify_one();
-            self.hand_back.clone()
+            (self.hand_back.clone(), 0)
         }
         async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
             self.merged.lock().expect("merged lock").push(plan);
@@ -2876,6 +2953,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_task_polls_the_watch_set_and_hands_the_answers_back() {
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
         let signal = CancelSignal::new();
         let deps = ReviewWatchDeps {
@@ -2885,26 +2963,29 @@ mod tests {
             sink: Arc::new(FakeSink {
                 watched: vec![coord(12), coord(13)],
                 seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
 
+        // Since STUDIO-953 the task hands each observation over on its own, immediately after its
+        // head is re-read, so the first tick is TWO hand-backs. Waking here does not preempt the
+        // tick, so the task's whole tick (both hand-backs) runs before it sleeps for the interval;
+        // the sleep below parks this task so the paused clock can advance at all.
         done.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         signal.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 
-        let seen = seen.lock().expect("seen lock");
+        let seen = seen.lock().expect("seen lock").clone();
+        let boundaries = boundaries.lock().expect("boundaries lock").clone();
         assert!(!seen.is_empty(), "the task never handed a tick back");
-        // Since STUDIO-953 the task hands each observation over on its own, immediately after its
-        // head is re-read, so a tick is a run of single-observation hand-backs rather than one
-        // batch. The coordinates, and their order, are unchanged.
-        let handed: Vec<PrCoord> = seen
-            .iter()
-            .take(2)
-            .flat_map(|batch| batch.iter().map(|o| o.pr.clone()))
-            .collect();
+        // Slice to the tick's END, not a fixed count: `take(2)` would hide a third hand-back in
+        // the same tick, which is exactly what this test claims cannot happen.
+        let end = boundaries.get(1).copied().unwrap_or(seen.len());
+        let handed: Vec<PrCoord> = seen[..end].iter().flatten().map(|o| o.pr.clone()).collect();
         assert_eq!(
             handed,
             vec![coord(12), coord(13)],
@@ -2922,6 +3003,7 @@ mod tests {
         let total = budget + 5;
         let watched: Vec<PrCoord> = (0..total).map(|n| coord(n as i64 + 1)).collect();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
         let signal = CancelSignal::new();
         let deps = ReviewWatchDeps {
@@ -2931,6 +3013,7 @@ mod tests {
             sink: Arc::new(FakeSink {
                 watched: watched.clone(),
                 seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
                 done: Arc::clone(&done),
                 ..FakeSink::default()
             }),
@@ -2943,14 +3026,20 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 
         let ticks = seen.lock().expect("seen lock").clone();
+        let boundaries = boundaries.lock().expect("boundaries lock").clone();
         assert!(
-            ticks.len() >= 2,
+            boundaries.len() >= 2,
             "expected at least two ticks, got {}",
-            ticks.len()
+            boundaries.len()
         );
-        // Since STUDIO-953 a tick is a run of single-observation hand-backs, not one batch: the
-        // first `budget` calls are its whole budget.
-        let first_tick: Vec<&PrObservation> = ticks.iter().take(budget).flatten().collect();
+        // Since STUDIO-953 a tick is a run of single-observation hand-backs, not one batch, so a
+        // tick boundary is no longer visible by counting to `budget` — the FakeSink records one at
+        // the start of each tick (`watched` is called exactly once per tick), and the first tick is
+        // the slice between the first two boundaries. Halving the budget reds this.
+        let first_tick: Vec<&PrObservation> = ticks[boundaries[0]..boundaries[1]]
+            .iter()
+            .flatten()
+            .collect();
         assert_eq!(
             first_tick.len(),
             budget,
@@ -3141,14 +3230,18 @@ mod tests {
         async fn watched(&self) -> Vec<PrCoord> {
             self.watched.clone()
         }
-        async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
-            let report = self
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let (report, left) = self
                 .orch
                 .lock()
                 .expect("orchestrator lock")
-                .handle_review_sweep(&observed);
+                .handle_review_sweep_slots(&observed, slots);
             self.done.notify_one();
-            report
+            (report, left)
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
@@ -3369,20 +3462,24 @@ mod tests {
         async fn watched(&self) -> Vec<PrCoord> {
             self.watched.clone()
         }
-        async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
             for obs in &observed {
                 self.events
                     .lock()
                     .expect("events lock")
                     .push(format!("sweep:{}", obs.pr.number));
             }
-            let report = self
+            let (report, left) = self
                 .orch
                 .lock()
                 .expect("orchestrator lock")
-                .handle_review_sweep(&observed);
+                .handle_review_sweep_slots(&observed, slots);
             self.done.notify_one();
-            report
+            (report, left)
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
@@ -3491,6 +3588,110 @@ mod tests {
         assert!(
             !watch_row(&guard, 12, "bob").requested_sha.is_empty(),
             "the round must be recorded as requested, not silently dropped"
+        );
+    }
+
+    /// A sink running the real control decision and then simulating the just-dispatched review
+    /// worker exiting before the next observation is handed over — the seam sol reproduced on #189.
+    /// The control task processes that exit between hand-backs, so a budget recomputed per hand-back
+    /// would see the slot as free and let one tick exceed `max_concurrent`.
+    struct WorkerExitSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        /// One message per hand-back, so a test can await the tick without busy-waiting (which
+        /// would stop tokio's paused clock from advancing to the watcher's poll interval).
+        handed: tokio::sync::mpsc::UnboundedSender<()>,
+        /// Reviews the control task dispatched across the tick.
+        dispatched: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for WorkerExitSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(
+            &self,
+            observed: Vec<PrObservation>,
+            slots: Option<i64>,
+        ) -> (ReviewSweepReport, i64) {
+            let mut orch = self.orch.lock().expect("orchestrator lock");
+            let (report, left) = orch.handle_review_sweep_slots(&observed, slots);
+            if report.dispatched > 0 {
+                // The worker just dispatched exits before the next hand-back.
+                orch.running.clear();
+            }
+            drop(orch);
+            *self.dispatched.lock().expect("dispatched lock") += report.dispatched;
+            let _ = self.handed.send(());
+            (report, left)
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// The daemon-wide dispatch budget is counted ONCE per watcher tick, not once per observation.
+    /// Four due pull requests at `max_concurrent = 1`, with the dispatched worker exiting between
+    /// hand-backs, must still dispatch exactly one review: the slot is spent for the tick. This is
+    /// the shape production actually uses (`sink.sweep(vec![fresh])` per observation), which the
+    /// batched [`the_daemon_wide_concurrency_cap_bounds_one_tick`] no longer exercises.
+    ///
+    /// Mutation: drop the `slots` carry in `run_review_watch_task` (pass `None` every time) and this
+    /// reds with 4 against 1.
+    #[tokio::test(start_paused = true)]
+    async fn the_daemon_wide_cap_bounds_a_tick_of_single_observation_sweeps() {
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "bob", "carol", "dave"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 1;
+        for n in 12..16 {
+            introduce(&o, row(n, "bob"));
+        }
+        let (handed, mut hand_backs) = tokio::sync::mpsc::unbounded_channel();
+        let total = Arc::new(Mutex::new(0usize));
+        let sink = Arc::new(WorkerExitSink {
+            watched: (12..16).map(coord).collect(),
+            orch: Mutex::new(o),
+            handed,
+            dispatched: Arc::clone(&total),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob", "carol", "dave"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        // All four observations of the first tick are handed over one at a time; wait for the tick
+        // to complete before cancelling, bounded so a never-firing implementation reds rather than
+        // hangs.
+        let whole_tick = async {
+            for _ in 0..4 {
+                if hand_backs.recv().await.is_none() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, whole_tick)
+            .await
+            .expect("the watcher never handed the whole tick back");
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        assert_eq!(
+            *total.lock().expect("dispatched lock"),
+            1,
+            "a worker exiting mid-tick must not replenish the tick's dispatch budget"
+        );
+        let guard = sink.orch.lock().expect("orchestrator lock");
+        assert_eq!(
+            watch_row(&guard, 12, "bob").requested_sha,
+            format!("{:040}", 12),
+            "the one dispatch the budget allowed is the first pull request"
+        );
+        assert!(
+            watch_row(&guard, 13, "bob").requested_sha.is_empty(),
+            "the round past the spent budget must stay un-dispatched, re-considered next tick"
         );
     }
 }

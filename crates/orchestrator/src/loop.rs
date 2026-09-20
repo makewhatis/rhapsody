@@ -352,7 +352,11 @@ pub enum Event {
     /// together or the F-DUP duplicate dispatch comes back through the gap.
     ReviewSweep {
         observed: Vec<crate::prstate::PrObservation>,
-        reply: oneshot::Sender<crate::reviewwatch::ReviewSweepReport>,
+        /// The daemon-wide dispatch budget this hand-back may spend: `None` on a tick's first
+        /// hand-back so the control task counts it, `Some(left)` on every later one so a tick
+        /// spends one budget (STUDIO-953).
+        slots: Option<i64>,
+        reply: oneshot::Sender<(crate::reviewwatch::ReviewSweepReport, i64)>,
     },
     /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
     /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
@@ -671,8 +675,12 @@ impl Orchestrator {
             Event::ReviewWatchList { reply } => {
                 let _ = reply.send(self.review_watch_coords());
             }
-            Event::ReviewSweep { observed, reply } => {
-                let _ = reply.send(self.handle_review_sweep(&observed));
+            Event::ReviewSweep {
+                observed,
+                slots,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_review_sweep_slots(&observed, slots));
             }
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
