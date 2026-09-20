@@ -1585,6 +1585,69 @@ mod tests {
             Some("1")
         );
     }
+
+    /// STUDIO-950: the capacity line must report the pool the draw beside it USED. With
+    /// `agent.max_concurrent_reviews` set, a ticketless review spends the review pool, not the
+    /// implementation one — so a daemon exactly at its implementation cap logged
+    /// `max_concurrent=1 running=2`, a line that reads as an overrun where nothing overran. It is
+    /// the very line the ticket quotes as the incident's evidence, and `review_pool_holders`
+    /// already makes this argument on the review side.
+    ///
+    /// The total is not dropped, only moved: `live_runs` carries it, and the two fields are equal
+    /// on every install that never sets the key (the control below).
+    ///
+    /// Mutation check: restore `running = self.running.len()` in `log_capacity_hold` and the first
+    /// assertion reds (`Some("1")` vs `Some("0")`).
+    #[test]
+    fn the_capacity_line_reports_the_implementation_pool_not_every_live_run() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+        ];
+
+        let (_got, events) = capture_events(|| o.select_dispatch(input));
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("running").map(String::as_str),
+            Some("0"),
+            "the line must name the implementation pool the draw used, not the review on its own pool"
+        );
+        assert_eq!(
+            ev.fields.get("live_runs").map(String::as_str),
+            Some("1"),
+            "the total is beside it, not lost"
+        );
+        assert_eq!(
+            ev.fields.get("max_concurrent").map(String::as_str),
+            Some("1")
+        );
+
+        // Control: the key unset — every install that never writes it — keeps the two equal, so the
+        // line is byte-identical to before STUDIO-950 apart from the additive `live_runs`.
+        let mut unset = orch_for_select(1, HashMap::new(), None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        let (_g, unset_events) = capture_events(|| {
+            unset.select_dispatch(vec![issue("1", "A-1", "Todo"), issue("2", "A-2", "Todo")])
+        });
+        let ev = unset_events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(ev.fields.get("live_runs").map(String::as_str), Some("1"));
+    }
+
     // STUDIO-949 round 7: a deliberate hold is NOT a capacity casualty, and the log must not say it
     // is. With a seat taken and a held candidate in the unexamined tail, reverting the `continue` in
     // the capacity branch pushes the held ticket into the tally, so the line blames the cap for a
