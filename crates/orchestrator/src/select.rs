@@ -1666,6 +1666,71 @@ mod tests {
         );
     }
 
+    /// **STUDIO-956, at the multi-project ladder.** The single-project test above exercises the
+    /// active guard at `select.rs:177`; this is the pass a `projects:` install actually runs, and
+    /// without a test of its own that half of the author-side bound can be deleted with the whole
+    /// suite green — a `projects:` install regresses STUDIO-170 and nothing notices.
+    #[test]
+    fn select_dispatch_multi_refuses_an_author_redispatch_at_the_adjudication_threshold() {
+        let mut o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                adjudicate_after_rounds: 3,
+                ..rhapsody_config::teams::Review::default()
+            },
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        let pr = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        let linked = || rhapsody_core::LinkedPRRef {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            merged: false,
+        };
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&crate::prstate::PrCoord::new("o", "r", 7)),
+            3 * o.reviewers_per_round(),
+        );
+
+        let input = tag_for(
+            0,
+            vec![
+                {
+                    // A summons newer than the activity, so `pr_suppressed` does NOT stop it...
+                    let mut i = issue("1", "A-1", "In Progress");
+                    i.linked_pr = true;
+                    i.linked_prs = Some(vec![linked()]);
+                    i.latest_pr_activity_at = Some(pr);
+                    i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                    i
+                },
+                {
+                    // ...while a linked pull request with budget left still dispatches.
+                    let mut i = issue("2", "A-2", "In Progress");
+                    i.linked_pr = true;
+                    i.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+                        number: 8,
+                        ..linked()
+                    }]);
+                    i.latest_pr_activity_at = Some(pr);
+                    i.latest_summon_at = Some(pr + ChronoDuration::hours(1));
+                    i
+                },
+            ],
+        );
+        let ids = picked_ids(&o.select_dispatch_multi(input));
+        assert!(
+            !ids.contains("1"),
+            "A-1's pull request has spent its shared budget; the multi ladder must not re-dispatch it"
+        );
+        assert!(
+            ids.contains("2"),
+            "A-2's pull request has budget left → dispatched (the guard is per pull request)"
+        );
+    }
+
     // Mirrors Go `TestSelectDispatchMultiPerStateCapIsGlobal`.
     #[test]
     fn select_dispatch_multi_per_state_cap_is_global() {

@@ -3764,6 +3764,35 @@ mod tests {
         );
     }
 
+    /// **A decided pull request refuses the author even below the threshold.** A settled decision is
+    /// itself a reason to stop the loop, so `author_round_budget_spent` reads the ledger as well as
+    /// the counter. The two agree today — a decision is only ever recorded at or above the threshold,
+    /// which is exactly why dropping the ledger half of the predicate leaves every other test green.
+    #[test]
+    fn a_settled_decision_refuses_the_author_side_below_the_threshold() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        let iss = author_issue("STUDIO-170", 12);
+        // One round charged — below the threshold of three — but the manager has already escalated.
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 1,
+                findings: vec![],
+                reason: "needs a human".to_string(),
+            },
+        );
+
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "a decided pull request stops the author half even below the threshold"
+        );
+    }
+
     /// **A decision is never made over an in-flight AUTHOR run.** The counter is charged at
     /// DISPATCH, so the summoned author's run is live from the instant its charge lands — and with
     /// the loop alternating review→author, every EVEN threshold is crossed by that dispatch. The
@@ -3969,6 +3998,43 @@ mod tests {
              still holds the merge back"
         );
         assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// The other half of the README's claim: a settled `ship` whose rows ARE all approved at the head
+    /// still reaches `report.merge`. The decision stops the loop; it does not stop a pull request the
+    /// gates have cleared. Without this the `propose_auto_merge` call in the settled-decision branch
+    /// can be deleted with the whole suite green — the sibling test above only pins the refusal.
+    #[test]
+    fn a_settled_ship_verdict_still_proposes_the_merge_once_every_row_approved() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0, "a settled decision arms nothing");
+        assert!(
+            report.adjudicate.is_empty(),
+            "a settled decision must not be re-asked"
+        );
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_A.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "a shipped pull request whose rows are all approved still reaches the merge gate"
+        );
     }
 
     /// The escalation carries the open findings, so a human gets the specific findings rather than
