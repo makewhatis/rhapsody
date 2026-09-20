@@ -1244,9 +1244,18 @@ The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResu
 never the all-default miss), so the selection pass can log it once per ticket rather than per tick,
 and the console board can read a held card as deliberately held rather than mysteriously idle. A
 ticket that has never run has no worklist row, so the board synthesizes a Queued card for it — a hold
-that is visible nowhere would be the same silent stall the label exists to end. The reconciliation
-sweep never reports it as a stall, by construction: a held ticket never runs, so it never arms a
-watch row for the sweep to see.
+that is visible nowhere would be the same silent stall the label exists to end.
+
+The refusal is also enforced on the paths that do not go through `eligible()`, because each would
+otherwise reach an agent: the review-reopen ladder refuses it in `review_reopen_eligible()`, the
+review-adoption sweep refuses it in `adopt_verdict`, an in-flight retry re-reads the ticket's current
+labels so a label added while it was backing off releases it, and the ticketless review watcher
+refuses to dispatch a round for a watch row whose origin ticket is currently held (the row is left
+armed, so a later label removal still gets the review it is owed). The reconciliation sweep is told
+the same state explicitly: a watch row whose origin ticket is held is dropped before the rules can
+date it, because a ticket labelled *after* it ran does have a row. The board reads a held ticket that
+has run as held too, independently of the historical run status, while the row stays openable on its
+real run.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
