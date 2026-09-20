@@ -328,14 +328,14 @@ pub(crate) struct IssueStatusKey {
 /// one vocabulary and a client reads a bucket with the code it already has for a row. The array is
 /// ordered by the key, so the payload is stable for a given store.
 ///
-/// `held_for_human` (STUDIO-949) is emitted only while the dispatcher holds at least one
-/// non-live `rhapsody:human` ticket, and it counts exactly the tickets the store buckets do NOT:
-/// [`handle_issue_counts`] drops each held ticket's stored row before bucketing, because the
-/// console paints a held ticket "queued" (a deliberate hold, not its lifecycle), and the client
-/// adds this count to `queued`. The daemon is the only side that can tell a held ticket apart from
-/// the aggregate buckets, which is why the increment is not the client's. Omitted when zero on the
-/// same terms as `lifecycle` and `review_run`, so a daemon with no hold serves the pre-STUDIO-949
-/// payload byte-for-byte.
+/// `held_for_human` (STUDIO-949) is emitted only while the dispatcher holds at least one non-live
+/// `rhapsody:human` ticket for which the run store has NO stored row — the never-ran hold, for
+/// which the console synthesizes a Queued card. It is deliberately NOT every non-live hold: a held
+/// ticket that HAS run keeps its stored row's bucket (its lane), so it is already counted there and
+/// [`handle_issue_counts`] never removes it. The daemon is the only side that can join the store's
+/// rows to the snapshot's hold set, which is why the increment is not the client's. Omitted when
+/// zero on the same terms as `lifecycle` and `review_run`, so a daemon with no such hold serves the
+/// pre-STUDIO-949 payload byte-for-byte.
 ///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
 pub(crate) fn issue_counts_response(

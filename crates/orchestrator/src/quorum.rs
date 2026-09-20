@@ -1307,6 +1307,29 @@ impl Orchestrator {
         if !self.quorum_enabled() || re.identity.is_empty() {
             return None;
         }
+        // A `rhapsody:human` parent is refused here too (STUDIO-949 round 7). This is a DISPATCH
+        // path — the fan-out mints review tickets and wakes reviewers — and it does not go through
+        // `eligible()`, so without this a held parent that HAD run (parked in review, then labelled)
+        // still fanned out: the hold cannot reach the review ticket, which is NEW and unlabelled, and
+        // an agent is dispatched onto the held ticket's pull request through it. Read from the same
+        // current hold set the ticketless watcher's origin gate and the auto-merge gate read, because
+        // the run's own `issue` is the dispatch-time snapshot and cannot carry a label added while
+        // the run was active. The candidacy bound documented on
+        // [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger) applies to this reader as it does to
+        // those two: a ticket the candidate query no longer returns is not in this set.
+        let held: HashSet<String> = self
+            .human_holds
+            .held()
+            .into_iter()
+            .map(|h| h.issue_identifier.to_ascii_lowercase())
+            .collect();
+        if held.contains(&re.issue.identifier.to_ascii_lowercase()) {
+            tracing::debug!(
+                issue = %re.issue.identifier,
+                "teams quorum: the handed-off ticket is held for a human; no review is requested"
+            );
+            return None;
+        }
         // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
         // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
         // and, because the parent would then stay unmarked, fail again on the next handoff, and the
@@ -2964,6 +2987,31 @@ mod tests {
         let req = request(&["bob"]);
         let (tr, _) = run_handoffs(vec![req.clone(), req], &[""]).await;
         assert_eq!(tr.create_issue_calls().len(), 1);
+    }
+
+    // STUDIO-949 round 7 — the TICKET-mode sibling of the ticketless watcher's held-origin gate.
+    // A held parent that HAD run (parked in review, then labelled) must not fan out a review: the
+    // fan-out mints a NEW, unlabelled review ticket and dispatches an agent at the held ticket's pull
+    // request, and the hold cannot reach that new ticket. `is_human` on `re.issue` cannot catch it —
+    // that issue is the dispatch-time snapshot, taken before the label was added — so the gate reads
+    // the current hold set, exactly as the watcher and the auto-merge gate do.
+    //
+    // MUTATION: delete the held-identifier gate from `plan_quorum` and this reds (`plan_quorum`
+    // returns `Some`, and `run_handoffs` would create a review ticket for the held parent).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_human_held_parent_does_not_fan_out_a_review() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        o.record_quorum_state(std::iter::once(&marked_parent()));
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "MT-1".to_string(),
+            title: "do the thing".to_string(),
+            project: String::new(),
+        });
+        assert!(
+            o.plan_quorum(&running_entry(marked_parent(), "alice"))
+                .is_none(),
+            "a held parent must not fan out a review"
+        );
     }
 
     // ── the retry and its exhaustion (STUDIO-822, defect 2) ─────────────────────────────────────

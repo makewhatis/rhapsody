@@ -153,7 +153,7 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * the two flags mark different subjects, the daemon sets them on different rows, and only the live
  * arm is shared between them.
  *
- * The fifth rule is `heldForHuman` (STUDIO-949), and it names the word deliberately. A
+ * The fifth rule is `heldNeverRan` (STUDIO-949), and it names the word deliberately. A
  * `rhapsody:human` ticket that has NEVER RUN reaches this function as a synthetic `waiting` row,
  * whose outcome maps to `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong:
  * the dispatcher has deliberately refused it and no agent will ever run it, so painting it
@@ -161,27 +161,34 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * board's own chip styling exists to prevent. It reads `queued` — waiting for a person rather than
  * mysteriously idle — because the hold, not the run that never happened, is the whole fact.
  *
- * The rule is scoped to a row with NO resolved `lifecycle` (STUDIO-949 round 5). A hold can OUTLIVE
- * a run — a ticket parked in review, then labelled — and `mergeJobs` says in as many words that
- * "the real run still decides the lane": the card belongs in Review, wearing its `held for a human`
+ * The rule is scoped to a hold with NOTHING RAN (STUDIO-949 rounds 5-7). A hold can OUTLIVE a run —
+ * a ticket parked in review, then labelled — and `mergeJobs` says in as many words that "the real
+ * run still decides the lane": the card belongs in Review, wearing its `held for a human`
  * sub-label, because the daemon is deferring the review rounds that ticket is owed. Returning
  * `queued` there moved the card out of Review and contradicted the watcher, which is at that same
  * moment holding the review. So the hold's own word only applies where there is no run to name the
- * lane; with a lifecycle resolved, the run wins and the hold rides as the sub-label. The caller
- * passes `heldForHuman` only for a row it has already keyed to a current hold (`mergeJobs`), so this
- * is about the LANE, not about whether the hold is visible.
+ * lane.
+ *
+ * "Nothing ran" is NOT "no lifecycle resolved" (round 7). `lifecycleByIssue` drops every row the
+ * daemon could not answer, and it answers off a TTL cache refreshed a bounded number of ids per
+ * lookup — a daemon that just restarted serves most of its rows with no `lifecycle`. An unresolved
+ * lifecycle means "the daemon could not ask", not "this ticket never ran", and a row in that gap
+ * can carry a real FAILED run: painting it `queued` erases the operator's cue that an agent
+ * flailed, and splits the lane from the strip that scores the same ticket through a bucket. The
+ * caller passes `heldNeverRan` only for a row that is a current hold AND has no real run at all
+ * (`JobRow.runId === 0`), so an unresolved lifecycle never reaches this arm.
  */
 export function consoleJobStatus(
   status: string,
   lifecycle?: string,
   reviewTicket = false,
   reviewRun = false,
-  heldForHuman = false,
+  heldNeverRan = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
   // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
-  // hold on a ticket that never ran (no lifecycle) speaks for the lane itself. See the doc above.
-  if (heldForHuman && lifecycle === undefined) return "queued";
+  // hold on a ticket that never ran speaks for the lane itself. See the doc above.
+  if (heldNeverRan) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
   // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
@@ -668,12 +675,17 @@ export function buildConsoleJobs(
     const ticket = lifecycles.get(job.issue);
     const reviewTicket = reviewTickets.has(job.issue);
     const reviewRun = reviewRuns.has(job.issue);
+    // "Held for a human" speaks for the LANE only when there is no run to name it (STUDIO-949):
+    // `mergeJobs` sets `runId` to the newest REAL segment's id and 0 for a synthetic hold row, so
+    // 0 is the honest "nothing ran" — never "the daemon could not resolve a lifecycle", which a cold
+    // cache serves for most rows. See `consoleJobStatus`.
+    const heldNeverRan = (job.heldForHuman ?? false) && job.runId === 0;
     const status = consoleJobStatus(
       job.status,
       ticket?.lifecycle,
       reviewTicket,
       reviewRun,
-      job.heldForHuman ?? false,
+      heldNeverRan,
     );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row

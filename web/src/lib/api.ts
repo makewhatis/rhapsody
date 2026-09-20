@@ -337,12 +337,13 @@ export interface IssueStatusBucket {
 export interface IssueCountsResponse {
   issues: number;
   buckets: IssueStatusBucket[];
-  // STUDIO-949: how many non-live `rhapsody:human` tickets the dispatcher is holding. A held
-  // ticket reads "queued" on the console (a deliberate hold, not a fault), and the daemon has
-  // already DROPPED its stored row from the buckets — so this is not a duplicate of anything above
-  // and the strip adds it to `queued`. It is the daemon's count, not `state.held_for_human.length`,
-  // because only the daemon can tell a hold that never ran from one that already did; see
-  // `consoleStoreCounts`. Absent when the daemon holds nothing.
+  // STUDIO-949: how many non-live `rhapsody:human` tickets the dispatcher is holding for which the
+  // run store has NO stored row — the never-ran hold, which reads "queued" on the console (a
+  // deliberate hold, not a fault) and which no bucket carries. A held ticket that HAS run keeps its
+  // stored row's bucket and is NOT included here, so this is not a duplicate of anything above and
+  // the strip adds it to `queued`. It is the daemon's count, not `state.held_for_human.length`,
+  // because only the daemon can join its bucket rows to the snapshot's hold set; see
+  // `consoleStoreCounts`. Absent when the daemon holds nothing with no stored row.
   held_for_human?: number;
 }
 

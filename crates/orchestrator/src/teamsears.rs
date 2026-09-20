@@ -1297,6 +1297,17 @@ async fn file_review(
             iss.identifier
         ));
     }
+    // The absolute human hold (STUDIO-949 round 7). `file_review` is a DISPATCH path — it mints a
+    // review ticket and wakes a reviewer — and its sibling `confirm_assignment` refuses a held
+    // ticket thirty lines below, so the room's explicit "review this" must answer the same way as
+    // its "assign this" rather than the opposite. `iss` here is this cycle's tracker fetch, so its
+    // labels are CURRENT, unlike `plan_quorum`'s dispatch-time snapshot.
+    if crate::teams::is_human(iss) {
+        return Done::say(format!(
+            "{} is held for a human, so I do not ask for a review of it.",
+            iss.identifier
+        ));
+    }
     if !cycle.states.is_in_review(iss) {
         return Done::say(format!(
             "{} is in `{}`, not a review state — nothing has been handed off yet, so there is no \
@@ -3431,6 +3442,56 @@ mod tests {
         assert!(
             fx.tracker.add_label_calls().is_empty(),
             "a human-held ticket earns no identity label: {:?}",
+            fx.tracker.add_label_calls()
+        );
+        assert!(
+            fx.reply_bodies()
+                .iter()
+                .any(|b| b.contains("held for a human")),
+            "{:?}",
+            fx.reply_bodies()
+        );
+    }
+
+    /// **The room never files a review for a human-held ticket.** `file_review` is the other
+    /// DISPATCH path the room owns, and its sibling `confirm_assignment` now refuses the hold, so an
+    /// explicit "review this" must not file a review ticket (and wake a reviewer) on a ticket only a
+    /// person may touch. Refused before any write, so the parent stays unmarked too.
+    #[tokio::test]
+    async fn the_room_never_files_a_review_for_a_human_held_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("Jimmy, someone want to review STUDIO-654?");
+        let t = teams(&["alice", "jimmy"], ManagerMode::Labels);
+        let mut iss = in_review("STUDIO-654");
+        iss.labels = Some(vec![crate::teams::HUMAN_LABEL.to_string()]);
+        let issues = vec![iss];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+            }))),
+        );
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert_eq!(report.filed, 0, "{:?}", fx.reply_bodies());
+        assert!(
+            fx.tracker.create_issue_calls().is_empty(),
+            "a human-held ticket earns no review ticket: {:?}",
+            fx.tracker.create_issue_calls()
+        );
+        assert!(
+            fx.tracker.add_label_calls().is_empty(),
+            "and no marker is written on the parent: {:?}",
             fx.tracker.add_label_calls()
         );
         assert!(

@@ -346,7 +346,8 @@ serves the same per-row facts `GET /api/v1/history/issues` already serves, group
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
              {"outcome": "completed", "review_run": true, "count": 7},
-             {"outcome": "running", "count": 1}]}
+             {"outcome": "running", "count": 1}],
+ "held_for_human": 2}
 ```
 
 Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
@@ -355,6 +356,14 @@ as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@review
 `id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
 sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
 different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+
+**A hold the store has no row for is reported separately** (STUDIO-949). `held_for_human` counts the
+non-live `rhapsody:human` tickets the dispatcher is holding for which the run store has NO stored
+row — the never-ran hold, for which the console synthesizes a Queued card and which no bucket could
+otherwise carry. It is emitted only while that count is positive, so a daemon with no such hold
+serves the pre-STUDIO-949 payload byte-for-byte. A held ticket that HAS run keeps its stored row's
+bucket (its lane), so it is deliberately not reclassified and not included here; `issues` remains
+the number of issues the buckets cover and the sum of their counts.
 
 What it costs the tracker is stated rather than left to be found, and this is the first caller that
 asks the daemon's lifecycle memo about more ids than one lookup will refresh. A lookup refreshes at
@@ -1237,7 +1246,7 @@ label is the entire opt-in: a ticket without it behaves byte-identically to toda
 | dispatch | n/a | refused in `eligible()` and, on the review-reopen ladder that bypasses it, in `review_reopen_eligible()` — both refuse, Teams on or off |
 | auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever), and reported as a hold from that pass |
 | triage | n/a | never assigned an identity, never spending a manager turn |
-| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key (a Backlog dependent included when its project has `dependency_mode` enabled — auto-promote is the only pass that ever sees it) |
+| visibility | n/a | a once-per-ticket INFO log; `/api/v1/state`'s `held_for_human` key, and the counts endpoint's `held_for_human` field for the never-ran hold the buckets cannot carry (a Backlog dependent included when its project has `dependency_mode` enabled — auto-promote is the only pass that ever sees it) |
 | Teams | n/a | **not** gated on it — the refusal holds on any install |
 
 The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,
@@ -1251,7 +1260,11 @@ otherwise reach an agent: the review-reopen ladder refuses it in `review_reopen_
 review-adoption sweep refuses it in `adopt_verdict`, an in-flight retry re-reads the ticket's current
 labels so a label added while it was backing off releases it, and the ticketless review watcher
 refuses to dispatch a round for a watch row whose origin ticket is currently held (the row is left
-armed, so a later label removal still gets the review it is owed). A held origin ticket also holds
+armed, so a later label removal still gets the review it is owed). The **ticket-mode** review path
+is its sibling and refuses for the same reason: `plan_quorum` does not fan out a review quorum for a
+held parent, and the room's `file_review` answers an explicit "review this" the way its
+`confirm_assignment` answers "assign this" — both refuse, so a held parent cannot mint a new,
+unlabelled review ticket that no hold on the parent could reach. A held origin ticket also holds
 back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
 would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
 finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
@@ -1259,7 +1272,17 @@ explicitly: a watch row whose origin ticket is held is dropped before the rules 
 a ticket labelled *after* it ran does have a row. The board reads a held ticket that has run as held
 too, independently of the historical run status, and keeps it in the run's lane (Review, with a
 "held for a human" sub-label) while the row stays openable on its real run; the hold key, the board
-and the Now strip all count such a ticket once, in that lane.
+and the Now strip all count such a ticket once, in that lane. The board's word for a hold keys on
+whether the ticket ever RAN (the row's own run), not on whether the tracker resolved a lifecycle: a
+cold lifecycle cache serves most rows without one, and a held ticket in that gap can still carry a
+real failed run, which must keep saying `failed` rather than being repainted `queued`.
+
+**How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
+dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the
+adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and a ticket that
+never becomes a candidate is never dispatched either. The ticketless review watcher, the
+reconciliation sweep, the auto-merge gate and the console's `held_for_human` key instead read
+dispatcher state built as the selection pass walks the candidate fetch (active ∪ review states,
 
 **How far the hold's reach extends is bounded by the candidate poll.** The label that REFUSES
 dispatch is read from the candidate issue itself, so `eligible()`, the reopen ladder and the

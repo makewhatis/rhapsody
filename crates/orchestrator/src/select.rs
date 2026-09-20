@@ -1214,6 +1214,69 @@ mod tests {
         );
     }
 
+    // STUDIO-949 round 7: a deliberate hold is NOT a capacity casualty, and the log must not say it
+    // is. With a seat taken and a held candidate in the unexamined tail, reverting the `continue` in
+    // the capacity branch pushes the held ticket into the tally, so the line blames the cap for a
+    // hold that would be refused with every seat free — the two causes an operator most needs to
+    // tell apart. Observed at `not_considered`; the human-hold LOG still fires, so the decision is
+    // "reported as a hold", not "not reported".
+    //
+    // MUTATION: delete the `continue` from the capacity branch (leaving `held.push`) and this reds
+    // (`not_considered` becomes "A-2, A-3") while every other select test stays green.
+    #[test]
+    fn a_capacity_hold_never_counts_a_human_held_ticket() {
+        let o = orch_for_select(1, HashMap::new(), None);
+        let mut human = issue("2", "A-2", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let input = vec![issue("1", "A-1", "Todo"), human, issue("3", "A-3", "Todo")];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(ids(&got), vec!["A-1"], "cap 1 admits exactly one");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-3"),
+            "only the genuine casualty; the deliberate hold is not billed to the cap"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
+    }
+
+    // The same decision on the multi-project ladder — the pass a `projects:` install actually runs,
+    // with its own `continue` to lose.
+    //
+    // MUTATION: delete the `continue` from the multi ladder's capacity branch and this reds
+    // (`not_considered` becomes "A-2, A-3").
+    #[test]
+    fn the_multi_project_capacity_hold_never_counts_a_human_held_ticket() {
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], None);
+        let mut human = issue("2", "A-2", "Todo");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        let input = tag_for(
+            0,
+            vec![issue("1", "A-1", "Todo"), human, issue("3", "A-3", "Todo")],
+        );
+        let (got, events) = capture_events(|| o.select_dispatch_multi(input));
+        assert_eq!(got.len(), 1, "global cap 1");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line on the multi ladder");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-3"),
+            "only the genuine casualty; the deliberate hold is not billed to the cap"
+        );
+        assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
+    }
+
     // The diagnostic is for a pass that ran OUT of slots, not for every pass: a board with room to
     // spare must stay quiet, or the line joins the background it exists to be noticed against.
     #[test]

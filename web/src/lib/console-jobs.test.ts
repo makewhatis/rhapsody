@@ -120,17 +120,15 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("completed", "some_future_state")).toBe("review");
   });
 
-  // STUDIO-949 round 5 — a hold can OUTLIVE a run (a ticket parked in review, then labelled), and
-  // the LANE stays the run's: the daemon is holding the review rounds that ticket is owed, so its
-  // card belongs in Review wearing the hold as a sub-label, not repainted Queued.
+  // STUDIO-949 — a hold on a ticket that never ran reaches this function as a synthetic `waiting`
+  // row, whose outcome would otherwise wear the BLOCKER's word. The hold, not the run that never
+  // happened, is the whole fact, so it reads `queued`. "Never ran" is decided by the caller from
+  // the row's own run (absence of one), never from whether the tracker resolved a lifecycle.
   //
-  // MUTATION: restore the unconditional `if (heldForHuman) return "queued"` and the first two
-  // assertions red (`expected 'queued' to be 'review'`).
-  it("keeps a held ticket's run lane, and speaks for the lane only when nothing ran", () => {
-    expect(consoleJobStatus("completed", "in_review", false, false, true)).toBe("review");
-    expect(consoleJobStatus("completed", "done", false, false, true)).toBe("done");
-    // A hold that never ran carries no lifecycle, and there the hold is the whole fact.
+  // MUTATION: delete the `heldNeverRan` arm and this reds (`expected 'blocked' to be 'queued'`).
+  it("names a hold on a never-run ticket queued rather than blocked", () => {
     expect(consoleJobStatus("waiting", undefined, false, false, true)).toBe("queued");
+    expect(consoleJobStatus("waiting", "", false, false, true)).toBe("queued");
   });
 });
 
@@ -1425,8 +1423,8 @@ describe("a held-for-human ticket through the production chain (STUDIO-949)", ()
   // `buildConsoleJobs` (a `lifecycle`-bearing `IssueRun`), because asserting on the `MergedRow`
   // alone cannot see the word the pill paints.
   //
-  // MUTATION: restore the unconditional `if (heldForHuman) return "queued"` and `status` reds with
-  // `expected 'queued' to be 'review'`.
+  // MUTATION: pass `job.heldForHuman` as the `heldNeverRan` argument (drop the `runId === 0` half)
+  // and `status` reds with `expected 'queued' to be 'review'`.
   it("keeps a held ticket that HAS run in the Review lane, with the hold as its sub-label", () => {
     const state: StateResponse = {
       status: "ok",
@@ -1452,5 +1450,36 @@ describe("a held-for-human ticket through the production chain (STUDIO-949)", ()
     expect(jobs[0].status).toBe("review"); // the real run decides the lane
     expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
     expect(jobs[0].runId).toBe(88); // and the row stays openable on the real run
+  });
+
+  // STUDIO-949 round 7 — "no lifecycle" is NOT "never ran". `lifecycleByIssue` drops every row the
+  // daemon could not answer, and a cold TTL cache serves most rows that way, so a held ticket can
+  // carry a real FAILED run with no resolved state. The hold must not overwrite the run's word with
+  // `queued`: that erases the operator's cue that an agent flailed and splits the lane from the
+  // strip, which scores the ticket through its bucket. The discriminator is the RUN (`runId`), not
+  // the tracker's silence. jimmy's probe is this fixture with `lifecycle` absent and `failed`.
+  //
+  // MUTATION: restore `heldForHuman && lifecycle === undefined` as the guard and `status` reds with
+  // `expected 'queued' to be 'blocked'`.
+  it("does not repaint a held ticket's failed run as queued just because the tracker was silent", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    };
+    const stored = [
+      // No `lifecycle`: the daemon could not resolve one. But the run is real and it failed.
+      issueRow({ id: 88, issue_identifier: "STUDIO-939", outcome: "failed" }),
+    ];
+    const jobs = buildConsoleJobs(mergeJobs(state, stored, [], NOW), stored, undefined, NOW, []);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("blocked"); // the failed RUN's word, not the hold's
+    expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
+    expect(jobs[0].runId).toBe(88); // and it is a real run, not a synthetic hold row
   });
 });
