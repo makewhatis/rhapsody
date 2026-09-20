@@ -831,6 +831,37 @@ mod tests {
         assert_eq!(held[0].issue_identifier, "MT-2");
     }
 
+    // STUDIO-949 round 5 — auto-promote runs on a tick whose candidate fetch FAILED, and that path
+    // returns before either selection ladder calls `HumanHoldLedger::begin_pass` while
+    // `promote_unblocked` still notes the same Backlog dependent. The current hold set must therefore
+    // be unique by identifier on its own: before the dedupe, each outage tick appended another
+    // identical `/api/v1/state.held_for_human` row and the Now strip's `+held_for_human` grew with
+    // it, while the board still had one card.
+    //
+    // MUTATION: revert `HumanHoldLedger::hold` to an unconditional push and this reds (2 rows).
+    #[tokio::test]
+    async fn promote_unblocked_does_not_duplicate_a_backlog_hold_across_ticks() {
+        let mut f = Fake::new();
+        let mut human = backlog_dep("Done");
+        human.labels = Some(vec!["rhapsody:human".into()]);
+        f.blocked_backlog = vec![human];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, _dispatched) = new_promote_orch(Arc::clone(&tr), "dag");
+
+        // Two promote ticks with no `begin_pass` between them — the failed-candidate-fetch shape.
+        o.promote_unblocked().await;
+        o.promote_unblocked().await;
+
+        let held = o.human_holds.held();
+        assert_eq!(
+            held.len(),
+            1,
+            "one Backlog hold per ticket across promote ticks: {held:?}"
+        );
+        assert_eq!(held[0].issue_identifier, "MT-2");
+    }
+
     // Never-run guard (durable): a ticket with a prior run row is NEVER re-promoted (Stop/park stays
     // authoritative), even after clearing o.claimed (restart sim); a never-run sibling with the same
     // cleared blocker IS promoted. Mirrors Go `TestPromoteUnblockedNeverRunGuardDurable`.

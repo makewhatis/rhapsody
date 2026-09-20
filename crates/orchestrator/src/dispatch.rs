@@ -153,6 +153,15 @@ impl HumanHoldLedger {
 
     /// Records a hold and returns whether it is NEWS (the first time this ticket has been announced
     /// this process lifetime). Only a news hold is logged.
+    ///
+    /// The CURRENT set is unique by identifier (STUDIO-949 round 5). It is cleared by
+    /// [`begin_pass`](Self::begin_pass), but that only runs when a selection pass runs: on the
+    /// legacy/top-level tracker path a candidate-fetch ERROR returns before either ladder calls it,
+    /// while `promote_unblocked` still runs and re-notes the same Backlog dependent — so an
+    /// unconditional `push` appended one identical `/api/v1/state.held_for_human` row per outage
+    /// tick, and the Now strip's `+held_for_human` grew with it while the board still had one card.
+    /// A second note for a ticket already held replaces the row (the later note carries the same
+    /// facts; the project slug differs only between the ladders and the Backlog pass).
     pub(crate) fn hold(&self, entry: HeldForHuman) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if st.announced.len() >= HUMAN_HOLD_CAPACITY
@@ -161,7 +170,14 @@ impl HumanHoldLedger {
             st.announced.clear();
         }
         let news = st.announced.insert(entry.issue_identifier.clone());
-        st.held.push(entry);
+        match st
+            .held
+            .iter_mut()
+            .find(|h| h.issue_identifier == entry.issue_identifier)
+        {
+            Some(existing) => *existing = entry,
+            None => st.held.push(entry),
+        }
         news
     }
 
@@ -1243,5 +1259,36 @@ mod tests {
                 "mode={mode:?}: must surface for logging"
             );
         }
+    }
+
+    // STUDIO-949 round 5 — the CURRENT hold set must be unique by identifier across notes that never
+    // had a `begin_pass` between them. `begin_pass` runs only when a selection pass runs; a
+    // candidate-fetch error returns before either ladder clears the set, yet `promote_unblocked`
+    // still notes the same Backlog dependent on every outage tick. Without this the set grows one
+    // identical row per tick and the Now strip's `held_for_human` count inflates.
+    //
+    // MUTATION: revert the find/replace in `hold` to an unconditional `push` and this reds (2 rows).
+    #[test]
+    fn human_hold_set_is_unique_by_identifier_across_notes() {
+        let ledger = HumanHoldLedger::default();
+        let entry = |project: &str| HeldForHuman {
+            issue_identifier: "STUDIO-939".into(),
+            title: "wire the stores".into(),
+            project: project.into(),
+        };
+        assert!(ledger.hold(entry("booch")), "the first note is news");
+        assert!(
+            !ledger.hold(entry("")),
+            "a repeat is not news, so it is not logged again"
+        );
+        assert_eq!(
+            ledger.held().len(),
+            1,
+            "two notes with no begin_pass between them are ONE held ticket: {:?}",
+            ledger.held()
+        );
+        ledger.begin_pass();
+        assert!(ledger.held().is_empty(), "begin_pass still clears the set");
+        assert!(!ledger.hold(entry("booch")), "the announced set survives");
     }
 }
