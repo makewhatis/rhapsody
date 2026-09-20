@@ -1040,13 +1040,12 @@ impl Teams {
     /// select (STUDIO-951), else `None`. The daemon's boot turns this into ONE warning naming both
     /// numbers.
     ///
-    /// Only **selectable** pins are counted: a name that is not on the roster can never be named by
-    /// the selector, so it occupies no reviewer slot and must not make this claim. Counting such a
-    /// name produced a false warning — `reviewers: 1` with `required: [ghost, sol]` and only `sol`
-    /// on the roster warned that a pin was dropped, while selection in fact kept `sol` and dropped
-    /// nothing. Off-roster names get their own diagnostic,
-    /// [`unknown_required_reviewers`](Self::unknown_required_reviewers), so the operator still
-    /// learns about the typo without this count lying.
+    /// Only **on-roster** pins are counted: a name the selector can never name occupies no
+    /// reviewer slot and must not make this claim. Counting such a name produced a false warning —
+    /// `reviewers: 1` with `required: [ghost, sol]` and only `sol` on the roster warned that a pin
+    /// was dropped, while selection in fact kept `sol` and dropped nothing. Off-roster names get
+    /// their own diagnostic, [`unknown_required_reviewers`](Self::unknown_required_reviewers), so
+    /// the operator still learns about the typo without this count lying.
     ///
     /// Selection **clamps** rather than refusing: pins are ranked first and the caller truncates to
     /// `total`, so a list longer than `total` simply drops the tail. That is the safe direction —

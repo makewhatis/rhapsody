@@ -1400,8 +1400,8 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
 /// explicitly required is the worst outcome the ticket names. The warning names both numbers so
 /// the fix (raise `reviewers`, or shorten `review.required`) is obvious, and the two are read from
 /// [`Teams::over_pinned_reviewers`], which knows which path is on, counts duplicates once, and
-/// counts **only selectable** (on-roster) pins — so its numbers are the ones selection would
-/// actually see. An off-roster name is [`report_unknown_required_reviewers`]'s job, not this one's.
+/// counts **only on-roster** pins — so an inert name cannot make it claim a drop that will not
+/// happen. An off-roster name is [`report_unknown_required_reviewers`]'s job, not this one's.
 fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
     let Some(teams) = teams else { return };
     let Some((required, total)) = teams.over_pinned_reviewers() else {
@@ -1420,8 +1420,15 @@ fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
 /// inert — selection can only ever name a roster member — so it silently does nothing, and the
 /// live warning in `rank_reviewers` only fires once a round is actually built. Naming the typo at
 /// boot is how the operator learns before the first pull request arrives.
+///
+/// Gated on an ACTIVE review path like [`report_over_pinned_reviewers`]: with no review path on,
+/// every pin is dead config, so a name that "never reviews anything" is not news and warning about
+/// it would be noise on an installation that never reviews.
 fn report_unknown_required_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
     let Some(teams) = teams else { return };
+    if teams.active_reviewer_count().is_none() {
+        return;
+    }
     let unknown = teams.unknown_required_reviewers();
     if unknown.is_empty() {
         return;
