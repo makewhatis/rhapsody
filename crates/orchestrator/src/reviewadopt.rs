@@ -246,6 +246,17 @@ impl Orchestrator {
         if iss.identifier.is_empty() {
             return Verdict::Skip;
         }
+        // Human-only gate (STUDIO-949). This predicate is the structural sibling of
+        // `review_reopen_eligible`, and it is reached with INVERTED polarity: a `true` reopen answer
+        // means SKIP the adoption (the ladder is about to re-dispatch underneath us). So refusing a
+        // `rhapsody:human` ticket in `review_reopen_eligible` — which we do — makes it `false` here,
+        // and without this gate the ticket would FALL THROUGH to the adoption machinery: a reviewer
+        // introduced, and an agent dispatched at work only a person can do (STUDIO-949 round 3). The
+        // hold is already reported by the selection ladders' review branch, so this path stays
+        // silent like every other Skip.
+        if crate::teams::is_human(iss) {
+            return Verdict::Skip;
+        }
         let Some(eff) = self.eff.as_ref() else {
             return Verdict::Skip;
         };
@@ -797,6 +808,29 @@ mod tests {
                 .expect("parse")
                 .with_timezone(&chrono::Utc),
         );
+
+        assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
+    }
+
+    /// The adoption path's OWN human gate (STUDIO-949 round 3). `adopt_verdict` consults
+    /// `review_reopen_eligible` with INVERTED polarity — `true` there means "the ladder is about to
+    /// reopen this ticket, so do NOT adopt". Gating the human label only inside that predicate
+    /// therefore turns the refusal into an ADOPTION: the ticket falls through and a reviewer is
+    /// introduced for work only a person can do, which is the exact leak the reopen gate was meant
+    /// to close, moved one step along.
+    ///
+    /// `an_orphaned_review_state_ticket_is_adopted` is the live control: the identical fixture
+    /// without the label plans exactly one adoption.
+    ///
+    /// MUTATION: delete the `is_human` gate from `adopt_verdict` and this reds (the ticket is
+    /// adopted). Deleting it from `review_reopen_eligible` alone does not — which is why the gate
+    /// must live on BOTH.
+    #[test]
+    fn a_human_labelled_review_state_ticket_is_not_adopted() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let mut iss = parked("STUDIO-836");
+        iss.labels = Some(vec!["rhapsody:human".to_string()]);
 
         assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
     }

@@ -116,10 +116,16 @@ impl Orchestrator {
                 // publishes nothing.
                 let mut held: Vec<String> = Vec::new();
                 for i in std::iter::once(iss).chain(issues.by_ref()) {
-                    if crate::teams::is_human(&i) {
-                        self.note_human_hold(&i, "");
-                    }
                     if self.is_unworked_candidate(&i, &running, &recovered_claims) {
+                        // The human note takes the SAME filter as the capacity tally (STUDIO-949
+                        // round 3). The tail is dominated by the daemon's own in-flight work, and
+                        // `eligibility` reaches its human gate only AFTER the running/claimed test —
+                        // so noting it unfiltered would report a ticket an agent is RUNNING RIGHT
+                        // NOW as "held for a human" whenever the pool happens to be full, the two
+                        // paths disagreeing about the same ticket at the same instant.
+                        if crate::teams::is_human(&i) {
+                            self.note_human_hold(&i, "");
+                        }
                         held.push(i.identifier);
                     }
                 }
@@ -343,15 +349,17 @@ impl Orchestrator {
                 // (STUDIO-949): a fully-booked pass must still name the deliberate holds.
                 let mut held: Vec<String> = Vec::new();
                 for t in std::iter::once(ti).chain(tagged.by_ref()) {
-                    if crate::teams::is_human(&t.iss) {
-                        let slug = t
-                            .proj
-                            .and_then(|i| eff.projects.get(i))
-                            .map(|p| p.slug.as_str())
-                            .unwrap_or("");
-                        self.note_human_hold(&t.iss, slug);
-                    }
                     if self.is_unworked_candidate(&t.iss, &running, &recovered_claims) {
+                        // See the single-project ladder: the human note shares the capacity
+                        // tally's filter so a ticket with a live run is never reported as held.
+                        if crate::teams::is_human(&t.iss) {
+                            let slug = t
+                                .proj
+                                .and_then(|i| eff.projects.get(i))
+                                .map(|p| p.slug.as_str())
+                                .unwrap_or("");
+                            self.note_human_hold(&t.iss, slug);
+                        }
                         held.push(t.iss.identifier);
                     }
                 }
@@ -927,6 +935,45 @@ mod tests {
         let held = o.human_holds.held();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-949 round 3: a labelled ticket an agent is RUNNING RIGHT NOW is not a deliberate hold.
+    // Labelling a ticket mid-run is the natural way an operator says "stop, I'll take this", and the
+    // saturated branch must not claim the agent's own live work is held for a person — the same
+    // `is_unworked_candidate` filter the capacity tally beside it already applies, which
+    // `eligibility` mirrors by reaching its human gate only AFTER the running/claimed test.
+    //
+    // MUTATION: note the hold unconditionally in the capacity branch and this reds
+    // (`held().len() == 1`) while `a_saturated_pass_still_reports_a_human_hold` still passes.
+    #[test]
+    fn a_saturated_pass_does_not_report_a_running_human_ticket_as_held() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "p", "p"));
+        // One seat, already taken by the labelled ticket's OWN run: the pass is saturated at once.
+        let o = orch_for_select(1, HashMap::new(), Some(running));
+
+        let got = o.select_dispatch(vec![live]);
+        assert!(got.is_empty(), "it is already running");
+        assert!(
+            o.human_holds.held().is_empty(),
+            "a ticket with a live run is not held for a human"
+        );
+    }
+
+    // The same on the multi-project ladder — the pass a `projects:` install actually runs.
+    #[test]
+    fn the_multi_project_saturated_pass_does_not_report_a_running_human_ticket_as_held() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], Some(running));
+
+        let got = o.select_dispatch_multi(tag_for(0, vec![live]));
+        assert!(got.is_empty());
+        assert!(o.human_holds.held().is_empty());
     }
 
     // A review-state orchestrator with an in-memory store seeded with a prior run of `identifier`,
