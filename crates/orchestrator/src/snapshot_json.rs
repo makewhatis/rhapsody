@@ -343,6 +343,9 @@ mod tests {
             reviewer: "jimmy".to_string(),
             stale_secs: 21_600,
             auto_merge_reason: None,
+            adjudicated_head: String::new(),
+            rounds: 0,
+            findings: Vec::new(),
         }];
 
         let rendered = render(&o.build_snapshot());

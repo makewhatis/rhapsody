@@ -163,6 +163,16 @@ pub enum DivergenceKind {
     /// budget never does — and cleared, with the recovery line, the moment an operator clears the
     /// budget or the pull request leaves the watch set.
     RoundBudgetExhausted,
+    /// A BOUND of the opt-in kind: the manager reached its configured round threshold and decided
+    /// that a human is needed (STUDIO-956). Not a stall — it is a decision, and the line names the
+    /// specific open findings and the head the loop stopped at.
+    ///
+    /// A separate kind from [`DivergenceKind::RoundBudgetExhausted`] because the two are opposite
+    /// outcomes of the same bound: that one is "the legacy cap stopped the loop and nothing
+    /// decided", this one is "the manager decided, and it says a human is needed". A `ship`
+    /// decision is NOT reported at all — it stopped the loop and the pull request is the merge
+    /// gates' business.
+    ReviewEscalated,
 }
 
 impl DivergenceKind {
@@ -174,9 +184,9 @@ impl DivergenceKind {
             DivergenceKind::ReviewRequestedNoRun => "review_requested_no_run",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
+            DivergenceKind::ReviewEscalated => "review_escalated",
         }
     }
-
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
     /// observation rather than a diagnosis — the sweep genuinely does not know the cause, and
     /// guessing one in the message is how an operator is sent down the wrong path.
@@ -194,6 +204,10 @@ impl DivergenceKind {
             DivergenceKind::RoundBudgetExhausted => {
                 "the review↔author round budget is spent, so no further review or author re-run \
                  will be dispatched until it is cleared"
+            }
+            DivergenceKind::ReviewEscalated => {
+                "the manager adjudicated the review loop and escalated it: the open findings need \
+                 a human"
             }
         }
     }
@@ -229,6 +243,16 @@ pub struct Divergence {
     /// onto `/api/v1/state` (`snapshot_json::render` enumerates fields explicitly and this is not
     /// among them) — the ticket's ask is the human-facing log report, not a wire-shape change.
     pub auto_merge_reason: Option<&'static str>,
+    /// The head the manager stopped at — only meaningful for [`DivergenceKind::ReviewEscalated`],
+    /// `""` otherwise. Read by [`Orchestrator::set_review_divergences`] to name where the loop
+    /// stopped, never rendered onto `/api/v1/state`.
+    pub adjudicated_head: String,
+    /// How many review↔author rounds the loop ran before the escalation — `0` for every kind but
+    /// [`DivergenceKind::ReviewEscalated`]. Rendered onto the escalation log line, not the wire.
+    pub rounds: usize,
+    /// The open findings the manager escalated on — empty for every kind but
+    /// [`DivergenceKind::ReviewEscalated`]. Named on the log line so the escalation is actionable.
+    pub findings: Vec<String>,
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -345,6 +369,9 @@ pub(crate) fn reconcile_pr(
                 // Filled in by the caller ([`Orchestrator::reconcile_review_divergence`]), which
                 // has the ledger this pure function deliberately does not.
                 auto_merge_reason: None,
+                adjudicated_head: String::new(),
+                rounds: 0,
+                findings: Vec::new(),
             });
         }
         return None;
@@ -371,6 +398,9 @@ fn row_divergence(
         reviewer: row.reviewer.clone(),
         stale_secs: stale_secs(now, anchor, stale_after)?,
         auto_merge_reason: None,
+        adjudicated_head: String::new(),
+        rounds: 0,
+        findings: Vec::new(),
     })
 }
 
@@ -642,10 +672,18 @@ impl Orchestrator {
                 // spent shared review↔author budget stops BOTH halves of the loop, so a round that is
                 // still owed will never be dispatched; an in-flight round is progressing and an
                 // approved pull request is the merge gate's business, so neither is reported here.
-                let mut d = if self.round_budget_spent(pr) && round_budget_owed(facts) {
-                    Some(Divergence {
+                //
+                // A manager adjudication suppresses the row rules entirely: an ESCALATE is reported
+                // as the decision it is (with its findings and rounds), and an IN-FLIGHT OR SHIPPED
+                // pull request is not a stall at all — it is a deliberate stop the manager owns.
+                let mut d = match self.adjudication(pr) {
+                    Some(crate::reviewadjudicate::Adjudication::Escalate {
+                        head,
+                        rounds,
+                        findings,
+                    }) => Some(Divergence {
                         pr: pr.to_string(),
-                        kind: DivergenceKind::RoundBudgetExhausted,
+                        kind: DivergenceKind::ReviewEscalated,
                         ticket: facts
                             .rows
                             .iter()
@@ -654,12 +692,34 @@ impl Orchestrator {
                             .unwrap_or_default(),
                         reviewer: String::new(),
                         stale_secs: newest_activity_secs(facts, now),
-                        // Filled in below only for `ApprovedStillOpen`; a spent budget has nothing
-                        // for the auto-merge ledger to say.
                         auto_merge_reason: None,
-                    })
-                } else {
-                    reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
+                        adjudicated_head: head,
+                        rounds,
+                        findings,
+                    }),
+                    // Shipped, or still deciding: nothing is diverged.
+                    Some(_) => None,
+                    None if self.round_budget_spent(pr) && round_budget_owed(facts) => {
+                        Some(Divergence {
+                            pr: pr.to_string(),
+                            kind: DivergenceKind::RoundBudgetExhausted,
+                            ticket: facts
+                                .rows
+                                .iter()
+                                .find(|r| !r.ticket.is_empty())
+                                .map(|r| r.ticket.clone())
+                                .unwrap_or_default(),
+                            reviewer: String::new(),
+                            stale_secs: newest_activity_secs(facts, now),
+                            // Filled in below only for `ApprovedStillOpen`; a spent budget has
+                            // nothing for the auto-merge ledger to say.
+                            auto_merge_reason: None,
+                            adjudicated_head: String::new(),
+                            rounds: 0,
+                            findings: Vec::new(),
+                        })
+                    }
+                    None => reconcile_pr(facts, now, RECONCILE_STALE_AFTER),
                 }?;
                 // The one place this sweep reads the auto-merge ledger (STUDIO-923): only for
                 // `ApprovedStillOpen`, the one divergence auto-merge would itself be attempting a
@@ -731,6 +791,32 @@ impl Orchestrator {
                          /api/v1/reviews/clear`) or close the pull request.",
                         d.pr,
                         d.kind.detail()
+                    );
+                    continue;
+                }
+                // STUDIO-956's decider: the manager reached the round threshold and escalated. The
+                // line carries the decision, the head it stopped at, the round count and the
+                // specific findings — an escalation an operator can act on, not "needs a human".
+                if d.kind == DivergenceKind::ReviewEscalated {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        head = %d.adjudicated_head,
+                        rounds = d.rounds,
+                        findings = ?d.findings,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Head {}, {} rounds. Open findings: {}",
+                        d.pr,
+                        d.kind.detail(),
+                        d.adjudicated_head,
+                        d.rounds,
+                        if d.findings.is_empty() {
+                            "none recorded".to_string()
+                        } else {
+                            d.findings.join("; ")
+                        }
                     );
                     continue;
                 }
@@ -1757,6 +1843,120 @@ mod store_tests {
             rendered["review_divergence"][0]["kind"],
             "round_budget_exhausted"
         );
+    }
+
+    /// **Acceptance.** An ESCALATE decision is reported by the sweep as an ESCALATION carrying the
+    /// open findings, the round count and the head the loop stopped at — not as an unexplained
+    /// stall, and not with the "nothing has reported it blocked" copy.
+    ///
+    /// Mutation check (the ticket's ⚠️): making the escalation log-only (so the divergence is not
+    /// recorded) leaves no WARN here and reds it.
+    #[test]
+    fn an_escalated_review_is_reported_with_its_findings_and_rounds() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            3,
+        );
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::Escalate {
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes at aaaaaaa".to_string()],
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        // Warm-up for the new WARN callsite, then capture.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("escalated"),
+            "the line must name the decision, got: {}",
+            warn.message
+        );
+        assert!(
+            warn.message.contains("alice asked for changes at aaaaaaa"),
+            "the specific open findings must be named, got: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::ReviewEscalated);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+        assert_eq!(found[0].rounds, 3);
+        assert_eq!(found[0].adjudicated_head, HEAD);
+        assert_eq!(
+            found[0].findings,
+            vec!["alice asked for changes at aaaaaaa".to_string()]
+        );
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
+    }
+
+    /// A pull request the manager has SHIPPED, or is still deciding, is not a stall: the loop was
+    /// stopped deliberately, so the row and budget rules must not report it. (An escalation is the
+    /// one decision that IS reported — see the sibling test.)
+    #[test]
+    fn a_shipped_or_deciding_pull_request_is_not_reported_as_a_stall() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        for decision in [
+            Adjudication::Ship {
+                head: HEAD.to_string(),
+                rounds: 3,
+            },
+            Adjudication::InFlight { rounds: 3 },
+        ] {
+            let o = &mut orch(false, "2026-09-14T21:20:00Z");
+            reviewed_row(o, "alice", "STUDIO-170");
+            run(
+                o,
+                &review_key("makewhatis", "rhapsody", 164, "alice"),
+                "2026-09-14T21:10:00Z",
+                "2026-09-14T21:19:00Z",
+            );
+            o.review_rounds.insert(
+                crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+                crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+            );
+            let ledger = Arc::new(AdjudicationLedger::default());
+            ledger.record(
+                &PrCoord::new("makewhatis", "rhapsody", 164),
+                decision.clone(),
+            );
+            o.adjudication_ledger = Some(ledger);
+
+            o.reconcile_review_divergence();
+
+            assert!(
+                o.review_divergences().is_empty(),
+                "an adjudication the manager owns must suppress the stall rules ({decision:?})"
+            );
+        }
     }
 
     /// The budget is spent at DISPATCH, so the summoned author run that spent it is in flight for

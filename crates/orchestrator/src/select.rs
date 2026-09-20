@@ -1296,12 +1296,21 @@ mod tests {
         );
     }
 
-    /// **STUDIO-956, at the ladder.** A summons lifts `pr_suppressed`, but when the pull request's
-    /// shared review↔author budget is spent the author re-dispatch is refused all the same — the
-    /// half of the loop that ran unbounded.
+    /// **STUDIO-956, at the ladder.** A summons lifts `pr_suppressed`, but when the pull request has
+    /// reached the opt-in adjudication threshold the author re-dispatch is refused all the same —
+    /// the half of the loop that ran unbounded.
     #[test]
-    fn select_dispatch_refuses_an_author_redispatch_when_the_shared_budget_is_spent() {
+    fn select_dispatch_refuses_an_author_redispatch_at_the_adjudication_threshold() {
         let mut o = orch_for_select(10, HashMap::new(), None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                adjudicate_after_rounds: 3,
+                ..rhapsody_config::teams::Review::default()
+            },
+            ..rhapsody_config::teams::Teams::disabled()
+        });
         let pr = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
         let linked = || rhapsody_core::LinkedPRRef {
             owner: "o".to_string(),
@@ -1311,7 +1320,7 @@ mod tests {
         };
         o.review_rounds.insert(
             crate::reviewwatch::churn_key(&crate::prstate::PrCoord::new("o", "r", 7)),
-            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+            3 * o.reviewers_per_round(),
         );
 
         let input = vec![

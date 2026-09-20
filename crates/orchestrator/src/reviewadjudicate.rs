@@ -1,0 +1,763 @@
+//! reviewadjudicate — the manager's decision that ends a review↔author loop that is not converging
+//! (STUDIO-956).
+//!
+//! **No Go v0.4.0 counterpart.** Ticketless review is a Rhapsody addition end to end, and this is
+//! the terminal edge the first version of STUDIO-956 got wrong: a round cap that STOPS is a stall
+//! with a nicer name. The maintainer's shape is a DECIDER — at a configurable threshold
+//! ([`Teams::review_adjudicate_after_rounds`](rhapsody_config::teams::Teams::review_adjudicate_after_rounds),
+//! their number is 3) the loop stops arming rounds and hands the pull request to the manager for
+//! exactly one decision: **ship it** (the open findings do not block) or **escalate** (a human is
+//! needed, naming the specific open findings).
+//!
+//! # Off the loop, and why the decision is a ledger and not a return value
+//!
+//! The decision is made ON the control task — where the round counter and the watch set are
+//! single-writer — and the model turn is performed OFF it, on the review watcher's own task, for
+//! [`crate::triage`]'s reason: a model call on the dispatch path is the STUDIO-551 head-of-line
+//! class. The control task therefore cannot await the turn. It hands the watcher a
+//! [`ReviewAdjudicationPlan`] (the same shape [`crate::automerge::AutoMergePlan`] is: plain owned
+//! data, performed on the far side), and the watcher writes the outcome into the shared
+//! [`AdjudicationLedger`] both tasks hold. The control task reads that ledger back on the next
+//! sweep, which is what makes "no further round arms" true without a second round-trip.
+//!
+//! # "Ship it" adjudicates the findings, NEVER the gates
+//!
+//! This is the ticket's first ⚠️ and the dangerous direction. An adjudication is a statement about
+//! the OPEN REVIEW FINDINGS: are they blocking? It is not a merge. CI, approval-at-head, a draft, a
+//! conflict and every other gate remain preconditions afterwards exactly as before — a manager that
+//! could merge a red pull request would be worse than the loop it replaced. Nothing in this module
+//! touches a merge gate; [`crate::reviewwatch`] only stops arming rounds once a verdict is present,
+//! and the ordinary auto-merge path re-applies every gate on its own.
+//!
+//! # Its own gate, not `manager.mode`
+//!
+//! `manager.mode: labels` means there is no manager ASSIGNMENT turn today — assignment is
+//! deterministic and spends nothing. An adjudication needs a turn, so it must not silently inherit
+//! that mode. It does not: it is gated by `review.adjudicate_after_rounds` alone, and runs through
+//! the daemon's one model-turn path ([`crate::triage::run_turn`]) with `manager.model` /
+//! `manager.timeout_ms`. A `labels`-mode install that sets the key gets adjudication; one that does
+//! not gets today's behaviour byte-for-byte.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+
+use rhapsody_config::room::{Message, RoomLog};
+
+use crate::ghsummons::PrCommentSink;
+use crate::prstate::PrCoord;
+use crate::reviewwatch::churn_key;
+
+/// The `from` every adjudication post is host-stamped with — [`crate::triage::MANAGER_IDENTITY`]'s
+/// value, restated rather than imported because that one is `pub(crate)` to the triage module and
+/// the manager is one function however many of its halves exist.
+pub const MANAGER_IDENTITY: &str = "@manager";
+
+/// The manager's one decision about a pull request that has run out its round threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The remaining open findings do not block. The loop stops; the pull request proceeds to the
+    /// normal merge gates, which are untouched.
+    Ship,
+    /// A human is needed. The reason is the manager's own words; the plan's findings are named
+    /// beside it wherever this is recorded.
+    Escalate { reason: String },
+}
+
+/// One pull request the control task has handed the manager to adjudicate.
+///
+/// It carries what the escalation must name: the head the loop stopped at, how many rounds it ran,
+/// and the open findings. Everything else the turn needs (the model, the command, the timeout) is
+/// installation config and lives on [`AdjudicationDeps`], not per plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAdjudicationPlan {
+    pub pr: PrCoord,
+    /// The head the loop stopped at.
+    pub head: String,
+    /// How many review↔author rounds the pull request ran before the threshold.
+    pub rounds: usize,
+    /// The open findings at the threshold — one human-readable line per reviewer round that asked
+    /// for changes, e.g. `alice asked for changes at a324d2d`. The manager names these on an
+    /// escalation, so an operator gets the specific findings rather than "needs a human".
+    pub findings: Vec<String>,
+}
+
+/// What the manager is asked, and the bounds it is asked under. The turn parameters mirror
+/// [`crate::triage::TriageRequest`]'s so the one daemon model-turn path can serve both.
+#[derive(Debug, Clone)]
+pub struct AdjudicationRequest {
+    pub pr: String,
+    pub head: String,
+    pub rounds: usize,
+    pub findings: Vec<String>,
+    pub command: String,
+    pub billing_guard: bool,
+    pub tracker_api_key: String,
+    pub model: String,
+    pub timeout: Duration,
+}
+
+/// The injectable model-turn seam, exactly as [`crate::triage::TriageArbiter`] is for assignment:
+/// production installs [`ClaudeReviewAdjudicator`], tests inject a fake and never shell out.
+#[async_trait]
+pub trait ReviewAdjudicator: Send + Sync {
+    /// Runs ONE bounded turn and returns the manager's decision. The implementation MUST bound
+    /// itself by `req.timeout`; `Err` is the operator-facing reason and is treated as "no decision"
+    /// — the in-flight marker is cleared so the next sweep asks again.
+    async fn adjudicate(&self, req: &AdjudicationRequest) -> Result<Verdict, String>;
+}
+
+/// The production adjudicator: the same `claude -p` turn [`crate::triage`] uses, differing only in
+/// prompt and answer shape.
+#[derive(Debug, Default, Clone)]
+pub struct ClaudeReviewAdjudicator;
+
+#[async_trait]
+impl ReviewAdjudicator for ClaudeReviewAdjudicator {
+    async fn adjudicate(&self, req: &AdjudicationRequest) -> Result<Verdict, String> {
+        let turn = crate::triage::TriageRequest {
+            command: req.command.clone(),
+            billing_guard: req.billing_guard,
+            tracker_api_key: req.tracker_api_key.clone(),
+            model: req.model.clone(),
+            timeout: req.timeout,
+            prompt: adjudication_prompt(req),
+        };
+        parse_verdict(&crate::triage::run_turn(&turn).await?)
+    }
+}
+
+/// The state one pull request's adjudication is in.
+///
+/// A three-state enum rather than a `Option<Verdict>` because "the turn is running" is the state
+/// that keeps the loop from re-requesting a decision every tick, and it is distinguishable from
+/// "no decision yet" only before the plan is handed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adjudication {
+    /// The plan is out for a decision; no round may arm until it lands.
+    InFlight { rounds: usize },
+    /// The manager shipped it. No further round arms.
+    Ship { head: String, rounds: usize },
+    /// The manager escalated it. No further round arms; a human is needed and the findings are
+    /// named.
+    Escalate {
+        head: String,
+        rounds: usize,
+        findings: Vec<String>,
+    },
+}
+
+impl Adjudication {
+    /// Whether this is a settled decision (as opposed to one still being made).
+    pub fn settled(&self) -> bool {
+        !matches!(self, Adjudication::InFlight { .. })
+    }
+
+    /// The head the loop stopped at, or `""` while the decision is still in flight.
+    pub fn head(&self) -> &str {
+        match self {
+            Adjudication::InFlight { .. } => "",
+            Adjudication::Ship { head, .. } | Adjudication::Escalate { head, .. } => head,
+        }
+    }
+
+    /// The round count the decision was made at.
+    pub fn rounds(&self) -> usize {
+        match self {
+            Adjudication::InFlight { rounds }
+            | Adjudication::Ship { rounds, .. }
+            | Adjudication::Escalate { rounds, .. } => *rounds,
+        }
+    }
+}
+
+/// What each pull request's adjudication is, shared between the control task (which reads it to
+/// stop arming and to report) and the watcher's task (which writes it after the turn).
+///
+/// One `Mutex`-guarded map with no `.await` ever held across the lock, mirroring
+/// [`crate::runautomerge::AutoMergeLedger`] — the control task only ever takes it briefly, and never
+/// while awaiting.
+#[derive(Debug, Default)]
+pub struct AdjudicationLedger {
+    entries: Mutex<HashMap<String, Adjudication>>,
+}
+
+impl AdjudicationLedger {
+    /// Locks the map, treating a poisoned lock as readable — [`crate::triage::TriageHandle`]'s
+    /// stance: a panic in a two-line critical section cannot leave the map logically inconsistent,
+    /// and refusing to read it would turn a cosmetic fault into a re-run loop.
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Adjudication>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records that `pr`'s plan has been handed out for a decision, unless a decision (or another
+    /// in-flight plan) is already there. Idempotent: the control task may reach this twice in a tick
+    /// and the second call must not overwrite a landed verdict.
+    pub fn mark_in_flight(&self, pr: &PrCoord, rounds: usize) {
+        let mut m = self.map();
+        m.entry(churn_key(pr))
+            .or_insert(Adjudication::InFlight { rounds });
+    }
+
+    /// Records a settled decision for `pr`.
+    pub fn record(&self, pr: &PrCoord, adjudication: Adjudication) {
+        self.map().insert(churn_key(pr), adjudication);
+    }
+
+    /// What is known about `pr`, or `None` when nothing is.
+    pub fn peek(&self, pr: &PrCoord) -> Option<Adjudication> {
+        self.map().get(&churn_key(pr)).cloned()
+    }
+
+    /// Forgets `pr` — used when a turn FAILED (so the next sweep re-asks) and when a pull request
+    /// leaves the watch set.
+    pub fn clear(&self, pr: &PrCoord) {
+        self.map().remove(&churn_key(pr));
+    }
+}
+
+/// Everything an off-loop adjudication needs that is installation config rather than per plan.
+pub struct AdjudicationDeps {
+    pub adjudicator: Arc<dyn ReviewAdjudicator>,
+    /// The room the decision is audited in. `None` when there is no on-disk runtime home — the
+    /// decision still lands on the pull request and in the ledger.
+    pub room: Option<Arc<dyn RoomLog>>,
+    /// Where the decision is recorded on the pull request. `None` disables only that half.
+    pub comments: Option<Arc<dyn PrCommentSink>>,
+    pub ledger: Arc<AdjudicationLedger>,
+    /// The turn's parameters, captured once at boot beside the Teams config.
+    pub turn: AdjudicationTurn,
+}
+
+/// The installation-wide turn parameters an adjudication runs under, captured at the composition
+/// root from `manager.*`.
+#[derive(Debug, Clone)]
+pub struct AdjudicationTurn {
+    pub command: String,
+    pub billing_guard: bool,
+    pub tracker_api_key: String,
+    pub model: String,
+    pub timeout: Duration,
+}
+
+/// Asks the manager to adjudicate ONE plan, off the control task, and records the outcome.
+///
+/// Infallible by contract, like [`crate::reviewwatch::ReviewWatchSink::merge`]: there is no caller
+/// with anything to do about a failure. A failed turn is NOT a decision — the in-flight marker is
+/// cleared so a later sweep re-asks, and the log says so.
+pub async fn perform_adjudication(
+    plan: &ReviewAdjudicationPlan,
+    deps: &AdjudicationDeps,
+    at: DateTime<Utc>,
+) {
+    let req = AdjudicationRequest {
+        pr: plan.pr.to_string(),
+        head: plan.head.clone(),
+        rounds: plan.rounds,
+        findings: plan.findings.clone(),
+        command: deps.turn.command.clone(),
+        billing_guard: deps.turn.billing_guard,
+        tracker_api_key: deps.turn.tracker_api_key.clone(),
+        model: deps.turn.model.clone(),
+        timeout: deps.turn.timeout,
+    };
+    let verdict = match deps.adjudicator.adjudicate(&req).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Not a decision: clear so the next sweep re-asks, and leave the loop stopped (no round
+            // arms while an adjudication is outstanding).
+            deps.ledger.clear(&plan.pr);
+            tracing::warn!(
+                pr = %plan.pr,
+                err = %e,
+                "review adjudication: the manager turn failed; the loop stays stopped and the \
+                 decision is re-asked on a later sweep"
+            );
+            return;
+        }
+    };
+
+    let body = decision_body(plan, &verdict);
+    let refs = vec![plan.pr.to_string()];
+    if let Some(room) = deps.room.as_ref() {
+        let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());
+        msg.refs = refs.clone();
+        if let Err(e) = room.append(&msg) {
+            tracing::warn!(
+                pr = %plan.pr,
+                err = %e,
+                "review adjudication: the decision could not be posted to the room; the pull \
+                 request comment and the ledger are unaffected"
+            );
+        }
+    }
+    if let Some(comments) = deps.comments.as_ref()
+        && let Err(e) = comments
+            .post_pr_comment(&plan.pr.owner, &plan.pr.repo, plan.pr.number, &body)
+            .await
+    {
+        tracing::warn!(
+            pr = %plan.pr,
+            err = %e,
+            "review adjudication: the decision could not be recorded on the pull request; the \
+             room post and the ledger are unaffected"
+        );
+    }
+
+    let adjudication = match verdict {
+        Verdict::Ship => Adjudication::Ship {
+            head: plan.head.clone(),
+            rounds: plan.rounds,
+        },
+        Verdict::Escalate { reason: _ } => Adjudication::Escalate {
+            head: plan.head.clone(),
+            rounds: plan.rounds,
+            findings: plan.findings.clone(),
+        },
+    };
+    let outcome = match &adjudication {
+        Adjudication::Ship { .. } => "ship",
+        Adjudication::Escalate { .. } => "escalate",
+        Adjudication::InFlight { .. } => "in flight",
+    };
+    tracing::info!(
+        pr = %plan.pr,
+        head = %plan.head,
+        rounds = plan.rounds,
+        verdict = outcome,
+        findings = plan.findings.len(),
+        "review adjudication: the manager decided"
+    );
+    deps.ledger.record(&plan.pr, adjudication);
+}
+
+/// The prompt the manager answers. Names the pull request, the head, the round count and every open
+/// finding, and asks for exactly one of the two decisions.
+pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
+    let findings = if req.findings.is_empty() {
+        "(none recorded)".to_string()
+    } else {
+        req.findings
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "You are the engineering manager for a software team. A pull request's review↔author loop \
+         has run {rounds} rounds and reached its limit without converging. Decide ONE thing.\n\n\
+         Pull request: {pr}\nHead: {head}\nRounds: {rounds}\nOpen findings:\n{findings}\n\n\
+         Answer with exactly one line, one of:\n\
+         SHIP\n\
+         ESCALATE: <the specific reason a human is needed>\n\n\
+         SHIP means the remaining open findings do not block and the pull request may proceed to \
+         the normal merge gates (this does NOT merge it — CI, approvals and conflicts are still \
+         checked separately). ESCALATE means a human must decide; name the specific findings, not \
+         'needs a human'.",
+        rounds = req.rounds,
+        pr = req.pr,
+        head = req.head,
+        findings = findings,
+    )
+}
+
+/// Reads `SHIP` or `ESCALATE: …` out of the turn's stdout.
+///
+/// Lenient about punctuation and surrounding prose, strict about the decision: an answer naming
+/// neither is an error, and the caller re-asks rather than guessing a verdict.
+pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let upper = line.to_ascii_uppercase();
+    let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
+    if bare == "SHIP" || bare.starts_with("SHIP:") || bare.starts_with("SHIP ") {
+        return Ok(Verdict::Ship);
+    }
+    if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
+        let rest = line
+            .get("ESCALATE:".len()..)
+            .map(str::trim)
+            .unwrap_or_default();
+        return Ok(Verdict::Escalate {
+            reason: if rest.is_empty() {
+                "the manager escalated without stating a reason".to_string()
+            } else {
+                rest.to_string()
+            },
+        });
+    }
+    Err(format!(
+        "adjudication reply named neither SHIP nor ESCALATE: {}",
+        snippet(stdout)
+    ))
+}
+
+/// A short, single-line excerpt of a reply for an error message, so a long transcript does not land
+/// in one log line.
+fn snippet(s: &str) -> String {
+    let one = s.trim().replace('\n', " ");
+    one.chars().take(160).collect()
+}
+
+/// The human-readable decision, posted to the room and the pull request: which way it went, and why.
+///
+/// The escalation names the head, the round count and every open finding — the ticket's third ⚠️.
+pub fn decision_body(plan: &ReviewAdjudicationPlan, verdict: &Verdict) -> String {
+    let findings = if plan.findings.is_empty() {
+        "none recorded".to_string()
+    } else {
+        plan.findings.join("; ")
+    };
+    match verdict {
+        Verdict::Ship => format!(
+            "@manager adjudicated {pr} after {rounds} review rounds: **ship it**. The remaining \
+             open findings do not block. Head `{head}`. This does not merge the pull request — CI, \
+             approval-at-head and conflicts remain the usual gates.\n\nOpen findings: {findings}",
+            pr = plan.pr,
+            rounds = plan.rounds,
+            head = plan.head,
+        ),
+        Verdict::Escalate { reason } => format!(
+            "@manager adjudicated {pr} after {rounds} review rounds: **escalate** — a human is \
+             needed. Head `{head}`.\n\nReason: {reason}\nOpen findings: {findings}",
+            pr = plan.pr,
+            rounds = plan.rounds,
+            head = plan.head,
+            reason = if reason.trim().is_empty() {
+                "not stated"
+            } else {
+                reason.trim()
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> ReviewAdjudicationPlan {
+        ReviewAdjudicationPlan {
+            pr: PrCoord::new("makewhatis", "rhapsody", 192),
+            head: "be260a6b4366fac70fbc0e2dbabd9d51fe9d44e5".to_string(),
+            rounds: 3,
+            findings: vec![
+                "alice asked for changes at a324d2d".to_string(),
+                "bob asked for changes at c366a61".to_string(),
+            ],
+        }
+    }
+
+    // ── the two verdicts parse, and nothing else does ────────────────────────────────────────────
+
+    #[test]
+    fn ship_parses_through_prose_and_punctuation() {
+        for reply in ["SHIP", "ship", "SHIP.", "  SHIP  ", "SHIP: go"] {
+            assert_eq!(parse_verdict(reply), Ok(Verdict::Ship), "({reply:?})");
+        }
+    }
+
+    #[test]
+    fn escalate_parses_and_carries_its_reason() {
+        assert_eq!(
+            parse_verdict("ESCALATE: the migration needs a DBA"),
+            Ok(Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string()
+            })
+        );
+        // A bare ESCALATE still escalates — the decision is the word, the reason is a detail.
+        assert_eq!(
+            parse_verdict("ESCALATE"),
+            Ok(Verdict::Escalate {
+                reason: "the manager escalated without stating a reason".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_answer_naming_neither_decision_is_an_error() {
+        for reply in ["", "maybe?", "I think we should keep going", "APPROVE"] {
+            assert!(parse_verdict(reply).is_err(), "({reply:?})");
+        }
+    }
+
+    /// The prompt carries everything the escalation must name, and both decisions it may pick.
+    #[test]
+    fn the_prompt_names_the_rounds_head_and_every_finding() {
+        let req = AdjudicationRequest {
+            pr: "makewhatis/rhapsody#192".to_string(),
+            head: "be260a6".to_string(),
+            rounds: 3,
+            findings: vec!["alice asked for changes at a324d2d".to_string()],
+            command: "claude".to_string(),
+            billing_guard: true,
+            tracker_api_key: String::new(),
+            model: String::new(),
+            timeout: Duration::from_secs(60),
+        };
+        let p = adjudication_prompt(&req);
+        assert!(p.contains("makewhatis/rhapsody#192"));
+        assert!(p.contains("be260a6"));
+        assert!(p.contains("3"));
+        assert!(p.contains("alice asked for changes at a324d2d"));
+        assert!(p.contains("SHIP"));
+        assert!(p.contains("ESCALATE"));
+    }
+
+    // ── the recorded decision names the findings and the rounds ──────────────────────────────────
+
+    #[test]
+    fn a_ship_body_says_it_does_not_merge_and_lists_the_findings() {
+        let body = decision_body(&plan(), &Verdict::Ship);
+        assert!(body.contains("ship it"));
+        assert!(body.contains("does not merge"));
+        assert!(body.contains("alice asked for changes at a324d2d"));
+    }
+
+    #[test]
+    fn an_escalate_body_names_the_findings_rounds_head_and_reason() {
+        let body = decision_body(
+            &plan(),
+            &Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string(),
+            },
+        );
+        assert!(body.contains("escalate"));
+        assert!(body.contains("3 review rounds"));
+        assert!(body.contains("be260a6b4366fac70fbc0e2dbabd9d51fe9d44e5"));
+        assert!(body.contains("alice asked for changes at a324d2d"));
+        assert!(body.contains("bob asked for changes at c366a61"));
+        assert!(body.contains("the migration needs a DBA"));
+    }
+
+    // ── the ledger records, reads back, and refuses to overwrite a landed verdict ────────────────
+
+    #[test]
+    fn the_ledger_records_and_reads_back_a_verdict() {
+        let l = AdjudicationLedger::default();
+        let pr = plan().pr;
+        assert_eq!(l.peek(&pr), None);
+        l.mark_in_flight(&pr, 3);
+        assert_eq!(l.peek(&pr), Some(Adjudication::InFlight { rounds: 3 }));
+        l.record(
+            &pr,
+            Adjudication::Escalate {
+                head: "abc".to_string(),
+                rounds: 3,
+                findings: vec!["x".to_string()],
+            },
+        );
+        assert_eq!(l.peek(&pr).map(|a| a.settled()), Some(true));
+        l.mark_in_flight(&pr, 99);
+        assert_eq!(
+            l.peek(&pr).map(|a| a.rounds()),
+            Some(3),
+            "an in-flight marker must not overwrite a landed decision"
+        );
+    }
+
+    /// A failed turn CLEARS the marker so the next sweep re-asks.
+    #[test]
+    fn clearing_forgets_the_entry() {
+        let l = AdjudicationLedger::default();
+        let pr = plan().pr;
+        l.mark_in_flight(&pr, 3);
+        l.clear(&pr);
+        assert_eq!(l.peek(&pr), None);
+    }
+
+    // ── the off-loop decision is recorded in the room AND on the pull request ─────────────────────
+
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use rhapsody_config::room::{CaughtUp, Cursor, RoomError};
+
+    struct RecordingRoom(Mutex<Vec<Message>>);
+
+    impl RoomLog for RecordingRoom {
+        fn append(&self, msg: &Message) -> Result<String, RoomError> {
+            self.0.lock().unwrap().push(msg.clone());
+            Ok("2026-09-20:1".to_string())
+        }
+        fn read_since(&self, _: &str, _: &Cursor, _: usize) -> Result<CaughtUp, RoomError> {
+            Err(RoomError::Invalid("unused in this test".to_string()))
+        }
+        fn read_forward(&self, _: &str, _: &Cursor, _: usize) -> Result<CaughtUp, RoomError> {
+            Err(RoomError::Invalid("unused in this test".to_string()))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingComments(Mutex<Vec<(String, String, i64, String)>>);
+
+    #[async_trait]
+    impl PrCommentSink for RecordingComments {
+        async fn post_pr_comment(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            body: &str,
+        ) -> crate::ghsummons::PrCommentResult {
+            self.0.lock().unwrap().push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                body.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    struct FixedVerdict(Verdict);
+
+    #[async_trait]
+    impl ReviewAdjudicator for FixedVerdict {
+        async fn adjudicate(&self, _: &AdjudicationRequest) -> Result<Verdict, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct BrokenVerdict;
+
+    #[async_trait]
+    impl ReviewAdjudicator for BrokenVerdict {
+        async fn adjudicate(&self, _: &AdjudicationRequest) -> Result<Verdict, String> {
+            Err("model is down".to_string())
+        }
+    }
+
+    fn deps(
+        adjudicator: Arc<dyn ReviewAdjudicator>,
+        room: Arc<RecordingRoom>,
+        comments: Arc<RecordingComments>,
+        ledger: Arc<AdjudicationLedger>,
+    ) -> AdjudicationDeps {
+        AdjudicationDeps {
+            adjudicator,
+            room: Some(room as Arc<dyn RoomLog>),
+            comments: Some(comments as Arc<dyn PrCommentSink>),
+            ledger,
+            turn: AdjudicationTurn {
+                command: "claude".to_string(),
+                billing_guard: true,
+                tracker_api_key: String::new(),
+                model: String::new(),
+                timeout: Duration::from_secs(60),
+            },
+        }
+    }
+
+    /// **Acceptance: the decision is recorded in the room AND on the pull request**, both naming the
+    /// way it went, the findings, the rounds and the head.
+    #[tokio::test]
+    async fn an_escalation_is_recorded_in_the_room_and_on_the_pull_request() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = plan();
+        let deps = deps(
+            Arc::new(FixedVerdict(Verdict::Escalate {
+                reason: "the migration needs a DBA".to_string(),
+            })),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+
+        let posted = room.0.lock().unwrap().clone();
+        assert_eq!(posted.len(), 1, "one room post");
+        assert_eq!(posted[0].from, MANAGER_IDENTITY);
+        assert!(posted[0].body.contains("escalate"));
+        assert!(
+            posted[0]
+                .body
+                .contains("alice asked for changes at a324d2d")
+        );
+        assert!(
+            posted[0]
+                .refs
+                .contains(&"makewhatis/rhapsody#192".to_string())
+        );
+
+        let on_pr = comments.0.lock().unwrap().clone();
+        assert_eq!(on_pr.len(), 1, "one pull-request comment");
+        assert_eq!(
+            (on_pr[0].0.as_str(), on_pr[0].1.as_str(), on_pr[0].2),
+            ("makewhatis", "rhapsody", 192)
+        );
+        assert!(on_pr[0].3.contains("escalate"));
+        assert!(on_pr[0].3.contains("the migration needs a DBA"));
+
+        assert_eq!(
+            ledger.peek(&plan.pr),
+            Some(Adjudication::Escalate {
+                head: plan.head.clone(),
+                rounds: 3,
+                findings: plan.findings.clone(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ship_decision_is_recorded_both_ways() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = plan();
+        let deps = deps(
+            Arc::new(FixedVerdict(Verdict::Ship)),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+
+        assert!(room.0.lock().unwrap()[0].body.contains("ship it"));
+        assert!(comments.0.lock().unwrap()[0].3.contains("ship it"));
+        assert_eq!(
+            ledger.peek(&plan.pr),
+            Some(Adjudication::Ship {
+                head: plan.head.clone(),
+                rounds: 3,
+            })
+        );
+    }
+
+    /// A failed turn is NOT a decision: nothing is recorded, the marker is cleared so the next
+    /// sweep re-asks, and the loop stays stopped in the meantime.
+    #[tokio::test]
+    async fn a_failed_turn_records_nothing_and_re_asks() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = plan();
+        ledger.mark_in_flight(&plan.pr, 3);
+        let deps = deps(
+            Arc::new(BrokenVerdict),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+
+        assert!(room.0.lock().unwrap().is_empty());
+        assert!(comments.0.lock().unwrap().is_empty());
+        assert_eq!(
+            ledger.peek(&plan.pr),
+            None,
+            "cleared so the next sweep re-asks"
+        );
+    }
+}

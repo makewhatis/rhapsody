@@ -276,13 +276,19 @@ impl Orchestrator {
             if let Some(spent) = self.review_rounds.get_mut(&churn_key(pr)) {
                 *spent = spent.saturating_sub(round);
             }
+            // The operator's re-run overrides a manager adjudication too (STUDIO-956): otherwise a
+            // settled `ship`/`escalate` would keep the loop stopped and the refunded round would
+            // never dispatch.
+            if let Some(ledger) = self.adjudication_ledger.as_ref() {
+                ledger.clear(pr);
+            }
             tracing::info!(pr = %pr, rows = armed, "ticketless review: operator re-ran a review");
         }
         ReviewControlOutcome::Applied(armed)
     }
 
     /// **Clear the round budget** (`Event::ReviewClear`) — the operator's deliberate reset of a
-    /// pull request's shared review↔author budget (STUDIO-956).
+    /// pull request's review round budget — and any manager adjudication of it (STUDIO-956).
     ///
     /// §15-e's third lever, and the answer to that lever's own failure mode. A spent budget defers
     /// every further review AND every author re-dispatch "until the daemon restarts or the pull
@@ -313,10 +319,16 @@ impl Orchestrator {
                 "no review budget to clear for that pull request",
             );
         }
+        // The manager's adjudication of this pull request goes with the counter (STUDIO-956): a
+        // settled decision keeps the loop stopped on its own, so clearing the budget WITHOUT this
+        // would leave the operator's lever looking applied while nothing could dispatch.
+        if let Some(ledger) = self.adjudication_ledger.as_ref() {
+            ledger.clear(pr);
+        }
         tracing::info!(
             pr = %pr,
-            "ticketless review: operator cleared the pull request's shared review↔author round \
-             budget"
+            "ticketless review: operator cleared the pull request's review budget and any manager \
+             adjudication of it"
         );
         ReviewControlOutcome::Applied(1)
     }
@@ -914,7 +926,7 @@ mod tests {
     // ── clear the round budget (STUDIO-956) ─────────────────────────────────────────────────────
 
     /// **Acceptance: the budget is clearable without a daemon restart.** An operator clears a spent
-    /// shared review↔author budget and the pull request is unbounded again.
+    /// review budget and the pull request is unbounded again.
     #[test]
     fn an_operator_clear_lifts_a_spent_round_budget() {
         let mut o = ticketless();
@@ -935,6 +947,38 @@ mod tests {
             "a clear drops the counter outright, unlike re-run's one-round refund"
         );
         assert!(!o.round_budget_spent(&pr()));
+    }
+
+    /// **STUDIO-956.** Clear also drops the manager's adjudication of the pull request: a settled
+    /// `ship`/`escalate` keeps the loop stopped on its own, so leaving it behind would make the
+    /// operator's lever look applied while nothing could dispatch.
+    #[test]
+    fn an_operator_clear_also_drops_a_manager_adjudication() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes".to_string()],
+            },
+        );
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.adjudication(&pr()),
+            None,
+            "the decision must go with the budget, or the loop stays stopped"
+        );
     }
 
     /// Clear touches no row: unlike re-run it re-arms nothing, so it dispatches only what was
