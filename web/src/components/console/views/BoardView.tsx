@@ -264,7 +264,7 @@ function BoardCardView({
   // The harness chip belongs to the AUTHOR (STUDIO-952): it is the implementation run's provider, so
   // it renders beside the assignee inside `.who2` rather than as a bare peer of the project, which
   // read as the whole card's. With no assignee it keeps the slot and names the author in its title.
-  const author = showAssignee ? card.assignee : "the author";
+  const author = card.assignee !== "" ? card.assignee : "the author";
   return (
     <article
       className={cn("bcard", card.live && "live")}
@@ -307,7 +307,7 @@ function BoardCardView({
       {!fields.reviews || card.reviewers.length === 0 ? null : (
         <div className="bchips" aria-label="Reviews">
           {card.reviewers.map((r) => (
-            <ReviewerChipView key={r.key} chip={r} />
+            <ReviewerChipView key={r.key} chip={r} harness={fields.harness} />
           ))}
         </div>
       )}
@@ -337,15 +337,18 @@ function BoardCardView({
 // A reviewer's chip: who reviewed, and how that run ended. The tone is the chip's whole point — two
 // green chips on an in-review card is the two-gate state at a glance — so it keys off the review
 // RUN's status rather than reusing the status Pill, whose `done` is the tracker-blue `--info`.
-function ReviewerChipView({ chip }: { chip: ReviewerChip }) {
+function ReviewerChipView({ chip, harness }: { chip: ReviewerChip; harness: boolean }) {
   // Two reviewers can be on different pull requests, so the chip names its own PR in the tooltip
   // rather than assuming the card's primary one.
   const on = chip.pr === undefined ? "" : ` on ${pullRequestLabel(chip.pr)}`;
   // The provider is metadata, not status: it reuses the List view's harness chip treatment (quiet
   // mono text on the shared `.provbadge`) rather than a status colour, so it never competes with the
   // pill or the chip's own tone (STUDIO-952). A run predating STUDIO-909's provider field records
-  // none, so it renders no chip at all rather than a placeholder.
-  const onProvider = chip.provider === "" ? "" : ` · ${chip.provider}`;
+  // none, so it renders no chip at all rather than a placeholder. It rides the SAME Harness card
+  // field the author's chip does, so turning that control off hides every provider on the card —
+  // badge and tooltip text alike — rather than leaving the reviews' behind.
+  const showProvider = harness && chip.provider !== "";
+  const onProvider = showProvider ? ` · ${chip.provider}` : "";
   return (
     <span
       className={cn("rchip", reviewerTone(chip.status))}
@@ -353,7 +356,7 @@ function ReviewerChipView({ chip }: { chip: ReviewerChip }) {
     >
       <span className="d" aria-hidden="true" />
       {chip.reviewer}
-      {chip.provider === "" ? null : <span className="provbadge">{chip.provider}</span>}
+      {showProvider ? <span className="provbadge">{chip.provider}</span> : null}
       <span className="o">{chip.outcome}</span>
     </span>
   );

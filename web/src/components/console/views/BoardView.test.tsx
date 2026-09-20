@@ -236,10 +236,23 @@ describe("the board (STUDIO-925)", () => {
     expect(document.querySelector(".bcard .bproj")).toBeNull();
     cleanup();
 
-    mount([row({ issue: "R-1", provider: "fireworks" })], vi.fn(), COUNTS, 4, {
-      fields: { ...DEFAULT_BOARD_CARD_FIELDS, harness: false },
-    });
+    // Harness off hides the author's chip AND every review chip's, so the control means one thing
+    // across the card. Without the review row here the review provider still leaked through.
+    mount(
+      [
+        row({ issue: "R-1", provider: "fireworks" }),
+        review("pr:makewhatis/booch#540@jimmy", "R-1", { provider: "openai" }),
+      ],
+      vi.fn(),
+      COUNTS,
+      4,
+      { fields: { ...DEFAULT_BOARD_CARD_FIELDS, harness: false } },
+    );
     expect(document.querySelector(".bcard .provbadge")).toBeNull();
+    // The review chip itself survives — only its provider is gated.
+    expect(document.querySelector(".bcard .rchip")?.textContent).toContain("jimmy");
+    // …and the provider is gone from the tooltip too, not just the badge.
+    expect(document.querySelector(".bcard .rchip")?.getAttribute("title")).toBe("jimmy on #540 · review done");
     cleanup();
 
     mount([row({ issue: "R-1" }), review("pr:makewhatis/booch#540@jimmy", "R-1")], vi.fn(), COUNTS, 4, {
@@ -374,6 +387,19 @@ describe("the card's harness chips (STUDIO-952)", () => {
     expect(document.querySelector(".bcard .bmeta .provbadge")?.textContent).toBe("fireworks-ai");
     // The review chip is the review run's — sol's, a DIFFERENT provider, rendered distinctly.
     expect(document.querySelector(".bcard .rchip .provbadge")?.textContent).toBe("openai");
+    // The chip's tooltip names that same provider, so the fact is reachable without the badge too.
+    expect(document.querySelector(".bcard .rchip")?.getAttribute("title")).toBe(
+      "sol on #186 · openai · review done",
+    );
+  });
+
+  it("names the author in the meta-row tooltip even when the assignee chip is toggled off", () => {
+    mount([row({ issue: "STUDIO-949", assignee: "jerry", provider: "fireworks-ai" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, assignee: false },
+    });
+    expect(document.querySelector(".bcard .provbadge")?.getAttribute("title")).toBe(
+      "jerry ran on fireworks-ai",
+    );
   });
 
   it("attaches the meta-row harness chip to the author, not the card", () => {
