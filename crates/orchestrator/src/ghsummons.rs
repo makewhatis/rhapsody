@@ -1440,6 +1440,17 @@ pub type DeltaResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub const MAX_DELTA_FINDINGS: usize = 20;
 pub const MAX_DELTA_FINDING_CHARS: usize = 2000;
 
+/// The `per_page` a delta round's comment reads ask for, paired with `--paginate --slurp`.
+///
+/// The endpoint that carries a review thread, `GET /repos/{o}/{r}/issues/{n}/comments`, answers in
+/// ASCENDING id order and has NO `sort`/`direction` parameter at all — `direction=desc`,
+/// `direction=asc` and no parameter return the identical first page — so asking it for the newest
+/// comments by query is silently impossible (STUDIO-959, alice's round-2 blocker). It honours only
+/// `per_page`/`page`, which is why the round pages the whole thread and selects the newest in code,
+/// the same shape [`SummonSource::summons_since`] uses. The cap the round actually reads stays
+/// [`MAX_DELTA_FINDINGS`]; this is only the page size.
+pub const DELTA_FINDINGS_PAGE: usize = 100;
+
 /// The two reads a DELTA review round needs from GitHub (STUDIO-959): whether the commit the
 /// reviewer last read is an ancestor of the head, and the findings comments already on the pull
 /// request.
@@ -1528,8 +1539,8 @@ impl ReviewDeltaSource for GH {
         }
     }
 
-    /// Two bounded `gh api` reads (issue comments + inline review comments), merged into one
-    /// newest-first list capped at [`MAX_DELTA_FINDINGS`].
+    /// Two `gh api --paginate --slurp` reads (issue comments + inline review comments), merged into
+    /// one oldest-first list capped at [`MAX_DELTA_FINDINGS`].
     ///
     /// A failure on either endpoint is an error, not a partial list: the caller degrades to a full
     /// review, which is the safe direction. Silently handing a round half its findings would be
@@ -1552,31 +1563,40 @@ impl ReviewDeltaSource for GH {
         // (STUDIO-959, alice's round-1 blocker): the repo-wide form returns every pull request's
         // comments, so a delta round would be handed some other review's findings. The number is
         // the path segment here, which is why it is not merely a positivity guard above.
+        //
+        // `--paginate --slurp`, and NO `sort`/`direction`: the per-issue endpoint does not accept
+        // them and answers ascending whatever they say, so the newest comments have to be selected
+        // here rather than asked for (alice's round-2 blocker). `--slurp` wraps the pages as
+        // `[[page1…],[page2…]]`, even for one page.
         for endpoint in ["issues", "pulls"] {
             let path = format!(
-                "repos/{owner}/{repo}/{endpoint}/{number}/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                "repos/{owner}/{repo}/{endpoint}/{number}/comments?per_page={DELTA_FINDINGS_PAGE}"
             );
-            let body = self.run_off_task(vec!["api".into(), path.clone()]).await?;
-            let v: serde_json::Value = serde_json::from_slice(&body).map_err(
+            let body = self
+                .run_off_task(vec![
+                    "api".into(),
+                    "--paginate".into(),
+                    "--slurp".into(),
+                    path.clone(),
+                ])
+                .await?;
+            let pages: Vec<Vec<serde_json::Value>> = serde_json::from_slice(&body).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("decode gh api {path}: {e}").into()
                 },
             )?;
-            let comments =
-                v.as_array()
-                    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("gh api {path}: expected a JSON array of comments").into()
-                    })?;
-            for c in comments {
-                if let Some(raw) = c.get("body").and_then(serde_json::Value::as_str)
-                    && !raw.trim().is_empty()
-                {
-                    let at = c
-                        .get("created_at")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    found.push((at, bounded_finding(raw)));
+            for page in &pages {
+                for c in page {
+                    if let Some(raw) = c.get("body").and_then(serde_json::Value::as_str)
+                        && !raw.trim().is_empty()
+                    {
+                        let at = c
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        found.push((at, bounded_finding(raw)));
+                    }
                 }
             }
         }
@@ -3461,9 +3481,9 @@ mod tests {
             sink.lock().expect("argv lock").push(args.join(" "));
             let ep = args.last().copied().unwrap_or_default();
             let body = if ep.contains("/issues/12/comments") {
-                r#"[{"body":"newer issue finding","created_at":"2026-09-20T12:00:00Z"},{"body":"   "}]"#
+                r#"[[{"body":"newer issue finding","created_at":"2026-09-20T12:00:00Z"},{"body":"   "}]]"#
             } else {
-                r#"[{"body":"older review finding","created_at":"2026-09-20T09:00:00Z"}]"#
+                r#"[[{"body":"older review finding","created_at":"2026-09-20T09:00:00Z"}]]"#
             };
             Ok(body.as_bytes().to_vec())
         });
@@ -3483,13 +3503,63 @@ mod tests {
             argv,
             [
                 format!(
-                    "api repos/o/r/issues/12/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                    "api --paginate --slurp repos/o/r/issues/12/comments?per_page={DELTA_FINDINGS_PAGE}"
                 ),
                 format!(
-                    "api repos/o/r/pulls/12/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
+                    "api --paginate --slurp repos/o/r/pulls/12/comments?per_page={DELTA_FINDINGS_PAGE}"
                 ),
             ],
-            "the comments are read at the pull request's OWN endpoints"
+            "the comments are read at the pull request's OWN endpoints, paged and unsorted \
+             (the per-issue endpoint ignores sort/direction, so the newest is selected in code)"
+        );
+    }
+
+    /// The per-issue endpoint answers in ASCENDING order and applies only `per_page`/`page`, so a
+    /// round that trusts a `direction=desc` query is handed the OLDEST page. This fake models that
+    /// documented behaviour — it returns the first `per_page` comments of an ascending 86-comment
+    /// thread, wrapped for `--slurp` — and asserts the round still comes away with the newest 20.
+    ///
+    /// A regression back to `per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc` (the shape
+    /// alice's round-2 blocker was about) makes this test red: the fake then yields the oldest 20,
+    /// and the newest body never appears.
+    #[tokio::test]
+    async fn prior_findings_takes_the_newest_page_of_an_ascending_thread() {
+        // 86 comments, ascending, one minute apart. The last is the newest.
+        let all: Vec<String> = (0..86)
+            .map(|i| {
+                format!(
+                    r#"{{"body":"finding-{i:02}","created_at":"2026-09-20T{:02}:{:02}:00Z"}}"#,
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let newest = "finding-85";
+        let oldest = "finding-00";
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if !ep.contains("/issues/12/comments") {
+                return Ok(b"[]".to_vec());
+            }
+            // Model the endpoint: honour `per_page` (first N of the ascending list), ignore
+            // `sort`/`direction` entirely, and wrap the single page for `--slurp`.
+            let per_page: usize = ep
+                .split("per_page=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let page: Vec<String> = all.iter().take(per_page).cloned().collect();
+            // `--slurp` wraps all pages as `[[page1…],…]`, even for a single page.
+            Ok(format!("[[{}]]", page.join(",")).into_bytes())
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.len(), MAX_DELTA_FINDINGS);
+        assert_eq!(got.last().map(String::as_str), Some(newest));
+        assert!(
+            !got.iter().any(|c| c == oldest),
+            "the oldest page must not be what a delta round is handed"
         );
     }
 
@@ -3497,7 +3567,7 @@ mod tests {
     #[tokio::test]
     async fn prior_findings_bounds_a_huge_comment() {
         let long = "é".repeat(MAX_DELTA_FINDING_CHARS + 50);
-        let body = serde_json::json!([{ "body": long }]).to_string();
+        let body = serde_json::json!([[{ "body": long }]]).to_string();
         let run: RunFn = Box::new(move |args: &[&str]| {
             // Answer the first endpoint with the long body and the second with nothing.
             let ep = args.last().copied().unwrap_or_default();
