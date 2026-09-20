@@ -218,6 +218,23 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(byIssue.get("STUDIO-940")?.heldForHuman).toBe(false);
   });
 
+  it("synthesizes a Queued card for a held ticket with no row at all (STUDIO-949)", () => {
+    // The production shape: a fresh `rhapsody:human` ticket has never run, so it has no worklist
+    // row. Annotating existing rows alone would leave it invisible on the board; the hold itself
+    // must produce a card, exactly as a held dependent's synthetic row does upstream.
+    const board = buildConsoleBoard(
+      [],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    );
+    const card = cards(board).find((c) => c.issue === "STUDIO-939");
+    expect(card?.heldForHuman).toBe(true);
+    expect(card?.title).toBe("store work");
+    expect(board.find((l) => l.id === "queued")?.cards.map((c) => c.issue)).toContain(
+      "STUDIO-939",
+    );
+  });
+
   it("carries assignee and provider onto the card", () => {
     const board = buildConsoleBoard([
       row({

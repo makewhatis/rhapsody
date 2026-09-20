@@ -23,6 +23,7 @@
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type {
   BlockedEntry,
+  HeldForHuman,
   IssueCountsResponse,
   IssueLifecycle,
   IssueRun,
@@ -872,10 +873,16 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  * It is inert on a Rhapsody daemon today — the Rust `Snapshot` carries no held-dependent set, so
  * `/api/v1/state` never sends one — and it is here so that the strip and the table cannot disagree
  * about a row the table already knows how to draw, rather than as a feature.
+ *
+ * `heldForHuman` (STUDIO-949) is the second such client-side set, and unlike `held` it IS live on a
+ * Rhapsody daemon: a `rhapsody:human` ticket has been refused, so it never ran and the store never
+ * counted it. It is folded into `queued` — a deliberate hold is not a fault — so the lane header
+ * and the card beside it cannot disagree.
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
   held: readonly BlockedEntry[] = [],
+  heldForHuman: readonly HeldForHuman[] = [],
 ): ConsoleJobCounts | undefined {
   if (payload === undefined) return undefined;
   // A held dependent's status inputs are exactly a `waiting` outcome and nothing else, so it goes
@@ -884,7 +891,7 @@ export function consoleStoreCounts(
     held.length === 0
       ? payload.buckets
       : [...payload.buckets, { outcome: "waiting", count: held.length }];
-  return tally(
+  const counts = tally(
     buckets.map((b) => {
       // `reviewTicket` is always false here: the daemon does not resolve that marker for the tally
       // because it cannot move any of these five numbers — a live review TICKET reads `reviewing`
@@ -900,6 +907,8 @@ export function consoleStoreCounts(
       ] as const;
     }),
   );
+  if (heldForHuman.length === 0) return counts;
+  return { ...counts, queued: counts.queued + heldForHuman.length };
 }
 
 /** One teammate's live state in the Now strip (§3). */

@@ -552,6 +552,22 @@ describe("mergeJobs", () => {
     expect(rows.some((r) => r.status === "waiting")).toBe(false);
     expect(rows).toHaveLength(1);
   });
+
+  it("turns a rhapsody:human hold (state.held_for_human) into a waiting row that says so (STUDIO-949)", () => {
+    // A held ticket has never run, so nothing else contributes a row for it. It is a deliberate
+    // hold, not a blocker, so its sub-label must not masquerade as "waiting on <blocker>".
+    const s = state({
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    });
+    const rows = mergeJobs(s, [], PROJECTS, NOW);
+    expect(rows).toHaveLength(1);
+    const h = rows[0];
+    expect(h.issue).toBe("STUDIO-939");
+    expect(h.status).toBe("waiting");
+    expect(h.runId).toBe(0); // never ran → not clickable
+    expect(h.title).toBe("store work");
+    expect(h.subLabel).toBe("held for a human");
+  });
 });
 
 describe("jobStatus", () => {

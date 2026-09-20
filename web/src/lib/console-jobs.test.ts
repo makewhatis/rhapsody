@@ -1341,4 +1341,20 @@ describe("consoleStoreCounts", () => {
     // applies to the row, reached through the same call.
     expect(withHeld?.needsYou).toBe(0);
   });
+
+  // A `rhapsody:human` hold is the one live client-side addition (STUDIO-949): the refused ticket
+  // never ran, so the store's tally cannot carry it, and it must read as Queued so the lane header
+  // and the card beside it cannot disagree.
+  it("adds the live snapshot's held-for-human tickets to queued", () => {
+    const payload = counts([{ outcome: "completed", lifecycle: "done", count: 1 }]);
+    const holds = [
+      { issue_identifier: "STUDIO-939", title: "store work", project: "booch" },
+      { issue_identifier: "STUDIO-940", title: "legal form", project: "studio" },
+    ];
+    const withHolds = consoleStoreCounts(payload, [], holds);
+    expect(withHolds?.queued).toBe(2);
+    expect(withHolds?.blocked).toBe(0);
+    // A deliberate hold is not a failure, so it is not billed as needing the operator.
+    expect(withHolds?.needsYou).toBe(0);
+  });
 });

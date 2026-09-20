@@ -134,7 +134,11 @@ export function JobsView({
   // `state.blocked` rides along because it is the one part of the worklist the daemon's tally
   // cannot see — and, being the live snapshot rather than a page, adding it keeps the numbers
   // paging-invariant. See `consoleStoreCounts`.
-  const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
+  const counts = consoleStoreCounts(
+    issueCounts.data,
+    state.data?.blocked,
+    state.data?.held_for_human,
+  );
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
   // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:

@@ -282,7 +282,8 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
  *
  * `rows` is exactly what the table renders (one per issue key, review rows included); `blocked` is
  * the live snapshot's held-dependent set, which is the only dependency edge the state payload
- * carries.
+ * carries. `heldForHuman` is the live snapshot's `rhapsody:human` hold set (STUDIO-949): it both
+ * flags a card the rows already carry and synthesizes a Queued card for a hold that has never run.
  */
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
@@ -344,6 +345,35 @@ export function buildConsoleBoard(
     heldBy.set(b.issue_identifier, list);
   }
   for (const card of cards) card.dependencies = heldBy.get(card.issue) ?? [];
+
+  // A held-for-human ticket has usually NEVER RUN, so it has no worklist row at all — rows come from
+  // run history plus the live snapshot's running/retrying/blocked sets, and a ticket the dispatcher
+  // refuses never reaches any of them. Annotating an existing row would therefore leave the hold
+  // invisible on the board: the exact silent stall the hold exists to end (STUDIO-949). Synthesize a
+  // Queued card for any hold the rows did not already surface, as `mergeJobs` synthesizes a held
+  // dependent's row. The chip is the deliberate-hold marker; the pill stays the lane's own word.
+  for (const h of heldForHuman) {
+    if (h.issue_identifier === "" || byIssue.has(h.issue_identifier)) continue;
+    const card: BoardCard = {
+      key: `held-${h.issue_identifier}`,
+      issue: h.issue_identifier,
+      title: h.title,
+      project: h.project,
+      projectSlug: h.project,
+      status: "queued",
+      statusLabel: "queued",
+      trackerState: "",
+      assignee: "",
+      provider: "",
+      live: false,
+      pr: undefined,
+      reviewers: [],
+      dependencies: [],
+      heldForHuman: true,
+    };
+    cards.push(card);
+    byIssue.set(h.issue_identifier, card);
+  }
 
   const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));
   for (const card of cards) {

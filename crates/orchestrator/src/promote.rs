@@ -126,7 +126,16 @@ impl Orchestrator {
             // moving it would strand it — the standard select's `eligible` refuses it outright, so it
             // would sit in Todo dispatching nothing forever, strictly worse than leaving it in
             // Backlog. Checked BEFORE the label gate because the hold is absolute.
+            //
+            // This pass is also the ONLY place a human-gated Backlog dependent is ever seen: the
+            // selection pass's candidate fetch is active ∪ review, so a Backlog ticket never reaches
+            // `eligibility` at all (STUDIO-939 — the motivating case — sits in Backlog with its
+            // blocker already Done). A bare `continue` here would therefore be the seventh silent
+            // stall: no INFO line, no `held_for_human` row, no console chip. Report it through the
+            // same once-per-ticket seam the active path uses, as loudly as the `cancelled_blocker`
+            // skip below.
             if crate::teams::is_human(&iss) {
+                self.note_human_hold(&iss, &scope.slug);
                 continue;
             }
             // Label gate: a project with required labels only proactively works tickets carrying one.
@@ -779,8 +788,14 @@ mod tests {
     // it sits in Todo dispatching nothing — strictly worse than leaving it in Backlog. It must stay
     // put while an ordinary sibling is still promoted.
     //
-    // MUTATION: delete the `is_human` skip from `promote_unblocked_scope` and this reds while
-    // `eligible_refuses_human_label` (dispatch.rs) still passes — two independent properties.
+    // It must ALSO be visible: auto-promote is the only pass that ever sees a Backlog dependent (the
+    // selection pass's candidate fetch is active ∪ review), so the skip has to reach the same hold
+    // ledger the active path feeds, or the ticket is a seventh silent stall with no log and no
+    // console chip.
+    //
+    // MUTATION: delete the `is_human` skip from `promote_unblocked_scope` and this reds (the hold
+    // never reaches `human_holds`) while `eligible_refuses_human_label` (dispatch.rs) still passes —
+    // two independent properties.
     #[tokio::test]
     async fn promote_unblocked_939_human_ticket_stays_in_backlog() {
         let mut f = Fake::new();
@@ -805,6 +820,15 @@ mod tests {
         assert_eq!(moves[0].issue_id, "b3");
         assert_eq!(dispatched_len(&dispatched), 0);
         assert!(o.pending_stack.is_empty(), "dag stashes no stack hint");
+
+        let held = o.human_holds.held();
+        assert_eq!(
+            held.len(),
+            1,
+            "STUDIO-939 is a Backlog dependent; only auto-promote ever sees it, so the hold must be \
+             reported from here: {held:?}"
+        );
+        assert_eq!(held[0].issue_identifier, "MT-2");
     }
 
     // Never-run guard (durable): a ticket with a prior run row is NEVER re-promoted (Stop/park stays

@@ -566,8 +566,21 @@ impl Orchestrator {
     /// nor claimed, carries a `team_id` (required to promote it), carries a summons, AND that
     /// summons is strictly newer than the START of the daemon's last run on it. No run / store
     /// disabled / unparseable start ⇒ NOT eligible (the daemon never grabs a human-managed review
-    /// ticket it has never worked; the check converges). Mirrors Go `reviewReopenEligible`.
+    /// ticket it has never worked; the check converges). A `rhapsody:human` ticket is NEVER eligible
+    /// (STUDIO-949) — this ladder bypasses `eligibility`, so the human gate must be repeated here or
+    /// the label leaks dispatch through the one path that does not consult it. Mirrors Go
+    /// `reviewReopenEligible`.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
+        // Human-only gate (STUDIO-949). This ladder runs BEFORE `eligibility` — a review-state issue
+        // is never active, so `eligibility` rejects it outright and the reopen path is the only one
+        // that can move it back to an active state and dispatch it. Without the gate here, a
+        // `rhapsody:human` ticket that had run once and then been parked in review with a newer
+        // `@symphony` summons would leak straight back to an agent, contradicting the README's claim
+        // that the label refuses every dispatch path. Absolute, like the gate in `eligibility`: it
+        // does not consult the summons, the store, or Teams.
+        if crate::teams::is_human(iss) {
+            return false;
+        }
         if iss.id.is_empty() || iss.identifier.is_empty() || iss.team_id.is_empty() {
             return false;
         }
@@ -614,6 +627,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::*;
+    use std::sync::Arc;
 
     // Mirrors Go `TestSortForDispatchPriorityThenCreatedThenIdentifier`.
     #[test]
@@ -846,6 +860,49 @@ mod tests {
                 "spelling {spelling:?} must be held"
             );
         }
+    }
+
+    // STUDIO-949: the review-reopen ladder is the one dispatch path that bypasses `eligibility` (a
+    // review-state issue is never active), so `review_reopen_eligible` carries the human gate itself.
+    // The control below — the same ticket without the label — IS eligible, so the refusal is the
+    // label's work and this function is pinned directly, not only through the select ladders.
+    //
+    // MUTATION: delete the `is_human` gate from `review_reopen_eligible` and the second assertion reds.
+    #[test]
+    fn review_reopen_refuses_a_human_ticket() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        let store = o.store();
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        store
+            .end_run(run, rhapsody_store::RunEnd::default())
+            .expect("end run");
+
+        let summoned = |labels: Option<Vec<String>>| Issue {
+            id: "1".into(),
+            identifier: "A-1".into(),
+            team_id: "team-1".into(),
+            state: "In Review".into(),
+            latest_summon_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+            labels,
+            ..Default::default()
+        };
+        let none: HashSet<String> = HashSet::new();
+        assert!(
+            o.review_reopen_eligible(&summoned(None), &none),
+            "the reopen path is otherwise live; the label is the only refusal"
+        );
+        assert!(
+            !o.review_reopen_eligible(&summoned(Some(vec!["rhapsody:human".into()])), &none),
+            "a human ticket is never reopened"
+        );
     }
 
     // STUDIO-949 acceptance: a ticket WITHOUT the label behaves identically to today. Written

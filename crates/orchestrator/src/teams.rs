@@ -90,17 +90,19 @@ pub(crate) const SOLO_LABEL: &str = "rhapsody:solo";
 ///
 /// Unlike [`SOLO_LABEL`] this is **not a Teams feature**: it lives in the shared
 /// `rhapsody:` namespace only for naming consistency, is enforced in
-/// [`eligible`](crate::dispatch::eligible) — the single chokepoint every dispatch path
-/// flows through — and must hold on any install, Teams enabled or not. It is the
-/// Rhapsody-only opt-in the frozen Go reference has no counterpart for (README
-/// Divergences).
+/// [`eligible`](crate::dispatch::eligible) and — because the review-reopen ladder
+/// runs before `eligible` and would otherwise bypass it — in
+/// [`Orchestrator::review_reopen_eligible`](crate::orchestrator::Orchestrator::review_reopen_eligible),
+/// and must hold on any install, Teams enabled or not. It is the Rhapsody-only opt-in
+/// the frozen Go reference has no counterpart for (README Divergences).
 ///
-/// Three consumers agree on it: the dispatch gate refuses it (distinguishably from
+/// Four consumers agree on it: the dispatch gate refuses it (distinguishably from
 /// ordinary ineligibility, via
-/// [`EligibilityResult::held_for_human`](crate::dispatch::EligibilityResult)),
+/// [`EligibilityResult::held_for_human`](crate::dispatch::EligibilityResult)), the
+/// review-reopen gate refuses it too,
 /// [`Orchestrator::promote_unblocked`](crate::orchestrator::Orchestrator::promote_unblocked)
-/// never moves one to Todo, and triage never assigns it an identity
-/// ([`crate::triage::unlabelled_candidates`]).
+/// never moves one to Todo (and reports the hold), and triage never assigns it an
+/// identity ([`crate::triage::unlabelled_candidates`]).
 pub(crate) const HUMAN_LABEL: &str = "rhapsody:human";
 
 /// The `events` row kind for a routed run (§3.4). A **data** value in the

@@ -1234,17 +1234,19 @@ label is the entire opt-in: a ticket without it behaves byte-identically to toda
 
 | A `rhapsody:human` ticket | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| dispatch | n/a | refused in `eligible()`, the single chokepoint every dispatch path flows through |
-| auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever) |
+| dispatch | n/a | refused in `eligible()` and, on the review-reopen ladder that bypasses it, in `review_reopen_eligible()` — both refuse, Teams on or off |
+| auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever), and reported as a hold from that pass |
 | triage | n/a | never assigned an identity, never spending a manager turn |
-| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key |
+| visibility | n/a | a once-per-ticket INFO log, and `/api/v1/state`'s `held_for_human` key (a Backlog dependent included — auto-promote is the only pass that sees it) |
 | Teams | n/a | **not** gated on it — the refusal holds on any install |
 
 The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,
 never the all-default miss), so the selection pass can log it once per ticket rather than per tick,
-and the console board can read a held card as deliberately held rather than mysteriously idle. The
-reconciliation sweep never reports it as a stall, by construction: a held ticket never runs, so it
-never arms a watch row for the sweep to see.
+and the console board can read a held card as deliberately held rather than mysteriously idle. A
+ticket that has never run has no worklist row, so the board synthesizes a Queued card for it — a hold
+that is visible nowhere would be the same silent stall the label exists to end. The reconciliation
+sweep never reports it as a stall, by construction: a held ticket never runs, so it never arms a
+watch row for the sweep to see.
 
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes

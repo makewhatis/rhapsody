@@ -295,6 +295,9 @@ interface MergedRow {
   waiting: boolean;
   /** The formatted "<blocker> · <state>" a waiting row is held on (waiting rows only). */
   waitingOn?: string;
+  /** A synthetic `rhapsody:human` hold (from state.held_for_human, STUDIO-949) — deliberately held
+   *  for a person, not blocked by a predecessor. Gives the row its own sub-label. */
+  heldForHuman?: boolean;
   /** Failure reason (history rows only; drives the failed sub-label). */
   error: string;
 }
@@ -434,6 +437,35 @@ export function mergeJobs(
     });
   }
 
+  // Synthetic held-for-human rows: one per `rhapsody:human` hold (state.held_for_human, STUDIO-949).
+  // A ticket the dispatcher refuses has usually NEVER RUN, so no other source contributes a row for
+  // it and it would be absent from the worklist entirely — `buildConsoleBoard` synthesizes one too,
+  // for that reason. It is a deliberate HOLD, not a blocker, so it carries `heldForHuman` and its own
+  // sub-label rather than masquerading as "waiting on <blocker>".
+  for (const h of state?.held_for_human ?? []) {
+    merged.push({
+      key: `held-${h.issue_identifier}`,
+      runId: 0,
+      issue: h.issue_identifier,
+      title: h.title,
+      agent: agentName(h.project, "", meta),
+      agentColor: agentColor(h.project, meta),
+      project: h.project,
+      projectShort: projectDisplayName(h.project, meta),
+      turn: 0,
+      tokens: formatTokens(0),
+      duration: "",
+      durationAccent: false,
+      startedAtMs: 0,
+      outcome: "waiting",
+      live: false,
+      queued: false,
+      waiting: true,
+      heldForHuman: true,
+      error: "",
+    });
+  }
+
   for (const h of rows) {
     if (h.id > 0 && liveIds.has(h.id)) continue; // already represented by the live row
     const live = h.outcome === "running";
@@ -499,7 +531,9 @@ export function mergeJobs(
       live: !!liveRow,
       startedAtMs: rep.startedAtMs,
       subLabel: isWaiting
-        ? `waiting on ${waitingRow?.waitingOn ?? ""}`
+        ? waitingRow?.heldForHuman
+          ? "held for a human"
+          : `waiting on ${waitingRow?.waitingOn ?? ""}`
         : status === "failed"
           ? failureSubLabel(newestReal?.error ?? "") || undefined
           : undefined,
