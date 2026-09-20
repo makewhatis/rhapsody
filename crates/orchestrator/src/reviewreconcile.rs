@@ -468,17 +468,30 @@ fn stale_secs(now: DateTime<Utc>, anchor: DateTime<Utc>, stale_after: Duration) 
 /// Whether any LIVE row of a pull request still OWES a round — a review, or the author's run a
 /// verdict bought (STUDIO-956).
 ///
-/// Scoped to these three statuses on purpose. An `in_flight` round is progressing and a spent budget
-/// beside it is not a stall; an `approved` pull request is waiting on the merge gate rather than on
-/// this budget, and reporting it here would cry wolf on every healthy approval. A row that has left
-/// the watch set says nothing at all.
+/// Scoped to these three statuses on purpose. An `approved` pull request is waiting on the merge
+/// gate rather than on this budget, and reporting it here would cry wolf on every healthy approval.
+/// A row that has left the watch set says nothing at all.
+///
+/// A round still `in_flight` silences the whole pull request, matching [`reconcile_pr`]: a second
+/// reviewer reading the same head is activity ON THIS PULL REQUEST, and a spent budget beside a
+/// running agent is not a stall — the report would be premature and would flicker off when that
+/// round finished. That is a mixed-row case (one reviewer mid-round, another's findings outstanding)
+/// and it is exactly why this cannot be a per-row predicate.
 fn round_budget_owed(facts: &PrFacts) -> bool {
-    facts.rows.iter().any(|r| {
-        r.open
-            && matches!(
-                r.status.as_str(),
-                REVIEW_STATUS_REVIEWED | REVIEW_STATUS_REQUESTED | REVIEW_STATUS_TRUNCATED
-            )
+    let live = || {
+        facts
+            .rows
+            .iter()
+            .filter(|r| r.open && r.status != REVIEW_STATUS_DROPPED)
+    };
+    if live().any(|r| r.status == REVIEW_STATUS_IN_FLIGHT) {
+        return false;
+    }
+    live().any(|r| {
+        matches!(
+            r.status.as_str(),
+            REVIEW_STATUS_REVIEWED | REVIEW_STATUS_REQUESTED | REVIEW_STATUS_TRUNCATED
+        )
     })
 }
 
@@ -1736,16 +1749,32 @@ mod store_tests {
     /// keeps the report from crying wolf on a healthy (if expensive) loop.
     #[test]
     fn a_spent_budget_reports_nothing_while_a_round_is_in_flight_or_approved() {
-        // A round in flight: `mark_review_requested` moves the row to `in_flight`.
+        // A MIXED pull request: one reviewer's findings are outstanding (reviewed) while a second
+        // reviewer's round is in flight. The running agent silences the whole pull request — a spent
+        // budget beside it is not a stall — which a per-row rule would get wrong.
         let o = &mut orch(false, "2026-09-14T21:20:00Z");
         reviewed_row(o, "alice", "STUDIO-170");
-        let key = ReviewWatchKey {
+        let running_key = ReviewWatchKey {
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
             number: 164,
-            reviewer: "alice".to_string(),
+            reviewer: "bob".to_string(),
         };
-        o.store().mark_review_requested(&key, HEAD).expect("re-arm");
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: running_key.clone(),
+                author: "jimmy".to_string(),
+                introduced_by: "handoff:STUDIO-170".to_string(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: String::new(),
+                open: true,
+            })
+            .expect("seed the second row");
+        // `mark_review_requested` moves it to `in_flight`.
+        o.store()
+            .mark_review_requested(&running_key, HEAD)
+            .expect("in-flight");
         o.review_rounds.insert(
             crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
             crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
@@ -1753,7 +1782,7 @@ mod store_tests {
         o.reconcile_review_divergence();
         assert!(
             o.review_divergences().is_empty(),
-            "a round in flight is progressing, got {:?}",
+            "a round in flight silences the pull request, got {:?}",
             o.review_divergences()
         );
 
