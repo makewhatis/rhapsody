@@ -2623,6 +2623,69 @@ mod tests {
         );
     }
 
+    /// STUDIO-950: the review/implementation separation is GLOBAL only, pinned here for the RETRY
+    /// ladder — `on_retry`'s `no_project` is the second site `running_in_project_group` gates. A
+    /// ticketless review still spends its project's own `max_concurrent` ceiling even with the key
+    /// set, so at the project cap the retry is requeued; the control (same fixture, no review in the
+    /// group) dispatches. See the README's STUDIO-950 entry, which states the boundary.
+    #[tokio::test]
+    async fn a_ticketless_review_still_counts_against_its_projects_own_cap_on_retry() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let mut pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        pa.max_concurrent = 1; // the project cap, not the global one, is the binding constraint
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 10);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        let mut rev = ticketless_review_run("rev-1");
+        rev.project_slug = "a".into();
+        rev.project_group = "a".into();
+        o.running.insert("rev-1".into(), rev);
+        o.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("a1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "a1".into(),
+        })
+        .await;
+
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "a review still spends its project's own cap on the retry path: global only"
+        );
+        assert_eq!(
+            o.retry_attempts.get("a1").expect("requeued").err,
+            "no available orchestrator slots"
+        );
+
+        // Control: the identical fixture with no review in the group dispatches.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let mut pb = proj_with_tracker("a", Arc::clone(&tr_b), "pb");
+        pb.max_concurrent = 1;
+        let (mut clean, dispatched_clean) = orch_for_retry_multi(vec![pb], 10);
+        clean.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        clean.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        clean.retry_attempts.insert("a1".into(), re);
+
+        clean
+            .on_retry(EvRetry {
+                issue_id: "a1".into(),
+            })
+            .await;
+
+        assert_eq!(
+            dispatched_clean.lock().expect("lock").len(),
+            1,
+            "the project cap admits once the review is gone"
+        );
+    }
+
     /// STUDIO-950: the RECOVERED requeue arm shares the same `no_global` draw, so it needs its own
     /// pin — a boot-recovered implementation must dispatch once the key gives a ticketless review its
     /// own pool, and still requeue on the shared budget when the key is unset.
