@@ -62,6 +62,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use rhapsody_config::room::{Message, RoomLog};
+use rhapsody_config::teams::{ReviewModelChoice, Teams};
 use rhapsody_store::{
     REVIEW_ADJUDICATION_ESCALATE, REVIEW_ADJUDICATION_SHIP, ReviewAdjudication, Store,
 };
@@ -424,6 +425,44 @@ pub struct AdjudicationDeps {
     pub turn: AdjudicationTurn,
 }
 
+/// The harness an adjudication turn actually runs on. [`ClaudeReviewAdjudicator`] reuses
+/// [`crate::triage::run_turn`], which spawns `claude -p`, so the model this turn may be given is a
+/// `claude` model and nothing else — see [`adjudication_model`].
+const ADJUDICATION_HARNESS: &str = "claude";
+
+/// The model an adjudication turn runs on (STUDIO-956, round-8 finding 4).
+///
+/// `manager.model` defaults to empty and is empty on the installation that filed this, and
+/// [`crate::triage::run_turn`] passes `--model` only when the value is non-empty. So the turn that
+/// decides ship-or-escalate was running on whatever the CLI happens to default to, while every
+/// review whose findings it is adjudicating ran on the pinned `review.model`. A decision made on a
+/// weaker model than the reviews it is deciding about is not one an operator would sign off on, and
+/// nothing anywhere said it was happening.
+///
+/// Resolved in order:
+///
+/// 1. `manager.model` when set — the operator named a model for the manager's turns and this is one
+///    of them, so an explicit choice always wins;
+/// 2. else `review.model` scoped to the `claude` harness this turn runs on
+///    ([`Teams::review_model_for`]) — the model the reviews themselves ran on, which is the closest
+///    thing to "decide this at the same standard it was reviewed at";
+/// 3. else empty: the CLI's own default. That is what happened before this change and is the only
+///    honest answer on an installation that has pinned nothing at all.
+///
+/// A `review.model` scoped to OTHER harnesses only ([`ReviewModelChoice::Refuse`]) does NOT apply:
+/// handing a `claude` turn a model scoped to `opencode` is precisely the mistake STUDIO-908 exists
+/// to prevent. It falls through to (3) rather than refusing the turn — refusing would freeze the
+/// loop at the threshold with no decision, which is the outcome this whole feature replaces.
+pub fn adjudication_model(teams: &Teams, backend: &str) -> String {
+    if !teams.manager.model.trim().is_empty() {
+        return teams.manager.model.clone();
+    }
+    match teams.review_model_for(ADJUDICATION_HARNESS, backend) {
+        ReviewModelChoice::Use(model) => model.to_string(),
+        ReviewModelChoice::Inherit | ReviewModelChoice::Refuse(_) => String::new(),
+    }
+}
+
 /// The installation-wide turn parameters an adjudication runs under, captured at the composition
 /// root from `manager.*`.
 #[derive(Debug, Clone)]
@@ -431,6 +470,8 @@ pub struct AdjudicationTurn {
     pub command: String,
     pub billing_guard: bool,
     pub tracker_api_key: String,
+    /// Resolved by [`adjudication_model`], NOT read raw from `manager.model` — see that function for
+    /// why an empty `manager.model` must not silently decide on the CLI default.
     pub model: String,
     pub timeout: Duration,
 }
@@ -788,6 +829,70 @@ pub fn decision_body(plan: &ReviewAdjudicationPlan, verdict: &Verdict) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ticketless-review Teams config with `review.model` pinned the way this installation has
+    /// it, and `manager.model` left at its default empty.
+    fn adjudicating_teams(review_model: rhapsody_config::teams::HarnessScoped) -> Teams {
+        let mut t = Teams::disabled();
+        t.enabled = true;
+        t.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+        t.review.model = review_model;
+        t
+    }
+
+    /// **Round-8 finding 4.** `manager.model` is empty by default and empty on the installation
+    /// that filed this, and `run_turn` passes `--model` only when the value is non-empty — so the
+    /// ship-or-escalate decision was being made on the CLI's default while every review it was
+    /// adjudicating ran on the pinned `review.model`. It now inherits that review model.
+    ///
+    /// MUTATION: return `teams.manager.model.clone()` unconditionally (the pre-fix behaviour) and
+    /// this reds.
+    #[test]
+    fn an_unset_manager_model_falls_back_to_the_pinned_review_model() {
+        let teams =
+            adjudicating_teams(rhapsody_config::teams::HarnessScoped::bare("claude-opus-5"));
+        assert_eq!(
+            teams.manager.model, "",
+            "the default this install actually has"
+        );
+        assert_eq!(adjudication_model(&teams, "claude"), "claude-opus-5");
+    }
+
+    /// An explicit `manager.model` always wins: the operator named a model for the manager's turns
+    /// and an adjudication is one of them.
+    #[test]
+    fn an_explicit_manager_model_wins_over_the_review_model() {
+        let mut teams =
+            adjudicating_teams(rhapsody_config::teams::HarnessScoped::bare("claude-opus-5"));
+        teams.manager.model = "claude-haiku-5".to_string();
+        assert_eq!(adjudication_model(&teams, "claude"), "claude-haiku-5");
+    }
+
+    /// A `review.model` scoped to ANOTHER harness does not apply — the turn is a `claude -p` one,
+    /// and handing it an `opencode` model is the mistake STUDIO-908 exists to prevent. It falls
+    /// back to the CLI default rather than refusing the turn, because refusing would freeze the
+    /// loop at the threshold with no decision at all.
+    ///
+    /// MUTATION: treat `ReviewModelChoice::Refuse` as a value to use and this reds.
+    #[test]
+    fn a_review_model_scoped_to_another_harness_is_not_borrowed() {
+        let mut scoped = rhapsody_config::teams::HarnessScoped::default();
+        scoped.insert("opencode", "some-opencode-model");
+        let teams = adjudicating_teams(scoped);
+        assert_eq!(
+            adjudication_model(&teams, "opencode"),
+            "",
+            "an opencode model must never reach a claude turn"
+        );
+    }
+
+    /// An installation that has pinned nothing gets exactly what it got before: no `--model`, the
+    /// CLI's own default. The byte-identical-when-unset direction.
+    #[test]
+    fn an_installation_that_pins_nothing_still_gets_the_cli_default() {
+        let teams = adjudicating_teams(rhapsody_config::teams::HarnessScoped::default());
+        assert_eq!(adjudication_model(&teams, "claude"), "");
+    }
 
     fn plan() -> ReviewAdjudicationPlan {
         ReviewAdjudicationPlan {

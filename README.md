@@ -1324,6 +1324,16 @@ request, and are rehydrated before the first tick — see that table's Divergenc
 measurement that forced it (five restarts in a day, 46 review rounds on one pull request) and for
 why an in-flight adjudication deliberately does not survive.
 
+**The adjudication turn's model.** `manager.model` is empty by default, and the turn path passes
+`--model` only when it is set — so an unset installation would decide ship-or-escalate on the CLI's
+own default while every review it is adjudicating ran on the pinned `review.model`. It now resolves
+in order: `manager.model` when set; else `review.model` scoped to the `claude` harness the turn
+actually runs on; else empty (the CLI default), which is the only honest answer when nothing is
+pinned anywhere. A `review.model` scoped to OTHER harnesses only is never borrowed — handing an
+`opencode` model to a `claude` turn is the mistake STUDIO-908 exists to prevent — and it falls
+through to the CLI default rather than refusing the turn, because refusing would freeze the loop at
+the threshold with no decision at all.
+
 **Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
 author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×
 reviewers review-only cap and its stop behave exactly as before. Adjudication is opt-in.

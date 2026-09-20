@@ -866,7 +866,18 @@ where
                     command,
                     billing_guard,
                     tracker_api_key,
-                    model: teams_cfg.manager.model.clone(),
+                    // NOT `manager.model` raw (STUDIO-956, round-8 finding 4): it is empty by
+                    // default, and an empty model means `claude -p` with no `--model` — the
+                    // decision would run on the CLI default while the reviews it is adjudicating
+                    // ran on the pinned `review.model`. The resolver falls back to that review
+                    // model, and says so in the README.
+                    model: rhapsody_orchestrator::reviewadjudicate::adjudication_model(
+                        &teams_cfg,
+                        &resolved
+                            .as_ref()
+                            .map(|c| c.agent.backend.clone())
+                            .unwrap_or_default(),
+                    ),
                     timeout: rhapsody_orchestrator::triage::manager_turn_timeout(&teams_cfg),
                 },
             })
