@@ -973,6 +973,7 @@ mod tests {
     }
 
     // ---- config_mcp_test.go mirrors (the Decode-related cases; the Encode round-trip is C6) ----
+
     /// Minimal front matter Decode needs for the MCP cases (tracker + repo), per Go `baseTrackerMCP`.
     fn base_tracker_mcp() -> String {
         "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\nrepo: \"git@github.com:o/r.git\"\n".to_string()

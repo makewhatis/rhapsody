@@ -337,6 +337,7 @@ claude:
 ---
 Do {{ issue.identifier }}.
 ";
+
     /// Writes `body` to a fresh temp `WORKFLOW.md`, returning its path + the owning dir (kept alive
     /// for the test's duration). Mirrors Go `writeWorkflow`.
     fn write_workflow(body: &str) -> (String, TempDir) {

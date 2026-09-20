@@ -881,6 +881,7 @@ mod tests {
     }
 
     // ---- claim_mode_test.go mirrors (the EffectiveFor halves) ----
+
     // Mirrors Go `TestEffectiveClaimModeDefaultsToAssignee`.
     #[test]
     fn effective_claim_mode_defaults_to_assignee() {
