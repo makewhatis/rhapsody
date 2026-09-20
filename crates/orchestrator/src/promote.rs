@@ -1005,6 +1005,25 @@ mod tests {
         ) -> Result<Option<rhapsody_store::SummonWatermark>, StoreError> {
             self.0.summon_watermark(identifier)
         }
+        fn set_review_rounds(&self, pr: &str, dispatches: i64) -> Result<(), StoreError> {
+            self.0.set_review_rounds(pr, dispatches)
+        }
+        fn record_review_adjudication(
+            &self,
+            pr: &str,
+            a: &rhapsody_store::ReviewAdjudication,
+        ) -> Result<(), StoreError> {
+            self.0.record_review_adjudication(pr, a)
+        }
+        fn clear_review_adjudication(&self, pr: &str) -> Result<(), StoreError> {
+            self.0.clear_review_adjudication(pr)
+        }
+        fn clear_review_bound(&self, pr: &str) -> Result<(), StoreError> {
+            self.0.clear_review_bound(pr)
+        }
+        fn load_review_bounds(&self) -> Result<Vec<rhapsody_store::ReviewBoundRow>, StoreError> {
+            self.0.load_review_bounds()
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }

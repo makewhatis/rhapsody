@@ -124,7 +124,9 @@ where
     // failed open. Only the one reader that would ACT on an absence uses it (the Teams
     // identity-label reconcile, STUDIO-672); everything else is guard-free by design.
     let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
-    o.set_store(store);
+    // Cloned rather than moved: the adjudication ledger below is built with the SAME handle, so the
+    // manager's decision and the round counter it belongs beside land in one row (STUDIO-956).
+    o.set_store(Arc::clone(&store));
     // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
     // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
     // failure — or no on-disk store home (--no-store / off / :memory:) — leaves the registry `None`, so
@@ -786,8 +788,17 @@ where
     // Built on exactly `spawn_watcher`'s condition, matching the auto-merge ledger: a ledger nothing
     // ever writes has nothing to read either, and the threshold gate keeps it inert until an
     // operator asks for adjudication.
-    let adjudication_ledger = spawn_watcher
-        .then(|| Arc::new(rhapsody_orchestrator::reviewadjudicate::AdjudicationLedger::default()));
+    // Built WITH the store (STUDIO-956), so a settled decision survives the restart that used to
+    // forget it — measured: 2026-09-20, five restarts, a pull request that had already been
+    // escalated resumed its loop from zero. `Orchestrator::rehydrate_review_bounds` seeds it back
+    // at boot, before the first tick, from the same rows.
+    let adjudication_ledger = spawn_watcher.then(|| {
+        Arc::new(
+            rhapsody_orchestrator::reviewadjudicate::AdjudicationLedger::with_store(Arc::clone(
+                &store,
+            )),
+        )
+    });
     o.adjudication_ledger = adjudication_ledger.clone();
     // One room handle for this process (see `triage_room` above): the adjudication posts its
     // decision there, and a second `LocalRoom` over the same directory would mint a second append

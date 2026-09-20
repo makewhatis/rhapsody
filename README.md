@@ -423,7 +423,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
+| `rhapsody.db` | no column, no new row *kind*; the two Teams-only tables (`rhapsody_review_watch` and `rhapsody_review_bound`, below) are created by the migration but stay **empty** — nothing writes to either unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -831,6 +831,45 @@ to the Go capture and grew nothing.
 and every Go-pinned golden is untouched: the new table is prefix-gated, the new endpoint is
 additive, and the new fields appear only on the Rhapsody-only issue listing. `divergent_objects_are_gated_by_name_only`
 now pins the third name.
+
+### A fourth schema table with no Go counterpart — `rhapsody_review_bound` (STUDIO-956)
+
+The review↔author round bound was in memory, and a bound a restart refunds is not a bound. Measured
+on the operator's own store, 2026-09-20: **five daemon restarts**, every one of them to apply a
+boot-only `teams.yaml` change — i.e. caused by tuning the review configuration — and each one handed
+seven in-flight pull requests a fresh budget. **264 review runs that day; 46 on one pull request
+against a nominal cap of 16.** Worse, a pull request the manager had already ESCALATED forgot the
+decision on restart and resumed the loop from zero. At a threshold of 3, a daemon that restarts more
+often than every 3 rounds never reaches the threshold at all.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **11** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance` and `rhapsody_review_bound` |
+| the round counter | — | `rhapsody_review_bound.dispatches`, written at every charge, rehydrated at boot |
+| the manager's decision | — | `decision`/`head`/`rounds`/`findings`/`reason` on the same row |
+
+One row per PULL REQUEST (`owner/repo#number`, case-folded), not per (pull request, reviewer): the
+bound is shared by all of a pull request's reviewers, and putting it on `rhapsody_review_watch` would
+give N reviewers N budgets — the defect STUDIO-727 already fixed in memory. The key is what makes the
+value mean *"rounds spent on this pull request"* rather than *"rounds since some daemon booted"*.
+
+**The counter and the decision have different writers, so neither upsert carries the other's
+columns.** The control task charges rounds; the off-loop adjudication half records what the manager
+said. A last-write-wins row would let a charged round erase a landed decision.
+
+**An in-flight adjudication is deliberately NOT persisted.** The in-flight marker means "a turn is
+out right now, do not ask again", and the process that was going to land it is exactly what a restart
+destroys. Persisted, it would stop every further round for that pull request forever with no turn
+left anywhere to clear it — a permanent freeze in place of the temporary refund this fixes.
+Unpersisted, a restart mid-turn costs one re-asked turn.
+
+**A pull request that leaves the watch set deletes its row** — merged, closed, or dismissed from the
+console — so one that is later re-introduced, reopened or rebuilt under the same number never
+inherits a spent budget. `POST /api/v1/reviews/clear` is the deliberate clear and is now the only
+thing that lifts a bound in place; the operator's **Re-run** refunds one round and drops the decision
+without resetting the budget. **Off is still off:** with `storage.path: off` there is nowhere to
+remember a bound, so the daemon keeps the per-boot behaviour it had before this ticket.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
@@ -1279,6 +1318,11 @@ the threshold. A turn that fails clears its in-flight marker so a later sweep re
 turn per sweep forever — through the same room post and pull-request comment every other decision
 gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —
 and the round budget — from the console (`POST /api/v1/reviews/clear`).
+
+**The bound and the decision are DURABLE.** Both live on `rhapsody_review_bound`, keyed by the pull
+request, and are rehydrated before the first tick — see that table's Divergences entry above for the
+measurement that forced it (five restarts in a day, 46 review rounds on one pull request) and for
+why an in-flight adjudication deliberately does not survive.
 
 **Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
 author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×

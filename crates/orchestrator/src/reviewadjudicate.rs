@@ -29,6 +29,22 @@
 //! touches a merge gate; [`crate::reviewwatch`] only stops arming rounds once a verdict is present,
 //! and the ordinary auto-merge path re-applies every gate on its own.
 //!
+//! # The decision is DURABLE; the in-flight marker deliberately is not (STUDIO-956, round 8)
+//!
+//! A decision the daemon forgets on restart is not a decision. The ledger therefore writes every
+//! SETTLED verdict through to `rhapsody_review_bound` beside the pull request's round counter, and
+//! [`crate::orchestrator::Orchestrator::rehydrate_review_bounds`] seeds it back at boot — measured
+//! need: on 2026-09-20 five restarts in one day each refunded seven in-flight pull requests their
+//! whole budget, and a pull request that had already been escalated resumed the loop from zero.
+//!
+//! The [`Adjudication::InFlight`] marker is the one thing that is NOT persisted, and that asymmetry
+//! is load-bearing. It means "a turn is out right now, do not ask again", and the process that was
+//! going to land it is exactly what a restart destroys. Persisted, it would stop every further
+//! round for that pull request forever with no turn left anywhere to clear it — a permanent freeze
+//! in place of the temporary refund this ticket is fixing. Unpersisted, a restart mid-turn costs
+//! one re-asked turn. The failure tally ([`MAX_ADJUDICATION_ATTEMPTS`]) is per-boot for the same
+//! reason: it only bounds the re-asking of an in-flight decision that never landed.
+//!
 //! # Its own gate, not `manager.mode`
 //!
 //! `manager.mode: labels` means there is no manager ASSIGNMENT turn today — assignment is
@@ -46,6 +62,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use rhapsody_config::room::{Message, RoomLog};
+use rhapsody_store::{
+    REVIEW_ADJUDICATION_ESCALATE, REVIEW_ADJUDICATION_SHIP, ReviewAdjudication, Store,
+};
 
 use crate::ghsummons::PrCommentSink;
 use crate::prstate::PrCoord;
@@ -188,6 +207,54 @@ impl Adjudication {
             | Adjudication::Escalate { rounds, .. } => *rounds,
         }
     }
+
+    /// The durable form of a SETTLED decision, or `None` for one still in flight — see the module
+    /// doc on why an in-flight marker must never reach the store.
+    fn to_stored(&self) -> Option<ReviewAdjudication> {
+        match self {
+            Adjudication::InFlight { .. } => None,
+            Adjudication::Ship { head, rounds } => Some(ReviewAdjudication {
+                decision: REVIEW_ADJUDICATION_SHIP.to_string(),
+                head: head.clone(),
+                rounds: *rounds as i64,
+                findings: Vec::new(),
+                reason: String::new(),
+            }),
+            Adjudication::Escalate {
+                head,
+                rounds,
+                findings,
+                reason,
+            } => Some(ReviewAdjudication {
+                decision: REVIEW_ADJUDICATION_ESCALATE.to_string(),
+                head: head.clone(),
+                rounds: *rounds as i64,
+                findings: findings.clone(),
+                reason: reason.clone(),
+            }),
+        }
+    }
+
+    /// Rebuilds a settled decision from its durable form. `None` for a `decision` token this build
+    /// does not know — the fail-open direction here, because the alternative is a pull request
+    /// stopped forever by a value no branch matches (see `Store::load_review_bounds`, which already
+    /// refuses to hand one over).
+    pub(crate) fn from_stored(stored: &ReviewAdjudication) -> Option<Adjudication> {
+        let rounds = stored.rounds.max(0) as usize;
+        match stored.decision.as_str() {
+            REVIEW_ADJUDICATION_SHIP => Some(Adjudication::Ship {
+                head: stored.head.clone(),
+                rounds,
+            }),
+            REVIEW_ADJUDICATION_ESCALATE => Some(Adjudication::Escalate {
+                head: stored.head.clone(),
+                rounds,
+                findings: stored.findings.clone(),
+                reason: stored.reason.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// What each pull request's adjudication is, shared between the control task (which reads it to
@@ -196,7 +263,7 @@ impl Adjudication {
 /// One `Mutex`-guarded map with no `.await` ever held across the lock, mirroring
 /// [`crate::runautomerge::AutoMergeLedger`] — the control task only ever takes it briefly, and never
 /// while awaiting.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AdjudicationLedger {
     entries: Mutex<HashMap<String, Adjudication>>,
     /// How many turns have FAILED per pull request since its last successful decision or its last
@@ -204,9 +271,48 @@ pub struct AdjudicationLedger {
     /// next sweep re-asks; this map is the memory that bounds the re-asking
     /// ([`MAX_ADJUDICATION_ATTEMPTS`]).
     failures: Mutex<HashMap<String, usize>>,
+    /// Where a SETTLED decision is written so it survives a restart (STUDIO-956). `None` leaves the
+    /// ledger exactly as it was before durability — per-boot — which is what the `Default` used by
+    /// the tests and by a daemon built without a store gets.
+    ///
+    /// The ledger WRITES through this handle and never reads it: the boot read is
+    /// [`crate::orchestrator::Orchestrator::rehydrate_review_bounds`]'s, on the control task, which
+    /// seeds this map through [`AdjudicationLedger::seed`]. One reader keeps the rehydration
+    /// ordered against the round counter's, which comes from the same rows.
+    store: Option<Arc<dyn Store + Send + Sync>>,
+}
+
+impl std::fmt::Debug for AdjudicationLedger {
+    /// Hand-written because `dyn Store` is not `Debug`; the handle is named by presence, which is
+    /// the only thing about it a diagnostic could use.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdjudicationLedger")
+            .field("entries", &self.entries)
+            .field("failures", &self.failures)
+            .field("durable", &self.store.is_some())
+            .finish()
+    }
 }
 
 impl AdjudicationLedger {
+    /// A ledger whose settled decisions are written through to `store` (STUDIO-956). The daemon's
+    /// composition root builds it with the same store handle the orchestrator holds, so the
+    /// decision and the round counter it belongs beside land in one row.
+    pub fn with_store(store: Arc<dyn Store + Send + Sync>) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::default()
+        }
+    }
+
+    /// Installs a decision read back from the store at boot, WITHOUT writing it out again — the one
+    /// entry point [`crate::orchestrator::Orchestrator::rehydrate_review_bounds`] uses. Never
+    /// overwrites an entry already present: a decision this process has made is newer than the one
+    /// on disk by construction.
+    pub fn seed(&self, pr_key: &str, adjudication: Adjudication) {
+        self.map().entry(pr_key.to_string()).or_insert(adjudication);
+    }
+
     /// Locks the map, treating a poisoned lock as readable — [`crate::triage::TriageHandle`]'s
     /// stance: a panic in a two-line critical section cannot leave the map logically inconsistent,
     /// and refusing to read it would turn a cosmetic fault into a re-run loop.
@@ -233,6 +339,20 @@ impl AdjudicationLedger {
         // than a deadlock rule. Holding one guard across the other would CREATE the deadlock the
         // old comment claimed to prevent — don't "tidy" this into a single expression expecting the
         // guards to stay ordered.
+        // Durable BEFORE the in-memory insert (STUDIO-956). The control task reads `entries` to
+        // decide that no further round arms, so a decision visible in memory but not on disk is
+        // exactly the window a restart turns into a forgotten verdict and a resumed loop. Writing
+        // first makes the durable state the leading edge; a write that fails still lands in memory,
+        // so the decision is honoured for this lifetime and the daemon says so.
+        if let (Some(store), Some(stored)) = (self.store.as_ref(), adjudication.to_stored())
+            && let Err(e) = store.record_review_adjudication(&key, &stored)
+        {
+            tracing::warn!(
+                pr = %key, err = %e,
+                "ticketless review: the manager's decision could not be persisted; it holds for \
+                 this daemon lifetime only"
+            );
+        }
         self.map().insert(key.clone(), adjudication);
         self.failures
             .lock()
@@ -272,6 +392,14 @@ impl AdjudicationLedger {
     /// dropped a decision (or a failure tally) but no counter.
     pub fn clear(&self, pr: &PrCoord) -> bool {
         let key = churn_key(pr);
+        // The decision only — never the round counter beside it in the same row. The operator's
+        // re-run clears a decision while REFUNDING one round rather than resetting the budget, and
+        // the callers that do want both gone call `Orchestrator::forget_review_bound` as well.
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = store.clear_review_adjudication(&key)
+        {
+            tracing::warn!(pr = %pr, err = %e, "ticketless review: the manager's decision could not be cleared durably");
+        }
         let had_entry = self.map().remove(&key).is_some();
         let had_failure = self
             .failures

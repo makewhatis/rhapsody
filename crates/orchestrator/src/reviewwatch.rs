@@ -171,11 +171,24 @@ use crate::teams::LoadSnapshot;
 /// force-push, a `--fixup` habit, or a reviewer who keeps summoning — would otherwise buy a full
 /// agent run per amendment forever. The adjudication threshold is the bound for that half.
 ///
-/// Deliberately in memory rather than a column: it is a churn floor, not an audit record, and the
-/// churn it guards against happens over minutes inside one daemon lifetime. An operator can clear
-/// it deliberately without a restart ([`Orchestrator::handle_review_clear`], `POST
-/// /api/v1/reviews/clear`); a restart clears it too, which is the correct outcome for an operator
-/// who restarted the daemon to unstick something.
+/// **The counter is DURABLE, and a restart does not refund it** (STUDIO-956). It is written to
+/// `rhapsody_review_bound` at every charge and rehydrated at boot
+/// ([`Orchestrator::rehydrate_review_bounds`]), keyed by the PULL REQUEST, so it means "rounds spent
+/// on this pull request" rather than "rounds since this daemon booted".
+///
+/// This replaces an earlier claim that keeping it in memory was right because "a restart clears it
+/// too, which is the correct outcome for an operator who restarted the daemon to unstick something".
+/// That was measured wrong. On 2026-09-20 there were five restarts, every one of them to apply a
+/// boot-only `teams.yaml` change — i.e. caused by tuning the review configuration — and each one
+/// handed seven in-flight pull requests a fresh budget: 46 review runs on one pull request against a
+/// nominal cap of 16, 264 review runs that day. The effective bound was 16 PER RESTART, which is no
+/// bound at all, and a pull request the manager had already escalated forgot the decision and
+/// resumed the loop from zero.
+///
+/// The deliberate clear is still there and is now the only thing that lifts a bound in place:
+/// [`Orchestrator::handle_review_clear`], `POST /api/v1/reviews/clear`. A pull request that leaves
+/// the watch set — merged, closed, dismissed — has its row deleted, so a re-introduced, reopened or
+/// rebuilt pull request never inherits a spent budget.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
 /// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
@@ -1072,6 +1085,14 @@ impl Orchestrator {
             .and_then(|t| t.review_adjudicate_after_rounds())
     }
 
+    /// [`Self::adjudication_threshold`] for tests in sibling modules — the reconciliation sweep's
+    /// budget-copy test asserts that its fixture really is an install with no threshold, which is
+    /// the whole premise of the sentence it pins.
+    #[cfg(test)]
+    pub(crate) fn adjudication_threshold_for_test(&self) -> Option<usize> {
+        self.adjudication_threshold()
+    }
+
     /// What the manager has decided (or is deciding) about `pr`, if anything (STUDIO-956).
     pub(crate) fn adjudication(
         &self,
@@ -1086,6 +1107,85 @@ impl Orchestrator {
     /// reviews do.
     fn rounds_used(&self, pr: &PrCoord) -> usize {
         self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) / self.reviewers_per_round()
+    }
+
+    /// Writes `key`'s round counter through to `rhapsody_review_bound`, so the bound survives the
+    /// restart that used to refund it (STUDIO-956). Call it after EVERY change to
+    /// [`Orchestrator::review_rounds`] that is not a wholesale forget (which is
+    /// [`Orchestrator::forget_review_bound`]).
+    ///
+    /// The in-memory figure is what is written, not an increment: the counter has exactly one
+    /// writer — the control task — and it is rehydrated at boot, so memory is authoritative and a
+    /// dropped write is repaired by the next charge rather than compounding.
+    ///
+    /// A store error is a WARN and nothing else. Persistence is best-effort everywhere in this
+    /// daemon, and the alternative — refusing to charge a round the store could not record — would
+    /// turn a disk problem into an unbounded review loop, which is the failure this ticket exists
+    /// to end.
+    pub(crate) fn persist_review_rounds(&self, key: &str) {
+        let spent = self.review_rounds.get(key).copied().unwrap_or(0);
+        if let Err(e) = self.store().set_review_rounds(key, spent as i64) {
+            tracing::warn!(
+                pr = %key, err = %e,
+                "ticketless review: the round counter could not be persisted; this pull request's \
+                 bound is per-boot until a later charge writes it"
+            );
+        }
+    }
+
+    /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
+    /// request that has left the watch set or that an operator has deliberately cleared
+    /// (STUDIO-956). The durability trap the ticket names: a bound that outlived its pull request
+    /// would hand a rebuilt or reopened one a spent budget it never earned.
+    pub(crate) fn forget_review_bound(&self, pr: &PrCoord) {
+        if let Err(e) = self.store().clear_review_bound(&churn_key(pr)) {
+            tracing::warn!(pr = %pr, err = %e, "ticketless review: the durable round bound could not be cleared");
+        }
+    }
+
+    /// Rebuilds the per-pull-request review bounds from the store at boot — the round counters into
+    /// [`Orchestrator::review_rounds`] and the manager's settled decisions into the adjudication
+    /// ledger (STUDIO-956). Called by [`Orchestrator::boot_recovery`], before the first tick.
+    ///
+    /// Only SETTLED decisions come back: an in-flight marker is never persisted (see
+    /// [`crate::reviewadjudicate::Adjudication`]), so an adjudication a restart interrupted is
+    /// simply re-asked rather than left stopping the loop forever with no turn anywhere to land it.
+    ///
+    /// Best-effort, like every other step of boot recovery: a failed read is logged and the daemon
+    /// starts with the per-boot behaviour it had before this ticket rather than refusing to boot.
+    pub(crate) fn rehydrate_review_bounds(&mut self) {
+        let rows = match self.store().load_review_bounds() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "recovery: the review round bounds could not be read; the bound is per-boot this lifetime");
+                return;
+            }
+        };
+        let (mut counters, mut decisions) = (0usize, 0usize);
+        for row in rows {
+            if row.dispatches > 0 {
+                // `row.pr` IS `churn_key`'s spelling — it is what wrote the row — so no second
+                // place derives the key and the two can never disagree about what one budget is.
+                self.review_rounds
+                    .insert(row.pr.clone(), row.dispatches as usize);
+                counters += 1;
+            }
+            if let Some(stored) = row.adjudication.as_ref()
+                && let Some(ledger) = self.adjudication_ledger.as_ref()
+                && let Some(decision) = crate::reviewadjudicate::Adjudication::from_stored(stored)
+            {
+                ledger.seed(&row.pr, decision);
+                decisions += 1;
+            }
+        }
+        if counters > 0 || decisions > 0 {
+            tracing::info!(
+                counters,
+                decisions,
+                "recovery: rehydrated the review round bounds; a restart no longer refunds a spent \
+                 budget or forgets a manager decision"
+            );
+        }
     }
 
     /// The decision-relevant open facts at `head`, one human-readable line per live row. Named on an
@@ -1211,7 +1311,9 @@ impl Orchestrator {
         }
         let round = self.reviewers_per_round();
         for pr in self.charged_linked_prs(iss) {
-            *self.review_rounds.entry(churn_key(&pr)).or_default() += round;
+            let key = churn_key(&pr);
+            *self.review_rounds.entry(key.clone()).or_default() += round;
+            self.persist_review_rounds(&key);
         }
     }
 
@@ -1311,6 +1413,10 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // Durably too (STUDIO-956) — counter and decision in one delete, so a pull request that is
+        // rebuilt or reopened under the same number starts from zero rather than inheriting a
+        // budget the pull request it replaced had spent.
+        self.forget_review_bound(pr);
         // And the manager's adjudication of it (STUDIO-956), for the same reasons: a re-introduced
         // pull request must be adjudicated afresh, and an entry for a gone pull request would keep
         // a divergence reported for a review nobody is waiting on any more.
@@ -1609,11 +1715,16 @@ impl Orchestrator {
                             tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
                         }
                     }
-                    let counter = self.review_rounds.entry(churn_key(pr)).or_default();
+                    let key = churn_key(pr);
+                    let counter = self.review_rounds.entry(key.clone()).or_default();
                     *counter += 1;
-                    if *counter == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
+                    let spent = *counter;
+                    // Durable from the instant it is charged (STUDIO-956): a round the daemon spent
+                    // and then forgot across a restart is how one pull request ran 46 of them.
+                    self.persist_review_rounds(&key);
+                    if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
                         tracing::warn!(
-                            pr = %pr, rounds = *counter,
+                            pr = %pr, rounds = spent,
                             "ticketless review: this pull request has now had its whole re-review \
                              budget; further pushes will not be reviewed"
                         );
@@ -2096,9 +2207,32 @@ mod tests {
         (o, dispatched)
     }
 
+    /// [`orch`] against a store the CALLER owns — the restart shape (STUDIO-956).
+    fn orch_on(
+        teams: Teams,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> (Orchestrator, DispatchedEntries) {
+        let (o, dispatched) = orch_on_store(teams, store);
+        o.human_holds.begin_pass(true);
+        (o, dispatched)
+    }
+
     /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so the ledger's
     /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
     fn orch_before_first_pass(teams: Teams) -> (Orchestrator, DispatchedEntries) {
+        orch_on_store(
+            teams,
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store")),
+        )
+    }
+
+    /// [`orch_before_first_pass`] against a store the CALLER owns — the restart shape. Two
+    /// orchestrators built over one `Arc<Sqlite>` are two daemon lifetimes over one database file
+    /// (STUDIO-956).
+    fn orch_on_store(
+        teams: Teams,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> (Orchestrator, DispatchedEntries) {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo", "in progress"]);
@@ -2110,9 +2244,7 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         o.teams = Some(teams);
-        o.set_store(Arc::new(
-            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
-        ));
+        o.set_store(store);
         let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&dispatched);
         o.spawn = Some(Box::new(move |_iss, _attempt, re| {
@@ -4067,6 +4199,210 @@ mod tests {
         let l = Arc::new(AdjudicationLedger::default());
         o.adjudication_ledger = Some(Arc::clone(&l));
         l
+    }
+
+    /// [`ledger`] whose settled decisions are written through to the orchestrator's own store — the
+    /// shape `rhapsodyd::run` builds (STUDIO-956).
+    fn durable_ledger(
+        o: &mut Orchestrator,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> Arc<AdjudicationLedger> {
+        let l = Arc::new(AdjudicationLedger::with_store(store));
+        o.adjudication_ledger = Some(Arc::clone(&l));
+        l
+    }
+
+    /// **Acceptance, and the round-8 blocker.** *"The threshold and the recorded decision survive a
+    /// daemon restart — assert it by writing rounds, dropping and rebuilding the Orchestrator from
+    /// the same store, and reading the count back."*
+    ///
+    /// The rounds are charged through the REAL path (`handle_review_sweep`'s dispatch), not by
+    /// poking the map, so what is pinned is that charging a round persists it — and the decision is
+    /// recorded through the real ledger the off-loop turn writes.
+    ///
+    /// Why it mattered: `review_rounds` was a bare `HashMap` nothing ever rehydrated, so every
+    /// restart refunded every pull request's whole budget. On 2026-09-20 five restarts (each one to
+    /// apply a boot-only `teams.yaml` change) produced 46 review runs on one pull request against a
+    /// nominal cap of 16, and a pull request the manager had already escalated forgot the decision
+    /// and resumed the loop from zero.
+    ///
+    /// ⚠️ MUTATION (the ticket's): make the round counter in-memory again — drop the
+    /// `persist_review_rounds` call from the dispatch site, or the `rehydrate_review_bounds` call
+    /// from `boot_recovery` — and this reds. Dropping the ledger's durable write reds the decision
+    /// half.
+    #[test]
+    fn the_round_counter_and_the_decision_survive_a_daemon_restart() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        // --- daemon lifetime one ---
+        let (mut o, dispatched) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            1,
+            "one round is dispatched, and charged"
+        );
+        assert!(!dispatched.lock().expect("lock").is_empty());
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&1));
+        // And the manager decides, off-loop, exactly as `perform_adjudication` does.
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaa".to_string()],
+                reason: "the reviewers disagree about the schema".to_string(),
+            },
+        );
+        drop(o);
+
+        // --- daemon lifetime two, same store ---
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "a fresh Orchestrator knows nothing until boot recovery runs"
+        );
+
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            Some(&1),
+            "the round this pull request spent must survive the restart that used to refund it"
+        );
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            Some(Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaa".to_string()],
+                reason: "the reviewers disagree about the schema".to_string(),
+            }),
+            "and so must the manager's decision, with the findings and the reason it named"
+        );
+    }
+
+    /// The other half of durability: an IN-FLIGHT marker must NOT survive, because the turn that
+    /// was going to land it does not. Persisted, it would stop every further round for that pull
+    /// request forever with no turn left anywhere to clear it — a permanent freeze in place of the
+    /// temporary refund this ticket fixes. So the restarted daemon sees no decision and the next
+    /// sweep re-asks.
+    ///
+    /// MUTATION: make `AdjudicationLedger::mark_in_flight` write through to the store the way
+    /// `record` does, and this reds. (`Adjudication::to_stored` already refuses an `InFlight`, which
+    /// is why `record` itself cannot be mutated into this defect.)
+    #[test]
+    fn an_in_flight_decision_does_not_survive_the_restart_that_killed_its_turn() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        l.mark_in_flight(&coord(12), 3);
+        assert!(o.adjudication(&coord(12)).is_some());
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "an interrupted adjudication is re-asked, never left stopping the loop forever"
+        );
+    }
+
+    /// The durability trap the ticket names: a pull request that LEAVES the watch set must not hand
+    /// a spent budget to the one that replaces it. A merged, closed or dismissed pull request
+    /// deletes its durable row, so a re-introduced, reopened or rebuilt one under the same number
+    /// boots with nothing.
+    ///
+    /// MUTATION: drop the `forget_review_bound` call from `retire_review_pr` and this reds — the
+    /// rebuilt pull request boots already at the threshold, its author half frozen, with no
+    /// decision anywhere and nothing to clear.
+    #[test]
+    fn a_reopened_pull_request_does_not_inherit_the_spent_budget() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&1));
+
+        // The pull request is merged: the watcher retires it.
+        o.handle_review_sweep(&[observed(12, merged_at(HEAD_A))]);
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(
+            o2.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "the retired pull request's budget must not outlive it"
+        );
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "nor the decision that was made about it"
+        );
+    }
+
+    /// The operator's deliberate clear (`POST /api/v1/reviews/clear`) is the escape hatch now that a
+    /// restart is not one. It must clear DURABLY: a clear the next boot undoes is worse than no
+    /// clear, because the operator watched it succeed.
+    ///
+    /// MUTATION: drop the `forget_review_bound` call from `handle_review_clear` and this reds.
+    #[test]
+    fn an_operator_clear_survives_the_restart_too() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        let (mut o, _d) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let l = durable_ledger(&mut o, Arc::clone(&store));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "a human is needed".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            o.handle_review_clear(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(_)
+        ));
+        drop(o);
+
+        let (mut o2, _d2) = orch_on(adjudicating(&["alice", "bob"], 3), Arc::clone(&store));
+        let _l2 = durable_ledger(&mut o2, Arc::clone(&store));
+        o2.boot_recovery();
+
+        assert_eq!(o2.review_rounds.get(&churn_key(&coord(12))), None);
+        assert_eq!(
+            o2.adjudication(&coord(12)),
+            None,
+            "the operator cleared it; a restart must not bring the decision back"
+        );
     }
 
     /// **Acceptance.** With the threshold set to 3, a pull request reaching round 3 dispatches NO

@@ -273,8 +273,14 @@ impl Orchestrator {
             // the refund and the charge can never disagree. Saturating: a counter below one round's
             // cost just returns to zero.
             let round = self.reviewers_per_round();
-            if let Some(spent) = self.review_rounds.get_mut(&churn_key(pr)) {
+            let key = churn_key(pr);
+            if let Some(spent) = self.review_rounds.get_mut(&key) {
                 *spent = spent.saturating_sub(round);
+                // The refund is durable too (STUDIO-956): a re-run whose refunded round only
+                // existed in memory would be undone by the next restart, which is the same defect
+                // as the charge only existing in memory — in the operator's face rather than the
+                // budget's.
+                self.persist_review_rounds(&key);
             }
             // The operator's re-run overrides a manager adjudication too (STUDIO-956): otherwise a
             // settled `ship`/`escalate` would keep the loop stopped and the refunded round would
@@ -326,6 +332,10 @@ impl Orchestrator {
         // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
         // which is a different fact from "the budget is now clear" and worth saying.
         let cleared_counter = self.review_rounds.remove(&churn_key(pr)).is_some();
+        // Durably, and unconditionally: the deliberate clear is the documented way to lift a bound
+        // now that a restart no longer does it (STUDIO-956), so it must leave nothing behind for a
+        // later boot to rehydrate — including a row this process never saw.
+        self.forget_review_bound(pr);
         if !cleared_counter && !cleared_decision {
             return ReviewControlOutcome::Refused(
                 "no review budget to clear for that pull request",
@@ -397,6 +407,7 @@ impl Orchestrator {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
+            self.forget_review_bound(pr);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
