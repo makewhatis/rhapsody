@@ -1580,11 +1580,15 @@ pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::f
 /// mistake: it only moves on a tick that actually asked this coordinate, so it is
 /// rotation-independent by construction.
 ///
-/// The value is 2, so ONE failed attempt still names the hold — a transient rate-limit must not
-/// blink a live annotation off for a sweep — while a second consecutive failure (two ticks on
-/// which GitHub would not answer) drops it. A genuinely dead coordinate takes one further rotation
-/// per attempt to reach that count, which is a bound; the defect this closes was that it never
-/// aged out at all.
+/// The value is 2, so ONE failed attempt still names the hold — a single transient lookup failure
+/// must not blink a live annotation off for a sweep — while a second consecutive failure (two ticks
+/// on which GitHub would not answer) drops it. The grace is deliberately small and is NOT sized to
+/// survive a GitHub rate limit: the primary REST limit resets on the hour, far beyond any count of
+/// attempts, and a wall-clock grace that tried to cover it is exactly what rounds 14–15 removed. It
+/// need not cover it, because the denial is REPORTED — the reconciliation sweep names the unreadable
+/// coordinate instead of falling through to the false plain page (round 18). A genuinely dead
+/// coordinate takes one further rotation per attempt to reach that count, which is a bound; the
+/// defect this closes was that it never aged out at all.
 pub(crate) const UNREADABLE_ATTEMPTS_TO_DROP_HOLD: u32 = 2;
 
 impl ControlHandle {

@@ -339,6 +339,7 @@ mod tests {
             stale_secs: 21_600,
             auto_merge_reason: None,
             capacity_held: None,
+            capacity_unreadable: None,
         }];
 
         let rendered = render(&o.build_snapshot());
@@ -388,6 +389,7 @@ mod tests {
                 separate: true,
                 recorded: now,
             }),
+            capacity_unreadable: None,
         }];
 
         let rendered = render(&o.build_snapshot());

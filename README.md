@@ -1210,8 +1210,10 @@ rather than claiming nothing reported it blocked. It is a statement about the ca
 sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
 watcher's own liveness is re-stamped on every tick and a hold is refreshed whenever the rotating
 cursor next evaluates its pull request. A hold older than the watcher's liveness stamp is ignored, and
-one whose pull request has failed enough consecutive lookups is dropped outright, so a hold from
-before a `gh` outage cannot keep being named.
+one whose pull request has failed enough consecutive lookups is dropped outright — and that denial is
+reported, with the attempt count, as an unreadable coordinate rather than falling back to the false
+"nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being named and a
+coordinate GitHub has stopped answering for cannot read as an unexplained stall.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |

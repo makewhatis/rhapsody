@@ -365,10 +365,18 @@ impl Orchestrator {
             .review_divergences()
             .iter()
             .any(|d| d.capacity_held.is_some());
+        // STUDIO-950 round 18: a coordinate GitHub stopped answering for is a second EXPLAINED
+        // stall, so the plain "nothing has reported it blocked" string is false for it too, and the
+        // unreadable warning takes its place. `review_unexplained` is therefore neither held NOR
+        // unreadable: only a row with no annotation at all is the STUDIO-898 stall this string means.
+        let review_unreadable = self
+            .review_divergences()
+            .iter()
+            .any(|d| d.capacity_unreadable.is_some());
         let review_unexplained = self
             .review_divergences()
             .iter()
-            .any(|d| d.capacity_held.is_none());
+            .any(|d| d.capacity_held.is_none() && d.capacity_unreadable.is_none());
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -400,6 +408,10 @@ impl Orchestrator {
             if review_held {
                 warnings
                     .push(crate::reviewreconcile::REVIEW_DIVERGENCE_CAPACITY_WARNING.to_string());
+            }
+            if review_unreadable {
+                warnings
+                    .push(crate::reviewreconcile::REVIEW_DIVERGENCE_UNREADABLE_WARNING.to_string());
             }
             if review_unexplained {
                 warnings.push(crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string());

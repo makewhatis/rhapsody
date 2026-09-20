@@ -135,6 +135,16 @@ pub const REVIEW_DIVERGENCE_WARNING: &str = "a pull request's board state and it
 pub const REVIEW_DIVERGENCE_CAPACITY_WARNING: &str = "a pull request's board state and its activity disagree because it is held \
      for capacity — no reviewer run can start yet; see `review_divergence` on /api/v1/state";
 
+/// [`REVIEW_DIVERGENCE_WARNING`]'s sibling for a divergence whose pull request GitHub has stopped
+/// answering for (STUDIO-950 round 18). The watcher reports the coordinate as unreadable every tick,
+/// so "nothing has reported it blocked" is false here too; the advisory names the silence instead and
+/// still points at the surface that says WHICH pull request. Pushed alongside the other two, never
+/// instead of them: a reported set can hold an unreadable coordinate, a capacity-held round and a
+/// genuinely unexplained stall at once, and each string is pushed on its own evidence.
+pub const REVIEW_DIVERGENCE_UNREADABLE_WARNING: &str = "a pull request's board state and its activity disagree and its GitHub state \
+     could not be read — the daemon cannot confirm it is progressing; see `review_divergence` on \
+     /api/v1/state";
+
 /// Which way a pull request's intent and its activity disagree. Three shapes, not six causes — see
 /// the module docs on why an enumeration of causes would defeat the purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +226,16 @@ pub struct Divergence {
     /// advisory both need it to say the wait is deliberate, and it cannot be folded into the fixed
     /// advisory string. Absent when there is no hold, so the healthy payload is untouched.
     pub capacity_held: Option<CapacityHold>,
+    /// How many CONSECUTIVE `gh` lookups of this pull request's coordinate had failed when the sweep
+    /// ran, once that count has reached [`UNREADABLE_ATTEMPTS_TO_DROP_HOLD`] (STUDIO-950 round 18).
+    /// `None` below the threshold — the annotation is absent for a coordinate the watcher is still
+    /// answering for — and it is mutually exclusive with `capacity_held`, because the count reaching
+    /// the threshold is exactly what makes [`Orchestrator::fresh_capacity_hold`] deny the hold.
+    ///
+    /// It exists so the sweep can say WHY a hold it still has in memory is not being named: GitHub
+    /// stopped answering for this coordinate, which is a fact the daemon knows and previously
+    /// declined to state, falling through instead to the false "nothing has reported it blocked".
+    pub capacity_unreadable: Option<u32>,
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -258,6 +278,11 @@ pub(crate) struct RowFacts {
     /// it so [`Orchestrator::set_review_divergences`] can name the hold and its holder count rather
     /// than claim nothing has reported it blocked.
     pub capacity_held: Option<CapacityHold>,
+    /// The consecutive failed `gh` lookups of this pull request's coordinate, once they have reached
+    /// [`UNREADABLE_ATTEMPTS_TO_DROP_HOLD`]; `None` below the threshold. Copied onto the divergence
+    /// so [`Orchestrator::set_review_divergences`] can name GitHub's silence rather than falling
+    /// through to the plain wording when `capacity_held` is denied for it (STUDIO-950 round 18).
+    pub capacity_unreadable: Option<u32>,
     /// The newest run of `review_key(pr, reviewer)` — this row's own review round.
     pub reviewer_run: Option<RunMoment>,
     /// The newest run of `ticket`.
@@ -341,6 +366,7 @@ pub(crate) fn reconcile_pr(
                 // A capacity hold defers a ROUND; it has nothing to say about an approved-and-open
                 // pull request, whose next move is a merge.
                 capacity_held: None,
+                capacity_unreadable: None,
             });
         }
         return None;
@@ -386,6 +412,7 @@ fn row_divergence(
                 stale_secs: stale_secs(now, anchor, stale_after)?,
                 auto_merge_reason: None,
                 capacity_held: row.capacity_held,
+                capacity_unreadable: row.capacity_unreadable,
             })
         }
         // A round ENDED without the agent ever declaring it had finished, so the round is owed
@@ -406,6 +433,7 @@ fn row_divergence(
                 stale_secs: stale_secs(now, attempt.last_at(), stale_after)?,
                 auto_merge_reason: None,
                 capacity_held: row.capacity_held,
+                capacity_unreadable: row.capacity_unreadable,
             })
         }
         // A round is owed and the REVIEWER owes it, and no run for this head has been recorded yet.
@@ -443,6 +471,7 @@ fn row_divergence(
                 stale_secs: stale_secs(now, anchor, stale_after)?,
                 auto_merge_reason: None,
                 capacity_held: row.capacity_held,
+                capacity_unreadable: row.capacity_unreadable,
             })
         }
         // `approved` is decided above (and, with auto-merge off, is a healthy wait for a human);
@@ -537,6 +566,7 @@ impl Orchestrator {
                     ),
                     now,
                 ),
+                capacity_unreadable: self.unreadable_attempts(&pr),
                 reviewer_run: self.newest_run_moment(&review_key(
                     &row.key.owner,
                     &row.key.repo,
@@ -624,12 +654,21 @@ impl Orchestrator {
         // watcher can be said to be holding. Counting attempts (not a deadline) is what makes this
         // rotation-independent: the counter only moves on a tick that actually asked this
         // coordinate, so a large watch set cannot age a still-carried hold out between rotations.
-        if self.review_watch_unreadable.get(pr).copied().unwrap_or(0)
-            >= UNREADABLE_ATTEMPTS_TO_DROP_HOLD
-        {
+        // The denial is not silent: `unreadable_attempts` carries the same count onto the reported
+        // row, so the sweep names GitHub's silence instead of the false plain page (round 18).
+        if self.unreadable_attempts(pr).is_some() {
             return None;
         }
         Some(*hold)
+    }
+
+    /// The consecutive failed `gh` lookups recorded for one coordinate, once they have reached
+    /// [`UNREADABLE_ATTEMPTS_TO_DROP_HOLD`] — the count at which [`Self::fresh_capacity_hold`] stops
+    /// naming a hold. `None` below the threshold, so the annotation is absent for a coordinate the
+    /// watcher is still answering for. STUDIO-950 round 18.
+    fn unreadable_attempts(&self, pr: &PrCoord) -> Option<u32> {
+        let attempts = self.review_watch_unreadable.get(pr).copied().unwrap_or(0);
+        (attempts >= UNREADABLE_ATTEMPTS_TO_DROP_HOLD).then_some(attempts)
     }
 
     /// The newest `runs` row for one issue identifier, or `None` when the ledger has none (a store
@@ -744,6 +783,29 @@ impl Orchestrator {
                             reason
                         );
                     }
+                    (None, None) if d.capacity_unreadable.is_some() => {
+                        // STUDIO-950 round 18: the hold (if any) was DENIED because GitHub stopped
+                        // answering for this coordinate, so the fallback's "nothing has reported it
+                        // blocked" is false — the watcher reports the failure every tick. Name the
+                        // silence instead. `capacity_unreadable` is `Some` by the guard; the default
+                        // cannot panic and only affects a hand-written `Divergence` fixture.
+                        let attempts = d.capacity_unreadable.unwrap_or_default();
+                        tracing::warn!(
+                            pr = %d.pr,
+                            kind = d.kind.as_str(),
+                            ticket = %d.ticket,
+                            reviewer = %d.reviewer,
+                            stale_secs = d.stale_secs,
+                            sweeps,
+                            unreadable_attempts = attempts,
+                            "review reconciliation: {} — {}. Its GitHub state could not be read for \
+                             {} consecutive attempt(s), so the daemon cannot confirm it is still \
+                             progressing. This sweep only reports, so it needs a human.",
+                            d.pr,
+                            d.kind.detail(),
+                            attempts
+                        );
+                    }
                     (None, None) => {
                         tracing::warn!(
                             pr = %d.pr,
@@ -834,6 +896,7 @@ mod tests {
             ticket: ticket.to_string(),
             open: true,
             capacity_held: None,
+            capacity_unreadable: None,
             reviewer_run,
             ticket_run,
         }
@@ -1692,6 +1755,84 @@ mod store_tests {
             review_warns[2].message.contains("2 run(s) hold"),
             "a changed holder count must be reported on the sweep that saw it, got: {}",
             review_warns[2].message
+        );
+    }
+
+    /// STUDIO-950 (round 18, jimmy's blocking finding): a hold the watcher DENIED because GitHub
+    /// stopped answering for its coordinate must not fall through to "nothing has reported it
+    /// blocked" — false, and false BECAUSE of the branch that produced it. The watcher knows exactly
+    /// what is wrong, so the sweep names it: the state could not be read for N consecutive attempts.
+    ///
+    /// Mutation check: delete the `capacity_unreadable` arm in [`Orchestrator::set_review_divergences`]
+    /// and this reds on the fallback wording (and on the advisory assertion, which reverts to the
+    /// plain "nothing has reported it blocked" string).
+    #[test]
+    fn a_round_github_stopped_answering_for_is_reported_as_unreadable() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        // The watcher is still holding the round for capacity, but its coordinate has failed
+        // `gh` lookups for enough consecutive attempts that the hold is no longer a wait anyone is
+        // confirming.
+        o.review_capacity_held.insert(
+            review_key("makewhatis", "rhapsody", 164, "alice"),
+            CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: t("2026-09-14T21:20:00Z"),
+            },
+        );
+        o.review_watch_unreadable.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            UNREADABLE_ATTEMPTS_TO_DROP_HOLD,
+        );
+
+        // TRA-243: register the unreadable callsite (new here) against a capturing subscriber before
+        // the real run, then reset the sweep counter so the assertion below is the FIRST crossing.
+        let _ = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("could not be read"),
+            "the sweep must name GitHub's silence, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the unreadable line replaces the fallback wording, not sits beside it: {}",
+            warn.message
+        );
+
+        // The project advisory makes the same claim and must stop making it too.
+        let projects = o.project_statuses();
+        assert!(
+            projects.iter().any(|p| p
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_DIVERGENCE_UNREADABLE_WARNING)),
+            "the advisory must name the unreadable coordinate, got {projects:?}"
+        );
+        assert!(
+            !projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "it must not also claim nothing has reported it blocked, got {projects:?}"
         );
     }
 
