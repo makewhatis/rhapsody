@@ -1045,9 +1045,24 @@ impl Orchestrator {
         let Some(threshold) = self.adjudication_threshold() else {
             return false;
         };
-        self.charged_linked_prs(iss)
+        let charged = self.charged_linked_prs(iss);
+        if charged.is_empty() {
+            return false;
+        }
+        // A manager decision — settled or still in flight — stops the author half on its own.
+        if charged.iter().any(|pr| self.adjudication(pr).is_some()) {
+            return true;
+        }
+        // A pull request that CONVERGED at the threshold is not bounded. The review half declines to
+        // adjudicate it (`service_review_pr` lets every-live-row-approved fall to the ordinary
+        // auto-merge path), so refusing the author here would freeze a healthy pull request with no
+        // decision in the ledger and nothing reporting it. Read the same live rows the review half
+        // reads to make that call — an author summoned after convergence is asking to move the head,
+        // which re-arms the review half and re-opens the budget.
+        let rows = self.store().load_live_review_watch().unwrap_or_default();
+        charged
             .iter()
-            .any(|pr| self.adjudication(pr).is_some() || self.rounds_used(pr) >= threshold)
+            .any(|pr| self.rounds_used(pr) >= threshold && !converged(&rows, pr))
     }
 
     /// The configured adjudication threshold, or `None` when adjudication is off (STUDIO-956).
@@ -1914,6 +1929,28 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
     row.key.owner.eq_ignore_ascii_case(&pr.owner)
         && row.key.repo.eq_ignore_ascii_case(&pr.repo)
         && row.key.number == pr.number
+}
+
+/// Whether every LIVE row of `pr` is an APPROVAL — the convergence question
+/// [`crate::automerge::auto_merge_verdict`] answers from a live head, reduced here to the rows' own
+/// verdicts so the author half (which holds no GitHub observation) can ask it too.
+///
+/// A row that is `approved` has stated a verdict about the commit it read, and a head advance
+/// re-arms it to `requested` on the next sweep — so at the moment an author is summoned after a
+/// changes-requested round, "all approved" cannot be a stale pre-push verdict. A pull request with
+/// no live row is NOT converged: nothing has reviewed it.
+fn converged(rows: &[ReviewWatchRow], pr: &PrCoord) -> bool {
+    let mut any = false;
+    for r in rows
+        .iter()
+        .filter(|r| row_is(r, pr) && r.open && r.status != REVIEW_STATUS_DROPPED)
+    {
+        any = true;
+        if r.status != REVIEW_STATUS_APPROVED {
+            return false;
+        }
+    }
+    any
 }
 
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
@@ -4345,6 +4382,51 @@ mod tests {
              not all run"
         );
         assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **A converged pull request is not bounded.** The review half declines to adjudicate a pull
+    /// request whose every live row approved at the head — it falls to the ordinary auto-merge path
+    /// — so the author half must not refuse a summons on the count alone. That would freeze a
+    /// healthy pull request with no decision in the ledger and nothing reporting it.
+    ///
+    /// Mutation check: refusing on `rounds_used(pr) >= threshold` alone reds this test.
+    #[test]
+    fn a_converged_pull_request_at_the_threshold_does_not_freeze_the_author_half() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        let iss = author_issue("STUDIO-1", 12);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "every live row approved at the head: the loop converged, so the author half stays open"
+        );
+        assert!(
+            o.adjudication(&coord(12)).is_none(),
+            "and nothing recorded a decision that could explain a refusal"
+        );
+    }
+
+    /// …but the convergence exemption must not become an unbounded author half: a threshold reached
+    /// with a row still holding changes-requested findings still refuses the re-dispatch.
+    #[test]
+    fn a_churning_pull_request_at_the_threshold_still_refuses_the_author_half() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        let iss = author_issue("STUDIO-1", 12);
+        let mut r = row(12, "bob");
+        r.status = REVIEW_STATUS_REVIEWED.to_string();
+        r.last_reviewed_sha = HEAD_A.to_string();
+        introduce(&o, r);
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        assert!(
+            o.author_round_budget_spent(&iss),
+            "a live row still holds changes-requested findings, so the loop has not converged"
+        );
     }
 
     /// The author guard is per PULL REQUEST: a ticket linked to a pull request that has reached the
