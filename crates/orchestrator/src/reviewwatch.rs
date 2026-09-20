@@ -942,8 +942,23 @@ impl Orchestrator {
         // request's required reviews. A row with no last round has no such continuity, so it takes
         // the ranking's answer — which is what makes two same-tick introductions land on two
         // different reviewers.
+        //
+        // The one thing continuity does NOT outrank is a required reviewer (STUDIO-951). A row
+        // persisted before the operator added `review.required` still names its old reviewer, and
+        // letting continuity keep them would mean the required identity never reviews that pull
+        // request — the guarantee the config asks for, silently unmet, with no adoption or
+        // reconciliation sweep to repair it. So continuity holds only while the incumbent is itself
+        // required, or while the ranking offers no required reviewer at all (the unset case, which
+        // is byte-identical to before the feature).
         if !row.last_reviewed_sha.is_empty() && candidates.iter().any(|name| name == incumbent) {
-            return Some(incumbent.to_string());
+            let required = teams.review_required();
+            let incumbent_required = required.contains(&incumbent);
+            let required_among_candidates = candidates
+                .iter()
+                .any(|name| required.contains(&name.as_str()));
+            if incumbent_required || !required_among_candidates {
+                return Some(incumbent.to_string());
+            }
         }
         candidates.into_iter().next()
     }
@@ -2127,6 +2142,46 @@ mod tests {
         });
         busy.identity = "bob".to_string();
         o.running.insert("iss-9".to_string(), busy);
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// STUDIO-951: a required reviewer outranks a NON-required incumbent. The persisted row names
+    /// `bob` — reviewing before the operator added `review.required: [carol]` — and continuity must
+    /// not keep him, or the pinned identity never reviews this pull request and nothing repairs it.
+    ///
+    /// Mutation check: remove the `required_among_candidates` guard and this goes red with `bob`,
+    /// which is exactly the defect the round-2 review found.
+    #[test]
+    fn a_required_reviewer_outranks_a_non_required_incumbent() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.required = vec!["carol".to_string()];
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["carol".to_string()],
+            "a required reviewer must win over an incumbent who is no longer pinned"
+        );
+    }
+
+    /// The counterpart, so the fix cannot simply disable continuity: with `review.required` unset a
+    /// non-required incumbent is still preferred over an idler (Decision B is unchanged).
+    #[test]
+    fn an_optional_incumbent_still_keeps_the_round() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol"]));
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("complete");
 
         o.handle_review_sweep(&[open_at(12, HEAD_B)]);
 

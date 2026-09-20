@@ -180,6 +180,7 @@ where
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
         report_over_pinned_reviewers(o.teams.as_ref());
+        report_unknown_required_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
@@ -1398,7 +1399,9 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
 /// reviewer count — which is the safe direction, but silently dropping a reviewer the operator
 /// explicitly required is the worst outcome the ticket names. The warning names both numbers so
 /// the fix (raise `reviewers`, or shorten `review.required`) is obvious, and the two are read from
-/// [`Teams::over_pinned_reviewers`], which knows which path is on and counts duplicates once.
+/// [`Teams::over_pinned_reviewers`], which knows which path is on, counts duplicates once, and
+/// counts **only selectable** (on-roster) pins — so its numbers are the ones selection would
+/// actually see. An off-roster name is [`report_unknown_required_reviewers`]'s job, not this one's.
 fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
     let Some(teams) = teams else { return };
     let Some((required, total)) = teams.over_pinned_reviewers() else {
@@ -1410,6 +1413,23 @@ fn report_over_pinned_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
         "review.required pins {required} identities but the active review path selects only \
          {total} reviewer(s): the extra pins are dropped, and the ones kept are the first {total} \
          in `required:` order. Raise the reviewer count or shorten `review.required`."
+    );
+}
+
+/// Warns about every `review.required` name that is not on the roster (STUDIO-951). Such a pin is
+/// inert — selection can only ever name a roster member — so it silently does nothing, and the
+/// live warning in `rank_reviewers` only fires once a round is actually built. Naming the typo at
+/// boot is how the operator learns before the first pull request arrives.
+fn report_unknown_required_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    let unknown = teams.unknown_required_reviewers();
+    if unknown.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        names = %unknown.join(", "),
+        "review.required names identities that are not on the roster; a pin can only select a \
+         roster member, so these names never review anything. Fix or remove them in teams.yaml."
     );
 }
 

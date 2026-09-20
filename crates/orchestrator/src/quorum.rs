@@ -1096,7 +1096,7 @@ fn post<TF>(deps: &QuorumDeps<TF>, msg: Message) {
     }
 }
 
-/// Chooses who reviews: the roster **minus the author and the pinned names that cannot run**,
+/// Chooses who reviews: the roster **minus the author and every pinned name that cannot run**,
 /// required reviewers first, then least-loaded, capped at `quorum.reviewers` (§0.12). Pure — the
 /// whole selection is a comparison over data already in hand, which is what lets it run on the
 /// control task.
@@ -1117,9 +1117,10 @@ pub(crate) fn select_reviewers(
     picked
 }
 
-/// The whole roster minus `author`, **required reviewers first** and then least-loaded with roster
-/// order as the tie-break — the ranking [`select_reviewers`] truncates to the quorum's count and
-/// the ticketless path truncates to its own (STUDIO-721; pinning STUDIO-951).
+/// The whole roster minus `author` and minus every name in `unavailable`, **required reviewers
+/// first** and then least-loaded with roster order as the tie-break — the ranking
+/// [`select_reviewers`] truncates to the quorum's count and the ticketless path truncates to its
+/// own (STUDIO-721; pinning STUDIO-951).
 ///
 /// Split out because the two review paths ask for different numbers of reviewers from the same
 /// order, and a second ranking function would be a second place for "never the author" and "ties
@@ -1141,12 +1142,15 @@ pub(crate) fn select_reviewers(
 /// * appears in `unavailable` — the orchestrator's live answer for pins whose harness cannot serve
 ///   the operator's `review.model` ([`Orchestrator::unavailable_required_reviewers`]). A pin that
 ///   cannot be dispatched must not empty or block a round; a hard pin that stalls a merge forever
-///   is strictly worse than the load-ranked behaviour it replaces.
+///   is strictly worse than the load-ranked behaviour it replaces. An unavailable name is excluded
+///   from BOTH halves below, not just from `pinned`: otherwise it would be emitted again as the
+///   ranked fill the moment its load or roster position made it early enough, which is the same
+///   permanent dispatch-refusal the exclusion exists to prevent.
 ///
 /// When any pin is dropped this way, a single warning names every dropped name — one line per
 /// selection, never one per reviewer — so a degraded round is visible rather than silent. The
-/// static cases (off-roster, an unimplemented harness) are also reported once at boot by the
-/// daemon; this is the live answer at the moment the round is actually built.
+/// static off-roster case is also reported once at boot by the daemon; the live harness answers
+/// cannot be, so they are visible here, at the moment the round is actually built.
 pub(crate) fn rank_reviewers(
     teams: &Teams,
     author: &str,
@@ -1185,7 +1189,9 @@ pub(crate) fn rank_reviewers(
         .roster
         .iter()
         .enumerate()
-        .filter(|(_, i)| i.name != author && !pinned.contains(&i.name.as_str()))
+        .filter(|(_, i)| {
+            i.name != author && !pinned.contains(&i.name.as_str()) && !unavailable.contains(&i.name)
+        })
         .map(|(idx, i)| {
             (
                 load.get(&i.name).copied().unwrap_or(0),
@@ -1829,16 +1835,18 @@ mod tests {
     }
 
     // Edge 3 (the degrade path): a pin that cannot run is skipped and the round proceeds with the
-    // reviewers that can — never blocked. Mutation check: remove the `unavailable` filter and this
-    // goes red, because `sol` is emitted first.
+    // reviewers that can — never blocked. Mutation check: remove the `unavailable` exclusion from the
+    // ranked half and this goes red, because `sol` sits at roster index 1 and is emitted as the fill.
+    // The roster order is deliberate: it puts `sol` before both replacements, so a selector that only
+    // drops the pin from the PINNED half still surfaces it — the defect this test pins down.
     #[test]
     fn a_required_reviewer_that_cannot_run_degrades_to_the_ranked_fill() {
-        let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
+        let teams = teams_quorum_pinning(&["alice", "sol", "bob", "carol"], 2, &["sol"]);
         let unavailable = HashSet::from(["sol".to_string()]);
         assert_eq!(
             select_reviewers(&teams, "alice", &HashMap::new(), &unavailable),
             vec!["bob".to_string(), "carol".to_string()],
-            "the unrunnable pin is dropped and the round is filled by ranking"
+            "the unrunnable pin is dropped and the round is filled by ranking, never by the pin again"
         );
     }
 

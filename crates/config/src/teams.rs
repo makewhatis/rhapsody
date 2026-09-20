@@ -1040,6 +1040,14 @@ impl Teams {
     /// select (STUDIO-951), else `None`. The daemon's boot turns this into ONE warning naming both
     /// numbers.
     ///
+    /// Only **selectable** pins are counted: a name that is not on the roster can never be named by
+    /// the selector, so it occupies no reviewer slot and must not make this claim. Counting such a
+    /// name produced a false warning — `reviewers: 1` with `required: [ghost, sol]` and only `sol`
+    /// on the roster warned that a pin was dropped, while selection in fact kept `sol` and dropped
+    /// nothing. Off-roster names get their own diagnostic,
+    /// [`unknown_required_reviewers`](Self::unknown_required_reviewers), so the operator still
+    /// learns about the typo without this count lying.
+    ///
     /// Selection **clamps** rather than refusing: pins are ranked first and the caller truncates to
     /// `total`, so a list longer than `total` simply drops the tail. That is the safe direction —
     /// the alternative, disabling Teams over an over-long pin list, loses every reviewer, not the
@@ -1048,16 +1056,34 @@ impl Teams {
     /// two numbers are named so the fix (raise `reviewers` or shorten `required`) is obvious.
     pub fn over_pinned_reviewers(&self) -> Option<(usize, usize)> {
         let total = self.active_reviewer_count()?;
-        // Counted the way the selector consumes them: trimmed, blanks dropped, duplicates folded.
-        // A repeated name occupies one reviewer slot, not two, so counting it twice would warn
-        // about a clamp that does not happen.
+        // Counted the way the selector consumes them: trimmed, blanks dropped, duplicates folded,
+        // and only names the selector can actually name (roster members).
         let mut seen: HashSet<&str> = HashSet::new();
         let required = self
             .review_required()
             .into_iter()
             .filter(|name| seen.insert(*name))
+            .filter(|name| self.roster.iter().any(|i| i.name == *name))
             .count();
         (required > total).then_some((required, total))
+    }
+
+    /// The `review.required` names that are **not on the roster** (STUDIO-951), in declaration
+    /// order, trimmed, blanks dropped and duplicates folded.
+    ///
+    /// Separate from [`over_pinned_reviewers`](Self::over_pinned_reviewers) because the selector can
+    /// only ever name a roster member: an unknown name never takes a slot and never clamps anything,
+    /// so folding it into that count made the boot warning claim a drop that never happened. It is
+    /// still worth a boot line of its own — the operator wrote the name believing it would review,
+    /// and the live `rank_reviewers` warning only fires once a round is actually built. An empty
+    /// list means every pin names somebody, which is the normal state.
+    pub fn unknown_required_reviewers(&self) -> Vec<&str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        self.review_required()
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .filter(|name| !self.roster.iter().any(|i| i.name == *name))
+            .collect()
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -2748,6 +2774,42 @@ mod tests {
             None,
             "a repeated name is one reviewer, not two"
         );
+    }
+
+    /// **sol round-2 finding 3 on PR #190.** A pin that is not on the roster can never be selected,
+    /// so it occupies no slot and must not make the over-pin count claim a clamp. It is reported by
+    /// `unknown_required_reviewers` instead — a boot diagnostic of its own, with a count that never
+    /// disagrees with selection.
+    ///
+    /// Mutation check: drop the roster filter from `over_pinned_reviewers` and the first assertion
+    /// goes red at `Some((2, 1))`, the false warning this pins down.
+    #[test]
+    fn off_roster_pins_are_reported_separately_from_the_clamp() {
+        let over = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 1\nreview:\n  required: [ghost, sol]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            over.over_pinned_reviewers(),
+            None,
+            "ghost cannot be selected, so the one real pin fits and nothing clamps"
+        );
+        assert_eq!(over.unknown_required_reviewers(), vec!["ghost"]);
+
+        // The same typo with no real pin at all: still no clamp warning, still reported as unknown.
+        let only_unknown = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 1\nreview:\n  required: [ghost]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert_eq!(only_unknown.over_pinned_reviewers(), None);
+        assert_eq!(only_unknown.unknown_required_reviewers(), vec!["ghost"]);
+
+        // An empty list is the normal state: nothing unknown, nothing clamped.
+        let pinned = Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\n  reviewers: 2\nreview:\n  required: [sol]\nroster:\n  - name: sol\n  - name: bob\n",
+        )
+        .expect("parses");
+        assert!(pinned.unknown_required_reviewers().is_empty());
     }
 
     /// **jimmy/alice round-1 finding 2 on PR #168.** `review_model_for`/`review_effort` must not
