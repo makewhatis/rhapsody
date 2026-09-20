@@ -845,7 +845,23 @@ impl Orchestrator {
             crate::reviewdone::origin_ticket(&row.introduced_by)
                 .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
         });
-        if held_origin {
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11), so on a daemon held by a bad config, an armed drain or a dead credential — the
+        // exact daemon whose dispatch has stopped — `held` is empty for the whole process lifetime
+        // and `held_origin` is `false` for a ticket that genuinely wears the label. The gate then
+        // opens and merges human-only work, irreversibly. Fail CLOSED instead: until a pass has
+        // actually looked, an empty set is "unknown", not "no hold". Once a pass has run the answer
+        // is real and the gate behaves exactly as before.
+        //
+        // MUTATION: make this read `is_primed()` as always-true (drop the fail-closed branch) and
+        // `an_unprimed_hold_ledger_refuses_auto_merge` reds (a plan is proposed).
+        if !self.human_holds.is_primed() {
+            tracing::debug!(
+                pr = %pr,
+                "auto-merge: no selection pass has run yet, so the human-hold label set is unknown; \
+                 refusing to merge"
+            );
+        } else if held_origin {
             tracing::debug!(
                 pr = %pr,
                 "auto-merge: the origin ticket is held for a human; not merging"
@@ -1200,7 +1216,20 @@ mod tests {
 
     /// An orchestrator with one enabled project owning [`REPO_URL`], an in-memory store and a
     /// recording spawn seam — the shape `dispatch_review` needs to reach a worker.
+    ///
+    /// Primed by a selection pass, because every watcher test after this one simulates a daemon that
+    /// is actually dispatching: on a real one the first tick runs before the watcher's 120s first
+    /// sweep, so the human-hold label set is a real answer by the time the watcher reads it. The
+    /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(teams: Teams) -> (Orchestrator, DispatchedEntries) {
+        let (o, dispatched) = orch_before_first_pass(teams);
+        o.human_holds.begin_pass();
+        (o, dispatched)
+    }
+
+    /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so the ledger's
+    /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
+    fn orch_before_first_pass(teams: Teams) -> (Orchestrator, DispatchedEntries) {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo", "in progress"]);
@@ -1788,6 +1817,40 @@ mod tests {
             o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
             1,
             "once the hold is gone the approved merge is proposed"
+        );
+    }
+
+    /// ⚠️ STUDIO-949 round 11: an approved, at-head pull request is NOT merged while the human-hold
+    /// ledger has never been primed by a selection pass — even with nothing labelled at all. This is
+    /// the failing-open direction: the current-label set has no writer above `on_tick`'s three early
+    /// gates (a bad config, an armed drain, a dead credential), so on a daemon held by one of them it
+    /// is empty for the whole process lifetime and the ordinary hold check would see "no hold" for a
+    /// ticket that wears the label. An unknown set fails closed.
+    ///
+    /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: it
+    /// runs the SAME fixture through a primed daemon and proposes the plan.
+    ///
+    /// MUTATION: drop the `is_primed()` fail-closed branch in `service_review_pr` and this reds (a
+    /// plan is proposed).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_auto_merge() {
+        let (mut o, _d) = orch_before_first_pass(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A)); // nothing held — the label set is just unknown
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "with no pass having looked, the hold set is unknown and the merge must not run: {:?}",
+            report.merge
+        );
+
+        // Once a pass has run the set is a real answer, and the same pull request merges.
+        o.human_holds.begin_pass();
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
+            1,
+            "a primed ledger merges the approved head"
         );
     }
 

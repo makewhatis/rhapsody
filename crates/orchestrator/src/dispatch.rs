@@ -119,7 +119,13 @@ const HUMAN_HOLD_CAPACITY: usize = 256;
 /// deliberately NOT retired on the tick's three early returns (a failed preflight, an armed drain, a
 /// dead credential). A leftover capacity tally would be a stale claim about a pass that no longer
 /// ran; a deliberate human hold does not depend on dispatch being enabled at all — the ticket still
-/// needs a person while the daemon is gated — so keeping it is the honest answer.
+/// needs a person while the daemon is gated — so keeping a populated set is the honest answer.
+///
+/// The converse is also load-bearing: on a daemon held by one of those gates since boot, NO pass has
+/// ever run, so an empty set is not "no hold" but "nothing has looked", and reading it as the former
+/// is how a `rhapsody:human` ticket's pull request self-merges on a drained daemon (STUDIO-949 round
+/// 11). [`HumanHoldState::primed`] carries that distinction; the two decision gates that run on
+/// their own schedules fail closed while it is `false`.
 ///
 /// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
 /// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
@@ -145,6 +151,24 @@ struct HumanHoldState {
     /// issue snapshot predates it. Kept separate so tightening a decision gate never makes the
     /// console call live work "held".
     labelled: HashSet<String>,
+    /// Whether a selection pass has run in this process — set by the first
+    /// [`HumanHoldLedger::begin_pass`] and never cleared (STUDIO-949 round 11).
+    ///
+    /// `labelled` is written ONLY from inside a selection pass (both ladders) or from the
+    /// auto-promote pass that runs immediately after one, and every one of those writers sits BELOW
+    /// `on_tick`'s three early-return gates (a failed config validation, an armed drain, a dead
+    /// agent credential). On a daemon held by one of those gates `labelled` is therefore empty for
+    /// the WHOLE process lifetime, and a decision gate reading it would see "no hold" rather than
+    /// "no information". The two gates that turn on it — the auto-merge refusal and the
+    /// reconciliation sweep's held-row filter — run on their own schedules (`Event::ReviewSweep`
+    /// from the watcher's 120s task; the sweep from `on_tick` ABOVE the gates) and so keep
+    /// executing while dispatch is gated.
+    ///
+    /// `primed` is that distinction: `false` until a pass has actually looked, so those two gates
+    /// fail CLOSED instead of silently open. `begin_pass` is the only writer on purpose — the
+    /// auto-promote pass observes only Backlog dependents, a partial view, and must not be able to
+    /// make an unknown label set look known.
+    primed: bool,
 }
 
 impl Default for HumanHoldLedger {
@@ -158,11 +182,26 @@ impl Default for HumanHoldLedger {
 impl HumanHoldLedger {
     /// Starts a fresh selection pass: the CURRENT hold set is dropped, so a ticket that stopped
     /// wearing the label — or left the candidate set — stops being reported. The announced set is
-    /// deliberately NOT touched.
+    /// deliberately NOT touched, and the **primed** flag is set: this is the first moment the
+    /// process can be said to have looked at all, which is what lets the fail-closed decision gates
+    /// (the auto-merge refusal, the reconciliation sweep's held-row filter) read an answer. No other
+    /// method sets it; see [`HumanHoldState::primed`].
     pub(crate) fn begin_pass(&self) {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         st.held.clear();
         st.labelled.clear();
+        st.primed = true;
+    }
+
+    /// Whether a full selection pass has run in this process (STUDIO-949 round 11). While `false`,
+    /// [`Self::labelled`] is not an answer — it is an absence of one — and the decision gates that
+    /// read it must fail closed rather than treat an empty set as "no hold". See
+    /// [`HumanHoldState::primed`].
+    pub(crate) fn is_primed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .primed
     }
 
     /// Records a ticket the pass OBSERVED wearing [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), with

@@ -462,6 +462,24 @@ impl Orchestrator {
             self.set_review_divergences(Vec::new());
             return;
         }
+        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
+        // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
+        // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
+        // selection pass has ever run, leaving `labelled` empty for the whole process lifetime. The
+        // held-row filter below would then match nothing, and this sweep would publish a
+        // `review_divergence` WARN for the very ticket the operator deliberately took over — the
+        // false alarm the filter exists to prevent, on every tick. With no pass having looked, an
+        // empty set is "unknown", not "no hold", so report NOTHING rather than a verdict the sweep
+        // cannot stand behind. (Once a pass has run the set is a real answer and the filter is
+        // exact; a false stall for a held ticket is strictly worse than a deferred report, and this
+        // sweep is a report, not a control.)
+        //
+        // MUTATION: drop this branch and
+        // `an_unprimed_hold_ledger_reports_no_divergence` reds (the held row is reported).
+        if !self.human_holds.is_primed() {
+            self.set_review_divergences(Vec::new());
+            return;
+        }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -1280,7 +1298,18 @@ mod store_tests {
             .with_timezone(&Utc)
     }
 
+    /// An enabled ticketless daemon with one project. Primed by a selection pass, because every
+    /// sweep test after this one simulates a running daemon whose dispatch half has executed; the
+    /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(auto_merge: bool, now: &str) -> Orchestrator {
+        let o = orch_before_first_pass(auto_merge, now);
+        o.human_holds.begin_pass();
+        o
+    }
+
+    /// [`orch`] with the human-hold ledger left un-primed: no selection pass has run, so its
+    /// current-label set is an absence of information rather than "no hold" (STUDIO-949 round 11).
+    fn orch_before_first_pass(auto_merge: bool, now: &str) -> Orchestrator {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
         eff.active_states = set_of(&["todo"]);
@@ -1477,6 +1506,53 @@ mod store_tests {
             o.project_statuses()
                 .iter()
                 .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
+        );
+    }
+
+    /// ⚠️ STUDIO-949 round 11: while the human-hold ledger has never been primed by a selection
+    /// pass, the sweep reports NOTHING — even a genuinely diverged row with no hold on it. The
+    /// current-label set has no writer above `on_tick`'s three early gates, and this sweep runs
+    /// ABOVE them on purpose, so on a daemon held by a bad config, an armed drain or a dead
+    /// credential the set is empty for the whole process lifetime. With no pass having looked, "the
+    /// row is not held" is not a fact the sweep can assert, and publishing a `review_divergence` WARN
+    /// for a held ticket is the false alarm the filter exists to prevent.
+    ///
+    /// `a_diverged_pull_request_is_reported_on_both_surfaces` is the live control: the SAME fixture
+    /// through a primed daemon reports on both surfaces.
+    ///
+    /// MUTATION: drop the `is_primed()` branch from `reconcile_review_divergence` and this reds (a
+    /// divergence is published).
+    #[test]
+    fn an_unprimed_hold_ledger_reports_no_divergence() {
+        let o = &mut orch_before_first_pass(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "with no pass having looked, the sweep cannot tell a hold from a stall"
+        );
+
+        // Once a pass has run, the same row is reported again.
+        o.human_holds.begin_pass();
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a primed sweep reports the divergence"
         );
     }
 

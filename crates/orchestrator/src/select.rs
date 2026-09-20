@@ -939,10 +939,10 @@ mod tests {
 
     // STUDIO-949 round 10: the multi-project ladder's own current-label note (`select.rs:376`) is
     // the ONLY one a `projects:` install ever reaches, and it feeds every decision gate that reads
-    // `labelled()` — `plan_quorum`, the ticketless watcher and the auto-merge gate. The tests above
-    // pin the console's REPORT set (fed by `note_human_hold`), so none of them notices if this write
-    // is deleted: the report survives while the decision gates silently lose the mid-run hold shape
-    // on the ladder most installs run.
+    // `labelled()` — `plan_quorum`, the ticketless watcher, the auto-merge gate and the
+    // reconciliation sweep. The tests above pin the console's REPORT set (fed by `note_human_hold`),
+    // so none of them notices if this write is deleted: the report survives while the decision gates
+    // silently lose the mid-run hold shape on the ladder most installs run.
     //
     // MUTATION: delete the `note_human_label` from the multi ladder's main-loop branch and this
     // reds while every other test in this file still passes.

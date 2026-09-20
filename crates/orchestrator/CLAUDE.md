@@ -108,7 +108,15 @@ the `Orchestrator` struct itself. Concretely:
     discovers the holds while taking `&self` by design, and the control task's `build_snapshot`
     reads the same cell. Never held across an `.await` — two map operations and out. Unlike
     `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
-    SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets.
+    SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets and sets the
+    ledger's **primed** flag — the boolean that distinguishes "the last pass saw no hold" from
+    "no pass has ever looked". Every writer is below `on_tick`'s three early-return gates while the
+    auto-merge gate and the reconciliation sweep keep running above/independently of them, so on a
+    daemon gated since boot `labelled` is empty for the whole process lifetime. Both gates therefore
+    fail CLOSED while `is_primed()` is false — auto-merge refuses, the sweep reports nothing
+    (STUDIO-949 round 11). Don't move the primed write into `hold`/`note_human_label`: the
+    auto-promote pass writes those with a partial (Backlog-only) view, and letting it mark the set
+    "known" would reopen the silent hole.
     This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
     both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
 

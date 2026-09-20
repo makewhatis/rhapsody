@@ -1305,6 +1305,25 @@ pass, is the window in which a label that was live a tick ago stops reaching the
 These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
 here rather than implying the refusal holds while the daemon no longer owns the ticket.
 
+**Every one of those writers sits below `on_tick`'s three early-return gates** — a failed config
+validation, an armed drain, a dead agent credential — while two of the decision gates keep running
+anyway: the reconciliation sweep is called from `on_tick` ABOVE those gates on purpose, and the
+auto-merge decision is reached through the ticketless review watcher's own 120s task. On a daemon held
+by one of those gates **since boot**, no selection pass has ever run, so the current-label set is not
+"no hold" but "nothing has looked". An empty set read as the former is how a `rhapsody:human`
+ticket's approved pull request self-merges on a drained daemon, irreversibly. Both gates therefore
+**fail closed** on a ledger no pass has primed: while `HumanHoldLedger::is_primed()` is `false` the
+auto-merge gate refuses (and logs at `debug!` why), and the reconciliation sweep reports nothing —
+a false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
+exists to prevent. This is a deliberate conservatism for a bounded window: a healthy daemon's first
+tick runs immediately (before the watcher's first sweep), so the ledger is primed long before either
+gate can act on real work, and once a single pass has run the set is real and the bounds above are
+the ones left. Those bounds are unchanged by this: after any pass the set is only as fresh as that
+pass, so a daemon gated *after* it dispatched freezes the set at the last one and a label that lands
+during the gate is unseen until dispatch resumes. That is the same "as fresh as the last pass"
+property the two-writer paragraph names; the fail-closed branch closes the strictly larger "never
+looked at all" case, not this one.
+
 **The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
 unchanged, and a second test asserts the key is ABSENT on a daemon with no hold so the conditional
