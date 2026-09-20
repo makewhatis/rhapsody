@@ -1342,20 +1342,38 @@ impl Orchestrator {
         // `teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the two readers
         // that gate covers are simply absent here (STUDIO-949 round 12). The path stays live while the
         // dispatch gates return early: `plan_quorum` is reached from the `evHandoffRun` control
-        // handler, which is not on `on_tick` at all, so a live run restored by recovery on a gated
-        // boot can hand off before any pass has looked. An empty set read as "no hold" then fans out a
-        // review for a held parent whose label landed mid-run — and the fan-out mints a NEW,
-        // unlabelled review ticket that no hold on the parent can reach. With no pass having looked,
-        // empty is "unknown", not "no hold": fail CLOSED and refuse the fan-out. Once a pass has run
-        // the set is a real answer and the gate behaves exactly as before.
+        // handler, which is not on `on_tick` at all.
+        //
+        // The run being handed off is LIVE, and on a gated daemon live runs come from the RETRY path,
+        // not from recovery: `boot_recovery` restores no running entry — it converts every interrupted
+        // claim into an IMMEDIATE RETRY (`recovery.rs` `arm_immediate_retry`) — and `on_retry` is
+        // gated by the drain ONLY, not by `validate()` (which returns `on_tick` at its first line) and
+        // not by the credential preflight. The real shape is therefore a daemon whose CONFIG
+        // VALIDATION HAS FAILED SINCE BOOT: every tick returns before dispatch and never primes, while
+        // `on_retry` keeps dispatching perfectly healthy runs off the last-good `eff`, and each of
+        // their handoffs reaches this gate for the whole life of the gate (STUDIO-949 round 14). An
+        // empty set read as "no hold" would fan out a review for a held parent whose label landed
+        // mid-run — and the fan-out mints a NEW, unlabelled review ticket that no hold on the parent
+        // can reach. With no pass having looked, empty is "unknown", not "no hold": fail CLOSED and
+        // refuse the fan-out. Once a pass has read the board the set is a real answer and the gate
+        // behaves exactly as before.
+        //
+        // This refusal DROPS the decision, and unlike the watcher's round and auto-merge gates it is
+        // NOT re-offered: the handoff has already landed, the run winds down, and `request_quorum` is
+        // the only feeder of the fan-out. So it is logged at `warn!`, naming the ticket, the way
+        // `request_quorum` warns for a gone task and `give_up` posts `REVIEW QUORUM FAILED` for an
+        // undelivered fan-out. A one-shot, unrecoverable refusal filed below those two, at `debug!`,
+        // is a review lost in silence — which is the defect this branch was fixed for.
         //
         // MUTATION: drop this branch and
-        // `an_unprimed_hold_ledger_refuses_a_quorum_fan_out` reds (the un-primed daemon fans out).
+        // `an_unprimed_hold_ledger_refuses_a_quorum_fan_out` reds (the un-primed daemon fans out);
+        // demote the log below `warn!` and the same test's level assertion reds.
         if !ledger_primed {
-            tracing::debug!(
+            tracing::warn!(
                 issue = %re.issue.identifier,
-                "teams quorum: no selection pass has run yet, so the human-hold label set is \
-                 unknown; no review is requested"
+                "teams quorum: no selection pass has read the board yet, so the human-hold label set \
+                 is unknown; no review is requested, so this handoff's review is dropped. Re-summon \
+                 the ticket once the daemon is healthy if the review is still wanted."
             );
             return None;
         }
@@ -1500,7 +1518,7 @@ mod tests {
 
     use super::*;
     use crate::ghsummons::OpenPrResult;
-    use crate::testsupport::{TempDir, issue};
+    use crate::testsupport::{TempDir, capture_events, issue};
     use rhapsody_config::room::{Cursor, LocalRoom, RoomError};
     use rhapsody_config::teams::{Identity, Quorum, Review, ReviewMode};
     use rhapsody_core::LinkedPRRef;
@@ -3130,17 +3148,25 @@ mod tests {
         );
     }
 
-    // STUDIO-949 round 12 — the ticket-mode sibling of the un-primed fail-closed branch. The
-    // current-label set has no writer above `on_tick`'s three early-return gates; a daemon held
-    // since boot that RECOVERY restores a live run onto can hand that run off before any pass has
-    // looked. `plan_quorum` is reached from the handoff handler, not from `on_tick`, and it is the
-    // ONLY `labelled()` gate a ticket-mode install has — `quorum_enabled()` excludes the ticketless
-    // watcher, and the sweep carries its own branch — so an un-primed empty set read as "no hold"
-    // fans out a review for a held parent whose label landed mid-run, minting a NEW unlabelled
-    // review ticket the hold cannot reach.
+    // STUDIO-949 rounds 12/14 — the ticket-mode sibling of the un-primed fail-closed branch. The
+    // current-label set has no writer above `on_tick`'s three early-return gates; `plan_quorum` is
+    // reached from the handoff handler, not from `on_tick`, and it is the ONLY `labelled()` gate a
+    // ticket-mode install has — `quorum_enabled()` excludes the ticketless watcher, and the sweep
+    // carries its own branch. The handed-off run is LIVE, and on a gated daemon live runs come from
+    // the RETRY path: `boot_recovery` turns interrupted claims into immediate retries (it restores no
+    // running entry), and `on_retry` is drain-gated only while `validate()` gates `on_tick`. So a
+    // daemon whose config validation has failed SINCE BOOT keeps dispatching and its handoffs reach
+    // this gate for the whole life of the gate — an un-primed empty set read as "no hold" fans out a
+    // review for a held parent whose label landed mid-run, minting a NEW unlabelled review ticket the
+    // hold cannot reach.
     //
-    // MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `plan_quorum` and this reds (the
-    // un-primed daemon plans a fan-out).
+    // Unlike the watcher's round and auto-merge gates, this refusal is NOT re-offered: the handoff has
+    // landed, the run winds down, and nothing else feeds the fan-out. The dropped review must
+    // therefore be LOUD, so the refusal is `warn!` naming the ticket.
+    //
+    // MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `plan_quorum` and this
+    // reds (the un-primed daemon plans a fan-out); demote the log below `warn!` and the level
+    // assertion reds.
     #[test]
     fn an_unprimed_hold_ledger_refuses_a_quorum_fan_out() {
         let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
@@ -3150,10 +3176,25 @@ mod tests {
         // No selection pass has run: the ledger's label set is not an answer, so the fan-out is
         // refused even though this parent wears no hold...
         assert!(!o.human_holds.labelled_and_primed().1);
+        let (planned, events) = capture_events(|| o.plan_quorum(&re));
         assert!(
-            o.plan_quorum(&re).is_none(),
+            planned.is_none(),
             "an un-primed ledger must fail closed rather than fan out a review it cannot prove unheld"
         );
+        // ...and the dropped, unrecoverable decision is logged at WARN, naming the ticket, so it can
+        // never pass in silence.
+        let warned = events
+            .iter()
+            .find(|e| {
+                e.message
+                    .contains("no selection pass has read the board yet")
+            })
+            .expect("the un-primed refusal is logged");
+        assert_eq!(
+            warned.level, "WARN",
+            "a one-shot, unrecoverable refusal must not be filed below WARN"
+        );
+        assert_eq!(warned.fields.get("issue").map(String::as_str), Some("MT-1"));
 
         // ...and once a pass has looked the SAME unlabelled parent fans out, so the refusal above is
         // the missing pass and not some unrelated gate.
