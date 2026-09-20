@@ -931,7 +931,7 @@ impl Orchestrator {
             teams,
             row.author.trim(),
             load.counts(),
-            &self.unavailable_required_reviewers(teams),
+            &self.reviewer_exclusions(teams),
         )
         .into_iter()
         .filter(|name| !peers.contains(name.as_str()))

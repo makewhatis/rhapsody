@@ -35,11 +35,18 @@ Ask, don't assume. The useful shapes:
 |---|---|---|
 | **Generalist pair** | two `profile: swe` | Default. Two teammates means reviews have somebody to go to who is not the author. |
 | **Specialist + generalist** | one custom profile, one `swe` | A codebase with real domain rules — deploy semantics, a frozen vocabulary, a parity contract. |
-| **Dedicated reviewer** | `profile: reviewer` | The roster is big enough that review is its own role. |
+| **Dedicated reviewer** | `profile: reviewer` | The roster is big enough that review is its own role. Add it to `review.required` (below) so it reviews every pull request. |
 | **Ops teammate** | `profile: sre` | Infra repos. |
 
 ⚠️ **One teammate is a degenerate team.** Reviewers exclude the author, so a single-teammate
 roster can never review its own work — the handoff finds nobody. Two is the practical floor.
+
+⚠️ **A dedicated reviewer competes for work like everyone else unless it is pinned.** Selection is
+least-loaded first with roster order breaking ties, so an idle generalist can push a review-only
+teammate out of every round. Pin it with `review.required: [<name>]` — the identity is then
+selected on every pull request regardless of load or roster position. A pin the daemon cannot use
+degrades to the remaining reviewers rather than blocking the round; see `rhapsody-teams`'s Review
+section for the four cases.
 
 Built-ins available today: **`swe`**, **`reviewer`**, **`sre`** (each versioned).
 

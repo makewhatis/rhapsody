@@ -1096,10 +1096,10 @@ fn post<TF>(deps: &QuorumDeps<TF>, msg: Message) {
     }
 }
 
-/// Chooses who reviews: the roster **minus the author and every pinned name that cannot run**,
-/// required reviewers first, then least-loaded, capped at `quorum.reviewers` (§0.12). Pure — the
-/// whole selection is a comparison over data already in hand, which is what lets it run on the
-/// control task.
+/// Chooses who reviews: the roster **minus the author and every identity that cannot be
+/// dispatched**, required reviewers first, then least-loaded, capped at `quorum.reviewers`
+/// (§0.12). Pure — the whole selection is a comparison over data already in hand, which is what
+/// lets it run on the control task.
 ///
 /// Ties break on roster order, exactly as [`crate::teams::route`]'s label-overlap fallback does, so
 /// the choice is deterministic and a test can pin it. `load` is §0.11.1's load: open tickets
@@ -1110,14 +1110,38 @@ pub(crate) fn select_reviewers(
     teams: &Teams,
     author: &str,
     load: &HashMap<String, i64>,
-    unavailable: &HashSet<String>,
+    exclusions: &ReviewerExclusions,
 ) -> Vec<String> {
-    let mut picked = rank_reviewers(teams, author, load, unavailable);
+    let mut picked = rank_reviewers(teams, author, load, exclusions);
     picked.truncate(teams.quorum.effective_reviewers());
     picked
 }
 
-/// The whole roster minus `author` and minus every name in `unavailable`, **required reviewers
+/// The two DIFFERENT reasons a pinned required reviewer can fail to become the pinned specialist
+/// (STUDIO-951), kept apart because they call for opposite treatment of the ranked fill.
+///
+/// Both are questions the pure selector cannot answer for itself — one is about the live harness a
+/// profile resolves to, the other about what `dispatch_review` will accept — so the orchestrator
+/// resolves them ([`Orchestrator::reviewer_exclusions`]) and hands the answer in.
+///
+/// * `unselectable` — the identity cannot be dispatched **at all**, so it is removed from both the
+///   pinned prefix and the ranked fill. Today this is exactly the ticketless `review.model`
+///   refusal: `dispatch_review` refuses the run before any watch write, so leaving the name in the
+///   ranked fill would re-offer the same refused review every tick and never complete — the
+///   merge-stalling loop the exclusion exists to prevent.
+/// * `unpinnable` — the identity still runs (on `agent.backend`), just not as the specialist its
+///   profile names, so it is dropped from the **pinned prefix only** and remains a ranked
+///   candidate. This is an unimplemented harness. Excluding these from the ranked fill too — as
+///   one shared set once did — made writing `review.required` strictly *reduce* a teammate's
+///   participation: an operator who pinned a specialist whose harness this build cannot run got
+///   that specialist as the ranked fill only until the pin removed them from it.
+#[derive(Debug, Default)]
+pub(crate) struct ReviewerExclusions {
+    pub(crate) unselectable: HashSet<String>,
+    pub(crate) unpinnable: HashSet<String>,
+}
+
+/// The whole roster minus `author` and minus every `unselectable` name, **required reviewers
 /// first** and then least-loaded with roster order as the tie-break — the ranking
 /// [`select_reviewers`] truncates to the quorum's count and the ticketless path truncates to its
 /// own (STUDIO-721; pinning STUDIO-951).
@@ -1139,50 +1163,90 @@ pub(crate) fn select_reviewers(
 /// * is not a roster member (`rank_reviewers` only ever names roster members), or
 /// * is the author (the existing non-author filter outranks the pin: nobody reviews their own pull
 ///   request), or
-/// * appears in `unavailable` — the orchestrator's live answer for pins whose harness cannot serve
-///   the operator's `review.model` ([`Orchestrator::unavailable_required_reviewers`]). A pin that
-///   cannot be dispatched must not empty or block a round; a hard pin that stalls a merge forever
-///   is strictly worse than the load-ranked behaviour it replaces. An unavailable name is excluded
-///   from BOTH halves below, not just from `pinned`: otherwise it would be emitted again as the
-///   ranked fill the moment its load or roster position made it early enough, which is the same
-///   permanent dispatch-refusal the exclusion exists to prevent.
+/// * appears in [`ReviewerExclusions`] — the orchestrator's live answer for pins whose harness
+///   cannot serve the operator's `review.model` or whose profile names a harness this build cannot
+///   run ([`Orchestrator::reviewer_exclusions`]). A pin that cannot be dispatched must not empty
+///   or block a round; a hard pin that stalls a merge forever is strictly worse than the
+///   load-ranked behaviour it replaces. An `unselectable` name is excluded from BOTH halves below,
+///   not just from `pinned`: otherwise it would be emitted again as the ranked fill the moment its
+///   load or roster position made it early enough, which is the same permanent dispatch-refusal
+///   the exclusion exists to prevent. An `unpinnable` name is dropped from `pinned` only and
+///   stays in the ranked fill.
 ///
-/// When any pin is dropped this way, a single warning names every dropped name — one line per
-/// selection, never one per reviewer — so a degraded round is visible rather than silent. The
-/// static off-roster case is also reported once at boot by the daemon; the live harness answers
-/// cannot be, so they are visible here, at the moment the round is actually built.
+/// A dropped pin is named in one warning per selection, never one per reviewer, so a degraded
+/// round is visible rather than silent. The three reasons get distinct messages so the operator is
+/// not told to fix a config that is correct: the **author** case is the normal state (a pinned
+/// teammate who opened the pull request) and is skipped without a warning at all; an **off-roster**
+/// name is also reported once at boot by the daemon; the two live harness answers cannot be, so
+/// they are visible here, at the moment the round is actually built.
 pub(crate) fn rank_reviewers(
     teams: &Teams,
     author: &str,
     load: &HashMap<String, i64>,
-    unavailable: &HashSet<String>,
+    exclusions: &ReviewerExclusions,
 ) -> Vec<String> {
     let on_roster = |name: &str| teams.roster.iter().any(|i| i.name == name);
     // Declaration order, trimmed and deduped, with every non-candidate dropped rather than
-    // emitted. `unavailable` is consulted first only because it also covers an off-roster name;
-    // the roster and author checks are repeated so a caller that passes an empty set still cannot
-    // pin an impossible reviewer.
+    // emitted. The roster and author checks are repeated here so a caller that passes no
+    // exclusions still cannot pin an impossible reviewer.
     let mut seen: HashSet<&str> = HashSet::new();
     let mut pinned: Vec<&str> = Vec::new();
-    let mut dropped: Vec<&str> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut unpinnable: Vec<&str> = Vec::new();
+    let mut unselectable: Vec<&str> = Vec::new();
     for name in teams.review_required() {
         if !seen.insert(name) {
             continue;
         }
-        if name == author || !on_roster(name) || unavailable.contains(name) {
-            dropped.push(name);
+        // The author case is the normal, intended state — a pinned teammate who opened this pull
+        // request — so it is skipped silently. Warning here would fire on every round of every
+        // pull request the pinned teammate authors and would tell them to fix correct config.
+        if name == author {
+            continue;
+        }
+        if !on_roster(name) {
+            unknown.push(name);
+            continue;
+        }
+        if exclusions.unselectable.contains(name) {
+            unselectable.push(name);
+            continue;
+        }
+        if exclusions.unpinnable.contains(name) {
+            unpinnable.push(name);
             continue;
         }
         pinned.push(name);
     }
-    if !dropped.is_empty() {
+    if !unselectable.is_empty() {
         tracing::warn!(
-            required = %dropped.join(", "),
+            required = %unselectable.join(", "),
             author = %author,
-            "teams review: a required reviewer cannot run and was skipped — it is off the roster, \
-             is this pull request's author, or its harness cannot serve review.model. The round \
-             proceeds with the remaining reviewers; fix `review.required` in teams.yaml to silence \
+            "teams review: a required reviewer cannot be dispatched for this configuration and \
+             was dropped from the round entirely — its harness cannot serve the configured \
+             `review.model` and a dispatch would be refused before any review row is written, so \
+             leaving it as a candidate would re-offer the same refused review forever. The round \
+             proceeds with the remaining reviewers; fix `review.model` in teams.yaml to silence \
              this."
+        );
+    }
+    if !unpinnable.is_empty() {
+        tracing::warn!(
+            required = %unpinnable.join(", "),
+            author = %author,
+            "teams review: a required reviewer's profile names a harness this build cannot run, so \
+             it cannot review as the pinned specialist — the pin was skipped and it stays in the \
+             ranked fill, running on `agent.backend`. The round proceeds; fix the profile's harness \
+             in teams.yaml to silence this."
+        );
+    }
+    if !unknown.is_empty() {
+        tracing::warn!(
+            required = %unknown.join(", "),
+            author = %author,
+            "teams review: a required reviewer is not on the roster and was skipped — the selector \
+             can only ever name a roster member. The round proceeds with the remaining reviewers; \
+             fix `review.required` in teams.yaml to silence this."
         );
     }
     let mut ranked: Vec<(i64, usize, &str)> = teams
@@ -1190,7 +1254,9 @@ pub(crate) fn rank_reviewers(
         .iter()
         .enumerate()
         .filter(|(_, i)| {
-            i.name != author && !pinned.contains(&i.name.as_str()) && !unavailable.contains(&i.name)
+            i.name != author
+                && !pinned.contains(&i.name.as_str())
+                && !exclusions.unselectable.contains(&i.name)
         })
         .map(|(idx, i)| {
             (
@@ -1430,7 +1496,7 @@ impl Orchestrator {
                 teams,
                 &re.identity,
                 &self.quorum_load,
-                &self.unavailable_required_reviewers(teams),
+                &self.reviewer_exclusions(teams),
             ),
             state_name: self.quorum_create_state(&re.project_slug),
             summon_token: self.quorum_summon_token(),
@@ -1736,7 +1802,7 @@ mod tests {
             ("dave".to_string(), 3),
         ]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            select_reviewers(&teams, "alice", &load, &ReviewerExclusions::default()),
             vec!["carol".to_string(), "dave".to_string()],
             "least-loaded first, author excluded, capped at reviewers"
         );
@@ -1749,7 +1815,7 @@ mod tests {
         let teams = teams_quorum(&["alice", "bob", "carol"], 1);
         let load = HashMap::from([("bob".to_string(), 4)]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            select_reviewers(&teams, "alice", &load, &ReviewerExclusions::default()),
             vec!["carol"]
         );
     }
@@ -1761,7 +1827,7 @@ mod tests {
         let teams = teams_quorum(&["alice", "bob", "carol", "dave"], 2);
         let load = HashMap::new();
         assert_eq!(
-            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            select_reviewers(&teams, "alice", &load, &ReviewerExclusions::default()),
             vec!["bob".to_string(), "carol".to_string()]
         );
     }
@@ -1771,13 +1837,24 @@ mod tests {
     fn a_short_roster_degrades_to_as_many_as_exist() {
         let teams = teams_quorum(&["alice", "bob"], 2);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["bob"]
         );
 
         let solo = teams_quorum(&["alice"], 2);
         assert!(
-            select_reviewers(&solo, "alice", &HashMap::new(), &HashSet::new()).is_empty(),
+            select_reviewers(
+                &solo,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            )
+            .is_empty(),
             "a roster of one has nobody to ask"
         );
     }
@@ -1796,7 +1873,12 @@ mod tests {
     fn a_required_reviewer_is_selected_with_every_teammate_idle() {
         let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["sol".to_string(), "bob".to_string()],
             "the pin is first and the single remaining slot is the ranked fill"
         );
@@ -1815,7 +1897,7 @@ mod tests {
             ("sol".to_string(), 9),
         ]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            select_reviewers(&teams, "alice", &load, &ReviewerExclusions::default()),
             vec!["sol".to_string(), "bob".to_string()],
             "the pin outranks load; the fill is still least-loaded first"
         );
@@ -1828,25 +1910,55 @@ mod tests {
     fn a_required_reviewer_that_is_the_author_is_skipped_and_never_selected() {
         let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol"]);
         assert_eq!(
-            select_reviewers(&teams, "sol", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "sol",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["alice".to_string(), "bob".to_string()],
             "the author pin is dropped; the fill proceeds"
         );
     }
 
-    // Edge 3 (the degrade path): a pin that cannot run is skipped and the round proceeds with the
-    // reviewers that can — never blocked. Mutation check: remove the `unavailable` exclusion from the
-    // ranked half and this goes red, because `sol` sits at roster index 1 and is emitted as the fill.
-    // The roster order is deliberate: it puts `sol` before both replacements, so a selector that only
-    // drops the pin from the PINNED half still surfaces it — the defect this test pins down.
+    // Edge 3, `unselectable` half (the hard-degrade path): a pin whose dispatch would be REFUSED
+    // is removed from both halves and the round proceeds with the reviewers that can — never
+    // blocked, and never re-offered. Mutation check: remove the `unselectable` exclusion from the
+    // ranked half and this goes red, because `sol` sits at roster index 1 and is emitted as the
+    // fill. The roster order is deliberate: it puts `sol` before both replacements, so a selector
+    // that only drops the pin from the PINNED half still surfaces it — the defect this test pins
+    // down.
     #[test]
-    fn a_required_reviewer_that_cannot_run_degrades_to_the_ranked_fill() {
+    fn an_unselectable_required_reviewer_degrades_to_the_ranked_fill() {
         let teams = teams_quorum_pinning(&["alice", "sol", "bob", "carol"], 2, &["sol"]);
-        let unavailable = HashSet::from(["sol".to_string()]);
+        let exclusions = ReviewerExclusions {
+            unselectable: HashSet::from(["sol".to_string()]),
+            ..ReviewerExclusions::default()
+        };
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &unavailable),
+            select_reviewers(&teams, "alice", &HashMap::new(), &exclusions),
             vec!["bob".to_string(), "carol".to_string()],
-            "the unrunnable pin is dropped and the round is filled by ranking, never by the pin again"
+            "a refused reviewer is dropped from both halves and the round is filled by ranking"
+        );
+    }
+
+    // Edge 3, `unpinnable` half: a pin whose harness this build cannot run is dropped from the
+    // pinned prefix but KEEPS its place in the ranked fill, because `spawn_worker` falls back to
+    // `agent.backend` and the teammate really does review. Writing the pin must not make the
+    // teammate review LESS than not writing it, which is what sharing one exclusion set with the
+    // refusal above did. Mutation check: put `sol` in `unselectable` instead and this goes red
+    // with the pin deleted from a pool it would otherwise lead.
+    #[test]
+    fn an_unpinnable_required_reviewer_stays_in_the_ranked_fill() {
+        let teams = teams_quorum_pinning(&["alice", "sol", "bob", "carol"], 2, &["sol"]);
+        let exclusions = ReviewerExclusions {
+            unpinnable: HashSet::from(["sol".to_string()]),
+            ..ReviewerExclusions::default()
+        };
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new(), &exclusions),
+            vec!["sol".to_string(), "bob".to_string()],
+            "the pin is dropped but `sol` still leads the ranked fill, exactly as if unpinned"
         );
     }
 
@@ -1856,7 +1968,12 @@ mod tests {
     fn an_off_roster_required_name_is_ignored() {
         let teams = teams_quorum_pinning(&["alice", "bob", "carol"], 2, &["ghost"]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["bob".to_string(), "carol".to_string()]
         );
     }
@@ -1868,7 +1985,12 @@ mod tests {
     fn more_required_reviewers_than_reviewers_clamps_the_tail() {
         let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 1, &["sol", "bob"]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["sol".to_string()],
             "one reviewer: the first pin, and nothing else"
         );
@@ -1879,7 +2001,12 @@ mod tests {
     fn a_duplicate_required_name_is_counted_once() {
         let teams = teams_quorum_pinning(&["alice", "bob", "carol", "sol"], 2, &["sol", "sol"]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &HashSet::new()),
+            select_reviewers(
+                &teams,
+                "alice",
+                &HashMap::new(),
+                &ReviewerExclusions::default()
+            ),
             vec!["sol".to_string(), "bob".to_string()]
         );
     }
@@ -1897,7 +2024,7 @@ mod tests {
             ("dave".to_string(), 4),
         ]);
         assert_eq!(
-            select_reviewers(&teams, "alice", &load, &HashSet::new()),
+            select_reviewers(&teams, "alice", &load, &ReviewerExclusions::default()),
             vec!["carol".to_string(), "bob".to_string(), "dave".to_string()],
             "least-loaded first, roster order breaking the bob/dave tie"
         );

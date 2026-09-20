@@ -466,7 +466,7 @@ impl Orchestrator {
             teams,
             &re.identity,
             load.counts(),
-            &self.unavailable_required_reviewers(teams),
+            &self.reviewer_exclusions(teams),
         );
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() {
