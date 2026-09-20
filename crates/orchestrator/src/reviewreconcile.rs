@@ -1583,6 +1583,21 @@ mod store_tests {
             separate: false,
             recorded: t("2026-09-14T21:20:00Z"),
         };
+
+        // TRA-243: this test asserts on TWO `tracing` callsites — the plain line and the capacity
+        // line — and `tracing` caches per-callsite Interest GLOBALLY, so a callsite whose first hit
+        // races a concurrently-running subscriber can be cached `never` and then drop its events.
+        // A warm-up capture pass under the same lock registers BOTH callsites against a capturing
+        // subscriber before the assertions below. Reset afterwards so the real run starts from a
+        // clean crossing with no hold.
+        let _ = crate::testsupport::capture_events(|| {
+            o.reconcile_review_divergence(); // the plain callsite
+            o.review_capacity_held.insert(id.clone(), hold);
+            o.reconcile_review_divergence(); // the capacity callsite
+        });
+        o.review_divergent.clear();
+        o.review_capacity_held.clear();
+
         let (_, events) = crate::testsupport::capture_events(|| {
             // Sweep 1: the obligation is stale, but the watcher is holding nothing — the plain line.
             o.reconcile_review_divergence();
