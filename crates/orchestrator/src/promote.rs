@@ -543,6 +543,11 @@ mod tests {
         o.promote_unblocked().await;
 
         assert_eq!(
+            tr.blocked_backlog_calls(),
+            1,
+            "the scope must actually be fetched, or the zero-move assertion below is vacuous"
+        );
+        assert_eq!(
             tr.move_to_type_calls().len(),
             0,
             "a parked Deferred ticket (backlog type, not a promote_from state) must never be promoted"
@@ -632,6 +637,11 @@ mod tests {
 
         o.promote_unblocked().await;
 
+        assert_eq!(
+            tr.blocked_backlog_calls(),
+            1,
+            "the project scope must actually be fetched, or the zero-move assertion below is vacuous"
+        );
         assert_eq!(
             tr.move_to_type_calls().len(),
             0,
