@@ -706,6 +706,15 @@ impl Orchestrator {
         // round deferred for a different reason, or one whose pull request the lookup did not even
         // reach, cannot keep annotating the reconciliation sweep's row under an old hold. The
         // capacity branch below re-inserts each round the budget defers.
+        //
+        // Deliberately placed AFTER the store read above. A first hand-back whose WAL read failed
+        // decided nothing — it neither dispatches nor defers — so the tick's holds are unknown, and
+        // the deliberate choice is to KEEP the previous tick's (still `CAPACITY_HOLD_TTL`-fresh)
+        // records rather than blank the map: a round that really is held keeps its "held for
+        // capacity" annotation instead of paging a human with "nothing has reported it blocked"
+        // because the watcher could not read its own watch set. Clearing BEFORE the read would
+        // blank it in exactly that failure. The cost is at most one extra tick of a stale-but-fresh
+        // hold, which the TTL then expires.
         if slots.is_none() {
             self.review_capacity_held.clear();
         }
@@ -3093,7 +3102,7 @@ mod tests {
     /// asserts the round ran *while implementations held the global cap*, which is the whole
     /// property, not merely that some review ran.
     #[test]
-    fn a_review_round_dispatches_while_implementations_hold_the_global_budget() {
+    fn strava_31_a_review_round_dispatches_while_implementations_hold_the_global_budget() {
         let (mut o, dispatched) = orch(ticketless(&["bob"]));
         {
             let eff = o.eff.as_mut().expect("eff");
@@ -3353,6 +3362,9 @@ mod tests {
     /// round's hold is gone once the second hand-back lands.
     #[test]
     fn a_capacity_hold_survives_a_later_hand_back_in_the_same_tick() {
+        // TRA-243: this test drives the same capacity-hold `tracing` callsites a capturing test
+        // asserts on, so it serializes against them rather than poisoning their interest cache.
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.blocking_lock();
         let (mut o, _d) = orch(ticketless(&["bob"]));
         o.eff.as_mut().expect("eff").max_concurrent = 4;
         for i in 0..4 {
@@ -3372,7 +3384,7 @@ mod tests {
         );
 
         // A later hand-back in the SAME tick must not clear it.
-        let _ = o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], Some(left));
+        let (_, left) = o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], Some(left));
         assert_eq!(
             o.review_capacity_held
                 .get(&review_key(OWNER, REPO, 31, "bob"))
@@ -3386,6 +3398,25 @@ mod tests {
                 .map(|h| h.holders),
             Some(4),
             "the later hand-back records its own hold too"
+        );
+
+        // A FINAL observation that holds nothing — a retirement — must not erase the tick's holds
+        // either: an unguarded clear leaves the map empty, which is the false page in its worst form
+        // (no row annotated at all) once the tick's last observation is not a deferred round.
+        let _ = o.handle_review_sweep_slots(&[observed(99, PrLookup::Gone)], Some(left));
+        assert_eq!(
+            o.review_capacity_held
+                .get(&review_key(OWNER, REPO, 31, "bob"))
+                .map(|h| h.holders),
+            Some(4),
+            "a final non-holding observation must not erase an earlier hold"
+        );
+        assert_eq!(
+            o.review_capacity_held
+                .get(&review_key(OWNER, REPO, 32, "bob"))
+                .map(|h| h.holders),
+            Some(4),
+            "nor the one recorded by the previous hand-back"
         );
     }
 
@@ -3434,6 +3465,60 @@ mod tests {
         assert!(
             o.review_divergences()[0].capacity_held.is_none(),
             "a hold no live sweep is refreshing must not be named"
+        );
+    }
+
+    /// STUDIO-950: [`CAPACITY_HOLD_TTL`]'s LOWER bound — the half the stale test above cannot see,
+    /// because it only ever advances past the constant. A hold is recorded partway through a sweep
+    /// and the reconciliation sweep may read it only after the watcher has finished the rest of that
+    /// sweep, so the TTL has to outlast a healthy WORST-CASE tick — the sleep before a sweep plus a
+    /// full tick of sequential `gh` lookups — or the sweep would call a live hold stale while the
+    /// watcher is still working through the very sweep that recorded it.
+    ///
+    /// Mutation check: shrink the TTL to `2 * PR_STATE_POLL_INTERVAL` (the pre-STUDIO-953 bound sol
+    /// flagged) and the age advanced here overtakes it, red. The advance is derived from the
+    /// documented worst case, never from `CAPACITY_HOLD_TTL`, so it cannot follow the constant it is
+    /// pinning.
+    #[test]
+    fn a_capacity_hold_survives_a_full_healthy_tick() {
+        // TRA-243: see the sibling test above — same callsites, serialized against the capturers.
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.blocking_lock();
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1);
+
+        // One second short of the documented worst case: the interval slept before a sweep, then a
+        // full tick of lookups each bounded by `GH_EXEC_TIMEOUT`.
+        let worst_case = crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
+            + crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
+                * crate::ghsummons::GH_EXEC_TIMEOUT.as_secs();
+        let later = chrono::Utc::now()
+            + chrono::Duration::seconds(i64::try_from(worst_case).expect("worst case") - 1);
+        o.now = Box::new(move || later);
+
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "the owed round still reports"
+        );
+        assert_eq!(
+            o.review_divergences()[0].capacity_held.map(|h| h.holders),
+            Some(4),
+            "a hold from the tick currently in flight must still be named"
         );
     }
 

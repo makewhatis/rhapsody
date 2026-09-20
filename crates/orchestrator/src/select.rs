@@ -738,8 +738,10 @@ mod tests {
             "a ticketless review still spends its project's own cap: the separation is global only"
         );
 
-        // Control: the same fixture with nothing running admits the implementation.
-        let clean = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        // Control: the IDENTICAL fixture — key still set — with no review in the group admits the
+        // implementation, so the refusal above is the running review and not the key or the fixture.
+        let mut clean = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        clean.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
         assert_eq!(
             clean
                 .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))

@@ -1247,11 +1247,15 @@ separated in BOTH directions — the two `select` ladders and the retry path sub
 ticketless reviews from their global implementation draw, so a review in flight cannot cost an
 implementation a GLOBAL slot, and the review watcher draws only its own pool.
 
-The separation is **global only**. A project's own `max_concurrent` ceiling is a separate budget and
-still counts a running ticketless review against implementations in its project
-(`running_in_project_group` mirrors Go and is deliberately untouched), so on a `projects:` install
-whose project cap is or inherits `max_concurrent_agents`, raise that project's `max_concurrent` too —
-otherwise the project gate binds before the global one and the key buys that project nothing.
+The separation is **global only**, and the two directions see that boundary differently. A project's
+own `max_concurrent` ceiling is a separate budget and still counts a running ticketless review
+against implementations in its project (`running_in_project_group` mirrors Go and is deliberately
+untouched). So the key frees the **review** direction unconditionally — the review watcher draws only
+`max_concurrent_reviews` and consults no per-project cap at all — while it widens the
+**implementation** direction only against the global budget. On a `projects:` install whose project
+cap is or inherits `max_concurrent_agents`, implementations in that project can still be held by the
+project gate even with the key set, so raise that project's `max_concurrent` too if you want the
+implementation direction to benefit there.
 
 Total live agents may therefore exceed `max_concurrent_agents` by up to `max_concurrent_reviews`.
 That is the intended "reviews are free" semantics rather than a leak: the implementation cap still
