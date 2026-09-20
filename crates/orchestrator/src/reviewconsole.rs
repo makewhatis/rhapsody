@@ -331,9 +331,6 @@ impl Orchestrator {
                 "no review budget to clear for that pull request",
             );
         }
-        // The manager's adjudication of this pull request goes with the counter (STUDIO-956): a
-        // settled decision keeps the loop stopped on its own, so clearing the budget WITHOUT this
-        // would leave the operator's lever looking applied while nothing could dispatch.
         tracing::info!(
             pr = %pr,
             "ticketless review: operator cleared the pull request's review budget and any manager \

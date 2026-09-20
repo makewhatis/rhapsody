@@ -92,7 +92,8 @@ export interface HeldForHuman {
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
-// that is neither progressing nor reported blocked.
+// whose review loop has stopped moving — either neither progressing nor reported blocked, or stopped
+// with a stated cause and remedy (review_escalated, review_shipped, round_budget_exhausted).
 //
 // `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
 // of the wording is how the two drift apart. `kind` is still given because it is stable and a client
