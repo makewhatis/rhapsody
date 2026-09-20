@@ -1203,10 +1203,13 @@ Detection stays cause-agnostic, but the report is not silent about a cause the d
 When the review watcher deferred a round for want of a global slot it records the hold (STUDIO-950),
 and the sweep names it — the holder count and which budget — instead of the unenriched "nothing has
 reported it blocked", exactly as it names auto-merge's decline reason (STUDIO-923). It annotates and
-never suppresses: the pull request is still reported, which matters because under the 90-minute
-threshold the only capacity hold that reaches the report is one that has genuinely lasted an hour and
-a half — the incident this sweep exists to surface. A recorded hold older than the watcher's own
-refresh window is ignored, so a hold from before a `gh` outage cannot keep being named.
+never suppresses: the pull request is still reported. The annotation reaches all three surfaces, not
+just the log — the `/api/v1/state` row carries the holder count and the budget key under
+`capacity_held`, the console banner renders them, and the per-project advisory names a capacity hold
+rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
+sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
+hold itself is refreshed on every watcher tick. A recorded hold older than the watcher's own refresh
+window is ignored, so a hold from before a `gh` outage cannot keep being named.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |

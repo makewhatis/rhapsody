@@ -114,10 +114,34 @@ describe("DivergenceBanner", () => {
     );
     renderBanner();
     const banner = await screen.findByRole("status");
-    expect(banner.textContent).toContain("2 pull requests are neither progressing nor reported");
+    expect(banner.textContent).toContain("2 pull requests' board state and activity disagree");
     expect(banner.textContent).toContain("makewhatis/rhapsody#164");
     expect(banner.textContent).toContain("makewhatis/strava#21");
     expect(banner.textContent).toContain("for 3 days");
+  });
+
+  // STUDIO-950: a round the daemon is HOLDING for want of a global slot must not read as an
+  // unexplained stall. The row carries the watcher's own annotation, and the banner renders the
+  // holder count and the budget key, so an operator sees the wait is deliberate and which knob
+  // frees it. The heading stays true of every row — held or not.
+  it("names a capacity hold and the budget an operator would turn", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_requested_no_run",
+            detail: "a review round is owed and no reviewer run has started",
+            capacity_held: { holders: 4, budget: "agent.max_concurrent_agents" },
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("held for capacity");
+    expect(banner.textContent).toContain("4 run(s) hold the agent.max_concurrent_agents budget");
+    // A held round is still a report, not a control.
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   // The shortest staleness the daemon can actually report — just past its ninety-minute threshold —

@@ -84,14 +84,33 @@ pub fn render(s: &Snapshot) -> Value {
                 s.review_divergence
                     .iter()
                     .map(|d| {
-                        json!({
+                        let mut row = json!({
                             "pr": d.pr,
                             "kind": d.kind.as_str(),
                             "detail": d.kind.detail(),
                             "ticket": d.ticket,
                             "reviewer": d.reviewer,
                             "stale_secs": d.stale_secs,
-                        })
+                        });
+                        // STUDIO-950: the capacity annotation, conditional exactly as the key and
+                        // the row are. When the review watcher is HOLDING this round for want of a
+                        // global slot it is a deliberate wait, and the row must say so — otherwise
+                        // the console (and anything else reading this row) can only repeat the
+                        // unenriched "not reported blocked" framing the ticket exists to kill.
+                        // Absent with no hold, so a divergence the sweep found before this ticket
+                        // keeps the row shape it had, and the healthy payload is untouched either
+                        // way. `budget` is the key an operator would loosen; `holders` is the
+                        // watcher's own count.
+                        if let (Some(hold), Some(obj)) = (d.capacity_held, row.as_object_mut()) {
+                            obj.insert(
+                                "capacity_held".to_string(),
+                                json!({
+                                    "holders": hold.holders,
+                                    "budget": hold.budget_key(),
+                                }),
+                            );
+                        }
+                        row
                     })
                     .collect::<Vec<_>>(),
             ),
@@ -338,6 +357,53 @@ mod tests {
             rows[0]["detail"],
             "a reviewer asked for changes and the ticket has had no run since"
         );
+        // ...and no `capacity_held` key when there is no hold: the annotation is conditional, like
+        // the key and the row it lives on.
+        assert!(
+            rows[0].get("capacity_held").is_none(),
+            "a divergence with no hold must not carry the annotation, got: {}",
+            rows[0]
+        );
+    }
+
+    // STUDIO-950: when the review watcher IS holding the reported round for want of a global slot,
+    // the state row carries the hold — the fact that lets the console say the wait is deliberate
+    // and name the budget, instead of repeating "not reported blocked". The whole divergence key is
+    // Rhapsody-only and conditional, so annotating a row on it leaves the Go-pinned healthy payload
+    // byte-identical.
+    #[test]
+    fn a_capacity_held_divergence_carries_its_hold_on_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.review_divergence = vec![crate::reviewreconcile::Divergence {
+            pr: "makewhatis/rhapsody#164".to_string(),
+            kind: crate::reviewreconcile::DivergenceKind::ReviewRequestedNoRun,
+            ticket: "STUDIO-950".to_string(),
+            reviewer: "alice".to_string(),
+            stale_secs: 21_600,
+            auto_merge_reason: None,
+            capacity_held: Some(crate::reviewwatch::CapacityHold {
+                holders: 2,
+                separate: true,
+                recorded: now,
+            }),
+        }];
+
+        let rendered = render(&o.build_snapshot());
+        let row = &rendered["review_divergence"][0];
+        assert_eq!(row["kind"], "review_requested_no_run");
+        assert_eq!(
+            row["capacity_held"]["holders"], 2,
+            "the holder count the watcher recorded"
+        );
+        assert_eq!(
+            row["capacity_held"]["budget"], "agent.max_concurrent_reviews",
+            "the annotation names the budget an operator would loosen"
+        );
+        // It is still reported in full — the hold ANNOTATES, it never suppresses.
+        assert!(row.get("detail").is_some());
+        assert_eq!(row["stale_secs"], 21_600);
     }
 
     // And the other half: while a drain IS armed the key appears, carrying the two annotations an

@@ -347,7 +347,17 @@ impl Orchestrator {
         // names no cause — the sweep genuinely does not know one — so the advisory points at
         // `/api/v1/state`'s `review_divergence`, which says WHICH pull request and how. Empty while
         // healthy → the wire shape and the status fixtures are unaffected.
+        //
+        // STUDIO-950: the cause it does NOT name is the one the daemon already knows. When the
+        // review watcher is holding a reported round for want of a global slot the plain "nothing
+        // has reported it blocked" is false, so the advisory names the deliberate wait instead
+        // (`REVIEW_DIVERGENCE_CAPACITY_WARNING`). The per-row holder count and the budget an
+        // operator would turn are on the state row; this fixed string cannot carry them.
         let review_diverged = !self.review_divergences().is_empty();
+        let review_held = self
+            .review_divergences()
+            .iter()
+            .any(|d| d.capacity_held.is_some());
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -377,7 +387,11 @@ impl Orchestrator {
                 warnings.push(crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING.to_string());
             }
             if review_diverged {
-                warnings.push(crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string());
+                warnings.push(if review_held {
+                    crate::reviewreconcile::REVIEW_DIVERGENCE_CAPACITY_WARNING.to_string()
+                } else {
+                    crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string()
+                });
             }
             out.push(ProjectStatus {
                 slug: group.clone(),

@@ -125,6 +125,15 @@ pub const RECONCILE_LOG_EVERY: usize = 60;
 pub const REVIEW_DIVERGENCE_WARNING: &str = "a pull request's board state and its activity disagree — nothing is progressing it and \
      nothing has reported it blocked; see `review_divergence` on /api/v1/state";
 
+/// [`REVIEW_DIVERGENCE_WARNING`]'s sibling for a divergence the review watcher is HOLDING for want
+/// of a global slot (STUDIO-950). The plain string's "nothing has reported it blocked" is false
+/// there — the watcher reports the hold every tick — so the project advisory names the deliberate
+/// wait instead, and still points at the surface that says WHICH pull request and with what holder
+/// count. Selected whenever any reported divergence carries a hold, so a project never reads a
+/// held round as the unexplained stall [`REVIEW_DIVERGENCE_WARNING`] describes.
+pub const REVIEW_DIVERGENCE_CAPACITY_WARNING: &str = "a pull request's board state and its activity disagree because it is held \
+     for capacity — no reviewer run can start yet; see `review_divergence` on /api/v1/state";
+
 /// Which way a pull request's intent and its activity disagree. Three shapes, not six causes — see
 /// the module docs on why an enumeration of causes would defeat the purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +460,19 @@ fn stale_secs(now: DateTime<Utc>, anchor: DateTime<Utc>, stale_after: Duration) 
     (elapsed > threshold).then_some(elapsed)
 }
 
+/// Whether two capacity annotations say the same thing: the held-or-not fact, and the holder count
+/// and budget that name it. [`CapacityHold::recorded`] is deliberately EXCLUDED — the watcher
+/// re-stamps it on every sweep, so comparing it would make every sweep look like a transition and
+/// defeat the reconciliation log's rate limit. A change to the holder count or the budget IS a
+/// transition worth logging: the operator tuning the key needs the new number.
+fn same_capacity(a: Option<CapacityHold>, b: Option<CapacityHold>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.holders == y.holders && x.separate == y.separate,
+        _ => false,
+    }
+}
+
 impl Orchestrator {
     /// Runs one reconciliation sweep: reads the live watch set, dates each row against the `runs`
     /// ledger, and records what diverged. **Reports only** — nothing here dispatches, arms, merges
@@ -599,13 +621,34 @@ impl Orchestrator {
 
     /// Replaces the reported set, logging the transitions and rate-limiting the steady state.
     fn set_review_divergences(&mut self, found: Vec<Divergence>) {
+        // The capacity annotation each pull request carried on the PREVIOUS sweep, so a hold that
+        // APPEARS (or one whose holder count/budget changes) is a transition that logs on the sweep
+        // that learned it rather than waiting out the steady-state rate limit. A pull request newly
+        // reported simply has none, which is why the crossing sweep's `sweeps == 1` still logs.
+        let previous: HashMap<&str, Option<CapacityHold>> = self
+            .review_divergence
+            .iter()
+            .map(|d| (d.pr.as_str(), d.capacity_held))
+            .collect();
         for d in &found {
             let sweeps = self.review_divergent.entry(d.pr.clone()).or_insert(0);
             *sweeps += 1;
             let sweeps = *sweeps;
-            // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
-            // count is 1, and `1 - 1` is a multiple of everything.
-            if (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
+            // A newly added or CHANGED capacity annotation is its own report transition. The
+            // generic repeat clock alone would let a row that first crossed the threshold WITHOUT a
+            // hold keep the plain "nothing has reported it blocked" wording for a full
+            // `RECONCILE_LOG_EVERY` window (~30 min at the default cadence) after the watcher
+            // started holding it — the false page this ticket exists to close, reintroduced on the
+            // second sweep instead of the first. `recorded` is excluded from the comparison (see
+            // [`same_capacity`]): it is refreshed every watcher tick, so comparing it would log
+            // every sweep and defeat the rate limit entirely.
+            let annotation_changed = !same_capacity(
+                previous.get(d.pr.as_str()).copied().flatten(),
+                d.capacity_held,
+            );
+            // The crossing sweep, an annotation transition, and the rate-limited repeats in ONE
+            // condition: at the crossing the count is 1, and `1 - 1` is a multiple of everything.
+            if annotation_changed || (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
                 // STUDIO-923: when auto-merge has already said something about this exact pull
                 // request, name it instead of claiming nothing has. The sentence states no count:
                 // auto-merge's own attempts run on the review watcher's separate
@@ -623,11 +666,7 @@ impl Orchestrator {
                 // the watcher's own, from its most recent sweep, not this sweep's `sweeps`.
                 match (d.capacity_held, d.auto_merge_reason) {
                     (Some(hold), _) => {
-                        let budget = if hold.separate {
-                            "agent.max_concurrent_reviews"
-                        } else {
-                            "agent.max_concurrent_agents"
-                        };
+                        let budget = hold.budget_key();
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -1509,6 +1548,143 @@ mod store_tests {
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["ticket"], "STUDIO-893");
+    }
+
+    /// STUDIO-950: a capacity annotation is a REPORT TRANSITION, not a repeat. A pull request that
+    /// first crosses the sweep's threshold with no hold logs the plain "nothing has reported it
+    /// blocked" line; when the NEXT sweep sees the watcher now holding that round, the enriched
+    /// "held for capacity" line must be emitted on THAT sweep, not one `RECONCILE_LOG_EVERY` window
+    /// (~30 minutes at the default cadence) later. Without this, the second sweep updates the
+    /// in-memory divergence silently and the false page stands for half an hour — the very defect
+    /// the ticket closes, reintroduced on the second sweep.
+    ///
+    /// Mutation check: drop `annotation_changed` from the log condition and the second reconciliation
+    /// emits no WARN at all, because `sweeps` is 2 and `RECONCILE_LOG_EVERY` is 60.
+    #[test]
+    fn a_newly_held_round_is_logged_on_the_sweep_that_learned_it() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+
+        let id = review_key("makewhatis", "rhapsody", 164, "alice");
+        let hold = CapacityHold {
+            holders: 4,
+            separate: false,
+            recorded: t("2026-09-14T21:20:00Z"),
+        };
+        let (_, events) = crate::testsupport::capture_events(|| {
+            // Sweep 1: the obligation is stale, but the watcher is holding nothing — the plain line.
+            o.reconcile_review_divergence();
+            // The watcher's next tick defers the round for want of a slot and records the hold.
+            o.review_capacity_held.insert(id.clone(), hold);
+            // Sweep 2: the hold is newly known, so it must be reported NOW.
+            o.reconcile_review_divergence();
+            // Sweep 3: the holder count CHANGED. That is a transition too — the operator tuning the
+            // budget needs the new number, not a line that still says four.
+            o.review_capacity_held.insert(
+                id.clone(),
+                CapacityHold {
+                    holders: 2,
+                    separate: false,
+                    recorded: t("2026-09-14T21:20:00Z"),
+                },
+            );
+            o.reconcile_review_divergence();
+        });
+
+        let review_warns: Vec<&crate::testsupport::CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message.contains("review reconciliation"))
+            .collect();
+        assert_eq!(
+            review_warns.len(),
+            3,
+            "every transition must report, got: {review_warns:?}"
+        );
+        assert!(
+            review_warns[0]
+                .message
+                .contains("nothing has reported it blocked"),
+            "the first sweep knows of no hold, got: {}",
+            review_warns[0].message
+        );
+        assert!(
+            review_warns[1].message.contains("held for capacity"),
+            "the sweep that LEARNED the hold must say so immediately, got: {}",
+            review_warns[1].message
+        );
+        assert!(
+            review_warns[2].message.contains("2 run(s) hold"),
+            "a changed holder count must be reported on the sweep that saw it, got: {}",
+            review_warns[2].message
+        );
+    }
+
+    /// STUDIO-950: when the reported divergence is HELD for capacity, the project advisory must stop
+    /// claiming nothing has reported it blocked. It names the deliberate wait instead, while the
+    /// state row says which pull request and with what holder count — the two surfaces the ticket
+    /// says must not keep making the false claim.
+    ///
+    /// Mutation check: revert the advisory selection to always push `REVIEW_DIVERGENCE_WARNING` and
+    /// the first assertion reds (the false claim is back).
+    #[test]
+    fn a_capacity_held_divergence_changes_the_project_advisory() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        o.review_capacity_held.insert(
+            review_key("makewhatis", "rhapsody", 164, "alice"),
+            CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: t("2026-09-14T21:20:00Z"),
+            },
+        );
+
+        o.reconcile_review_divergence();
+
+        let projects = o.project_statuses();
+        assert!(
+            projects.iter().any(|p| p
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_DIVERGENCE_CAPACITY_WARNING)),
+            "the advisory must name the capacity hold, got {projects:?}"
+        );
+        assert!(
+            !projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "it must not also claim nothing has reported it blocked, got {projects:?}"
+        );
+        // The state row carries the detail the fixed advisory string cannot.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["capacity_held"]["holders"],
+            4
+        );
     }
 
     /// The healthy case through the same path: the author answered the findings, so nothing is

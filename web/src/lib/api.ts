@@ -91,6 +91,12 @@ export interface ReviewDivergence {
   ticket: string; // "" when the origin names no ticket
   reviewer: string; // "" when the divergence is a property of every reviewer
   stale_secs: number;
+  // The capacity hold the review watcher recorded for this round (STUDIO-950), or absent when the
+  // round is not held. Present only when a review round was deferred for want of a global slot, so
+  // the console can say the wait is deliberate and name the budget an operator would loosen —
+  // rather than repeating the daemon's general "not reported blocked" framing. `budget` is the
+  // config key (`agent.max_concurrent_reviews` or `agent.max_concurrent_agents`).
+  capacity_held?: { holders: number; budget: string };
 }
 
 // DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
