@@ -1047,6 +1047,34 @@ mod tests {
         );
     }
 
+    /// STUDIO-950 (round 15, alice's non-blocking 1): a dismissal forgets the dismissed pull
+    /// request's unreadability record, keyed by coordinate for `retire_review_pr`'s reason. Left
+    /// behind it would outlive the pull request it names and sit in the map for the daemon's whole
+    /// life; a re-introduced coordinate could inherit a failure count it never earned and have its
+    /// first fresh hold denied.
+    ///
+    /// Mutation check: drop the `review_watch_unreadable.remove(pr)` in `handle_review_dismiss`
+    /// and this reds.
+    #[test]
+    fn a_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        assert!(
+            o.review_watch_unreadable.contains_key(&pr()),
+            "precondition: a failed lookup is recorded"
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "a dismissed pull request must not keep an unreadability record"
+        );
+    }
+
     /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls without
     /// reading or writing anything — and says `Dormant`, which is not the same fact as a refusal.
     #[test]

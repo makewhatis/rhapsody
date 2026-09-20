@@ -163,7 +163,7 @@ pub async fn sweep_pr_states(
                 tracing::warn!(
                     pr = %pr,
                     error = %e,
-                    "pr-state lookup failed; the pull request stays watched and is re-asked next tick"
+                    "pr-state lookup failed; the pull request stays watched and is re-asked next rotation"
                 );
             }
         }

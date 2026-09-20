@@ -89,7 +89,7 @@ use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
 use crate::review::review_key;
 use crate::reviewdone::origin_ticket;
-use crate::reviewwatch::{CAPACITY_HOLD_TTL, CapacityHold};
+use crate::reviewwatch::{CAPACITY_HOLD_TTL, CapacityHold, UNREADABLE_ATTEMPTS_TO_DROP_HOLD};
 
 /// How long a party may owe the next move before the sweep calls the pull request diverged.
 ///
@@ -599,10 +599,14 @@ impl Orchestrator {
     ///
     /// The global stamp alone is not enough (STUDIO-950 round 14): it advances whenever ANY watched
     /// pull request answers, so a sibling keeps a hold fresh for a pull request GitHub has stopped
-    /// answering for. `review_watch_unreadable` carries that per-coordinate fact — the moment the
-    /// pull request last STOPPED answering — and a hold whose coordinate has gone unanswered for a
-    /// full TTL is not a wait anything is still confirming. The TTL grace, rather than an immediate
-    /// drop, keeps one transient lookup failure from blinking a live annotation off for a sweep.
+    /// answering for. `review_watch_unreadable` carries that per-coordinate fact — how many
+    /// CONSECUTIVE `gh` lookups of it have FAILED — and a hold whose coordinate has reached
+    /// [`UNREADABLE_ATTEMPTS_TO_DROP_HOLD`] is not a wait anything is still confirming. Counting
+    /// ATTEMPTS rather than wall-clock is deliberate (STUDIO-950 round 15): the quantity is a
+    /// ROTATION of the cursor (`ceil(watch_set / MAX_PR_STATE_CALLS_PER_TICK)` ticks), not the
+    /// one-tick [`CAPACITY_HOLD_TTL`], so no constant sized against the tick could bound it without
+    /// blinking a live hold. See [`UNREADABLE_ATTEMPTS_TO_DROP_HOLD`]. The one-attempt grace keeps
+    /// a single transient rate-limit from blinking a live annotation off for a sweep.
     fn fresh_capacity_hold(
         &self,
         pr: &PrCoord,
@@ -615,18 +619,14 @@ impl Orchestrator {
         if age >= CAPACITY_HOLD_TTL {
             return None;
         }
-        // A pull request whose lookup has been failing for a full TTL is not one the watcher can be
-        // said to be holding. A stamp in the future (a clock that went backwards) is not continuity
-        // either, so it reads as unanswered.
-        if let Some(unreadable_since) = self.review_watch_unreadable.get(pr) {
-            let unanswered = now
-                .signed_duration_since(*unreadable_since)
-                .to_std()
-                .map(|d| d >= CAPACITY_HOLD_TTL)
-                .unwrap_or(true);
-            if unanswered {
-                return None;
-            }
+        // A pull request whose lookup has failed for enough CONSECUTIVE ATTEMPTS is not one the
+        // watcher can be said to be holding. Counting attempts (not a deadline) is what makes this
+        // rotation-independent: the counter only moves on a tick that actually asked this
+        // coordinate, so a large watch set cannot age a still-carried hold out between rotations.
+        if self.review_watch_unreadable.get(pr).copied().unwrap_or(0)
+            >= UNREADABLE_ATTEMPTS_TO_DROP_HOLD
+        {
+            return None;
         }
         Some(*hold)
     }
