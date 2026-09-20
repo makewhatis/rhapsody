@@ -269,12 +269,10 @@ impl Orchestrator {
         if armed > 0 {
             // One ROUND back, in the dispatches the counter is kept in — the same scaling
             // `service_review_pr` applies to the cap, so a two-reviewer config gets a two-dispatch
-            // round back rather than half of one. Saturating: a counter below one round's cost just
-            // returns to zero.
-            let round = self
-                .teams
-                .as_ref()
-                .map_or(1, |t| t.review.effective_reviewers().max(1));
+            // round back rather than half of one. Read from the one helper that defines the unit, so
+            // the refund and the charge can never disagree. Saturating: a counter below one round's
+            // cost just returns to zero.
+            let round = self.reviewers_per_round();
             if let Some(spent) = self.review_rounds.get_mut(&churn_key(pr)) {
                 *spent = spent.saturating_sub(round);
             }

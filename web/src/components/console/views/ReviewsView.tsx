@@ -85,9 +85,14 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
   // One slot, written by whichever control finished last, is the thing that actually matches what
   // the operator just did.
   const [notice, setNotice] = React.useState<WriteNotice | null>(null);
-  // The row whose dismissal is armed, if any — one at a time, so a second Dismiss click elsewhere
-  // moves the confirmation rather than leaving two rows looking half-pressed.
-  const [confirming, setConfirming] = React.useState<string | null>(null);
+  // The row whose control is armed, and which control — one at a time, so a second Dismiss click
+  // (or a Dismiss and a Clear on two rows) moves the confirmation rather than leaving rows looking
+  // half-pressed. Dismiss is the destructive control; Clear lifts a churn bound and so is also
+  // arm-then-confirm, because on a healthy pull request it quietly zeroes the §14.2 force-push floor.
+  const [confirming, setConfirming] = React.useState<{
+    key: string;
+    action: "dismiss" | "clear";
+  } | null>(null);
 
   const refused = (e: unknown): WriteNotice => ({
     role: "alert",
@@ -220,10 +225,12 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
                 key={row.key}
                 row={row}
                 busy={rerun.isPending || dismiss.isPending || clear.isPending}
-                confirming={confirming === row.key}
+                confirming={confirming?.key === row.key && confirming.action === "dismiss"}
+                confirmingClear={confirming?.key === row.key && confirming.action === "clear"}
                 onRerun={onRerun}
                 onClear={onClear}
-                onArm={() => setConfirming(row.key)}
+                onArm={() => setConfirming({ key: row.key, action: "dismiss" })}
+                onArmClear={() => setConfirming({ key: row.key, action: "clear" })}
                 onDisarm={() => setConfirming(null)}
                 onDismiss={onDismiss}
               />
@@ -255,9 +262,11 @@ function ReviewsRow({
   row,
   busy,
   confirming,
+  confirmingClear,
   onRerun,
   onClear,
   onArm,
+  onArmClear,
   onDisarm,
   onDismiss,
 }: {
@@ -265,9 +274,12 @@ function ReviewsRow({
   busy: boolean;
   /** Whether THIS row's dismissal is armed and awaiting a second, explicit click. */
   confirming: boolean;
+  /** Whether THIS row's budget clear is armed and awaiting a second, explicit click. */
+  confirmingClear: boolean;
   onRerun: (job: ReviewJob) => void;
   onClear: (job: ReviewJob) => void;
   onArm: () => void;
+  onArmClear: () => void;
   onDisarm: () => void;
   onDismiss: (job: ReviewJob) => void;
 }) {
@@ -324,6 +336,36 @@ function ReviewsRow({
                 </Button>
               </span>
             </div>
+          ) : confirmingClear ? (
+            // Armed. On a pull request the budget had STOPPED this is the recovery lever the
+            // reconciliation sweep tells the operator to use; on a healthy one it silently zeroes the
+            // §14.2 force-push floor, and the row's read carries no counter for the console to gate
+            // on, so a second click is how the destructive-by-accident case is answered.
+            <div className="rconfirm" role="group" aria-label={`Clear ${row.pr}'s review budget?`}>
+              <span className="rwhy">
+                Clear resets {row.pr}'s review↔author round budget. It re-arms nothing — it only
+                lets a pull request the bound had stopped move again. On a pull request with budget
+                left it also clears the force-push churn floor.
+              </span>
+              <span className="racts">
+                <Button
+                  variant="link"
+                  disabled={busy}
+                  onClick={onDisarm}
+                  aria-label={`Cancel clearing the review budget of ${row.pr}`}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="sec"
+                  disabled={busy}
+                  onClick={() => onClear(row.job)}
+                  aria-label={`Confirm clearing the review budget of ${row.pr}`}
+                >
+                  Clear budget
+                </Button>
+              </span>
+            </div>
           ) : (
             <>
               <Button
@@ -340,7 +382,7 @@ function ReviewsRow({
               <Button
                 variant="link"
                 disabled={busy}
-                onClick={() => onClear(row.job)}
+                onClick={onArmClear}
                 aria-label={`Clear the review budget of ${row.pr}`}
               >
                 Clear budget

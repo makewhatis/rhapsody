@@ -363,6 +363,26 @@ fn row_divergence(
     now: DateTime<Utc>,
     stale_after: Duration,
 ) -> Option<Divergence> {
+    let (kind, anchor) = row_owed(row)?;
+    Some(Divergence {
+        pr: pr.to_string(),
+        kind,
+        ticket: row.ticket.clone(),
+        reviewer: row.reviewer.clone(),
+        stale_secs: stale_secs(now, anchor, stale_after)?,
+        auto_merge_reason: None,
+    })
+}
+
+/// The instant this row's obligation started, and which divergence it is — `None` when the row owes
+/// nothing RIGHT NOW.
+///
+/// Factored out of [`row_divergence`] so [`round_budget_owed`] can ask the same question without
+/// re-deriving the discharge rules (the two must never disagree about whether a row still owes a
+/// round), and without a staleness threshold: a spent budget is reported the moment it is spent, not
+/// after [`RECONCILE_STALE_AFTER`]. Every `None` here is answered by `row_divergence` as "no
+/// divergence", so the table of discharge rules lives in exactly one place.
+fn row_owed(row: &RowFacts) -> Option<(DivergenceKind, DateTime<Utc>)> {
     match row.status.as_str() {
         // The reviewer posted findings, so the AUTHOR owes a run on the origin ticket.
         REVIEW_STATUS_REVIEWED => {
@@ -382,14 +402,7 @@ fn row_divergence(
             {
                 return None; // the author moved, or is moving
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ChangesRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, anchor, stale_after)?,
-                auto_merge_reason: None,
-            })
+            Some((DivergenceKind::ChangesRequestedNoRun, anchor))
         }
         // A round ENDED without the agent ever declaring it had finished, so the round is owed
         // AGAIN. Its own arm rather than sharing `requested`'s below, because the reviewer's run is
@@ -401,14 +414,7 @@ fn row_divergence(
             if attempt.in_flight() {
                 return None; // the retry is running
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ReviewRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, attempt.last_at(), stale_after)?,
-                auto_merge_reason: None,
-            })
+            Some((DivergenceKind::ReviewRequestedNoRun, attempt.last_at()))
         }
         // A round is owed and the REVIEWER owes it, and no run for this head has been recorded yet.
         REVIEW_STATUS_REQUESTED => {
@@ -437,14 +443,7 @@ fn row_divergence(
             {
                 return None; // the reviewer moved after the row was armed
             }
-            Some(Divergence {
-                pr: pr.to_string(),
-                kind: DivergenceKind::ReviewRequestedNoRun,
-                ticket: row.ticket.clone(),
-                reviewer: row.reviewer.clone(),
-                stale_secs: stale_secs(now, anchor, stale_after)?,
-                auto_merge_reason: None,
-            })
+            Some((DivergenceKind::ReviewRequestedNoRun, anchor))
         }
         // `approved` is decided above (and, with auto-merge off, is a healthy wait for a human);
         // `in_flight` and `dropped` are filtered out by the caller. Spelled as a catch-all rather
@@ -477,6 +476,15 @@ fn stale_secs(now: DateTime<Utc>, anchor: DateTime<Utc>, stale_after: Duration) 
 /// running agent is not a stall — the report would be premature and would flicker off when that
 /// round finished. That is a mixed-row case (one reviewer mid-round, another's findings outstanding)
 /// and it is exactly why this cannot be a per-row predicate.
+///
+/// Whether a row owes a round is [`row_owed`]'s question, asked UNCONDITIONALLY and through the very
+/// same table `reconcile_pr` uses, so the two can never disagree about a row. That matters most for
+/// the author's own run, which the first cut of this predicate ignored: the budget is charged at
+/// DISPATCH, so the summoned author run that spent it is `in_flight` for its whole duration, and a
+/// per-status predicate reported `round_budget_exhausted` over a running agent — premature by an
+/// entire agent run. A `ticket_run` that started at or after the reviewer's verdict discharges the
+/// row the same way `reconcile_pr`'s `reviewed` arm says it does, so an author who answered and
+/// deliberately held without pushing is not a stall either.
 fn round_budget_owed(facts: &PrFacts) -> bool {
     let live = || {
         facts
@@ -487,12 +495,7 @@ fn round_budget_owed(facts: &PrFacts) -> bool {
     if live().any(|r| r.status == REVIEW_STATUS_IN_FLIGHT) {
         return false;
     }
-    live().any(|r| {
-        matches!(
-            r.status.as_str(),
-            REVIEW_STATUS_REVIEWED | REVIEW_STATUS_REQUESTED | REVIEW_STATUS_TRUNCATED
-        )
-    })
+    live().any(|r| row_owed(r).is_some())
 }
 
 /// Seconds since the newest activity this sweep can see on the pull request — the latest of its
@@ -1514,6 +1517,18 @@ mod store_tests {
             .expect("completed");
     }
 
+    /// Records one run of `identifier` that has STARTED and not yet ended — the shape of the
+    /// summoned author run the budget was just spent on.
+    fn run_in_flight(o: &Orchestrator, identifier: &str, started: &str) -> i64 {
+        o.store()
+            .start_run(RunStart {
+                issue_identifier: identifier.to_string(),
+                started_at: started.to_string(),
+                ..Default::default()
+            })
+            .expect("start_run")
+    }
+
     /// Records one finished run of `identifier`.
     fn run(o: &Orchestrator, identifier: &str, started: &str, ended: &str) {
         let id = o
@@ -1741,6 +1756,70 @@ mod store_tests {
         assert_eq!(
             rendered["review_divergence"][0]["kind"],
             "round_budget_exhausted"
+        );
+    }
+
+    /// The budget is spent at DISPATCH, so the summoned author run that spent it is in flight for
+    /// its WHOLE duration. Reporting the pull request then would be premature by an entire agent run
+    /// and would flicker off when the run finished — the same defect this feature's first cut fixed
+    /// for the review half, on the author half.
+    #[test]
+    fn a_spent_budget_reports_nothing_while_the_summoned_author_runs() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        // The reviewer's round finished at 21:19...
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // ...and the author's summoned run STARTED 21:19:30 and has not ended. This is the run the
+        // spent budget was charged for: the loop is progressing, not stalled.
+        run_in_flight(o, "STUDIO-170", "2026-09-14T21:19:30Z");
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "an author run in flight must silence the pull request, got {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// The other half of the same gap: an author who ran, answered and deliberately held without
+    /// pushing leaves the row `reviewed`, but `ticket_run.started_at >= anchor` is a shape
+    /// [`reconcile_pr`] calls healthy — so the budget report must not call it a stall either.
+    #[test]
+    fn a_spent_budget_reports_nothing_when_the_author_answered_and_held() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // The author answered the findings after the verdict landed and pushed nothing.
+        run(
+            o,
+            "STUDIO-170",
+            "2026-09-14T21:19:30Z",
+            "2026-09-14T21:19:40Z",
+        );
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "a row the author already answered is not a stall, got {:?}",
+            o.review_divergences()
         );
     }
 

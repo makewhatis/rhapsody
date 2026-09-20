@@ -230,17 +230,12 @@ export function dismissNotice(res: ReviewActionResponse, liveReview: boolean): R
 /**
  * The outcome of clearing a pull request's shared review↔author round budget (STUDIO-956).
  *
- * The daemon refuses a pull request with no budget rather than answering `Applied(0)`, so a `rows`
- * of zero here means "there was nothing to clear" and the surface should say so rather than claim a
- * change. One means the bound is gone and both halves of the loop may run again.
+ * A success is always one row: the daemon answers a pull request with no budget with a `409`
+ * refusal, not an `Applied(0)`, so a zero never reaches here — the refusal path is `refused(e)` on
+ * the mutation's error, not this notice. So this only ever says the bound is gone and both halves of
+ * the loop may run again.
  */
 export function clearNotice(res: ReviewActionResponse): ReviewNotice {
-  if (res.rows === 0) {
-    return {
-      tone: "warn",
-      text: `Nothing to clear — ${res.pr} has no spent review budget.`,
-    };
-  }
   return {
     tone: "info",
     text: `The review↔author round budget for ${res.pr} is cleared — its next round may dispatch.`,

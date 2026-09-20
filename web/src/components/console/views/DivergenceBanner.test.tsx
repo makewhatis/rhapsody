@@ -131,4 +131,27 @@ describe("DivergenceBanner", () => {
     const banner = await screen.findByRole("status");
     expect(banner.textContent).toContain("for 1 hour");
   });
+
+  // STUDIO-956: `round_budget_exhausted` has no staleness threshold and is reported the moment the
+  // budget is spent, so it is the one kind that reaches the minutes branch — often at zero seconds.
+  // It must read "1 minute" and never the ungrammatical "1 minutes".
+  it("renders a just-spent budget as a single minute, not '1 minutes'", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "round_budget_exhausted",
+            detail:
+              "the review↔author round budget is spent, so no further review or author re-run will be dispatched until it is cleared",
+            reviewer: "",
+            stale_secs: 0,
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("for 1 minute");
+    expect(banner.textContent).not.toContain("1 minutes");
+  });
 });

@@ -142,13 +142,21 @@ describe("the Reviews surface", () => {
 
   /**
    * **STUDIO-956.** Clear budget POSTs to its own route with the row's coordinate — the deliberate
-   * lift of a shared review↔author budget the daemon had stopped dispatching at.
+   * lift of a shared review↔author budget the daemon had stopped dispatching at. It is
+   * arm-then-confirm like Dismiss: the first click only offers the control, so nothing reaches the
+   * daemon until the operator confirms.
    */
   it("clears a review budget through the daemon's own control", async () => {
     h.postReviewClear.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 1 });
     mount({ enabled: true, reviews: [job()] });
 
     fireEvent.click(await screen.findByLabelText("Clear the review budget of makewhatis/rhapsody#12"));
+    // Armed, not sent: one click must not zero a healthy pull request's churn floor.
+    expect(h.postReviewClear).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      await screen.findByLabelText("Confirm clearing the review budget of makewhatis/rhapsody#12"),
+    );
 
     await waitFor(() => expect(h.postReviewClear).toHaveBeenCalledTimes(1));
     expect(h.postReviewClear.mock.calls[0][0]).toMatchObject({

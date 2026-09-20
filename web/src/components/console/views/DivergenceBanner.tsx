@@ -47,13 +47,15 @@ export function DivergenceBanner() {
 /**
  * How long the obligation has been outstanding, in the coarsest honest unit.
  *
- * Coarse on purpose: the daemon only reports past a ninety-minute threshold, so a second-accurate
- * rendering would imply a precision the measurement does not have, and the decision an operator
- * makes from it ("is this minutes or is this all morning?") never needs more.
+ * Coarse on purpose: the staleness rules only report past a ninety-minute threshold, so a
+ * second-accurate rendering would imply a precision the measurement does not have, and the decision
+ * an operator makes from it ("is this minutes or is this all morning?") never needs more.
  *
- * That same threshold means the minutes branch cannot be reached by anything the daemon sends today —
- * it is the floor for a future lower threshold, and for the arithmetic never to render a real
- * divergence as "0 hours". Keep it whichever way the threshold moves.
+ * The minutes branch is reachable: `round_budget_exhausted` has NO threshold and is reported the
+ * moment the budget is spent, so a fresh exhaustion arrives as seconds since the newest run — often
+ * `0`. The staleness-rule kinds floor at ninety minutes and therefore bottom out at "1 hour"; the
+ * arithmetic still clamps to a minimum of one unit so a real divergence is never rendered as "0
+ * minutes". Keep that whichever way the threshold moves.
  */
 function humanStale(secs: number): string {
   const hours = Math.floor(secs / 3600);
@@ -62,5 +64,6 @@ function humanStale(secs: number): string {
     return `for ${days} ${days === 1 ? "day" : "days"}`;
   }
   if (hours >= 1) return `for ${hours} ${hours === 1 ? "hour" : "hours"}`;
-  return `for ${Math.max(1, Math.floor(secs / 60))} minutes`;
+  const minutes = Math.max(1, Math.floor(secs / 60));
+  return `for ${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
 }
