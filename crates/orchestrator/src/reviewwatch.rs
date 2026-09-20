@@ -4289,8 +4289,12 @@ mod tests {
 
         let interval = chrono::Duration::from_std(crate::prstate::PR_STATE_POLL_INTERVAL)
             .expect("the poll interval fits a chrono duration");
-        // One interval per tick for a full rotation of the large watch set — 30 ticks past
-        // `MAX_PR_STATE_CALLS_PER_TICK`'s 20, so the cursor reaches `#31` only at the very end.
+        // One interval per tick. The binding bound is not `MAX_PR_STATE_CALLS_PER_TICK` (a per-tick
+        // CALL budget, not a tick count): the round-14 wall-clock rule this test guards would deny a
+        // hold first at `ceil(CAPACITY_HOLD_TTL / PR_STATE_POLL_INTERVAL) + 1` = 22 ticks, and the
+        // false page needs one more tick that is neither first nor last before `#31` answers again
+        // and clears the record. 24 is the smallest `ticks` the mutation check still detects; 30
+        // leaves slack.
         let ticks = 30i32;
         let (holds, events) = capture_events(|| {
             let mut holds = Vec::new();

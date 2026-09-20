@@ -317,6 +317,14 @@ impl Orchestrator {
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no watched review of that pull request");
         }
+        // The dismissal's coordinate, taken from a MATCHED ROW rather than from the request, so the
+        // records removed below are keyed by the same source the watcher inserted them from. The
+        // operator's own coordinate is unnormalized (`check_coords` only rejects empties) while
+        // `PrCoord`'s derived `Eq` is case-sensitive, so removing `pr` directly would miss a record
+        // the watcher stored under the store row's casing — a dismissal typed `MakeWhatIs` matched
+        // this row case-insensitively but left its unreadability record behind (STUDIO-950 round 16).
+        // `mine` is non-empty by the check above, and every row in it is the same pull request.
+        let dismissed = PrCoord::new(&mine[0].key.owner, &mine[0].key.repo, mine[0].key.number);
         let mut dropped = 0usize;
         for row in mine {
             let id = review_key(
@@ -353,7 +361,7 @@ impl Orchestrator {
             // dismissal whose every store drop FAILED left the rows watched, so the failure count
             // is still a live fact about a pull request the daemon still polls. Once a row is gone
             // the operator has said they are not waiting on it, and the record goes with it.
-            self.review_watch_unreadable.remove(pr);
+            self.review_watch_unreadable.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
@@ -1077,6 +1085,36 @@ mod tests {
         assert!(
             !o.review_watch_unreadable.contains_key(&pr()),
             "a dismissed pull request must not keep an unreadability record"
+        );
+    }
+
+    /// STUDIO-950 (round 16, jimmy's finding): the dismissal removes the unreadability record by the
+    /// MATCHED ROW's coordinate, not the operator's. `PrCoord`'s derived `Eq` is case-sensitive and
+    /// `check_coords` never normalizes, while `row_is` matches case-insensitively — so a dismissal
+    /// typed the way GitHub prints the repository used to drop the rows and the churn budget but
+    /// leave the record behind. Mutation check: remove `pr` instead of the matched row's coordinate
+    /// and this reds on the unreadable assertion only.
+    #[test]
+    fn a_case_mismatched_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        o.review_rounds.insert(churn_key(&pr()), 1);
+
+        // The operator's coordinate, typed in different casing from the store row the watcher
+        // keyed the record on.
+        let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
+        assert_eq!(
+            o.handle_review_dismiss(&typed),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_rounds.contains_key(&churn_key(&pr())),
+            "the churn budget goes with the rows"
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "so must the unreadability record, whatever casing the operator typed"
         );
     }
 

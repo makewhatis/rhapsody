@@ -1208,8 +1208,10 @@ just the log — the `/api/v1/state` row carries the holder count and the budget
 `capacity_held`, the console banner renders them, and the per-project advisory names a capacity hold
 rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
 sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
-hold itself is refreshed on every watcher tick. A recorded hold older than the watcher's own refresh
-window is ignored, so a hold from before a `gh` outage cannot keep being named.
+watcher's own liveness is re-stamped on every tick and a hold is refreshed whenever the rotating
+cursor next evaluates its pull request. A hold older than the watcher's liveness stamp is ignored, and
+one whose pull request has failed enough consecutive lookups is dropped outright, so a hold from
+before a `gh` outage cannot keep being named.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |

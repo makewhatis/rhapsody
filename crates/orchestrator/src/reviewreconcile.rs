@@ -466,7 +466,8 @@ fn stale_secs(now: DateTime<Utc>, anchor: DateTime<Utc>, stale_after: Duration) 
 
 /// Whether two capacity annotations say the same thing: the held-or-not fact, and the holder count
 /// and budget that name it. [`CapacityHold::recorded`] is deliberately EXCLUDED — the watcher
-/// re-stamps it on every sweep, so comparing it would make every sweep look like a transition and
+/// re-stamps it whenever the rotating cursor next evaluates the pull request, which is not a change
+/// in the held capacity, so comparing it would log each rotation as a transition and
 /// defeat the reconciliation log's rate limit. A change to the holder count or the budget IS a
 /// transition worth logging: the operator tuning the key needs the new number.
 fn same_capacity(a: Option<CapacityHold>, b: Option<CapacityHold>) -> bool {
@@ -681,8 +682,9 @@ impl Orchestrator {
             // `RECONCILE_LOG_EVERY` window (~30 min at the default cadence) after the watcher
             // started holding it — the false page this ticket exists to close, reintroduced on the
             // second sweep instead of the first. `recorded` is excluded from the comparison (see
-            // [`same_capacity`]): it is refreshed every watcher tick, so comparing it would log
-            // every sweep and defeat the rate limit entirely.
+            // [`same_capacity`]): it is re-stamped when the rotating cursor next evaluates the pull
+            // request, not every sweep, so comparing it would log a rotation as a transition and
+            // defeat the rate limit.
             let annotation_changed = !same_capacity(
                 previous.get(d.pr.as_str()).copied().flatten(),
                 d.capacity_held,
