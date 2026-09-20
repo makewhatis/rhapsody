@@ -609,10 +609,10 @@ pub struct Orchestrator {
     /// It exists so the reconciliation sweep can name a DELIBERATE capacity hold — a wait the
     /// operator can see in `reviewwatch`'s own log — as the cause, instead of reporting an
     /// unexplained stall (the second instance of the STUDIO-923 class). It ANNOTATES the sweep's
-    /// report; it never suppresses it, because under this module's own 90-minute threshold the only
-    /// hold that reaches the report is the one that has genuinely lasted an hour and a half — the
-    /// incident this ticket is about. Each value carries the sweep's own timestamp so the
-    /// reconciliation sweep ignores a hold no later sweep is refreshing.
+    /// report; it never suppresses it, because a row held for capacity is still a pull request whose
+    /// board state and activity disagree — the signal this sweep exists to raise. Each value carries
+    /// the sweep's own timestamp so the reconciliation sweep ignores a hold no later sweep is
+    /// refreshing.
     pub(crate) review_capacity_held: crate::reviewwatch::CapacityHolds,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a

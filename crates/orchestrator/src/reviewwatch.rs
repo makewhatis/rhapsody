@@ -1353,9 +1353,10 @@ pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 /// It annotates, it never suppresses: the sweep keeps reporting the pull request — the alarm that
 /// STUDIO-898 exists to raise — and names this as the cause instead of claiming nothing has
 /// reported it blocked, exactly as [`Divergence::auto_merge_reason`](crate::reviewreconcile::Divergence::auto_merge_reason)
-/// does for auto-merge (STUDIO-923). Under this module's own 90-minute threshold only a hold that
-/// has genuinely lasted an hour and a half reaches the report at all, which is the incident — a
-/// transient hold resolves long before the threshold and never pages.
+/// does for auto-merge (STUDIO-923). It is a statement about the capacity THIS sweep found, not a
+/// duration: what reaches the report is a ROW whose obligation has been stale past the sweep's own
+/// 90-minute threshold — the incident — while the hold itself is only as old as the watcher's most
+/// recent tick. A transient hold self-corrects the moment a slot frees.
 ///
 /// The record is deliberately coarse: it is taken the moment the slot check fails, BEFORE the
 /// permanent refusals below it (the per-PR churn cap, `choose_review_reviewer`, `review_repo_url`)
@@ -1376,6 +1377,20 @@ pub struct CapacityHold {
     pub recorded: chrono::DateTime<chrono::Utc>,
 }
 
+impl CapacityHold {
+    /// The config key an operator would turn to free a slot from the pool this hold names — reviews'
+    /// own `agent.max_concurrent_reviews` when the round was held against it, the shared
+    /// `agent.max_concurrent_agents` otherwise. One source for the reconciliation WARN and the
+    /// `/api/v1/state` annotation, so the two cannot drift apart.
+    pub fn budget_key(&self) -> &'static str {
+        if self.separate {
+            "agent.max_concurrent_reviews"
+        } else {
+            "agent.max_concurrent_agents"
+        }
+    }
+}
+
 /// The rounds the watcher held on its most recent sweep, keyed by the same
 /// `review:<owner>/<repo>#<n>@<reviewer>` id `running` and `claimed` use. See
 /// [`Orchestrator::review_capacity_held`]. STUDIO-950.
@@ -1384,18 +1399,22 @@ pub(crate) type CapacityHolds = HashMap<String, CapacityHold>;
 /// How long a recorded [`CapacityHold`] stays meaningful. The watcher refreshes its holds on every
 /// sweep it actually runs, and a healthy sweep-to-sweep gap is NOT one
 /// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL): the interval is the sleep
-/// BEFORE each sweep, and the sweep then asks about up to
-/// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) pull requests
-/// sequentially, each bounded by
-/// [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT). Three slow lookups already put a healthy
-/// watcher past two intervals, so the bound is the worst case — the sleep plus a full tick of
-/// lookups — rather than the cadence alone. A hold older than that is from a sweep that has since
-/// stopped happening (a `gh` outage, a cancelled watcher), and the reconciliation sweep must not
-/// keep naming a fact nothing is refreshing. The threshold keeps the two sweeps decoupled: the
-/// reconciliation sweep asks only whether a hold is FRESH, never whether the watcher is running.
+/// BEFORE each sweep, and the tick then makes TWO serial phases of `gh` lookups, each bounded by
+/// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) calls at
+/// [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT) apiece. The FIRST is the batched sweep
+/// ([`sweep_pr_states`](crate::prstate::sweep_pr_states)); the SECOND is STUDIO-953's
+/// per-observation pre-dispatch re-read ([`refresh_observed_head`]), which asks GitHub once more for
+/// every OPEN observation the sweep returned — the same bound, spent again. Counting only the first
+/// phase understates a healthy tick by half, so a hold could be called stale while the watcher is
+/// still working through the very sweep that recorded it. Three slow lookups already put a healthy
+/// watcher past two intervals, so the bound is the worst case — the sleep plus both lookup phases —
+/// rather than the cadence alone. A hold older than that is from a sweep that has since stopped
+/// happening (a `gh` outage, a cancelled watcher), and the reconciliation sweep must not keep naming
+/// a fact nothing is refreshing. The threshold keeps the two sweeps decoupled: the reconciliation
+/// sweep asks only whether a hold is FRESH, never whether the watcher is running.
 pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::from_secs(
     crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
-        + crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
+        + 2 * crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
             * crate::ghsummons::GH_EXEC_TIMEOUT.as_secs(),
 );
 
@@ -3616,16 +3635,17 @@ mod tests {
     }
 
     /// STUDIO-950: [`CAPACITY_HOLD_TTL`]'s LOWER bound — the half the stale test above cannot see,
-    /// because it only ever advances past the constant. A hold is recorded partway through a sweep
+    /// because it only ever advances past the constant. A hold is recorded partway through a tick
     /// and the reconciliation sweep may read it only after the watcher has finished the rest of that
-    /// sweep, so the TTL has to outlast a healthy WORST-CASE tick — the sleep before a sweep plus a
-    /// full tick of sequential `gh` lookups — or the sweep would call a live hold stale while the
-    /// watcher is still working through the very sweep that recorded it.
+    /// tick, so the TTL has to outlast a healthy WORST-CASE tick — the sleep before a sweep plus BOTH
+    /// serial `gh` phases it then makes: the batched sweep and STUDIO-953's per-observation re-read,
+    /// each bounded by `MAX_PR_STATE_CALLS_PER_TICK` calls — or the sweep would call a live hold
+    /// stale while the watcher is still working through the very tick that recorded it.
     ///
-    /// Mutation check: shrink the TTL to `2 * PR_STATE_POLL_INTERVAL` (the pre-STUDIO-953 bound sol
-    /// flagged) and the age advanced here overtakes it, red. The advance is derived from the
-    /// documented worst case, never from `CAPACITY_HOLD_TTL`, so it cannot follow the constant it is
-    /// pinning.
+    /// Mutation check: shrink the TTL to count only ONE of the two phases (the pre-STUDIO-953
+    /// bound sol flagged) and the age advanced here overtakes it, red. The advance is derived from
+    /// the documented worst case, never from `CAPACITY_HOLD_TTL`, so it cannot follow the constant it
+    /// is pinning.
     #[test]
     fn a_capacity_hold_survives_a_full_healthy_tick() {
         // TRA-243: see the sibling test above — same callsites, serialized against the capturers.
@@ -3656,10 +3676,10 @@ mod tests {
         let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
         assert_eq!(report.deferred, 1);
 
-        // One second short of the documented worst case: the interval slept before a sweep, then a
-        // full tick of lookups each bounded by `GH_EXEC_TIMEOUT`.
+        // One second short of the documented worst case: the interval slept before a sweep, then
+        // both serial lookup phases, each a full budget of lookups bounded by `GH_EXEC_TIMEOUT`.
         let worst_case = crate::prstate::PR_STATE_POLL_INTERVAL.as_secs()
-            + crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
+            + 2 * crate::prstate::MAX_PR_STATE_CALLS_PER_TICK as u64
                 * crate::ghsummons::GH_EXEC_TIMEOUT.as_secs();
         let later =
             base + chrono::Duration::seconds(i64::try_from(worst_case).expect("worst case") - 1);
