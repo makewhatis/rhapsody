@@ -419,7 +419,7 @@ impl Orchestrator {
     /// The configured summon token the completion comment leads with. Empty config ⇒ the shipped
     /// default, for [`crate::quorum`]'s reason: a comment naming no token would silently produce
     /// reviews that never re-engage the author, which is the exact failure this slice removes.
-    fn review_summon_token(&self) -> String {
+    pub(crate) fn review_summon_token(&self) -> String {
         let token = self
             .eff
             .as_ref()

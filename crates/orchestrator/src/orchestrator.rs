@@ -578,6 +578,15 @@ pub struct Orchestrator {
     /// [`AutoMergeLedger`](crate::runautomerge::AutoMergeLedger), which does the same job for the
     /// refusals on the other side of the seam.
     pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
+    /// Per-pull-request draft-poke bookkeeping (STUDIO-962), keyed by
+    /// [`churn_key`](crate::reviewwatch::churn_key) exactly as the two above are, and dropped with
+    /// them when the pull request leaves the watch set. Written and read only by the watcher's
+    /// loop-side handler.
+    ///
+    /// It remembers which HEAD was last poked, how many distinct heads have been poked, and whether
+    /// a human has already been handed the pull request — the state that makes the poke once per
+    /// head and the escalation once ever, rather than once per tick.
+    pub(crate) draft_pokes: HashMap<String, crate::draftpoke::DraftPokeState>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
@@ -860,6 +869,7 @@ impl Orchestrator {
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
+            draft_pokes: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
