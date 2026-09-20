@@ -589,10 +589,9 @@ pub struct Orchestrator {
     pub(crate) review_unassignable: HashMap<String, usize>,
     /// The ticketless review rounds the watcher deferred for want of a global slot on its most
     /// recent sweep (STUDIO-950), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id
-    /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler; a
-    /// round is cleared from it as soon as the next sweep re-evaluates it (including when it
-    /// dispatches), so it only ever reflects the MOST RECENT sweep, and it is dropped when the pull
-    /// request leaves the watch set.
+    /// `running` and `claimed` use. Written and read only by the watcher's loop-side handler, which
+    /// CLEARS it wholesale at the top of each sweep and re-inserts only the rounds that sweep held —
+    /// so it always means exactly "what the latest sweep held", never an accumulation.
     ///
     /// It exists so the reconciliation sweep can tell a DELIBERATE capacity hold — a healthy wait the
     /// operator can see in `reviewwatch`'s own log — from an unexplained stall. Without it the sweep

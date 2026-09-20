@@ -503,6 +503,13 @@ impl Orchestrator {
         // clearing a pull request is what FREES an implementation slot, so sharing the one budget
         // queues the capacity-creating work behind the capacity-spending work. Unset ⇒ the shared
         // draw below, byte-identical to before the key existed.
+        // STUDIO-950: this sweep is about to re-evaluate every round, so a hold recorded by a
+        // PREVIOUS sweep is stale from here on. Cleared wholesale up front (rather than per row) so
+        // `review_capacity_held` always means exactly "what THIS sweep held" — a round deferred for
+        // a different reason this sweep, or one whose pull request the lookup did not even reach,
+        // cannot keep suppressing the reconciliation sweep under an old hold. The capacity branch
+        // below re-inserts each round the budget defers.
+        self.review_capacity_held.clear();
         let mut slots = self
             .eff
             .as_ref()
@@ -651,7 +658,6 @@ impl Orchestrator {
         self.auto_merge_announced.remove(&churn_key(pr));
         for id in retired_ids {
             self.review_unassignable.remove(&id);
-            self.review_capacity_held.remove(&id);
         }
         dropped
     }
@@ -699,12 +705,6 @@ impl Orchestrator {
                 row.key.number,
                 &row.key.reviewer,
             );
-            // STUDIO-950: this sweep is about to re-evaluate the round, so any hold recorded by a
-            // PREVIOUS sweep is stale from here on. Cleared unconditionally — a round that then
-            // defers for a different reason must not keep suppressing the reconciliation sweep's
-            // report under a capacity hold that no longer applies. The capacity branch below
-            // re-inserts it when the budget is what deferred this round.
-            self.review_capacity_held.remove(&id);
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             if !review_round_due(row, head, live) {
                 continue;
