@@ -119,6 +119,19 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("completed", "")).toBe("review");
     expect(consoleJobStatus("completed", "some_future_state")).toBe("review");
   });
+
+  // STUDIO-949 round 5 — a hold can OUTLIVE a run (a ticket parked in review, then labelled), and
+  // the LANE stays the run's: the daemon is holding the review rounds that ticket is owed, so its
+  // card belongs in Review wearing the hold as a sub-label, not repainted Queued.
+  //
+  // MUTATION: restore the unconditional `if (heldForHuman) return "queued"` and the first two
+  // assertions red (`expected 'queued' to be 'review'`).
+  it("keeps a held ticket's run lane, and speaks for the lane only when nothing ran", () => {
+    expect(consoleJobStatus("completed", "in_review", false, false, true)).toBe("review");
+    expect(consoleJobStatus("completed", "done", false, false, true)).toBe("done");
+    // A hold that never ran carries no lifecycle, and there the hold is the whole fact.
+    expect(consoleJobStatus("waiting", undefined, false, false, true)).toBe("queued");
+  });
 });
 
 // STUDIO-780 — "in review" was doing double duty: an agent whose whole job is to review a
@@ -1349,14 +1362,14 @@ describe("consoleStoreCounts", () => {
     expect(withHeld?.needsYou).toBe(0);
   });
 
-  // A `rhapsody:human` hold is the one client-side ADDITION the daemon owns (STUDIO-949): the
-  // refused ticket reads Queued, so whatever bucket its stored row would have landed in is dropped
-  // and re-reported as `held_for_human`, which the strip adds to queued. The client must NOT compute
-  // this from `state.held_for_human` — a hold that has already run is in the buckets too, and adding
-  // it again double-counted the STUDIO-939 shape (parked in review, then labelled).
+  // A `rhapsody:human` hold that never ran is the one client-side ADDITION the daemon owns
+  // (STUDIO-949): the refused ticket reads Queued, and having no stored row it is re-reported as
+  // `held_for_human`, which the strip adds to queued. The client must NOT compute this from
+  // `state.held_for_human` — a hold that has already run keeps its stored row's bucket (its card
+  // stays in the run's lane), and adding it again double-counted the STUDIO-939 shape.
   it("adds the daemon's held-for-human count to queued, exactly once", () => {
-    // The daemon has already dropped the held ticket's stored row, so the bucket below belongs to a
-    // different issue and `held_for_human` names the reclassified one.
+    // `held_for_human` names holds the daemon found NO stored row for, so the bucket below belongs
+    // to a different issue and this is the only place the never-ran holds are counted.
     const payload: IssueCountsResponse = {
       issues: 1,
       buckets: [{ outcome: "completed", lifecycle: "done", count: 1 }],
@@ -1403,5 +1416,41 @@ describe("a held-for-human ticket through the production chain (STUDIO-949)", ()
     expect(rows[0].subLabel).toBe("held for a human");
     // ...and it is not billed as needing the operator, exactly as the strip counts it.
     expect(rows[0].needsYou).toBe(false);
+  });
+
+  // STUDIO-949 round 5 — the STUDIO-939 shape (parked in review, then labelled) through the SAME
+  // production chain. The card must keep the run's lane (Review) while carrying the hold, because
+  // the watcher is at that instant deferring the rounds the ticket is owed; jimmy's round-5 probe
+  // showed the opposite word reaching the operator. The test pins the decision THROUGH
+  // `buildConsoleJobs` (a `lifecycle`-bearing `IssueRun`), because asserting on the `MergedRow`
+  // alone cannot see the word the pill paints.
+  //
+  // MUTATION: restore the unconditional `if (heldForHuman) return "queued"` and `status` reds with
+  // `expected 'queued' to be 'review'`.
+  it("keeps a held ticket that HAS run in the Review lane, with the hold as its sub-label", () => {
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked: [],
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    };
+    const stored = [
+      issueRow({
+        id: 88,
+        issue_identifier: "STUDIO-939",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ];
+    const jobs = buildConsoleJobs(mergeJobs(state, stored, [], NOW), stored, undefined, NOW, []);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("review"); // the real run decides the lane
+    expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
+    expect(jobs[0].runId).toBe(88); // and the row stays openable on the real run
   });
 });

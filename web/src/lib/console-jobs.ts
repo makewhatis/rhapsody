@@ -154,12 +154,22 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * arm is shared between them.
  *
  * The fifth rule is `heldForHuman` (STUDIO-949), and it names the word deliberately. A
- * `rhapsody:human` ticket reaches this function as a synthetic `waiting` row, whose outcome maps to
- * `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong: the dispatcher has
- * deliberately refused it and no agent will ever run it, so painting it "blocked" puts a deliberate
- * hold one pill away from a real fault, which is the confusion the board's own chip styling exists
- * to prevent. It reads `queued` — waiting for a person rather than mysteriously idle — and it is
- * checked before the run arms because the hold, not the run that never happened, is the whole fact.
+ * `rhapsody:human` ticket that has NEVER RUN reaches this function as a synthetic `waiting` row,
+ * whose outcome maps to `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong:
+ * the dispatcher has deliberately refused it and no agent will ever run it, so painting it
+ * "blocked" puts a deliberate hold one pill away from a real fault, which is the confusion the
+ * board's own chip styling exists to prevent. It reads `queued` — waiting for a person rather than
+ * mysteriously idle — because the hold, not the run that never happened, is the whole fact.
+ *
+ * The rule is scoped to a row with NO resolved `lifecycle` (STUDIO-949 round 5). A hold can OUTLIVE
+ * a run — a ticket parked in review, then labelled — and `mergeJobs` says in as many words that
+ * "the real run still decides the lane": the card belongs in Review, wearing its `held for a human`
+ * sub-label, because the daemon is deferring the review rounds that ticket is owed. Returning
+ * `queued` there moved the card out of Review and contradicted the watcher, which is at that same
+ * moment holding the review. So the hold's own word only applies where there is no run to name the
+ * lane; with a lifecycle resolved, the run wins and the hold rides as the sub-label. The caller
+ * passes `heldForHuman` only for a row it has already keyed to a current hold (`mergeJobs`), so this
+ * is about the LANE, not about whether the hold is visible.
  */
 export function consoleJobStatus(
   status: string,
@@ -169,7 +179,9 @@ export function consoleJobStatus(
   heldForHuman = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
-  if (heldForHuman) return "queued";
+  // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
+  // hold on a ticket that never ran (no lifecycle) speaks for the lane itself. See the doc above.
+  if (heldForHuman && lifecycle === undefined) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
   // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
@@ -890,15 +902,16 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  * about a row the table already knows how to draw, rather than as a feature.
  *
  * `held_for_human` (STUDIO-949) is NOT a client-side set like `held`, and it is the one figure the
- * client cannot compute: it is a COUNT the daemon serves beside the buckets. Only the daemon can
- * tell a held ticket that never ran (absent from the store) from one that already did (present,
- * usually as `review` — the STUDIO-939 shape: parked in review, then labelled), and the daemon
- * drops each non-live held ticket's stored row from the buckets before reporting the count here,
- * so adding it to `queued` counts each hold exactly once. A held ticket the daemon is mid-run on
- * keeps its running bucket and is not in this count, matching the console's own exception for a
- * live row. The never-run hold is why the fold is needed at all: the dispatcher refused it, so no
- * stored row exists for the tally to carry, and the card beside this number is a synthesized
- * Queued card. Reading `state.held_for_human.length` here instead would reopen the double-count.
+ * client cannot compute: it is a COUNT the daemon serves beside the buckets, and it counts ONLY the
+ * holds with no stored row — the never-ran ticket the dispatcher refused, for which the console
+ * synthesizes a Queued card. The daemon joins the store rows (which control the ROW) with the
+ * snapshot's hold set (which controls WHICH ticket) and reclassifies only that shape, so adding this
+ * count to `queued` counts each hold exactly once. A hold that HAS run keeps its stored row's bucket
+ * — its card stays in the run's lane with the hold as a sub-label (the STUDIO-939 shape) — and is
+ * deliberately NOT in this count; a held ticket the daemon is mid-run on keeps its running bucket
+ * and is not in it either, matching the console's own exceptions. Reading
+ * `state.held_for_human.length` here instead would reopen the double-count, and treating every hold
+ * as queued would move a hold that has run out of its lane.
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
