@@ -186,6 +186,30 @@ impl Store for Noop {
         Ok(None)
     }
 
+    // STUDIO-956: with persistence off there is nowhere to remember a bound, so the daemon keeps
+    // the pre-STUDIO-956 per-boot behaviour — the in-memory counter and ledger still bound the
+    // loop for as long as the process lives, and a restart still refunds it. Exactly the
+    // `summon_watermark` stance above: a no-op store is a store, not a second policy.
+    fn set_review_rounds(&self, _pr: &str, _dispatches: i64) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn record_review_adjudication(
+        &self,
+        _pr: &str,
+        _adjudication: &ReviewAdjudication,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn clear_review_adjudication(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn clear_review_bound(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {
         Ok(())
     }

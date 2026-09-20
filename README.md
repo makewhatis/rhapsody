@@ -423,7 +423,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
+| `rhapsody.db` | no column, no new row *kind*; the two Teams-only tables (`rhapsody_review_watch` and `rhapsody_review_bound`, below) are created by the migration but stay **empty** — nothing writes to either unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -832,6 +832,45 @@ and every Go-pinned golden is untouched: the new table is prefix-gated, the new 
 additive, and the new fields appear only on the Rhapsody-only issue listing. `divergent_objects_are_gated_by_name_only`
 now pins the third name.
 
+### A fourth schema table with no Go counterpart — `rhapsody_review_bound` (STUDIO-956)
+
+The review↔author round bound was in memory, and a bound a restart refunds is not a bound. Measured
+on the operator's own store, 2026-09-20: **five daemon restarts**, every one of them to apply a
+boot-only `teams.yaml` change — i.e. caused by tuning the review configuration — and each one handed
+seven in-flight pull requests a fresh budget. **264 review runs that day; 46 on one pull request
+against a nominal cap of 16.** Worse, a pull request the manager had already ESCALATED forgot the
+decision on restart and resumed the loop from zero. At a threshold of 3, a daemon that restarts more
+often than every 3 rounds never reaches the threshold at all.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **11** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance` and `rhapsody_review_bound` |
+| the round counter | — | `rhapsody_review_bound.dispatches`, written at every charge, rehydrated at boot |
+| the manager's decision | — | `decision`/`head`/`rounds`/`findings`/`reason` on the same row |
+
+One row per PULL REQUEST (`owner/repo#number`, case-folded), not per (pull request, reviewer): the
+bound is shared by all of a pull request's reviewers, and putting it on `rhapsody_review_watch` would
+give N reviewers N budgets — the defect STUDIO-727 already fixed in memory. The key is what makes the
+value mean *"rounds spent on this pull request"* rather than *"rounds since some daemon booted"*.
+
+**The counter and the decision have different writers, so neither upsert carries the other's
+columns.** The control task charges rounds; the off-loop adjudication half records what the manager
+said. A last-write-wins row would let a charged round erase a landed decision.
+
+**An in-flight adjudication is deliberately NOT persisted.** The in-flight marker means "a turn is
+out right now, do not ask again", and the process that was going to land it is exactly what a restart
+destroys. Persisted, it would stop every further round for that pull request forever with no turn
+left anywhere to clear it — a permanent freeze in place of the temporary refund this fixes.
+Unpersisted, a restart mid-turn costs one re-asked turn.
+
+**A pull request that leaves the watch set deletes its row** — merged, closed, or dismissed from the
+console — so one that is later re-introduced, reopened or rebuilt under the same number never
+inherits a spent budget. `POST /api/v1/reviews/clear` is the deliberate clear and is now the only
+thing that lifts a bound in place; the operator's **Re-run** refunds one round and drops the decision
+without resetting the budget. **Off is still off:** with `storage.path: off` there is nowhere to
+remember a bound, so the daemon keeps the per-boot behaviour it had before this ticket.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
@@ -1228,6 +1267,84 @@ eleven hours the incidents actually cost. A pull request mid-round is silent, an
 activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
 
+### The manager decides at the review round threshold — ship it or escalate (STUDIO-956)
+
+Go v0.4.0 has no manager turn at all, so this is additive surface. It exists because a
+convergence property that depends on an agent choosing to stop is not a property: before this, the
+review↔author loop ran until `REVIEW_ROUNDS_PER_PR_CAP` × reviewers (sixteen rounds at two
+reviewers), logged a DEBUG refusal, and stopped with **no decision and no escalation**. Three pull
+requests sat unreviewable on 2026-09-20 until an unrelated restart. Measured against the operator's
+own store, four tickets burned **353M tokens** — STUDIO-170 alone ran eleven author rounds and 23
+review runs on one pull request.
+
+`teams.review.adjudicate_after_rounds` is the opt-in round threshold. At it, the loop stops arming
+rounds and the **manager** makes exactly one decision:
+
+- **ship it** — the open findings do not block; the pull request proceeds to the normal merge gates.
+- **escalate** — a human is needed, and the escalation names the specific open findings, the round
+  count and the head the loop stopped at.
+
+| At the threshold | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| who ends the loop | nothing — there is no review loop | the manager, one turn |
+| the decision | — | `SHIP`, or `ESCALATE: <reason>` |
+| the audit | — | a room post **and** a pull-request comment, both naming the way it went |
+| the report | — | `review_escalated` / `review_shipped` on `/api/v1/state` and a WARN line |
+| default | — | **off**: `adjudicate_after_rounds: 0`, byte-identical to before this ticket |
+
+```yaml
+review:
+  adjudicate_after_rounds: 3     # the maintainer's number: three rounds, then escalate
+  auto_merge: false              # unchanged — a ship adjudicates findings, never the gates
+```
+
+**"Ship it" adjudicates the findings, NEVER the gates.** The manager decides whether the open review
+findings block; it can never override CI, approval-at-head, a draft, a conflict, or any other merge
+gate. A manager that could merge a red pull request would be worse than the loop it replaced. A
+shipped pull request whose rows are not all approved is therefore reported as `review_shipped` (the
+gate still holds it, and no round will ever arm), while one whose rows are all approved either
+merges or falls to the ordinary `approved_still_open` report after the staleness threshold.
+
+**Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
+assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot
+silently inherit that mode. It is gated by this key alone, runs through the daemon's one model-turn
+path with `manager.model` / `manager.timeout_ms`, and needs no `gh` on the control task: the control
+task decides and hands a plan to the watcher, which performs the turn and the writes off-loop.
+
+**Both halves are bounded, and a failed turn is bounded too.** Author re-dispatches charge the same
+counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
+the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
+`MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
+turn per sweep forever — through the same room post and pull-request comment every other decision
+gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —
+and the round budget — from the console (`POST /api/v1/reviews/clear`).
+
+**The bound and the decision are DURABLE.** Both live on `rhapsody_review_bound`, keyed by the pull
+request, and are rehydrated before the first tick — see that table's Divergences entry above for the
+measurement that forced it (five restarts in a day, 46 review rounds on one pull request) and for
+why an in-flight adjudication deliberately does not survive.
+
+**The adjudication turn's model.** `manager.model` is empty by default, and the turn path passes
+`--model` only when it is set — so an unset installation would decide ship-or-escalate on the CLI's
+own default while every review it is adjudicating ran on the pinned `review.model`. It now resolves
+in order: `manager.model` when set; else `review.model` scoped to the `claude` harness the turn
+actually runs on; else empty (the CLI default), which is the only honest answer when nothing is
+pinned anywhere. A `review.model` scoped to OTHER harnesses only is never borrowed — handing an
+`opencode` model to a `claude` turn is the mistake STUDIO-908 exists to prevent — and it falls
+through to the CLI default rather than refusing the turn, because refusing would freeze the loop at
+the threshold with no decision at all.
+
+**Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
+author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×
+reviewers review-only cap and its stop behave exactly as before. Adjudication is opt-in.
+
+**What `round_budget_exhausted` claims, and what it does not.** That report fires when the legacy
+review-only cap has stopped the loop and no manager decision exists — including on an installation
+that sets no threshold. Its copy therefore says only that **no further REVIEW round** will be
+dispatched: on an unset installation the author half is deliberately unbounded, so the earlier
+wording ("no further review or author re-run") was false in exactly the incident it printed in. It is
+reworded rather than gated on the threshold: gating it would restore the silent stop on the default
+installation, which is the incident that filed this ticket.
 
 ### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
 
@@ -1475,8 +1592,10 @@ inside the last window.
 console armed an auto-merge on a behind branch that could never land. A behind branch's approval is
 for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
 otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
-approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
-which already caps the review dispatches one pull request may draw.
+approval of the new head can clear the gate again. The REVIEW side of the loop is bounded by
+`REVIEW_ROUNDS_PER_PR_CAP`; the AUTHOR side by the opt-in manager adjudication above
+(`review.adjudicate_after_rounds`) — an install that sets no threshold keeps the review-only cap and
+its stop, exactly as before STUDIO-956.
 
 **Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
 sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's

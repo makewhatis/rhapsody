@@ -454,3 +454,57 @@ pub struct SummonWatermark {
     /// Empty when the source could not surface one.
     pub body: String,
 }
+
+/// The `decision` column of a SETTLED "ship it" adjudication (STUDIO-956).
+pub const REVIEW_ADJUDICATION_SHIP: &str = "ship";
+/// The `decision` column of a SETTLED "escalate" adjudication (STUDIO-956).
+pub const REVIEW_ADJUDICATION_ESCALATE: &str = "escalate";
+
+/// What the manager DECIDED about one pull request's review loop, durably (STUDIO-956). No Go
+/// counterpart — the whole review feature is a Rhapsody addition.
+///
+/// Only SETTLED decisions are representable here. The in-flight marker the control task uses to
+/// stop re-asking while a turn is out is deliberately NOT persisted: a marker that outlived the
+/// process that was going to land it would stop every further round forever, with no turn left
+/// anywhere to clear it. An adjudication interrupted by a restart is therefore simply re-asked,
+/// which costs one turn and cannot deadlock the loop.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewAdjudication {
+    /// [`REVIEW_ADJUDICATION_SHIP`] or [`REVIEW_ADJUDICATION_ESCALATE`]. A row whose decision is
+    /// neither (including the empty string a counter-only row carries) records no decision at all.
+    pub decision: String,
+    /// The head the loop stopped at.
+    pub head: String,
+    /// How many review↔author ROUNDS had been spent when the decision was made.
+    pub rounds: i64,
+    /// The open findings named to the manager, one human-readable line each. Stored NEWLINE-JOINED
+    /// in one column: every finding this daemon produces is a single line by construction, and the
+    /// writer folds any embedded newline to a space rather than let one split a finding in two.
+    pub findings: Vec<String>,
+    /// The manager's own words for an escalation. Empty for a ship.
+    pub reason: String,
+}
+
+/// One pull request's durable REVIEW BOUND: how much of its review↔author loop has been spent, and
+/// what the manager decided about it (STUDIO-956). No Go counterpart.
+///
+/// It exists because the bound it carries was in memory and therefore was not a bound at all: on
+/// 2026-09-20 five daemon restarts — every one of them to apply a boot-only `teams.yaml` change —
+/// handed seven in-flight pull requests a fresh budget each, and one pull request ran 46 review
+/// rounds against a nominal cap of 16. A restart must not refund a spent budget, and it must not
+/// forget a decision the manager already made.
+///
+/// Keyed by the PULL REQUEST (`owner/repo#number`, case-folded — `reviewwatch::churn_key`'s
+/// spelling) so the row means "rounds spent on this pull request", never "rounds since some daemon
+/// booted". The row is DELETED when the pull request leaves the watch set, so a re-introduced,
+/// reopened or rebuilt pull request starts from zero.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewBoundRow {
+    /// `owner/repo#number`, case-folded. The primary key.
+    pub pr: String,
+    /// The round counter in DISPATCHES (one round costs one dispatch per required reviewer), which
+    /// is the unit `REVIEW_ROUNDS_PER_PR_CAP` and the adjudication threshold are both compared in.
+    pub dispatches: i64,
+    /// The manager's settled decision, or `None` when there is none.
+    pub adjudication: Option<ReviewAdjudication>,
+}

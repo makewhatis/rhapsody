@@ -146,6 +146,12 @@ fn turn_timeout(timeout_ms: i64) -> Duration {
     })
 }
 
+/// [`turn_timeout`] for callers outside this module — the review adjudication turn (STUDIO-956)
+/// runs under the same `manager.timeout_ms` and the same fallback, so the constant has one home.
+pub fn manager_turn_timeout(teams: &Teams) -> Duration {
+    turn_timeout(teams.manager.timeout_ms)
+}
+
 /// How many cycles of an UNCHANGED outcome pass before the schedule says so again (STUDIO-671).
 ///
 /// Applied as a WINDOW rather than a counter — `interval * IDLE_HEARTBEAT_CYCLES` — because cycles
@@ -1945,7 +1951,7 @@ impl crate::teamsears::RoomArbiter for ClaudeTriageArbiter {
 /// `kill_on_drop` so a timeout reaps the child, `--model` before `-p` because a flag trailing the
 /// prompt is at the mercy of positional parsing. Shared by both of this daemon's model turns; the
 /// only thing either adds is how it reads the answer.
-async fn run_turn(req: &TriageRequest) -> Result<String, String> {
+pub(crate) async fn run_turn(req: &TriageRequest) -> Result<String, String> {
     {
         let (name, base_args) = rhapsody_agent::claude::split_command(&req.command)
             .map_err(|e| format!("invalid claude command {:?}: {e}", req.command))?;

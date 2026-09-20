@@ -9,10 +9,10 @@
 //! # The divergent schema objects, and how the golden still gates the rest (STUDIO-711)
 //!
 //! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
-//! (`rhapsody_summon_watermark`, STUDIO-885) and step 10 (`rhapsody_run_provenance`, STUDIO-909)
-//! have no Go counterpart: they are the ticketless PR-review watch set, the per-ticket summons
-//! watermark and the per-run harness/model/provider record, none of which the frozen v0.4.0
-//! reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
+//! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909) and
+//! step 11 (`rhapsody_review_bound`, STUDIO-956) have no Go counterpart: they are the ticketless
+//! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record
+//! and the per-pull-request review bound, none of which the frozen v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
 //! `schema_matches_committed_golden` permanently red with no honest way to fix it. Hand-editing
@@ -39,10 +39,11 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7, 8, 9 and 10 are Rhapsody-only (the ticketless review watch set,
-/// then its `author` column, then the summons watermark, then per-run provenance) and are the one
-/// documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 10;
+/// Go v0.4.0 froze at 6. Steps 7, 8, 9, 10 and 11 are Rhapsody-only (the ticketless review watch
+/// set, then its `author` column, then the summons watermark, then per-run provenance, then the
+/// per-pull-request review bound) and are the one documented reason this number is ahead of the
+/// reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 11;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -202,6 +203,30 @@ CREATE TABLE IF NOT EXISTS rhapsody_run_provenance (
   provider       TEXT    NOT NULL DEFAULT ''
 );
 "#,
+    // v10 -> v11: the DURABLE review bound — one row per pull request carrying how much of its
+    // review<->author loop has been spent and what the manager decided about it (STUDIO-956).
+    // Rhapsody-only, so the `rhapsody_` prefix gates it out of the Go-recaptured schema golden by
+    // name exactly as steps 7-10 are.
+    //
+    // A table rather than columns on `rhapsody_review_watch`: that table's granularity is
+    // per-(pull request, REVIEWER) and this bound is shared by all of a pull request's reviewers,
+    // so putting it there would give N reviewers N budgets — the exact defect STUDIO-727 fixed in
+    // memory. `pr TEXT PRIMARY KEY` on a rowid table gets SQLite's implicit auto-index, whose
+    // `sqlite_master.sql IS NULL`, so no explicit index reaches the golden comparison.
+    //
+    // `decision` empty means a counter-only row: a pull request whose loop is being counted and
+    // which the manager has not decided about.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_review_bound (
+  pr         TEXT    NOT NULL PRIMARY KEY,
+  dispatches INTEGER NOT NULL DEFAULT 0,
+  decision   TEXT    NOT NULL DEFAULT '',
+  head       TEXT    NOT NULL DEFAULT '',
+  rounds     INTEGER NOT NULL DEFAULT 0,
+  findings   TEXT    NOT NULL DEFAULT '',
+  reason     TEXT    NOT NULL DEFAULT ''
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -232,6 +257,29 @@ const REVIEW_WATCH_KEY_WHERE_NOCASE: &str = "owner = ?1 COLLATE NOCASE AND repo 
 /// The four key columns as positional params `?1..?4` for [`REVIEW_WATCH_KEY_WHERE`].
 fn review_watch_key_params(key: &ReviewWatchKey) -> [&dyn rusqlite::ToSql; 4] {
     [&key.owner, &key.repo, &key.number, &key.reviewer]
+}
+
+/// Fold an adjudication's findings into the one `findings` TEXT column, newline-separated.
+///
+/// Every finding this daemon produces is a single line by construction (`open_findings` formats
+/// one sentence per watch row), so a newline in one is a malformed input rather than content —
+/// folded to a space so it cannot split one finding into two on the way back. Deliberately not
+/// JSON: this crate has no serialization dependency outside its tests, and inventing one for a
+/// list of sentences would be a heavier contract than the column needs.
+fn join_findings(findings: &[String]) -> String {
+    findings
+        .iter()
+        .map(|f| f.replace(['\n', '\r'], " "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The inverse of [`join_findings`]. An empty column is no findings at all, not one empty finding.
+fn split_findings(stored: &str) -> Vec<String> {
+    if stored.is_empty() {
+        return Vec::new();
+    }
+    stored.split('\n').map(str::to_string).collect()
 }
 
 /// Scan one `rhapsody_review_watch` row selected with [`REVIEW_WATCH_COLS`] (positional, in DDL
@@ -1436,6 +1484,108 @@ impl Store for Sqlite {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    fn set_review_rounds(&self, pr: &str, dispatches: i64) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Column-scoped on the UPDATE half, exactly as `mark_review_requested` is on the watch
+        // table: the counter and the decision have DIFFERENT writers (the control task and the
+        // off-loop adjudication half), so neither upsert may carry the other's columns or a
+        // last-write-wins race would silently erase a landed decision.
+        conn.execute(
+            "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES (?1, ?2)
+             ON CONFLICT(pr) DO UPDATE SET dispatches = excluded.dispatches",
+            params![pr, dispatches],
+        )?;
+        Ok(())
+    }
+
+    fn record_review_adjudication(
+        &self,
+        pr: &str,
+        adjudication: &ReviewAdjudication,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_review_bound (pr, decision, head, rounds, findings, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(pr) DO UPDATE SET
+               decision = excluded.decision,
+               head     = excluded.head,
+               rounds   = excluded.rounds,
+               findings = excluded.findings,
+               reason   = excluded.reason",
+            params![
+                pr,
+                adjudication.decision,
+                adjudication.head,
+                adjudication.rounds,
+                join_findings(&adjudication.findings),
+                adjudication.reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn clear_review_adjudication(&self, pr: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // The counter column is untouched on purpose — the operator's re-run drops the decision and
+        // refunds ONE round; resetting the budget here is `clear_review_bound`'s job.
+        conn.execute(
+            "UPDATE rhapsody_review_bound \
+               SET decision = '', head = '', rounds = 0, findings = '', reason = '' \
+             WHERE pr = ?1",
+            params![pr],
+        )?;
+        Ok(())
+    }
+
+    fn clear_review_bound(&self, pr: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A DELETE rather than a zeroing UPDATE: "no row" is what a pull request nobody has
+        // reviewed looks like, and a re-introduced, reopened or rebuilt pull request must be
+        // indistinguishable from one the daemon has never seen.
+        conn.execute(
+            "DELETE FROM rhapsody_review_bound WHERE pr = ?1",
+            params![pr],
+        )?;
+        Ok(())
+    }
+
+    fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT pr, dispatches, decision, head, rounds, findings, reason \
+             FROM rhapsody_review_bound ORDER BY pr",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let decision: String = row.get(2)?;
+            let findings: String = row.get(5)?;
+            Ok(ReviewBoundRow {
+                pr: row.get(0)?,
+                dispatches: row.get(1)?,
+                // An unrecognised (or empty) decision reads as NO decision rather than as a
+                // decision nobody can act on — the fail-closed direction, since the alternative is
+                // a pull request stopped forever by a token no code branch matches.
+                adjudication: (decision == REVIEW_ADJUDICATION_SHIP
+                    || decision == REVIEW_ADJUDICATION_ESCALATE)
+                    .then(|| {
+                        Ok::<_, rusqlite::Error>(ReviewAdjudication {
+                            decision,
+                            head: row.get(3)?,
+                            rounds: row.get(4)?,
+                            findings: split_findings(&findings),
+                            reason: row.get(6)?,
+                        })
+                    })
+                    .transpose()?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
@@ -3531,6 +3681,210 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// **STUDIO-956, the whole point of the durable bound.** The round counter and the manager's
+    /// settled decision survive a daemon restart: written through a store on disk, dropped, and
+    /// re-opened, the same file must hand both back. The in-memory version of this was measured
+    /// failing — five restarts in a day, 46 review rounds on one pull request against a cap of 16.
+    ///
+    /// MUTATION: make `set_review_rounds` or `record_review_adjudication` a no-op and this reds.
+    #[test]
+    fn a_review_bound_round_trips_across_a_restart() {
+        let scratch = scratch_dir();
+        let db = scratch.join("bound.db");
+
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            store
+                .set_review_rounds("makewhat/rhapsody#84", 6)
+                .expect("count");
+            store
+                .record_review_adjudication(
+                    "makewhat/rhapsody#84",
+                    &ReviewAdjudication {
+                        decision: REVIEW_ADJUDICATION_ESCALATE.into(),
+                        head: "aaa111".into(),
+                        rounds: 3,
+                        findings: vec!["alice asked for changes at aaa111".into()],
+                        reason: "the two reviewers disagree about the schema".into(),
+                    },
+                )
+                .expect("decide");
+            // A second pull request counted but never decided, to prove a partial bound survives.
+            store
+                .set_review_rounds("makewhat/rhapsody#85", 2)
+                .expect("count 2");
+        } // store dropped — the daemon "restarts" here
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        let bounds = store.load_review_bounds().expect("recover bounds");
+        assert_eq!(
+            bounds,
+            vec![
+                ReviewBoundRow {
+                    pr: "makewhat/rhapsody#84".into(),
+                    dispatches: 6,
+                    adjudication: Some(ReviewAdjudication {
+                        decision: REVIEW_ADJUDICATION_ESCALATE.into(),
+                        head: "aaa111".into(),
+                        rounds: 3,
+                        findings: vec!["alice asked for changes at aaa111".into()],
+                        reason: "the two reviewers disagree about the schema".into(),
+                    }),
+                },
+                ReviewBoundRow {
+                    pr: "makewhat/rhapsody#85".into(),
+                    dispatches: 2,
+                    adjudication: None,
+                },
+            ],
+            "both halves of the bound, and a counter-only row, must survive the restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The counter and the decision have DIFFERENT writers — the control task charges rounds while
+    /// the off-loop adjudication half records what the manager said — so neither upsert may carry
+    /// the other's columns. A later charge must not erase a landed decision, and dropping the
+    /// decision (the operator's re-run) must not reset the budget.
+    ///
+    /// MUTATION: widen either upsert to write the other half's columns and this reds.
+    #[test]
+    fn the_counter_and_the_decision_do_not_overwrite_each_other() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let pr = "makewhat/rhapsody#84";
+        store.set_review_rounds(pr, 6).expect("count");
+        store
+            .record_review_adjudication(
+                pr,
+                &ReviewAdjudication {
+                    decision: REVIEW_ADJUDICATION_SHIP.into(),
+                    head: "aaa111".into(),
+                    rounds: 3,
+                    findings: Vec::new(),
+                    reason: String::new(),
+                },
+            )
+            .expect("decide");
+
+        // A later charge leaves the decision standing.
+        store.set_review_rounds(pr, 8).expect("count again");
+        let after = store.load_review_bounds().expect("load");
+        assert_eq!(after[0].dispatches, 8);
+        assert_eq!(
+            after[0].adjudication.as_ref().map(|a| a.decision.as_str()),
+            Some(REVIEW_ADJUDICATION_SHIP),
+            "charging a round must not erase the manager's decision"
+        );
+
+        // And dropping the decision leaves the counter standing.
+        store.clear_review_adjudication(pr).expect("undecide");
+        let after = store.load_review_bounds().expect("load");
+        assert_eq!(
+            after,
+            vec![ReviewBoundRow {
+                pr: pr.into(),
+                dispatches: 8,
+                adjudication: None,
+            }],
+            "the re-run's override drops the decision and keeps the budget"
+        );
+    }
+
+    /// A pull request that leaves the watch set forgets BOTH halves, so one that is later
+    /// re-introduced, reopened or rebuilt is indistinguishable from one the daemon has never seen.
+    /// The durability trap the ticket names: a durable bound must not resurrect a spent budget.
+    ///
+    /// MUTATION: make `clear_review_bound` zero the columns instead of deleting the row and the
+    /// `load_review_bounds().is_empty()` assertion reds.
+    #[test]
+    fn clearing_a_bound_forgets_both_halves_and_is_idempotent() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let pr = "makewhat/rhapsody#84";
+        store.set_review_rounds(pr, 6).expect("count");
+        store
+            .record_review_adjudication(
+                pr,
+                &ReviewAdjudication {
+                    decision: REVIEW_ADJUDICATION_ESCALATE.into(),
+                    head: "aaa111".into(),
+                    rounds: 3,
+                    findings: vec!["alice asked for changes at aaa111".into()],
+                    reason: "needs a human".into(),
+                },
+            )
+            .expect("decide");
+
+        store.clear_review_bound(pr).expect("clear");
+        assert!(
+            store.load_review_bounds().expect("load").is_empty(),
+            "a cleared pull request must leave no row at all"
+        );
+        // Idempotent: clearing what is already gone is not an error.
+        store.clear_review_bound(pr).expect("clear again");
+        store.clear_review_adjudication(pr).expect("undecide gone");
+        assert!(store.load_review_bounds().expect("load").is_empty());
+    }
+
+    /// A `decision` column holding neither token reads as NO decision, not as a decision nobody can
+    /// act on. The fail-closed direction: the alternative is a pull request stopped forever by a
+    /// value no code branch matches — and it is what a future schema step's half-written row, or a
+    /// hand-edited database, actually looks like.
+    #[test]
+    fn an_unrecognised_decision_reads_as_no_decision() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        store
+            .set_review_rounds("makewhat/rhapsody#84", 6)
+            .expect("count");
+        store
+            .lock()
+            .execute(
+                "UPDATE rhapsody_review_bound SET decision = 'maybe' WHERE pr = ?1",
+                params!["makewhat/rhapsody#84"],
+            )
+            .expect("hand-write a junk decision");
+
+        let bounds = store.load_review_bounds().expect("load");
+        assert_eq!(bounds[0].dispatches, 6, "the counter still reads");
+        assert_eq!(
+            bounds[0].adjudication, None,
+            "an unrecognised decision is no decision"
+        );
+    }
+
+    /// The findings column is newline-separated, so a finding that itself contains a newline is
+    /// folded to a space rather than allowed to split into two findings on the way back.
+    #[test]
+    fn a_multi_line_finding_survives_as_one_finding() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let pr = "makewhat/rhapsody#84";
+        store
+            .record_review_adjudication(
+                pr,
+                &ReviewAdjudication {
+                    decision: REVIEW_ADJUDICATION_ESCALATE.into(),
+                    head: "aaa111".into(),
+                    rounds: 3,
+                    findings: vec!["alice asked\nfor changes".into(), "bob is unread".into()],
+                    reason: String::new(),
+                },
+            )
+            .expect("decide");
+
+        let bounds = store.load_review_bounds().expect("load");
+        assert_eq!(
+            bounds[0]
+                .adjudication
+                .as_ref()
+                .expect("a decision")
+                .findings,
+            vec![
+                "alice asked for changes".to_string(),
+                "bob is unread".to_string()
+            ]
+        );
+    }
+
     // STUDIO-730: the three TEXT key columns have no NOCASE collation, so `get_review_watch` is a
     // byte comparison. That is right for the watcher, which only looks a row up with the spelling
     // it wrote, and wrong for a reader handed a coordinate a PERSON typed — GitHub treats an owner
@@ -4330,6 +4684,7 @@ mod tests {
                 "rhapsody_review_watch".to_string(),
                 "rhapsody_summon_watermark".to_string(),
                 "rhapsody_run_provenance".to_string(),
+                "rhapsody_review_bound".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

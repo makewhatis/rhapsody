@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ReviewJob } from "@/lib/api";
 import {
   REVIEW_STATUSES,
+  clearNotice,
   dismissNotice,
   isLive,
   prLabel,
@@ -248,5 +249,18 @@ describe("dismissNotice", () => {
     expect(dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }, false).text).not.toMatch(
       /still running/i,
     );
+  });
+});
+
+describe("clearNotice", () => {
+  // STUDIO-956: the budget is cleared deliberately, and the notice names the pull request and says
+  // that its next round may dispatch — the operator asked for a bound to be lifted, so confirm it.
+  // A pull request with no budget never reaches here: the daemon answers `409`, which is the
+  // mutation's error path (`refused`), not a zero-row notice.
+  it("confirms the clear and says the next round may dispatch", () => {
+    const cleared = clearNotice({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    expect(cleared.tone).toBe("info");
+    expect(cleared.text).toContain("makewhatis/rhapsody#12");
+    expect(cleared.text).toMatch(/cleared/i);
   });
 });

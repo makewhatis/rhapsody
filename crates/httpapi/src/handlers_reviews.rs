@@ -10,8 +10,9 @@
 //! | `GET /api/v1/reviews` | the watch set: per (PR, reviewer) — status, both SHAs, the open flag |
 //! | `POST /api/v1/reviews/rerun` | the operator asking for one more review round |
 //! | `POST /api/v1/reviews/dismiss` | the operator taking a pull request out of the watch set |
+//! | `POST /api/v1/reviews/clear` | the operator clearing a pull request's round budget (STUDIO-956) |
 //!
-//! # These two writes are the security fix, not a convenience
+//! # These writes are the security fix, not a convenience
 //!
 //! §14.1's fatal **F-SEC** finding is that a review checks a pull request's head out and reads its
 //! diff under `bypassPermissions`, so whoever decides WHICH pull request that is decides what code
@@ -53,7 +54,7 @@ use crate::server::StateProvider;
 /// is not one.
 const MAX_CONTROL_BODY: usize = 8 << 10;
 
-/// The body both control routes take: the pull request, and nothing else.
+/// The body every control route takes: the pull request, and nothing else.
 ///
 /// There is no `reviewer` field, deliberately. A review is a property of the pull request — a
 /// two-reviewer round is one round — so both controls act on every row of the coordinate rather
@@ -71,13 +72,15 @@ struct ReviewControlReq {
     number: i64,
 }
 
-/// The 200 body for both control routes: how many watch-set rows the action changed.
+/// The 200 body for every control route: how many watch-set rows the action changed.
 #[derive(Serialize)]
 struct ReviewControlJson {
     /// `owner/repo#number`, echoed so a log or a toast can name what was acted on.
     pr: String,
-    /// Rows re-armed (rerun) or dropped (dismiss). `0` is possible and is not an error: every row
-    /// of the pull request already had a review in flight.
+    /// Rows re-armed (rerun) or dropped (dismiss), or budgets cleared (clear, always 1 on success —
+    /// clearing a pull request with no budget is a `409` refusal, not an `Applied(0)`). `0` is
+    /// possible and is not an error for the first two: every row of the pull request already had a
+    /// review in flight.
     rows: usize,
 }
 
@@ -126,6 +129,21 @@ pub(crate) async fn handle_review_dismiss(
     };
     let label = pr.to_string();
     render(provider.review_dismiss(pr).await, label)
+}
+
+/// `POST /api/v1/reviews/clear` — clear a pull request's shared review↔author round budget
+/// (STUDIO-956), the deliberate lift of a bound that otherwise clears only on a restart or a close.
+pub(crate) async fn handle_review_clear(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
+) -> Response {
+    let pr = match parse_control(&method, &body, "use POST to clear a review budget") {
+        Ok(pr) => pr,
+        Err(resp) => return *resp,
+    };
+    let label = pr.to_string();
+    render(provider.review_clear(pr).await, label)
 }
 
 /// POST-only, one bounded JSON coordinate. The error is `Box`ed so the common `Ok` path stays small
@@ -319,6 +337,7 @@ mod tests {
         for (path, seen) in [
             ("rerun", FakeProvider::review_rerun_pr as Seen),
             ("dismiss", FakeProvider::review_dismiss_pr as Seen),
+            ("clear", FakeProvider::review_clear_pr as Seen),
         ] {
             assert_eq!(seen(&provider), None, "{path} has not been called yet");
             let resp = post(
@@ -359,12 +378,12 @@ mod tests {
         );
     }
 
-    /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls with
+    /// **Acceptance 4, the control half (§16).** A dormant daemon refuses every control with
     /// `review_disabled` — the answer that says "configured off", not "something went wrong".
     #[tokio::test]
-    async fn a_dormant_daemon_refuses_both_controls() {
+    async fn a_dormant_daemon_refuses_every_control() {
         let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
-        for path in ["rerun", "dismiss"] {
+        for path in ["rerun", "dismiss", "clear"] {
             let resp = post(
                 &format!("{url}/api/v1/reviews/{path}"),
                 r#"{"owner":"makewhatis","repo":"rhapsody","number":12}"#,
@@ -450,7 +469,7 @@ mod tests {
         assert_eq!(resp.status(), 405);
         assert_eq!(err_code(resp).await, "method_not_allowed");
 
-        for path in ["rerun", "dismiss"] {
+        for path in ["rerun", "dismiss", "clear"] {
             let resp = reqwest::get(&format!("{url}/api/v1/reviews/{path}"))
                 .await
                 .expect("GET a POST-only route");
