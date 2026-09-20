@@ -66,14 +66,13 @@
 //! dispatch. The fresh answer is ADOPTED: refusing on a move would let a short-cycle author starve
 //! the review entirely, which is strictly worse than reviewing slightly-stale code.
 //!
-//! **Why two passes.** They do different jobs: the sweep's read CLASSIFIES — a merged, closed, gone
-//! or untrusted answer dispatches nothing and leaves the watch set, and only an OPEN one may be
-//! re-read — while the re-read PINS the head the dispatch records. One interleaved pass could do
-//! both from a single call, at N `gh` requests per tick instead of 2N, but it would fold away the
-//! sweep's own answer: the control task's retirement paths read that classification, and the
-//! re-read's FAILURE rule ("keep the observed answer") exists only because the two answers can
-//! disagree. Doubling the requests is a deliberate price for keeping classification and pinning on
-//! their own answers — not an oversight (STUDIO-953).
+//! **Why two passes.** They do different jobs: the sweep's read CLASSIFIES (a merged, closed, gone
+//! or untrusted answer dispatches nothing and leaves the watch set; only an OPEN one may be
+//! re-read) while the re-read PINS the head the dispatch records. One interleaved pass would do
+//! both from a single call — N `gh` requests per tick instead of 2N — at the cost of the re-read's
+//! FAILURE rule, which only exists when there are two answers to disagree: a failed read would
+//! simply be a failed read, counted and re-asked next tick. Doubling the requests buys that
+//! fallback, and is a deliberate price rather than an oversight (STUDIO-953).
 //!
 //! **What this closes, and what it does not.** It closes the window between the batched
 //! observation and the dispatch — on this deployment that is the ~2.4 s the tick body spends on
