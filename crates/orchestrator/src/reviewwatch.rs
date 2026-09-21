@@ -1656,6 +1656,33 @@ impl Orchestrator {
             })
     }
 
+    /// Whether `pr` still owes its ONE resumed round at `head` (STUDIO-971).
+    ///
+    /// Past the adjudication threshold a content-changing head move buys exactly one review round;
+    /// this answers "is that round still owed?", so the fresh adjudication is held back until it is
+    /// spent. It is decided from the ROWS — the round is owed while ANY live row still owes a review
+    /// of `head`, the same [`review_round_due`] the dispatch loop itself uses.
+    ///
+    /// Deliberately NOT `rounds_used(pr) <= decision.rounds()`. A round costs one dispatch per live
+    /// reviewer, and `rounds_used` is the floor of the dispatch counter divided by
+    /// `review.reviewers`. When a pull request has fewer live rows than that configured count — a
+    /// smaller eligible roster, a retired or unassignable row — the resumed round does not carry the
+    /// counter across the next whole multiple, so the floor comparison keeps reporting the round
+    /// owed forever, the threshold branch is never reached, the stale `ship` is never cleared, and
+    /// the pull request stalls exactly as it did before this ticket, one round later. Reading the
+    /// rows answers the question the counter was a proxy for.
+    ///
+    /// A row still owing a review of `head` because its round crashed (`truncated`) or its reviewer
+    /// was never assignable is a round NOT yet spent, and those deferrals are reported by their own
+    /// paths; the round genuinely has not happened.
+    fn resumed_round_owed(&self, mine: &[&ReviewWatchRow], head: &str) -> bool {
+        mine.iter().any(|r| {
+            let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+            let live = self.running.contains_key(&id) || self.claimed.contains(&id);
+            review_round_due(r, head, live)
+        })
+    }
+
     /// Whether the ticket `identifier` — a watched pull request's author — has a live run.
     ///
     /// The author's run is a normal ticket run, so it is keyed by the tracker's opaque ID rather
@@ -1991,11 +2018,15 @@ impl Orchestrator {
                     return;
                 }
                 // A settled `ship` at a head this content-changing push has moved past. Past the
-                // threshold the new head buys exactly one round; `rounds_used` counts the rounds
-                // spent, so it says whether that one is still owed without a second durable field.
-                // Once it is spent the fresh adjudication below takes over — and a round that came
-                // back with findings is exactly what re-adjudicates here.
-                resumed_round = self.rounds_used(pr) <= decision.rounds();
+                // threshold the new head buys exactly one round. Whether that one round is still
+                // owed is answered from the ROWS ([`Self::resumed_round_owed`]) and NOT from
+                // `rounds_used`: a round dispatches one row per live reviewer, and when fewer rows
+                // than `review.reviewers` exist the floor-divided counter never reaches the next
+                // whole multiple, so a counter comparison would consider the round owed forever and
+                // reproduce this ticket's stall one round later. Once the round is spent the fresh
+                // adjudication below takes over — and a round that came back with findings is
+                // exactly what re-adjudicates here.
+                resumed_round = self.resumed_round_owed(&mine, head);
             }
             if !resumed_round && self.rounds_used(pr) >= threshold {
                 // A pull request that CONVERGED on its last allowed round is not a failure for the
@@ -2038,7 +2069,9 @@ impl Orchestrator {
                     // round COUNT beside it in the same durable row is deliberately left alone,
                     // because the count is "how much has been spent on this pull request" and the
                     // decision is "what the manager concluded about one specific head". This is the
-                    // inverse of a `record`, and it clears exactly one half of the row.
+                    // inverse of a `record`, and it clears exactly one half of the durable row; it
+                    // also drops any in-memory failure tally for the pull request, which is the
+                    // right lifetime for a tally that only bounds the re-asking of THIS decision.
                     if self.adjudication(pr).is_some() {
                         ledger.clear(pr);
                     }
@@ -6545,6 +6578,87 @@ mod tests {
             dispatched.lock().expect("lock").len(),
             3,
             "exactly the one resumed round reached a worker"
+        );
+
+        // ⚠️ The fresh adjudication CLEARS the superseded decision before it marks the plan in
+        // flight (B2). Without the `ledger.clear`, `mark_in_flight`'s `or_insert` keeps the stale
+        // settled `Ship`, this third sweep sees `settled()` true, `governs(head_b)` false and a spent
+        // round, and hands out a SECOND plan while the manager is still deciding — one per sweep.
+        assert!(
+            !l.peek(&coord(202)).expect("a plan is in flight").settled(),
+            "the superseded decision is cleared and the fresh plan is marked in flight, not left \
+             settled at the old head"
+        );
+        let third = o.handle_review_sweep(&[open_at(202, NEW_HEAD)]);
+        assert!(
+            third.adjudicate.is_empty(),
+            "a turn is already out for this head; a second plan must not be handed out on the next \
+             sweep"
+        );
+    }
+
+    /// **B1: a resumed round with FEWER rows than `review.reviewers` still counts as spent.** The
+    /// original resume check compared the floor-divided dispatch counter against the decision's
+    /// round count, so a round that dispatched fewer rows than the configured reviewer count left
+    /// the counter on the same whole multiple — the resumed round stayed "owed" forever, the
+    /// threshold branch was never reached, and the pull request stalled exactly as before, one round
+    /// later. The resume is now decided from the rows.
+    ///
+    /// Reproduced with alice's numbers: `reviewers=3`, two rows (bob, carol), `dispatches=6`,
+    /// `Ship{head:"243a790", rounds:2}`, threshold 2, head `daa65d3`. The round dispatches 2, the
+    /// count reaches 8, and `8 / 3 == 2` never crosses to 3 — the shape the old check stalled on.
+    ///
+    /// MUTATION: restore `self.rounds_used(pr) <= decision.rounds()` and this reds — the second
+    /// sweep adjudicates nothing and dispatches nothing.
+    #[test]
+    fn a_resumed_round_that_dispatches_fewer_rows_than_reviewers_is_still_spent() {
+        const STALE_HEAD: &str = "243a790";
+        const NEW_HEAD: &str = "daa65d3";
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 2);
+        teams.review.reviewers = 3;
+        let (mut o, dispatched) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, row(202, "bob"));
+        introduce(&o, row(202, "carol"));
+        o.review_rounds.insert(churn_key(&coord(202)), 6);
+        l.record(
+            &coord(202),
+            Adjudication::Ship {
+                head: STALE_HEAD.to_string(),
+                rounds: 6 / o.reviewers_per_round(),
+            },
+        );
+
+        let first = o.handle_review_sweep(&[open_at(202, NEW_HEAD)]);
+        assert_eq!(
+            first.dispatched, 2,
+            "the one resumed round arms both live rows"
+        );
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(202))), Some(&8));
+        assert_eq!(
+            o.rounds_used(&coord(202)),
+            2,
+            "sanity: the floor-divided counter has NOT crossed to a new round"
+        );
+
+        for reviewer in ["bob", "carol"] {
+            complete(&mut o, 202, reviewer, NEW_HEAD);
+        }
+        let second = o.handle_review_sweep(&[open_at(202, NEW_HEAD)]);
+        assert_eq!(
+            second.dispatched, 0,
+            "the round is spent; nothing more is armed at the head"
+        );
+        assert_eq!(
+            second.adjudicate.len(),
+            1,
+            "and with the round spent the manager is asked again at the new head"
+        );
+        assert_eq!(second.adjudicate[0].head, NEW_HEAD);
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            2,
+            "exactly one short round reached a worker"
         );
     }
 
