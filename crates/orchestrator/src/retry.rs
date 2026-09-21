@@ -555,22 +555,26 @@ impl Orchestrator {
         // Refused dispatches are recorded so `/api/v1/state` surfaces them and the reconciliation
         // sweep names the budget rather than claiming nothing has reported the ticket blocked.
         if attempt.is_none() {
-            let provider =
-                self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
-            if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
-                self.note_budget_hold(
-                    &iss.identifier,
-                    &iss.title,
-                    &re.project_slug,
-                    &provider,
-                    limit,
-                    spent,
-                );
-                return;
+            // No configured budget ⇒ nothing to check and no provider resolution is done, so the
+            // dispatch is byte-identical to one built before this feature.
+            if self.budgets_configured() {
+                let provider =
+                    self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
+                if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
+                    self.note_budget_hold(
+                        &iss.identifier,
+                        &iss.title,
+                        &re.project_slug,
+                        &provider,
+                        limit,
+                        spent,
+                    );
+                    return;
+                }
+                // The ticket dispatched, so a stale hold from an earlier tick must not linger on
+                // the console. Best-effort and idempotent.
+                self.release_budget_hold(&iss.identifier);
             }
-            // The ticket dispatched, so a stale hold from an earlier tick must not linger on the
-            // console. Best-effort and idempotent.
-            self.release_budget_hold(&iss.identifier);
             // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
             // AUTHOR round to that pull request's shared review↔author budget. Charged here rather
             // than in `select` because this is the one funnel every dispatch path shares, so no path

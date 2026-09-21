@@ -406,14 +406,16 @@ impl Orchestrator {
         // incident's whole Claude bill was REVIEWS, so a budget that could not see this path would
         // have refused nothing. The subject is the pull request's coordinate, which is also the key
         // the reconciliation sweep reports a divergence under.
-        let provider = self.review_projected_provider(&iss, &route.slug);
-        if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
-            let subject = format!("{}/{}#{}", run.owner, run.repo, run.number);
-            self.note_budget_hold(&subject, "", &route.slug, &provider, limit, spent);
-            return ReviewDispatchOutcome::BudgetHeld;
+        if self.budgets_configured() {
+            let provider = self.review_projected_provider(&iss, &route.slug);
+            if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
+                let subject = format!("{}/{}#{}", run.owner, run.repo, run.number);
+                self.note_budget_hold(&subject, "", &route.slug, &provider, limit, spent);
+                return ReviewDispatchOutcome::BudgetHeld;
+            }
+            // A dispatched review clears any stale hold for this coordinate.
+            self.release_budget_hold(&format!("{}/{}#{}", run.owner, run.repo, run.number));
         }
-        // A dispatched review clears any stale hold for this coordinate.
-        self.release_budget_hold(&format!("{}/{}#{}", run.owner, run.repo, run.number));
 
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
         // watcher's re-review condition is level-triggered and stays true on every tick between

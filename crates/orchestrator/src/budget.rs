@@ -37,6 +37,13 @@ use serde::Serialize;
 /// recorded without waiting the window out.
 const SPEND_CACHE_TTL: Duration = Duration::from_secs(3);
 
+/// How long a recorded refusal stays on the console without being re-confirmed. A subject still
+/// being offered re-refuses on every pass and stays fresh; one that stopped being offered (the
+/// ticket was moved to Done, the pull request merged) goes stale and drops, so `/api/v1/state`
+/// never carries a refusal that no longer holds. Long enough to outlive the poll cadence with room
+/// to spare.
+const HOLD_TTL: Duration = Duration::from_secs(300);
+
 /// Reports whether a provider's configured daily budget is SPENT. `limit <= 0` is unlimited (the
 /// `max_concurrent` idiom), as is the absence of a limit (the caller only calls this with a
 /// configured one). `spent >= limit` — a budget bounds the next token, so spending exactly to the
@@ -105,10 +112,22 @@ pub struct BudgetLedger {
     state: Mutex<LedgerState>,
 }
 
+/// A recorded refusal and when it was last confirmed, so a stale one can be dropped.
+struct Entry {
+    held: BudgetHeld,
+    recorded: Instant,
+}
+
+impl Entry {
+    fn fresh(&self) -> bool {
+        self.recorded.elapsed() < HOLD_TTL
+    }
+}
+
 #[derive(Default)]
 struct LedgerState {
     /// Refusals by subject, replaced as the gate re-refuses and removed when the subject dispatches.
-    holds: BTreeMap<String, BudgetHeld>,
+    holds: BTreeMap<String, Entry>,
     /// Subjects whose refusal has already been logged, so a refusal repeated every tick is one line.
     announced: std::collections::HashSet<String>,
     /// The cached provider→spend map and the instant it was fetched.
@@ -121,7 +140,13 @@ impl BudgetLedger {
     pub fn hold(&self, subject: &str, held: BudgetHeld) -> bool {
         let mut st = self.lock();
         let first = st.announced.insert(subject.to_string());
-        st.holds.insert(subject.to_string(), held);
+        st.holds.insert(
+            subject.to_string(),
+            Entry {
+                held,
+                recorded: Instant::now(),
+            },
+        );
         first
     }
 
@@ -133,15 +158,27 @@ impl BudgetLedger {
         st.announced.remove(subject);
     }
 
-    /// The hold recorded for a subject, if any — the lookup the reconciliation sweep makes so it can
-    /// name a budget hold instead of claiming nothing has reported a divergence blocked.
+    /// The hold recorded for a subject, if any and still fresh — the lookup the reconciliation sweep
+    /// makes so it can name a budget hold instead of claiming nothing has reported a divergence
+    /// blocked.
     pub fn get(&self, subject: &str) -> Option<BudgetHeld> {
-        self.lock().holds.get(subject).cloned()
+        self.lock()
+            .holds
+            .get(subject)
+            .filter(|e| e.fresh())
+            .map(|e| e.held.clone())
     }
 
-    /// The current refused set, ordered by subject, for `GET /api/v1/state`.
+    /// The current refused set, ordered by subject, for `GET /api/v1/state`. Stale entries (a
+    /// subject that stopped being offered without dispatching — moved to Done, merged) are dropped
+    /// rather than reported forever.
     pub fn held(&self) -> Vec<BudgetHeld> {
-        self.lock().holds.values().cloned().collect()
+        self.lock()
+            .holds
+            .values()
+            .filter(|e| e.fresh())
+            .map(|e| e.held.clone())
+            .collect()
     }
 
     /// Today's spend per provider, reused for [`SPEND_CACHE_TTL`]. The store is only consulted when
@@ -166,6 +203,15 @@ impl BudgetLedger {
         self.lock().spend = None;
     }
 
+    /// Test seam: records a hold as if it were confirmed at `recorded`, so the staleness rule can be
+    /// exercised without sleeping out [`HOLD_TTL`].
+    #[cfg(test)]
+    fn hold_at(&self, subject: &str, held: BudgetHeld, recorded: Instant) {
+        self.lock()
+            .holds
+            .insert(subject.to_string(), Entry { held, recorded });
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
         self.state
             .lock()
@@ -177,6 +223,15 @@ impl BudgetLedger {
 pub type SharedBudgetLedger = Arc<BudgetLedger>;
 
 impl crate::orchestrator::Orchestrator {
+    /// Whether ANY provider has a configured (positive) daily budget. The gates test this first so a
+    /// daemon that configures none does no provider resolution at all on the dispatch path — the
+    /// strong form of "unset is byte-identical to today".
+    pub(crate) fn budgets_configured(&self) -> bool {
+        self.eff
+            .as_ref()
+            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_tokens > 0))
+    }
+
     /// The configured daily token limit for a provider, or `None` when there is no budget for it or
     /// it is non-positive. `None` is the whole "unset is unlimited" property — every gate is a no-op
     /// on it, so a daemon that configures no budget schedules byte-identically to one built before
@@ -461,7 +516,9 @@ mod tests {
     fn a_successful_dispatch_clears_a_stale_hold() {
         let store: Arc<dyn Store + Send + Sync> =
             Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
-        let (mut o, _) = orch_with_budgets(store, &[]);
+        // A configured budget is what arms the gate's release path; the ceiling is unspent, so the
+        // dispatch itself is allowed.
+        let (mut o, _) = orch_with_budgets(store, &[("anthropic", 1_000_000)]);
         o.note_budget_hold("MT-1", "t", "core", "anthropic", 200, 250);
         assert!(o.budget_ledger.get("MT-1").is_some());
 
@@ -524,5 +581,33 @@ mod tests {
         l.release("MT-1");
         assert!(l.get("MT-1").is_none());
         assert!(l.held().is_empty());
+    }
+
+    /// A subject that stopped being offered without dispatching must not sit on the console forever:
+    /// an unrefreshed hold goes stale and drops. A subject still being refused every tick refreshes
+    /// its hold and stays.
+    #[test]
+    fn a_stale_hold_drops_but_a_refreshed_one_stays() {
+        let l = BudgetLedger::default();
+        let h = BudgetHeld {
+            subject: "MT-1".into(),
+            title: "t".into(),
+            project: "core".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200,
+            spent_tokens: 250,
+        };
+        let old = Instant::now()
+            .checked_sub(HOLD_TTL + Duration::from_secs(1))
+            .expect("instant arithmetic");
+        l.hold_at("MT-1", h.clone(), old);
+        assert!(
+            l.get("MT-1").is_none(),
+            "a hold not re-confirmed within TTL must drop"
+        );
+        assert!(l.held().is_empty());
+
+        l.hold("MT-1", h);
+        assert!(l.get("MT-1").is_some(), "a fresh hold stays");
     }
 }
