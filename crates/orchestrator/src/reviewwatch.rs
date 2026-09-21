@@ -1141,9 +1141,11 @@ impl Orchestrator {
                 PrLookup::Found(snap) => self.service_review_pr(
                     &rows,
                     &obs.pr,
-                    &snap.head_sha,
-                    &snap.merge_state,
-                    &obs.unchanged_from,
+                    ObservedHead {
+                        head: &snap.head_sha,
+                        merge_state: &snap.merge_state,
+                        unchanged_from: &obs.unchanged_from,
+                    },
                     &mut slots,
                     &mut report,
                 ),
@@ -1640,12 +1642,15 @@ impl Orchestrator {
         &mut self,
         rows: &[ReviewWatchRow],
         pr: &PrCoord,
-        head: &str,
-        merge_state: &str,
-        unchanged_from: &[String],
+        observed: ObservedHead<'_>,
         slots: &mut i64,
         report: &mut ReviewSweepReport,
     ) {
+        let ObservedHead {
+            head,
+            merge_state,
+            unchanged_from,
+        } = observed;
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
@@ -2506,6 +2511,25 @@ pub type ReviewRounds = HashMap<String, usize>;
 /// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
 /// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
 pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
+
+/// What one poll of ONE watched pull request told the watcher about its current head.
+///
+/// The three facts arrive from two different structs — `head`/`merge_state` off the
+/// [`PrSnapshot`](crate::ghsummons::PrSnapshot) the lookup answered with, `unchanged_from` off the
+/// [`PrObservation`](crate::prstate::PrObservation) that carried it — so no existing type holds
+/// them together. Bundled rather than threaded flat because they are one observation and they
+/// travel together, and because three more scalars on
+/// [`service_review_pr`](Orchestrator::service_review_pr)'s already long argument list is where a
+/// caller starts transposing two `&str`s.
+struct ObservedHead<'a> {
+    /// The head SHA GitHub reports for the pull request right now.
+    head: &'a str,
+    /// GitHub's `mergeStateStatus`, upper-cased, or empty when it answered none (STUDIO-961).
+    merge_state: &'a str,
+    /// The head SHAs this pull request's rows have already READ, for STUDIO-960's proof that a head
+    /// move carried no new work.
+    unchanged_from: &'a [String],
+}
 
 /// One pull request's record of the conflict route-back the watcher has already fired
 /// (STUDIO-961), keyed by coordinate. See [`Orchestrator::conflict_routed`].
