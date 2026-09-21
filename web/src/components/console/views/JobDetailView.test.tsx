@@ -202,8 +202,8 @@ function teammate(name: string) {
 /** The client the last mount rendered under — how a test simulates a poll tick landing. */
 let client: QueryClient;
 
-function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
-  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs });
+function mountDetail(runs: RunSummary[], onNavigate = vi.fn(), reviews: RunSummary[] = []) {
+  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs, reviews });
   // A test that cares what the poll says configures it BEFORE mounting; this is only the default.
   if (h.fetchRunDetail.getMockImplementation() === undefined) {
     h.fetchRunDetail.mockImplementation(async (id: number) => {
@@ -503,6 +503,79 @@ describe("zone A — the sticky header (§3A)", () => {
       "attempt 3 · alice",
     );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+  });
+
+  // STUDIO-976 — the ticket's review runs, credited to it by the daemon's own origin-ticket join,
+  // shown beside the attempts. They live in their OWN strip, never in the attempt selector: an
+  // attempt's ordinal is its position in the ticket's run list, so folding reviews into
+  // `attemptOptions` would silently renumber every label. This test is the pin for that mutation —
+  // with two reviews present, the three attempt labels must read exactly as they did without them.
+  it("shows the ticket's review runs in their own strip, naming each reviewer, without renumbering the attempts", async () => {
+    const reviews = [
+      run({ id: 802, issue_identifier: "pr:makewhatis/rhapsody#204@sol", started_at: "2026-09-01T17:30:00Z" }),
+      run({ id: 801, issue_identifier: "pr:makewhatis/rhapsody#204@alice", started_at: "2026-09-01T17:00:00Z" }),
+    ];
+    mountDetail(
+      [
+        run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+        run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+        run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
+      ],
+      vi.fn(),
+      reviews,
+    );
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(2));
+    // A review names its reviewer and is never numbered as an attempt...
+    expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
+      "review · sol",
+      "review · alice",
+    ]);
+    // ...and the attempts keep their own ordinals, untouched by the two reviews above them.
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · alice", "attempt 1 · alice"],
+      ),
+    );
+    // A review carries its own run id and start time in the tooltip, exactly as an attempt does.
+    expect(document.querySelector(".trrev")?.getAttribute("title")).toMatch(
+      /^review · sol · run 802 · started /,
+    );
+  });
+
+  // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
+  // so selecting it drives the same detail fetch and the same header pill as an attempt.
+  it("opens a review run's own trace from the review strip", async () => {
+    const rows = [
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ];
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    h.fetchRunDetail.mockImplementation(async (id: number) => {
+      const row = [...rows, review].find((r) => r.id === id);
+      if (row === undefined) throw new Error(`no run with id: ${id}`);
+      return detailOf(row);
+    });
+    mountDetail(rows, vi.fn(), [review]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    fireEvent.click(document.querySelector(".trrev") as HTMLElement);
+    // The review's own run is opened — its transcript is fetched — the header pill follows it, and
+    // its reviewer is the header's assignee: one resolution, so the strip and the header cannot
+    // disagree about whose run it is.
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledWith(801));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 801 · started /,
+      ),
+    );
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice");
+    expect(document.querySelector('.trrev[aria-pressed="true"]')?.textContent).toBe("review · alice");
+    // No ATTEMPT is selected — a review is not an attempt.
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')).toBeNull();
   });
 
   // The acceptance's two degradations, which are DIFFERENT answers about the same absence.

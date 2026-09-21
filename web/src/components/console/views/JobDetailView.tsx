@@ -66,6 +66,7 @@ import {
   relayBatons,
   resultBanner,
   resultEyebrow,
+  reviewOptions,
   runBranch,
   runTeammate,
   runVitals,
@@ -189,10 +190,17 @@ export function JobDetailView({
   const identityRead = { isPending: identityEvents.isPending, isError: identityEvents.isError };
 
   const runs = useMemo(() => runsNewestFirst(history.data?.runs ?? []), [history.data]);
+  // The ticket's REVIEW runs (STUDIO-976), already credited to it by the daemon's own origin-ticket
+  // join — this console never decides which ticket a review belongs to. Newest-first like `runs`, so
+  // the two feed one time order; empty on a ticket with no reviews, and on a daemon that predates
+  // the field, so the detail renders exactly as it did before it existed.
+  const reviews = useMemo(() => runsNewestFirst(history.data?.reviews ?? []), [history.data]);
   // The attempt the zones render. `null` follows the newest run, so a ticket that gains a run
-  // while the page is open moves with it; picking an attempt pins the choice.
+  // while the page is open moves with it; picking an attempt pins the choice. A REVIEW run is
+  // selectable too (its own trace, cost and outcome), so the pin resolves against both lists —
+  // `runs` alone would refuse a review id and silently fall back to the newest attempt.
   const [pinned, setPinned] = useState<number | null>(null);
-  const run = runs.find((r) => r.id === pinned) ?? runs[0];
+  const run = [...runs, ...reviews].find((r) => r.id === pinned) ?? runs[0];
   // The live roster, which only ever names a RUNNING ticket — the gap-filler behind the durable
   // record for a run whose ledger has no routing row at all (`runTeammate`).
   //
@@ -238,6 +246,7 @@ export function JobDetailView({
         <RunTrace
           run={run}
           runs={runs}
+          reviews={reviews}
           identities={identities}
           identityRead={identityRead}
           assignee={assignee}
@@ -258,6 +267,7 @@ export function JobDetailView({
 function RunTrace({
   run,
   runs,
+  reviews,
   identities,
   identityRead,
   assignee,
@@ -271,6 +281,8 @@ function RunTrace({
 }: {
   run: RunSummary;
   runs: readonly RunSummary[];
+  /** The ticket's review runs (STUDIO-976), credited by the daemon's origin-ticket join. */
+  reviews: readonly RunSummary[];
   /** Run id → the teammate that run was dispatched as; see `lib/run-identity` for the tri-state. */
   identities: ReadonlyMap<number, string>;
   /** How that map's own fetch is going — an empty map means nothing without it. */
@@ -309,6 +321,14 @@ function RunTrace({
   const attempts = useMemo(
     () => attemptOptions(runs, identities, assignee),
     [runs, identities, assignee],
+  );
+  // The review strip (STUDIO-976): the ticket's review runs, labelled by reviewer through the SAME
+  // resolution the attempts, the batons and the header's assignee use. Deliberately NOT folded into
+  // `attempts`: an attempt's ordinal is its position in the TICKET's run list, and inserting
+  // reviews there would renumber every attempt label quoted in tickets, PR comments and the room.
+  const reviewStrip = useMemo(
+    () => reviewOptions(reviews, identities, assignee),
+    [reviews, identities, assignee],
   );
   // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
   // "what <who> did" can never disagree about whose run this is — they did while only the header
@@ -381,6 +401,34 @@ function RunTrace({
           setFocusMessage(true);
         }}
       />
+
+      {/* The review strip (STUDIO-976). Its own row beneath the attempt selector, not folded into
+          it: the selector's single-row width budget is measured per ATTEMPT count (`attemptBucket`,
+          console-trace.css), and a one-attempt ticket with reviews would have them hidden by the
+          `[data-attempts="1"]` rule — while a heavily reviewed ticket's strip is long enough that
+          no threshold fits it either way. A review is a real run with its own trace, so each entry
+          opens it exactly as an attempt does; a review is never numbered, and it is styled as its
+          own kind of row rather than a fourth attempt. */}
+      {reviewStrip.length === 0 ? null : (
+        <div className="trreviews" role="group" aria-label="Reviews">
+          {reviewStrip.map((r) => (
+            <button
+              key={r.id}
+              type="button"
+              className={r.id === run.id ? "trrev on" : "trrev"}
+              aria-pressed={r.id === run.id}
+              title={
+                r.named
+                  ? `${r.label} · run ${r.id} · started ${formatDateTime(r.startedAt)}`
+                  : `run ${r.id} · started ${formatDateTime(r.startedAt)}`
+              }
+              onClick={() => selectRun(r.id)}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="trmode">
         <div className="rt">
