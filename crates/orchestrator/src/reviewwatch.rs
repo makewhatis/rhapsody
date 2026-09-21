@@ -1690,6 +1690,60 @@ impl Orchestrator {
         // un-primed empty set and then read `primed == true`, treating "nothing has looked" as "no
         // hold". The pair is now always the pair one pass produced.
         let (held, ledger_primed) = self.human_holds.labelled_and_primed();
+        // Whether THIS pull request's origin ticket currently wears the `rhapsody:human` label
+        // (STUDIO-949 round 5). Bound HERE, beside the label set it reads, because two gates need
+        // the same answer: the conflict route-back immediately below, and the auto-merge gate at the
+        // tail of this function. Both are decided before their plan is formed, so nothing is handed
+        // across the seam.
+        //
+        // For auto-merge: the round gate below refuses to DISPATCH against a held ticket, but a pull
+        // request whose reviewers had already approved the current head when the label landed would
+        // still clear auto-merge — and the merge then runs `plan_review_done` on the next tick and
+        // moves the ticket to `review.done_state`. Refusing the review round while MERGING the code
+        // and closing the ticket is the daemon finishing work the label says only a person can do,
+        // and the merge is irreversible. Read from the same current-LABEL set as the round gate
+        // (`labelled()`, live runs included).
+        //
+        // MUTATION: delete this gate and `a_held_origin_ticket_holds_back_auto_merge` /
+        // `a_held_origin_ticket_routes_no_conflict_back` red (a plan is proposed).
+        let held_origin = mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+        });
+        // The conflict route-back (STUDIO-961), behind STUDIO-949's two gates and deliberately ABOVE
+        // the adjudication block rather than at the tail beside `propose_auto_merge`.
+        //
+        // BEHIND THE GATES because a route-back moves tracker state AND reopens the author's agent
+        // run through the summon token — precisely the class of action `rhapsody:human` exists to
+        // refuse. A conflict on a human-held ticket is a human's to resolve; the daemon must not
+        // summon an agent back onto it, and moving the ticket out of the review state would undo a
+        // placement a person made. The fail-closed `ledger_primed` half is the auto-merge gate's own
+        // reasoning verbatim: on a daemon held by a bad config, an armed drain or a dead credential
+        // no selection pass ever runs, so an empty label set is "unknown", not "no hold" — and this
+        // sweep runs from the watcher's own task, independent of those gates.
+        //
+        // ABOVE THE ADJUDICATION BLOCK because STUDIO-956's four `return`s precede the tail of this
+        // function. At the tail, a pull request that has reached `review.adjudicate_after_rounds`
+        // would never route back on a conflict again — and a `ship` adjudication of a conflicted
+        // head is exactly the nine-hour stall STUDIO-961 was filed for: the manager decides the
+        // FINDINGS question, `propose_auto_merge` hands out a plan, and GitHub declines the merge
+        // every time with nobody handing the branch back. Mergeability is orthogonal to the review
+        // verdict, so its trigger must be too. Placing it here costs nothing: `mine` is this
+        // hand-back's opening snapshot and neither the adjudication block nor the dispatch loop
+        // writes any state this decision reads, so its answer is the same at either end.
+        //
+        // MUTATION: move this call to the tail's `else` branch and
+        // `a_conflict_past_the_adjudication_threshold_still_routes_back` reds (nothing routes).
+        if ledger_primed && !held_origin {
+            self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
+        } else if merge_state == MERGE_STATE_DIRTY {
+            tracing::debug!(
+                pr = %pr, ledger_primed, held_origin,
+                "ticketless review: this pull request is conflicted, but its origin ticket is held \
+                 for a human (or no selection pass has read the board yet); the conflict is a \
+                 human's to resolve"
+            );
+        }
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly
         // would go stale the moment one row is reassigned: the next row would still see the retired
@@ -1713,7 +1767,7 @@ impl Orchestrator {
                 // The gates keep their say either way: a `ship` verdict adjudicates the open
                 // findings, never CI, approval-at-head, a draft, a conflict, or any other merge
                 // gate.
-                self.propose_auto_merge(&mine, pr, head, report);
+                self.propose_auto_merge(&mine, pr, head, merge_state, report);
                 return;
             }
             if self.rounds_used(pr) >= threshold {
@@ -1726,14 +1780,14 @@ impl Orchestrator {
                 // half for a pull request every reviewer approved. Let it fall to the ordinary
                 // auto-merge path below, which re-applies every gate.
                 if crate::automerge::auto_merge_verdict(&mine, head).is_ok() {
-                    self.propose_auto_merge(&mine, pr, head, report);
+                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
                     return;
                 }
                 // Never decide over a round mid-flight: findings could still land, and the author's
                 // own fix may be about to supersede the head this would decide against.
                 if self.review_round_in_flight(&mine) {
                     report.deferred += 1;
-                    self.propose_auto_merge(&mine, pr, head, report);
+                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
                     return;
                 }
                 let rounds = self.rounds_used(pr);
@@ -1757,7 +1811,7 @@ impl Orchestrator {
                 }
                 report.adjudicate.push(plan);
                 report.deferred += 1;
-                self.propose_auto_merge(&mine, pr, head, report);
+                self.propose_auto_merge(&mine, pr, head, merge_state, report);
                 return;
             }
         }
@@ -1987,22 +2041,6 @@ impl Orchestrator {
             }
         }
 
-        // A `rhapsody:human` origin ticket must not have its pull request auto-merged either
-        // (STUDIO-949 round 5). The round gate above refuses to DISPATCH against a held ticket, but
-        // a pull request whose reviewers had already approved the current head when the label landed
-        // would still clear auto-merge here — and the merge then runs `plan_review_done` on the next
-        // tick and moves the ticket to `review.done_state`. Refusing the review round while MERGING
-        // the code and closing the ticket is the daemon finishing work the label says only a person
-        // can do, and the merge is irreversible. Read from the same current-LABEL set as the round
-        // gate (`labelled()`, live runs included), and decided before the plan is formed so nothing
-        // is handed across the seam.
-        //
-        // MUTATION: delete this gate and
-        // `a_held_origin_ticket_holds_back_auto_merge` reds (a plan is proposed).
-        let held_origin = mine.iter().any(|row| {
-            crate::reviewdone::origin_ticket(&row.introduced_by)
-                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
-        });
         // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
         // round 11), so on a daemon held by a bad config, an armed drain or a dead credential — the
         // exact daemon whose dispatch has stopped — `held` is empty for the whole process lifetime
@@ -2026,9 +2064,8 @@ impl Orchestrator {
                 "auto-merge: the origin ticket is held for a human; not merging"
             );
         } else {
-            self.propose_auto_merge(&mine, pr, head, report);
+            self.propose_auto_merge(&mine, pr, head, merge_state, report);
         }
-        self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
     }
 
     /// The `mergeStateStatus` values that are a SETTLED non-conflict — GitHub has finished
@@ -2060,7 +2097,14 @@ impl Orchestrator {
     /// then the tracker move — is performed by [`crate::reviewnotify`]'s off-loop task, through the
     /// same channel and the same plan/perform split a findings verdict uses; this half only decides.
     ///
-    /// Four guards, each of which the ticket names:
+    /// A FIFTH guard lives at the caller and not here: STUDIO-949's human hold. `service_review_pr`
+    /// calls this only once `ledger_primed && !held_origin`, beside the same decision the auto-merge
+    /// gate takes, because a route-back moves tracker state AND reopens the author's run — the class
+    /// of action `rhapsody:human` exists to refuse. It is called from ABOVE the adjudication block
+    /// (STUDIO-956) rather than from the tail, so a pull request past the round threshold still
+    /// routes back: the manager decides the findings, never whether the branch merges.
+    ///
+    /// Four guards here, each of which the ticket names:
     ///
     /// * **Settled only.** GitHub computes mergeability lazily and answers `UNKNOWN` — or, briefly,
     ///   nothing — while it does, so only a positively-recognised [`MERGE_STATE_DIRTY`] acts. An
@@ -2166,10 +2210,30 @@ impl Orchestrator {
         mine: &[&ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
+        merge_state: &str,
         report: &mut ReviewSweepReport,
     ) {
         if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
             return; // opt-in, and off by default (the D5 invariant)
+        }
+        // This tick ALREADY has GitHub's answer (STUDIO-961): the `mergeStateStatus` the watcher
+        // read on the poll it was making anyway says the branch conflicts, and
+        // `perform_auto_merge` will re-read exactly that field through its own seam and decline on
+        // anything but `CLEAN` (`runautomerge.rs`). Handing out a plan here spends two `gh` round
+        // trips to be told what this string already says, and opens a narrow window in which the
+        // merge is attempted while the conflict route-back's comment and tracker move are in
+        // flight. Refused on the SETTLED conflict only — an empty or `UNKNOWN` read decides
+        // nothing here either, and must not hold back a merge GitHub would allow.
+        //
+        // MUTATION: drop this branch and `a_conflicted_pull_request_is_not_offered_for_auto_merge`
+        // reds (a merge plan is proposed beside the route-back).
+        if merge_state == MERGE_STATE_DIRTY {
+            tracing::debug!(
+                pr = %pr, head,
+                "auto-merge: GitHub reports this pull request conflicted, so no merge is asked for; \
+                 the conflict route-back has it"
+            );
+            return;
         }
         match crate::automerge::auto_merge_verdict(mine, head) {
             Ok(approved_by) => {
@@ -4260,6 +4324,170 @@ mod tests {
             !o.conflict_routed.contains_key(&coord(12)),
             "the retired pull request's record must not survive"
         );
+    }
+
+    /// ⚠️ STUDIO-949's hold, on the conflict trigger: a `rhapsody:human` origin ticket whose pull
+    /// request is observed CONFLICTED routes nowhere and summons nobody.
+    ///
+    /// A route-back is not a read. It moves tracker state out of the review state AND reopens the
+    /// author's agent run through the summon token, which is exactly the pair of actions the label
+    /// exists to refuse — a conflict on a human-held ticket is a human's to resolve. Without the
+    /// gate the merged tree answers `routed=1, summons=1` here.
+    ///
+    /// MUTATION: move `propose_conflict_route_back` back outside the `ledger_primed && !held_origin`
+    /// gate in `service_review_pr` and this reds (a ticket is routed and a summons sent).
+    #[test]
+    fn a_held_origin_ticket_routes_no_conflict_back() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        o.human_holds.note_human_label("STUDIO-721"); // the row's origin is `handoff:STUDIO-721`
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "a held ticket must not be moved out of review by the daemon"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and no summons may reopen the author's run on it"
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — and the same
+        // conflict, at the same head, routes back on the next tick. The live control: nothing but
+        // the hold was holding it.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1,
+            "once the hold is gone the conflict routes back"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// ⚠️ The fail-closed half of the same gate (STUDIO-949 round 11): no selection pass has run, so
+    /// the current-label set is an ABSENCE OF INFORMATION rather than "no hold" — on a daemon held
+    /// by a bad config, an armed drain or a dead credential it stays that way for the whole process
+    /// lifetime, while this sweep runs from the watcher's own independent task. An unknown set must
+    /// not route a ticket that may wear the label.
+    ///
+    /// MUTATION: drop the `ledger_primed` half of the gate and this reds (a ticket is routed).
+    #[test]
+    fn an_unprimed_hold_ledger_routes_no_conflict_back() {
+        let (o, _d) = orch_before_first_pass(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        let mut o = o;
+        introduce(&o, row(12, "bob")); // nothing held — the label set is just unknown
+        run_of(&o, "STUDIO-721");
+        let mut rx = o.open_review_notify_channel();
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "with no pass having looked, the hold set is unknown and the route-back must wait"
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Once a pass has run the answer is real, and the same conflict routes back.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1,
+            "a primed ledger routes the conflicted head back"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// ⚠️ A conflict routes back PAST the adjudication threshold too (STUDIO-956 × STUDIO-961).
+    ///
+    /// The manager's `ship`/`escalate` decision settles the FINDINGS question; it says nothing about
+    /// whether the branch merges, and `perform_auto_merge` declines a conflicted head every time.
+    /// STUDIO-956's four `return`s precede the tail of `service_review_pr`, so a route-back placed
+    /// there would never fire again for any pull request that reached the threshold — the
+    /// nine-hour stall STUDIO-961 was filed for, restored for exactly the pull requests that have
+    /// already spent the most review rounds. Mergeability is orthogonal to the verdict, so the
+    /// trigger is decided above the adjudication block.
+    ///
+    /// MUTATION: move `propose_conflict_route_back` to the tail's `else` branch and this reds
+    /// (`routed == 0`), while every other conflict test stays green.
+    #[test]
+    fn a_conflict_past_the_adjudication_threshold_still_routes_back() {
+        let mut teams = ticketless_conflict(&["alice", "bob"], "In Progress");
+        teams.review.adjudicate_after_rounds = 3;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        run_of(&o, "STUDIO-721");
+        let mut rx = o.open_review_notify_channel();
+        // The manager has already decided: the loop is stopped, and every path through
+        // `service_review_pr` now returns before its tail.
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "a settled decision must not be re-asked"
+        );
+        assert_eq!(
+            report.dispatched, 0,
+            "and the round loop stays stopped — this changes nothing about STUDIO-956"
+        );
+        assert_eq!(
+            report.routed, 1,
+            "a shipped pull request that cannot merge still needs its author"
+        );
+        let c = rx.try_recv().expect("the author is summoned");
+        assert_eq!(c.reason, crate::reviewnotify::CompletionReason::Conflict);
+        assert_eq!(c.head_sha, HEAD_A);
+    }
+
+    /// ⚠️ The tick already knows the answer: a pull request every reviewer approved at this head,
+    /// observed CONFLICTED, is NOT handed to the auto-merge gate — `perform_auto_merge` re-reads
+    /// `mergeStateStatus` through its own seam and declines on anything but `CLEAN`, so the plan
+    /// costs two `gh` round trips to be told what the string this tick already read says, and opens
+    /// a window in which the merge is attempted while the route-back's comment and move are in
+    /// flight.
+    ///
+    /// The `CLEAN` half is the live control: the identical fixture, one `mergeStateStatus` apart,
+    /// merges and routes nothing.
+    ///
+    /// MUTATION: drop the `merge_state == MERGE_STATE_DIRTY` branch in `propose_auto_merge` and this
+    /// reds (`merge_plans = 1` beside `routed = 1`, from one sweep).
+    #[test]
+    fn a_conflicted_pull_request_is_not_offered_for_auto_merge() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.review.changes_state = "In Progress".to_string();
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(12, "bob", HEAD_A)); // origin: `handoff:STUDIO-721`
+        run_of(&o, "STUDIO-721");
+        let _rx = o.open_review_notify_channel();
+
+        // Settled and CLEAN: the merge is proposed and nothing routes.
+        let clean = o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "CLEAN")]);
+        assert_eq!(
+            clean.merge.len(),
+            1,
+            "the control: an approved clean head merges"
+        );
+        assert_eq!(clean.routed, 0);
+
+        // Settled and CONFLICTED: no merge is asked for, and the author gets the branch back.
+        let dirty = o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")]);
+        assert!(
+            dirty.merge.is_empty(),
+            "GitHub has already said this cannot merge: {:?}",
+            dirty.merge
+        );
+        assert_eq!(dirty.routed, 1, "and the conflict goes back to its author");
     }
 
     // --- load-aware reviewer selection ------------------------------------------------------

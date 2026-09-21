@@ -1782,6 +1782,18 @@ request as needing a human while the route-back is FRESH; past the sweep's own s
 author who never answers, or a tracker move that never landed — the human signal comes back rather
 than being silenced forever.
 
+It is refused, like every other action, on a ticket held for a human (STUDIO-949). A route-back
+moves tracker state **and** reopens the author's agent run, which is the class of thing the
+`rhapsody:human` label exists to refuse: a conflict on a held ticket is a human's to resolve. The
+gate is the auto-merge gate's, read from the same current-label set and failing CLOSED while no
+selection pass has primed it. It is decided **before** the manager's adjudication (STUDIO-956),
+not after: the adjudication settles the FINDINGS question and says nothing about whether the branch
+merges, so a pull request past `review.adjudicate_after_rounds` whose head conflicts still goes back
+to its author rather than sitting on a `ship` verdict GitHub will decline forever. And a head this
+tick already read as `DIRTY` is not offered to the auto-merge gate at all — the gate's own perform
+re-reads `mergeStateStatus` and declines on anything but `CLEAN`, so proposing it spends two `gh`
+round trips to be told what the tick already knows.
+
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 
 Go v0.4.0 has one base prompt per run and renders whatever `prompt`/`prompt_file` names — on a real
