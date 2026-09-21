@@ -439,6 +439,13 @@ function ReviewerChipView({
 // A running RUN, drawn compactly in the Running lane (STUDIO-955). A ticket whose review is in
 // flight sits in the In Review lane, so the review has no card here; this row is what the lane's
 // count counts. Like a card, it opens its own trace.
+//
+// The row now SAYS the relationship rather than leaving it to be inferred (STUDIO-968). It used to
+// render a bare `{reviewer}{ticket}`, while its accessible name already read "alice's review of
+// STUDIO-957" — the screen reader was told a fact the sighted reader was not, which is the defect
+// with the sign flipped. One phrase feeds both the visible spans and the `aria-label`, so the two
+// cannot drift apart again. A ticketless run still names a pull request as the verb's object rather
+// than leaving the verb hanging.
 function RunningRunView({
   run,
   roster,
@@ -449,13 +456,19 @@ function RunningRunView({
   onOpen: (issue: string) => void;
 }) {
   const open = () => onOpen(run.issue);
-  const label = run.ticket === "" ? `${run.reviewer}'s review run` : `${run.reviewer}'s review of ${run.ticket}`;
+  // A ticketless run's origin never resolved to a ticket, but it is still a review of a pull
+  // request: that, not a possessive glued to the name, is what reads with no object hanging off the
+  // verb — and the verb lives in its own span, so an `'s` would pick up a gap before it.
+  const relationship =
+    run.ticket === ""
+      ? `${run.reviewer} is reviewing a pull request`
+      : `${run.reviewer} is reviewing ${run.ticket}`;
   return (
     <div
       className="brun"
       role="link"
       tabIndex={0}
-      aria-label={`Open ${label}`}
+      aria-label={relationship}
       onClick={open}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -466,6 +479,7 @@ function RunningRunView({
     >
       <TeammateAvatar color={teammateColor(roster, run.reviewer)} size={7} />
       <span className="rwho">{run.reviewer}</span>
+      <span className="rverb">{run.ticket === "" ? " is reviewing a pull request" : " is reviewing "}</span>
       {run.ticket === "" ? null : <span className="rtk">{run.ticket}</span>}
       {run.provider === "" ? null : <span className="provbadge">{run.provider}</span>}
       {run.elapsed === "" ? null : <span className="rel">{run.elapsed}</span>}
