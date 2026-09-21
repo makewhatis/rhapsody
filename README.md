@@ -2317,8 +2317,8 @@ dispatch is per `(PR, reviewer)`: in a mixed roster one reviewer's successful di
 erase a sibling reviewer's still-active hold, and two held reviewers must not overwrite each other.
 The coordinate rides on the record so the reconciliation sweep still finds every hold for a
 divergence. The staleness window is `max(300s, 2 × polling.interval_ms)` for a ticket, and a
-**review** hold takes the wider of that and `CAPACITY_HOLD_TTL`, because a review is refreshed on
-the review watcher's own rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh`
-phases), not on the poll interval — so neither can age out between two refreshes. And the local
-midnight is resolved through the zone's own transition rules rather than `now`'s current offset, so
-a DST transition day no longer folds an extra hour of yesterday's spend into today.
+**review** hold takes the wider of that and `CAPACITY_HOLD_TTL`: a review is refreshed on the review
+watcher's rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` phases), not on the
+poll interval, so the poll bound alone under-covers it. And the local midnight is resolved through
+the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
+longer folds an extra hour of yesterday's spend into today.
