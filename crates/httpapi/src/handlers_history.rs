@@ -398,6 +398,17 @@ pub(crate) async fn handle_history_costs(
 /// the live overlay, this is best-effort: a failed snapshot costs the reclassification, not the
 /// tally.
 ///
+/// THE BUDGET-HOLD RECLASSIFICATION (STUDIO-970). Its sibling for a spent provider budget, with the
+/// same shape and the same join: a ticket the dispatcher REFUSED before it ever started has no
+/// stored row, so the console synthesizes a Queued card for it and the tally reports it once in
+/// `budget_held`, which the client adds to queued. A ticket with a stored row (a prior stopped run)
+/// keeps its bucket, and one the daemon is mid-run on keeps its running bucket — the console's own
+/// exceptions, mirrored. It is a separate key rather than a share of `held_for_human` because the
+/// two holds clear differently: a human hold needs a person, a budget hold clears at local midnight,
+/// and a strip that conflated them would tell an operator a spent budget was their move. REVIEW
+/// budget holds are excluded: they name a pull request coordinate and are surfaced by the
+/// reconciliation sweep, not as tickets.
+///
 /// THE REVIEW-RUN FOLD (STUDIO-965). The tally must count the board's unit — the TICKET — so a
 /// `pr:owner/repo#n@reviewer` review row is attributed to the ticket it reviews (through the same
 /// watch-set join the listing's `review_of` and the cost ledger use) instead of being counted as a
@@ -486,6 +497,11 @@ pub(crate) async fn handle_issue_counts(
     // the snapshot controls which ticket is held; neither alone can answer, so the daemon joins
     // them.
     let mut held: HashSet<String> = HashSet::new();
+    // The current per-provider BUDGET holds that are TICKET holds (STUDIO-970), the same shape the
+    // `held` set above carries for `rhapsody:human`. A REVIEW hold names a pull request coordinate
+    // (`pr` non-empty) and is surfaced by the reconciliation sweep; it is not a console card, so it
+    // is deliberately left out here rather than billed as a Queued ticket.
+    let mut budget_held: HashSet<String> = HashSet::new();
     if let Ok(Ok(snap)) = snap {
         for r in &snap.running {
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
@@ -496,6 +512,11 @@ pub(crate) async fn handle_issue_counts(
         for h in &snap.held_for_human {
             if !h.issue_identifier.is_empty() {
                 held.insert(h.issue_identifier.clone());
+            }
+        }
+        for h in &snap.budget_held {
+            if h.pr.is_empty() && !h.subject.is_empty() {
+                budget_held.insert(h.subject.clone());
             }
         }
     }
@@ -528,6 +549,12 @@ pub(crate) async fn handle_issue_counts(
     // `held_for_human` below — a Queued card the header could not see (STUDIO-965 B2). Same class as
     // the live no-row ticket above: a card source `card_idents` did not know about.
     for identifier in &held {
+        card_idents.insert(identifier.as_str());
+    }
+    // A budget-held ticket with no stored row has a card too (STUDIO-970), for the identical reason:
+    // the console synthesizes a Queued card for it and folds its reviews onto it as chips, so its
+    // identifier must be known here or its review becomes an orphan and the hold is dropped.
+    for identifier in &budget_held {
         card_idents.insert(identifier.as_str());
     }
 
@@ -636,9 +663,21 @@ pub(crate) async fn handle_issue_counts(
         .iter()
         .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
         .count() as i64;
+    // Every budget-held TICKET that is not live AND has no stored row — the never-ran hold the
+    // console synthesizes a Queued card for (STUDIO-970). A budget hold that has run keeps its
+    // stored row's bucket, so the join is by identity rather than assumed absent. A hold beside a
+    // live run is not billed again either, but the `!live` guard is DEFENSIVE rather than
+    // load-bearing: the live-work loop above already inserted every non-empty live identifier into
+    // `counted`, so `!counted` alone would exclude it. It is kept only to read like the human hold's
+    // filter beside it (the dispatcher releases the hold before dispatch — `release_budget_hold` on
+    // the dispatch path — and the console keeps a running row live rather than queued).
+    let budget_held = budget_held
+        .iter()
+        .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
+        .count() as i64;
     write_json(
         StatusCode::OK,
-        &issue_counts_response(&buckets, held_for_human),
+        &issue_counts_response(&buckets, held_for_human, budget_held),
     )
 }
 
@@ -2879,6 +2918,175 @@ mod tests {
         assert!(
             body.get("held_for_human").is_none(),
             "no second queued for a ticket the daemon is running: {body}",
+        );
+    }
+
+    /// One ticket budget hold, with only the fields the tally reads spelled out.
+    fn budget_hold(subject: &str, pr: &str) -> rhapsody_orchestrator::budget::BudgetHeld {
+        rhapsody_orchestrator::budget::BudgetHeld {
+            subject: subject.into(),
+            title: "meter spend per provider".into(),
+            project: "rhapsody".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200_000_000,
+            spent_tokens: 361_000_000,
+            pr: pr.into(),
+        }
+    }
+
+    // STUDIO-970 — a ticket the dispatcher REFUSED for a spent provider budget has never run, so it
+    // has no stored row and the console synthesizes a Queued card for it. The daemon reports it once
+    // in `budget_held`, which the client adds to queued, and NOT in `held_for_human`: the hold clears
+    // at local midnight, not by a person, and telling an operator otherwise sends them looking for
+    // work that does not exist. MUTATION: fold the budget hold into `held_for_human` and the key
+    // assertion reds.
+    #[tokio::test]
+    async fn issue_counts_reclassify_a_never_run_budget_hold_as_queued() {
+        let store = mem_store();
+        seed_run_for("iss_other", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_other".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["budget_held"], 1,
+            "the never-ran budget hold is reported once, by the count the client adds to queued: {body}",
+        );
+        assert!(
+            body.get("held_for_human").is_none(),
+            "a budget hold is not a human hold: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/done".to_string(), 1)]),
+            "only the stored row is in the buckets: {body}",
+        );
+    }
+
+    // STUDIO-970 — a budget hold on a ticket that HAS run keeps its stored row's bucket, exactly as
+    // a human hold does: the console's card stays in the run's lane wearing the budget as a
+    // sub-label, so the strip must not add a second queued for it. MUTATION: reclassify every hold
+    // rather than only the never-ran one and this reds with `budget_held` present beside the bucket.
+    #[tokio::test]
+    async fn issue_counts_keep_a_non_live_budget_hold_that_has_run_in_its_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-970", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_held".to_string(),
+                    IssueLifecycleRow {
+                        state: "In Review".into(),
+                        lifecycle: IssueLifecycle::InReview,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/in_review".to_string(), 1)]),
+            "a budget hold that has run keeps its bucket: {body}",
+        );
+        assert!(
+            body.get("budget_held").is_none(),
+            "and is NOT billed a second time in queued: {body}",
+        );
+    }
+
+    // STUDIO-970 — a budget hold beside a LIVE run must not be billed a second time: the dispatcher
+    // releases the hold before it dispatches, so the console keeps the ticket as a live Running row
+    // and the ticket's own running session already fills its bucket. The sibling of the live human
+    // hold above, and the budget half of "the daemon does not hold what it is running". MUTATION:
+    // drop the budget filter entirely (or its `!counted` term) and this reds with `budget_held` = 1
+    // beside the running bucket. The `!live` term alone is redundant — the live-work loop above
+    // already counted this ticket — so no test can isolate it; the comment on the filter says so.
+    #[tokio::test]
+    async fn issue_counts_keep_a_live_budget_hold_in_its_running_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-970", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-970"));
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+            "the live ticket fills its running bucket: {body}",
+        );
+        assert!(
+            body.get("budget_held").is_none(),
+            "no second queued hold for a ticket the daemon is running: {body}",
+        );
+    }
+
+    // STUDIO-970 — a REVIEW budget hold names a pull request coordinate and is surfaced by the
+    // reconciliation sweep. It is not a console card, so the tally must not bill it as a Queued
+    // ticket. MUTATION: drop the `h.pr.is_empty()` filter and this reds with `budget_held` = 1.
+    #[tokio::test]
+    async fn issue_counts_ignore_a_review_budget_hold() {
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold(
+            "pr:makewhatis/rhapsody#199@alice",
+            "makewhatis/rhapsody#199",
+        ));
+        let base = spawn(FakeProvider::ok(snap)).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.get("budget_held").is_none(),
+            "a review hold is the sweep's surface, not a ticket card: {body}",
+        );
+        assert_eq!(tally(&body), std::collections::HashMap::new(), "{body}");
+    }
+
+    // STUDIO-965 B2's shape, for the budget hold: a never-ran budget-held ticket is a Queued card the
+    // console synthesizes, so its reviews must fold onto that card and not become an orphan bucket.
+    // MUTATION: drop the budget identifiers from `card_idents` and this reds with a
+    // `completed/-/review_run` bucket beside the budget card the board actually draws.
+    #[tokio::test]
+    async fn issue_counts_a_budget_held_never_run_ticket_absorbs_its_review() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#150@alice";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 150, "alice", "adopt:STUDIO-970");
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["budget_held"], 1,
+            "the budget card is counted where the board draws it: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::new(),
+            "the review folds onto the budget card and adds no bucket: {body}",
         );
     }
 
