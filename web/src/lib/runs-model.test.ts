@@ -593,6 +593,61 @@ describe("mergeJobs", () => {
   });
 });
 
+describe("a per-provider budget hold (STUDIO-970)", () => {
+  const hold = (over: Partial<NonNullable<StateResponse["budget_held"]>[number]> = {}) => ({
+    subject: "STUDIO-970",
+    title: "meter spend per provider",
+    project: "rhapsody",
+    provider: "anthropic",
+    daily_tokens: 200_000_000,
+    spent_tokens: 361_000_000,
+    pr: "",
+    ...over,
+  });
+
+  it("turns a refused ticket into a waiting row that names the provider", () => {
+    // A budget-refused ticket has never run, so nothing else contributes a row for it. It is a
+    // deliberate hold that clears at local midnight — NOT a human hold — so its sub-label must name
+    // the provider and must not read as "held for a human".
+    const rows = mergeJobs(state({ budget_held: [hold()] }), [], PROJECTS, NOW);
+    expect(rows).toHaveLength(1);
+    const b = rows[0];
+    expect(b.issue).toBe("STUDIO-970");
+    expect(b.status).toBe("waiting");
+    expect(b.runId).toBe(0); // never ran → not clickable
+    expect(b.subLabel).toBe("anthropic daily budget spent");
+    expect(b.budgetHeld).toBe("anthropic");
+    expect(b.heldForHuman).toBe(false);
+  });
+
+  it("keeps a current budget hold on a ticket that HAS run, with the hold as its sub-label", () => {
+    // A prior stopped run leaves a stored row; the dispatcher then refuses the re-dispatch. The real
+    // run decides the lane and stays the click target, but the budget hold must not be erased.
+    const history = [summary({ id: 88, issue_identifier: "STUDIO-970", outcome: "stopped" })];
+    const rows = mergeJobs(state({ budget_held: [hold()] }), history, PROJECTS, NOW);
+    expect(rows).toHaveLength(1);
+    const b = rows[0];
+    expect(b.status).toBe("stopped"); // the real run still decides the lane
+    expect(b.runId).toBe(88); // clickable — opens the real run
+    expect(b.subLabel).toBe("anthropic daily budget spent");
+    expect(b.budgetHeld).toBe("anthropic");
+  });
+
+  it("does not synthesize a row for a REVIEW budget hold", () => {
+    // A review hold names a pull request coordinate; the reconciliation sweep surfaces it, and the
+    // board must not draw it as a ticket.
+    const rows = mergeJobs(
+      state({
+        budget_held: [hold({ subject: "pr:makewhatis/rhapsody#199@alice", pr: "makewhatis/rhapsody#199", title: "" })],
+      }),
+      [],
+      PROJECTS,
+      NOW,
+    );
+    expect(rows).toHaveLength(0);
+  });
+});
+
 describe("jobStatus", () => {
   const seg = (outcome: string, opts: { live?: boolean; queued?: boolean } = {}) => ({
     outcome,

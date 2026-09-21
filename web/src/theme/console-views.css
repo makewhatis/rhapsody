@@ -167,6 +167,10 @@
    blocker amber so "waiting on X" and "only a person can do this" never read alike. The fill is
    overridden too, or `.dchip`'s amber wash would survive under the blue text. */
 .rh-console .dchip.hchip { background: rgba(127, 167, 230, .1); border-color: #2b3b52; color: var(--info); }
+/* A spent provider budget (STUDIO-970): also a deliberate hold, but a clock's, not a person's — so
+   its own teal rather than the human hold's blue, and the fill is overridden for the same reason
+   `.hchip`'s is. Never the blocker amber: nothing is blocking, the daemon is waiting on midnight. */
+.rh-console .dchip.bchip { background: rgba(87, 195, 204, .1); border-color: #24444a; color: var(--operator); }
 .rh-console .bpr { display: flex; }
 .rh-console .bpr .tk.pr { cursor: pointer; }
 .rh-console .bpr .tk.pr:hover { border-color: var(--ok); }

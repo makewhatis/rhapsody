@@ -24,7 +24,7 @@
 // THE LANE SET IS FIXED. Lanes are never built from the cards present: the board is quietest exactly
 // when the pipeline is idle or starved, and an absent lane would hide the very condition the console
 // most needs to shout about. All four always exist, empty ones included.
-import type { BlockedEntry, HeldForHuman } from "@/lib/api";
+import type { BlockedEntry, BudgetHeld, HeldForHuman } from "@/lib/api";
 import { runOutcomeLabel } from "@/lib/console-job-detail";
 import type { ConsoleJobRow, ConsoleJobStatus } from "@/lib/console-jobs";
 
@@ -129,6 +129,16 @@ export interface BoardCard {
    * it is console/legal/physical work, so the board must read it as held, not as mysteriously idle.
    */
   heldForHuman: boolean;
+  /**
+   * The provider whose spent daily token budget is holding this ticket (`state.budget_held`,
+   * STUDIO-957/970), or undefined. A DIFFERENT hold from `heldForHuman` — this one clears at local
+   * midnight and needs nobody — so the card carries it as its own fact and names the provider, which
+   * is the only actionable part of a budget refusal.
+   *
+   * Review holds (a non-empty `pr` on the wire row) never reach a card: the reconciliation sweep
+   * surfaces those, and a ticket card for one would be work that does not exist.
+   */
+  budgetHeld?: string;
 }
 
 /** The four lanes, left to right — the order a ticket travels them. */
@@ -357,15 +367,25 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
  * the live snapshot's held-dependent set, which is the only dependency edge the state payload
  * carries. `heldForHuman` is the live snapshot's `rhapsody:human` hold set (STUDIO-949): it both
  * flags a card the rows already carry and synthesizes a Queued card for a hold that has never run.
+ * `budgetHeld` is the live snapshot's `budget_held` set (STUDIO-957/970) and does the same for a
+ * spent provider budget — its TICKET rows only, since a review hold names a coordinate and is the
+ * reconciliation sweep's surface.
  */
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
   blocked: readonly BlockedEntry[] = [],
   heldForHuman: readonly HeldForHuman[] = [],
+  budgetHeld: readonly BudgetHeld[] = [],
 ): BoardLane[] {
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
   const held = new Set(heldForHuman.map((h) => h.issue_identifier));
+  // The provider per budget-held ticket, from the TICKET half of the snapshot's set. A review hold
+  // carries a pull request coordinate and is skipped: the sweep reports it, the board does not.
+  const budgetByIssue = new Map<string, string>();
+  for (const b of budgetHeld) {
+    if (b.pr === "" && b.subject !== "") budgetByIssue.set(b.subject, b.provider);
+  }
   // The hold entry carries only the project SLUG (the daemon's `HeldForHuman`), while a card's
   // `project` is the display NAME. Recover the name from any row of the same project so a
   // synthesized card's chip matches every other card; fall back to the slug when the project has no
@@ -396,6 +416,7 @@ export function buildConsoleBoard(
       reviewers: [],
       dependencies: [],
       heldForHuman: held.has(row.issue),
+      budgetHeld: budgetByIssue.get(row.issue),
     };
     cards.push(card);
     byIssue.set(row.issue, card);
@@ -468,6 +489,34 @@ export function buildConsoleBoard(
     };
     cards.push(card);
     byIssue.set(h.issue_identifier, card);
+  }
+
+  // The budget hold's synthesized card, for the same belt-and-braces reason as the human hold's
+  // above (unreachable through `JobsView`, whose `mergeJobs` already synthesizes the row). It is a
+  // deliberate wait that clears on a clock, so it too waits in Queued; the provider is what the
+  // chip names.
+  for (const b of budgetHeld) {
+    if (b.pr !== "" || b.subject === "" || byIssue.has(b.subject)) continue;
+    const card: BoardCard = {
+      key: `budget-${b.subject}`,
+      issue: b.subject,
+      title: b.title,
+      project: nameBySlug.get(b.project) ?? b.project,
+      projectSlug: b.project,
+      status: "queued",
+      statusLabel: "queued",
+      trackerState: "",
+      assignee: "",
+      provider: "",
+      live: false,
+      pr: undefined,
+      reviewers: [],
+      dependencies: [],
+      heldForHuman: false,
+      budgetHeld: b.provider,
+    };
+    cards.push(card);
+    byIssue.set(b.subject, card);
   }
 
   const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));

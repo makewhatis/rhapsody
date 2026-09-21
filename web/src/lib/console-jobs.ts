@@ -213,6 +213,14 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * reaches a truer word, and a `failed`/`waiting` outcome still keeps `blocked`: that is the RUN's
  * fact and a human has to act on it wherever the ticket is parked. A live run still outranks
  * everything — the earlier arms have already returned.
+ *
+ * The seventh rule is `budgetHeldNeverRan` (STUDIO-957/970), the fifth rule's sibling for a ticket
+ * the dispatcher refused because a provider's daily token budget is spent. It reads `queued` for
+ * exactly the reason the human hold does — the refusal, not the run that never happened, is the
+ * whole fact, and it is a deliberate wait rather than a fault — but it is a SEPARATE fact from
+ * `heldForHuman`: a budget hold clears at local midnight on its own and needs nobody, so the console
+ * must not tell an operator a person is required. It is scoped to a hold with nothing ran on the
+ * same terms, so a budget hold that outlives a prior run keeps that run's lane.
  */
 export function consoleJobStatus(
   status: string,
@@ -221,11 +229,12 @@ export function consoleJobStatus(
   reviewRun = false,
   heldNeverRan = false,
   parked = false,
+  budgetHeldNeverRan = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
   // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
   // hold on a ticket that never ran speaks for the lane itself. See the doc above.
-  if (heldNeverRan) return "queued";
+  if (heldNeverRan || budgetHeldNeverRan) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
   // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
@@ -419,6 +428,12 @@ export interface ConsoleJobRow {
   updatedAtMs: number;
   /** Held/failed detail, e.g. "waiting on STUDIO-1 · In Progress". */
   subLabel?: string;
+  /**
+   * The provider whose spent daily token budget holds this ticket (STUDIO-957/970), or undefined
+   * when it is not budget-held. Distinct from the `subLabel`'s human-hold wording on purpose: the
+   * two holds clear differently, and the card must not say a person is needed for a clock.
+   */
+  budgetHeld?: string;
   /**
    * What this row's own RUN did, when the status beside it is the TICKET's and the two are
    * different facts — "run done" on a ticket parked in review (STUDIO-780). See [`statusNote`].
@@ -780,6 +795,10 @@ export function buildConsoleJobs(
     // 0 is the honest "nothing ran" — never "the daemon could not resolve a lifecycle", which a cold
     // cache serves for most rows. See `consoleJobStatus`.
     const heldNeverRan = (job.heldForHuman ?? false) && job.runId === 0;
+    // The same "speaks for the lane only when nothing ran" scope for a budget hold (STUDIO-970): a
+    // ticket the dispatcher refused has usually never run, but one with a prior stopped run keeps
+    // that run's lane and wears the budget as its sub-label.
+    const budgetHeldNeverRan = (job.budgetHeld ?? "") !== "" && job.runId === 0;
     // Dispatchable vs parked (STUDIO-966), resolved against THIS row's project — `projects[].*`
     // overlays differ, so a state parked in one project can be live work in another.
     const parked =
@@ -792,6 +811,7 @@ export function buildConsoleJobs(
       reviewRun,
       heldNeverRan,
       parked,
+      budgetHeldNeverRan,
     );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
@@ -825,6 +845,7 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
+      budgetHeld: job.budgetHeld,
       // Not when the row already has a `subLabel`: that is the held/failed detail, and on a failed
       // row it IS the error, which says more than "run failed" does. See [`statusNote`].
       statusNote:
@@ -1047,6 +1068,13 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  * and is not in it either, matching the console's own exceptions. Reading
  * `state.held_for_human.length` here instead would reopen the double-count, and treating every hold
  * as queued would move a hold that has run out of its lane.
+ *
+ * `budget_held` (STUDIO-970) is its sibling for the per-provider budget refusal, and is added to
+ * `queued` for exactly the same reasons with one difference worth stating: it is a hold that clears
+ * at local midnight and needs nobody, so it must NOT reach `needsYou`. Adding a bare COUNT keeps
+ * that true by construction — the count carries no row to score through [`needsOperator`] — which is
+ * also why the daemon's join is unavoidable here. A review budget hold is excluded by the daemon
+ * (it names a pull request coordinate, not a ticket) before the count is served.
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
@@ -1076,8 +1104,9 @@ export function consoleStoreCounts(
     }),
   );
   const heldForHuman = payload.held_for_human ?? 0;
-  if (heldForHuman === 0) return counts;
-  return { ...counts, queued: counts.queued + heldForHuman };
+  const budgetHeld = payload.budget_held ?? 0;
+  if (heldForHuman === 0 && budgetHeld === 0) return counts;
+  return { ...counts, queued: counts.queued + heldForHuman + budgetHeld };
 }
 
 /** One teammate's live state in the Now strip (§3). */
