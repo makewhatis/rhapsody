@@ -266,6 +266,67 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(card?.projectSlug).toBe("booch");
   });
 
+  // STUDIO-970 — the per-provider budget hold rides the same board shapes as the human hold, but it
+  // is a DIFFERENT fact: it names the provider and clears at local midnight. A card must not conflate
+  // the two, and a review hold (a coordinate, not a ticket) must not become a card at all.
+  //
+  // The provider comes off the ROW (`ConsoleJobRow.budgetHeld`, filled by `mergeJobs`), which is the
+  // production channel; the snapshot set below is the belt-and-braces synthesis path only.
+  it("attaches the provider for a budget-held ticket, distinct from a human hold (STUDIO-970)", () => {
+    const board = buildConsoleBoard(
+      [
+        row({
+          issue: "STUDIO-970",
+          trackerState: "Todo",
+          status: "queued",
+          statusLabel: "queued",
+          budgetHeld: "anthropic",
+        }),
+        row({ issue: "STUDIO-939", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+      ],
+      [],
+      [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+      [
+        {
+          subject: "pr:makewhatis/rhapsody#199@alice",
+          title: "",
+          project: "rhapsody",
+          provider: "anthropic",
+          daily_tokens: 200_000_000,
+          spent_tokens: 361_000_000,
+          pr: "makewhatis/rhapsody#199",
+        },
+      ],
+    );
+    const byIssue = new Map(cards(board).map((c) => [c.issue, c]));
+    expect(byIssue.get("STUDIO-970")?.budgetHeld).toBe("anthropic");
+    // The two holds are not each other: the budget card is not a human hold...
+    expect(byIssue.get("STUDIO-970")?.heldForHuman).toBe(false);
+    // ...and the human hold is not a budget hold.
+    expect(byIssue.get("STUDIO-939")?.heldForHuman).toBe(true);
+    expect(byIssue.get("STUDIO-939")?.budgetHeld).toBeUndefined();
+    // A review hold is a pull request coordinate, not a ticket card.
+    expect(byIssue.has("pr:makewhatis/rhapsody#199@alice")).toBe(false);
+  });
+
+  it("synthesizes a Queued card for a budget-held ticket with no row at all (STUDIO-970)", () => {
+    const board = buildConsoleBoard([], [], [], [
+      {
+        subject: "STUDIO-970",
+        title: "meter spend per provider",
+        project: "rhapsody",
+        provider: "anthropic",
+        daily_tokens: 200_000_000,
+        spent_tokens: 361_000_000,
+        pr: "",
+      },
+    ]);
+    const card = cards(board).find((c) => c.issue === "STUDIO-970");
+    expect(card?.budgetHeld).toBe("anthropic");
+    expect(card?.heldForHuman).toBe(false);
+    expect(board.find((l) => l.id === "queued")?.cards.map((c) => c.issue)).toContain("STUDIO-970");
+  });
+
   it("carries assignee and provider onto the card", () => {
     const board = buildConsoleBoard([
       row({

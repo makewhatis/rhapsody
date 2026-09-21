@@ -245,6 +245,7 @@ export function JobsView({
           rows={rows}
           blocked={state.data?.blocked ?? []}
           heldForHuman={state.data?.held_for_human ?? []}
+          budgetHeld={state.data?.budget_held ?? []}
           project={project}
           counts={counts}
           maxConcurrent={maxConcurrent}

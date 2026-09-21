@@ -95,6 +95,7 @@ function mount(
       rows={rows}
       blocked={[]}
       heldForHuman={[]}
+      budgetHeld={[]}
       project=""
       counts={counts}
       maxConcurrent={maxConcurrent}
@@ -181,6 +182,74 @@ describe("the board (STUDIO-925)", () => {
     expect(card).not.toBeNull();
     expect(card?.querySelector(".hchip")?.textContent).toBe("held for a human");
     expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-939");
+  });
+
+  // STUDIO-970 — a ticket the dispatcher refused for a spent provider budget is a deliberate hold
+  // too, but a DIFFERENT one: it clears at local midnight and needs nobody. The card must name the
+  // provider (the actionable half of a budget refusal) and must NOT wear the human-hold chip.
+  //
+  // The production path reaches the card through the ROW (`mergeJobs` fills `budgetHeld`), so this
+  // pins the row channel; the snapshot-set channel is the never-ran synthesis test below.
+  it("names the provider on a budget-held ticket, distinctly from a human hold (STUDIO-970)", () => {
+    mount(
+      [
+        row({
+          issue: "STUDIO-970",
+          trackerState: "Todo",
+          status: "queued",
+          statusLabel: "queued",
+          budgetHeld: "anthropic",
+        }),
+      ],
+      vi.fn(),
+      COUNTS,
+      4,
+      { budgetHeld: [] },
+    );
+    const chip = document.querySelector(".bcard .bchip");
+    expect(chip?.textContent).toBe("anthropic budget spent");
+    // Nobody is needed: this is not the human hold.
+    expect(document.querySelector(".bcard .hchip")).toBeNull();
+    // It waits in Queued, as a deliberate hold with no run does.
+    expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-970");
+  });
+
+  it("draws a card for a budget-held ticket that has NEVER RAN (STUDIO-970)", () => {
+    mount([], vi.fn(), COUNTS, 4, {
+      budgetHeld: [
+        {
+          subject: "STUDIO-970",
+          title: "meter spend",
+          project: "rhapsody",
+          provider: "anthropic",
+          daily_tokens: 200_000_000,
+          spent_tokens: 361_000_000,
+          pr: "",
+        },
+      ],
+    });
+    const card = document.querySelector('.bcard[aria-label="STUDIO-970 meter spend"]');
+    expect(card?.querySelector(".bchip")?.textContent).toBe("anthropic budget spent");
+    expect(card?.querySelector(".hchip")).toBeNull();
+  });
+
+  // STUDIO-970 — a REVIEW budget hold names a pull request coordinate and is the reconciliation
+  // sweep's surface. The board must not invent a ticket card for it.
+  it("draws no card for a review budget hold (STUDIO-970)", () => {
+    mount([], vi.fn(), COUNTS, 4, {
+      budgetHeld: [
+        {
+          subject: "pr:makewhatis/rhapsody#199@alice",
+          title: "",
+          project: "rhapsody",
+          provider: "anthropic",
+          daily_tokens: 200_000_000,
+          spent_tokens: 361_000_000,
+          pr: "makewhatis/rhapsody#199",
+        },
+      ],
+    });
+    expect(document.querySelectorAll(".bcard")).toHaveLength(0);
   });
 
   it("never renders a review row as its own card, even with a null tracker_state", () => {

@@ -176,6 +176,13 @@ pub fn render(s: &Snapshot) -> Value {
                             "provider": h.provider,
                             "daily_tokens": h.daily_tokens,
                             "spent_tokens": h.spent_tokens,
+                            // STUDIO-970: the pull request coordinate, empty for a TICKET hold. The
+                            // console board draws cards for the ticket half only and must tell the
+                            // two apart: a review hold is surfaced by the reconciliation sweep and
+                            // naming it as a ticket card would invent work that does not exist. The
+                            // struct already carries this discriminator, so it travels rather than
+                            // being re-derived from the subject's `pr:` convention.
+                            "pr": h.pr,
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -603,6 +610,38 @@ mod tests {
         assert_eq!(rows[0]["provider"], "anthropic");
         assert_eq!(rows[0]["daily_tokens"], 200_000_000);
         assert_eq!(rows[0]["spent_tokens"], 361_000_000);
+        // STUDIO-970: a ticket hold carries no pull request coordinate, which is how the console
+        // board tells it from a review hold and draws a card for it.
+        assert_eq!(rows[0]["pr"], "");
+    }
+
+    // STUDIO-970, the other half: a REVIEW hold's coordinate reaches the wire, so the console can
+    // exclude it from the ticket cards the board draws. Mutation: drop `pr` from the row and this
+    // reds with `null` for every hold — including the ticket half the board must still card.
+    #[test]
+    fn a_review_budget_hold_carries_its_coordinate_on_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.note_review_budget_hold(
+            "pr:makewhatis/rhapsody#199@alice",
+            "makewhatis/rhapsody#199",
+            "rhapsody",
+            "anthropic",
+            200_000_000,
+            361_000_000,
+        );
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["budget_held"]
+            .as_array()
+            .expect("budget_held is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["subject"], "pr:makewhatis/rhapsody#199@alice");
+        assert_eq!(
+            rows[0]["pr"], "makewhatis/rhapsody#199",
+            "a review hold names the pull request the sweep will report it against"
+        );
     }
 
     // And the other half: while a drain IS armed the key appears, carrying the two annotations an

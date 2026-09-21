@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import type { BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import type { BoardCardFields } from "@/hooks/useBoardCardFields";
 import { teammateColor } from "@/theme/teammates";
-import type { BlockedEntry, HeldForHuman } from "@/lib/api";
+import type { BlockedEntry, BudgetHeld, HeldForHuman } from "@/lib/api";
 import {
   boardLaneTally,
   buildConsoleBoard,
@@ -63,6 +63,9 @@ export interface BoardViewProps {
   blocked: readonly BlockedEntry[];
   /** The live snapshot's `rhapsody:human` holds (STUDIO-949) — cards that no agent will ever run. */
   heldForHuman: readonly HeldForHuman[];
+  /** The live snapshot's per-provider budget holds (STUDIO-957/970) — cards the dispatcher refused
+   *  until local midnight. Its ticket half only; a review hold is the reconciliation sweep's. */
+  budgetHeld: readonly BudgetHeld[];
   /** The project Select's value ("" = all projects). */
   project: string;
   /** The daemon's whole-store tally, so the footer agrees with the Now strip above it. */
@@ -89,6 +92,7 @@ export function BoardView({
   rows,
   blocked,
   heldForHuman,
+  budgetHeld,
   project,
   counts,
   maxConcurrent,
@@ -108,8 +112,8 @@ export function BoardView({
   // surviving card of its chips, which is the one thing the board exists to show. Status is NOT
   // applied: the lanes are that axis (STUDIO-932).
   const lanes = useMemo(
-    () => buildConsoleBoard(rows, blocked, heldForHuman),
-    [rows, blocked, heldForHuman],
+    () => buildConsoleBoard(rows, blocked, heldForHuman, budgetHeld),
+    [rows, blocked, heldForHuman, budgetHeld],
   );
   // The Running lane's contents are RUNS, not only tickets (STUDIO-955): a live review's ticket is
   // parked in In Review, so the review has no card and the lane would otherwise read `5 / 6` beside
@@ -369,6 +373,19 @@ function BoardCardView({
           </span>
         </div>
       ) : null}
+      {card.budgetHeld === undefined ? null : (
+        // A spent provider budget (STUDIO-957/970). Deliberately NOT the human-hold chip: nobody is
+        // needed, the hold clears at local midnight, and the provider is what makes it actionable.
+        // Its own teal (.bchip) keeps the two deliberate holds from reading alike at a glance.
+        <div className="bchips" aria-label="Held by a provider budget">
+          <span
+            className="dchip bchip"
+            title={`${card.budgetHeld} daily token budget is spent — the dispatcher resumes at local midnight`}
+          >
+            {card.budgetHeld} budget spent
+          </span>
+        </div>
+      )}
       {!fields.pullRequest || card.pr === undefined ? null : (
         // The anchor is wrapped rather than given its own `onClick`: `ExternalLink` deliberately
         // does not accept one (so its open-seam cannot be replaced), and the card underneath must not

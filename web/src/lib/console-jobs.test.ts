@@ -1596,6 +1596,32 @@ describe("consoleStoreCounts", () => {
       consoleStoreCounts(counts([{ outcome: "completed", lifecycle: "done", count: 1 }]))?.queued,
     ).toBe(0);
   });
+
+  // STUDIO-970 — the per-provider budget refusal is the same never-ran shape as the human hold: the
+  // daemon reports it once in `budget_held` and the strip adds it to queued. It is a SEPARATE count
+  // because it must stay OUT of "needs you": a spent budget clears at local midnight on its own, and
+  // telling an operator they are required sends them looking for work that does not exist.
+  //
+  // MUTATION: count it as needing a human and the `needsYou` assertion reds.
+  it("adds the daemon's budget-held count to queued, but never to needs you (STUDIO-970)", () => {
+    const payload: IssueCountsResponse = {
+      issues: 1,
+      buckets: [{ outcome: "completed", lifecycle: "done", count: 1 }],
+      budget_held: 2,
+    };
+    const withHolds = consoleStoreCounts(payload);
+    expect(withHolds?.queued).toBe(2);
+    expect(withHolds?.review).toBe(0);
+    expect(withHolds?.blocked).toBe(0);
+    // The hold clears on a clock, not by a person.
+    expect(withHolds?.needsYou).toBe(0);
+    // Absent (a daemon with no configured budget) is the pre-STUDIO-970 payload: no queued invention.
+    const withoutBudget = consoleStoreCounts(
+      counts([{ outcome: "completed", lifecycle: "done", count: 1 }]),
+    );
+    expect(withoutBudget?.queued).toBe(0);
+    expect(withoutBudget?.needsYou).toBe(0);
+  });
 });
 
 // The chain `JobsView` actually runs: `mergeJobs` → `buildConsoleJobs`. Both board-side tests fed
@@ -1693,5 +1719,74 @@ describe("a held-for-human ticket through the production chain (STUDIO-949)", ()
     expect(jobs[0].status).toBe("blocked"); // the failed RUN's word, not the hold's
     expect(jobs[0].subLabel).toBe("held for a human"); // the hold is still visible
     expect(jobs[0].runId).toBe(88); // and it is a real run, not a synthetic hold row
+  });
+});
+
+// STUDIO-970 — the sibling of the held-for-human chain, for a spent provider budget. The two holds
+// are deliberately different: this one clears at local midnight, needs nobody, and names the
+// provider, so the pill and the strip must both read it as a Queued wait rather than as "needs you".
+describe("a budget-held ticket through the production chain (STUDIO-970)", () => {
+  const budgetState = (): StateResponse => ({
+    status: "ok",
+    poll_interval_ms: 2000,
+    running: [],
+    retrying: [],
+    codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+    rate_limits: [],
+    blocked: [],
+    budget_held: [
+      {
+        subject: "STUDIO-970",
+        title: "meter spend per provider",
+        project: "rhapsody",
+        provider: "anthropic",
+        daily_tokens: 200_000_000,
+        spent_tokens: 361_000_000,
+        pr: "",
+      },
+    ],
+  });
+
+  it("paints the pill 'queued' and names the provider, without asking for a human", () => {
+    const rows = buildConsoleJobs(mergeJobs(budgetState(), [], [], NOW), [], undefined, NOW, []);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue).toBe("STUDIO-970");
+    expect(rows[0].status).toBe("queued");
+    expect(rows[0].statusLabel).toBe("queued");
+    expect(rows[0].subLabel).toBe("anthropic daily budget spent");
+    expect(rows[0].budgetHeld).toBe("anthropic");
+    // Distinct from a human hold: the row says the provider's budget is spent, never that a person
+    // is needed (the human-hold sub-label is "held for a human").
+    expect(rows[0].subLabel).not.toBe("held for a human");
+    // ...and it is not billed as needing the operator.
+    expect(rows[0].needsYou).toBe(false);
+  });
+
+  // STUDIO-970, the mutation the ticket names: rendering it with the human hold's sub-label
+  // ("held for a human") must red. A budget hold that HAS run keeps its run's lane and wears the
+  // budget sub-label, never the human hold's — that word would tell an operator a person is needed.
+  it("keeps a budget hold that HAS run in its lane, and never as a human hold", () => {
+    const stored = [
+      issueRow({
+        id: 88,
+        issue_identifier: "STUDIO-970",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ];
+    const jobs = buildConsoleJobs(
+      mergeJobs(budgetState(), stored, [], NOW),
+      stored,
+      undefined,
+      NOW,
+      [],
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].status).toBe("review"); // the real run decides the lane
+    expect(jobs[0].subLabel).toBe("anthropic daily budget spent");
+    expect(jobs[0].budgetHeld).toBe("anthropic");
+    // Still not the human hold's word, even beside a real run.
+    expect(jobs[0].subLabel).not.toBe("held for a human");
   });
 });
