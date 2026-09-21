@@ -149,7 +149,10 @@ const LANES: readonly Omit<BoardLane, "cards">[] = [
   {
     id: "queued",
     name: "Queued",
-    caption: "waiting for an agent, or held by a blocker",
+    // `parked` rides in this lane (STUDIO-966) — it is not running, not review and not done. The
+    // caption names it because it no longer means "an agent is coming": a parked ticket is one a
+    // person has to move, and a lane that promised an agent for it was the lie this ticket is about.
+    caption: "waiting for an agent, held by a blocker, or parked for a person",
     empty: "Nothing is waiting for an agent.",
   },
   {

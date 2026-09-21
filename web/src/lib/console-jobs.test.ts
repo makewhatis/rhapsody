@@ -5,6 +5,7 @@ import type {
   StateResponse,
   TeamsOverview,
   TicketCostRow,
+  TypedConfigResponse,
 } from "@/lib/api";
 import { mergeJobs } from "@/lib/runs-model";
 import type { JobRow } from "@/lib/runs-model";
@@ -15,13 +16,16 @@ import {
   consoleJobsPageNote,
   consoleJobCounts,
   consoleJobProjects,
+  activeStatesFor,
   consoleJobStatus,
   consoleStoreCounts,
   durableAssignees,
   filterConsoleJobs,
+  isParkedState,
   lastActivityByIssue,
   lifecycleByIssue,
   mateStates,
+  projectActiveStates,
   needsOperator,
   providerByIssue,
   relativeSince,
@@ -31,6 +35,7 @@ import {
   statusNote,
   ticketAssignees,
   ticketCostsByIssue,
+  type ConsoleJobRow,
 } from "./console-jobs";
 import { runOutcomeLabel } from "./console-job-detail";
 
@@ -129,6 +134,43 @@ describe("consoleJobStatus", () => {
   it("names a hold on a never-run ticket queued rather than blocked", () => {
     expect(consoleJobStatus("waiting", undefined, false, false, true)).toBe("queued");
     expect(consoleJobStatus("waiting", "", false, false, true)).toBe("queued");
+  });
+
+  // STUDIO-966 — the `open` bucket conflates dispatchable and parked, so the caller resolves
+  // "would the gate pick this up?" and passes it in. `parked` splits ONLY the open arm.
+  //
+  // MUTATION: drop the `parked` arm (collapse it back into `queued`) and the first assertion reds
+  // with `expected 'queued' to be 'parked'`.
+  it("names a parked ticket parked rather than queued", () => {
+    // The reported case: a run completed and left its ticket in Backlog.
+    expect(consoleJobStatus("completed", "open", false, false, false, true)).toBe("parked");
+    // A stopped run on a parked ticket left nothing for an agent to pick up either.
+    expect(consoleJobStatus("stopped", "open", false, false, false, true)).toBe("parked");
+  });
+
+  // The guard on the fix, and the common case it must not take with it: a Todo ticket is genuinely
+  // back in the pool. Passing `parked: false` is what the caller does for it.
+  //
+  // MUTATION: classify a Todo ticket as parked and this reds (`expected 'parked' to be 'queued'`).
+  it("still names an unparked open ticket queued", () => {
+    expect(consoleJobStatus("completed", "open", false, false, false, false)).toBe("queued");
+    expect(consoleJobStatus("completed", "open")).toBe("queued");
+  });
+
+  // Parked is about the TICKET's dispatchability; a failure is about the RUN and still needs a
+  // person. A live run outranks both and has already returned above.
+  it("keeps the run's own verdicts on a parked ticket", () => {
+    expect(consoleJobStatus("failed", "open", false, false, false, true)).toBe("blocked");
+    expect(consoleJobStatus("waiting", "open", false, false, false, true)).toBe("blocked");
+    expect(consoleJobStatus("running", "open", false, false, false, true)).toBe("run");
+  });
+
+  // The rule is confined to `open`: a review or terminal ticket already reaches a truer word, and
+  // the flag must not overwrite it.
+  it("changes no other lifecycle arm", () => {
+    expect(consoleJobStatus("completed", "in_review", false, false, false, true)).toBe("review");
+    expect(consoleJobStatus("completed", "done", false, false, false, true)).toBe("done");
+    expect(consoleJobStatus("completed", "canceled", false, false, false, true)).toBe("done");
   });
 });
 
@@ -433,6 +475,99 @@ describe("lifecycleByIssue", () => {
   });
 });
 
+/** A minimal GET /api/v1/config payload — only the fields the dispatchable sets read. */
+function typedConfig(over: {
+  active_states?: string[];
+  projects?: {
+    slugs: string[];
+    active_states?: string[] | null;
+    effective?: { active_states: string[] };
+  }[];
+} = {}): TypedConfigResponse {
+  return {
+    config: {},
+    prompt_body: "",
+    global: { active_states: over.active_states ?? [] },
+    projects: (over.projects ?? []).map((p) => ({
+      name: p.slugs[0] ?? "project",
+      slugs: p.slugs,
+      enabled: true,
+      overrides: {},
+      active_states: p.active_states ?? null,
+      effective: p.effective,
+    })),
+  } as unknown as TypedConfigResponse;
+}
+
+// STUDIO-966 — the classification the worklist needs is "would the selection gate pick this ticket
+// up?", and the gate filters by the configured `active_states` SETS resolved per project. Nothing
+// here reads Linear's state `type`, and nothing hardcodes a state name.
+describe("isParkedState / the dispatchable sets (STUDIO-966)", () => {
+  const DEFAULT = ["Todo", "In Progress"];
+
+  it("treats a state in the set as dispatchable and one outside it as parked", () => {
+    expect(isParkedState("Todo", DEFAULT)).toBe(false);
+    expect(isParkedState("In Progress", DEFAULT)).toBe(false);
+    expect(isParkedState("Backlog", DEFAULT)).toBe(true);
+    // Triage is in the same bucket as Backlog — not in `active_states` at all — and must be covered
+    // by the same rule rather than by special-casing one state name.
+    expect(isParkedState("Triage", DEFAULT)).toBe(true);
+  });
+
+  it("compares trimmed and case-folded, exactly as the daemon normalizes a state", () => {
+    expect(isParkedState("  todo ", DEFAULT)).toBe(false);
+    expect(isParkedState("BACKLOG", DEFAULT)).toBe(true);
+  });
+
+  // "I cannot tell" is not "parked": a blank state, or a config that has not loaded, must leave a
+  // row reading as it did before the rule existed.
+  it("answers no when there is nothing to compare against", () => {
+    expect(isParkedState("", DEFAULT)).toBe(false);
+    expect(isParkedState("Backlog", [])).toBe(false);
+  });
+
+  // The sets are derived from the config, never hardcoded: a project that makes Backlog active
+  // makes it dispatchable for that project.
+  //
+  // MUTATION: hardcode `["Todo", "In Progress"]` here and this reds (`expected true to be false`).
+  it("resolves each project's own set, with the global default as the fallback", () => {
+    const cfg = typedConfig({
+      active_states: DEFAULT,
+      projects: [
+        { slugs: ["alpha"], active_states: ["Todo"] },
+        // A project that pulls a non-default state INTO the active set.
+        { slugs: ["beta"], active_states: ["Todo", "Backlog"] },
+        // No override: inherits the global set.
+        { slugs: ["gamma"] },
+      ],
+    });
+    const states = projectActiveStates(cfg);
+    expect(activeStatesFor(states, "alpha")).toEqual(["Todo"]);
+    expect(activeStatesFor(states, "beta")).toEqual(["Todo", "Backlog"]);
+    expect(activeStatesFor(states, "gamma")).toEqual(DEFAULT);
+    // An unknown project falls back to the global default rather than inventing an empty set.
+    expect(activeStatesFor(states, "unknown")).toEqual(DEFAULT);
+
+    // The same tracker state is parked in one project and dispatchable in another.
+    expect(isParkedState("Backlog", activeStatesFor(states, "alpha"))).toBe(true);
+    expect(isParkedState("Backlog", activeStatesFor(states, "beta"))).toBe(false);
+  });
+
+  it("prefers the daemon's own resolved effective set when it serves one", () => {
+    const cfg = typedConfig({
+      active_states: DEFAULT,
+      projects: [{ slugs: ["alpha"], active_states: ["Todo"], effective: { active_states: ["Started"] } }],
+    });
+    expect(activeStatesFor(projectActiveStates(cfg), "alpha")).toEqual(["Started"]);
+  });
+
+  it("knows nothing before the config loads, so nothing is parked", () => {
+    const states = projectActiveStates(undefined);
+    expect(activeStatesFor(states, "rhapsody")).toEqual([]);
+    expect(isParkedState("Backlog", activeStatesFor(states, "rhapsody"))).toBe(false);
+  });
+});
+
 describe("buildConsoleJobs", () => {
   // STUDIO-702 — the acceptance case: a merged ticket reads "done", the "in review" count holds
   // only work actually awaiting a reviewer, and the Done tab has something to show.
@@ -649,6 +784,83 @@ describe("buildConsoleJobs", () => {
     expect(at(41)).toBe("41s");
     expect(at(60)).toBe("1m");
     expect(at(3600 + 5 * 60 + 59)).toBe("1h 5m");
+  });
+});
+
+// STUDIO-966 — the reported case. STUDIO-958 was parked in Backlog (its spec says do not start it
+// yet); its one run completed, `consoleJobStatus("completed", "open")` returned `queued`, and the
+// card read as waiting for an agent under a lane that said so. Nothing will ever dispatch it.
+describe("a parked ticket through the builder (STUDIO-966)", () => {
+  const DEFAULT = projectActiveStates(typedConfig({ active_states: ["Todo", "In Progress"] }));
+  const build = (rows: IssueRun[], jobs: JobRow[], states = DEFAULT) =>
+    buildConsoleJobs(jobs, rows, undefined, NOW, [], states);
+  const row = (rows: ConsoleJobRow[], issue: string) => rows.find((r) => r.issue === issue);
+
+  it("reads the Backlog ticket parked, and leaves a Todo ticket queued", () => {
+    const built = build(
+      [
+        issueRow({ issue_identifier: "STUDIO-958", lifecycle: "open", tracker_state: "Backlog" }),
+        issueRow({ issue_identifier: "TODO", lifecycle: "open", tracker_state: "Todo" }),
+      ],
+      [job({ issue: "STUDIO-958", status: "completed" }), job({ issue: "TODO", status: "completed" })],
+    );
+    expect(row(built, "STUDIO-958")?.statusLabel).toBe("parked");
+    expect(row(built, "TODO")?.statusLabel).toBe("queued");
+    // The run's own verdict is still stated beside the ticket's, exactly as for a review ticket.
+    expect(row(built, "STUDIO-958")?.statusNote).toBe("run done");
+  });
+
+  it("treats Triage exactly as Backlog", () => {
+    const built = build(
+      [issueRow({ issue_identifier: "T", lifecycle: "open", tracker_state: "Triage" })],
+      [job({ issue: "T", status: "completed" })],
+    );
+    expect(row(built, "T")?.status).toBe("parked");
+  });
+
+  // Each project's own `active_states` overlay decides, so the SAME state is parked for one project
+  // and dispatchable for another. Hardcoding the default set reds this.
+  it("classifies by each project's own sets", () => {
+    const states = projectActiveStates(
+      typedConfig({
+        active_states: ["Todo", "In Progress"],
+        projects: [
+          { slugs: ["default"], active_states: ["Todo", "In Progress"] },
+          { slugs: ["custom"], active_states: ["Backlog"] },
+        ],
+      }),
+    );
+    const built = build(
+      [
+        issueRow({ issue_identifier: "P1", lifecycle: "open", tracker_state: "Backlog", project_slug: "default" }),
+        issueRow({ issue_identifier: "P2", lifecycle: "open", tracker_state: "Backlog", project_slug: "custom" }),
+      ],
+      [
+        job({ issue: "P1", status: "completed", project: "default", projectShort: "Default" }),
+        job({ issue: "P2", status: "completed", project: "custom", projectShort: "Custom" }),
+      ],
+      states,
+    );
+    expect(row(built, "P1")?.status).toBe("parked");
+    expect(row(built, "P2")?.status).toBe("queued");
+  });
+
+  // The parked row answers the Queued button and the queued count, because the daemon's whole-store
+  // tally groups by lifecycle and cannot split it out; only the PILL tells the two apart. Pinned so
+  // the strip and the table cannot drift on this. See `ConsoleJobCounts`.
+  it("files under the Queued filter and count, wearing its own pill", () => {
+    const built = build(
+      [
+        issueRow({ issue_identifier: "STUDIO-958", lifecycle: "open", tracker_state: "Backlog" }),
+        issueRow({ issue_identifier: "TODO", lifecycle: "open", tracker_state: "Todo" }),
+      ],
+      [job({ issue: "STUDIO-958", status: "completed" }), job({ issue: "TODO", status: "completed" })],
+    );
+    expect(filterConsoleJobs(built, "queued", "").map((r) => r.issue).sort()).toEqual([
+      "STUDIO-958",
+      "TODO",
+    ]);
+    expect(consoleJobCounts(built).queued).toBe(2);
   });
 });
 
