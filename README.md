@@ -2339,3 +2339,34 @@ watcher's rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` 
 poll interval, so the poll bound alone under-covers it. And the local midnight is resolved through
 the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
 longer folds an extra hour of yesterday's spend into today.
+
+### The PR-state watcher polls with conditional requests — `polling.pr_state_interval_ms` (STUDIO-974)
+
+The ticketless review watcher re-asks GitHub where every watched pull request stands on a timer, and
+that timer was a pinned 120s constant because a full sweep is ~600 requests an hour against the
+account's shared 5,000/hour GitHub budget (shared with the summons enrichment poll, the quorum's PR
+lookups and every `gh` call an agent makes inside a run) — and since STUDIO-953 a tick makes up to
+twice the sweep's calls. Go v0.4.0 has no review watcher at all, so this subsystem is Rhapsody-only;
+what is new here is that its clock is configurable and its unchanged polls are cheap.
+
+- **`polling.pr_state_interval_ms`** — a `WORKFLOW.md` key beside `polling.interval_ms`, read by the
+  watcher each tick so a hot reload applies on the next sleep. It **defaults to `120000`** (the pinned
+  clock), so an installation that never writes it is byte-identical to a daemon built before the key
+  existed; a positive value below `MIN_PR_STATE_INTERVAL_MS` (10s) is raised to that floor so a fast
+  cadence cannot busy-loop the watcher or the paid fallback. It is emitted by `encode` (so a console
+  Save keeps a non-default value) and deliberately kept out of `GET /api/v1/config`'s typed view
+  (`effective_json`), so the Go-captured config goldens stay byte-identical.
+- **A conditional-request transport for this one read.** When a token resolves (`GH_TOKEN` /
+  `GITHUB_TOKEN` / `gh auth token`), the watcher reads PR state from `api.github.com`'s REST API with
+  `If-None-Match` and a per-coordinate ETag cache; an unchanged pull request answers `304 Not
+  Modified`, which does **not** count against the primary rate limit. A cold start or an evicted
+  entry degrades to an ordinary 200. When no token resolves, or a lookup is refused with `401` after
+  the credential is re-resolved once, that lookup is answered through the existing `gh pr view`
+  source instead, so the watcher degrades rather than going quiet. This transport is **github.com
+  only** — a GHES/`GH_HOST` install takes the 401 path back to `gh`.
+
+`gh` itself exposes no way to send `If-None-Match` or read a response `ETag`, which is why this path
+speaks HTTP directly. Nothing else moves: `MAX_PR_STATE_CALLS_PER_TICK` and the rotating cursor still
+bound one tick, and STUDIO-953's pre-dispatch head re-read stays unconditional — it goes through
+`pr_state_unconditional`, which sends no `If-None-Match`, because acting on a stale head is the
+failure that re-read exists to prevent.

@@ -477,7 +477,14 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(f) else {
                 continue;
             };
-            if !text.contains(".pr_state(") && !text.contains("sweep_pr_states(") {
+            // `.pr_state_unconditional(` is caught too: STUDIO-974 added it as the pre-dispatch
+            // re-read's entry point, and it is the SAME blocking lookup, so a control-loop caller of
+            // it is exactly the hazard this guard exists for. The two names do not overlap — the
+            // `(` after `pr_state` makes the substring match exact.
+            if !text.contains(".pr_state(")
+                && !text.contains(".pr_state_unconditional(")
+                && !text.contains("sweep_pr_states(")
+            {
                 continue;
             }
             let name = f

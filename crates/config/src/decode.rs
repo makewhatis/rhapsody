@@ -651,10 +651,13 @@ mod tests {
     // carried verbatim when set. The engine's hot-reload mirror reads this value.
     #[test]
     fn decode_pr_state_interval_defaults_to_120s_and_takes_an_explicit_value() {
+        // Pin the LITERAL, not the constant: asserting `== DEFAULT_PR_STATE_INTERVAL_MS` here would
+        // hold for any default the constant is later changed to, which is no test at all.
         assert_eq!(
             decode_yaml("", "body").polling.pr_state_interval_ms,
-            DEFAULT_PR_STATE_INTERVAL_MS
+            120_000
         );
+        assert_eq!(DEFAULT_PR_STATE_INTERVAL_MS, 120_000);
         assert_eq!(
             decode_yaml("polling:\n  pr_state_interval_ms: 10000\n", "body")
                 .polling
