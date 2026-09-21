@@ -133,6 +133,13 @@ pub struct Polling {
 /// orchestrator's boot default cannot drift.
 pub const DEFAULT_PR_STATE_INTERVAL_MS: i64 = 120_000;
 
+/// The floor the orchestrator applies to [`Polling::pr_state_interval_ms`] when mirroring it into
+/// the watcher's atomic. A conditional 304 is free against the PRIMARY budget, but GitHub still
+/// enforces secondary concurrency/burst limits, and the `gh` fallback (no token) pays every call —
+/// so a sub-second cadence is exactly the exhaustion this key was added to avoid. Ten seconds is
+/// well under the ~10–15s the ticket targets and still far too slow to be a busy loop.
+pub const MIN_PR_STATE_INTERVAL_MS: i64 = 10_000;
+
 /// Workspace root (Go `Workspace`; `root` normalized in Resolve, kept raw here).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {

@@ -10,7 +10,9 @@
 //! cadence was pinned at 120s ([`crate::prstate::PR_STATE_POLL_INTERVAL`]) because a full sweep is
 //! ~600 requests an hour against the account's 5,000/hour budget, shared with every other `gh`
 //! call the daemon and its agents make — and since STUDIO-953 a tick makes up to twice the sweep's
-//! calls. The budget is live, not theoretical: it was exhausted on 2026-09-21.
+//! calls. The budget is finite and shared, which is why the answer is to attack the COST of a poll
+//! rather than merely lower the constant; an earlier draft's claim that the budget was exhausted on
+//! 2026-09-21 was retracted (see the STUDIO-974 ticket), so nothing here rests on it.
 //!
 //! GitHub answers a conditional `GET` with `304 Not Modified` when the sent `If-None-Match` ETag
 //! still matches, and a 304 does **not** count against the primary rate limit (verified against the
@@ -20,6 +22,12 @@
 //! The `gh` CLI cannot do this: it exposes no way to send `If-None-Match` or read the response
 //! `ETag` from `gh pr view`. So this module speaks HTTP directly, for this one path only;
 //! [`crate::ghsummons`] and every agent `gh` call are untouched.
+//!
+//! **github.com only.** [`rest_pr_url`] hardcodes `api.github.com` and the token is resolved for the
+//! default host, so a GHES/`GH_HOST` install cannot use this transport. That is not silent: the
+//! first lookup would answer 401, and [`ConditionalPrState::lookup`] treats a 401 as a signal to
+//! re-resolve the credential and then to fall back to the `gh` source — the watcher keeps observing
+//! at the old cost instead of going quiet.
 //!
 //! # The rules that make it safe
 //!
@@ -45,7 +53,7 @@
 //! "an unstated field is not an error" rules.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -77,6 +85,18 @@ pub trait ConditionalTransport: Send + Sync {
         url: &str,
         if_none_match: Option<&str>,
     ) -> Result<HttpAnswer, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// A lookup just answered 401: the credential this transport holds is no longer accepted (an
+    /// expired PAT, or a `gh auth refresh`/relogin that rotated the keyring token). Re-resolve the
+    /// credential — bounded, off-task — and return whether a *different* credential is now in
+    /// place, so the caller can retry that one lookup. Returns `false` when there is nothing to
+    /// renew (no token to resolve, or the resolved token is byte-identical to the current one), and
+    /// the caller then answers through its `gh` source instead of going quiet.
+    ///
+    /// The default declines: a transport with no credential to renew.
+    async fn renew(&self) -> bool {
+        false
+    }
 }
 
 /// The one entry the cache keeps per coordinate: the last ETag GitHub returned with an answer, and
@@ -89,8 +109,13 @@ struct CachedPr {
 
 /// A [`PrStateSource`] over GitHub's REST API that sends `If-None-Match` and answers 304s from a
 /// per-coordinate ETag store.
+///
+/// The cache is keyed by coordinate and only a 404 (or a 200 with no ETag) removes an entry, so it
+/// grows with every pull request the daemon has ever watched rather than shrinking as the watch set
+/// does. In practice that is a handful of small entries, and it is bounded per daemon lifetime — a
+/// restart clears it — so it is not pruned.
 pub struct ConditionalPrState {
-    transport: std::sync::Arc<dyn ConditionalTransport>,
+    transport: Arc<dyn ConditionalTransport>,
     /// Per-exec bound, [`GH_EXEC_TIMEOUT`] in production. A field so a test can observe the bound
     /// firing without waiting a real minute.
     exec_timeout: Duration,
@@ -98,17 +123,31 @@ pub struct ConditionalPrState {
     /// `.await`, only read and written around it (the lock is taken, the entry cloned, the guard
     /// dropped, and only then is the request awaited).
     cache: Mutex<HashMap<PrCoord, CachedPr>>,
+    /// What a lookup is answered through when the REST transport cannot be used — a 401 that a
+    /// renewed token did not fix. `None` in a test or a caller that wired no fallback, in which
+    /// case a 401 is an ordinary failure. The `gh`-subprocess source in production, so a rotated
+    /// or expired credential degrades the watcher to its old (paid) behaviour rather than stopping
+    /// it.
+    fallback: Option<Arc<dyn PrStateSource>>,
 }
 
 impl ConditionalPrState {
     /// Builds a source over `transport`. The cache starts empty: the first lookup of each
     /// coordinate is a normal 200, which is the correct cold-start behavior.
-    pub fn new(transport: std::sync::Arc<dyn ConditionalTransport>) -> ConditionalPrState {
+    pub fn new(transport: Arc<dyn ConditionalTransport>) -> ConditionalPrState {
         ConditionalPrState {
             transport,
             exec_timeout: GH_EXEC_TIMEOUT,
             cache: Mutex::new(HashMap::new()),
+            fallback: None,
         }
+    }
+
+    /// Attaches the source a 401 falls back to when the credential cannot be renewed. Production
+    /// passes the `gh`-subprocess [`PrStateSource`]; see [`Self::lookup`].
+    pub fn with_fallback(mut self, fallback: Arc<dyn PrStateSource>) -> ConditionalPrState {
+        self.fallback = Some(fallback);
+        self
     }
 
     /// The cached ETag and answer for `pr`, cloned out from under the lock.
@@ -120,10 +159,12 @@ impl ConditionalPrState {
             .cloned()
     }
 
-    /// Records the ETag GitHub returned with an answer. A missing ETag leaves any existing entry
-    /// in place: the server gave us nothing to condition on, so we must not lose the token we had.
+    /// Records the ETag GitHub returned with an answer. A 200 with no ETag leaves nothing to
+    /// condition on, so the entry is DROPPED rather than kept: the next lookup is then an honest
+    /// unconditional 200, instead of carrying a token the server no longer vouches for.
     fn record(&self, pr: &PrCoord, etag: Option<&str>, lookup: &PrLookup) {
         let Some(etag) = etag.filter(|e| !e.is_empty()) else {
+            self.forget(pr);
             return;
         };
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -177,9 +218,44 @@ impl ConditionalPrState {
             return Ok(PrLookup::Gone);
         }
         let cached = use_cache.then(|| self.cached(pr)).flatten();
-        let answer = self
+        let mut answer = self
             .fetch(pr, cached.as_ref().map(|c| c.etag.as_str()))
             .await?;
+
+        // A 401 is the credential no longer being accepted (an expired PAT, or a rotated keyring
+        // token), not the pull request changing. Renew the credential and retry that one lookup
+        // against the REST source; if it still cannot be made, answer through the `gh` source so
+        // the watcher keeps observing instead of going quiet until a restart (STUDIO-974 review,
+        // finding 2).
+        if answer.status == 401 {
+            tracing::warn!(
+                pr = %pr,
+                "conditional pr-state GET answered HTTP 401; re-resolving the GitHub token"
+            );
+            if self.transport.renew().await {
+                answer = self
+                    .fetch(pr, cached.as_ref().map(|c| c.etag.as_str()))
+                    .await?;
+            }
+            if answer.status == 401
+                && let Some(fallback) = self.fallback.as_ref()
+            {
+                tracing::warn!(
+                    pr = %pr,
+                    "conditional pr-state GET still 401 after renewing; answering through the \
+                     `gh` source"
+                );
+                return if use_cache {
+                    fallback
+                        .pr_state(&pr.owner, &pr.repo, pr.number, allow)
+                        .await
+                } else {
+                    fallback
+                        .pr_state_unconditional(&pr.owner, &pr.repo, pr.number, allow)
+                        .await
+                };
+            }
+        }
 
         match answer.status {
             // Unchanged: the recorded answer, NOT a failure and NOT `Gone`.
@@ -346,10 +422,11 @@ fn parse_rest_pr(
 /// A [`ConditionalTransport`] over `reqwest`, sending the daemon's GitHub token as a bearer
 /// credential. The client is built once; the token is read from `GH_TOKEN`/`GITHUB_TOKEN` or, when
 /// neither is set, from the authenticated `gh` CLI (`gh auth token`), so an installation whose `gh`
-/// already works needs no new environment.
+/// already works needs no new environment. The token is held behind a `Mutex` rather than copied
+/// into the client so [`ConditionalTransport::renew`] can swap it after a 401.
 pub struct GitHubRestTransport {
     client: reqwest::Client,
-    token: String,
+    token: Mutex<String>,
 }
 
 impl GitHubRestTransport {
@@ -358,7 +435,7 @@ impl GitHubRestTransport {
     pub fn new(token: String) -> GitHubRestTransport {
         GitHubRestTransport {
             client: reqwest::Client::new(),
-            token,
+            token: Mutex::new(token),
         }
     }
 }
@@ -370,13 +447,15 @@ impl ConditionalTransport for GitHubRestTransport {
         url: &str,
         if_none_match: Option<&str>,
     ) -> Result<HttpAnswer, Box<dyn std::error::Error + Send + Sync>> {
+        // Cloned out from under the lock, which is dropped before the `.await` below.
+        let token = self.token.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut req = self
             .client
             .get(url)
             // The REST media type; GitHub returns `mergeable_state` on this endpoint.
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::USER_AGENT, "rhapsody")
-            .bearer_auth(&self.token);
+            .bearer_auth(&token);
         if let Some(etag) = if_none_match {
             req = req.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -391,13 +470,36 @@ impl ConditionalTransport for GitHubRestTransport {
         let body = res.bytes().await?.to_vec();
         Ok(HttpAnswer { status, etag, body })
     }
+
+    /// Re-resolves the token through the same bounded, off-task path boot uses, and reports whether
+    /// it actually changed. An unchanged token (for example one still supplied by `GH_TOKEN`) is
+    /// `false`, so the caller does not pay a second request to learn what it already knows.
+    async fn renew(&self) -> bool {
+        let Some(fresh) = resolve_github_token().await else {
+            return false;
+        };
+        let mut current = self.token.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == fresh {
+            return false;
+        }
+        *current = fresh;
+        true
+    }
 }
 
 /// Resolves a GitHub token for [`GitHubRestTransport`]: `GH_TOKEN`, then `GITHUB_TOKEN`, then the
 /// authenticated `gh` CLI's own token (`gh auth token`). `None` when none can be found, which the
 /// caller treats as "keep using the `gh`-subprocess source" — a daemon that cannot build the
 /// conditional transport must still be able to watch its pull requests.
-pub fn resolve_github_token() -> Option<String> {
+///
+/// The `gh` exec runs on tokio's BLOCKING pool under [`GH_EXEC_TIMEOUT`], the same containment
+/// every other `gh` call in the daemon uses (STUDIO-829). This is called from the async boot path
+/// (and again from [`GitHubRestTransport::renew`]), so an exec run inline would hold a tokio worker
+/// thread with no yield point, and a hung `gh` — a locked keychain, a keyring prompt under launchd,
+/// a stuck credential helper — would stall boot with nothing logged. The bound is what makes a
+/// timeout enforceable; on expiry the token is simply absent and the `gh`-source fallback is
+/// chosen, so a hung `gh` costs a fallback rather than the daemon.
+pub async fn resolve_github_token() -> Option<String> {
     for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             let t = t.trim();
@@ -406,10 +508,31 @@ pub fn resolve_github_token() -> Option<String> {
             }
         }
     }
-    let out = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .ok()?;
+    let exec = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+    });
+    let out = match tokio::time::timeout(GH_EXEC_TIMEOUT, exec).await {
+        Ok(Ok(Ok(out))) => out,
+        // Timed out, the blocking task failed to join, or the spawn did not happen: treat all
+        // three as "no token", which selects the `gh`-source fallback.
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "`gh auth token` could not be run");
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "`gh auth token` task did not join");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?GH_EXEC_TIMEOUT,
+                "`gh auth token` timed out; falling back to the `gh` pr-state source"
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
         return None;
     }
@@ -425,11 +548,13 @@ mod tests {
     use super::*;
 
     /// A transport that answers a fixed script of `(status, etag, body)` per call, recording the
-    /// `If-None-Match` each call carried.
+    /// `If-None-Match` each call carried. `renew` is scripted too, and counted.
     struct ScriptedTransport {
         answers: Mutex<Vec<HttpAnswer>>,
         seen_etags: Arc<Mutex<Vec<Option<String>>>>,
         calls: Arc<AtomicUsize>,
+        renews: Arc<AtomicUsize>,
+        renew_result: bool,
     }
 
     #[async_trait]
@@ -449,6 +574,44 @@ mod tests {
                 return Err("script exhausted".into());
             }
             Ok(answers.remove(0))
+        }
+
+        async fn renew(&self) -> bool {
+            self.renews.fetch_add(1, Ordering::SeqCst);
+            self.renew_result
+        }
+    }
+
+    /// A [`PrStateSource`] standing in for the `gh` fallback: records every call and answers one
+    /// fixed lookup.
+    struct FakeFallback {
+        answer: PrLookup,
+        calls: Arc<AtomicUsize>,
+        unconditional_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PrStateSource for FakeFallback {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer.clone())
+        }
+
+        async fn pr_state_unconditional(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            self.unconditional_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer.clone())
         }
     }
 
@@ -477,10 +640,19 @@ mod tests {
     }
 
     fn source(answers: Vec<HttpAnswer>) -> (ConditionalPrState, Arc<ScriptedTransport>) {
+        source_with(answers, false)
+    }
+
+    fn source_with(
+        answers: Vec<HttpAnswer>,
+        renew_result: bool,
+    ) -> (ConditionalPrState, Arc<ScriptedTransport>) {
         let t = Arc::new(ScriptedTransport {
             answers: Mutex::new(answers),
             seen_etags: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(AtomicUsize::new(0)),
+            renews: Arc::new(AtomicUsize::new(0)),
+            renew_result,
         });
         let src = ConditionalPrState::new(Arc::clone(&t) as Arc<dyn ConditionalTransport>);
         (src, t)
@@ -678,5 +850,102 @@ mod tests {
             src.pr_state("o", "r", 1, &HeadAllowlist::none()).await,
             Ok(PrLookup::Untrusted)
         ));
+    }
+
+    /// A 401 is a credential that is no longer accepted, not a failure to report forever: the token
+    /// is renewed and the lookup is retried once with the new credential.
+    /// Mutation check: drop the `renew` call and the retry, and this is an `Err`.
+    #[tokio::test]
+    async fn a_401_renews_the_token_and_retries_the_lookup() {
+        let (src, t) = source_with(
+            vec![
+                answer(401, None, b"Bad credentials".to_vec()),
+                answer(200, Some("etag-1"), body("sha1", "open", false)),
+            ],
+            true,
+        );
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(found(&got).head_sha, "sha1");
+        assert_eq!(
+            t.renews.load(Ordering::SeqCst),
+            1,
+            "a 401 must attempt one credential renewal"
+        );
+        assert_eq!(
+            t.calls.load(Ordering::SeqCst),
+            2,
+            "the lookup must be retried once after the renewal"
+        );
+    }
+
+    /// When the credential cannot be renewed (or the retry still 401s), the lookup is answered
+    /// through the `gh` fallback, so the watcher keeps observing rather than going quiet until a
+    /// restart. Mutation check: remove the fallback branch and this is an `Err`.
+    #[tokio::test]
+    async fn a_401_that_survives_renewal_falls_back_to_the_gh_source() {
+        let (src, t) = source_with(vec![answer(401, None, b"Bad credentials".to_vec())], false);
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(FakeFallback {
+            answer: PrLookup::Found(PrSnapshot {
+                head_sha: "from-gh".to_string(),
+                status: PrStatus::Open,
+                is_draft: None,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+                merge_state: String::new(),
+            }),
+            calls: Arc::clone(&fallback_calls),
+            unconditional_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let src = src.with_fallback(Arc::clone(&fallback) as Arc<dyn PrStateSource>);
+
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(found(&got).head_sha, "from-gh");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.renews.load(Ordering::SeqCst), 1);
+    }
+
+    /// Without a fallback a 401 is still a failure, never `Gone` — so a caller cannot retire a live
+    /// pull request on a bad credential.
+    #[tokio::test]
+    async fn a_401_without_a_fallback_is_a_failure_not_gone() {
+        let (src, _t) = source_with(vec![answer(401, None, b"Bad credentials".to_vec())], false);
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert!(got.is_err(), "a 401 is a failure, not an answer");
+    }
+
+    /// A 200 that carries no ETag drops any prior entry: there is no token to condition on, so the
+    /// next lookup is an honest unconditional 200 rather than a stale conditional one.
+    /// Mutation check: keep the old entry and the second request carries `etag-1`.
+    #[tokio::test]
+    async fn a_200_without_an_etag_drops_the_prior_entry() {
+        let (src, t) = source(vec![
+            answer(200, Some("etag-1"), body("sha1", "open", false)),
+            answer(200, None, body("sha2", "open", false)),
+            answer(200, Some("etag-3"), body("sha3", "open", false)),
+        ]);
+        let _ = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(
+            found(&src.pr_state("o", "r", 1, &HeadAllowlist::none()).await).head_sha,
+            "sha2"
+        );
+        let _ = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(
+            t.seen_etags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            vec![None, Some("etag-1".to_string()), None],
+            "an answer with no ETag must not leave the old token behind"
+        );
+    }
+
+    /// A 304 with no cached answer is a bookkeeping mismatch, not a state to invent: it is an
+    /// `Err`, never `Gone` and never a made-up `Found`.
+    #[tokio::test]
+    async fn a_304_with_no_cache_entry_is_a_failure_not_gone() {
+        let (src, _t) = source(vec![answer(304, None, Vec::new())]);
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert!(got.is_err(), "a 304 with nothing to serve cannot be Gone");
     }
 }

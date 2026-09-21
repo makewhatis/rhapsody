@@ -812,6 +812,18 @@ where
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
+    //
+    // STUDIO-974: resolve the conditional REST transport's token HERE, before the task is built and
+    // on the async path's own terms — `resolve_github_token` runs `gh auth token` on the blocking
+    // pool under `GH_EXEC_TIMEOUT`, so a hung `gh` costs a `None` (and the `gh`-source fallback)
+    // rather than a stalled boot (review finding 1). Resolved once: the token does not hot-reload
+    // (it is an environment/CLI fact, not a workflow key), and rebuilding the client per tick would
+    // defeat the ETag cache it exists to keep. A later 401 re-resolves it in place.
+    let conditional_pr_token = if spawn_watcher {
+        rhapsody_orchestrator::prconditional::resolve_github_token().await
+    } else {
+        None
+    };
     let review_watch_task = spawn_watcher.then(|| {
         let watch_ctx = shutdown.wait();
         let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
@@ -907,8 +919,13 @@ where
             // be found the `gh`-subprocess source is kept, so a daemon that cannot build the
             // conditional transport still watches its pull requests. Only the SWEEP is affected —
             // the pre-dispatch re-read goes through `pr_state_unconditional`, which this source
-            // answers with an unconditional request.
-            pr_source: Some(conditional_pr_source(Arc::clone(&gh))),
+            // answers with an unconditional request. The `gh` source is also wired as the REST
+            // source's 401 fallback, so a credential that is rotated or expires downgrades the
+            // watcher to its old (paid) path instead of silencing it until a restart.
+            pr_source: Some(conditional_pr_source(
+                conditional_pr_token.clone(),
+                Arc::clone(&gh),
+            )),
             // The base repository's own owner and nothing else — the default trust boundary. A
             // fork's head is refused rather than reviewed (design §14.1 F-SEC); there is no config
             // key to widen it, so widening is a code change a reviewer sees.
@@ -1264,13 +1281,16 @@ fn spawn_review_intro(teams: &rhapsody_config::teams::Teams) -> bool {
 /// `gh`-subprocess source when no token is available — a daemon that cannot build the conditional
 /// transport must still watch its pull requests, at the old (paid) cost.
 ///
-/// The choice is made ONCE, at boot: the token does not hot-reload (it is an environment/CLI fact,
-/// not a workflow key), and rebuilding the client per tick would defeat the ETag cache it exists to
-/// keep.
+/// The choice is made ONCE, at boot (`token` is resolved by the caller, off the async worker and
+/// bounded; see `resolve_github_token`): the token does not hot-reload (it is an environment/CLI
+/// fact, not a workflow key), and rebuilding the client per tick would defeat the ETag cache it
+/// exists to keep. The `gh` source is ALSO attached as the REST source's 401 fallback, so a token
+/// that later stops being accepted has somewhere to go.
 fn conditional_pr_source(
+    token: Option<String>,
     gh: Arc<rhapsody_orchestrator::ghsummons::GH>,
 ) -> Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource> {
-    match rhapsody_orchestrator::prconditional::resolve_github_token() {
+    match token {
         Some(token) => {
             tracing::info!(
                 "pr-state watcher: using conditional REST requests (If-None-Match); an unchanged \
@@ -1279,7 +1299,10 @@ fn conditional_pr_source(
             Arc::new(
                 rhapsody_orchestrator::prconditional::ConditionalPrState::new(Arc::new(
                     rhapsody_orchestrator::prconditional::GitHubRestTransport::new(token),
-                )),
+                ))
+                .with_fallback(
+                    Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
+                ),
             )
         }
         None => {

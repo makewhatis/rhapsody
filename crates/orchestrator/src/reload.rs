@@ -210,9 +210,14 @@ impl Orchestrator {
         self.retention_loaded.store(true, Ordering::Relaxed);
         // Mirror polling.pr_state_interval_ms into the atomic the off-loop review watcher reads
         // (STUDIO-974). Stored on every (re)load so a hot-reloaded cadence applies. `<= 0` falls back
-        // to the 120s default rather than a zero-millisecond busy loop.
+        // to the 120s default rather than a zero-millisecond busy loop, and a small positive value is
+        // raised to MIN_PR_STATE_INTERVAL_MS: a free 304 is still subject to GitHub's secondary
+        // limits, and the `gh` fallback (no token) pays every call, so a short-of-the-floor cadence
+        // is the exhaustion this key exists to avoid.
         let interval = if cfg.polling.pr_state_interval_ms > 0 {
-            cfg.polling.pr_state_interval_ms
+            cfg.polling
+                .pr_state_interval_ms
+                .max(rhapsody_config::model::MIN_PR_STATE_INTERVAL_MS)
         } else {
             rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS
         };
@@ -422,7 +427,8 @@ Do {{ issue.identifier }}.
 
     /// STUDIO-974: the ticketless PR-state watcher's cadence hot-reloads with WORKFLOW.md. Unset ⇒
     /// the historical 120s default (byte-identical to before the key existed); a set value applies
-    /// on `on_reload`; a non-positive value falls back to the default rather than a busy loop.
+    /// on `on_reload`; a non-positive value falls back to the default rather than a busy loop, and a
+    /// positive value below `MIN_PR_STATE_INTERVAL_MS` is raised to that floor.
     #[test]
     fn reload_applies_the_pr_state_interval() {
         let (path, _dir) = write_workflow(CLAUDE_WF);
@@ -462,6 +468,22 @@ Do {{ issue.identifier }}.
             o.current_pr_state_interval_ms(),
             120_000,
             "a non-positive cadence falls back to the default, not a zero-millisecond loop"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  interval_ms: 1234",
+                "  interval_ms: 1234\n  pr_state_interval_ms: 1000",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.current_pr_state_interval_ms(),
+            10_000,
+            "a cadence below the floor is raised to it, so a fast interval cannot busy-loop the \
+             watcher (or the `gh` fallback) into the exhaustion this key exists to avoid"
         );
     }
 
