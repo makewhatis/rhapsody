@@ -972,6 +972,57 @@ mod tests {
         assert_eq!(t.renews.load(Ordering::SeqCst), 1);
     }
 
+    /// A `renew()` that SUCCEEDS but hands back a credential GitHub still rejects must also fall
+    /// back, not return the second 401 as a failure. The sibling test above pins only the
+    /// `renew()`-returned-false path; this one pins the renewed-token-still-rejected path — a
+    /// rotated-but-not-yet-propagated keyring token, or an expired `GH_TOKEN` that `gh auth token`
+    /// echoes back unchanged. An implementation that falls back only when renewal REPORTED failure
+    /// would silence this lookup, which is exactly the regression the review named.
+    /// Mutation check: fall back only when `renew()` returned false and this reds (an `Err` instead
+    /// of `from-gh`).
+    #[tokio::test]
+    async fn a_401_that_survives_a_successful_renewal_falls_back_to_the_gh_source() {
+        let (src, t) = source_with(
+            vec![
+                answer(401, None, b"Bad credentials".to_vec()),
+                answer(401, None, b"Bad credentials".to_vec()),
+            ],
+            true,
+        );
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(FakeFallback {
+            answer: PrLookup::Found(PrSnapshot {
+                head_sha: "from-gh".to_string(),
+                status: PrStatus::Open,
+                is_draft: None,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+                merge_state: String::new(),
+            }),
+            calls: Arc::clone(&fallback_calls),
+            unconditional_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let src = src.with_fallback(Arc::clone(&fallback) as Arc<dyn PrStateSource>);
+
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(found(&got).head_sha, "from-gh");
+        assert_eq!(
+            t.renews.load(Ordering::SeqCst),
+            1,
+            "the 401 must attempt exactly one renewal"
+        );
+        assert_eq!(
+            t.calls.load(Ordering::SeqCst),
+            2,
+            "the successful renewal must be followed by exactly one retry"
+        );
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            1,
+            "a still-401 after a SUCCESSFUL renewal must answer through the gh fallback"
+        );
+    }
+
     /// Without a fallback a 401 is still a failure, never `Gone` — so a caller cannot retire a live
     /// pull request on a bad credential.
     #[tokio::test]
