@@ -36,6 +36,43 @@ in review", check `auto-done` in the log and the ticket in the tracker — and c
 Note also that a row's **UPDATED** column is its *run's* last activity, not its ticket's. A row
 can legitimately read "4h ago" while its state changed seconds ago.
 
+## Releasing a pull request the manager has settled
+
+`POST /api/v1/reviews/clear` with `{"owner":…,"repo":…,"number":…}` forgets a pull request's
+review bound — **both** the durable round count and the manager's adjudication. The loop then
+resumes from zero and arms a round at the current head.
+
+This is the only way to release a pull request a `ship` or `escalate` decision has stopped, and
+the reconciliation sweep's WARN names it. Reach for it when the sweep says *"the manager shipped
+the review loop … a human must merge it or clear the adjudication"* and you want the loop to run
+again rather than merging by hand.
+
+⚠️ It clears the spent count too, so the pull request gets a fresh budget — deliberate (an
+operator clearing a bound is saying "carry on"), but it means a clear on a genuinely churning
+pull request buys another full threshold's worth of rounds.
+
+## How fast the daemon notices GitHub
+
+Pull-request state (merged, closed, head moved, mergeability) is read by an off-loop watcher on
+its own clock — **not** `polling.interval_ms`, which drives the tracker poll. Until 2026-09-21
+that clock was a hard-coded 120s, so a merged pull request could sit on the board reading
+*"needs attention"* for two minutes.
+
+`polling.pr_state_interval_ms` in `WORKFLOW.md` now sets it, hot-reloading, defaulting to
+**15s** with a 10s floor (STUDIO-974). The polls are cheap rather than merely frequent: PR state
+is read over REST with `If-None-Match`, and an unchanged pull request answers `304`, which does
+not count against the primary rate limit.
+
+⚠️ Two things that are still true and bound how low it can go. The per-tick call budget
+(`MAX_PR_STATE_CALLS_PER_TICK`) and the rotating cursor still apply — a faster interval makes
+the rotation matter MORE, not less. And STUDIO-953's pre-dispatch head re-read is deliberately
+**unconditional**, so it always costs a request: the change is 2N → N per tick, not free.
+
+Measured on this installation before the change: ~480–520 core requests/hour of 5,000, about
+10% of budget. ⚠️ `gh api rate_limit` is a **stale probe** — it reported `5000/5000` while live
+response headers on the same token read `used: 27`. Read `x-ratelimit-used` from a real response
+instead.
+
 ## Stopping a run
 
 `POST /api/v1/runs/{id}/stop` moves the ticket to Backlog and kills the agent's whole process
