@@ -255,7 +255,11 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     // Re-read from GitHub on every tick, and deliberately not remembered: marking a draft ready
     // for review does NOT move the head, so a gate that latched on this answer would strand a pull
     // request the author had already un-drafted. Only the REPORT is de-duplicated — see `refuse`.
-    if snap.is_draft {
+    //
+    // `draft_blocks_merge`, not a bare bool (STUDIO-962): the gate refuses unless GitHub POSITIVELY
+    // said the pull request is not a draft, and the reader carries that default itself so the draft
+    // poke can take the opposite one from the same unstated answer.
+    if snap.draft_blocks_merge() {
         return refuse(plan, deps, DECLINE_DRAFT);
     }
 
@@ -644,7 +648,7 @@ mod tests {
         PrLookup::Found(PrSnapshot {
             head_sha: head.to_string(),
             status,
-            is_draft,
+            is_draft: Some(is_draft),
             merged_at: None,
             head_repo: "makewhatis/tally".to_string(),
             merge_state: String::new(),
@@ -1281,13 +1285,36 @@ mod tests {
         }
     }
 
-    /// A pull request that has vanished, and one whose head repository is not trusted, are both
-    /// refused before any merge is attempted.
+    /// A pull request that has vanished, one whose head repository is not trusted, and one whose
+    /// `isDraft` GitHub never stated are all refused before any merge is attempted.
+    ///
+    /// ⚠️ The third case is the STUDIO-881 direction pinned at the CALL SITE (STUDIO-962). Every
+    /// other draft test here builds `is_draft: Some(..)` through `snapshot`, so the gate's choice of
+    /// reader was invisible: swapping `snap.draft_blocks_merge()` for `snap.draft_observed()` —
+    /// which answers `false` on an unstated `isDraft` — let auto-merge attempt a pull request GitHub
+    /// never said was ready, and left the whole suite green. Before `is_draft` became an
+    /// `Option<bool>` the composition was one bool with one default and the gate could not pick the
+    /// wrong direction; now it can, so this case says which direction it must pick.
     #[tokio::test]
-    async fn a_gone_or_untrusted_pull_request_is_declined() {
+    async fn a_gone_untrusted_or_unstated_draft_pull_request_is_declined() {
         for (lookup, want) in [
             (PrLookup::Gone, "the pull request is gone"),
             (PrLookup::Untrusted, "the head repository is not trusted"),
+            (
+                // Open, at the planned head, trusted, `CLEAN` and every check green — so the draft
+                // gate is the only thing between this and an irreversible `gh pr merge`.
+                PrLookup::Found(PrSnapshot {
+                    head_sha: HEAD.to_string(),
+                    status: PrStatus::Open,
+                    is_draft: None,
+                    merged_at: None,
+                    head_repo: "makewhatis/tally".to_string(),
+                    // Not read on this path: `perform_auto_merge` asks its own
+                    // `MergeStateSource` for mergeability (STUDIO-961).
+                    merge_state: String::new(),
+                }),
+                DECLINE_DRAFT,
+            ),
         ] {
             let merger = Arc::new(FakeMerger::default());
             let d = AutoMergeDeps {
@@ -1302,14 +1329,16 @@ mod tests {
 
             assert_eq!(
                 perform_auto_merge(&plan(), &d).await,
-                AutoMergeOutcome::Declined(want)
+                AutoMergeOutcome::Declined(want),
+                "({lookup:?})"
             );
             assert!(
                 merger
                     .calls
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_empty()
+                    .is_empty(),
+                "({lookup:?}) nothing may be merged on an answer GitHub did not give"
             );
         }
     }

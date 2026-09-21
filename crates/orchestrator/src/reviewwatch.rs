@@ -139,7 +139,8 @@ use rhapsody_store::{
 
 use crate::control_loop::{CancelWait, Event};
 use crate::ghsummons::{
-    HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrStateSource, PrStatus, ReviewDiffSource,
+    HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrSnapshot, PrStateSource, PrStatus,
+    ReviewDiffSource,
 };
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
@@ -269,6 +270,12 @@ pub struct ReviewSweepReport {
     /// notification task on the control task, through the same channel a verdict's completion
     /// uses; the watcher task performs nothing extra for it.
     pub routed: usize,
+    /// The pokes (and, at most once, the human escalation) that a finished run's still-draft pull
+    /// request earned this tick (STUDIO-962). A work LIST for [`ReviewSweepReport::done`]'s reason:
+    /// posting the summons is a `gh` call, and the room post an escalation makes is disk I/O, so
+    /// neither may happen on the control task. Empty on every healthy board and on every tick where
+    /// nothing is both finished and still a draft.
+    pub nudges: Vec<crate::draftpoke::DraftNudge>,
     /// The pull requests whose round threshold was reached this tick and which the MANAGER must
     /// adjudicate (STUDIO-956). A work LIST for [`ReviewSweepReport::done`]'s reason: the decision
     /// is a model turn and a pair of writes, which must not happen on the control task. Empty on
@@ -367,6 +374,15 @@ pub trait ReviewWatchSink: Send + Sync {
     /// happens and the ticket stays in review — there is no caller with anything to do about it.
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan);
 
+    /// Pokes ONE finished run's author when its pull request is still a draft, or escalates to a
+    /// human once the poking is exhausted (STUDIO-962).
+    ///
+    /// On the sink for [`Self::finish`]'s reason: a poke is a `gh` comment (and an escalation a
+    /// room append), neither of which may happen on the control task. Infallible by contract: a
+    /// failed post is logged where it happens and the head is not re-poked — there is no caller
+    /// with anything to do about it.
+    async fn nudge(&self, nudge: crate::draftpoke::DraftNudge);
+
     /// Asks the MANAGER to adjudicate ONE pull request that has reached its round threshold
     /// (STUDIO-956) — ship it, or escalate.
     ///
@@ -386,6 +402,14 @@ pub struct ControlWatchSink {
     /// merge needs no loop-owned state at all, so routing it through the control channel would
     /// queue an irreversible network call behind the current tick for no benefit.
     automerge: Option<Arc<crate::runautomerge::AutoMergeDeps>>,
+    /// The `gh` comment seam and the room a draft poke (or its escalation) writes through
+    /// (STUDIO-962). Held here for [`Self::automerge`]'s reason: the poke is a `gh` comment and the
+    /// escalation also appends to the room, neither of which the control task may block on.
+    ///
+    /// Wiring is UNCONDITIONAL, like the auto-merge's and the findings route-back's: the feature's
+    /// gate is the run having handed over a pull request, which lives on the control task where the
+    /// plan is made, so an installation with nothing to poke sends no plan and this is never called.
+    draft_poke: Option<crate::draftpoke::DraftPokeDeps>,
     /// The manager's adjudication turn and its two audit writes (STUDIO-956), or `None` when
     /// `review.adjudicate_after_rounds` is unset. Held here for [`Self::automerge`]'s reason: the
     /// turn is a model call and the writes are a room append and a `gh` comment, none of which the
@@ -398,6 +422,7 @@ impl ControlWatchSink {
         ControlWatchSink {
             control,
             automerge: None,
+            draft_poke: None,
             adjudication: None,
         }
     }
@@ -410,6 +435,14 @@ impl ControlWatchSink {
         deps: Arc<crate::runautomerge::AutoMergeDeps>,
     ) -> ControlWatchSink {
         self.automerge = Some(deps);
+        self
+    }
+
+    /// Gives the sink the comment and room seams a draft poke needs (STUDIO-962). Without this a
+    /// plan is still emitted by the control task and this side says so once per plan, which a
+    /// daemon with no GitHub source or no room reaches only for the half it is missing.
+    pub fn with_draft_poke(mut self, deps: crate::draftpoke::DraftPokeDeps) -> ControlWatchSink {
+        self.draft_poke = Some(deps);
         self
     }
 
@@ -467,6 +500,18 @@ impl ReviewWatchSink for ControlWatchSink {
     }
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
         self.control.finish_review_ticket(plan).await
+    }
+    async fn nudge(&self, nudge: crate::draftpoke::DraftNudge) {
+        let Some(deps) = self.draft_poke.as_ref() else {
+            // The control task emits a plan, so this is only reachable on a daemon whose sink was
+            // built without the seams. Say so once per plan rather than silently dropping it.
+            tracing::warn!(
+                "draft poke: the watcher has no comment/room seams; the author is not poked"
+            );
+            return;
+        };
+        // Infallible by contract: `perform_nudge` logs every failure and retries nothing.
+        crate::draftpoke::perform_nudge(&nudge, deps, chrono::Utc::now()).await;
     }
     async fn adjudicate(&self, plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {
         let Some(deps) = self.adjudication.as_ref() else {
@@ -764,6 +809,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 done,
                 merge,
                 routed,
+                nudges,
                 adjudicate,
             } = one;
             report.dispatched += dispatched;
@@ -775,6 +821,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             report.routed += routed;
             report.done.extend(done);
             report.merge.extend(merge);
+            report.nudges.extend(nudges);
             report.adjudicate.extend(adjudicate);
         }
         if report != ReviewSweepReport::default() {
@@ -794,6 +841,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 done = report.done.len(),
                 merge = report.merge.len(),
                 routed = report.routed,
+                nudges = report.nudges.len(),
                 "ticketless review watcher tick"
             );
         }
@@ -816,6 +864,16 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 return;
             }
             deps.sink.finish(plan).await;
+        }
+        // The draft pokes (STUDIO-962), out here because each is a `gh` comment and an escalation
+        // is also a room append. After the merges and the auto-Done moves and before the
+        // adjudications, because nothing else waits on them: a poke that goes unposted costs one
+        // nudge, and the head not moving means the next tick does not repeat it.
+        for nudge in report.nudges {
+            if ctx.is_cancelled() {
+                return;
+            }
+            deps.sink.nudge(nudge).await;
         }
         // The manager adjudications (STUDIO-956), out here because each is a bounded model turn plus
         // a room append and a GitHub comment. Serially and with a cancellation check between them,
@@ -1138,17 +1196,23 @@ impl Orchestrator {
                     };
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
-                PrLookup::Found(snap) => self.service_review_pr(
-                    &rows,
-                    &obs.pr,
-                    ObservedHead {
-                        head: &snap.head_sha,
-                        merge_state: &snap.merge_state,
-                        unchanged_from: &obs.unchanged_from,
-                    },
-                    &mut slots,
-                    &mut report,
-                ),
+                PrLookup::Found(snap) => {
+                    // STUDIO-962: a finished run's pull request left in draft gets its author
+                    // poked, once per head, before the review dispatch below — the two are
+                    // independent and a draft may still owe a round.
+                    self.plan_draft_poke(&rows, &obs.pr, snap, &mut report);
+                    self.service_review_pr(
+                        &rows,
+                        &obs.pr,
+                        ObservedHead {
+                            head: &snap.head_sha,
+                            merge_state: &snap.merge_state,
+                            unchanged_from: &obs.unchanged_from,
+                        },
+                        &mut slots,
+                        &mut report,
+                    )
+                }
             }
         }
         (report, slots)
@@ -1196,6 +1260,136 @@ impl Orchestrator {
                 }
             })
             .unwrap_or(0)
+    }
+
+    /// Whether the implementation ticket `identifier` has a run in flight right now — the guard
+    /// that keeps a draft poke off a run that is still going (STUDIO-962).
+    ///
+    /// Reads `running`'s own issues, not a second index: a review run's synthetic issue carries
+    /// `pr:owner/repo#n@reviewer` as its identifier ([`crate::review::ReviewRun::key`]), so an
+    /// in-flight REVIEW of the pull request does not read as a live AUTHOR run, while the author's
+    /// own re-engaged run under the origin ticket does. `claimed` is deliberately not consulted — it
+    /// holds opaque issue IDs, which cannot be matched against an identifier without a second lookup
+    /// this path does not need; a claim that becomes a run is seen here on the next tick.
+    fn ticket_run_live(&self, identifier: &str) -> bool {
+        self.running
+            .values()
+            .any(|entry| entry.issue.identifier == identifier)
+    }
+
+    /// Plans the one poke — or, once the poking is exhausted, the human escalation — that a
+    /// finished run's still-draft pull request earns this tick (STUDIO-962).
+    ///
+    /// The trigger is the HANDOFF, not the process exiting: the rows this acts on exist because a
+    /// run handed its pull request over ([`crate::reviewintro`]) or the adoption sweep found a
+    /// parked one ([`crate::reviewadopt`]), so an observed draft is by construction one the author's
+    /// run has stopped working on. A row can also be introduced from the CONSOLE
+    /// ([`crate::reviewconsole`]) — a third source, with no run behind it — and those are excluded
+    /// by the `origin_ticket` gate below rather than by this sentence: a `console:` row names an
+    /// operator, not a ticket, so there is no run for a summons to reopen.
+    ///
+    /// The guards that remain are [`Self::ticket_run_live`] — a draft is normal mid-run, so a live
+    /// author run is never poked — and the per-head bookkeeping in [`Orchestrator::draft_pokes`],
+    /// which makes the poke once per head and the escalation once ever rather than once per tick.
+    ///
+    /// The poking is bounded on two axes (STUDIO-962, jimmy's round-1 finding): after
+    /// [`crate::draftpoke::MAX_DRAFT_POKES`] pokes (ATTEMPTS — the ledger remembers only the head
+    /// poked last, so `A → B → A` spends the budget), and after
+    /// [`crate::draftpoke::MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head. The second
+    /// is the one that matters for the incident this was filed on — a head that never moves would
+    /// otherwise get one poke and then silence, which is the parking the ticket names.
+    fn plan_draft_poke(
+        &mut self,
+        rows: &[ReviewWatchRow],
+        pr: &PrCoord,
+        snap: &PrSnapshot,
+        report: &mut ReviewSweepReport,
+    ) {
+        if snap.draft_published() {
+            // GitHub positively said it is NOT a draft — it was published. Forget the count so a
+            // re-draft starts afresh and the map does not grow for the daemon's whole life.
+            self.draft_pokes.remove(&churn_key(pr));
+            return;
+        }
+        if !snap.draft_observed() {
+            // GitHub did not say. An unstated answer is not a resolved draft: forgetting here would
+            // drop a ledger that may already have escalated and restart the poke cycle at the same
+            // head — acting on a guess, the direction the summon read exists to refuse. Change
+            // nothing; the ledger stands.
+            return;
+        }
+        let head = snap.head_sha.trim();
+        if head.is_empty() {
+            return; // an answer with no head is not an answer about a head
+        }
+        let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
+        // Only a pull request this daemon parked for a TICKET can be re-engaged by a summons: the
+        // token reopens that ticket's run. A `console:` row names an operator and has none.
+        let Some(identifier) = mine
+            .iter()
+            .find_map(|r| crate::reviewdone::origin_ticket(&r.introduced_by))
+        else {
+            return;
+        };
+        if self.ticket_run_live(identifier) {
+            return; // the author is working on it; a draft is entirely normal there
+        }
+        let author = mine
+            .iter()
+            .find(|r| !r.author.is_empty())
+            .map(|r| r.author.clone())
+            .unwrap_or_default();
+        let token = self.review_summon_token();
+        let state = self.draft_pokes.entry(churn_key(pr)).or_default();
+        if state.escalated {
+            return;
+        }
+        if state.pokes > 0 && state.poked_head == head {
+            // Already poked at this head: the author has not moved it. Count the sweeps it has
+            // stayed a draft and hand it to a human once the poke has clearly gone unanswered —
+            // the bound that makes the escalation reachable in the STATIC-head shape booch#537 had,
+            // where a distinct-head ceiling alone would poke once and then go silent forever.
+            state.unanswered_sweeps = state.unanswered_sweeps.saturating_add(1);
+            if state.unanswered_sweeps >= crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+                state.escalated = true;
+                report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
+                    crate::draftpoke::DraftEscalation {
+                        pr: pr.clone(),
+                        identifier: identifier.to_string(),
+                        author,
+                        pokes: state.pokes,
+                    },
+                ));
+            }
+            return;
+        }
+        if state.pokes >= crate::draftpoke::MAX_DRAFT_POKES {
+            state.escalated = true;
+            report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
+                crate::draftpoke::DraftEscalation {
+                    pr: pr.clone(),
+                    identifier: identifier.to_string(),
+                    author,
+                    pokes: state.pokes,
+                },
+            ));
+            return;
+        }
+        let pokes = state.pokes;
+        state.poked_head = head.to_string();
+        state.pokes += 1;
+        // A new head is a fresh poke: the unanswered-sweep clock restarts, because the author has
+        // demonstrably done something since the last poke.
+        state.unanswered_sweeps = 0;
+        report.nudges.push(crate::draftpoke::DraftNudge::Poke(
+            crate::draftpoke::DraftPokePlan {
+                pr: pr.clone(),
+                head: head.to_string(),
+                author,
+                summon_token: token,
+                pokes,
+            },
+        ));
     }
 
     /// How many dispatches one review ROUND costs for this installation — the unit the shared
@@ -1619,6 +1813,9 @@ impl Orchestrator {
         // route back, and leaving the entry would keep the reconciliation sweep silent about a
         // coordinate that is watched again later.
         self.conflict_routed.remove(pr);
+        // And the draft-poke bookkeeping (STUDIO-962): a re-introduced pull request must be poked
+        // afresh, and an entry for a gone one would be a map that only ever grows.
+        self.draft_pokes.remove(&churn_key(pr));
         // The failure record goes too (STUDIO-950 round 14): keyed by coordinate, it would otherwise
         // outlive the pull request it names and sit in the map for the daemon's whole life. It is
         // part of this function's own contract to forget EVERYTHING about the coordinate, even
@@ -2912,7 +3109,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -2937,7 +3134,7 @@ mod tests {
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: head.to_string(),
             status: PrStatus::Merged,
             merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
@@ -2951,7 +3148,7 @@ mod tests {
     /// One observation of a pull request that was CLOSED without merging.
     fn closed_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: head.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -3427,6 +3624,466 @@ mod tests {
         ));
     }
 
+    // --- draft pokes (STUDIO-962) -----------------------------------------------------------
+
+    /// One observation of an OPEN, DRAFT pull request at `head`.
+    fn draft_at(number: i64, head: &str) -> PrObservation {
+        observed(
+            number,
+            PrLookup::Found(PrSnapshot {
+                is_draft: Some(true),
+                head_sha: head.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+                // An UNSETTLED read (STUDIO-961): it decides no conflict and forgets none, which
+                // is what these draft fixtures want from a field they do not exercise.
+                merge_state: String::new(),
+            }),
+        )
+    }
+
+    /// One observation of an OPEN pull request at `head` whose payload carried NO boolean
+    /// `isDraft` — GitHub did not say whether it is a draft ([`PrSnapshot::is_draft`]).
+    fn unstated_at(number: i64, head: &str) -> PrObservation {
+        observed(
+            number,
+            PrLookup::Found(PrSnapshot {
+                is_draft: None,
+                head_sha: head.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+                // An UNSETTLED read (STUDIO-961): it decides no conflict and forgets none, which
+                // is what these draft fixtures want from a field they do not exercise.
+                merge_state: String::new(),
+            }),
+        )
+    }
+
+    /// The origin ticket with a run in flight RIGHT NOW — the mid-run shape a draft is normal in.
+    fn live_author_run(o: &mut Orchestrator, identifier: &str) {
+        let iss = rhapsody_core::Issue {
+            id: format!("ID-{identifier}"),
+            identifier: identifier.to_string(),
+            ..Default::default()
+        };
+        o.running.insert(iss.id.clone(), RunningEntry::empty(iss));
+    }
+
+    /// The heads a report's POKES named, in order. An escalation contributes nothing.
+    fn poked_heads(report: &ReviewSweepReport) -> Vec<String> {
+        report
+            .nudges
+            .iter()
+            .filter_map(|n| match n {
+                crate::draftpoke::DraftNudge::Poke(p) => Some(p.head.clone()),
+                crate::draftpoke::DraftNudge::Escalate(_) => None,
+            })
+            .collect()
+    }
+
+    /// The poke state for pull request `number`, if any.
+    fn poke_state(o: &Orchestrator, number: i64) -> Option<crate::draftpoke::DraftPokeState> {
+        o.draft_pokes.get(&churn_key(&coord(number))).cloned()
+    }
+
+    /// Acceptance: a finished run's still-draft pull request produces ONE summons naming the pull
+    /// request, its author and the head — the run is finished because the row exists (it was
+    /// handoff-introduced), and the poke is what asks the author to publish it.
+    #[test]
+    fn a_finished_draft_pull_request_pokes_its_author_once() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob")); // introduced_by: handoff:STUDIO-721
+
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Poke(p) => {
+                assert_eq!(p.pr, coord(12));
+                assert_eq!(p.head, HEAD_A);
+                assert_eq!(p.author, "alice");
+                assert_eq!(p.summon_token, "@symphony");
+                assert_eq!(p.pokes, 0, "the first poke");
+            }
+            other => panic!("expected a poke, got {other:?}"),
+        }
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
+            Some((HEAD_A.to_string(), 1))
+        );
+    }
+
+    /// ⚠️ Acceptance: no poke while the author's run is still going. A draft is entirely normal
+    /// mid-run; the trigger is run FINISHED and still draft, and this is the guard that says so.
+    #[test]
+    fn a_draft_is_not_poked_while_the_authors_run_is_live() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        live_author_run(&mut o, "STUDIO-721"); // `row`'s origin
+
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+
+        assert!(report.nudges.is_empty(), "{:?}", report.nudges);
+        assert!(
+            poke_state(&o, 12).is_none(),
+            "a live run must not even record a poke"
+        );
+    }
+
+    /// ⚠️ Acceptance: ONE poke per head, across many ticks with the state unchanged. The draft
+    /// persists until the author acts, so a per-tick summons would be a re-dispatch loop.
+    #[test]
+    fn a_draft_is_poked_once_per_head_not_once_per_tick() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        let first = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(poked_heads(&first), vec![HEAD_A.to_string()]);
+        for _ in 0..5 {
+            let again = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+            assert!(
+                again.nudges.is_empty(),
+                "the same head must never be poked twice consecutively"
+            );
+        }
+
+        // The author pushes but leaves it a draft: the new head is a new poke, exactly once.
+        let moved = o.handle_review_sweep(&[draft_at(12, HEAD_B)]);
+        assert_eq!(poked_heads(&moved), vec![HEAD_B.to_string()]);
+        assert!(
+            o.handle_review_sweep(&[draft_at(12, HEAD_B)])
+                .nudges
+                .is_empty()
+        );
+    }
+
+    /// ⚠️ Acceptance (alice's round-3 blocker): the unanswered-sweep clock counts CONSECUTIVE sweeps
+    /// at the SAME head, so a pushed head RESTARTS it. Without the reset, the clock carried across a
+    /// push would escalate an author who demonstrably just acted a few sweeps into the new head — at
+    /// poke 2 of 3, not the `MAX_DRAFT_POKES` the distinct-head axis promises.
+    #[test]
+    fn a_new_head_restarts_the_unanswered_sweep_clock() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // Poke HEAD_A, then sit at it for half the window — far enough that a carried clock would
+        // cross the bound soon after a push, but never crossing it at A.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        for _ in 0..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2 {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty()
+            );
+        }
+        let spent = crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2;
+        assert_eq!(
+            poke_state(&o, 12).map(|s| s.unanswered_sweeps),
+            Some(spent),
+            "the clock has advanced at the head that never moved"
+        );
+
+        // The author pushes but leaves it a draft: the new head is a fresh poke AND a fresh clock.
+        let moved = o.handle_review_sweep(&[draft_at(12, HEAD_B)]);
+        assert_eq!(poked_heads(&moved), vec![HEAD_B.to_string()]);
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.pokes, s.unanswered_sweeps)),
+            Some((2, 0)),
+            "a pushed head restarts the unanswered-sweep clock"
+        );
+        // And the new head gets the WHOLE window: a carried clock would escalate within a few sweeps.
+        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_B)])
+                    .nudges
+                    .is_empty(),
+                "sweep {sweep} at the new head: the clock restarted and the bound is not crossed"
+            );
+        }
+    }
+
+    /// ⚠️ Acceptance (jimmy's round-1 blocker): a draft IGNORED at a static head — the shape
+    /// booch#537 actually had — escalates to a human instead of parking in silence forever. The
+    /// distinct-head ceiling alone poked once and then heard from nobody, so this pins the SECOND
+    /// bound: the same head still draft for `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps.
+    #[test]
+    fn a_static_draft_head_escalates_to_a_human_after_a_bounded_silence() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // The one poke, at the head the author never moves.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        // The poke is unanswered and the head does not move: silence until the bound, then a human.
+        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty(),
+                "sweep {sweep}: the same head is never poked twice consecutively"
+            );
+        }
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Escalate(e) => {
+                assert_eq!(e.pr, coord(12));
+                assert_eq!(e.identifier, "STUDIO-721", "the origin ticket is named");
+                assert_eq!(e.author, "alice");
+                assert_eq!(e.pokes, 1, "poked once; the head never moved");
+                // `pokes == 1` is the PRIMARY shape of this axis, not an edge case — it is the only
+                // count a static head can produce — so its singular render is pinned here as a
+                // PHRASE. The trailing `to` discriminates: the plural form renders "made 1 attempts
+                // to", which does not contain "made 1 attempt to".
+                assert!(
+                    crate::draftpoke::escalation_body(e).contains("made 1 attempt to"),
+                    "the singular count is named: {}",
+                    crate::draftpoke::escalation_body(e)
+                );
+            }
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+        // And once a human holds it, the static head stays quiet forever rather than re-poking.
+        for _ in 0..5 {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty()
+            );
+        }
+    }
+
+    /// ⚠️ Acceptance (alice's round-2 blocker): an UNSTATED `isDraft` is not a published draft. A
+    /// pull request already handed to a human must survive a tick GitHub could not answer — if the
+    /// state-clearing branch took `None` as "resolved" it would drop the ledger, including
+    /// `escalated`, and the next `Some(true)` tick would restart the whole poke cycle at the same
+    /// head, re-summoning a run a human was just told to take over.
+    #[test]
+    fn an_unstated_draft_does_not_forget_the_poke_ledger() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // Poke the static head, then let it reach the human escalation.
+        o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        for _ in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        }
+        assert!(matches!(
+            o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                .nudges
+                .first(),
+            Some(crate::draftpoke::DraftNudge::Escalate(_))
+        ));
+
+        // GitHub does not say: no answer is not an answer, and the ledger — and the escalation —
+        // stands. Nothing is poked, and the state is not dropped.
+        let unstated = o.handle_review_sweep(&[unstated_at(12, HEAD_A)]);
+        assert!(unstated.nudges.is_empty(), "{:?}", unstated.nudges);
+        assert_eq!(
+            poke_state(&o, 12).map(|s| s.escalated),
+            Some(true),
+            "an unstated answer must not erase the escalation"
+        );
+
+        // And the next tick that positively says "still a draft" stays silent rather than reopening
+        // as a fresh "poke 1 of at most 3".
+        let again = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert!(again.nudges.is_empty(), "{:?}", again.nudges);
+    }
+
+    /// ⚠️ Acceptance (sol's round-5/6 blocker): an UNSTATED `isDraft` is never ACTED ON either. The
+    /// test above drives its `None` tick after the escalation has latched, so it returns on the
+    /// `escalated` branch and never reaches the unstated guard; this one drives a FRESH row, where
+    /// that guard is the only thing standing between "GitHub did not say" and a summons.
+    ///
+    /// Two halves, and both are load-bearing. The `None` tick must poke NOTHING and record nothing —
+    /// a recorded poke on an unstated answer is the "act on a guess" failure the `Option<bool>`
+    /// refactor exists to prevent, and it would also spend a poke of the bounded budget. The
+    /// `Some(true)` tick that follows must then poke normally, which is what says the guard SKIPPED
+    /// the tick rather than retiring the pull request from poking altogether.
+    #[test]
+    fn an_unstated_draft_on_a_fresh_pull_request_is_never_poked() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // GitHub did not say, and nothing has been poked yet: no summons, and no ledger at all.
+        let unstated = o.handle_review_sweep(&[unstated_at(12, HEAD_A)]);
+        assert!(
+            unstated.nudges.is_empty(),
+            "an answer GitHub never gave must not summon anyone: {:?}",
+            unstated.nudges
+        );
+        assert_eq!(
+            poke_state(&o, 12),
+            None,
+            "an unstated answer must not record a poke either"
+        );
+
+        // And the tick that positively says "still a draft" pokes normally — the guard skipped a
+        // tick, it did not retire the pull request from poking.
+        let stated = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(
+            poked_heads(&stated),
+            vec![HEAD_A.to_string()],
+            "the first STATED draft is poked exactly once: {:?}",
+            stated.nudges
+        );
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
+            Some((HEAD_A.to_string(), 1)),
+            "and it is the FIRST poke: the unstated tick spent none of the budget"
+        );
+    }
+
+    /// Acceptance: a draft ignored across every head escalates to a human rather than poking
+    /// forever, and names how many times it was poked.
+    #[test]
+    fn a_draft_ignored_across_every_head_escalates_to_a_human() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        const HEAD_D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+        for (n, head) in [HEAD_A, HEAD_B, HEAD_C].into_iter().enumerate() {
+            let report = o.handle_review_sweep(&[draft_at(12, head)]);
+            assert_eq!(
+                poked_heads(&report),
+                vec![head.to_string()],
+                "poke {}",
+                n + 1
+            );
+        }
+        // The next distinct head is not poked: the ceiling is reached and a human is asked instead.
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_D)]);
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Escalate(e) => {
+                assert_eq!(e.pr, coord(12));
+                assert_eq!(e.identifier, "STUDIO-721", "the origin ticket is named");
+                assert_eq!(e.author, "alice");
+                assert_eq!(e.pokes, crate::draftpoke::MAX_DRAFT_POKES);
+            }
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+        // Once handed to a human it stays quiet — at any head, for as long as the draft persists.
+        for _ in 0..3 {
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_D)])
+                    .nudges
+                    .is_empty()
+            );
+            assert!(
+                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                    .nudges
+                    .is_empty()
+            );
+        }
+    }
+
+    /// ⚠️ `MAX_DRAFT_POKES` counts ATTEMPTS, not distinct heads (alice's round-5 finding): the
+    /// ledger remembers only the head poked LAST, so a force-push back to an earlier head is a fresh
+    /// poke and `A → B → A` spends the whole budget on two distinct heads. This is the test the four
+    /// doc sites that used to say "distinct heads" were corrected to describe; without it the
+    /// "returning to an earlier head is a fresh poke" sentence is a claim nothing drives.
+    #[test]
+    fn a_force_push_back_to_an_earlier_head_is_a_fresh_poke() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // A → B → A: each move is a new head and so a new poke, even though the last one returns to
+        // a head already poked. Only TWO distinct heads are involved.
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_B)])),
+            vec![HEAD_B.to_string()]
+        );
+        let back = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(
+            poked_heads(&back),
+            vec![HEAD_A.to_string()],
+            "returning to an earlier head is a fresh poke"
+        );
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
+            Some((HEAD_A.to_string(), 3)),
+            "three ATTEMPTS across two distinct heads"
+        );
+
+        // The budget is now spent: the NEXT head escalates rather than being poked a fourth time.
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_C)]);
+        assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
+        match &report.nudges[0] {
+            crate::draftpoke::DraftNudge::Escalate(e) => {
+                assert_eq!(e.pokes, crate::draftpoke::MAX_DRAFT_POKES);
+            }
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+    }
+
+    /// A pull request the operator introduced names no ticket, so the summon token could re-engage
+    /// nobody: it is never poked. The watch set can hold such rows (`console:…`).
+    #[test]
+    fn a_console_introduced_pull_request_is_never_poked() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(
+            &o,
+            ReviewWatchRow {
+                introduced_by: "console:operator".to_string(),
+                ..row(12, "bob")
+            },
+        );
+
+        assert!(
+            o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                .nudges
+                .is_empty()
+        );
+    }
+
+    /// Marking it ready resolves the draft: the bookkeeping is dropped, so a later re-draft starts
+    /// afresh rather than inheriting a spent poke count.
+    #[test]
+    fn publishing_a_draft_clears_its_poke_state() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert!(poke_state(&o, 12).is_some());
+
+        let ready = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(ready.nudges.is_empty());
+        assert!(
+            poke_state(&o, 12).is_none(),
+            "a published draft forgets its pokes"
+        );
+    }
+
+    /// A pull request that leaves the watch set takes its poke bookkeeping with it, for the same
+    /// reasons `review_rounds` does — and so it cannot keep a stale count against a re-introduction.
+    #[test]
+    fn retiring_a_pull_request_forgets_its_poke_state() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert!(poke_state(&o, 12).is_some());
+
+        assert_eq!(
+            o.handle_review_sweep(&[observed(12, PrLookup::Gone)])
+                .retired,
+            1
+        );
+        assert!(poke_state(&o, 12).is_none());
+    }
+
     // --- the drop terminal ------------------------------------------------------------------
 
     /// Acceptance: a merged, closed or gone pull request is dropped from the watch set — and so is
@@ -3434,7 +4091,7 @@ mod tests {
     #[test]
     fn a_retired_pull_request_leaves_the_watch_set() {
         let merged = PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Merged,
             merged_at: None,
@@ -3442,7 +4099,7 @@ mod tests {
             merge_state: String::new(),
         });
         let closed = PrLookup::Found(PrSnapshot {
-            is_draft: false,
+            is_draft: Some(false),
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -4023,7 +4680,9 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                // STUDIO-962's tri-state: GitHub said "not a draft", which is what a conflicted
+                // pull request awaiting its author looks like.
+                is_draft: Some(false),
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -7459,6 +8118,7 @@ mod tests {
         async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
             self.finished.lock().expect("finished lock").push(plan);
         }
+        async fn nudge(&self, _plan: crate::draftpoke::DraftNudge) {}
         async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
@@ -7564,7 +8224,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: self.0.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -7588,7 +8248,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: format!("{number:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -8028,7 +8688,7 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let head = if call == 0 { &self.first } else { &self.rest };
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head.clone(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -8054,7 +8714,7 @@ mod tests {
         ) -> PrStateResult {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: format!("{n:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -8124,6 +8784,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _plan: crate::draftpoke::DraftNudge) {}
         async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
@@ -8319,7 +8980,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| HEAD_A.to_string());
             Ok(PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: head,
                 status: PrStatus::Open,
                 merged_at: None,
@@ -8371,6 +9032,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _plan: crate::draftpoke::DraftNudge) {}
         async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
@@ -8525,6 +9187,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _plan: crate::draftpoke::DraftNudge) {}
         async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 
@@ -8651,6 +9314,7 @@ mod tests {
         }
         async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _plan: crate::draftpoke::DraftNudge) {}
         async fn adjudicate(&self, _plan: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
     }
 

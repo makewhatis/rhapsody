@@ -1333,16 +1333,28 @@ pub struct PrSnapshot {
     pub head_sha: String,
     pub status: PrStatus,
     /// `isDraft` — whether the pull request is still a draft, and so cannot be merged by anyone.
+    /// `None` when GitHub's answer carried no boolean: the field is absent or is not a boolean. A
+    /// payload that does not say is deliberately not an error — the lookup also serves the review
+    /// watcher's head observation, and one field must not blind it — so an unstated answer is
+    /// `None` here and each caller decides what it means.
     ///
     /// Read because `mergeStateStatus` does NOT cover it: a draft with approvals and green checks
     /// reports `CLEAN`, and `gh pr merge` then fails with `GraphQL: Pull Request is still a draft`
     /// (STUDIO-881). It is on this payload rather than a seam of its own so the gate costs no extra
     /// round trip — the auto-merge already re-resolves the pull request here before merging.
     ///
-    /// Absent or non-boolean reads as `true`, which is the direction that REFUSES: a daemon that
-    /// cannot tell whether a pull request is a draft must not merge it. The only caller is the
-    /// auto-merge gate, so the safe default costs a stalled merge and never a wrong one.
-    pub is_draft: bool,
+    /// **The readers want opposite things from an unstated answer**, so each reads it through its
+    /// own method rather than a shared default:
+    /// [`draft_blocks_merge`](Self::draft_blocks_merge) (STUDIO-881) refuses unless GitHub
+    /// POSITIVELY said this is not a draft — a merge must never happen on a guess — while
+    /// [`draft_observed`](Self::draft_observed) (STUDIO-962) acts only on a POSITIVELY observed
+    /// draft, because a summon reopens the author's run and must never do so on a guess either. The
+    /// third read, [`draft_published`](Self::draft_published), is the poke's state-clearing gate: it
+    /// forgets a ledger only on a POSITIVELY observed publication, never on an unstated answer that
+    /// might otherwise restart a cycle already handed to a human. Do not collapse these back into
+    /// one `bool` with one default: the safe directions are opposite, and a single default is safe
+    /// for exactly one of them.
+    pub is_draft: Option<bool>,
     /// `mergedAt`, when GitHub states one it can parse. Informational: [`PrStatus::Merged`] is what
     /// a caller acts on.
     pub merged_at: Option<DateTime<Utc>>,
@@ -1361,6 +1373,34 @@ pub struct PrSnapshot {
     /// `UNKNOWN` must not move a ticket. It is a `String` rather than a closed enum for
     /// [`MergeStateResult`]'s reason — GitHub's vocabulary here is open and has grown before.
     pub merge_state: String,
+}
+
+impl PrSnapshot {
+    /// The auto-merge gate's draft read (STUDIO-881): refuse unless GitHub POSITIVELY said this is
+    /// NOT a draft. An unstated answer (`None`) blocks the merge, because a merge must never happen
+    /// on a guess and the cost of waiting is a stalled merge rather than a wrong one.
+    pub fn draft_blocks_merge(&self) -> bool {
+        self.is_draft != Some(false)
+    }
+
+    /// The summon's draft read (STUDIO-962): act only on a POSITIVELY observed draft. An unstated
+    /// answer (`None`) is not a draft here, because acting means posting a token-bearing comment
+    /// that reopens the author's run and tells them to publish a pull request that may already be
+    /// ready — up to three times, then a human escalation. The safe direction is the reverse of the
+    /// merge gate's, which is why the two are separate methods.
+    pub fn draft_observed(&self) -> bool {
+        self.is_draft == Some(true)
+    }
+
+    /// The poke's state-clearing read (STUDIO-962): forget what is known about a draft only when
+    /// GitHub POSITIVELY said this is NOT one. An unstated answer (`None`) is deliberately not a
+    /// publication: the draft bookkeeping may already have escalated, and dropping it would restart
+    /// the poke cycle at the same head — a fresh "poke 1 of at most 3" on a pull request a human was
+    /// just asked to take over. The unstated direction is the same one [`Self::draft_observed`]
+    /// refuses, applied to the other decision this feature makes.
+    pub fn draft_published(&self) -> bool {
+        self.is_draft == Some(false)
+    }
 }
 
 /// The outcome of a [`PrStateSource`] query, which is three-valued for a reason each case earns.
@@ -1596,13 +1636,11 @@ impl PrStateSource for GH {
                 .into());
             }
         };
-        // `true` when the field is absent or is not a boolean: see [`PrSnapshot::is_draft`]. An
-        // error here would be worse than a refusal, because it would take the watcher's head
-        // observation down with it for a field only the merge gate reads.
-        let is_draft = pr
-            .get("isDraft")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+        // `None` when the field is absent or is not a boolean: see [`PrSnapshot::is_draft`]. An
+        // error here would be worse than an unstated answer, because it would take the watcher's
+        // head observation down with it for a field only two gates read, and each of those reads it
+        // in its own safe direction.
+        let is_draft = pr.get("isDraft").and_then(serde_json::Value::as_bool);
         let merged_at = pr
             .get("mergedAt")
             .and_then(serde_json::Value::as_str)
@@ -2599,7 +2637,7 @@ mod tests {
         assert_eq!(
             got,
             PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: "93db6e8ec3b7c54071eb031ebac3be71eee1008a".to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -2636,7 +2674,7 @@ mod tests {
         assert_eq!(
             got,
             PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: "df574d9a665c6987d7c72d65f052ff5422862bc3".to_string(),
                 status: PrStatus::Merged,
                 merged_at: Some(utc(2026, 9, 2, 4, 37, 59)),
@@ -2660,7 +2698,7 @@ mod tests {
                 .await
                 .expect("pr_state"),
             PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: "abc".to_string(),
                 status: PrStatus::Closed,
                 merged_at: None,
@@ -2674,17 +2712,21 @@ mod tests {
     /// STUDIO-881: `isDraft` is read off the same payload, because `mergeStateStatus` does not
     /// cover it — the two live drafts that motivated the ticket both reported `CLEAN`.
     ///
-    /// A payload with no `isDraft` at all reads as a DRAFT, which is the direction that refuses to
-    /// merge. An error would be the wrong shape: this call is also the review watcher's head
-    /// observation, and one field only the merge gate reads must not be able to blind it.
+    /// A payload with no `isDraft` at all reads as `None`, and each reader takes it in its OWN safe
+    /// direction (STUDIO-962): the merge gate refuses (see `draft_blocks_merge`), the draft poke
+    /// does not act (`draft_observed`), and the poke does not forget its ledger
+    /// (`draft_published`). An error would be the wrong shape: this call is also the review
+    /// watcher's head observation, and one field three gates read must not be able to blind it.
     #[tokio::test]
-    async fn pr_state_reads_is_draft_and_treats_an_absent_field_as_one() {
-        for (payload, want, why) in [
+    async fn pr_state_reads_is_draft_and_leaves_an_unstated_answer_to_each_reader() {
+        for (payload, blocks_merge, observed, published, why) in [
             (
                 r#"{"headRefOid":"abc","state":"OPEN","isDraft":true,
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
+                true,
+                false,
                 "a draft is reported as one",
             ),
             (
@@ -2692,6 +2734,8 @@ mod tests {
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 false,
+                false,
+                true,
                 "a ready pull request is not a draft",
             ),
             (
@@ -2699,14 +2743,18 @@ mod tests {
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
-                "an absent isDraft refuses rather than merging blind",
+                false,
+                false,
+                "an absent isDraft refuses the merge but does not summon or forget",
             ),
             (
                 r#"{"headRefOid":"abc","state":"OPEN","isDraft":"no",
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 true,
-                "a non-boolean isDraft refuses too",
+                false,
+                false,
+                "a non-boolean isDraft refuses the merge too, and neither summons nor forgets",
             ),
         ] {
             let src = GH::new(
@@ -2720,7 +2768,9 @@ mod tests {
             else {
                 panic!("expected a found pull request ({why})");
             };
-            assert_eq!(snap.is_draft, want, "({why})");
+            assert_eq!(snap.draft_blocks_merge(), blocks_merge, "({why})");
+            assert_eq!(snap.draft_observed(), observed, "({why})");
+            assert_eq!(snap.draft_published(), published, "({why})");
         }
     }
 
@@ -2953,7 +3003,7 @@ mod tests {
                 .await
                 .expect("lookup"),
             PrLookup::Found(PrSnapshot {
-                is_draft: false,
+                is_draft: Some(false),
                 head_sha: "abc".to_string(),
                 status: PrStatus::Merged,
                 merged_at: None,

@@ -486,6 +486,10 @@ where
     // `None` — no on-disk runtime home, or Teams off — leaves every Teams task room-less, which is
     // the pre-T5 behaviour: the work still happens and only the history is lost.
     let triage_room = teams_room.clone();
+    // The review watcher's escalation room (STUDIO-962), another clone of the same handle: a draft
+    // poke's human escalation is a manager post, and it must serialize with every other appender's
+    // for the reason above.
+    let watch_room = teams_room.clone();
     let quorum_room = teams_room;
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
@@ -844,7 +848,20 @@ where
             }),
         });
         let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
-            .with_auto_merge(automerge);
+            .with_auto_merge(automerge)
+            // The draft poke's two writes (STUDIO-962): a `gh` comment (the summons) and, when the
+            // poking is exhausted, a room post. Wired UNCONDITIONALLY, like the seams above and for
+            // the same reason — the plan is gated on the control task, so an installation with
+            // nothing to poke emits none and this is never called. `gh` is the same handle the
+            // auto-merge uses; only its `PrCommentSink` face is taken here.
+            .with_draft_poke(rhapsody_orchestrator::draftpoke::DraftPokeDeps {
+                comments: Some(
+                    Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrCommentSink>
+                ),
+                room: watch_room
+                    .clone()
+                    .map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            });
         // The manager adjudication turn (STUDIO-956), wired on its OWN gate —
         // `review.adjudicate_after_rounds` — and not on `manager.mode`, so a `labels`-mode install
         // that asks for it still gets a decision. Its turn runs under `manager.model` /

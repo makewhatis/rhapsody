@@ -233,7 +233,7 @@ mod tests {
             FakeSource {
                 answer: Box::new(|n| {
                     Ok(PrLookup::Found(PrSnapshot {
-                        is_draft: false,
+                        is_draft: Some(false),
                         head_sha: format!("sha{n}"),
                         status: PrStatus::Open,
                         merged_at: None,
