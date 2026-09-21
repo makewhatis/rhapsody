@@ -470,12 +470,16 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
         live: true,
       }),
     ];
-    // The buckets `handle_issue_counts` serves for this store: the three review rows folded onto
-    // their two Done tickets, the live ticket overridden to `running`, so the tally is 1 Queued
-    // (STUDIO-958), 1 Running (STUDIO-963) and no review bucket. On a COMPLETE page every header is
-    // the fold's card count and the tally is inert, so no lane claims a phantom and the pagination
-    // copy never appears — THE MUTATION: make that copy unconditional and the `/in this lane/`
-    // assertion reds. (The page where the tally is NOT inert is pinned just below.)
+    // The tally the PRE-FIX endpoint served for this store: the three review rows billed as their
+    // own buckets (two failed ⇒ Blocked 2, one interrupted ⇒ Queued 1) on top of STUDIO-958
+    // (Queued 1) and the review ticket read off its lifecycle (In Review 1). Every one of those
+    // exceeds what the board can draw — 2 Queued / 1 card, 1 In Review / 0 cards, 2 Blocked / 0
+    // cards — which is the phantom this ticket removes. On a COMPLETE page the board holds every row
+    // there is, so the header is what the lane DRAWS and the pagination copy never appears, however
+    // large the tally is: THE MUTATIONS — make that copy unconditional (drop `truncated &&`) and the
+    // `/in this lane/` assertion reds; make the header read the tally on a complete page
+    // (`count = tally ?? rendered`) and the `count("queued")`/`count("review")` assertions red. (The
+    // page where the tally is legitimately load-bearing is pinned just below.)
     mount(
       rows,
       vi.fn(),
@@ -484,7 +488,10 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
         buckets: [
           { outcome: "completed", lifecycle: "done", count: 2 },
           { outcome: "completed", lifecycle: "open", count: 1 },
+          { outcome: "completed", lifecycle: "in_review", count: 1 },
           { outcome: "running", lifecycle: "in_review", count: 1 },
+          { outcome: "failed", count: 2 },
+          { outcome: "interrupted", count: 1 },
         ],
       })!,
       6,
@@ -511,15 +518,14 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
   });
 
   // B2 — THE GUARD THE TICKET REQUIRED, and the page the operator actually reported. The test above
-  // mounts a COMPLETE page, where `count = rendered` and the daemon's tally is inert: nothing there
-  // reads the server's number, so deleting the tally from the header would leave it green. The
-  // reported screen was TRUNCATED (585 issues against a 50-row page, the pagination copy on show),
-  // and on a truncated page the lane header IS the tally — the one place the fix lives. So this
-  // starts from a payload shaped exactly as `handle_issue_counts` serves it and drives it through
-  // `consoleStoreCounts` into `BoardView` at `hasMore: true`, with ONE genuine truncation gap (a
-  // Queued card on an older page) so the tally is load-bearing. MUTATION: make the header ignore the
-  // tally on a truncated page (`count = rendered`) and the Queued assertion reds; make the gap copy
-  // unconditional and the review-lane no-phantom assertion reds.
+  // mounts a COMPLETE page, where `count = rendered` gates the tally out; its over-counting payload
+  // makes that gate load-bearing, but the server's number never reaches a complete page's header.
+  // The reported screen was TRUNCATED (585 issues against a 50-row page, the pagination copy on
+  // show), and on a truncated page the lane header IS the tally — the one place the fix lives. So
+  // this starts from a payload shaped exactly as `handle_issue_counts` serves it and drives it
+  // through `consoleStoreCounts` into `BoardView` at `hasMore: true`, with ONE genuine truncation gap
+  // (a Queued card on an older page) so the tally is load-bearing. MUTATION: make the header ignore
+  // the tally on a truncated page (`count = rendered`) and the Queued assertion reds (1, not 2).
   it("reads the daemon's tally on a truncated page, and claims no card the page cannot draw", () => {
     const rows = [
       row({ issue: "STUDIO-949", trackerState: "Done", status: "done", statusLabel: "done" }),

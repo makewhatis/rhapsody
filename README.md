@@ -365,8 +365,9 @@ for both the listing row and the bucket, so the strip and the card cannot disagr
 Each bucket spells its fields exactly as a listing row spells them, absences included. The two
 endpoints no longer count the same SET — the listing pages RUNS and still returns a review row as
 its own row — but a bucket and the row of the same ticket describe the same facts, so one
-vocabulary. A `review_run: true` bucket survives only for an orphan review (an adopted pull request
-whose ticket never ran here), and a LIVE one is a Running row the board draws. The lifecycle lookup
+vocabulary. A `review_run: true` bucket survives only for a LIVE review run — a Running row the board
+draws, folded onto its ticket's card or not — or for an orphan review (an adopted pull request whose
+ticket never ran here). The lifecycle lookup
 is filtered by `review::is_review_key` exactly as the listing filters it (STUDIO-831) — one
 synthetic `pr:owner/repo#n@reviewer` id in a Linear `id: { in: … }` batch fails the whole request,
 silently — and the snapshot's `running`/`retrying` sets are folded in the way the worklist folds
