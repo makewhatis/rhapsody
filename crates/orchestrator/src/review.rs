@@ -413,8 +413,8 @@ impl Orchestrator {
         // (and let two held reviewers overwrite each other's provider/figures). The coordinate
         // rides on the hold as `pr` so the reconciliation sweep still finds every hold for a
         // divergence it reports.
-        let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         if self.budgets_configured() {
+            let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
             let provider = self.review_projected_provider(&iss, &route.slug);
             if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
                 self.note_review_budget_hold(&id, &pr, &route.slug, &provider, limit, spent);
