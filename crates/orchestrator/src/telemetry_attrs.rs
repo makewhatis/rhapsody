@@ -1,10 +1,11 @@
 //! telemetry_attrs — parity port of Go `internal/orchestrator/telemetry_attrs.go`.
 //!
 //! Bounded metric-label builders (the cardinality contract, design spec §cross-cutting #1): every
-//! metric attribute is one of project / model / outcome / reason. NEVER add an issue/run/session
-//! identifier here — high-cardinality identity belongs on spans and logs. The label values come
-//! from data already in scope (the running entry / worker deps); an empty slug/model (legacy
-//! single-project or test-injected paths) records as an empty-string label, which stays bounded.
+//! metric attribute is one of project / model / harness / provider / outcome / reason. NEVER add an
+//! issue/run/session identifier here — high-cardinality identity belongs on spans and logs. The
+//! label values come from data already in scope (the running entry / worker deps); an empty
+//! slug/model (legacy single-project or test-injected paths) records as an empty-string label,
+//! which stays bounded.
 //!
 //! The metric-emitting call sites (dispatch/worker/retry) live in later tickets (O2/O3/O5); the
 //! real OpenTelemetry export wiring is P6. Go reads the attribute KEYS from its `telemetry` package
@@ -14,8 +15,17 @@
 
 /// Metric attribute key: the owning project's slug.
 pub const ATTR_PROJECT: &str = "project";
-/// Metric attribute key: the effective claude model.
+/// Metric attribute key: the model the run actually used. NOT "the claude model" — that single-
+/// provider assumption was invalidated by the multi-harness work (STUDIO-902/909) and nothing had
+/// revisited this doc (STUDIO-957).
 pub const ATTR_MODEL: &str = "model";
+/// Metric attribute key: the harness the run actually used (`claude` | `opencode`) — the backend
+/// that produced the run, which `model` alone cannot name (STUDIO-957).
+pub const ATTR_HARNESS: &str = "harness";
+/// Metric attribute key: the provider account the run billed. A model name is not a substitute: the
+/// quota pool is a property of the account, not the model string (STUDIO-908), so a token metric
+/// without this dimension cannot answer "how much did each account spend" (STUDIO-957).
+pub const ATTR_PROVIDER: &str = "provider";
 /// Metric attribute key: the terminal run outcome.
 pub const ATTR_OUTCOME: &str = "outcome";
 /// Metric attribute key: the bounded failure reason.
@@ -30,8 +40,8 @@ pub const REASON_ERROR: &str = "error";
 
 /// One metric attribute (bounded key → value). The Rust stand-in for OpenTelemetry's
 /// `attribute.KeyValue` (there is no telemetry crate this phase); P6 maps these onto the real
-/// exporter. The key is always one of the bounded [`ATTR_PROJECT`]/[`ATTR_MODEL`]/[`ATTR_OUTCOME`]/
-/// [`ATTR_REASON`] constants.
+/// exporter. The key is always one of the bounded [`ATTR_PROJECT`]/[`ATTR_MODEL`]/[`ATTR_HARNESS`]/
+/// [`ATTR_PROVIDER`]/[`ATTR_OUTCOME`]/[`ATTR_REASON`] constants.
 pub type Attr = (&'static str, String);
 
 /// Labels the project-only instruments (dispatched/completed/retried/stalled). Mirrors Go
@@ -58,11 +68,15 @@ pub fn run_attrs(slug: &str, model: &str, outcome: &str) -> Vec<Attr> {
     ]
 }
 
-/// Labels the token counters with project + model. Mirrors Go `tokenAttrs`.
-pub fn token_attrs(slug: &str, model: &str) -> Vec<Attr> {
+/// Labels the token counters with project + model + harness + provider (STUDIO-957). Additive over
+/// Go's `project`/`model` pair: a model name is not a provider, so the provider dimension is what
+/// makes "how much did each account spend" answerable from the metrics at all.
+pub fn token_attrs(slug: &str, model: &str, harness: &str, provider: &str) -> Vec<Attr> {
     vec![
         (ATTR_PROJECT, slug.to_string()),
         (ATTR_MODEL, model.to_string()),
+        (ATTR_HARNESS, harness.to_string()),
+        (ATTR_PROVIDER, provider.to_string()),
     ]
 }
 
@@ -106,14 +120,26 @@ mod tests {
     }
 
     #[test]
-    fn token_attrs_labels_project_and_model() {
+    fn token_attrs_labels_project_model_harness_and_provider() {
         assert_eq!(
-            token_attrs("alpha", "opus"),
+            token_attrs("alpha", "opus", "claude", "anthropic"),
             vec![
                 (ATTR_PROJECT, "alpha".to_string()),
                 (ATTR_MODEL, "opus".to_string()),
+                (ATTR_HARNESS, "claude".to_string()),
+                (ATTR_PROVIDER, "anthropic".to_string()),
             ]
         );
+    }
+
+    // The provider dimension is its own key, distinct from the model. Dropping it (or reusing
+    // `model`) is the mutation this pins (STUDIO-957).
+    #[test]
+    fn provider_is_not_model() {
+        assert_ne!(ATTR_PROVIDER, ATTR_MODEL);
+        assert_ne!(ATTR_HARNESS, ATTR_MODEL);
+        let attrs = token_attrs("alpha", "opus", "claude", "anthropic");
+        assert!(attrs.iter().any(|(k, _)| *k == ATTR_PROVIDER));
     }
 
     // The reason constants are the exact Go string values (issues.failed's bounded subset).

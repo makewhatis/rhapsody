@@ -10,8 +10,17 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 /// Metric attribute key: the owning project's slug. Mirrors Go `AttrProject`.
 pub const ATTR_PROJECT: &str = "project";
-/// Metric attribute key: the claude model. Mirrors Go `AttrModel`.
+/// Metric attribute key: the model the run actually used. NOT "the claude model" — the multi-harness
+/// work (STUDIO-902/909) invalidated that single-provider assumption and this doc had not been
+/// revisited (STUDIO-957). Mirrors Go `AttrModel` in KEY only; the VALUE is harness-agnostic now.
 pub const ATTR_MODEL: &str = "model";
+/// Metric attribute key: the harness the run ran on (`claude` | `opencode`) — the backend `model`
+/// alone cannot name (STUDIO-957). Additive; Go has no such attribute.
+pub const ATTR_HARNESS: &str = "harness";
+/// Metric attribute key: the provider account the run billed (STUDIO-957). The quota pool is a
+/// property of the account, not the model string (STUDIO-908), so `model` is not a substitute.
+/// Additive; Go has no such attribute.
+pub const ATTR_PROVIDER: &str = "provider";
 /// Metric attribute key: the run/turn terminal outcome. Mirrors Go `AttrOutcome`.
 pub const ATTR_OUTCOME: &str = "outcome";
 /// Metric attribute key: the bounded failure reason (`error` | `stalled`). Mirrors Go `AttrReason`.
@@ -137,8 +146,12 @@ impl Metrics {
         self.turn_dur.record(secs, attrs);
     }
 
-    /// Records the input/output/total token counters together (attrs: project, model). Mirrors Go
-    /// `Metrics.Tokens`.
+    /// Records the input/output/total token counters together (attrs: project, model, harness,
+    /// provider). The harness/provider pair is additive over Go's project/model (STUDIO-957).
+    ///
+    /// NOTE: no production call site feeds these counters yet — the recording site is still a
+    /// separate concern (constraint 2 on STUDIO-957). The attribute CONTRACT is correct regardless,
+    /// so wiring the site later needs no further change here.
     pub fn tokens(&self, input: i64, output: i64, total: i64, attrs: &[KeyValue]) {
         self.in_tok.add(input as u64, attrs);
         self.out_tok.add(output as u64, attrs);
@@ -305,5 +318,37 @@ mod tests {
                 ("outcome", "completed"),
             ],
         );
+    }
+
+    // STUDIO-957: the token counters carry the PROVIDER and HARNESS dimensions as their own keys,
+    // not as a substituted `model`. Dropping either (or folding provider into model) fails this:
+    // the datapoint's attribute set is no longer a superset of what is asserted.
+    #[test]
+    fn token_counters_carry_provider_and_harness() {
+        let (m, exporter, mp) = collectable();
+        m.tokens(
+            10,
+            5,
+            15,
+            &[
+                KeyValue::new(ATTR_PROJECT, "alpha"),
+                KeyValue::new(ATTR_MODEL, "fireworks-ai/accounts/fireworks/models/x"),
+                KeyValue::new(ATTR_HARNESS, "opencode"),
+                KeyValue::new(ATTR_PROVIDER, "fireworks-ai"),
+            ],
+        );
+        let rm = collect(&mp, &exporter);
+        require_datapoint_attrs(
+            &rm,
+            "symphony.tokens.total",
+            &[
+                ("provider", "fireworks-ai"),
+                ("harness", "opencode"),
+            ],
+        );
+        // The provider key is distinct from the model key: the exact trap a single-provider
+        // assumption sets (a model name is not an account).
+        assert_ne!(ATTR_PROVIDER, ATTR_MODEL);
+        assert_ne!(ATTR_HARNESS, ATTR_MODEL);
     }
 }

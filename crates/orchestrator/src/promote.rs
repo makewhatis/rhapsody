@@ -902,6 +902,13 @@ mod tests {
         fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
             self.0.metrics(since_days, project)
         }
+        fn metrics_by_provider(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rhapsody_store::DayProviderRollup>, StoreError> {
+            self.0.metrics_by_provider(since_days, project)
+        }
         fn set_run_provenance(
             &self,
             id: i64,
