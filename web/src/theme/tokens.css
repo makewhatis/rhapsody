@@ -67,6 +67,12 @@
      available: `--operator` owns it as the operator's VOICE, and a status pill is not a voice. */
   --reviewing: #a98be0;
   --reviewing-soft: #221b30;
+  /* The `parked` status tone (STUDIO-966) — a ticket the dispatcher will never pick up, sitting
+     outside its project's `active_states` (Backlog, Triage). A muted slate, deliberately neither
+     `queued`'s grey (which claims an agent is coming) nor `blocked`'s red (which claims a fault):
+     the hold is a person's, and the row has to say so without reading as either. */
+  --parked: #8a9bbd;
+  --parked-soft: #1a1f2b;
 
   /* ---- the two named teammate colors the prototype ships, plus info ----
      Kept because §1.1 lists them; NOTHING assigns a teammate color from these by

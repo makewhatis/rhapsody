@@ -1,7 +1,14 @@
 import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
-export type PillVariant = "run" | "reviewing" | "review" | "queued" | "done" | "blocked";
+export type PillVariant =
+  | "run"
+  | "reviewing"
+  | "review"
+  | "queued"
+  | "done"
+  | "blocked"
+  | "parked";
 
 /**
  * The color each variant paints, as declared in `theme/console.css`. Exported so a view
@@ -19,6 +26,10 @@ export const PILL_COLORS: Record<PillVariant, string> = {
   queued: "var(--ink-3)",
   done: "var(--info)",
   blocked: "var(--bad)",
+  // `parked` (STUDIO-966) — a ticket outside its project's `active_states`, which no agent will
+  // pick up: a deliberate hold, not a failure. Its own hue because `queued`'s grey would read as
+  // "an agent is coming" and `blocked`'s red as a fault, and neither is true.
+  parked: "var(--parked)",
 };
 
 export interface PillProps extends HTMLAttributes<HTMLSpanElement> {
