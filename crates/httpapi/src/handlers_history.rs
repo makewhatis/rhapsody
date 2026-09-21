@@ -12,7 +12,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
 use rhapsody_orchestrator::{IssueKey, IssueLifecycleRow, review};
-use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, effective_run_limit};
+use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, RunSummary, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
@@ -408,13 +408,15 @@ pub(crate) async fn handle_history_costs(
 ///
 /// A review row whose origin ticket HAS a card row (stored, or live with no stored row yet) adds
 /// nothing: the ticket's own bucket already counts it. One whose origin resolves to a ticket with NO
-/// row at all still counts ONCE for that ticket — the newest of its several rounds, so a ticket with
-/// three reviews still counts once (trap 2) and the row is never an orphan that counts nowhere
-/// (trap 4). It keeps the REVIEW's own key, though, so `review_run` survives and a finished review
-/// still reads `done` rather than the `review` a completed ticket would mean; the board cannot draw
-/// the ticket's card (there is no row), so the lane reports the honest "not among the jobs loaded"
-/// gap. A review row whose origin names no ticket is not work and is dropped, exactly as the board
-/// drops it.
+/// row at all still counts ONCE for that ticket (trap 4). Its several rounds are reduced to the one
+/// the board draws — a LIVE round if there is one (the board renders it as its own Running row and
+/// drops the finished rounds' chips, which have no card to fold onto), else the newest finished
+/// round — so a ticket with three reviews still counts once (trap 2) and the row is never an orphan
+/// that counts nowhere. It keeps the REVIEW's own key, though, so `review_run` survives and a
+/// finished review still reads `done` rather than the `review` a completed ticket would mean; the
+/// board cannot draw the ticket's card (there is no row), so the lane reports the honest "not among
+/// the jobs loaded" gap. A review row whose origin names no ticket is not work and is dropped,
+/// exactly as the board drops it.
 ///
 /// The lane is the RUN's, not the lifecycle's (trap 2): a ticket the snapshot has in flight or
 /// parked for retry buckets as `running` whatever its tracker state says, because that is where
@@ -517,52 +519,82 @@ pub(crate) async fn handle_issue_counts(
     // groups by identifier and so does `list_issue_runs`, so a live run with a stored row is ONE
     // row on both sides; an empty identifier never groups on either, so it never joins this set.
     let mut counted: HashSet<&str> = HashSet::new();
+    // The review rounds of each ticket with NO card of its own — an orphan: a review row whose
+    // origin resolves to a ticket that has neither a stored row nor a live run. Every such ticket
+    // is ONE unit (trap 2), so the rounds are grouped here and reduced to the one the board draws,
+    // below. A review whose origin names no ticket is not work (the board drops it,
+    // `buildConsoleBoard`) and never joins this map — it counts nowhere.
+    let mut orphan_rounds: HashMap<&str, Vec<&RunSummary>> = HashMap::new();
     for r in &runs {
-        // The TICKET this row counts for — itself, or the ticket a review run is OF. A review run
-        // whose origin names no ticket is not work (the board drops it, `buildConsoleBoard`), so it
-        // counts nowhere; one whose ticket already has a card is folded into it, above.
-        let card: &str = if review::is_review_key(&r.issue_id) {
-            match origins.get(&r.issue_id) {
-                Some(origin) if !card_idents.contains(origin.as_str()) => origin.as_str(),
-                _ => continue,
-            }
-        } else {
-            r.issue_identifier.as_str()
+        if !review::is_review_key(&r.issue_id) {
+            continue;
+        }
+        if let Some(origin) = origins.get(&r.issue_id)
+            && !origin.is_empty()
+            && !card_idents.contains(origin.as_str())
+        {
+            orphan_rounds.entry(origin.as_str()).or_default().push(r);
+        }
+    }
+    for (origin, rounds) in &orphan_rounds {
+        // The LIVE round wins the dedupe: `buildConsoleBoard` drops a finished review's chip (the
+        // orphan ticket has no card to fold it onto) while `runningRuns` draws the live round as
+        // its own Running row, so the one unit the tally reports must be the live round's bucket.
+        // Picking the newest round instead put a finished orphan in a finished lane while the body
+        // drew the live row in Running — the header/body disagreement this ticket removes, in the
+        // branch trap 4 added. With no live round, the newest finished round decides, as before
+        // (`runs` is newest-first).
+        let picked = rounds
+            .iter()
+            .copied()
+            .find(|r| live.contains(r.issue_id.as_str()))
+            .or_else(|| rounds.first().copied());
+        let Some(picked) = picked else {
+            continue;
         };
-        // ONE bucket per card. A normal row and its identifier are 1:1, so this only bites for an
-        // orphan review, where several review rounds stand in for one ticket with no row of its own:
-        // the newest row decides the card (STUDIO-965 trap 2 — three failed reviews count once).
+        // EVERY round of the orphan is marked counted, not just the picked one, so the live overlay
+        // below cannot bill a live round a second time on top of the card it already stands in for.
+        for r in rounds {
+            counted.insert(r.issue_id.as_str());
+        }
+        counted.insert(origin);
+        // The lifecycle is keyed by the store's ISSUE ID, which only a real ticket row has. An
+        // orphan review resolves no lifecycle, so it carries none and the client falls back to the
+        // run outcome exactly as the board does for a card it cannot decorate. Its key stays the
+        // REVIEW's OWN, though, so `review_run` survives: a finished review means the review
+        // finished (`done`), never that a ticket is owed one (`review`). Bucketing the orphan under
+        // its ticket's identifier dropped that bit and read every finished orphan as In Review —
+        // the same header/card disagreement this ticket removes.
+        let outcome = if live.contains(picked.issue_id.as_str()) {
+            OUTCOME_RUNNING
+        } else {
+            picked.outcome.as_str()
+        };
+        *buckets
+            .entry(status_key(&picked.issue_id, outcome, &lifecycles))
+            .or_insert(0) += 1;
+    }
+    // Every ordinary stored row (a ticket, not a review) is one bucket. A stored row always lands
+    // in its lifecycle's bucket, held or not: a hold that has run keeps the run's lane on the
+    // console (its card is in Review, sub-labelled "held for a human"), so the strip must count it
+    // there. Only a hold with NO stored row is reclassified, below, in `held_for_human`.
+    //
+    // The lane is the RUN's, not the lifecycle's (STUDIO-965 trap 2): a ticket with a live run
+    // counts in Running even when its tracker state says In Review, because that is where the board
+    // draws its card (`boardLaneOf`). The live override is what makes the two agree.
+    for r in &runs {
+        if review::is_review_key(&r.issue_id) {
+            continue;
+        }
+        let card = r.issue_identifier.as_str();
         if card.is_empty() || !counted.insert(card) {
             continue;
         }
-        // An orphan review is counted as its ticket's card, so the review RUN itself must not then
-        // be counted a second time by the live overlay below. (A FOLDED review is deliberately left
-        // uncounted here: if it is live, the board draws it as its own Running run row, and the
-        // overlay below is what counts that row.)
-        if review::is_review_key(&r.issue_id) {
-            counted.insert(r.issue_id.as_str());
-        }
-        // A stored row always lands in its lifecycle's bucket, held or not: a hold that has run
-        // keeps the run's lane on the console (its card is in Review, sub-labelled "held for a
-        // human"), so the strip must count it there. Only a hold with NO stored row is
-        // reclassified, below, in `held_for_human`.
-        //
-        // The lane is the RUN's, not the lifecycle's (STUDIO-965 trap 2): a ticket with a live run
-        // counts in Running even when its tracker state says In Review, because that is where the
-        // board draws its card (`boardLaneOf`). The live override is what makes the two agree.
         let outcome = if live.contains(card) {
             OUTCOME_RUNNING
         } else {
             r.outcome.as_str()
         };
-        // The lifecycle is keyed by the store's ISSUE ID, which only a real ticket row has. An
-        // orphan review — one whose ticket has no stored row at all — resolves no lifecycle, so it
-        // carries none and the client falls back to the run outcome exactly as the board does for a
-        // card it cannot decorate. Its key stays the REVIEW's OWN, though, so `review_run` survives:
-        // a finished review means the review finished (`done`), never that a ticket is owed one
-        // (`review`). Bucketing the orphan under its ticket's identifier dropped that bit and read
-        // every finished orphan as In Review — the same header/card disagreement this ticket
-        // removes, in the branch trap 4 added.
         *buckets
             .entry(status_key(&r.issue_id, outcome, &lifecycles))
             .or_insert(0) += 1;
@@ -2416,6 +2448,63 @@ mod tests {
             tally(&body),
             std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
             "the live orphan review is one card, not also a run of its own: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 trap 4, mixed ordering. An orphan ticket (a review row whose origin has no stored
+    // row) with an OLDER live review round and a NEWER finished one is still ONE unit, and it
+    // counts in the LIVE round's lane: `buildConsoleBoard` drops the finished review's chip (there
+    // is no card to fold it onto) and `runningRuns` draws the live round as its own Running row.
+    // Deduping by the newest round alone let the finished round claim the card, then the live
+    // overlay counted the live round again — two units, one of them in a lane the board cannot
+    // draw: the header/body disagreement this ticket removes, in the branch trap 4 added.
+    // MUTATION: pick the newest round regardless of `live` and this reds with a second bucket.
+    #[tokio::test]
+    async fn issue_counts_an_orphan_with_a_live_round_counts_once_in_running() {
+        let store = mem_store();
+        // The older round is still in flight; the newer one finished. Same adopted ticket, no row.
+        let live_key = "pr:makewhatis/rhapsody#151@alice";
+        store
+            .start_run(RunStart {
+                issue_id: live_key.to_string(),
+                issue_identifier: live_key.to_string(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start live review run");
+        let done_key = "pr:makewhatis/rhapsody#152@sol";
+        let done_id = store
+            .start_run(RunStart {
+                issue_id: done_key.to_string(),
+                issue_identifier: done_key.to_string(),
+                started_at: "2026-08-01T01:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start finished review run");
+        store
+            .end_run(
+                done_id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: "2026-08-01T01:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end finished review run");
+        seed_watch(&store, 151, "alice", "adopt:STUDIO-838");
+        seed_watch(&store, 152, "sol", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row(live_key));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
+            "the live round is the one the board draws; the finished one is a chip it drops: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
     }
