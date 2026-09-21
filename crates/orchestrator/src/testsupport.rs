@@ -231,6 +231,7 @@ pub(crate) fn empty_effective(tracker: Arc<dyn Tracker>) -> Effective {
         claim_ttl: DEFAULT_CLAIM_TTL,
         claim_settle_delay: DEFAULT_CLAIM_SETTLE_DELAY,
         max_turns: 0,
+        max_run_tokens: 0,
         max_retry_backoff_ms: 0,
         poll_interval: Duration::ZERO,
         stall_timeout: Duration::ZERO,

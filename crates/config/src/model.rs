@@ -190,6 +190,18 @@ pub struct Agent {
     /// whose response is byte-pinned to the Go config goldens — the same pattern as
     /// `mcp.allow_handoff`.
     pub max_concurrent_reviews: Option<i64>,
+    /// A PER-RUN token ceiling (STUDIO-967). `0` — the default, and every install that never writes
+    /// the key — means unlimited, matching `max_concurrent_agents`' `0 = unlimited` idiom. A positive
+    /// value stops a run that has accumulated this many billed tokens within the turn it is in, and
+    /// records the stop as its own outcome so it is distinguishable from a failure or an operator
+    /// stop. Unlike `agent.max_concurrent_reviews` (which bounds *new* dispatch), this acts on a run
+    /// already in flight — the runaway itself, not the next one.
+    ///
+    /// **Rhapsody-only** (no Go reference): decoded, carried on `Effective`, and preserved by
+    /// `encode` (so a console Save keeps it), but deliberately NOT rendered by `effective_json`,
+    /// whose response is byte-pinned to the Go config goldens — the same pattern as
+    /// `mcp.allow_handoff`.
+    pub max_run_tokens: i64,
     pub max_turns: i64,
     pub max_retry_backoff_ms: i64,
     /// Per-state concurrency caps: keys lowercased, only positive ints kept (upstream §5.3.5).
@@ -551,6 +563,8 @@ pub(crate) struct RawAgent {
     pub max_concurrent_agents: Option<i64>,
     /// STUDIO-950; Rhapsody-only, absent ⇒ reviews keep the shared `max_concurrent_agents` pool.
     pub max_concurrent_reviews: Option<i64>,
+    /// STUDIO-967; Rhapsody-only, absent ⇒ unlimited (0). A per-run token ceiling.
+    pub max_run_tokens: Option<i64>,
     pub max_turns: Option<i64>,
     pub max_retry_backoff_ms: Option<i64>,
     pub handoff_drain_grace_ms: Option<i64>,

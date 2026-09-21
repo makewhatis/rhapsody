@@ -1564,6 +1564,46 @@ names it as `held for capacity` rather than reporting it as an unexplained stall
 entry above).
 
 
+### A per-run token ceiling — `agent.max_run_tokens` (STUDIO-967)
+
+Every bound in the review loop counts ROUNDS: the shared round cap, the adjudication threshold, the
+author-side refusal, the concurrency budgets, and the delta/verdict carry rules. None of them bounds
+the tokens spent WITHIN a single turn, and turns are not uniform — one STUDIO-957 run spent
+44,743,645 tokens in a single 42-minute turn and every round-counting bound stayed green, correctly,
+because it *was* one round.
+
+Rhapsody adds one key, `agent.max_run_tokens`, bounding a single run's billed tokens. It is
+**opt-in and inert when unset**: `0` — the default, and every install that never writes the key —
+means unlimited, matching `max_concurrent_agents`' idiom, so an unset ceiling is byte-identical to a
+daemon built before it existed. It lives in `WORKFLOW.md` and hot-reloads with the rest of the file.
+
+When a run's live spend (committed across finished turns plus the current turn's in-flight estimate)
+reaches the ceiling, the daemon stops the run MID-TURN by killing the agent's process tree. This is
+deliberately the opposite of STUDIO-957's daily budget, which refuses NEW dispatch and explicitly does
+not kill in-flight runs: that rule protects a run that is innocent of the budget, whereas here the
+run IS the runaway and the tokens already spent are the argument FOR stopping. The branch and
+workspace are left intact, so work already committed survives; the run records its own outcome
+(`token_ceiling`, distinct from `failed`, `interrupted` and `stopped`) with the ceiling and the spend,
+and the ticket is held rather than immediately re-dispatched (a fresh run would re-burn the ceiling
+with nothing to show). The reconciliation sweep reports the held ticket as
+`author_token_ceiling_stopped`, so the stop is never an unexplained stall.
+
+Ticketless review runs are subject to the same ceiling: a review is a run too, and the review half is
+where much of the spend lives. A review stopped this way parks its watch row `truncated`, the same
+disposition a `max_turns` backstop gives a round that delivered no verdict.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| per-run token bound | none | `agent.max_run_tokens` — a run is stopped when it reaches it |
+| default | n/a | **unset (`0`) ⇒ unlimited**, byte-identical to before the key |
+| stop attribution | n/a | its own `token_ceiling` outcome on the run |
+| hot reload | n/a | yes, with `WORKFLOW.md` |
+
+Rhapsody-only, so like `agent.max_concurrent_reviews` it is decoded, carried on `Effective`, and
+preserved by `encode` (a console Save keeps it) but deliberately NOT rendered by `effective_json`,
+whose response is byte-pinned to the Go config goldens.
+
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it

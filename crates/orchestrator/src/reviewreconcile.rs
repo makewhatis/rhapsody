@@ -170,6 +170,15 @@ pub enum DivergenceKind {
     /// Divergence (a), one step earlier: a round is owed and no reviewer run has started since the
     /// row was armed. STUDIO-891 ends here.
     ReviewRequestedNoRun,
+    /// The author's newest run after the verdict stopped at its per-run token ceiling (STUDIO-967).
+    ///
+    /// Without this kind the row's own rule reads the ceiling-stopped run as the author having
+    /// MOVED — it started after the verdict landed — and reports nothing, so a ticket that keeps
+    /// hitting its ceiling looks like a healthy author quietly working. That is the silent stall the
+    /// ticket forbids: the run made no progress, and the reason is a bound this daemon itself
+    /// applied, so the sweep can and must name it. Reported at the ordinary staleness threshold
+    /// because a later run may still resume the ticket.
+    AuthorTokenCeilingStopped,
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
@@ -224,6 +233,7 @@ impl DivergenceKind {
         match self {
             DivergenceKind::ChangesRequestedNoRun => "changes_requested_no_run",
             DivergenceKind::ReviewRequestedNoRun => "review_requested_no_run",
+            DivergenceKind::AuthorTokenCeilingStopped => "author_token_ceiling_stopped",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
             DivergenceKind::ReviewEscalated => "review_escalated",
@@ -240,6 +250,10 @@ impl DivergenceKind {
             }
             DivergenceKind::ReviewRequestedNoRun => {
                 "a review round is owed and no reviewer run has started"
+            }
+            DivergenceKind::AuthorTokenCeilingStopped => {
+                "the author's newest run stopped at its per-run token ceiling, so it made no \
+                 progress and the ticket is still owed a run"
             }
             DivergenceKind::ApprovedStillOpen => {
                 "every required reviewer approved and the pull request is still open"
@@ -340,6 +354,10 @@ pub struct RunMoment {
     pub started_at: DateTime<Utc>,
     /// `None` while the run is still in flight.
     pub ended_at: Option<DateTime<Utc>>,
+    /// The run's stored `runs.outcome`. The rules use one value from it: a ticket run stopped at its
+    /// per-run token ceiling ([`rhapsody_store::OUTCOME_TOKEN_CEILING`]) did NOT make progress, so a
+    /// `reviewed` row must report the ceiling rather than counting that run as the author moving.
+    pub outcome: String,
 }
 
 impl RunMoment {
@@ -535,6 +553,14 @@ fn row_owed(row: &RowFacts) -> Option<(DivergenceKind, DateTime<Utc>)> {
             if let Some(t) = &row.ticket_run
                 && (t.in_flight() || t.started_at >= anchor)
             {
+                // The author moved — UNLESS the run that moved was stopped at its per-run token
+                // ceiling (STUDIO-967). Such a run ended mid-turn without finishing anything, so
+                // counting it as progress is exactly how a ceiling-stopped ticket reads as a healthy
+                // author; name the ceiling instead. A LATER run (of any outcome) supersedes this one
+                // as `ticket_run` and clears the report, which is correct: the ticket resumed.
+                if t.outcome == rhapsody_store::OUTCOME_TOKEN_CEILING {
+                    return Some((DivergenceKind::AuthorTokenCeilingStopped, anchor));
+                }
                 return None; // the author moved, or is moving
             }
             Some((DivergenceKind::ChangesRequestedNoRun, anchor))
@@ -1036,6 +1062,7 @@ impl Orchestrator {
             // An unparseable end on a row that HAS one reads as in-flight, which is the safe
             // direction: in-flight reports nothing.
             ended_at: parse_run_time(&run.ended_at),
+            outcome: run.outcome.clone(),
         })
     }
 
@@ -1157,6 +1184,25 @@ impl Orchestrator {
                         d.kind.detail(),
                         d.adjudicated_head,
                         d.rounds
+                    );
+                    continue;
+                }
+                // STUDIO-967: the author's newest run was stopped at its per-run token ceiling, so
+                // the generic "nothing has reported it blocked" below would be false — this daemon
+                // stopped it and said so on the run. Name the bound and the two ways out.
+                if d.kind == DivergenceKind::AuthorTokenCeilingStopped {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        reviewer = %d.reviewer,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. The run was stopped by \
+                         `agent.max_run_tokens`; raise the ceiling or split the ticket to make it \
+                         fit, then re-run. This sweep only reports, so it needs a human.",
+                        d.pr,
+                        d.kind.detail()
                     );
                     continue;
                 }
@@ -1330,6 +1376,7 @@ mod tests {
         Some(RunMoment {
             started_at: t(started),
             ended_at: Some(t(ended)),
+            outcome: rhapsody_store::OUTCOME_COMPLETED.to_string(),
         })
     }
 
@@ -1338,6 +1385,16 @@ mod tests {
         Some(RunMoment {
             started_at: t(started),
             ended_at: None,
+            outcome: rhapsody_store::OUTCOME_RUNNING.to_string(),
+        })
+    }
+
+    /// A FINISHED run that was stopped at its per-run token ceiling (STUDIO-967).
+    fn ran_at_ceiling(started: &str, ended: &str) -> Option<RunMoment> {
+        Some(RunMoment {
+            started_at: t(started),
+            ended_at: Some(t(ended)),
+            outcome: rhapsody_store::OUTCOME_TOKEN_CEILING.to_string(),
         })
     }
 
@@ -1401,6 +1458,70 @@ mod tests {
         assert_eq!(d.kind, DivergenceKind::ChangesRequestedNoRun);
         assert_eq!(d.ticket, "STUDIO-870");
         assert_eq!(d.stale_secs, 11 * 3600, "eleven hours, as the incident ran");
+    }
+
+    /// STUDIO-967 — the author's newest run after the verdict exists, but it was STOPPED at its
+    /// per-run token ceiling. The run started after the verdict, so the plain `ChangesRequestedNoRun`
+    /// rule reads it as the author having moved and reports nothing; that is precisely the silent
+    /// stall the ticket forbids, because the run made no progress and the cause is a bound this
+    /// daemon applied. The sweep must name the ceiling.
+    #[test]
+    fn reports_studio_967_author_run_stopped_at_its_token_ceiling() {
+        let facts = pr(
+            vec![row(
+                "alice",
+                REVIEW_STATUS_REVIEWED,
+                "STUDIO-967",
+                ran("2026-09-21T09:00:00Z", "2026-09-21T09:25:00Z"),
+                // The author DID run after the verdict — and was stopped at the ceiling.
+                ran_at_ceiling("2026-09-21T10:00:00Z", "2026-09-21T10:05:00Z"),
+            )],
+            false,
+        );
+        let d = verdict(&facts, "2026-09-21T12:00:00Z").expect("reported");
+        assert_eq!(d.kind, DivergenceKind::AuthorTokenCeilingStopped);
+        assert_eq!(d.ticket, "STUDIO-967");
+        assert!(
+            d.kind.detail().contains("token ceiling"),
+            "the operator must read the cause, got {:?}",
+            d.kind.detail()
+        );
+    }
+
+    /// The sibling guard: a ticket run after the verdict that merely COMPLETED is still the author
+    /// having moved, and must NOT be reported. Without this, the ceiling check above could decay into
+    /// "any post-verdict run that is not in flight", which would report every healthy review.
+    #[test]
+    fn a_completed_author_run_after_the_verdict_is_not_reported() {
+        let facts = pr(
+            vec![row(
+                "alice",
+                REVIEW_STATUS_REVIEWED,
+                "STUDIO-967",
+                ran("2026-09-21T09:00:00Z", "2026-09-21T09:25:00Z"),
+                ran("2026-09-21T10:00:00Z", "2026-09-21T10:05:00Z"),
+            )],
+            false,
+        );
+        assert!(verdict(&facts, "2026-09-21T12:00:00Z").is_none());
+    }
+
+    /// A ceiling-stopped run that PREDATES the verdict is not this rule's business: it did not move
+    /// the ticket after the findings landed, so the ordinary `changes_requested_no_run` applies.
+    #[test]
+    fn a_ceiling_stop_before_the_verdict_falls_through_to_the_plain_rule() {
+        let facts = pr(
+            vec![row(
+                "alice",
+                REVIEW_STATUS_REVIEWED,
+                "STUDIO-967",
+                ran("2026-09-21T10:00:00Z", "2026-09-21T10:25:00Z"),
+                ran_at_ceiling("2026-09-21T09:00:00Z", "2026-09-21T09:05:00Z"),
+            )],
+            false,
+        );
+        let d = verdict(&facts, "2026-09-21T12:00:00Z").expect("reported");
+        assert_eq!(d.kind, DivergenceKind::ChangesRequestedNoRun);
     }
 
     /// STUDIO-882 — 875's attachment WAS written, but resolved `sourceType: "api"`, so `is_github_pr`
@@ -1947,7 +2068,9 @@ mod store_tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::testsupport::{empty_effective, empty_resolved_project, set_of};
+    use crate::testsupport::{
+        empty_effective, empty_resolved_project, issue, running_entry, set_of,
+    };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const HEAD: &str = "c0a54eb0000000000000000000000000000000000";
@@ -2076,6 +2199,11 @@ mod store_tests {
 
     /// Records one finished run of `identifier`.
     fn run(o: &Orchestrator, identifier: &str, started: &str, ended: &str) {
+        run_outcome(o, identifier, started, ended, "completed");
+    }
+
+    /// As [`run`] with an explicit terminal outcome — for the STUDIO-967 ceiling stop.
+    fn run_outcome(o: &Orchestrator, identifier: &str, started: &str, ended: &str, outcome: &str) {
         let id = o
             .store()
             .start_run(RunStart {
@@ -2088,7 +2216,7 @@ mod store_tests {
             .end_run(
                 id,
                 RunEnd {
-                    outcome: "completed".to_string(),
+                    outcome: outcome.to_string(),
                     ended_at: ended.to_string(),
                     ..Default::default()
                 },
@@ -2841,6 +2969,125 @@ mod store_tests {
             rendered["review_divergence"][0]["kind"],
             "round_budget_exhausted"
         );
+    }
+
+    /// STUDIO-967, through the real store: a verdict asked for changes, the author DID run after it,
+    /// and that run was stopped at its per-run token ceiling. Without the ceiling kind the author run
+    /// reads as progress and the pull request reports NOTHING — the silent stall the ticket forbids.
+    /// Asserts on BOTH report surfaces, like the incidents above.
+    #[test]
+    fn a_ceiling_stopped_author_run_is_reported_on_both_surfaces() {
+        // Well past the 90-minute threshold measured from the VERDICT, so the report is due rather
+        // than early: verdict ended 21:00, now 23:30.
+        let o = &mut orch(false, "2026-09-21T23:30:00Z");
+        reviewed_row(o, "alice", "STUDIO-967");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-21T20:00:00Z",
+            "2026-09-21T21:00:00Z",
+        );
+        // The author moved — and was stopped at the ceiling.
+        run_outcome(
+            o,
+            "STUDIO-967",
+            "2026-09-21T21:05:00Z",
+            "2026-09-21T21:10:00Z",
+            rhapsody_store::OUTCOME_TOKEN_CEILING,
+        );
+
+        // Warm-up so the first WARN is captured deterministically (see the sibling tests).
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("token ceiling"),
+            "the line must name the ceiling, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the copy that was false about a ceiling stop must not be reused: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::AuthorTokenCeilingStopped);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-967");
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["kind"],
+            "author_token_ceiling_stopped"
+        );
+    }
+
+    /// STUDIO-967, end to end through the two halves: the CEILING actually stops a live run (not a
+    /// hand-seeded row), and the sweep then reports it. MUTATION: make the stop log-only (do not
+    /// record `token_ceiling` on the run) and the sweep sees an in-flight roomy run and reports
+    /// nothing, so this reds; delete the sweep rule and it reds too.
+    #[test]
+    fn the_ceiling_stop_and_the_sweep_agree_end_to_end() {
+        let o = &mut orch(false, "2026-09-21T23:30:00Z");
+        o.eff.as_mut().expect("eff").max_run_tokens = 1_000;
+        reviewed_row(o, "alice", "STUDIO-967");
+        // The reviewer's run, which produced the verdict that put the author on the clock.
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-21T20:00:00Z",
+            "2026-09-21T21:00:00Z",
+        );
+
+        // A LIVE author run for the ticket, started after the verdict, that blows the ceiling on a
+        // single in-flight usage event.
+        let mut re = running_entry(
+            issue("ID-967", "STUDIO-967", "In Progress"),
+            "rhapsody",
+            "rhapsody",
+        );
+        re.started_at = t("2026-09-21T21:05:00Z");
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-967".into(), re);
+        o.on_agent_update(crate::agentupdate::AgentUpdate {
+            issue_id: "ID-967".into(),
+            ev: rhapsody_agent::Event {
+                event_type: rhapsody_agent::EVENT_NOTIFICATION.to_string(),
+                usage: Some(rhapsody_agent::Usage {
+                    input_tokens: 44_743_645,
+                    total_tokens: 44_743_645,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        assert!(
+            !o.running.contains_key("ID-967"),
+            "the live runaway run must have been stopped"
+        );
+
+        // The sweep reads the run the stop WROTE and reports the cause.
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::AuthorTokenCeilingStopped);
     }
 
     /// **Acceptance.** An ESCALATE decision is reported by the sweep as an ESCALATION carrying the

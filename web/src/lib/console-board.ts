@@ -221,6 +221,10 @@ export const BOARD_ACTIVE_OUTCOMES = [
   "stopped",
   "failed",
   "interrupted",
+  // STUDIO-967: a run stopped at its per-run token ceiling. It is a non-terminal ticket's newest
+  // run (the daemon halts the ticket and the sweep reports it), so without it here the card would
+  // fall out of every active lane and vanish from the board while it waits for a human.
+  "token_ceiling",
 ] as const;
 
 /**
