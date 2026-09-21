@@ -30,6 +30,7 @@ import type {
   RunSummary,
   TeamsOverview,
   TicketCostRow,
+  TypedConfigResponse,
 } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 // The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
@@ -50,8 +51,21 @@ import { formatDuration } from "@/lib/format";
  * — the ticket's own job is to review a teammate's pull request, and a run is live on it — while
  * `review` says this ticket's work is finished and is AWAITING somebody's review. A worklist that
  * spells both "in review" is not ambiguous by accident; it is asserting they are the same state.
+ *
+ * `parked` (STUDIO-966) is the answer for a ticket sitting OUTSIDE its project's `active_states` —
+ * Backlog, Triage, any state the dispatcher will not pick up. It has its own word because `queued`
+ * claims an agent is coming, and for a parked ticket nothing is: a person has to move it. See
+ * [`consoleJobStatus`] for why it is derived from the configured state SETS rather than Linear's
+ * own state `type`, and [`consoleStatusMatches`] for why the Queued filter still reaches it.
  */
-export type ConsoleJobStatus = "run" | "reviewing" | "review" | "queued" | "done" | "blocked";
+export type ConsoleJobStatus =
+  | "run"
+  | "reviewing"
+  | "review"
+  | "queued"
+  | "done"
+  | "blocked"
+  | "parked";
 
 /**
  * The Seg's ids. `reviewing` is deliberately NOT one of them: it is a kind of RUNNING — an agent
@@ -78,6 +92,7 @@ export const CONSOLE_STATUS_LABELS: Record<ConsoleJobStatus, string> = {
   queued: "queued",
   done: "done",
   blocked: "blocked",
+  parked: "parked",
 };
 
 /**
@@ -177,6 +192,27 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * flailed, and splits the lane from the strip that scores the same ticket through a bucket. The
  * caller passes `heldNeverRan` only for a row that is a current hold AND has no real run at all
  * (`JobRow.runId === 0`), so an unresolved lifecycle never reaches this arm.
+ *
+ * The sixth rule is `parked` (STUDIO-966), and it splits the `open` arm in two. `open` is the
+ * daemon's bucket for "in an active state, OR in none of the configured sets (Backlog, Triage)" —
+ * one bucket, deliberately, because the four buckets are derived from the configured state SETS so
+ * this classification and the selection gate cannot disagree about what terminal means. That is
+ * right about terminal and silent about dispatchable: a `Todo` ticket a finished run left behind is
+ * genuinely back in the pool awaiting another agent (`queued`), while a `Backlog` one is not, and no
+ * agent will ever start it — the dispatcher's `active_states` set excludes it.
+ *
+ * The distinction is therefore `tracker_state` against the PROJECT's configured `active_states`, the
+ * same set the gate filters by, resolved per project because `projects[].active_states` overlays the
+ * global default. Nothing here reads Linear's state `type`: the sets are the daemon's own scheduling
+ * vocabulary, which is exactly what makes this agree with the gate. The caller passes `parked`
+ * already resolved (see [`isParkedState`]/[`activeStatesFor`]); a blank `tracker_state`, an unknown
+ * project and a config that has not loaded all resolve to `false` — say what was said before the
+ * rule existed rather than guess.
+ *
+ * It applies ONLY where the lifecycle is `open`. A ticket in a review or terminal state already
+ * reaches a truer word, and a `failed`/`waiting` outcome still keeps `blocked`: that is the RUN's
+ * fact and a human has to act on it wherever the ticket is parked. A live run still outranks
+ * everything — the earlier arms have already returned.
  */
 export function consoleJobStatus(
   status: string,
@@ -184,6 +220,7 @@ export function consoleJobStatus(
   reviewTicket = false,
   reviewRun = false,
   heldNeverRan = false,
+  parked = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
   // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
@@ -200,6 +237,9 @@ export function consoleJobStatus(
     case "in_review":
       return "review";
     case "open":
+      // A parked ticket is not waiting for an agent, whatever the run that left it there did — but a
+      // FAILED/waiting run is still the operator's move, so `blocked` survives the split.
+      if (parked) return fromRun === "blocked" ? "blocked" : "parked";
       return fromRun === "review" ? "queued" : fromRun;
     default:
       return fromRun;
@@ -441,6 +481,65 @@ export function lifecycleByIssue(rows: readonly IssueRun[]): Map<string, TicketL
 }
 
 /**
+ * The `active_states` sets the console classifies "dispatchable vs parked" against (STUDIO-966),
+ * resolved per project exactly as the daemon's selection gate resolves them.
+ *
+ * `global` is `tracker.active_states` — the default a project inherits; `bySlug` carries only the
+ * projects that OVERRIDE it (`projects[].active_states`, or the daemon's own resolved `effective` of
+ * that when it is served). A row whose project has no entry falls back to `global`, which is what a
+ * single-project install has and what an unknown project must mean. Nothing here hardcodes a state
+ * NAME: these are the configured sets verbatim, which is the only way this classification and the
+ * gate can agree.
+ */
+export interface DispatchableStates {
+  global: readonly string[];
+  bySlug: ReadonlyMap<string, readonly string[]>;
+}
+
+/** The empty answer — nothing known, so nothing is parked. The fallback until the config loads. */
+export const NO_DISPATCHABLE_STATES: DispatchableStates = { global: [], bySlug: new Map() };
+
+/**
+ * Resolve the per-project dispatchable sets from `GET /api/v1/config` (STUDIO-966).
+ *
+ * A project's own `active_states` overrides the global default; when the daemon serves its resolved
+ * `effective`, that is preferred, because it is the daemon's OWN answer for the same question and
+ * cannot drift from what the gate uses. A `slug` is what a history row carries (`project_slug`), and
+ * `projects[].slugs` is the list a project answers to — first project wins if two ever claimed one.
+ */
+export function projectActiveStates(cfg: TypedConfigResponse | undefined): DispatchableStates {
+  const global = cfg?.global?.active_states ?? [];
+  const bySlug = new Map<string, readonly string[]>();
+  for (const project of cfg?.projects ?? []) {
+    const states = project.effective?.active_states ?? project.active_states ?? global;
+    for (const slug of project.slugs ?? []) {
+      if (slug !== "" && !bySlug.has(slug)) bySlug.set(slug, states);
+    }
+  }
+  return { global, bySlug };
+}
+
+/** The active-state set for one project slug — its own override, else the global default. */
+export function activeStatesFor(states: DispatchableStates, projectSlug: string): readonly string[] {
+  return states.bySlug.get(projectSlug) ?? states.global;
+}
+
+/**
+ * Whether a tracker state sits OUTSIDE the dispatchable set — i.e. the gate would never pick this
+ * ticket up. Comparison is trimmed and case-folded, mirroring the daemon's `normalize_state`, so
+ * `" backlog "` and `"Backlog"` answer alike.
+ *
+ * A blank state, or no configured set at all, answers `false`: the console cannot tell, and "not
+ * parked" is the pre-existing reading. That is the same absence-is-not-a-verdict rule
+ * [`lifecycleByIssue`] follows — a cold config load must not repaint every row as parked.
+ */
+export function isParkedState(trackerState: string, activeStates: readonly string[]): boolean {
+  const state = trackerState.trim().toLowerCase();
+  if (state === "" || activeStates.length === 0) return false;
+  return !activeStates.some((active) => active.trim().toLowerCase() === state);
+}
+
+/**
  * The tickets the daemon says are REVIEW TICKETS, from the issue-level listing's `review_ticket`
  * field (STUDIO-780) — tickets whose own job is to review a teammate's pull request.
  *
@@ -660,6 +759,7 @@ export function buildConsoleJobs(
   overview: TeamsOverview | undefined,
   nowMs: number,
   costRows: readonly TicketCostRow[] = [],
+  dispatchable: DispatchableStates = NO_DISPATCHABLE_STATES,
 ): ConsoleJobRow[] {
   const durable = durableAssignees(issueRows);
   const live = ticketAssignees(overview);
@@ -680,12 +780,18 @@ export function buildConsoleJobs(
     // 0 is the honest "nothing ran" — never "the daemon could not resolve a lifecycle", which a cold
     // cache serves for most rows. See `consoleJobStatus`.
     const heldNeverRan = (job.heldForHuman ?? false) && job.runId === 0;
+    // Dispatchable vs parked (STUDIO-966), resolved against THIS row's project — `projects[].*`
+    // overlays differ, so a state parked in one project can be live work in another.
+    const parked =
+      ticket !== undefined &&
+      isParkedState(ticket.trackerState, activeStatesFor(dispatchable, job.project));
     const status = consoleJobStatus(
       job.status,
       ticket?.lifecycle,
       reviewTicket,
       reviewRun,
       heldNeverRan,
+      parked,
     );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
@@ -762,6 +868,11 @@ export function matchConsoleFilter(row: ConsoleJobRow, filter: ConsoleJobFilterI
 export function consoleStatusMatches(status: ConsoleJobStatus, filter: ConsoleJobFilterId): boolean {
   if (filter === "all") return true;
   if (filter === "run") return isLive(status);
+  // `parked` files under Queued (STUDIO-966): the two share a lane and a count, because the
+  // daemon's whole-store tally groups by lifecycle alone and cannot split them (see the note on
+  // [`ConsoleJobCounts`]). The PILL still says "parked" — this only decides which button reaches
+  // the row, and a parked row that answered to no button but "All" would vanish from the Seg.
+  if (filter === "queued") return status === "queued" || status === "parked";
   return status === filter;
 }
 
@@ -805,6 +916,13 @@ export interface ConsoleJobCounts {
   running: number;
   /** Rows reading in-review. Still counted, no longer painted — see the note above. */
   review: number;
+  /**
+   * Rows waiting to run: `queued` AND `parked` (STUDIO-966). The two share this number because the
+   * daemon's tally groups by lifecycle and cannot tell them apart — a parked ticket reaches the
+   * client as an `open` bucket exactly as a Todo one does — so splitting them here would put the
+   * strip and the table on two different rules, which is the disagreement STUDIO-828 exists to
+   * prevent. What the number can say honestly is "not yet running"; the row's PILL says which.
+   */
   queued: number;
   blocked: number;
   /**
@@ -856,7 +974,12 @@ function tally(entries: Iterable<readonly [CountedJob, number]>): ConsoleJobCoun
     total += weight;
     if (isLive(job.status)) counts.running += weight;
     else if (job.status === "review") counts.review += weight;
-    else if (job.status === "queued") counts.queued += weight;
+    // `parked` is folded into queued (STUDIO-966), deliberately: the daemon's tally groups by
+    // lifecycle, so a parked ticket reaches this side as an `open` bucket and there is no way for
+    // the store-side count to put it anywhere else. Counting it apart here would split the strip
+    // from the table — the exact class of disagreement STUDIO-828 exists to prevent. The row's own
+    // pill still distinguishes them.
+    else if (job.status === "queued" || job.status === "parked") counts.queued += weight;
     else if (job.status === "blocked") counts.blocked += weight;
     if (job.needsYou) needsYou += weight;
     if (job.lifecycleResolved) heard = true;

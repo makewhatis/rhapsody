@@ -680,8 +680,8 @@ mod tests {
 
     use rhapsody_config::teams::{HarnessScoped, Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, Store,
-        StorePath,
+        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED,
+        REVIEW_STATUS_TRUNCATED, Sqlite, Store, StorePath,
     };
     use rhapsody_tracker::fake::Fake;
     use rhapsody_workspace::sanitize_key;
@@ -1198,10 +1198,14 @@ mod tests {
     /// STUDIO-959: dispatch reads the reviewer's PRIOR commit off the existing row BEFORE it writes
     /// this head as requested.
     ///
-    /// Mutation: reading `requested_sha` (which the dispatch itself is about to overwrite) or
-    /// reading AFTER the writes would name this head as its own prior commit and red the delta
-    /// assertions here. And a reviewer with no row at all must carry nothing — a first round is
-    /// full, so the worker must not be handed a delta request it cannot honour.
+    /// Mutation: reading `requested_sha` AFTER the writes would name this head as its own prior
+    /// commit and red the delta assertions here; the placement is otherwise unobservable, because
+    /// neither write moves `last_reviewed_sha` (see the production read above). Reading
+    /// `requested_sha` BEFORE the writes is invisible to this test — its two seeded SHA columns are
+    /// equal, so either read returns the same answer — which is why
+    /// [`a_truncated_round_carries_no_prior_commit_so_the_next_head_is_full`] pins the column. And a
+    /// reviewer with no row at all must carry nothing — a first round is full, so the worker must
+    /// not be handed a delta request it cannot honour.
     #[test]
     fn dispatch_carries_the_reviewers_prior_commit_into_the_run() {
         let (mut o, dispatched) = orch_with_review(true);
@@ -1267,6 +1271,66 @@ mod tests {
         assert!(
             review.checkout().delta.is_none(),
             "a first round must not present a delta request"
+        );
+    }
+
+    /// A truncated round — one ASKED to review [`HEAD_A`] but which read NOTHING — must leave the
+    /// reviewer with no prior commit, so its next round at [`HEAD_B`] is FULL, not a delta
+    /// (STUDIO-963).
+    ///
+    /// This is the state `mark_review_truncated` leaves behind when a round dies on `max_turns`, a
+    /// drain or a worker failure: `requested_sha` stays at the head it was dispatched against while
+    /// `last_reviewed_sha` stays empty. `dispatch` must read the LATTER. Reading `requested_sha`
+    /// would tell this reviewer "you last read A — confirm those findings are addressed" when it
+    /// read A not at all and filed no findings: trap 2 of STUDIO-959 reintroduced, for the same
+    /// reviewer rather than a different one. The sibling
+    /// [`dispatch_carries_the_reviewers_prior_commit_into_the_run`] cannot see that defect because
+    /// its two SHA columns are equal.
+    #[test]
+    fn a_truncated_round_carries_no_prior_commit_so_the_next_head_is_full() {
+        let (mut o, dispatched) = orch_with_review(true);
+        let asked = review_run("alice", HEAD_A);
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: asked.watch_key(),
+                author: asked.author.clone(),
+                introduced_by: asked.introduced_by.clone(),
+                requested_sha: HEAD_A.to_string(),
+                last_reviewed_sha: String::new(),
+                status: REVIEW_STATUS_IN_FLIGHT.to_string(),
+                open: true,
+            })
+            .expect("seed the round dispatched at HEAD_A");
+        o.store()
+            .mark_review_truncated(&asked.watch_key())
+            .expect("record that the round read nothing");
+
+        // The row really is the divergent shape the defect needs: asked at A, reviewed nothing.
+        let seeded = o
+            .store()
+            .get_review_watch(&asked.watch_key())
+            .expect("read")
+            .expect("row");
+        assert_eq!(seeded.requested_sha, HEAD_A);
+        assert!(seeded.last_reviewed_sha.is_empty());
+        assert_eq!(seeded.status, REVIEW_STATUS_TRUNCATED);
+
+        let next = review_run("alice", HEAD_B);
+        assert_eq!(
+            o.dispatch_review(next.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let entries = dispatched.lock().expect("dispatched lock");
+        let re = entries.first().expect("one dispatch");
+        let review = re.review.as_ref().expect("the entry carries its review");
+        assert!(
+            review.prior_sha.is_empty(),
+            "a truncated round read nothing, so the next round has no prior commit to diff from"
+        );
+        assert!(
+            review.checkout().delta.is_none(),
+            "a truncated round must leave the next round FULL, not a delta"
         );
     }
 

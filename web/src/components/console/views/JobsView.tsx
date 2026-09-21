@@ -26,6 +26,7 @@ import {
   consoleJobsPageNote,
   filterConsoleJobs,
   mateStates,
+  projectActiveStates,
   type ConsoleJobFilterId,
   type ConsoleJobRow,
   type TicketCost,
@@ -90,9 +91,13 @@ export function JobsView({
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
   const refresh = useRefresh();
-  // The concurrency cap the board footer measures against (STUDIO-925). A missing or unparseable
-  // config reads as "no cap known" — the footer then omits the "/ N" rather than inventing one.
-  const maxConcurrent = useTypedConfigQuery().data?.global?.agent.max_concurrent_agents ?? 0;
+  // The typed config is read once for both of the facts the worklist needs from it: the concurrency
+  // cap the board footer measures against (STUDIO-925), and the per-project `active_states` sets the
+  // parked classification resolves against (STUDIO-966). A missing or unparseable config reads as
+  // "no cap known" and "no sets known" — the footer omits the "/ N", and no row is called parked.
+  const typedConfig = useTypedConfigQuery().data;
+  const maxConcurrent = typedConfig?.global?.agent.max_concurrent_agents ?? 0;
+  const dispatchable = useMemo(() => projectActiveStates(typedConfig), [typedConfig]);
 
   // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits. The
   // lane width and the card-field chips (STUDIO-932) live in the same display-options popover, so
@@ -122,8 +127,9 @@ export function JobsView({
         overview.data,
         nowMs,
         costs.data?.costs,
+        dispatchable,
       ),
-    [state.data, boardIssueRows, projects, overview.data, nowMs, costs.data],
+    [state.data, boardIssueRows, projects, overview.data, nowMs, costs.data, dispatchable],
   );
 
   // The strip's numbers come from the DAEMON's tally over every issue in the store, not from `rows`

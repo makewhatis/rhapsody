@@ -154,6 +154,9 @@
 .rh-console .pill.done .d { background: var(--info); }
 .rh-console .pill.blocked { color: var(--bad); background: var(--bad-soft); }
 .rh-console .pill.blocked .d { background: var(--bad); }
+/* A parked ticket (STUDIO-966) is not waiting on an agent and is not a fault — see `--parked`. */
+.rh-console .pill.parked { color: var(--parked); background: var(--parked-soft); }
+.rh-console .pill.parked .d { background: var(--parked); }
 
 .rh-console .tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 5px 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); }
 .rh-console .tags input { border: 0; background: none; flex: 1; min-width: 70px; padding: 4px; }
