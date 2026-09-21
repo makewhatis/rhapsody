@@ -468,6 +468,22 @@ mod tests {
         }
     }
 
+    /// A room that refuses every append — the failure `RecordingRoom` never had, so the room arm's
+    /// `Err` branch is finally observable. Mirrors [`FailingComments`] on the other surface.
+    struct FailingRoom;
+
+    impl RoomLog for FailingRoom {
+        fn append(&self, _msg: &Message) -> Result<String, RoomError> {
+            Err(RoomError::Invalid("the room is unwritable".to_string()))
+        }
+        fn read_since(&self, _: &str, _: &Cursor, _: usize) -> Result<CaughtUp, RoomError> {
+            Err(RoomError::Invalid("unused in this test".to_string()))
+        }
+        fn read_forward(&self, _: &str, _: &Cursor, _: usize) -> Result<CaughtUp, RoomError> {
+            Err(RoomError::Invalid("unused in this test".to_string()))
+        }
+    }
+
     fn escalation() -> DraftEscalation {
         DraftEscalation {
             pr: coord(),
@@ -567,34 +583,102 @@ mod tests {
     /// a write that refused.
     #[tokio::test]
     async fn an_escalation_that_reaches_no_surface_does_not_claim_a_human_was_told() {
-        let events = captured(|| async {
-            let deps = DraftPokeDeps {
-                comments: Some(Arc::new(FailingComments) as Arc<dyn PrCommentSink>),
-                room: None,
-            };
-            perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+        // Two ways to reach no surface, and only the SECOND is a shape production can have: an
+        // installation that pokes at all has a room (see `an_escalation_that_reaches_only_the_
+        // _pull_request_still_hands_it_to_a_human`), so the reachable no-surface shape is a room
+        // that REFUSED alongside a comment that refused. The `room: None` stanza drives the same
+        // line with the room arm skipped entirely rather than entered and failed.
+        for (what, room) in [
+            ("no room at all", None),
+            (
+                "a room that refused",
+                Some(Arc::new(FailingRoom) as Arc<dyn RoomLog>),
+            ),
+        ] {
+            let events = captured(|| {
+                let room = room.clone();
+                async move {
+                    let deps = DraftPokeDeps {
+                        comments: Some(Arc::new(FailingComments) as Arc<dyn PrCommentSink>),
+                        room,
+                    };
+                    perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+                }
+            })
+            .await;
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.level == "WARN" && e.message.contains("reached no surface")),
+                "({what}) expected the honest no-surface line, got {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.message.contains("handing it to a human")),
+                "({what}) nothing accepted the escalation, so the log must not claim a human was \
+                 told: {events:?}"
+            );
+        }
+    }
+
+    /// ⚠️ The room arm's `Err` branch, which every other escalation test misses by construction:
+    /// `RecordingRoom` always returns `Ok` and the two `room: None` cases never enter the block at
+    /// all. A room append that FAILED must not count as having told anybody — with the arm taking
+    /// `told = true` on its error, a daemon whose room append and comment both failed would still
+    /// log "handing it to a human" when nobody was.
+    ///
+    /// Driven as room-Fail + comment-Ok rather than as a second no-surface case, so the assertion
+    /// discriminates the arm itself: the surviving surface is the comment, and the panic message
+    /// names which surface actually accepted.
+    #[tokio::test]
+    async fn a_room_that_refuses_the_escalation_is_not_counted_as_telling_a_human() {
+        let comments = Arc::new(RecordingComments::default());
+        let events = captured(|| {
+            let comments = Arc::clone(&comments);
+            async move {
+                let deps = DraftPokeDeps {
+                    comments: Some(comments as Arc<dyn PrCommentSink>),
+                    room: Some(Arc::new(FailingRoom) as Arc<dyn RoomLog>),
+                };
+                perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+            }
         })
         .await;
+        // The refusal is reported where it happened, and the comment is explicitly unaffected.
+        assert!(
+            events.iter().any(|e| e.level == "WARN"
+                && e.message
+                    .contains("the escalation could not be posted to the room")),
+            "the room's refusal must be logged where it happens: {events:?}"
+        );
+        // The comment carried it, so a human WAS told — the room's failure must not suppress that.
         assert!(
             events
                 .iter()
-                .any(|e| e.level == "WARN" && e.message.contains("reached no surface")),
-            "expected the honest no-surface line, got {events:?}"
+                .any(|e| e.message.contains("handing it to a human")),
+            "the comment accepted the escalation, so a human was told: {events:?}"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| e.message.contains("handing it to a human")),
-            "nothing accepted the escalation, so the log must not claim a human was told: {events:?}"
+                .any(|e| e.message.contains("reached no surface")),
+            "the comment is a surface and it accepted: {events:?}"
+        );
+        assert_eq!(
+            comments.0.lock().expect("lock").len(),
+            2,
+            "the comment is posted once per `captured` pass, both times"
         );
     }
 
     /// The OTHER half of the `told` OR, which the two tests above cannot see by construction: a
-    /// comment that POSTED with no room at all. That is a shipped shape rather than a hypothetical —
-    /// `run.rs` passes `room: None` whenever Teams is off, and the ticketless review watch (and this
-    /// poke) run regardless — so on such an installation the comment is the escalation's only
-    /// surface. With the comment arm neutered, a daemon whose escalation comment did post would emit
-    /// "reached no surface — no human was told": jimmy's false line in the opposite direction.
+    /// comment that POSTED, with the room arm skipped entirely. `room: None` is not a reachable
+    /// production shape — the same runtime home gates both `resolve_teams_path` and
+    /// `resolve_room_dir`, and no watcher spawns without Teams (`run.rs:1332-1335` says the same) —
+    /// so it is used here to drive the comment arm IN ISOLATION. With that arm neutered, a daemon
+    /// whose escalation comment did post would emit "reached no surface — no human was told":
+    /// jimmy's false line in the opposite direction.
     #[tokio::test]
     async fn an_escalation_that_reaches_only_the_pull_request_still_hands_it_to_a_human() {
         let events = captured(|| async {
