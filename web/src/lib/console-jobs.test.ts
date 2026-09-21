@@ -1755,16 +1755,16 @@ describe("a budget-held ticket through the production chain (STUDIO-970)", () =>
     expect(rows[0].statusLabel).toBe("queued");
     expect(rows[0].subLabel).toBe("anthropic daily budget spent");
     expect(rows[0].budgetHeld).toBe("anthropic");
-    // Distinct from a human hold: the row says the provider's budget cleared it, never that a
-    // person is needed (the human-hold sub-label is "held for a human").
+    // Distinct from a human hold: the row says the provider's budget is spent, never that a person
+    // is needed (the human-hold sub-label is "held for a human").
     expect(rows[0].subLabel).not.toBe("held for a human");
     // ...and it is not billed as needing the operator.
     expect(rows[0].needsYou).toBe(false);
   });
 
-  // STUDIO-970, the mutation the ticket names: rendering it as `held_for_human` must red. A budget
-  // hold that HAS run keeps its run's lane and wears the budget sub-label, but the two flags stay
-  // distinct — setting `heldForHuman` here would tell an operator a person is needed.
+  // STUDIO-970, the mutation the ticket names: rendering it with the human hold's sub-label
+  // ("held for a human") must red. A budget hold that HAS run keeps its run's lane and wears the
+  // budget sub-label, never the human hold's — that word would tell an operator a person is needed.
   it("keeps a budget hold that HAS run in its lane, and never as a human hold", () => {
     const stored = [
       issueRow({
