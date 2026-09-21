@@ -3102,6 +3102,75 @@ mod tests {
         );
     }
 
+    /// STUDIO-974 review finding: the watcher must CONSUME a hot-reloaded cadence, not merely have
+    /// a helper that reads the atomic. This drives the real task on a paused clock: it polls on a
+    /// non-default 1s cadence, the atomic is changed to 7s WHILE THE TASK IS ALIVE, and the next
+    /// sleep that begins after the change must use 7s.
+    ///
+    /// Mutation check: hardcode the sleep at the pinned `PR_STATE_POLL_INTERVAL` and this reds at
+    /// the first assert (no tick arrives at 1s). Before this test, that mutation left every
+    /// orchestrator test green (sol's review at STUDIO-974).
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_consumes_a_hot_reloaded_cadence() {
+        const FIRST_MS: i64 = 1_000;
+        const RELOADED_MS: i64 = 7_000;
+        let interval = Arc::new(std::sync::atomic::AtomicI64::new(FIRST_MS));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let signal = CancelSignal::new();
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            poll_interval_ms: Arc::clone(&interval),
+            teams: ticketless(&["alice", "bob"]),
+            diff_source: None,
+            sink: Arc::new(FakeSink {
+                watched: vec![WatchedPr::new(coord(12))],
+                seen: Arc::clone(&seen),
+                boundaries: Arc::clone(&boundaries),
+                done: Arc::clone(&done),
+                ..FakeSink::default()
+            }),
+        };
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        // The first tick must arrive on the configured 1s cadence, not the pinned 120s default.
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        assert_eq!(
+            boundaries.lock().expect("boundaries lock").len(),
+            1,
+            "the watcher must tick on the configured cadence"
+        );
+
+        // Hot reload the cadence while the task is alive. The sleep already in flight was
+        // scheduled from the OLD value and still fires a second later.
+        interval.store(RELOADED_MS, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        assert_eq!(
+            boundaries.lock().expect("boundaries lock").len(),
+            2,
+            "the sleep already in flight still used the old cadence"
+        );
+
+        // The sleep AFTER that one must use the reloaded 7s: nothing at ~8.1s, then a tick at ~9.1s.
+        tokio::time::sleep(std::time::Duration::from_millis(6_000)).await;
+        assert_eq!(
+            boundaries.lock().expect("boundaries lock").len(),
+            2,
+            "the watcher must consume the hot-reloaded cadence, not the old one"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert_eq!(
+            boundaries.lock().expect("boundaries lock").len(),
+            3,
+            "the reloaded cadence's tick must arrive on the new interval"
+        );
+
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
     fn ident(name: &str, max_concurrent: i64) -> Identity {
         Identity {
             name: name.to_string(),

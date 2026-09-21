@@ -34,8 +34,11 @@
 //! * **A 304 is an ANSWER ("unchanged"), never a failure and never `Gone`.** It maps to the
 //!   [`PrLookup`] last recorded for that coordinate. Getting this backwards retires live pull
 //!   requests (STUDIO-950's "a failure is never an answer").
-//! * **An ETag miss degrades to a normal 200.** A cold start, an evicted entry, a `412`, or a
-//!   server that simply ignores the header all mean "ask properly this time", not an error.
+//! * **An ETag miss degrades to a normal 200.** A cold start or an evicted entry sends no
+//!   `If-None-Match` and gets an honest 200; a server that simply ignores the header answers 200
+//!   anyway. A `412 Precondition Failed` means the recorded ETag no longer applies, so the one
+//!   request is retried UNCONDITIONALLY and the answer recorded — never an error, and never a
+//!   second conditional request carrying the same stale token.
 //! * **A failed lookup keeps the cache entry.** A rate limit or a network blip is not evidence the
 //!   pull request changed, and dropping the ETag would make the next attempt a full-cost read.
 //! * **The pre-dispatch re-read bypasses the cache.** STUDIO-953's re-read must see a head an
@@ -207,6 +210,33 @@ impl ConditionalPrState {
         }
     }
 
+    /// Applies a final (non-304) answer: a 200 is parsed and recorded, a 404 means the pull request
+    /// is gone and its entry is dropped, and every other status is a lookup that could not be MADE —
+    /// an `Err` that deliberately KEEPS the entry, because dropping the ETag would make the next
+    /// attempt a full-cost read. Shared by the first answer and a 412's unconditional retry so the
+    /// two cannot drift.
+    fn apply(&self, pr: &PrCoord, allow: &HeadAllowlist, answer: &HttpAnswer) -> PrStateResult {
+        match answer.status {
+            200 => {
+                let lookup = parse_rest_pr(&answer.body, &pr.owner, allow).map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("decode GET {pr}: {e}").into()
+                    },
+                )?;
+                self.record(pr, answer.etag.as_deref(), &lookup);
+                Ok(lookup)
+            }
+            404 => {
+                self.forget(pr);
+                Ok(PrLookup::Gone)
+            }
+            // Anything else — a rate limit (403/429), a 5xx, an unexpected status — is a lookup
+            // that could not be MADE. The entry is deliberately KEPT: the wrong direction here
+            // would be losing the ETag and paying full price on the next attempt.
+            other => Err(format!("conditional pr-state GET {pr} answered HTTP {other}").into()),
+        }
+    }
+
     /// The lookup for `pr`, either serving a 304 from the cache or (re)reading and recording a 200.
     /// `use_cache` false is the pre-dispatch re-read: send no `If-None-Match` and overwrite the
     /// entry with what comes back.
@@ -268,23 +298,20 @@ impl ConditionalPrState {
                 )
                 .into()),
             },
-            200 => {
-                let lookup = parse_rest_pr(&answer.body, &pr.owner, allow).map_err(
-                    |e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("decode GET {pr}: {e}").into()
-                    },
-                )?;
-                self.record(pr, answer.etag.as_deref(), &lookup);
-                Ok(lookup)
+            // A stale precondition: the ETag we sent no longer applies, so "ask properly this
+            // time" — retry the ONE request unconditionally and apply what it returns. The entry
+            // is not dropped first, so a retry that itself fails leaves the old ETag in place
+            // (the safe direction). A second 412 is a failure, not a loop.
+            412 => {
+                let retried = self.fetch(pr, None).await?;
+                if retried.status == 412 {
+                    return Err(
+                        format!("conditional pr-state GET {pr} answered HTTP 412 twice").into(),
+                    );
+                }
+                self.apply(pr, allow, &retried)
             }
-            404 => {
-                self.forget(pr);
-                Ok(PrLookup::Gone)
-            }
-            // Anything else — a rate limit (403/429), a 5xx, an unexpected status — is a lookup
-            // that could not be MADE. The entry is deliberately KEPT: the wrong direction here
-            // would be losing the ETag and paying full price on the next attempt.
-            other => Err(format!("conditional pr-state GET {pr} answered HTTP {other}").into()),
+            _ => self.apply(pr, allow, &answer),
         }
     }
 }
@@ -826,6 +853,46 @@ mod tests {
         );
     }
 
+    /// A `412 Precondition Failed` is a STALE precondition, not a failure: the ETag we sent no
+    /// longer applies, so the one request is retried UNCONDITIONALLY and the answer recorded.
+    /// Mutation check: send 412 to the error arm and this reds on the retry carrying `etag-1` and
+    /// the lookup coming back an `Err` instead of `sha2`.
+    #[tokio::test]
+    async fn a_412_retries_unconditionally_and_records_the_answer() {
+        let (src, t) = source(vec![
+            answer(200, Some("etag-1"), body("sha1", "open", false)),
+            answer(412, None, Vec::new()),
+            answer(200, Some("etag-2"), body("sha2", "open", false)),
+        ]);
+        let _ = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert_eq!(
+            found(&got).head_sha,
+            "sha2",
+            "a 412 must be retried, not reported as a failure"
+        );
+        assert_eq!(
+            t.seen_etags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            vec![None, Some("etag-1".to_string()), None],
+            "the retry after a 412 must send no If-None-Match"
+        );
+    }
+
+    /// A retry that 412s AGAIN is a failure, never an unbounded loop: the second answer is not
+    /// retried.
+    #[tokio::test]
+    async fn a_412_that_survives_the_retry_is_a_failure_not_gone() {
+        let (src, _t) = source(vec![
+            answer(412, None, Vec::new()),
+            answer(412, None, Vec::new()),
+        ]);
+        let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
+        assert!(got.is_err(), "a repeated 412 is a failure, not an answer");
+    }
+
     /// A merged pull request is `Merged`, from REST's `merged`/`merged_at` (REST reports
     /// `state: "closed"` for a merge, unlike GraphQL's `MERGED`).
     #[tokio::test]
@@ -914,6 +981,42 @@ mod tests {
         assert!(got.is_err(), "a 401 is a failure, not an answer");
     }
 
+    /// A 401 on the PRE-DISPATCH re-read answers through the fallback's UNCONDITIONAL entry point
+    /// (STUDIO-953): routing it through the cached `pr_state` would let the fallback's own caching
+    /// hide a head pushed after the sweep.
+    /// Mutation check: swap the fallback's `pr_state_unconditional` for `pr_state` and the
+    /// `unconditional_calls` assert reds.
+    #[tokio::test]
+    async fn a_401_on_the_unconditional_lookup_uses_the_unconditional_fallback() {
+        let (src, _t) = source_with(vec![answer(401, None, b"Bad credentials".to_vec())], false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let unconditional_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(FakeFallback {
+            answer: PrLookup::Found(PrSnapshot {
+                head_sha: "from-gh".to_string(),
+                status: PrStatus::Open,
+                is_draft: None,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+                merge_state: String::new(),
+            }),
+            calls: Arc::clone(&calls),
+            unconditional_calls: Arc::clone(&unconditional_calls),
+        });
+        let src = src.with_fallback(Arc::clone(&fallback) as Arc<dyn PrStateSource>);
+
+        let got = src
+            .pr_state_unconditional("o", "r", 1, &HeadAllowlist::none())
+            .await;
+        assert_eq!(found(&got).head_sha, "from-gh");
+        assert_eq!(
+            unconditional_calls.load(Ordering::SeqCst),
+            1,
+            "the pre-dispatch re-read must stay unconditional through the fallback"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     /// A 200 that carries no ETag drops any prior entry: there is no token to condition on, so the
     /// next lookup is an honest unconditional 200 rather than a stale conditional one.
     /// Mutation check: keep the old entry and the second request carries `etag-1`.
@@ -947,5 +1050,52 @@ mod tests {
         let (src, _t) = source(vec![answer(304, None, Vec::new())]);
         let got = src.pr_state("o", "r", 1, &HeadAllowlist::none()).await;
         assert!(got.is_err(), "a 304 with nothing to serve cannot be Gone");
+    }
+
+    /// STUDIO-974 review: this module's `gh auth token` exec — the one `gh` exec outside
+    /// [`crate::ghsummons`] — must run on the blocking pool under [`GH_EXEC_TIMEOUT`], exactly as
+    /// STUDIO-829 requires, and this is the test that keeps it so.
+    ///
+    /// `ghsummons::every_gh_exec_goes_through_the_blocking_pool` asserts on `ghsummons.rs`'s own
+    /// source, so it cannot see a `gh` exec added in another module. The property is architectural
+    /// rather than behavioural, which is why it is asserted on source: a synchronous inline exec
+    /// compiles and passes every other test in this file, holds a tokio WORKER thread with no await
+    /// point, and makes any `timeout` around it unenforceable. Review at STUDIO-974 reproduced
+    /// exactly that and watched all 1,712 orchestrator tests stay green.
+    #[test]
+    fn the_token_resolution_gh_exec_is_contained() {
+        let src = include_str!("prconditional.rs");
+        // Only the production half: `include_str!` also pulls in this file's test module, whose own
+        // text must not count as an occurrence of the thing it forbids.
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // Assembled at run time so this test's own source is not itself an occurrence.
+        let exec: String = ["std", "::process::", "Command"].concat();
+        let spawn = production
+            .find("tokio::task::spawn_blocking")
+            .expect("the `gh auth token` exec must run on the blocking pool (STUDIO-829)");
+        let closure_end = spawn
+            + production[spawn..]
+                .find("})")
+                .expect("the spawn_blocking closure is still a braced closure");
+        let uses: Vec<usize> = production
+            .match_indices(exec.as_str())
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            uses.len(),
+            1,
+            "expected exactly one `gh` exec in this module, found {}; route any new one through \
+             the blocking pool too (STUDIO-829)",
+            uses.len()
+        );
+        assert!(
+            (spawn..closure_end).contains(&uses[0]),
+            "the `gh auth token` exec is outside the `spawn_blocking` closure: it would hold a \
+             tokio worker thread and no timeout could fire (STUDIO-829)"
+        );
+        assert!(
+            production.contains("tokio::time::timeout(GH_EXEC_TIMEOUT"),
+            "the blocking-pool handle must be awaited under GH_EXEC_TIMEOUT"
+        );
     }
 }
