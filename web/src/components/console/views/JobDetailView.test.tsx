@@ -503,6 +503,9 @@ describe("zone A — the sticky header (§3A)", () => {
       "attempt 3 · alice",
     );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+    // A ticket the daemon credited no reviews to renders exactly as it did before the strip: no
+    // review row at all, rather than an empty one.
+    expect(document.querySelector(".trreviews")).toBeNull();
   });
 
   // STUDIO-976 — the ticket's review runs, credited to it by the daemon's own origin-ticket join,
