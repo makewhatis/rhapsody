@@ -1284,13 +1284,33 @@ mod tests {
         }
     }
 
-    /// A pull request that has vanished, and one whose head repository is not trusted, are both
-    /// refused before any merge is attempted.
+    /// A pull request that has vanished, one whose head repository is not trusted, and one whose
+    /// `isDraft` GitHub never stated are all refused before any merge is attempted.
+    ///
+    /// ⚠️ The third case is the STUDIO-881 direction pinned at the CALL SITE (STUDIO-962). Every
+    /// other draft test here builds `is_draft: Some(..)` through `snapshot`, so the gate's choice of
+    /// reader was invisible: swapping `snap.draft_blocks_merge()` for `snap.draft_observed()` —
+    /// which answers `false` on an unstated `isDraft` — let auto-merge attempt a pull request GitHub
+    /// never said was ready, and left the whole suite green. Before `is_draft` became an
+    /// `Option<bool>` the composition was one bool with one default and the gate could not pick the
+    /// wrong direction; now it can, so this case says which direction it must pick.
     #[tokio::test]
-    async fn a_gone_or_untrusted_pull_request_is_declined() {
+    async fn a_gone_untrusted_or_unstated_draft_pull_request_is_declined() {
         for (lookup, want) in [
             (PrLookup::Gone, "the pull request is gone"),
             (PrLookup::Untrusted, "the head repository is not trusted"),
+            (
+                // Open, at the planned head, trusted, `CLEAN` and every check green — so the draft
+                // gate is the only thing between this and an irreversible `gh pr merge`.
+                PrLookup::Found(PrSnapshot {
+                    head_sha: HEAD.to_string(),
+                    status: PrStatus::Open,
+                    is_draft: None,
+                    merged_at: None,
+                    head_repo: "makewhatis/tally".to_string(),
+                }),
+                DECLINE_DRAFT,
+            ),
         ] {
             let merger = Arc::new(FakeMerger::default());
             let d = AutoMergeDeps {
@@ -1305,14 +1325,16 @@ mod tests {
 
             assert_eq!(
                 perform_auto_merge(&plan(), &d).await,
-                AutoMergeOutcome::Declined(want)
+                AutoMergeOutcome::Declined(want),
+                "({lookup:?})"
             );
             assert!(
                 merger
                     .calls
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_empty()
+                    .is_empty(),
+                "({lookup:?}) nothing may be merged on an answer GitHub did not give"
             );
         }
     }

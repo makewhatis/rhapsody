@@ -3637,6 +3637,50 @@ mod tests {
         assert!(again.nudges.is_empty(), "{:?}", again.nudges);
     }
 
+    /// ⚠️ Acceptance (sol's round-5/6 blocker): an UNSTATED `isDraft` is never ACTED ON either. The
+    /// test above drives its `None` tick after the escalation has latched, so it returns on the
+    /// `escalated` branch and never reaches the unstated guard; this one drives a FRESH row, where
+    /// that guard is the only thing standing between "GitHub did not say" and a summons.
+    ///
+    /// Two halves, and both are load-bearing. The `None` tick must poke NOTHING and record nothing —
+    /// a recorded poke on an unstated answer is the "act on a guess" failure the `Option<bool>`
+    /// refactor exists to prevent, and it would also spend a poke of the bounded budget. The
+    /// `Some(true)` tick that follows must then poke normally, which is what says the guard SKIPPED
+    /// the tick rather than retiring the pull request from poking altogether.
+    #[test]
+    fn an_unstated_draft_on_a_fresh_pull_request_is_never_poked() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // GitHub did not say, and nothing has been poked yet: no summons, and no ledger at all.
+        let unstated = o.handle_review_sweep(&[unstated_at(12, HEAD_A)]);
+        assert!(
+            unstated.nudges.is_empty(),
+            "an answer GitHub never gave must not summon anyone: {:?}",
+            unstated.nudges
+        );
+        assert_eq!(
+            poke_state(&o, 12),
+            None,
+            "an unstated answer must not record a poke either"
+        );
+
+        // And the tick that positively says "still a draft" pokes normally — the guard skipped a
+        // tick, it did not retire the pull request from poking.
+        let stated = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert_eq!(
+            poked_heads(&stated),
+            vec![HEAD_A.to_string()],
+            "the first STATED draft is poked exactly once: {:?}",
+            stated.nudges
+        );
+        assert_eq!(
+            poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
+            Some((HEAD_A.to_string(), 1)),
+            "and it is the FIRST poke: the unstated tick spent none of the budget"
+        );
+    }
+
     /// Acceptance: a draft ignored across every head escalates to a human rather than poking
     /// forever, and names how many times it was poked.
     #[test]
