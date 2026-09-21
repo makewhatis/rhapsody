@@ -416,13 +416,13 @@ pub(crate) async fn handle_history_costs(
 /// finished review still reads `done` rather than the `review` a completed ticket would mean.
 ///
 /// What that orphan can do on the board, exactly: a completed one lands in a bucket no lane tally
-/// carries (Done is deliberately uncounted), so it draws no card and no gap; a live one IS a Running
-/// row the board draws (`runningRuns`); only a failed, interrupted or stopped orphan reaches a
-/// counted lane the board cannot draw it in, and on a truncated page that Queued lane can print its
-/// gap copy for a row that is loaded but never becomes a card. That residue is accepted rather than
-/// hidden — trap 4 requires the row to count somewhere — and it is unchanged from before this
-/// ticket; the operator's store has no orphan review today (every one of its watch rows resolves an
-/// origin that has a run row).
+/// carries (Done is deliberately uncounted), so it draws no card and no gap; a live one IS a
+/// Running row the board draws (`runningRuns`); only a failed, continued, interrupted or stopped
+/// orphan reaches a counted lane the board cannot draw it in, and on a truncated page that Queued
+/// lane can print its gap copy for a row that is loaded but never becomes a card. That residue is
+/// accepted rather than hidden — trap 4 requires the row to count somewhere — and it is unchanged
+/// from before this ticket; the operator's store has no orphan review today (every one of its
+/// watch rows resolves an origin that has a run row).
 /// A review row whose origin names no ticket is not work and is dropped, exactly as the board drops
 /// it.
 ///

@@ -436,10 +436,10 @@ describe("the board (STUDIO-925)", () => {
 
 // STUDIO-965 — the lane header and the lane body must answer the same question. The observed screen:
 // three failed/interrupted reviews of two Done tickets were tallied as their own rows (`Queued 4` —
-// one actual card), and a live-running ticket whose tracker state read In Review was tallied In
-// Review while its card sat in Running. The counts endpoint now folds a review run onto the ticket
-// it reviews and buckets a live ticket by its run, so the store tally equals the fold. This drives
-// the operator's screen through the view and asserts no lane claims a card it cannot draw.
+// one actual card), and the In Review lane reported 1 with no card while the only in-review ticket
+// was live and drawn in Running. The counts endpoint now folds a review run onto the ticket it
+// reviews and buckets a live ticket by its run, so the store tally equals the fold. This drives the
+// operator's screen through the view and asserts no lane claims a card it cannot draw.
 describe("the lane header matches the lane body (STUDIO-965)", () => {
   it("draws no phantom on the reported screen", () => {
     const rows = [
@@ -470,25 +470,23 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
         live: true,
       }),
     ];
-    // The tally the PRE-FIX endpoint served for this store: the three review rows billed as their
-    // own buckets (two failed ⇒ Blocked 2, one interrupted ⇒ Queued 1) on top of STUDIO-958
-    // (Queued 1) and the review ticket read off its lifecycle (In Review 1). Every one of those
-    // exceeds what the board can draw — 2 Queued / 1 card, 1 In Review / 0 cards, 2 Blocked / 0
-    // cards — which is the phantom this ticket removes. On a COMPLETE page the board holds every row
-    // there is, so the header is what the lane DRAWS and the pagination copy never appears, however
-    // large the tally is: THE MUTATIONS — make that copy unconditional (drop `truncated &&`) and the
-    // `/in this lane/` assertion reds; make the header read the tally on a complete page
-    // (`count = tally ?? rendered`) and the `count("queued")`/`count("review")` assertions red. (The
+    // An over-counting tally shaped like the pre-fix one: the three review rows billed as their own
+    // buckets (two failed ⇒ blocked 2, one interrupted ⇒ queued 1) on top of the real Queued ticket
+    // STUDIO-958 (queued 1). The queued lane folds blocked into queued, so that over-counts the lane
+    // as 4 beside the one card the page draws — the phantom this ticket removes. On a COMPLETE page
+    // the board holds every row there is, so the header is what the lane DRAWS and the pagination
+    // copy never appears, however large the tally is: THE MUTATIONS — make that copy unconditional
+    // (drop `truncated &&`) and the `/in this lane/` assertion reds; make the header read the tally
+    // on a complete page (`count = tally ?? rendered`) and `count("queued")` reds (4, not 1). (The
     // page where the tally is legitimately load-bearing is pinned just below.)
     mount(
       rows,
       vi.fn(),
       consoleStoreCounts({
-        issues: 4,
+        issues: 7,
         buckets: [
           { outcome: "completed", lifecycle: "done", count: 2 },
           { outcome: "completed", lifecycle: "open", count: 1 },
-          { outcome: "completed", lifecycle: "in_review", count: 1 },
           { outcome: "running", lifecycle: "in_review", count: 1 },
           { outcome: "failed", count: 2 },
           { outcome: "interrupted", count: 1 },
@@ -508,7 +506,7 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
     expect(count("running")).toBe("1 / 6");
     expect(lane("running").querySelectorAll(".bcard")).toHaveLength(1);
     expect(lane("running").textContent).toContain("STUDIO-963");
-    // In Review 1 -> 0 cards: no lane claims a card it cannot draw.
+    // In Review holds no card and reads 0: no lane claims a card it cannot draw.
     expect(count("review")).toBe("0");
     expect(lane("review").querySelectorAll(".bcard")).toHaveLength(0);
     // The two Done cards carry all three reviews as chips, so nothing counts nowhere.
