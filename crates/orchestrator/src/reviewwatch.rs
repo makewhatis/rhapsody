@@ -1956,7 +1956,7 @@ impl Orchestrator {
         // STUDIO-956: at the configured round threshold the loop stops ARMING and the MANAGER
         // decides — ship it, or escalate — instead of the loop silently stopping at the hard cap.
         // Checked before the dispatch loop so no row of this pull request is dispatched once the
-        // threshold is reached.
+        // threshold is reached — except the ONE resumed round STUDIO-971 grants a new head below.
         //
         // STUDIO-971: a decision applies to the HEAD it was made at, never to the pull request for
         // ever. A route-back after a `ship` adjudication is a NORMAL flow — the threshold fires on
