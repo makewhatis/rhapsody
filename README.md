@@ -1470,7 +1470,7 @@ here rather than implying the refusal holds while the daemon no longer owns the 
 validation, an armed drain, a dead agent credential — while **four** decision gates keep running
 anyway, none of them through the per-tick candidate pass: the reconciliation sweep is called from
 `on_tick` ABOVE those gates on purpose, the ticketless review watcher's **round** gate and its
-**auto-merge** gate are reached through the watcher's own 120s task, and the ticket-mode handoff
+**auto-merge** gate are reached through the watcher's own timer task, and the ticket-mode handoff
 quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not on `on_tick` at all.
 The handed-off run is LIVE, and on a gated daemon live runs come from the RETRY path, not from
 recovery: `boot_recovery` restores no running entry (it converts every interrupted claim into an
@@ -1484,7 +1484,7 @@ a drained daemon, irreversibly, how a real review round is dispatched at its pul
 held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
 therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
 ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
-both are re-offered — the watcher asks again in 120s), the reconciliation sweep reports nothing — a
+both are re-offered — the watcher asks again on its next tick), the reconciliation sweep reports nothing — a
 false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
 exists to prevent — and `plan_quorum` refuses the fan-out, logging at `warn!` and naming the ticket.
 That refusal is **one-shot and unrecoverable**: the handoff has already landed, the run winds down,
@@ -1506,7 +1506,7 @@ that could not read every enabled project neither clears nor primes. This is a d
 conservatism for a bounded window — though on a daemon gated since boot the window is the whole
 process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy daemon's
 first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act after it
-(the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation sweep —
+(the watcher's first sweep is one tick out, and a handoff has to arrive), and the reconciliation sweep —
 which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that first
 un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the board
 the set is real and the bounds above are the ones left. Those bounds are unchanged by this: after any
