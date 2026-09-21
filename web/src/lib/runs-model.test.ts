@@ -513,6 +513,8 @@ describe("mergeJobs", () => {
     expect(w.agent).toBe("Infrastructure"); // resolved from the Linear project list (via entry.project)
     expect(w.projectShort).toBe("Infrastructure");
     expect(w.subLabel).toBe("waiting on INF-1 · In Review");
+    // A blocker hold is NOT a human hold — the two must not collapse into one flag (STUDIO-949).
+    expect(w.heldForHuman).toBe(false);
   });
 
   it("collapses a blocked issue that is ALSO live to running (live wins; no longer waiting)", () => {
@@ -551,6 +553,43 @@ describe("mergeJobs", () => {
     );
     expect(rows.some((r) => r.status === "waiting")).toBe(false);
     expect(rows).toHaveLength(1);
+  });
+
+  it("turns a rhapsody:human hold (state.held_for_human) into a waiting row that says so (STUDIO-949)", () => {
+    // A held ticket has never run, so nothing else contributes a row for it. It is a deliberate
+    // hold, not a blocker, so its sub-label must not masquerade as "waiting on <blocker>".
+    const s = state({
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    });
+    const rows = mergeJobs(s, [], PROJECTS, NOW);
+    expect(rows).toHaveLength(1);
+    const h = rows[0];
+    expect(h.issue).toBe("STUDIO-939");
+    expect(h.status).toBe("waiting");
+    expect(h.runId).toBe(0); // never ran → not clickable
+    expect(h.title).toBe("store work");
+    expect(h.subLabel).toBe("held for a human");
+    // Carried as a fact, so the console can paint a deliberate hold Queued while a blocker-held row
+    // stays Blocked, without re-parsing the sub-label's wording (STUDIO-949 round 3).
+    expect(h.heldForHuman).toBe(true);
+  });
+
+  it("keeps a current rhapsody:human hold on a ticket that HAS run (STUDIO-949)", () => {
+    // A hold and a finished history row can share one group: a ticket parked in review, then
+    // labelled. The real run must stay the lane and the click target, but the hold must NOT be
+    // erased by the historical status — that is the List view presenting deliberate work as merely
+    // completed (the round-4 review blocker).
+    const s = state({
+      held_for_human: [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
+    });
+    const history = [summary({ id: 88, issue_identifier: "STUDIO-939", outcome: "completed" })];
+    const rows = mergeJobs(s, history, PROJECTS, NOW);
+    expect(rows).toHaveLength(1);
+    const h = rows[0];
+    expect(h.status).toBe("completed"); // the real run still decides the lane
+    expect(h.runId).toBe(88); // clickable — opens the real run
+    expect(h.subLabel).toBe("held for a human");
+    expect(h.heldForHuman).toBe(true);
   });
 });
 

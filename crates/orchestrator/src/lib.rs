@@ -66,6 +66,7 @@ pub mod recovery;
 pub mod reload;
 pub mod retry;
 pub mod review;
+pub mod reviewadjudicate;
 pub mod reviewadopt;
 pub mod reviewchanges;
 pub mod reviewconsole;

@@ -304,6 +304,15 @@ impl Orchestrator {
                  armed mid-tick; the run will wind down at its first turn boundary"
             );
         }
+        // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
+        // AUTHOR round to that pull request's shared review↔author budget. Charged here rather than
+        // in `select` because this is the one funnel every dispatch path shares, so no path can
+        // dispatch an author round the budget never saw. Retries and continuations (`attempt` is
+        // `Some`) are the SAME round and must not charge twice; a ticket whose pull request has
+        // never been reviewed carries no budget entry, so an ordinary first dispatch pays nothing.
+        if attempt.is_none() {
+            self.note_author_round(&iss);
+        }
         // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
         // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
         // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
@@ -982,9 +991,14 @@ impl Orchestrator {
                     if is_continuation {
                         delay = CONTINUATION_DELAY_MS.max(delay);
                     }
-                    tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "requeue: in-flight issue absent from candidates; state recheck failed");
+                    tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "requeue: in-flight issue absent from candidates; state/labels recheck failed");
                     if re.recovered {
-                        self.requeue_recovered(&re, next, delay, "in-flight state recheck failed");
+                        self.requeue_recovered(
+                            &re,
+                            next,
+                            delay,
+                            "in-flight state/labels recheck failed",
+                        );
                     } else {
                         self.schedule_retry_for(
                             RetryTarget {
@@ -995,7 +1009,7 @@ impl Orchestrator {
                             },
                             next,
                             delay,
-                            "in-flight state recheck failed",
+                            "in-flight state/labels recheck failed",
                             re.issue.clone(),
                             re.identity.clone(),
                         );
@@ -1029,9 +1043,25 @@ impl Orchestrator {
             self.persist_release(&re.identifier);
             return;
         }
+        // STUDIO-956: and the author-side half. A recovered SUMMONS-DRIVEN re-dispatch whose pull
+        // request has spent its shared review↔author budget is released rather than run — the loop
+        // has reached its bound and needs a human (reported by the reconciliation sweep). Only
+        // reached when a summons lifted the suppression above, so a ticket whose work is merely
+        // linked was already released there.
+        if re.recovered && self.author_round_budget_spent(&iss) {
+            tracing::warn!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: the pull request's shared review↔author round budget is spent");
+            self.claimed.remove(&e.issue_id);
+            self.completed.remove(&e.issue_id);
+            self.persist_release(&re.identifier);
+            return;
+        }
 
-        // Eligibility excluding this issue's own pending claim. The label gate is proactive-pickup-only
-        // (nil labels here), so a required label stripped mid-run does not abandon in-flight work.
+        // Eligibility excluding this issue's own pending claim. The REQUIRED-label gate is
+        // proactive-pickup-only (nil labels here), so a required label stripped mid-run does not
+        // abandon in-flight work. The `rhapsody:human` hold is the deliberate exception: it is not
+        // label-config driven, so it is absolute here too — an operator who labels a retrying ticket
+        // `rhapsody:human` means to take it off the agents, and releasing the retry is the intended
+        // outcome rather than a dropped label (STUDIO-949).
         let claimed_except: HashSet<String> = self
             .claimed
             .iter()
@@ -1062,7 +1092,12 @@ impl Orchestrator {
         }
 
         let st = normalize_state(&iss.state);
-        let no_global = global_slots(cfg.global_cap, self.running.len() as i64) <= 0;
+        // STUDIO-950: this is the THIRD implementation draw (the two `select` ladders are the
+        // others), and it is easy to miss because a due retry dispatches straight from here,
+        // bypassing the tick. With `agent.max_concurrent_reviews` set, a ticketless review draws its
+        // own pool and must NOT occupy an implementation slot here either, or a continuation mid-work
+        // is requeued (and escalates to `failure_backoff_ms`) for a slot that is in fact free.
+        let no_global = global_slots(cfg.global_cap, self.implementation_pool_holders()) <= 0;
         let no_project = cfg
             .rp_group
             .as_ref()
@@ -1162,6 +1197,16 @@ impl Orchestrator {
     /// refreshed honestly; the dispatch-time `blocked_by` is stale and cannot be re-verified, so it is
     /// DROPPED (the relocated path must not re-block work in flight on data it can no longer trust — the
     /// next full candidate poll re-applies the real blocker gate). Mirrors Go `recheckInFlight`.
+    ///
+    /// The LABELS are refreshed too (STUDIO-949), through the Rhapsody-only
+    /// [`Tracker::fetch_issue_labels_by_ids`] that exists for exactly this "whatever state" read. This
+    /// fallback is the normal POOL shape — claiming assigns the ticket, while the candidate query
+    /// returns only unassigned ones — so without it a `rhapsody:human` label added while the run was
+    /// active or backing off is invisible to the [`eligible`] call in `on_retry` and the retry
+    /// re-dispatches an agent at a ticket only a person may touch. The two reads are one round trip
+    /// each and this
+    /// path fires only when the candidate set has already lost the issue, so the extra cost is the
+    /// rare case's.
     async fn recheck_in_flight(
         &self,
         tr: &Arc<dyn Tracker>,
@@ -1180,6 +1225,22 @@ impl Orchestrator {
         let mut out = last; // last-known full issue (description / PR signals)
         out.state = cur.state.clone(); // refresh to the current state (the only field by-ids can refresh)
         out.blocked_by = None; // drop dispatch-time blockers we cannot re-verify (staleness contract)
+        // Refresh labels from the same by-id read, so the absolute `rhapsody:human` gate in
+        // `eligible` sees a label added since dispatch. A miss (the issue named by the state read but
+        // absent from the labels read, which the adapters should never do) keeps the stale snapshot
+        // rather than dropping the labels wholesale.
+        //
+        // A FAILED labels read is an ERROR (STUDIO-949 round 7). It must not fall through to the
+        // dispatch-time snapshot: that snapshot is exactly the thing this refresh exists to distrust,
+        // and it cannot carry a hold added while the run was active or backing off. `on_retry`'s
+        // existing `Err` arm keeps the claim and requeues on the failure backoff, so an unreadable
+        // label set PARKS the retry instead of opening the hold gate. Avoiding one backoff cycle
+        // cannot take precedence over never dispatching at a ticket a person may have taken over —
+        // absence of a hold we could not read is not evidence of absence.
+        let labels = tr.fetch_issue_labels_by_ids(&ids).await?;
+        if let Some(cur) = find_by_id(&labels, id) {
+            out.labels = cur.labels.clone();
+        }
         Ok(Recheck::Relocated(Box::new(out)))
     }
 }
@@ -2128,6 +2189,79 @@ mod tests {
         );
     }
 
+    // STUDIO-949: the relocation fallback must refresh LABELS as well as state. In pool mode the
+    // claimed ticket is absent from the candidate query, so this is the normal shape — and the
+    // dispatch-time snapshot in `RetryEntry::issue` carries the labels as they were then. An
+    // operator who labels a retrying ticket `rhapsody:human` means to take it off the agents; the
+    // retry must observe that label and release rather than dispatch a second agent at it.
+    // MUTATION: drop the `fetch_issue_labels_by_ids` refresh from `recheck_in_flight` and this reds
+    // (the dispatch sink receives "1").
+    #[tokio::test]
+    async fn a_filtered_out_retry_observes_a_new_human_label() {
+        let mut f = Fake::new(); // issue NOT in the filtered candidate set...
+        let mut current = issue("1", "MT-1", "In Progress");
+        current.labels = Some(vec!["rhapsody:human".into()]); // ...but the current by-id row is held
+        f.by_id.insert("1".into(), current);
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(Arc::clone(&tr), 10);
+        o.claimed.insert("1".into());
+        let mut re = retry_entry("1", "MT-1", 1);
+        re.issue = issue("1", "MT-1", "In Progress"); // dispatch-time snapshot: no label
+        o.retry_attempts.insert("1".into(), re);
+        o.on_retry(EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(
+            !o.claimed.contains("1"),
+            "a rhapsody:human label added mid-flight must release the retry"
+        );
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "no agent may be dispatched at a ticket a person took over"
+        );
+    }
+
+    // STUDIO-949 round 7: a FAILED labels read must not dispatch. The state read succeeding proves
+    // only that the ticket is still active; the labels are exactly what this refresh exists to
+    // establish, and the dispatch-time snapshot predates any mid-flight `rhapsody:human` label. So an
+    // unreadable label set fails CLOSED — `on_retry`'s existing `Err` arm keeps the claim and parks
+    // the retry on the failure backoff — rather than continuing on a snapshot that cannot carry the
+    // hold. The earlier "do not cost a backoff cycle" test pinned the unsafe dispatch and is gone.
+    //
+    // MUTATION: swallow the labels-read error and continue on the dispatch-time snapshot, and this
+    // reds (an agent is dispatched at a held ticket).
+    #[tokio::test]
+    async fn a_failed_labels_recheck_parks_the_retry_without_dispatching() {
+        let mut f = Fake::new(); // filtered out of the candidate set, still active
+        let mut current = issue("1", "MT-1", "In Progress");
+        current.labels = Some(vec!["rhapsody:human".into()]); // ...and the current row is held
+        f.by_id.insert("1".into(), current);
+        f.labels_by_id_err = Some(TrackerError::Other("linear_api_request: boom".into()));
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(Arc::clone(&tr), 10);
+        o.claimed.insert("1".into());
+        let mut re = retry_entry("1", "MT-1", 1);
+        re.issue = issue("1", "MT-1", "In Progress"); // dispatch-time snapshot: no label
+        o.retry_attempts.insert("1".into(), re);
+        o.on_retry(EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "the current labels are unknown, so no agent may be dispatched"
+        );
+        assert!(
+            o.retry_attempts.contains_key("1"),
+            "the retry must stay parked until the hold can be established"
+        );
+        assert!(
+            o.claimed.contains("1"),
+            "the claim must survive the requeue, not be released"
+        );
+    }
+
     // Mirrors Go `TestOnRetryReleasesInFlightWhenTerminal`.
     #[tokio::test]
     async fn on_retry_releases_in_flight_when_terminal() {
@@ -2546,6 +2680,197 @@ mod tests {
         assert_eq!(
             re.project_slug, "a",
             "requeued retry should keep project slug a"
+        );
+    }
+
+    /// A running TICKETLESS review: `review` coordinates are what mark it as drawing the separate
+    /// review pool once `agent.max_concurrent_reviews` is set. Mirrors `select.rs`'s helper.
+    fn ticketless_review_run(id: &str) -> RunningEntry {
+        let mut re = running_entry(issue(id, id, "In Progress"), "", "");
+        re.review = Some(crate::review::ReviewRun::default());
+        re
+    }
+
+    /// STUDIO-950: `on_retry` is the THIRD implementation draw — a due retry dispatches straight from
+    /// here, bypassing both `select` ladders — so with `agent.max_concurrent_reviews` set a
+    /// ticketless review on its own pool must not refuse it an implementation slot. Unset keeps the
+    /// shared draw, byte-identical to before the key.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw at `on_retry` and the keyed
+    /// assertion reds (nothing dispatched, requeued with "no available orchestrator slots").
+    #[tokio::test]
+    async fn a_ticketless_review_does_not_consume_an_implementation_slot_on_retry() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 1);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("a1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "a1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "a review on its own pool must not hold the implementation slot on the retry path"
+        );
+
+        // Control: unset ⇒ the review spends the shared `max_concurrent_agents` budget and requeues.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let pb = proj_with_tracker("b", Arc::clone(&tr_b), "pb");
+        let (mut unset, dispatched_unset) = orch_for_retry_multi(vec![pb], 1);
+        unset
+            .running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("b1", "B-1", 1);
+        re.project_slug = "b".into();
+        unset.retry_attempts.insert("b1".into(), re);
+
+        unset
+            .on_retry(EvRetry {
+                issue_id: "b1".into(),
+            })
+            .await;
+
+        assert!(
+            dispatched_unset.lock().expect("lock").is_empty(),
+            "unset must keep the shared draw"
+        );
+        assert_eq!(
+            unset.retry_attempts.get("b1").expect("requeued").err,
+            "no available orchestrator slots"
+        );
+    }
+
+    /// STUDIO-950: the review/implementation separation is GLOBAL only, pinned here for the RETRY
+    /// ladder — `on_retry`'s `no_project` is the second site `running_in_project_group` gates. A
+    /// ticketless review still spends its project's own `max_concurrent` ceiling even with the key
+    /// set, so at the project cap the retry is requeued; the control (same fixture, no review in the
+    /// group) dispatches. See the README's STUDIO-950 entry, which states the boundary.
+    #[tokio::test]
+    async fn a_ticketless_review_still_counts_against_its_projects_own_cap_on_retry() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let mut pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        pa.max_concurrent = 1; // the project cap, not the global one, is the binding constraint
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 10);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        let mut rev = ticketless_review_run("rev-1");
+        rev.project_slug = "a".into();
+        rev.project_group = "a".into();
+        o.running.insert("rev-1".into(), rev);
+        o.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("a1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "a1".into(),
+        })
+        .await;
+
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "a review still spends its project's own cap on the retry path: global only"
+        );
+        assert_eq!(
+            o.retry_attempts.get("a1").expect("requeued").err,
+            "no available orchestrator slots"
+        );
+
+        // Control: the identical fixture with no review in the group dispatches.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let mut pb = proj_with_tracker("a", Arc::clone(&tr_b), "pb");
+        pb.max_concurrent = 1;
+        let (mut clean, dispatched_clean) = orch_for_retry_multi(vec![pb], 10);
+        clean.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        clean.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        clean.retry_attempts.insert("a1".into(), re);
+
+        clean
+            .on_retry(EvRetry {
+                issue_id: "a1".into(),
+            })
+            .await;
+
+        assert_eq!(
+            dispatched_clean.lock().expect("lock").len(),
+            1,
+            "the project cap admits once the review is gone"
+        );
+    }
+
+    /// STUDIO-950: the RECOVERED requeue arm shares the same `no_global` draw, so it needs its own
+    /// pin — a boot-recovered implementation must dispatch once the key gives a ticketless review its
+    /// own pool, and still requeue on the shared budget when the key is unset.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw at `on_retry` and the keyed
+    /// assertion reds (the recovered entry is requeued instead of dispatched).
+    #[tokio::test]
+    async fn a_recovered_retry_is_not_held_by_a_ticketless_review_on_its_own_pool() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 1);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        // Recovered entries are keyed by identifier: the opaque id is unknown at restart.
+        let mut re = retry_entry("", "A-1", 1);
+        re.recovered = true;
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("A-1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "A-1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "the recovered arm must draw the implementation pool, not the raw run count"
+        );
+
+        // Control: unset ⇒ the recovered entry requeues on the shared draw.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let pb = proj_with_tracker("b", Arc::clone(&tr_b), "pb");
+        let (mut unset, dispatched_unset) = orch_for_retry_multi(vec![pb], 1);
+        unset
+            .running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("", "B-1", 1);
+        re.recovered = true;
+        re.project_slug = "b".into();
+        unset.retry_attempts.insert("B-1".into(), re);
+
+        unset
+            .on_retry(EvRetry {
+                issue_id: "B-1".into(),
+            })
+            .await;
+
+        assert!(
+            dispatched_unset.lock().expect("lock").is_empty(),
+            "unset must keep the shared draw"
         );
     }
 

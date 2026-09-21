@@ -226,3 +226,18 @@ export function dismissNotice(res: ReviewActionResponse, liveReview: boolean): R
   }
   return { tone: "info", text: dropped };
 }
+
+/**
+ * The outcome of clearing a pull request's shared review↔author round budget (STUDIO-956).
+ *
+ * A success is always one row: the daemon answers a pull request with no budget with a `409`
+ * refusal, not an `Applied(0)`, so a zero never reaches here — the refusal path is `refused(e)` on
+ * the mutation's error, not this notice. So this only ever says the bound is gone and both halves of
+ * the loop may run again.
+ */
+export function clearNotice(res: ReviewActionResponse): ReviewNotice {
+  return {
+    tone: "info",
+    text: `The review↔author round budget for ${res.pr} is cleared — its next round may dispatch.`,
+  };
+}

@@ -8,18 +8,24 @@
 #   * A design record that lives only in Linear is unreadable to a dispatched run, which is headless
 #     and has no Linear access. STUDIO-594 dead-ended with no deliverable because it could not read
 #     STUDIO-572's design; STUDIO-598 reconstructed STUDIO-594's trait surface from first principles
-#     instead. The prompt therefore dual-writes a produced record to `~/.rhapsody/docs/<TICKET>-<slug>.md`
-#     (the copy runs READ) and to the Linear ticket (the durable HISTORY), and the filesystem write is
-#     the one that does not depend on Linear being reachable.
+#     instead. The prompt therefore routes a produced record to `~/.rhapsody/docs/<TICKET>-<slug>.md`,
+#     which is the copy later runs READ and the one write that does not depend on anything being
+#     reachable.
 #   * That directory is a second read-only exception to the "stay in the workspace" rule, with a
 #     one-file write carve-out for the run's own record.
 #   * The invariant is the DEPENDENCY DIRECTION, not the absence of a token (STUDIO-600). 599 pinned
-#     `save_document` as absent, which also banned the only container suited to a 16-57KB record and
-#     left the ticket half of the dual-write as a document-sized comment paste. So the ticket copy now
-#     scales with the record — always a summary plus the `~/.rhapsody/docs/` path, full text inline
-#     below a named character threshold and a linked Linear document above it — and what is pinned is
-#     that the file is written first and unconditionally, and that `save_document` is the HISTORY
-#     container and never the deliverable.
+#     `save_document` as absent, which also banned the only container suited to a 16-57KB record; 600
+#     reinstated it as the ticket half of a dual-write. Both were reasoning about a Linear write that
+#     a dispatched run cannot make at all — see the next bullet. What survives from 600, and is still
+#     pinned here, is that the record file is written FIRST and unconditionally, and that the report
+#     of it is history and never the deliverable.
+#   * There is NO Linear access from a dispatched run — not a write, not a read (STUDIO-957/958).
+#     Neither harness configures a Linear MCP server. Unreachable writes were survivable; an
+#     unreachable READ was not, because Phase 0.2 told the run to fetch its spec that way and Phase
+#     1.3 says an unreadable required input must STOP the run. On 2026-09-20 STUDIO-957 and
+#     STUDIO-958 each spent a turn discovering the tool was absent, stopped exactly as instructed,
+#     and parked with no commits and no pull request. So the prompt names no Linear call, states the
+#     description IS the spec, and says in as many words that citing no record is never a blocker.
 #   * A run that cannot read a required input STOPS and hands off; it never reconstructs the input.
 #   * None of this weakens the absolute rule that specs, plans and design docs never land in the repo —
 #     the directory sits outside the repo precisely so that rule can stand.
@@ -82,70 +88,66 @@ present_i "the run may write exactly ONE file in that directory" \
 present_i "the run must never touch another ticket's record" \
           "another ticket's record"
 
-# --- dual-write: the filesystem copy is the deliverable ---------------------------------------------
+# --- the record goes to the filesystem; the run reports it in its final message -------------------
 present "a produced record is routed to ~/.rhapsody/docs/<TICKET>-<slug>.md" \
         '~/\.rhapsody/docs/\{\{ *issue\.identifier *\}\}-<slug>\.md'
-present_i "the routing is described as a dual-write (filesystem + ticket)" \
-          'dual-write'
-# NOT a bare `save_comment` grep: that token already appears in the ground rules' write budget and in
-# Phase 6 step 2 regardless of this change, so it would stay green with the ticket half of the
-# dual-write deleted. Same for a bare `dual-write`, which the Phase-2 intro also says. Pin the
-# instruction, plus the property that keeps the SMALL-record case affordable. That property is now
-# branch-specific, not universal — a large record deliberately pays a second Linear write for its
-# document — so the check names the branch it pins rather than overstating its subject.
-present_i "the ticket always gets a copy of the record, for history" \
-          'Give the ticket a copy, sized to the record'
-present_i "an inlined ticket copy costs no extra Linear write" \
-          'costs no extra write'
+
+# --- no Linear access at all (STUDIO-957/958) ------------------------------------------------------
+# STUDIO-600 reinstated `save_document` as the history container for a large record, on the premise
+# that a dispatched run could make Linear writes. It cannot, and never could: neither harness
+# configures a Linear MCP server, so every `mcp__claude_ai_Linear__*` call the prompt named was
+# unreachable. That was survivable for the WRITES — a lost history copy costs nothing the filesystem
+# record does not already hold — but Phase 0.2 also told the run to FETCH its spec that way, and
+# Phase 1.3 says an unreadable required input must STOP the run. On 2026-09-20 STUDIO-957 and
+# STUDIO-958 each burned a turn discovering the tool was absent, stopped exactly as instructed, and
+# parked with no commits and no pull request. The agents were right; the prompt was wrong.
+#
+# So the invariant is inverted from 600's: the prompt must state plainly that there is NO Linear
+# access, and must name no Linear call for the run to attempt.
+present_i "the prompt states the run has no Linear access" \
+          'You have no Linear access'
+# NOT a bare `mcp__claude_ai_Linear__` grep: the ground rule above names the family as
+# `mcp__claude_ai_Linear__*` to say it is absent, and that mention must stay. A CALL is the family
+# prefix followed by a tool name, so require a letter after the underscores.
+absent "no Linear MCP tool is named as something the run should call" \
+       'mcp__claude_ai_Linear__[a-z]'
+# The handoff is the daemon's own tool, which really is present, and it has no Linear fallback.
+present "the handoff goes through the daemon's own MCP tool" \
+        'mcp__symphony__symphony_handoff'
+absent "no dead Linear fallback survives beside the handoff" \
+       'save_issue|save_comment|save_document'
+
+# --- the description IS the spec, and its absence is never a blocker -------------------------------
+# The trap was not only the unreachable tool: Phase 0.2 asserted the spec and plan ARE Linear project
+# documents, so an agent reading a self-contained ticket still went looking for one. Most tickets
+# cite no record. Pin BOTH halves — where the spec actually is, and that finding no record is a
+# normal outcome rather than the unreadable-required-input case that stops the run.
+present_i "the ticket description is named as the spec" \
+          'Your spec is the ticket description above'
+present_i "a ticket citing no record is explicitly not a blocker" \
+          'absence of a plan document is not a missing input and is never a blocker'
 
 # --- the deliverable never DEPENDS on a Linear write (STUDIO-600) ---------------------------------
-# The real 599 invariant: the record FILE is written first and unconditionally, so a fully headless
-# run still produces the deliverable. Pin the dependency direction in all three places it is stated —
-# the file write itself, what it does not wait on, and what the ticket copy is demoted to.
+# The real 599 invariant, and the one that survives 957/958 unchanged: the record FILE is written
+# first and unconditionally, so a fully headless run still produces the deliverable. Pin the
+# dependency direction in all three places it is stated — the file write itself, what it does not
+# wait on, and what the report is demoted to.
 present "the record file is written first and never skipped" \
         'Write the file. Always, first, and never skipped'
 present_i "the record file does not depend on Linear, gh, or a pull request" \
           'does not depend on Linear, on `gh`, or on there being a pull request'
-present_i "the ticket copy is history, and the file write never waits on it" \
+present_i "the report is history, and the file write never waits on it" \
           'nothing in step 1 waits on it'
 
-# The summary comment ALWAYS carries the path, at every record size — that is what keeps a large
-# record findable from the ticket without pasting it there. Checked in both places that say it:
-# Phase 2 states the rule, Phase 6 is where the comment is actually written.
-present "Phase 2: the summary comment always carries a summary plus the record's docs path" \
+# The report ALWAYS carries the path, at every record size — that is what keeps a large record
+# findable without pasting it. Checked in both places that say it: Phase 2 states the rule, Phase 6
+# is where the report is actually written.
+present "Phase 2: the report always carries a summary plus the record's docs path" \
         'always carries a summary of the record plus its'
-present_i "the summary comment is never a document-sized paste" \
+present_i "the report is never a document-sized paste" \
           'never a [0-9]+KB paste'
-present "Phase 6: the summary comment cites the record's ~/.rhapsody/docs/ path" \
+present "Phase 6: the report cites the record's ~/.rhapsody/docs/ path" \
         '`~/\.rhapsody/docs/\{\{ *issue\.identifier *\}\}-<slug>\.md` path'
-
-# A NAMED threshold, not a judgement call. The number itself is deliberately not frozen — retuning it
-# is a legitimate edit; leaving the choice to the run's judgement is the regression.
-present "a numeric threshold is named for inlining the full text" \
-        'Under [0-9][0-9,]+ characters'
-present "a numeric threshold is named for the linked-document route" \
-        '[0-9][0-9,]+ characters or more'
-
-# `save_document` is allowed BACK, but only as the history container for a large record. Neither check
-# below is a bare `save_document` grep: that token now also appears in the ground rules' write budget,
-# independently of this route, so deleting the route would leave a bare grep green (the same hole 599's
-# own self-review found in its `save_comment` check). Pin the instruction, then the qualification —
-# because a route reinstated as the DELIVERABLE is the thing 599 was right to prevent.
-present "a large record's full text is published as a Linear document" \
-        'mcp__claude_ai_Linear__save_document`, parented to the ticket'
-present "save_document is the history container and never the deliverable" \
-        '`save_document` is the HISTORY container and never the deliverable'
-
-# A large record takes TWO Linear writes, which fail independently. Dropping the summary comment
-# because the DOCUMENT write failed would strand the path citation and leave the worst case strictly
-# worse than the single-write route this replaced, so the comment is unconditional.
-present_i "a failed save_document still posts the summary comment carrying the path" \
-          'still post the summary comment'
-# Phase 6 is where the comment is actually written, so it is the copy a run has in front of it when a
-# write fails. It must DEFER to the rule above, not restate a summary of it that can go stale — which
-# is exactly what happened once on this branch.
-present_i "Phase 6 defers to Phase 2's denial rule instead of restating it" \
-          "apply Phase 2's denial rule"
 
 # The PR body stays dead as a home for the document (unchanged from STUDIO-599).
 absent "the deliverable no longer lives in the pull request body" \

@@ -75,7 +75,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use rhapsody_store::{
-    REVIEW_STATUS_DROPPED, REVIEW_STATUS_REQUESTED, ReviewWatchKey, ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
+    ReviewWatchKey, ReviewWatchRow,
 };
 use rhapsody_workspace::sanitize_key;
 
@@ -380,6 +381,20 @@ fn pr_from_url(url: &str, owner: &str, repo: &str) -> Option<PrCoord> {
         })
 }
 
+/// What one head-advance did to a pull request's watch rows (STUDIO-960).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewHeadAdvance {
+    /// Rows re-armed to `requested` for a fresh review round — the author pushed something nobody
+    /// has read.
+    pub armed: usize,
+    /// Rows whose head move was PROVEN to carry no new work, so their `last_reviewed_sha` was
+    /// advanced to the new head and no round was armed. Returned as keys rather than a count
+    /// because the caller's dispatch loop decides from this hand-back's opening snapshot of the
+    /// rows, which still holds the pre-advance SHA: it must skip these explicitly or it re-dispatches
+    /// exactly the rounds the advance just avoided.
+    pub skipped: Vec<ReviewWatchKey>,
+}
+
 impl Orchestrator {
     /// Opens the introduction task's channel, storing the sender and handing back the receiver for
     /// [`run_review_intro_task`].
@@ -591,9 +606,14 @@ impl Orchestrator {
     /// Nothing sends this in production yet: the head-advance observation is the edge-triggered
     /// watcher's, which is slice 5. What this slice fixes is the CHANNEL — the design forbids that
     /// signal being a room post, and this is the shape it takes instead.
-    pub(crate) fn handle_review_head_advanced(&mut self, pr: &PrCoord, head_sha: &str) -> usize {
+    pub(crate) fn handle_review_head_advanced(
+        &mut self,
+        pr: &PrCoord,
+        head_sha: &str,
+        unchanged_from: &[String],
+    ) -> ReviewHeadAdvance {
         if !self.review_ticketless_enabled() || head_sha.is_empty() {
-            return 0;
+            return ReviewHeadAdvance::default();
         }
         // The allowlist, re-checked HERE and not only at introduction (STUDIO-721, the slice-6
         // F-SEC review's item (a)). Re-arming reads a STORED row, and the configuration can have
@@ -607,16 +627,16 @@ impl Orchestrator {
                 "ticketless review: refusing to re-arm a review in a repository no configured \
                  project owns"
             );
-            return 0;
+            return ReviewHeadAdvance::default();
         }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(pr = %pr, err = %e, "ticketless review: the watch set could not be read; no re-review was armed");
-                return 0;
+                return ReviewHeadAdvance::default();
             }
         };
-        let mut armed = 0usize;
+        let mut advance = ReviewHeadAdvance::default();
         for row in rows {
             if !row.key.owner.eq_ignore_ascii_case(&pr.owner)
                 || !row.key.repo.eq_ignore_ascii_case(&pr.repo)
@@ -652,6 +672,55 @@ impl Orchestrator {
             if self.running.contains_key(&id) || self.claimed.contains(&id) {
                 continue;
             }
+            // STUDIO-960: the head moved, but the diff it carries against the base is byte-identical
+            // to the one this row's VERDICT was made against, so there is no new work to read. The
+            // verdict is carried forward by advancing `last_reviewed_sha` to the new head and
+            // KEEPING the terminal status — the alternative, re-arming, would discard an approval
+            // the diff still justifies and bill the whole round again.
+            //
+            // Restricted to the two terminal statuses on purpose. A `requested`/`in_flight`/
+            // `truncated` row still OWES a review of this head — its partial or absent round is not
+            // a verdict a rebase can carry — and advancing a re-armed row that had already lost its
+            // terminal status would leave a `requested` row the dispatcher still owes, which is the
+            // opposite of the saving. The proof itself is the caller's: `unchanged_from` is empty
+            // unless the off-loop watcher compared the two diffs and found them identical, so a
+            // failed comparison degrades here to the plain re-arm below.
+            if matches!(
+                row.status.as_str(),
+                REVIEW_STATUS_REVIEWED | REVIEW_STATUS_APPROVED
+            ) && unchanged_from
+                .iter()
+                .any(|old| old == &row.last_reviewed_sha)
+            {
+                let reviewed_sha = row.last_reviewed_sha.clone();
+                let carried_status = row.status.clone();
+                let key = row.key.clone();
+                // `save_review_watch` deliberately never touches `last_reviewed_sha` (F-SHA), and
+                // the row's status is already the terminal one we want to keep, so the write is
+                // `mark_review_completed` re-stamping the SAME verdict at the new head. A dedicated
+                // method would say "carried" more loudly; reusing this one keeps the F-SHA guard in
+                // one place and makes the resulting row byte-identical to a verdict recorded at
+                // `head_sha` directly.
+                match self
+                    .store()
+                    .mark_review_completed(&key, head_sha, &carried_status)
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            pr = %pr, reviewer = %key.reviewer, from = %reviewed_sha,
+                            head = head_sha, status = %carried_status,
+                            "ticketless review: the head moved but its diff against the base is \
+                             byte-identical to the reviewed one; the verdict carries forward and no \
+                             review round is armed"
+                        );
+                        advance.skipped.push(key);
+                    }
+                    Err(e) => {
+                        tracing::warn!(review = %id, err = %e, "ticketless review: carrying a verdict across an unchanged head move failed; a normal round is armed")
+                    }
+                }
+                continue;
+            }
             // Racing a watcher tick is safe TODAY, and only for a reason worth writing down: the
             // tick decides from a snapshot loaded before this write, so it may still be holding the
             // pre-arm row — but `review_round_due` returns the same verdict for every status this
@@ -665,13 +734,13 @@ impl Orchestrator {
                 ..row
             };
             match self.store().save_review_watch(armed_row) {
-                Ok(()) => armed += 1,
+                Ok(()) => advance.armed += 1,
                 Err(e) => {
                     tracing::warn!(review = %id, err = %e, "ticketless review: re-arming the watch row failed")
                 }
             }
         }
-        armed
+        advance
     }
 
     /// Whether the watch set holds ANY row for this pull request — live or retired, whoever the
@@ -795,14 +864,18 @@ impl ControlHandle {
         }
     }
 
-    /// Reports that a WATCHED pull request's head advanced, arming one more review round. Returns
-    /// how many (PR, reviewer) rows were re-armed.
+    /// Reports that a WATCHED pull request's head advanced, arming one more review round or
+    /// carrying an existing verdict forward when the diff is unchanged (STUDIO-960).
     ///
     /// This is the design's in-process control Event standing in for the room post §14.1 F-SEC
     /// rules out. It cannot introduce a pull request — the loop-side `handle_review_head_advanced`
     /// only ever updates rows that already exist — so an observation about an unwatched coordinate
     /// is inert by construction rather than by the caller's care.
-    pub async fn review_head_advanced(&self, pr: PrCoord, head_sha: &str) -> usize {
+    ///
+    /// This event carries no diff proof, so a caller using it never skips: it is the console's and
+    /// the introduction path's direct signal, not the watcher's compared observation, and skipping
+    /// requires a comparison this seam cannot make.
+    pub async fn review_head_advanced(&self, pr: PrCoord, head_sha: &str) -> ReviewHeadAdvance {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = Event::ReviewHeadAdvanced {
             pr,
@@ -810,12 +883,13 @@ impl ControlHandle {
             reply: tx,
         };
         if self.events.send(ev).is_err() {
-            return 0; // the loop is gone: there is nothing to re-review into.
+            // The loop is gone: there is nothing to re-review into.
+            return ReviewHeadAdvance::default();
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
-            r = rx => r.unwrap_or(0),
-            _ = lifetime.cancelled() => 0,
+            r = rx => r.unwrap_or_default(),
+            _ = lifetime.cancelled() => ReviewHeadAdvance::default(),
         }
     }
 }
@@ -1398,7 +1472,8 @@ mod tests {
             .expect("completed");
 
         assert_eq!(
-            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B),
+            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B, &[])
+                .armed,
             1
         );
         let row = o
@@ -1421,12 +1496,14 @@ mod tests {
     fn a_head_advance_on_an_unwatched_pull_request_introduces_nothing() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         assert_eq!(
-            o.handle_review_head_advanced(&PrCoord::new("attacker", "evil", 1), HEAD_B),
+            o.handle_review_head_advanced(&PrCoord::new("attacker", "evil", 1), HEAD_B, &[])
+                .armed,
             0
         );
         // Not even for an allowlisted repository: only an INTRODUCED (PR, reviewer) is watched.
         assert_eq!(
-            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 99), HEAD_B),
+            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 99), HEAD_B, &[])
+                .armed,
             0
         );
         assert!(o.store().load_review_watch().expect("read").is_empty());
@@ -1438,7 +1515,8 @@ mod tests {
     #[test]
     fn a_head_advance_skips_rows_that_are_already_at_that_head_or_gone() {
         let advance = |o: &mut Orchestrator| {
-            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_A)
+            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_A, &[])
+                .armed
         };
 
         // Already reviewed at HEAD_A.
@@ -1493,12 +1571,14 @@ mod tests {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"]));
         assert_eq!(
-            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), ""),
+            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), "", &[])
+                .armed,
             0
         );
         o.teams = Some(teams_with(false, ReviewMode::Ticketless, &["alice", "bob"]));
         assert_eq!(
-            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B),
+            o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B, &[])
+                .armed,
             0
         );
     }

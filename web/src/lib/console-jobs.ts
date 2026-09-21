@@ -152,14 +152,43 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * It changes nothing about a ticket-based review row, which keeps STUDIO-780's behaviour entirely:
  * the two flags mark different subjects, the daemon sets them on different rows, and only the live
  * arm is shared between them.
+ *
+ * The fifth rule is `heldNeverRan` (STUDIO-949), and it names the word deliberately. A
+ * `rhapsody:human` ticket that has NEVER RUN reaches this function as a synthetic `waiting` row,
+ * whose outcome maps to `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong:
+ * the dispatcher has deliberately refused it and no agent will ever run it, so painting it
+ * "blocked" puts a deliberate hold one pill away from a real fault, which is the confusion the
+ * board's own chip styling exists to prevent. It reads `queued` — waiting for a person rather than
+ * mysteriously idle — because the hold, not the run that never happened, is the whole fact.
+ *
+ * The rule is scoped to a hold with NOTHING RAN (STUDIO-949 rounds 5-7). A hold can OUTLIVE a run —
+ * a ticket parked in review, then labelled — and `mergeJobs` says in as many words that "the real
+ * run still decides the lane": the card belongs in Review, wearing its `held for a human`
+ * sub-label, because the daemon is deferring the review rounds that ticket is owed. Returning
+ * `queued` there moved the card out of Review and contradicted the watcher, which is at that same
+ * moment holding the review. So the hold's own word only applies where there is no run to name the
+ * lane.
+ *
+ * "Nothing ran" is NOT "no lifecycle resolved" (round 7). `lifecycleByIssue` drops every row the
+ * daemon could not answer, and it answers off a TTL cache refreshed a bounded number of ids per
+ * lookup — a daemon that just restarted serves most of its rows with no `lifecycle`. An unresolved
+ * lifecycle means "the daemon could not ask", not "this ticket never ran", and a row in that gap
+ * can carry a real FAILED run: painting it `queued` erases the operator's cue that an agent
+ * flailed, and splits the lane from the strip that scores the same ticket through a bucket. The
+ * caller passes `heldNeverRan` only for a row that is a current hold AND has no real run at all
+ * (`JobRow.runId === 0`), so an unresolved lifecycle never reaches this arm.
  */
 export function consoleJobStatus(
   status: string,
   lifecycle?: string,
   reviewTicket = false,
   reviewRun = false,
+  heldNeverRan = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
+  // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
+  // hold on a ticket that never ran speaks for the lane itself. See the doc above.
+  if (heldNeverRan) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
   // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
@@ -646,7 +675,18 @@ export function buildConsoleJobs(
     const ticket = lifecycles.get(job.issue);
     const reviewTicket = reviewTickets.has(job.issue);
     const reviewRun = reviewRuns.has(job.issue);
-    const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket, reviewRun);
+    // "Held for a human" speaks for the LANE only when there is no run to name it (STUDIO-949):
+    // `mergeJobs` sets `runId` to the newest REAL segment's id and 0 for a synthetic hold row, so
+    // 0 is the honest "nothing ran" — never "the daemon could not resolve a lifecycle", which a cold
+    // cache serves for most rows. See `consoleJobStatus`.
+    const heldNeverRan = (job.heldForHuman ?? false) && job.runId === 0;
+    const status = consoleJobStatus(
+      job.status,
+      ticket?.lifecycle,
+      reviewTicket,
+      reviewRun,
+      heldNeverRan,
+    );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
     // has one; a plain ticket key never matches the parser.
@@ -872,6 +912,18 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  * It is inert on a Rhapsody daemon today — the Rust `Snapshot` carries no held-dependent set, so
  * `/api/v1/state` never sends one — and it is here so that the strip and the table cannot disagree
  * about a row the table already knows how to draw, rather than as a feature.
+ *
+ * `held_for_human` (STUDIO-949) is NOT a client-side set like `held`, and it is the one figure the
+ * client cannot compute: it is a COUNT the daemon serves beside the buckets, and it counts ONLY the
+ * holds with no stored row — the never-ran ticket the dispatcher refused, for which the console
+ * synthesizes a Queued card. The daemon joins the store rows (which control the ROW) with the
+ * snapshot's hold set (which controls WHICH ticket) and reclassifies only that shape, so adding this
+ * count to `queued` counts each hold exactly once. A hold that HAS run keeps its stored row's bucket
+ * — its card stays in the run's lane with the hold as a sub-label (the STUDIO-939 shape) — and is
+ * deliberately NOT in this count; a held ticket the daemon is mid-run on keeps its running bucket
+ * and is not in it either, matching the console's own exceptions. Reading
+ * `state.held_for_human.length` here instead would reopen the double-count, and treating every hold
+ * as queued would move a hold that has run out of its lane.
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
@@ -884,7 +936,7 @@ export function consoleStoreCounts(
     held.length === 0
       ? payload.buckets
       : [...payload.buckets, { outcome: "waiting", count: held.length }];
-  return tally(
+  const counts = tally(
     buckets.map((b) => {
       // `reviewTicket` is always false here: the daemon does not resolve that marker for the tally
       // because it cannot move any of these five numbers — a live review TICKET reads `reviewing`
@@ -900,6 +952,9 @@ export function consoleStoreCounts(
       ] as const;
     }),
   );
+  const heldForHuman = payload.held_for_human ?? 0;
+  if (heldForHuman === 0) return counts;
+  return { ...counts, queued: counts.queued + heldForHuman };
 }
 
 /** One teammate's live state in the Now strip (§3). */

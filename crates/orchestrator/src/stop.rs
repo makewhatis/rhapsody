@@ -118,6 +118,13 @@ pub struct ControlHandle {
     /// control task, and an event-channel round-trip would queue it behind the current tick — the
     /// head-of-line class the T3a/T3b split already exists to avoid.
     pub(crate) teams_memory: Option<std::sync::Arc<crate::teamsmemory::TeamsMemory>>,
+    /// The SAME `Arc`-shared warning state as
+    /// [`Orchestrator::warnings`](crate::orchestrator::Orchestrator::warnings) (STUDIO-949), so the
+    /// handoff can record `plan_quorum`'s un-primed refusal on the project advisory **after** its
+    /// review-state move lands — the move runs here, off-loop, once the control round-trip has
+    /// returned. It rides beside [`Self::quorum`] and for its reason, and the state is already an
+    /// `RwLock` seam written off the control task, so this is the same field, not a new one.
+    pub(crate) warnings: std::sync::Arc<crate::warnings::WarningsState>,
     /// The off-loop review-quorum task's inbox, cloned from
     /// [`Orchestrator::quorum_tx`](crate::orchestrator::Orchestrator) (STUDIO-659, T7). `None`
     /// whenever the quorum is off — so on a default installation a handoff cannot even represent a
@@ -190,6 +197,7 @@ impl crate::orchestrator::Orchestrator {
             retention_days: std::sync::Arc::clone(&self.retention_days),
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
+            warnings: std::sync::Arc::clone(&self.warnings),
             quorum: self.quorum_tx.clone(),
             review_intro: self.review_intro_tx.clone(),
             drain: self.drain.clone(),
