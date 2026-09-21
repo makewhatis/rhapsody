@@ -187,20 +187,25 @@ describe("the board (STUDIO-925)", () => {
   // STUDIO-970 — a ticket the dispatcher refused for a spent provider budget is a deliberate hold
   // too, but a DIFFERENT one: it clears at local midnight and needs nobody. The card must name the
   // provider (the actionable half of a budget refusal) and must NOT wear the human-hold chip.
+  //
+  // The production path reaches the card through the ROW (`mergeJobs` fills `budgetHeld`), so this
+  // pins the row channel; the snapshot-set channel is the never-ran synthesis test below.
   it("names the provider on a budget-held ticket, distinctly from a human hold (STUDIO-970)", () => {
-    mount([row({ issue: "STUDIO-970", trackerState: "Todo", status: "queued", statusLabel: "queued" })], vi.fn(), COUNTS, 4, {
-      budgetHeld: [
-        {
-          subject: "STUDIO-970",
-          title: "meter spend",
-          project: "rhapsody",
-          provider: "anthropic",
-          daily_tokens: 200_000_000,
-          spent_tokens: 361_000_000,
-          pr: "",
-        },
+    mount(
+      [
+        row({
+          issue: "STUDIO-970",
+          trackerState: "Todo",
+          status: "queued",
+          statusLabel: "queued",
+          budgetHeld: "anthropic",
+        }),
       ],
-    });
+      vi.fn(),
+      COUNTS,
+      4,
+      { budgetHeld: [] },
+    );
     const chip = document.querySelector(".bcard .bchip");
     expect(chip?.textContent).toBe("anthropic budget spent");
     // Nobody is needed: this is not the human hold.

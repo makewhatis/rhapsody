@@ -665,10 +665,12 @@ pub(crate) async fn handle_issue_counts(
         .count() as i64;
     // Every budget-held TICKET that is not live AND has no stored row — the never-ran hold the
     // console synthesizes a Queued card for (STUDIO-970). A budget hold that has run keeps its
-    // stored row's bucket, and one the daemon is mid-run on keeps its running bucket, exactly as
-    // the console keeps a running row live rather than queued. A budget hold is only ever recorded
-    // for a ticket the dispatcher REFUSED before starting it, but a ticket can have a previous
-    // stopped run behind it, which is why the join is by identity rather than assumed absent.
+    // stored row's bucket, so the join is by identity rather than assumed absent. A hold beside a
+    // live run is not billed again either, but the `!live` guard is DEFENSIVE rather than
+    // load-bearing: the live-work loop above already inserted every non-empty live identifier into
+    // `counted`, so `!counted` alone would exclude it. It is kept only to read like the human hold's
+    // filter beside it (the dispatcher releases the hold before dispatch — `release_budget_hold` on
+    // the dispatch path — and the console keeps a running row live rather than queued).
     let budget_held = budget_held
         .iter()
         .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
@@ -3007,6 +3009,35 @@ mod tests {
         assert!(
             body.get("budget_held").is_none(),
             "and is NOT billed a second time in queued: {body}",
+        );
+    }
+
+    // STUDIO-970 — a budget hold beside a LIVE run must not be billed a second time: the dispatcher
+    // releases the hold before it dispatches, so the console keeps the ticket as a live Running row
+    // and the ticket's own running session already fills its bucket. The sibling of the live human
+    // hold above, and the budget half of "the daemon does not hold what it is running". MUTATION:
+    // drop the budget filter entirely (or its `!counted` term) and this reds with `budget_held` = 1
+    // beside the running bucket. The `!live` term alone is redundant — the live-work loop above
+    // already counted this ticket — so no test can isolate it; the comment on the filter says so.
+    #[tokio::test]
+    async fn issue_counts_keep_a_live_budget_hold_in_its_running_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-970", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-970"));
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+            "the live ticket fills its running bucket: {body}",
+        );
+        assert!(
+            body.get("budget_held").is_none(),
+            "no second queued hold for a ticket the daemon is running: {body}",
         );
     }
 

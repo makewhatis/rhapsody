@@ -269,24 +269,24 @@ describe("the board regroup (STUDIO-925)", () => {
   // STUDIO-970 — the per-provider budget hold rides the same board shapes as the human hold, but it
   // is a DIFFERENT fact: it names the provider and clears at local midnight. A card must not conflate
   // the two, and a review hold (a coordinate, not a ticket) must not become a card at all.
+  //
+  // The provider comes off the ROW (`ConsoleJobRow.budgetHeld`, filled by `mergeJobs`), which is the
+  // production channel; the snapshot set below is the belt-and-braces synthesis path only.
   it("attaches the provider for a budget-held ticket, distinct from a human hold (STUDIO-970)", () => {
     const board = buildConsoleBoard(
       [
-        row({ issue: "STUDIO-970", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+        row({
+          issue: "STUDIO-970",
+          trackerState: "Todo",
+          status: "queued",
+          statusLabel: "queued",
+          budgetHeld: "anthropic",
+        }),
         row({ issue: "STUDIO-939", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
       ],
       [],
       [{ issue_identifier: "STUDIO-939", title: "store work", project: "booch" }],
       [
-        {
-          subject: "STUDIO-970",
-          title: "meter spend per provider",
-          project: "rhapsody",
-          provider: "anthropic",
-          daily_tokens: 200_000_000,
-          spent_tokens: 361_000_000,
-          pr: "",
-        },
         {
           subject: "pr:makewhatis/rhapsody#199@alice",
           title: "",

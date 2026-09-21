@@ -370,6 +370,11 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
  * `budgetHeld` is the live snapshot's `budget_held` set (STUDIO-957/970) and does the same for a
  * spent provider budget — its TICKET rows only, since a review hold names a coordinate and is the
  * reconciliation sweep's surface.
+ *
+ * A ROW BUILT THROUGH `mergeJobs` ALREADY CARRIES ITS BUDGET HOLD (`ConsoleJobRow.budgetHeld`), so
+ * the card reads that and the snapshot set here is only for the belt-and-braces synthesis below. A
+ * card cannot get the fact from two channels: the row is the production one, and a card that read
+ * the set instead would keep drawing a chip even after `mergeJobs` stopped filling the row.
  */
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
@@ -380,12 +385,6 @@ export function buildConsoleBoard(
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
   const held = new Set(heldForHuman.map((h) => h.issue_identifier));
-  // The provider per budget-held ticket, from the TICKET half of the snapshot's set. A review hold
-  // carries a pull request coordinate and is skipped: the sweep reports it, the board does not.
-  const budgetByIssue = new Map<string, string>();
-  for (const b of budgetHeld) {
-    if (b.pr === "" && b.subject !== "") budgetByIssue.set(b.subject, b.provider);
-  }
   // The hold entry carries only the project SLUG (the daemon's `HeldForHuman`), while a card's
   // `project` is the display NAME. Recover the name from any row of the same project so a
   // synthesized card's chip matches every other card; fall back to the slug when the project has no
@@ -416,7 +415,10 @@ export function buildConsoleBoard(
       reviewers: [],
       dependencies: [],
       heldForHuman: held.has(row.issue),
-      budgetHeld: budgetByIssue.get(row.issue),
+      // The row's OWN fact (STUDIO-970), filled by `mergeJobs` from `state.budget_held` for a TICKET
+      // hold only. Reading the snapshot set here would be a second source of truth for the same
+      // fact and could disagree with the row's status/sub-label.
+      budgetHeld: row.budgetHeld,
     };
     cards.push(card);
     byIssue.set(row.issue, card);

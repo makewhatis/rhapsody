@@ -633,6 +633,25 @@ describe("a per-provider budget hold (STUDIO-970)", () => {
     expect(b.budgetHeld).toBe("anthropic");
   });
 
+  it("suppresses a budget hold beside a LIVE run — the daemon does not hold what it is running", () => {
+    // The daemon releases the hold before it dispatches (`release_budget_hold` on the dispatch
+    // path), so a hold sitting next to a live row is a stale pass's ghost. Carrying it would
+    // repaint a running ticket as held/queued; the live run wins and the budget sub-label drops.
+    const rows = mergeJobs(
+      state({
+        running: [runningSession({ issue_identifier: "STUDIO-970", run_id: 77, project: "rhapsody" })],
+        budget_held: [hold()],
+      }),
+      [],
+      PROJECTS,
+      NOW,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("running");
+    expect(rows[0].budgetHeld).toBeUndefined();
+    expect(rows[0].subLabel).not.toBe("anthropic daily budget spent");
+  });
+
   it("does not synthesize a row for a REVIEW budget hold", () => {
     // A review hold names a pull request coordinate; the reconciliation sweep surfaces it, and the
     // board must not draw it as a ticket.
