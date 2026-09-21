@@ -1268,13 +1268,17 @@ impl Orchestrator {
     /// Plans the one poke — or, once the poking is exhausted, the human escalation — that a
     /// finished run's still-draft pull request earns this tick (STUDIO-962).
     ///
-    /// The trigger is the HANDOFF, not the process exiting: a row exists only because a run handed
-    /// its pull request over ([`crate::reviewintro`]) or the adoption sweep found a parked one
-    /// ([`crate::reviewadopt`]), so an observed draft is by construction one the author's run has
-    /// stopped working on. The guards that remain are [`Self::ticket_run_live`] — a draft is normal
-    /// mid-run, so a live author run is never poked — and the per-head bookkeeping in
-    /// [`Orchestrator::draft_pokes`], which makes the poke once per head and the escalation once
-    /// ever rather than once per tick.
+    /// The trigger is the HANDOFF, not the process exiting: the rows this acts on exist because a
+    /// run handed its pull request over ([`crate::reviewintro`]) or the adoption sweep found a
+    /// parked one ([`crate::reviewadopt`]), so an observed draft is by construction one the author's
+    /// run has stopped working on. A row can also be introduced from the CONSOLE
+    /// ([`crate::reviewconsole`]) — a third source, with no run behind it — and those are excluded
+    /// by the `origin_ticket` gate below rather than by this sentence: a `console:` row names an
+    /// operator, not a ticket, so there is no run for a summons to reopen.
+    ///
+    /// The guards that remain are [`Self::ticket_run_live`] — a draft is normal mid-run, so a live
+    /// author run is never poked — and the per-head bookkeeping in [`Orchestrator::draft_pokes`],
+    /// which makes the poke once per head and the escalation once ever rather than once per tick.
     ///
     /// The poking is bounded on two axes (STUDIO-962, jimmy's round-1 finding): after
     /// [`crate::draftpoke::MAX_DRAFT_POKES`] pokes (ATTEMPTS — the ledger remembers only the head

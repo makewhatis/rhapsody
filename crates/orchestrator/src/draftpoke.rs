@@ -290,7 +290,9 @@ pub async fn perform_nudge(nudge: &DraftNudge, deps: &DraftPokeDeps, at: DateTim
             // Note the asymmetry with the ledger: `DraftPokeState::escalated` was already latched
             // when this nudge was planned and is not cleared by a failed write, so this line is the
             // ONLY signal that the escalation reached nobody — "reached no surface" means the pull
-            // request stays silent until a restart (or a human publishing by hand) re-arms it.
+            // request stays silent until something clears the latch: a daemon restart, a human
+            // publishing it by hand, or the pull request leaving the watch set (see
+            // `DraftPokeState::escalated`, which names all three).
             let mut told = false;
             if let Some(room) = deps.room.as_ref() {
                 let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());

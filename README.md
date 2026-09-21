@@ -1718,8 +1718,11 @@ second escalation, once per restart for as long as the draft stands. The escalat
 second edge in the other direction: it is set when the escalation is PLANNED, before either write is
 attempted, so an escalation whose room post and pull-request comment both failed still silences the
 pull request while telling nobody — the WARN reads "the escalation reached no surface — no human was
-told", and a restart (or a human publishing by hand) is the only thing that clears the latch and
-re-arms the poke. Persisting the ladder is a larger decision than this feature.
+told", and only three things clear the latch and re-arm the poke: a daemon restart, a human
+publishing it by hand, or the pull request leaving the watch set (`retire_review_pr` drops the
+ledger, and it is reached on `gone` and on an untrusted head repository as well as on merged or
+closed, neither of the first two being a publication). Persisting the ladder is a larger decision
+than this feature.
 
 **An unstated `isDraft` is never acted on, in either direction.** `PrSnapshot::is_draft` is an
 `Option<bool>`, and its readers take an unstated answer in the safe direction each needs: the
