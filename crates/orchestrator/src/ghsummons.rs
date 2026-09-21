@@ -1719,11 +1719,13 @@ pub const DELTA_FINDINGS_PAGE: usize = 100;
 pub trait ReviewDeltaSource: Send + Sync {
     /// Whether `base` is an ancestor of `head` — `gh api repos/<o>/<r>/compare/<base>...<head>`.
     ///
-    /// `false` for a rebase or force-push (the compare is `diverged` or `behind`); an error is
-    /// reserved for a lookup that could not be made — including a base commit GitHub no longer
-    /// holds, which is a 404 from `gh api` and so ERRORS rather than returning `false`. Both paths
-    /// reach a full review on the caller's side, so the distinction is not load-bearing; the doc
-    /// must not describe a `false` the code never returns (STUDIO-963).
+    /// `false` for a rebase or force-push (the compare is `diverged` or `behind`) and for the
+    /// empty-input short-circuit in the `gh` implementation, which never attempts a lookup; an
+    /// error is reserved for a lookup that could not be made — including a base commit GitHub no
+    /// longer holds, which is a 404 from `gh api` and so ERRORS rather than returning `false`.
+    /// Both reach a full review on the caller's side, but with different recorded reasons
+    /// ([`crate::reviewprompt::FullReviewReason::Rebase`] vs `Unavailable`) and only the error
+    /// warns; the doc must not describe a `false` the code never returns (STUDIO-963).
     async fn is_ancestor(
         &self,
         owner: &str,
