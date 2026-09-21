@@ -674,6 +674,12 @@ mod tests {
             explicit_zero.agent.max_run_tokens, 0,
             "an explicit 0 is the same unlimited key"
         );
+
+        let negative = decode_yaml("agent:\n  max_run_tokens: -5\n", "body");
+        assert_eq!(
+            negative.agent.max_run_tokens, -5,
+            "decode is verbatim; the reader treats a non-positive value as unlimited"
+        );
     }
 
     // STUDIO-974: the PR-state watcher's clock is a Rhapsody-only key beside `polling.interval_ms`.

@@ -192,10 +192,11 @@ pub struct Agent {
     pub max_concurrent_reviews: Option<i64>,
     /// A PER-RUN token ceiling (STUDIO-967). `0` — the default, and every install that never writes
     /// the key — means unlimited, matching `max_concurrent_agents`' `0 = unlimited` idiom. A positive
-    /// value stops a run that has accumulated this many billed tokens within the turn it is in, and
-    /// records the stop as its own outcome so it is distinguishable from a failure or an operator
-    /// stop. Unlike `agent.max_concurrent_reviews` (which bounds *new* dispatch), this acts on a run
-    /// already in flight — the runaway itself, not the next one.
+    /// value stops a run whose billed tokens (committed across its finished turns plus the in-flight
+    /// turn's live estimate) have reached it, and records the stop as its own outcome so it is
+    /// distinguishable from a failure or an operator stop. Unlike `agent.max_concurrent_reviews`
+    /// (which bounds *new* dispatch), this acts on a run already in flight — the runaway itself, not
+    /// the next one.
     ///
     /// **Rhapsody-only** (no Go reference): decoded, carried on `Effective`, and preserved by
     /// `encode` (so a console Save keeps it), but deliberately NOT rendered by `effective_json`,
