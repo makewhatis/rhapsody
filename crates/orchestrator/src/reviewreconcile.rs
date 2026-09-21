@@ -915,6 +915,23 @@ impl Orchestrator {
                 // (the review watcher never spawned) and no entry for this coordinate (auto-merge
                 // off, or this head never reached a gate) both fall back to the plain wording.
                 if d.kind == DivergenceKind::ApprovedStillOpen {
+                    // STUDIO-961: a conflict route-back the watcher has already fired IS the
+                    // progress this pull request was waiting on — the author has been handed it and
+                    // owns the next move. Reporting it as needing a human would be the false
+                    // positive the divergence's own docs warn against, so it is dropped entirely
+                    // (and logged as recovered, once, by `set_review_divergences`).
+                    //
+                    // While it is FRESH. The transition is the progress at the moment it fires, and
+                    // only for so long: a route-back the author never answers — or a tracker move
+                    // that never landed — stops being progress once it is itself older than this
+                    // sweep's own staleness horizon, and the pull request needs the human signal
+                    // again. Suppressing it forever would trade a false positive for a false
+                    // negative, which is the worse of the two.
+                    if let Some(routed) = self.conflict_routed.get(pr)
+                        && stale_secs(now, routed.routed_at, RECONCILE_STALE_AFTER).is_none()
+                    {
+                        return None;
+                    }
                     d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
                     // The approved-and-open arm hardcodes `capacity_held` to `None` (a hold defers a
                     // ROUND, and this row's next move is a merge), but that reasoning does not extend
@@ -3287,6 +3304,172 @@ mod store_tests {
             !warn.message.contains("Auto-merge has declined"),
             "no ledger entry must never invent a decline count: {}",
             warn.message
+        );
+    }
+
+    /// STUDIO-961: an approved-and-open pull request whose conflict the watcher has already routed
+    /// back to its author is PROGRESSING, not waiting for a human — the transition is the progress.
+    ///
+    /// Mutation check: delete the `conflict_routed` branch in `reconcile_review_divergence` and this
+    /// test reds — the control call below proves the divergence would otherwise be reported.
+    #[test]
+    fn a_conflict_route_back_in_flight_is_not_reported_as_needing_a_human() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+
+        // The control: with no route-back on record, this IS reported as diverged.
+        o.reconcile_review_divergence();
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "an approved-and-open pull request is diverged until something progresses it"
+        );
+
+        // The watcher routed it back for a conflict at HEAD, so the sweep must fall silent.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T21:20:00Z"),
+            },
+        );
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a conflict route-back in flight must not be reported as needing a human"
+        );
+        assert!(
+            o.project_statuses()
+                .iter()
+                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "and the advisory must not light"
+        );
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert!(
+            rendered.get("review_divergence").is_none(),
+            "nor may it reach /api/v1/state"
+        );
+    }
+
+    /// STUDIO-961: the sweep's silence about a conflict route-back EXPIRES. A route-back the author
+    /// never answers — or whose tracker move never landed — is progress only while it is fresh; past
+    /// the sweep's own staleness horizon the pull request needs the human signal again, rather than
+    /// being suppressed forever.
+    ///
+    /// Mutation check: drop the `stale_secs` fresh-check in `reconcile_review_divergence` (suppress
+    /// on the record alone) and this test reds — the stale record would keep the divergence silent.
+    #[test]
+    fn a_stale_conflict_route_back_is_reported_as_needing_a_human_again() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+
+        // Routed back four hours and twenty minutes ago: older than the ninety-minute horizon, so
+        // the transition has stopped being progress.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T17:00:00Z"),
+            },
+        );
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "a stale route-back must not silence the human signal forever"
+        );
+        assert_eq!(
+            o.review_divergences()[0].kind,
+            DivergenceKind::ApprovedStillOpen
+        );
+    }
+
+    /// ⚠️ STUDIO-961: the suppression is scoped to [`DivergenceKind::ApprovedStillOpen`], and the
+    /// scoping is the point — not an implementation detail of where the branch happens to sit.
+    ///
+    /// [`DivergenceKind::ChangesRequestedNoRun`] is the sibling kind, and it is PRECISELY the signal
+    /// that a route-back's tracker move landed but the author's run never reopened: findings (or a
+    /// conflict) on the record, and no authoring run since. Silencing it on the same record would
+    /// hide the one failure mode the route-back itself can produce — the summons that never took —
+    /// and it would be hidden for the whole life of the record rather than for the freshness window,
+    /// because this kind's own staleness clock keeps running.
+    ///
+    /// `a_conflict_route_back_in_flight_is_not_reported_as_needing_a_human` is the live control: the
+    /// SAME fresh record, on an approved-and-open pull request, is silent.
+    ///
+    /// Mutation check: lift the `conflict_routed` branch out of the `d.kind ==
+    /// DivergenceKind::ApprovedStillOpen` block in `reconcile_review_divergence` and this test reds
+    /// (the divergence disappears), while the control above stays green.
+    #[test]
+    fn a_conflict_route_back_does_not_silence_a_changes_requested_divergence() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        // The authoring run ended BEFORE the review, so nothing has answered the findings.
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        // A conflict route-back fired for this very pull request, moments ago — as fresh as the
+        // control's.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T21:20:00Z"),
+            },
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "a route-back that moved the ticket but never reopened the author's run is exactly \
+             what this kind reports; it must not be suppressed: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ChangesRequestedNoRun);
+        assert!(
+            o.project_statuses()
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "and the advisory must still light"
         );
     }
 

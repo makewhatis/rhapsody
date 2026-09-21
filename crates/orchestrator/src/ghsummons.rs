@@ -757,6 +757,14 @@ impl BranchUpdater for GH {
 /// ([`BranchUpdateSource`]) — so arming a merge on it parks the pull request forever (STUDIO-784).
 pub const MERGE_STATE_BEHIND: &str = "BEHIND";
 
+/// GitHub's `mergeStateStatus` for a pull request whose head conflicts with its base.
+///
+/// The settled-conflict value, and the ONLY one the conflict route-back acts on (STUDIO-961): a
+/// conflicted pull request is unfinished work rather than work awaiting a decision, so its ticket
+/// belongs back with its author. Named rather than spelled inline, and compared exactly, so a
+/// transient `UNKNOWN` — GitHub still computing mergeability — moves nothing.
+pub const MERGE_STATE_DIRTY: &str = "DIRTY";
+
 /// The fallible result of a [`MergeStateSource`] lookup: GitHub's own `mergeStateStatus`
 /// upper-cased, or empty when GitHub states none.
 ///
@@ -770,10 +778,11 @@ pub type MergeStateResult = Result<String, Box<dyn std::error::Error + Send + Sy
 /// Where GitHub thinks a pull request stands with respect to being MERGED — its
 /// `mergeStateStatus`, and nothing else (STUDIO-784).
 ///
-/// **Deliberately not folded into [`PrStateSource`].** That seam's argv is polled by the review
-/// watcher every two minutes for every watched pull request, and widening it would make every one
-/// of those polls pay for a field only the console's merge action reads. This one is asked once,
-/// by one operator click, on one pull request.
+/// **Deliberately separate from [`PrStateSource`] as a SEAM.** The console merge action wants one
+/// field for one click, and routing it through the watcher's poll would tie a console read to the
+/// watcher's cadence for no benefit. Since STUDIO-961 the watcher's own poll ALSO carries
+/// `mergeStateStatus` on the payload (see [`PrSnapshot::merge_state`]) — but on the SAME
+/// `gh pr view` call, so it costs no extra round trip, and the two readers stay independent.
 ///
 /// What the merge path does with the answer is refuse rather than arm an auto-merge that can never
 /// fire: `main` has `strict: true` (a branch must be up to date to merge) with
@@ -1352,6 +1361,18 @@ pub struct PrSnapshot {
     /// The head repository as `owner/repo` — the value the trust guard below accepted, kept so a
     /// caller can name it in a log without asking GitHub a second time.
     pub head_repo: String,
+    /// `mergeStateStatus` — GitHub's own verdict on whether the pull request can be merged, upper-
+    /// cased, or EMPTY when GitHub states none (STUDIO-961).
+    ///
+    /// Read on this payload rather than through [`MergeStateSource`] for [`PrSnapshot::is_draft`]'s
+    /// reason: it rides the SAME `gh pr view` the watcher already makes every poll, so observing a
+    /// conflict costs no extra round trip, and the console's merge path keeps its own seam.
+    ///
+    /// Empty is the direction that acts on NOTHING: the conflict route-back fires only on a
+    /// positively-recognised [`MERGE_STATE_DIRTY`], so a missing field or a mid-computation
+    /// `UNKNOWN` must not move a ticket. It is a `String` rather than a closed enum for
+    /// [`MergeStateResult`]'s reason — GitHub's vocabulary here is open and has grown before.
+    pub merge_state: String,
 }
 
 impl PrSnapshot {
@@ -1451,7 +1472,9 @@ impl HeadAllowlist {
 /// [`PrBranchSource::head_branch_for_pr`] returns a branch NAME keyed by number. `headRefOid`
 /// appears nowhere. Re-review is triggered by the head ADVANCING past the SHA that was last
 /// reviewed, and a merged or closed pull request must be dropped from the watch set, so the
-/// watcher needs exactly `headRefOid` + `state` + `mergedAt`, per PR number, and nothing else.
+/// watcher needs exactly `headRefOid` + `state` + `mergedAt`, per PR number, and — since
+/// STUDIO-961 — `mergeStateStatus`, so a conflict is observed on the same poll the watcher already
+/// makes rather than through a second seam.
 ///
 /// **A head repository that is not the base's, and not allowlisted, is refused** — the security
 /// property the whole subsystem rests on (§14.1 F-SEC). What a later slice does with the answer is
@@ -1507,7 +1530,7 @@ fn is_gone_message(err: &str) -> bool {
 #[async_trait]
 impl PrStateSource for GH {
     /// One bounded `gh pr view <number> --repo <owner>/<repo> --json
-    /// headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner`.
+    /// headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner,mergeStateStatus`.
     ///
     /// An empty owner or repo, or a non-positive number, is not an error and not a query: nothing
     /// can ever be observed at a coordinate like that, so it answers [`PrLookup::Gone`] — the same
@@ -1517,7 +1540,9 @@ impl PrStateSource for GH {
     /// `headRefOid` and `state` have no safe default and a missing or unrecognised one is an error:
     /// an empty head SHA compares unequal to every SHA, which would make the watcher re-review the
     /// same pull request on every tick forever. `mergedAt` does have a safe default — `state`
-    /// already carries the decision — so an unparseable timestamp degrades to `None`.
+    /// already carries the decision — so an unparseable timestamp degrades to `None`. So does
+    /// `mergeStateStatus`, which degrades to empty: the conflict route-back acts only on a
+    /// positively-recognised value (STUDIO-961).
     async fn pr_state(
         &self,
         owner: &str,
@@ -1537,7 +1562,7 @@ impl PrStateSource for GH {
             "--repo",
             slug.as_str(),
             "--json",
-            "headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner",
+            "headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner,mergeStateStatus",
         ];
         let body = match self.run_off_task(args.map(String::from).into()).await {
             Ok(b) => b,
@@ -1621,12 +1646,22 @@ impl PrStateSource for GH {
             .and_then(serde_json::Value::as_str)
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
             .map(|t| t.with_timezone(&Utc));
+        // The conflict observation (STUDIO-961). Upper-cased and trimmed to match
+        // [`MergeStateSource::merge_state`]'s spelling; absent or non-string is EMPTY, which is
+        // the direction that acts on nothing.
+        let merge_state = pr
+            .get("mergeStateStatus")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
         Ok(PrLookup::Found(PrSnapshot {
             head_sha,
             status,
             is_draft,
             merged_at,
             head_repo,
+            merge_state,
         }))
     }
 }
@@ -2560,9 +2595,10 @@ mod tests {
     // ── pr_state (STUDIO-710, slice 1; design record §14.2, §15; no Go counterpart) ─────────────
 
     /// The captured payload of a live open pull request (`gh pr view 86 --repo makewhatis/rhapsody
-    /// --json headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner`, 2026-09-02),
-    /// with the owner renamed to the `o/r` the other tests use. `isDraft` joined the field list in
-    /// STUDIO-881 and is re-captured here with it.
+    /// --json headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner,mergeStateStatus`,
+    /// 2026-09-02), with the owner renamed to the `o/r` the other tests use. `isDraft` joined the
+    /// field list in STUDIO-881 and `mergeStateStatus` in STUDIO-961; the capture above predates
+    /// the latter, so it reads as an empty merge state.
     const PR_VIEW_OPEN: &str = r#"{
         "headRefOid":"93db6e8ec3b7c54071eb031ebac3be71eee1008a",
         "headRepository":{"id":"R_kgDOTcp16A","name":"r","nameWithOwner":"o/r"},
@@ -2606,13 +2642,14 @@ mod tests {
                 status: PrStatus::Open,
                 merged_at: None,
                 head_repo: "o/r".to_string(),
+                merge_state: String::new(),
             })
         );
         assert_eq!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             vec![
                 "pr view 86 --repo o/r --json \
-                 headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner"
+                 headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner,mergeStateStatus"
                     .to_string()
             ],
         );
@@ -2642,6 +2679,7 @@ mod tests {
                 status: PrStatus::Merged,
                 merged_at: Some(utc(2026, 9, 2, 4, 37, 59)),
                 head_repo: "o/r".to_string(),
+                merge_state: String::new(),
             })
         );
 
@@ -2665,6 +2703,7 @@ mod tests {
                 status: PrStatus::Closed,
                 merged_at: None,
                 head_repo: "o/r".to_string(),
+                merge_state: String::new(),
             }),
             "a closed-unmerged PR must not be reported as merged"
         );
@@ -2732,6 +2771,58 @@ mod tests {
             assert_eq!(snap.draft_blocks_merge(), blocks_merge, "({why})");
             assert_eq!(snap.draft_observed(), observed, "({why})");
             assert_eq!(snap.draft_published(), published, "({why})");
+        }
+    }
+
+    /// STUDIO-961: `mergeStateStatus` rides the same payload and is read upper-cased, so the
+    /// conflict route-back can recognise a settled `DIRTY` without a second `gh` call.
+    ///
+    /// Absent and non-string read as EMPTY, which is the direction that acts on nothing: a
+    /// mid-computation `UNKNOWN` or a field GitHub omits must not move a ticket.
+    #[tokio::test]
+    async fn pr_state_reads_merge_state_and_treats_an_absent_field_as_none() {
+        for (payload, want, why) in [
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","mergeStateStatus":"DIRTY",
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                "DIRTY",
+                "a conflict is read as one",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","mergeStateStatus":"clean",
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                "CLEAN",
+                "the value is upper-cased",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN",
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                "",
+                "an absent mergeStateStatus acts on nothing",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","mergeStateStatus":null,
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                "",
+                "a null mergeStateStatus acts on nothing",
+            ),
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(payload, Arc::new(Mutex::new(Vec::new())))),
+            );
+            let PrLookup::Found(snap) = src
+                .pr_state("o", "r", 247, &HeadAllowlist::none())
+                .await
+                .expect("pr_state")
+            else {
+                panic!("expected a found pull request ({why})");
+            };
+            assert_eq!(snap.merge_state, want, "({why})");
         }
     }
 
@@ -2917,6 +3008,7 @@ mod tests {
                 status: PrStatus::Merged,
                 merged_at: None,
                 head_repo: "o/r".to_string(),
+                merge_state: String::new(),
             })
         );
     }

@@ -588,6 +588,19 @@ pub struct Orchestrator {
     /// [`AutoMergeLedger`](crate::runautomerge::AutoMergeLedger), which does the same job for the
     /// refusals on the other side of the seam.
     pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
+    /// The HEAD at which each watched pull request was last routed back to its author for a
+    /// CONFLICT (STUDIO-961), and when, keyed by coordinate. Written by the watcher's loop-side
+    /// handler and read by both it and the reconciliation sweep — which uses the instant to keep
+    /// its own silence from outliving the transition — and dropped when the pull request leaves the
+    /// watch set, exactly as [`auto_merge_announced`](Orchestrator::auto_merge_announced) is.
+    ///
+    /// The HEAD is the once-per-conflicted-HEAD guard: the conflict persists across every poll
+    /// until a push lands, so without it a naive trigger would re-route and re-summons the author
+    /// into a loop. The instant is what lets the reconciliation sweep stop reporting the pull
+    /// request as needing a human while the author has been handed it — the transition IS the
+    /// progress — without that silence outliving the transition: a route-back the author never
+    /// answers stops being progress once it is itself stale.
+    pub(crate) conflict_routed: HashMap<crate::prstate::PrCoord, crate::reviewwatch::ConflictRoute>,
     /// Per-pull-request draft-poke bookkeeping (STUDIO-962), keyed by
     /// [`churn_key`](crate::reviewwatch::churn_key) exactly as the two above are, and dropped with
     /// them when the pull request leaves the watch set. Written and read only by the watcher's
@@ -959,6 +972,7 @@ impl Orchestrator {
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
+            conflict_routed: HashMap::new(),
             draft_pokes: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),

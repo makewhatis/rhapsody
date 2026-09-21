@@ -1796,6 +1796,7 @@ and the route-back In Review → In Progress was a manual step the maintainer to
 | --- | --- | --- |
 | findings | no review feature exists | ticket moved to `teams.review.changes_state` by NAME |
 | approved | — | nothing — approval is the pause in the re-review loop |
+| a conflict at the watched head (STUDIO-961) | no review feature exists | ticket moved to `teams.review.changes_state` by NAME, **once per conflicted head** |
 | default | — | **off**: `changes_state` is empty unless an operator names a state |
 
 **The pairing is the whole of the decision, and it is enforced twice.** Findings move the ticket;
@@ -1830,6 +1831,36 @@ no GitHub attachments (STUDIO-674). The daemon reports the half it knows: a move
 a WARNING naming the ticket and the pull request, and a move WITH one still names the remaining
 condition rather than promising a run. A ticket sitting in the changes state with no run is
 therefore traceable to one line.
+
+**A conflicted pull request is the same route-back on a different edge (STUDIO-961).** A pull
+request GitHub reports as `DIRTY` cannot merge, so it is unfinished work rather than work awaiting a
+decision — the maintainer's rule is *a conflicted pull request is not a working diff*. The watcher
+observes the pull request's `mergeStateStatus` on the `gh pr view` it already makes every poll (the
+same payload `isDraft` rides), and a settled `DIRTY` plans the SAME route-back a findings verdict
+does: a token-bearing comment naming the conflict and what to fix, then the ticket moved by NAME.
+It is deliberately **independent of the review verdict** — an approved-but-conflicted pull request
+still needs its author — so it does not take the findings trigger's approved-arm refusal. It fires
+**once per conflicted head**, the review edge trigger's discipline: the conflict persists across
+every tick until a push lands, and a naive trigger would re-summons the author into a loop. An
+unsettled read (`UNKNOWN`, or nothing) moves nothing **and forgets nothing**, because GitHub
+computes mergeability lazily whenever the base advances — reading that mid-computation tick as "the
+conflict resolved" would let `DIRTY → UNKNOWN → DIRTY` at one unchanged head re-summons the author.
+And because the transition IS the progress, the reconciliation sweep stops reporting such a pull
+request as needing a human while the route-back is FRESH; past the sweep's own staleness horizon — an
+author who never answers, or a tracker move that never landed — the human signal comes back rather
+than being silenced forever.
+
+It is refused, like every other action, on a ticket held for a human (STUDIO-949). A route-back
+moves tracker state **and** reopens the author's agent run, which is the class of thing the
+`rhapsody:human` label exists to refuse: a conflict on a held ticket is a human's to resolve. The
+gate is the auto-merge gate's, read from the same current-label set and failing CLOSED while no
+selection pass has primed it. It is decided **before** the manager's adjudication (STUDIO-956),
+not after: the adjudication settles the FINDINGS question and says nothing about whether the branch
+merges, so a pull request past `review.adjudicate_after_rounds` whose head conflicts still goes back
+to its author rather than sitting on a `ship` verdict GitHub will decline forever. And a head this
+tick already read as `DIRTY` is not offered to the auto-merge gate at all — the gate's own perform
+re-reads `mergeStateStatus` and declines on anything but `CLEAN`, so proposing it spends two `gh`
+round trips to be told what the tick already knows.
 
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 

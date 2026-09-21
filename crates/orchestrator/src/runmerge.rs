@@ -634,6 +634,7 @@ mod tests {
                     status,
                     merged_at: None,
                     head_repo: "o/r".to_string(),
+                    merge_state: String::new(),
                 })),
             })
         }

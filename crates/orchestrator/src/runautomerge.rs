@@ -651,6 +651,7 @@ mod tests {
             is_draft: Some(is_draft),
             merged_at: None,
             head_repo: "makewhatis/tally".to_string(),
+            merge_state: String::new(),
         })
     }
 
@@ -1308,6 +1309,9 @@ mod tests {
                     is_draft: None,
                     merged_at: None,
                     head_repo: "makewhatis/tally".to_string(),
+                    // Not read on this path: `perform_auto_merge` asks its own
+                    // `MergeStateSource` for mergeability (STUDIO-961).
+                    merge_state: String::new(),
                 }),
                 DECLINE_DRAFT,
             ),
