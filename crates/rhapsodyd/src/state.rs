@@ -34,8 +34,8 @@ use rhapsody_orchestrator::{
 };
 use rhapsody_store::{
     DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
-    ReviewWatchRow,
-    RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, Store, StoreError,
+    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, Store,
+    StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The

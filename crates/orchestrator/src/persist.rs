@@ -238,12 +238,8 @@ impl Orchestrator {
     /// `claude.model` regardless of harness. Reading the live config HERE, at dispatch, and
     /// persisting the answer is the whole point: the config hot-reloads, the run is history.
     fn run_provenance_for(&self, re: &RunningEntry) -> store::RunProvenance {
-        let harness = self.harness_actually_run(&re.harness);
-        let model = if re.model_override.model.is_empty() {
-            self.configured_model_for(&re.project_slug, &harness)
-        } else {
-            re.model_override.model.clone()
-        };
+        let (harness, model) =
+            self.resolved_harness_model(&re.harness, &re.model_override, &re.project_slug);
         // An origin is only meaningful beside a value (STUDIO-909 round 1). `re.model_origin` can
         // name a key that resolved nothing — `agent.backend: codex` is a recognized harness this
         // build has no runner for, so `configured_model_for` answers empty while the origin fallback
@@ -261,6 +257,39 @@ impl Orchestrator {
             model,
             model_origin,
         }
+    }
+
+    /// The harness and model a run will ACTUALLY use, from the harness it names (empty ⇒ the
+    /// configured backend), its model/effort override (empty model ⇒ the harness's configured
+    /// model), and the owning project. The single resolution shared by
+    /// [`run_provenance_for`](Orchestrator::run_provenance_for) (which persists it) and the
+    /// per-provider budget gate (which reads it before dispatch), so the provider the budget checks
+    /// can never disagree with the provider the run records (STUDIO-957).
+    pub(crate) fn resolved_harness_model(
+        &self,
+        harness: &str,
+        model_override: &rhapsody_agent::ModelOverride,
+        project_slug: &str,
+    ) -> (String, String) {
+        let harness = self.harness_actually_run(harness);
+        let model = if model_override.model.is_empty() {
+            self.configured_model_for(project_slug, &harness)
+        } else {
+            model_override.model.clone()
+        };
+        (harness, model)
+    }
+
+    /// The provider a prospective run will bill, derived from the harness+model it will actually
+    /// use (STUDIO-957). The budget gate's key.
+    pub(crate) fn projected_provider(
+        &self,
+        harness: &str,
+        model_override: &rhapsody_agent::ModelOverride,
+        project_slug: &str,
+    ) -> String {
+        let (harness, model) = self.resolved_harness_model(harness, model_override, project_slug);
+        derive_provider(&harness, &model)
     }
 
     /// The model the ACTUAL harness would run with when nothing overrides it: the owning project's

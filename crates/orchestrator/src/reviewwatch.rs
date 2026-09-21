@@ -2236,6 +2236,17 @@ impl Orchestrator {
                 // A drain is armed: the row is untouched and this head is re-offered on the sweep
                 // after the drain is cancelled, exactly as a deferred one is.
                 ReviewDispatchOutcome::Draining => report.deferred += 1,
+                // The reviewer's provider is out of daily budget (STUDIO-957): the row is untouched
+                // and this head is re-offered once the budget resets, exactly as a deferred one is.
+                // `dispatch_review` does not log here (it records the hold, which the sweep and
+                // `/api/v1/state` carry); this is the watcher's own once-per-round line.
+                ReviewDispatchOutcome::BudgetHeld => {
+                    report.deferred += 1;
+                    tracing::info!(
+                        pr = %pr,
+                        "ticketless review: deferred — the reviewer's provider is out of daily budget"
+                    );
+                }
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");

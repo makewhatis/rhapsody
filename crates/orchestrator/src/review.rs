@@ -302,6 +302,11 @@ pub enum ReviewDispatchOutcome {
     /// than `&'static str` because the `review.model` refusal (STUDIO-908) names the reviewer's
     /// harness, the configured model and the `review.model` origin — all data, not literals.
     Refused(String),
+    /// The reviewer's provider is out of daily budget (STUDIO-957). Nothing was touched: the watch
+    /// row stays exactly where it was and the sweep re-offers this head once the budget resets,
+    /// exactly as [`ReviewDispatchOutcome::Draining`] defers. Distinct from `Refused` because it is
+    /// a deliberate, temporary hold an operator can act on, not a coordinate that can never work.
+    BudgetHeld,
 }
 
 impl Orchestrator {
@@ -393,6 +398,22 @@ impl Orchestrator {
             tracing::warn!(review = %id, reason = %why, "ticketless review: refused");
             return ReviewDispatchOutcome::Refused(why);
         }
+
+        // STUDIO-957: the per-provider daily budget, the drain gate's sibling. It must refuse HERE
+        // rather than inside `dispatch_issue` for the SAME reason the drain gate does: the writes
+        // below record this head as requested and mark the row in-flight, so a refusal further down
+        // would leave the watcher believing a review dispatched and never re-offer this head. The
+        // incident's whole Claude bill was REVIEWS, so a budget that could not see this path would
+        // have refused nothing. The subject is the pull request's coordinate, which is also the key
+        // the reconciliation sweep reports a divergence under.
+        let provider = self.review_projected_provider(&iss, &route.slug);
+        if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
+            let subject = format!("{}/{}#{}", run.owner, run.repo, run.number);
+            self.note_budget_hold(&subject, "", &route.slug, &provider, limit, spent);
+            return ReviewDispatchOutcome::BudgetHeld;
+        }
+        // A dispatched review clears any stale hold for this coordinate.
+        self.release_budget_hold(&format!("{}/{}#{}", run.owner, run.repo, run.number));
 
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
         // watcher's re-review condition is level-triggered and stays true on every tick between
@@ -765,6 +786,98 @@ mod tests {
         assert!(
             iss.state.is_empty(),
             "a pr: key resolves to no ticket, so it must claim no tracker state"
+        );
+    }
+
+    /// STUDIO-957: the review path is the one that mattered — the incident's whole Claude bill was
+    /// REVIEWS — so a reviewer whose provider is out of daily budget must not dispatch, and the
+    /// refusal must be recorded rather than silently dropped. It must also refuse BEFORE the
+    /// watch-set writes, or the watcher would believe a review ran and never re-offer this head.
+    ///
+    /// Mutation check: drop the budget gate in [`Orchestrator::dispatch_review`] and this reds on
+    /// `Dispatched` (and on the untouched-watch-row assertion).
+    #[test]
+    fn a_review_is_refused_when_the_reviewers_provider_is_out_of_budget() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let (mut o, dispatched) = orch_with_review(true);
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.claude.model = "claude-opus-4-8".to_string();
+            // The review runs under the owning PROJECT, whose model is what
+            // `configured_model_for` reads first.
+            eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
+            eff.cfg.budgets.insert(
+                "anthropic".to_string(),
+                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+            );
+        }
+        // Today's spend is already over the ceiling.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        let outcome = o.dispatch_review(review_run("alice", HEAD_A));
+
+        assert_eq!(
+            outcome,
+            ReviewDispatchOutcome::BudgetHeld,
+            "a spent anthropic budget must refuse the review"
+        );
+        assert!(
+            dispatched.lock().expect("dispatched lock").is_empty(),
+            "no reviewer agent may be spawned"
+        );
+        let subject = "makewhatis/rhapsody#12";
+        let held = o
+            .budget_ledger
+            .get(subject)
+            .expect("the refusal is recorded");
+        assert_eq!(held.provider, "anthropic");
+        assert_eq!(held.spent_tokens, 300);
+        // The watch row was NOT marked in-flight: the watcher must re-offer this head, not believe
+        // a review ran.
+        let watch = o
+            .store()
+            .get_review_watch(&rhapsody_store::ReviewWatchKey {
+                owner: "makewhatis".to_string(),
+                repo: "rhapsody".to_string(),
+                number: 12,
+                reviewer: "alice".to_string(),
+            })
+            .expect("read watch");
+        assert!(
+            watch.is_none(),
+            "a budget refusal must leave the watch row exactly where it was, got: {watch:?}"
         );
     }
 

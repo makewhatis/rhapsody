@@ -341,10 +341,7 @@ mod tests {
         require_datapoint_attrs(
             &rm,
             "symphony.tokens.total",
-            &[
-                ("provider", "fireworks-ai"),
-                ("harness", "opencode"),
-            ],
+            &[("provider", "fireworks-ai"), ("harness", "opencode")],
         );
         // The provider key is distinct from the model key: the exact trap a single-provider
         // assumption sets (a model name is not an account).

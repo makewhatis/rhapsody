@@ -26,7 +26,9 @@ use chrono::Duration;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::decode::ConfigError;
-use crate::model::{Config, Project, Raw, RawClaudeOverride, RawHooks, RawProject};
+use crate::model::{
+    Config, Project, Raw, RawClaudeOverride, RawHooks, RawProject, RawProviderBudget,
+};
 use crate::workflow::Definition;
 
 /// Serializes a typed [`Config`] into a workflow [`Definition`] whose front matter re-decodes to an
@@ -183,6 +185,16 @@ fn raw_from_config(c: &Config) -> Raw {
     r.git_flow = c.git_flow.clone();
     r.workspace_mode = c.workspace_mode.clone();
     r.pr_label = c.pr_label.clone(); // defaulted "rhapsody" is non-empty, survives pruning (AIE-301)
+    // STUDIO-957 (Rhapsody-only): a configured daily budget round-trips; an empty map prunes away,
+    // preserving the pre-957 (unlimited) default.
+    for (provider, b) in &c.budgets {
+        r.budgets.insert(
+            provider.clone(),
+            RawProviderBudget {
+                daily_tokens: Some(b.daily_tokens),
+            },
+        );
+    }
     r.tracker.project_slug = c.tracker.project_slug.clone();
 
     if collapsible_to_single(c) {

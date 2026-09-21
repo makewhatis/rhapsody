@@ -157,6 +157,31 @@ pub fn render(s: &Snapshot) -> Value {
             ),
         );
     }
+    // STUDIO-957: the per-provider budget refusals, emitted ONLY while at least one dispatch is
+    // being held — for the `held_for_human` key's reason and under the same guard, so a daemon with
+    // no configured budget (the default) serves a payload byte-identical to the Go capture's.
+    if !s.budget_held.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "budget_held".to_string(),
+            Value::Array(
+                s.budget_held
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "subject": h.subject,
+                            "title": h.title,
+                            "project": h.project,
+                            "provider": h.provider,
+                            "daily_tokens": h.daily_tokens,
+                            "spent_tokens": h.spent_tokens,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
     out
 }
 
@@ -536,6 +561,48 @@ mod tests {
         assert_eq!(rows[0]["issue_identifier"], "STUDIO-939");
         assert_eq!(rows[0]["title"], "wire the stores to RevenueCat");
         assert_eq!(rows[0]["project"], "booch");
+    }
+
+    // STUDIO-957, the same parity guard as `held_for_human`: a daemon with no configured budget (the
+    // default) emits NO `budget_held` key, so `/api/v1/state` stays byte-identical to the Go capture.
+    // Mutation: emit the key unconditionally and this reds (and the golden's absence guard with it).
+    #[test]
+    fn a_daemon_with_no_budget_hold_emits_no_budget_held_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("budget_held").is_none(),
+            "a daemon with no budget refusal must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // And the other half: a budget refusal reaches `/api/v1/state`, so an operator can see WHY a
+    // ticket stopped dispatching rather than reading it as an unexplained stall.
+    #[test]
+    fn a_budget_held_subject_reaches_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.note_budget_hold(
+            "STUDIO-957",
+            "meter spend per provider",
+            "rhapsody",
+            "anthropic",
+            200_000_000,
+            361_000_000,
+        );
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["budget_held"]
+            .as_array()
+            .expect("budget_held is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["subject"], "STUDIO-957");
+        assert_eq!(rows[0]["provider"], "anthropic");
+        assert_eq!(rows[0]["daily_tokens"], 200_000_000);
+        assert_eq!(rows[0]["spent_tokens"], 361_000_000);
     }
 
     // And the other half: while a drain IS armed the key appears, carrying the two annotations an
