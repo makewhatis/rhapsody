@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   fetchDaySummary,
@@ -13,6 +14,7 @@ import {
   type IssueCountsResponse,
   type IssueRunsResponse,
 } from "@/lib/api";
+import { LIVE_POLL_MS } from "@/hooks/useStateQuery";
 
 // useHistory fetches the RUN-level history (GET /api/v1/history). It keeps the previous page's data
 // while refetching to avoid flicker. Note this is a run-paged fetch: it is the right input for a
@@ -136,6 +138,39 @@ export function useHistoryCosts(opts?: { enabled?: boolean; refetchInterval?: nu
     refetchInterval: opts?.refetchInterval ?? false,
     refetchOnWindowFocus: false,
   });
+}
+
+// useLiveHistoryCosts is the RUN DETAIL's read of that same ledger (STUDIO-975 round 1). The total
+// it feeds is the whole TICKET's cost, and the ledger behind it is not terminal-only:
+// `update_run_progress` writes `runs.total_tokens` after every turn, so on a live ticket the total
+// moves with the per-attempt vitals beside it. A plain `useHistoryCosts()` fetched once and froze —
+// the run detail polls `useRunDetail` at 2s, but `useJobsFeed`, whose live-signature pull-forward
+// is what refreshes this key on the Jobs surface, is unmounted here. The receipt then showed a
+// fresh attempt count beside an indefinitely stale ticket total, still stale after completion.
+//
+// So this rides the run's own cadence while the selected run is live, and fires ONE extra refetch on
+// the live→terminal edge — the moment a run's final turn lands in the ledger — the same shape
+// `useTranscript` uses. It shares `HISTORY_COSTS_QUERY_KEY`, so it is that one cache entry rather
+// than a second request when the worklist has already filled it.
+export function useLiveHistoryCosts(inFlight: boolean) {
+  const query = useQuery<HistoryCostsResponse>({
+    queryKey: HISTORY_COSTS_QUERY_KEY,
+    queryFn: fetchHistoryCosts,
+    refetchInterval: inFlight ? LIVE_POLL_MS : false,
+    refetchOnWindowFocus: false,
+  });
+
+  const wasInFlight = useRef(inFlight);
+  const refetchRef = useRef(query.refetch);
+  refetchRef.current = query.refetch;
+  useEffect(() => {
+    if (wasInFlight.current && !inFlight) {
+      void refetchRef.current();
+    }
+    wasInFlight.current = inFlight;
+  }, [inFlight]);
+
+  return query;
 }
 
 // useDaySummary fetches the daemon-computed totals for the local day containing `nowMs`
