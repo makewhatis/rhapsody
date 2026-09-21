@@ -1613,6 +1613,38 @@ describe("the whole-ticket token total (STUDIO-975)", () => {
     });
     await waitFor(() => expect(block().textContent).toContain("300.0k"));
   });
+
+  // STUDIO-976 meets STUDIO-975: a review run's own `issue_identifier` is its synthetic
+  // `pr:…@reviewer` key, which is not a ticket — the ledger keys on the TICKET. Selecting a review
+  // must keep the whole-ticket total on the ticket being viewed, not scope to a key the ledger
+  // cannot carry (the same trap sol blocked on the "Open ticket" action). The total is the whole
+  // point of the card; a review run's tokens are already inside it (`/history/costs` credits them).
+  it("keeps the ticket total on the viewed ticket when a review run is selected", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    h.fetchHistoryCosts.mockResolvedValue({
+      costs: [cost("STUDIO-654", "anthropic", 9_400_000)],
+    });
+    h.fetchRunDetail.mockImplementation(async (id: number) => {
+      const row = [run({ id: 547 }), review].find((r) => r.id === id);
+      if (row === undefined) throw new Error(`no run with id: ${id}`);
+      return detailOf(row);
+    });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 801, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })], vi.fn(), [review]);
+    await waitFor(() =>
+      expect(client.getQueryState(HISTORY_COSTS_QUERY_KEY)?.status).toBe("success"),
+    );
+    fireEvent.click(document.querySelector(".trrev") as HTMLElement);
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledWith(801));
+    const block = document.querySelector(".trticket") as HTMLElement;
+    expect(block.textContent).toContain("9.4M");
+    expect(block.textContent).not.toContain("—");
+  });
 });
 
 describe("zone C — The Split (§3C)", () => {

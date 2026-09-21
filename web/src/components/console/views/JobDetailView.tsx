@@ -464,6 +464,7 @@ function RunTrace({
         <>
           <ResultCardZone
             run={live}
+            ticket={issue}
             result={result}
             vitals={vitals}
             pending={transcript.isPending}
@@ -1075,6 +1076,7 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
 
 function ResultCardZone({
   run,
+  ticket,
   result,
   vitals,
   pending,
@@ -1082,6 +1084,10 @@ function ResultCardZone({
   onJumpToFailure,
 }: {
   run: RunSummary;
+  /** The route-level ticket being viewed — the ledger's key. A selected review run's own
+   * `issue_identifier` is its synthetic `pr:…@reviewer` key, which is not a ticket, so the
+   * whole-ticket total must resolve from HERE (STUDIO-976). */
+  ticket: string;
   result: ResultCard;
   vitals: RunVitals;
   pending: boolean;
@@ -1108,7 +1114,7 @@ function ResultCardZone({
   // per-attempt vitals (STUDIO-975 round 1).
   const costRows = useLiveHistoryCosts(inFlight);
   const ticketCost =
-    costRows.data === undefined ? null : ticketCostView(costRows.data.costs, run.issue_identifier);
+    costRows.data === undefined ? null : ticketCostView(costRows.data.costs, ticket);
   return (
     <div className={eyebrow.tone === "done" ? "trrc" : `trrc ${eyebrow.tone}`}>
       <div className="trbar" />
