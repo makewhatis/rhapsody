@@ -63,6 +63,13 @@ impl HistoryStore for HistoryView {
     ) -> Result<Vec<RunSummary>, StoreError> {
         self.0.issue_history(identifier, project, limit)
     }
+    fn runs_for_issues(
+        &self,
+        identifiers: &[String],
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError> {
+        self.0.runs_for_issues(identifiers, limit)
+    }
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
         self.0.get_run(run_id)
     }

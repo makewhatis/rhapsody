@@ -164,6 +164,20 @@ pub trait Store {
         project: &str,
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError>;
+    /// Every run whose `issue_identifier` is one of `identifiers`, most-recent first, capped at
+    /// `limit` (<= 0 ⇒ the default page). One query for a WHOLE set rather than a probe per key.
+    ///
+    /// This is the review-run half of a ticket's run detail (STUDIO-976): the identifiers are the
+    /// `pr:owner/repo#n@reviewer` keys the caller resolved from the watch set, so a ticket can show
+    /// the reviews credited to it in time order with its attempts. It is deliberately not a new
+    /// notion of which ticket a review belongs to — the caller joins with
+    /// `rhapsody_orchestrator::reviewdone::origin_ticket`, the same reader the listing's `review_of`
+    /// and the cost ledger use. Rhapsody-only; Go has no review runs.
+    fn runs_for_issues(
+        &self,
+        identifiers: &[String],
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError>;
     /// Returns a single run row by id. `Ok(None)` (not an error) when no such run exists, so the
     /// caller can answer 404 without treating "missing" as an error.
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError>;
