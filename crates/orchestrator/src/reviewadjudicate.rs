@@ -209,6 +209,30 @@ impl Adjudication {
         }
     }
 
+    /// Whether this decision still governs a pull request now at `head` (STUDIO-971).
+    ///
+    /// A decision is a statement about ONE head — the head the loop stopped at. It keeps the loop
+    /// stopped only while the branch still is, or is again, that head. A later head carrying new
+    /// work is a head the manager never adjudicated: the code the verdict describes no longer
+    /// exists on the branch, so the loop must resume. `unchanged_from` is STUDIO-960's proof that a
+    /// head move carried no new work — the diff against the base is byte-identical to the one the
+    /// verdict was made against — and a move that changed nothing does not re-open the decision.
+    ///
+    /// Only a [`Verdict::Ship`] can stop governing. An [`Adjudication::Escalate`] names a HUMAN as
+    /// the next actor; resuming it on a push the author made themselves would mean the escalation
+    /// never reaches that human, so an escalation governs however far the head moves.
+    ///
+    /// An in-flight marker governs too — a turn is out right now — but callers test
+    /// [`Self::settled`] first, because the resume question is about a LANDED verdict.
+    pub fn governs(&self, head: &str, unchanged_from: &[String]) -> bool {
+        match self {
+            Adjudication::InFlight { .. } => true,
+            // A push the author made themselves must never cancel a human escalation.
+            Adjudication::Escalate { .. } => true,
+            Adjudication::Ship { .. } => self.head() == head || !unchanged_from.is_empty(),
+        }
+    }
+
     /// The durable form of a SETTLED decision, or `None` for one still in flight — see the module
     /// doc on why an in-flight marker must never reach the store.
     fn to_stored(&self) -> Option<ReviewAdjudication> {
@@ -1172,6 +1196,48 @@ mod tests {
         assert!(body.contains("alice asked for changes at a324d2d"));
         assert!(body.contains("bob asked for changes at c366a61"));
         assert!(body.contains("the migration needs a DBA"));
+    }
+
+    // ── STUDIO-971: a decision governs only the head it was made at ──────────────────────────────
+
+    /// **Acceptance.** A `ship` decision applies to the head the loop stopped at and to a no-op head
+    /// move (STUDIO-960's `unchanged_from`), and to nothing else. An escalation governs however far
+    /// the head moves — it named a human, and a push the author made themselves must not cancel it.
+    ///
+    /// MUTATION: make `governs` return `true` unconditionally (gate on `settled()` alone) and the
+    /// `governs("bbb", &[])` case below reds; make it ignore `unchanged_from` and the
+    /// `unchanged_from == ["aaa"]` case reds.
+    #[test]
+    fn a_ship_decision_governs_only_the_head_it_was_made_at() {
+        let ship = Adjudication::Ship {
+            head: "aaa".to_string(),
+            rounds: 3,
+        };
+        assert!(ship.governs("aaa", &[]), "the head it was made at");
+        assert!(
+            !ship.governs("bbb", &[]),
+            "a content-changing push is a head the manager never adjudicated"
+        );
+        assert!(
+            ship.governs("bbb", &["aaa".to_string()]),
+            "a no-op head move carries the decision forward (STUDIO-960)"
+        );
+
+        let escalated = Adjudication::Escalate {
+            head: "aaa".to_string(),
+            rounds: 3,
+            findings: Vec::new(),
+            reason: "a human is needed".to_string(),
+        };
+        assert!(
+            escalated.governs("bbb", &[]),
+            "an escalation names a human and is never resumed by a push"
+        );
+
+        assert!(
+            Adjudication::InFlight { rounds: 3 }.governs("bbb", &[]),
+            "a turn is out right now"
+        );
     }
 
     // ── the ledger records, reads back, and refuses to overwrite a landed verdict ────────────────
