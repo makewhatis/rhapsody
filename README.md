@@ -2310,3 +2310,14 @@ metered **per provider and never aggregated**: 500M Fireworks tokens and 360M Op
 the same money, and there are no per-model rates to convert them. The key is deliberately kept out
 of `GET /api/v1/config`'s typed `global`/`projects` view, like `promote_from_states`; it appears in
 the response's verbatim `config` block when present.
+
+Three refinements to the stop, each from review of the first cut. A **review** refusal is keyed by
+the review's own identity (`pr:owner/repo#n@reviewer`), not by the pull request coordinate, because
+dispatch is per `(PR, reviewer)`: in a mixed roster one reviewer's successful dispatch must not
+erase a sibling reviewer's still-active hold, and two held reviewers must not overwrite each other.
+The coordinate rides on the record so the reconciliation sweep still finds every hold for a
+divergence. The staleness window is `max(300s, 2 × polling.interval_ms)`, so a hold re-confirmed
+once per selection/watch pass cannot age out between two passes on a poll interval longer than five
+minutes. And the local midnight is resolved through the zone's own transition rules rather than
+`now`'s current offset, so a DST transition day no longer folds an extra hour of yesterday's spend
+into today.

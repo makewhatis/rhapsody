@@ -555,9 +555,16 @@ impl Orchestrator {
         // Refused dispatches are recorded so `/api/v1/state` surfaces them and the reconciliation
         // sweep names the budget rather than claiming nothing has reported the ticket blocked.
         if attempt.is_none() {
+            // STUDIO-957 round 2 (alice finding 3): a REVIEW was already gated at its own door —
+            // `dispatch_review` refuses before its watch-set writes and stages this review in
+            // `pending_review` — so re-gating here would use a second provider derivation and a
+            // possibly re-fetched spend map, and a refusal at THIS point would strand the already-
+            // consumed pending review and a watch row recorded as `requested`, while the caller
+            // still answered `Dispatched`. The per-provider gate therefore binds only a direct
+            // TICKET dispatch; a review's is the one in `dispatch_review`.
             // No configured budget ⇒ nothing to check and no provider resolution is done, so the
             // dispatch is byte-identical to one built before this feature.
-            if self.budgets_configured() {
+            if review.is_none() && self.budgets_configured() {
                 let provider =
                     self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
                 if let Some((limit, spent)) = self.provider_budget_spent(&provider) {

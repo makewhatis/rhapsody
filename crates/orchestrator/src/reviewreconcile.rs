@@ -2261,10 +2261,11 @@ mod store_tests {
             "2026-09-14T13:00:00Z",
             "2026-09-14T14:40:00Z",
         );
-        // The reviewer's provider is out of daily budget; the watcher recorded it against the PR.
-        o.note_budget_hold(
+        // The reviewer's provider is out of daily budget; the watcher recorded it against the
+        // reviewer's identity, with the PR coordinate carried for this lookup.
+        o.note_review_budget_hold(
+            "pr:makewhatis/rhapsody#164@alice",
             "makewhatis/rhapsody#164",
-            "",
             "core",
             "anthropic",
             400_000_000,

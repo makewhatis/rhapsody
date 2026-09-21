@@ -404,17 +404,24 @@ impl Orchestrator {
         // below record this head as requested and mark the row in-flight, so a refusal further down
         // would leave the watcher believing a review dispatched and never re-offer this head. The
         // incident's whole Claude bill was REVIEWS, so a budget that could not see this path would
-        // have refused nothing. The subject is the pull request's coordinate, which is also the key
-        // the reconciliation sweep reports a divergence under.
+        // have refused nothing.
+        //
+        // Keyed by the review IDENTITY (`id`, `pr:owner/repo#n@reviewer`), not by the pull request
+        // coordinate (alice round 2 on PR #199). Dispatch is per `(PR, reviewer)`: in a mixed
+        // roster one reviewer can be out of budget while another is not, and a coordinate key let
+        // the second reviewer's successful dispatch release the first reviewer's still-active hold
+        // (and let two held reviewers overwrite each other's provider/figures). The coordinate
+        // rides on the hold as `pr` so the reconciliation sweep still finds every hold for a
+        // divergence it reports.
+        let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         if self.budgets_configured() {
             let provider = self.review_projected_provider(&iss, &route.slug);
             if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
-                let subject = format!("{}/{}#{}", run.owner, run.repo, run.number);
-                self.note_budget_hold(&subject, "", &route.slug, &provider, limit, spent);
+                self.note_review_budget_hold(&id, &pr, &route.slug, &provider, limit, spent);
                 return ReviewDispatchOutcome::BudgetHeld;
             }
-            // A dispatched review clears any stale hold for this coordinate.
-            self.release_budget_hold(&format!("{}/{}#{}", run.owner, run.repo, run.number));
+            // A dispatched review clears this reviewer's own stale hold — and only this reviewer's.
+            self.release_budget_hold(&id);
         }
 
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
@@ -859,13 +866,23 @@ mod tests {
             dispatched.lock().expect("dispatched lock").is_empty(),
             "no reviewer agent may be spawned"
         );
-        let subject = "makewhatis/rhapsody#12";
+        // The hold is keyed by the review IDENTITY, and carries the pull request coordinate so the
+        // reconciliation sweep can still find it.
+        let ttl = o.budget_hold_ttl();
         let held = o
             .budget_ledger
-            .get(subject)
-            .expect("the refusal is recorded");
+            .get(&review_run("alice", HEAD_A).key(), ttl)
+            .expect("the refusal is recorded under the review identity");
         assert_eq!(held.provider, "anthropic");
         assert_eq!(held.spent_tokens, 300);
+        assert_eq!(held.pr, "makewhatis/rhapsody#12");
+        assert_eq!(
+            o.budget_ledger
+                .get_for_pr("makewhatis/rhapsody#12", ttl)
+                .as_ref(),
+            Some(&held),
+            "the sweep finds the hold by pull request coordinate"
+        );
         // The watch row was NOT marked in-flight: the watcher must re-offer this head, not believe
         // a review ran.
         let watch = o
@@ -880,6 +897,113 @@ mod tests {
         assert!(
             watch.is_none(),
             "a budget refusal must leave the watch row exactly where it was, got: {watch:?}"
+        );
+    }
+
+    /// **alice round 2 on PR #199, finding 1: the mixed-roster regression.** Dispatch is per
+    /// `(PR, reviewer)`, so budget holds must be too. Alice reviews on Claude/Anthropic (out of
+    /// budget) while Jerry reviews the SAME pull request on opencode/Fireworks (unspent). Alice is
+    /// held; Jerry dispatches; Alice's hold must survive Jerry's success and still reach the
+    /// reconciliation sweep by coordinate.
+    ///
+    /// Mutation: key the review hold (and its release) by the pull request coordinate and this reds
+    /// — Jerry's dispatch erases Alice's hold.
+    #[test]
+    fn a_held_reviewers_budget_hold_survives_a_sibling_reviewers_dispatch() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "claude-reviewer",
+            "---\nextends: swe\nharness: claude\nmodel: claude-opus-4-8\n---\nClaude reviewer.\n",
+        );
+        write_profile(
+            &dir,
+            "opencode-reviewer",
+            "---\nextends: swe\nharness: opencode\nmodel: fireworks-ai/accounts/fireworks/models/x\n---\nOpencode reviewer.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "claude-reviewer".to_string();
+            teams.roster.push(Identity {
+                name: "jerry".to_string(),
+                profile: "opencode-reviewer".to_string(),
+                labels: Vec::new(),
+                bank: String::new(),
+                max_concurrent: 0,
+            });
+        }
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".to_string(),
+            rhapsody_config::ProviderBudget { daily_tokens: 200 },
+        );
+
+        // Today's anthropic spend is already over the ceiling; Fireworks has no budget at all.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        assert_eq!(
+            o.review_projected_provider(&review_run("alice", HEAD_A).synthetic_issue(), "rhapsody"),
+            "anthropic",
+            "sanity: alice reviews on anthropic"
+        );
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::BudgetHeld,
+            "alice's anthropic budget is spent"
+        );
+        assert_eq!(
+            o.dispatch_review(review_run("jerry", HEAD_B)),
+            ReviewDispatchOutcome::Dispatched,
+            "jerry is on fireworks, which has no budget"
+        );
+
+        let held = o
+            .budget_ledger
+            .get_for_pr("makewhatis/rhapsody#12", o.budget_hold_ttl())
+            .expect("alice's hold must survive jerry's dispatch");
+        assert_eq!(held.provider, "anthropic");
+        assert_eq!(
+            held.subject,
+            review_key("makewhatis", "rhapsody", 12, "alice"),
+            "the hold belongs to alice's review identity, not the shared coordinate"
+        );
+        assert_eq!(
+            dispatched.lock().expect("dispatched lock").len(),
+            1,
+            "only jerry's agent may be spawned"
         );
     }
 

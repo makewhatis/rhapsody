@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{Offset, SecondsFormat, Utc};
+use chrono::{DateTime, Local, LocalResult, SecondsFormat, TimeDelta, TimeZone, Utc};
 use rhapsody_store::Store;
 use serde::Serialize;
 
@@ -37,12 +37,18 @@ use serde::Serialize;
 /// recorded without waiting the window out.
 const SPEND_CACHE_TTL: Duration = Duration::from_secs(3);
 
-/// How long a recorded refusal stays on the console without being re-confirmed. A subject still
-/// being offered re-refuses on every pass and stays fresh; one that stopped being offered (the
-/// ticket was moved to Done, the pull request merged) goes stale and drops, so `/api/v1/state`
-/// never carries a refusal that no longer holds. Long enough to outlive the poll cadence with room
-/// to spare.
-const HOLD_TTL: Duration = Duration::from_secs(300);
+/// The FLOOR for how long a recorded refusal stays on the console without being re-confirmed. A
+/// subject still being offered re-refuses on every pass and stays fresh; one that stopped being
+/// offered (the ticket was moved to Done, the pull request merged) goes stale and drops, so
+/// `/api/v1/state` never carries a refusal that no longer holds.
+///
+/// It is a floor, not the rule: the real bound is
+/// [`Orchestrator::budget_hold_ttl`], which widens to two configured poll cadences whenever the
+/// operator's `polling.interval_ms` is longer than this. A fixed 300s was wrong (alice round 2 on
+/// PR #199): `polling.interval_ms` has no five-minute ceiling, so on a ten-minute poll a genuinely
+/// blocked ticket — refreshed only once per pass — disappeared from `/api/v1/state` for roughly
+/// half of every cycle.
+const HOLD_TTL_FLOOR: Duration = Duration::from_secs(300);
 
 /// Reports whether a provider's configured daily budget is SPENT. `limit <= 0` is unlimited (the
 /// `max_concurrent` idiom), as is the absence of a limit (the caller only calls this with a
@@ -55,18 +61,50 @@ pub fn budget_spent(spent: i64, limit: i64) -> bool {
 /// Midnight of the DAEMON host's current local day, as a UTC RFC3339 instant — the same LOCAL day
 /// boundary `/api/v1/history/summary` uses, so the budget and the figures an operator reads beside
 /// it describe one day. Local, not UTC: a UTC boundary would silently shift the reset for anyone
-/// not on UTC. Panic-free (the instant is the naive local midnight shifted by the host's current
-/// offset, so there is no ambiguous `LocalResult` to unwrap); on a DST spring-forward day that skips
-/// 00:00 the boundary lands an hour off for that one day rather than the daemon failing.
+/// not on UTC.
 pub fn local_day_start() -> String {
-    let now = chrono::Local::now();
-    let shift = chrono::TimeDelta::try_seconds(now.offset().fix().local_minus_utc() as i64)
-        .unwrap_or_default();
-    now.date_naive()
+    day_start(Local::now())
+}
+
+/// The local-day boundary for `now`, resolved through the ZONE's own transition rules rather than
+/// through `now`'s current offset.
+///
+/// The difference is the whole point (alice round 2 on PR #199): on a DST transition day the offset
+/// at local midnight differs from the offset now. After the US spring-forward, applying the current
+/// PDT (-07) to midnight yields 07:00Z although that midnight was PST (-08), 08:00Z — an extra hour
+/// of yesterday's spend inside today's budget. `Tz::from_local_datetime` consults the zone database
+/// and answers the offset midnight actually had. A `None` (a zone whose transition SKIPS 00:00, as
+/// `America/Santiago` does) walks forward a bounded few hours to the first local instant that
+/// exists; an `Ambiguous` midnight takes the earlier of the two. Panic-free throughout.
+fn day_start<Tz: TimeZone>(now: DateTime<Tz>) -> String {
+    let tz = now.timezone();
+    let midnight = now
+        .date_naive()
         .and_hms_opt(0, 0, 0)
-        .map(|naive| naive.and_utc() - shift)
-        .unwrap_or_else(Utc::now)
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+        .and_then(|naive| resolve_midnight(&tz, naive));
+    midnight
+        .map(|dt| {
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+/// Resolves the instant local `midnight` names, through the zone's own rules. `Single` and the
+/// earlier of an `Ambiguous` pair are the day start; a `None` probes forward in one-minute steps to
+/// the first local instant the zone accepts (bounded to three hours, far past any real gap).
+fn resolve_midnight<Tz: TimeZone>(
+    tz: &Tz,
+    midnight: chrono::NaiveDateTime,
+) -> Option<DateTime<Tz>> {
+    match tz.from_local_datetime(&midnight) {
+        LocalResult::Single(dt) => Some(dt),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        LocalResult::None => (1..=180).find_map(|m| {
+            let probe = midnight.checked_add_signed(TimeDelta::minutes(m))?;
+            tz.from_local_datetime(&probe).earliest()
+        }),
+    }
 }
 
 /// Sums a window's tokens per provider from the store. Best-effort: a store that cannot answer
@@ -87,9 +125,16 @@ fn spent_by_provider(store: &dyn Store, since: &str) -> HashMap<String, i64> {
     }
 }
 
-/// One refused dispatch: the subject (a ticket identifier, or a pull request's `owner/repo#n`), its
-/// title (empty for a review), the owning project, the provider whose budget is spent, and the two
-/// figures an operator needs to act.
+/// One refused dispatch: the subject (a ticket identifier, or a review's `pr:owner/repo#n@reviewer`
+/// identity), its title (empty for a review), the owning project, the provider whose budget is
+/// spent, and the two figures an operator needs to act.
+///
+/// `pr` is the pull request coordinate of a REVIEW refusal (`owner/repo#n`), empty for a ticket.
+/// It is carried separately from `subject` because dispatch is per `(PR, reviewer)` while a
+/// divergence is reported per pull request: keying the hold by the review IDENTITY keeps two
+/// reviewers of one PR independent (alice round 2 on PR #199 — one reviewer's successful dispatch
+/// used to erase a sibling reviewer's still-active hold), and this field is how the reconciliation
+/// sweep still finds every hold for a coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BudgetHeld {
     pub subject: String,
@@ -98,6 +143,7 @@ pub struct BudgetHeld {
     pub provider: String,
     pub daily_tokens: i64,
     pub spent_tokens: i64,
+    pub pr: String,
 }
 
 /// The budget ledger: the CURRENT refused set the console reads off `/api/v1/state`, a once-per-
@@ -119,8 +165,8 @@ struct Entry {
 }
 
 impl Entry {
-    fn fresh(&self) -> bool {
-        self.recorded.elapsed() < HOLD_TTL
+    fn fresh(&self, ttl: Duration) -> bool {
+        self.recorded.elapsed() < ttl
     }
 }
 
@@ -158,25 +204,37 @@ impl BudgetLedger {
         st.announced.remove(subject);
     }
 
-    /// The hold recorded for a subject, if any and still fresh — the lookup the reconciliation sweep
-    /// makes so it can name a budget hold instead of claiming nothing has reported a divergence
-    /// blocked.
-    pub fn get(&self, subject: &str) -> Option<BudgetHeld> {
+    /// The hold recorded for a subject, if any and still fresh under `ttl` — the lookup the
+    /// reconciliation sweep makes so it can name a budget hold instead of claiming nothing has
+    /// reported a divergence blocked.
+    pub fn get(&self, subject: &str, ttl: Duration) -> Option<BudgetHeld> {
         self.lock()
             .holds
             .get(subject)
-            .filter(|e| e.fresh())
+            .filter(|e| e.fresh(ttl))
+            .map(|e| e.held.clone())
+    }
+
+    /// The first fresh hold recorded for a pull request coordinate, ordered by subject — the lookup
+    /// that finds REVIEW holds, which are keyed by review identity rather than by coordinate. There
+    /// can be more than one (a mixed roster with two reviewers out of budget); the sweep names one,
+    /// and the console lists them all.
+    pub fn get_for_pr(&self, pr: &str, ttl: Duration) -> Option<BudgetHeld> {
+        self.lock()
+            .holds
+            .values()
+            .find(|e| e.fresh(ttl) && e.held.pr == pr)
             .map(|e| e.held.clone())
     }
 
     /// The current refused set, ordered by subject, for `GET /api/v1/state`. Stale entries (a
     /// subject that stopped being offered without dispatching — moved to Done, merged) are dropped
     /// rather than reported forever.
-    pub fn held(&self) -> Vec<BudgetHeld> {
+    pub fn held(&self, ttl: Duration) -> Vec<BudgetHeld> {
         self.lock()
             .holds
             .values()
-            .filter(|e| e.fresh())
+            .filter(|e| e.fresh(ttl))
             .map(|e| e.held.clone())
             .collect()
     }
@@ -204,7 +262,7 @@ impl BudgetLedger {
     }
 
     /// Test seam: records a hold as if it were confirmed at `recorded`, so the staleness rule can be
-    /// exercised without sleeping out [`HOLD_TTL`].
+    /// exercised without sleeping out [`HOLD_TTL_FLOOR`].
     #[cfg(test)]
     fn hold_at(&self, subject: &str, held: BudgetHeld, recorded: Instant) {
         self.lock()
@@ -257,10 +315,25 @@ impl crate::orchestrator::Orchestrator {
         budget_spent(spent, limit).then_some((limit, spent))
     }
 
-    /// Records a refused dispatch, logging the FIRST time this subject is refused (a refusal that
-    /// repeats every tick is not a signal anyone reads). Returns the hold when it was newly
-    /// announced, so the caller can decide whether to log again; the ledger keeps it either way so
-    /// `/api/v1/state` and the reconciliation sweep can name it.
+    /// How long an un-refreshed hold may survive before the console stops reporting it. The FLOOR
+    /// is [`HOLD_TTL_FLOOR`]; when the operator's poll interval is longer, two cadences, so a hold
+    /// re-confirmed once per selection/watch pass can never age out between two passes. Tied to the
+    /// configured cadence rather than a fixed wall-clock because `polling.interval_ms` has no
+    /// ceiling (alice round 2 on PR #199).
+    pub(crate) fn budget_hold_ttl(&self) -> Duration {
+        let poll_ms = self
+            .eff
+            .as_ref()
+            .map(|e| e.cfg.polling.interval_ms)
+            .unwrap_or(0)
+            .max(0) as u64;
+        HOLD_TTL_FLOOR.max(Duration::from_millis(poll_ms).saturating_mul(2))
+    }
+
+    /// Records a TICKET's refused dispatch, logging the FIRST time this subject is refused (a
+    /// refusal that repeats every tick is not a signal anyone reads). Returns whether it was newly
+    /// announced; the ledger keeps it either way so `/api/v1/state` and the reconciliation sweep
+    /// can name it.
     pub(crate) fn note_budget_hold(
         &self,
         subject: &str,
@@ -270,15 +343,48 @@ impl crate::orchestrator::Orchestrator {
         limit: i64,
         spent: i64,
     ) -> bool {
-        let held = BudgetHeld {
+        self.record_budget_hold(BudgetHeld {
             subject: subject.to_string(),
             title: title.to_string(),
             project: project.to_string(),
             provider: provider.to_string(),
             daily_tokens: limit,
             spent_tokens: spent,
-        };
-        let first = self.budget_ledger.hold(subject, held);
+            pr: String::new(),
+        })
+    }
+
+    /// Records a REVIEW's refused dispatch, keyed by the review IDENTITY
+    /// (`pr:owner/repo#n@reviewer`) and carrying its pull request coordinate for the sweep. The
+    /// identity is the key because dispatch is per `(PR, reviewer)`: two reviewers of one pull
+    /// request on different providers must not overwrite each other's hold, and one reviewer's
+    /// successful dispatch must not clear the other's still-active refusal (alice round 2 on PR
+    /// #199).
+    pub(crate) fn note_review_budget_hold(
+        &self,
+        identity: &str,
+        pr: &str,
+        project: &str,
+        provider: &str,
+        limit: i64,
+        spent: i64,
+    ) -> bool {
+        self.record_budget_hold(BudgetHeld {
+            subject: identity.to_string(),
+            title: String::new(),
+            project: project.to_string(),
+            provider: provider.to_string(),
+            daily_tokens: limit,
+            spent_tokens: spent,
+            pr: pr.to_string(),
+        })
+    }
+
+    fn record_budget_hold(&self, held: BudgetHeld) -> bool {
+        let subject = held.subject.clone();
+        let provider = held.provider.clone();
+        let (limit, spent) = (held.daily_tokens, held.spent_tokens);
+        let first = self.budget_ledger.hold(&subject, held);
         if first {
             tracing::warn!(
                 subject,
@@ -303,11 +409,12 @@ impl crate::orchestrator::Orchestrator {
     /// budget-held divergence is named by its cause rather than reported as an unexplained stall
     /// (STUDIO-957).
     pub(crate) fn budget_hold_for(&self, pr: &str, ticket: &str) -> Option<BudgetHeld> {
-        if let Some(h) = self.budget_ledger.get(pr) {
+        let ttl = self.budget_hold_ttl();
+        if let Some(h) = self.budget_ledger.get_for_pr(pr, ttl) {
             return Some(h);
         }
         if !ticket.is_empty() {
-            return self.budget_ledger.get(ticket);
+            return self.budget_ledger.get(ticket, ttl);
         }
         None
     }
@@ -432,12 +539,13 @@ mod tests {
             !o.claimed.contains("1"),
             "a refusal must not claim the ticket"
         );
+        let ttl = o.budget_hold_ttl();
         assert!(
-            o.budget_ledger.get("MT-1").is_some(),
+            o.budget_ledger.get("MT-1", ttl).is_some(),
             "the refusal must be recorded where the console and sweep read it"
         );
         assert_eq!(
-            o.budget_ledger.get("MT-1").expect("hold").provider,
+            o.budget_ledger.get("MT-1", ttl).expect("hold").provider,
             "anthropic"
         );
     }
@@ -459,7 +567,7 @@ mod tests {
             ["1".to_string()],
             "a run billed to anthropic is unaffected by a spent openai budget"
         );
-        assert!(o.budget_ledger.held().is_empty());
+        assert!(o.budget_ledger.held(o.budget_hold_ttl()).is_empty());
     }
 
     // THE behaviour-preservation test: an unset budget never refuses anything, however much was
@@ -478,7 +586,7 @@ mod tests {
             ["1".to_string()],
             "no configured budget ⇒ byte-identical to a daemon built before this feature"
         );
-        assert!(o.budget_ledger.held().is_empty());
+        assert!(o.budget_ledger.held(o.budget_hold_ttl()).is_empty());
     }
 
     // A budget bounds NEW dispatch only. A retry/continuation is the SAME ticket's already-started
@@ -505,7 +613,7 @@ mod tests {
             "a continuation must pass even when the budget is spent"
         );
         assert!(
-            o.budget_ledger.get("MT-1").is_none(),
+            o.budget_ledger.get("MT-1", o.budget_hold_ttl()).is_none(),
             "no hold is recorded for a run that was allowed"
         );
     }
@@ -520,12 +628,12 @@ mod tests {
         // dispatch itself is allowed.
         let (mut o, _) = orch_with_budgets(store, &[("anthropic", 1_000_000)]);
         o.note_budget_hold("MT-1", "t", "core", "anthropic", 200, 250);
-        assert!(o.budget_ledger.get("MT-1").is_some());
+        assert!(o.budget_ledger.get("MT-1", o.budget_hold_ttl()).is_some());
 
         o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
 
         assert!(
-            o.budget_ledger.get("MT-1").is_none(),
+            o.budget_ledger.get("MT-1", o.budget_hold_ttl()).is_none(),
             "dispatching clears the hold"
         );
     }
@@ -573,14 +681,15 @@ mod tests {
             provider: "anthropic".into(),
             daily_tokens: 200,
             spent_tokens: 250,
+            pr: String::new(),
         };
         assert!(l.hold("MT-1", h.clone()), "first refusal announces");
         assert!(!l.hold("MT-1", h.clone()), "a repeat does not re-announce");
-        assert_eq!(l.get("MT-1").as_ref(), Some(&h));
-        assert_eq!(l.held().len(), 1);
+        assert_eq!(l.get("MT-1", HOLD_TTL_FLOOR).as_ref(), Some(&h));
+        assert_eq!(l.held(HOLD_TTL_FLOOR).len(), 1);
         l.release("MT-1");
-        assert!(l.get("MT-1").is_none());
-        assert!(l.held().is_empty());
+        assert!(l.get("MT-1", HOLD_TTL_FLOOR).is_none());
+        assert!(l.held(HOLD_TTL_FLOOR).is_empty());
     }
 
     /// A subject that stopped being offered without dispatching must not sit on the console forever:
@@ -596,18 +705,231 @@ mod tests {
             provider: "anthropic".into(),
             daily_tokens: 200,
             spent_tokens: 250,
+            pr: String::new(),
         };
         let old = Instant::now()
-            .checked_sub(HOLD_TTL + Duration::from_secs(1))
+            .checked_sub(HOLD_TTL_FLOOR + Duration::from_secs(1))
             .expect("instant arithmetic");
         l.hold_at("MT-1", h.clone(), old);
         assert!(
-            l.get("MT-1").is_none(),
+            l.get("MT-1", HOLD_TTL_FLOOR).is_none(),
             "a hold not re-confirmed within TTL must drop"
         );
-        assert!(l.held().is_empty());
+        assert!(l.held(HOLD_TTL_FLOOR).is_empty());
 
         l.hold("MT-1", h);
-        assert!(l.get("MT-1").is_some(), "a fresh hold stays");
+        assert!(
+            l.get("MT-1", HOLD_TTL_FLOOR).is_some(),
+            "a fresh hold stays"
+        );
+    }
+
+    /// **alice round 2 on PR #199, finding 2.** The hold TTL is a FLOOR widened to two configured
+    /// poll cadences, so a hold refreshed once per pass cannot age out between two passes on a poll
+    /// interval longer than 300s. A fixed 300s dropped a genuinely-held subject mid-cycle on a
+    /// ten-minute poll, and the sweep then fell back to an unexplained divergence.
+    ///
+    /// Mutation: make `budget_hold_ttl` return the floor unconditionally and the 5-minute-old hold
+    /// reds as stale.
+    #[test]
+    fn a_hold_outlives_a_poll_interval_longer_than_the_floor() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let (mut o, _) = orch_with_budgets(store, &[("anthropic", 200)]);
+        o.eff.as_mut().expect("eff").cfg.polling.interval_ms = 600_000;
+        assert_eq!(o.budget_hold_ttl(), Duration::from_secs(1_200));
+
+        let h = BudgetHeld {
+            subject: "MT-1".into(),
+            title: "t".into(),
+            project: "core".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200,
+            spent_tokens: 250,
+            pr: String::new(),
+        };
+        let five_minutes_ago = Instant::now()
+            .checked_sub(Duration::from_secs(300 + 1))
+            .expect("instant arithmetic");
+        o.budget_ledger.hold_at("MT-1", h, five_minutes_ago);
+
+        assert!(
+            o.budget_ledger.get("MT-1", o.budget_hold_ttl()).is_some(),
+            "a hold refreshed once per ten-minute pass must survive a five-minute gap"
+        );
+        assert!(
+            o.budget_ledger.get("MT-1", HOLD_TTL_FLOOR).is_none(),
+            "the floor alone would have dropped it — that is the bug this pins"
+        );
+    }
+
+    /// **alice round 2 on PR #199, finding 1.** Review holds are keyed by the review IDENTITY, so
+    /// one reviewer's successful dispatch cannot release a sibling reviewer's still-active hold on
+    /// the same pull request. Before the fix both held under `owner/repo#n`, and dispatching the
+    /// second reviewer erased the first.
+    #[test]
+    fn three_reviewer_holds_on_one_pr_are_independent() {
+        let l = BudgetLedger::default();
+        let held = |provider: &str| BudgetHeld {
+            subject: format!("pr:o/r#12@{provider}"),
+            title: String::new(),
+            project: "core".into(),
+            provider: provider.into(),
+            daily_tokens: 200,
+            spent_tokens: 300,
+            pr: "o/r#12".into(),
+        };
+        let alice = held("anthropic");
+        let jerry = held("fireworks-ai");
+        l.hold(&alice.subject, alice.clone());
+        l.hold(&jerry.subject, jerry.clone());
+
+        // jerry dispatches successfully and releases only his own identity.
+        l.release(&jerry.subject);
+        assert_eq!(
+            l.get_for_pr("o/r#12", HOLD_TTL_FLOOR).as_ref(),
+            Some(&alice),
+            "alice's hold must survive jerry's dispatch"
+        );
+        l.release(&alice.subject);
+        assert!(l.get_for_pr("o/r#12", HOLD_TTL_FLOOR).is_none());
+    }
+
+    /// A boundary computed through the zone's own rules uses MIDNIGHT's offset, not `now`'s. On the
+    /// 2026-03-08 US spring-forward, noon local is PDT (-07) but midnight was PST (-08), so the day
+    /// starts at 08:00Z — NOT the 07:00Z that applying noon's offset to midnight yields, which folded
+    /// an extra hour of yesterday's spend into today (alice round 2 on PR #199, finding 3).
+    ///
+    /// Mutation: compute the boundary from `now.date_naive()` shifted by `now.offset()` and this reds
+    /// on `2026-03-08T07:00:00Z`.
+    #[test]
+    fn the_day_boundary_uses_midnights_own_offset_across_a_transition() {
+        use chrono::{FixedOffset, NaiveDate, NaiveDateTime, Offset};
+
+        /// An offset carrying whole seconds, the minimal [`Offset`] the fake zone needs.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Off(i32);
+        impl Offset for Off {
+            fn fix(&self) -> FixedOffset {
+                FixedOffset::east_opt(self.0).expect("valid offset seconds")
+            }
+        }
+
+        /// One spring-forward zone: local 2026-03-08T02:00–03:00 does not exist, and the offset goes
+        /// from -08 to -07 across it.
+        #[derive(Clone, Debug)]
+        struct SpringForward;
+        impl TimeZone for SpringForward {
+            type Offset = Off;
+            fn from_offset(_o: &Off) -> Self {
+                SpringForward
+            }
+            fn offset_from_local_date(&self, d: &NaiveDate) -> LocalResult<Off> {
+                self.offset_from_local_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<Off> {
+                let gap_start = NaiveDate::from_ymd_opt(2026, 3, 8)
+                    .expect("date")
+                    .and_hms_opt(2, 0, 0)
+                    .expect("gap start");
+                let gap_end = gap_start + TimeDelta::hours(1);
+                if *local >= gap_start && *local < gap_end {
+                    LocalResult::None
+                } else if *local >= gap_end {
+                    LocalResult::Single(Off(-7 * 3600))
+                } else {
+                    LocalResult::Single(Off(-8 * 3600))
+                }
+            }
+            fn offset_from_utc_date(&self, d: &NaiveDate) -> Off {
+                self.offset_from_utc_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> Off {
+                let switch = NaiveDate::from_ymd_opt(2026, 3, 8)
+                    .expect("date")
+                    .and_hms_opt(10, 0, 0)
+                    .expect("switch");
+                if *utc < switch {
+                    Off(-8 * 3600)
+                } else {
+                    Off(-7 * 3600)
+                }
+            }
+        }
+
+        let noon = NaiveDate::from_ymd_opt(2026, 3, 8)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon");
+        let now = SpringForward
+            .from_local_datetime(&noon)
+            .single()
+            .expect("noon is unambiguous");
+        assert_eq!(*now.offset(), Off(-7 * 3600), "sanity: noon is on PDT");
+        assert_eq!(
+            day_start(now),
+            "2026-03-08T08:00:00Z",
+            "the day starts at midnight's PST offset, not noon's PDT offset"
+        );
+    }
+
+    /// A zone whose transition SKIPS midnight (as `America/Santiago`'s spring-forward does) must not
+    /// lose the day: the boundary walks forward to the first local instant that exists.
+    #[test]
+    fn the_day_boundary_survives_a_zone_that_skips_midnight() {
+        use chrono::{FixedOffset, NaiveDate, NaiveDateTime, Offset};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Off(i32);
+        impl Offset for Off {
+            fn fix(&self) -> FixedOffset {
+                FixedOffset::east_opt(self.0).expect("valid offset seconds")
+            }
+        }
+
+        /// Local 2026-09-06T00:00–01:00 does not exist; the day begins at 01:00.
+        #[derive(Clone, Debug)]
+        struct SkipsMidnight;
+        impl TimeZone for SkipsMidnight {
+            type Offset = Off;
+            fn from_offset(_o: &Off) -> Self {
+                SkipsMidnight
+            }
+            fn offset_from_local_date(&self, d: &NaiveDate) -> LocalResult<Off> {
+                self.offset_from_local_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<Off> {
+                let gap_start = NaiveDate::from_ymd_opt(2026, 9, 6)
+                    .expect("date")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("gap start");
+                let gap_end = gap_start + TimeDelta::hours(1);
+                if *local >= gap_start && *local < gap_end {
+                    LocalResult::None
+                } else {
+                    LocalResult::Single(Off(-3 * 3600))
+                }
+            }
+            fn offset_from_utc_date(&self, d: &NaiveDate) -> Off {
+                self.offset_from_utc_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_utc_datetime(&self, _utc: &NaiveDateTime) -> Off {
+                Off(-3 * 3600)
+            }
+        }
+
+        let noon = NaiveDate::from_ymd_opt(2026, 9, 6)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon");
+        let now = SkipsMidnight
+            .from_local_datetime(&noon)
+            .single()
+            .expect("noon exists");
+        assert_eq!(
+            day_start(now),
+            "2026-09-06T04:00:00Z",
+            "a midnight that does not exist must resolve to the first instant that does (01:00 -03)"
+        );
     }
 }

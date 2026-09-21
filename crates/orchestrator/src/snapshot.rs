@@ -269,7 +269,7 @@ impl Orchestrator {
             held_for_human: self.human_holds.held(),
             // STUDIO-957: the current per-provider budget refusals; empty on a daemon with no
             // configured budget, which keeps the wire payload — and the golden — unchanged.
-            budget_held: self.budget_ledger.held(),
+            budget_held: self.budget_ledger.held(self.budget_hold_ttl()),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {

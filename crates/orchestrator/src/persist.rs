@@ -327,6 +327,12 @@ impl Orchestrator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&re.issue.id);
+        // STUDIO-957: the per-provider budget's cached spend must see the total this run just
+        // closed rather than a stale window — the cache's own doc (`BudgetLedger::invalidate_spend`)
+        // names this call, and alice round 1 finding 2 was that it had none. Before the `run_id`
+        // gate: a run that recorded no row left the spend unmoved, so this is a harmless no-op that
+        // keeps the "every end-of-run path" promise the mailbox drop above already makes.
+        self.budget_ledger.invalidate_spend();
         if re.run_id == 0 {
             return;
         }
