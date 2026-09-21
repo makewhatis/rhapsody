@@ -532,6 +532,13 @@ pub(crate) async fn handle_issue_counts(
         if card.is_empty() || !counted.insert(card) {
             continue;
         }
+        // An orphan review is counted as its ticket's card, so the review RUN itself must not then
+        // be counted a second time by the live overlay below. (A FOLDED review is deliberately left
+        // uncounted here: if it is live, the board draws it as its own Running run row, and the
+        // overlay below is what counts that row.)
+        if review::is_review_key(&r.issue_id) {
+            counted.insert(r.issue_id.as_str());
+        }
         // A stored row always lands in its lifecycle's bucket, held or not: a hold that has run
         // keeps the run's lane on the console (its card is in Review, sub-labelled "held for a
         // human"), so the strip must count it there. Only a hold with NO stored row is
@@ -2279,6 +2286,37 @@ mod tests {
             tally(&body),
             std::collections::HashMap::from([("completed/-".to_string(), 1)]),
             "the orphan review counts once, as the ticket it reviews (not as a review run): {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 — the orphan case, but LIVE. A live review run is in the snapshot too, so the live
+    // overlay would count its `pr:` key a second time on top of the card it already stands in for.
+    // It must be exactly one unit either way (the operator sees one Running row).
+    #[tokio::test]
+    async fn issue_counts_count_a_live_review_with_no_ticket_row_exactly_once() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#151@alice";
+        store
+            .start_run(RunStart {
+                issue_id: key.to_string(),
+                issue_identifier: key.to_string(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start review run");
+        seed_watch(&store, 151, "alice", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row(key));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+            "the live orphan review is one card, not also a run of its own: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
     }
