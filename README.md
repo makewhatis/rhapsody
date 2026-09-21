@@ -1247,6 +1247,28 @@ move, so has that party moved since the row started owing it? It **reports and n
 re-dispatching on a rule nobody has watched fire is how a stall becomes a loop, so acting is left to
 its own reviewed change.
 
+Detection stays cause-agnostic, but the report is not silent about a cause the daemon already knows.
+When the review watcher deferred a round for want of a global slot it records the hold (STUDIO-950),
+and the sweep names it — the holder count and which budget — instead of the unenriched "nothing has
+reported it blocked", exactly as it names auto-merge's decline reason (STUDIO-923). It annotates and
+never suppresses: the pull request is still reported. The hold's annotation reaches the surfaces, not
+just the log — the `/api/v1/state` row carries the holder count and the budget key under
+`capacity_held`, the console banner renders them, and the per-project advisory names a capacity hold
+rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
+sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
+watcher's own liveness is re-stamped on every tick and a hold is refreshed whenever the rotating
+cursor next evaluates its pull request. A hold stops being named once the watcher's liveness stamp is
+more than `CAPACITY_HOLD_TTL` old — measured against the sweep's own clock, not the hold's age — and
+one whose pull request has failed enough consecutive lookups is no longer reported as a hold — and
+that denial is reported as an unreadable coordinate, with the attempt count, rather than falling back
+to the false "nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being
+named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall. The
+denial takes the same route to all three surfaces: the state row carries it under
+`capacity_unreadable`, the console banner names it, and the per-project advisory reports that the
+GitHub state could not be read rather than the plain "nothing has reported it blocked", so an
+operator following the advisory's own pointer to `review_divergence` can tell the row it is about
+from an ordinary divergence.
+
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | detection | none (the feature does not exist) | a threshold sweep, 90 min, cause-agnostic |
@@ -1480,6 +1502,49 @@ closes the strictly larger "never looked at all" case, not this one.
 such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
 unchanged, and a second test asserts the key is ABSENT on a daemon with no hold so the conditional
 cannot decay into an unconditional `[]` on a Go-pinned surface.
+
+
+### A separate global budget for review runs — `agent.max_concurrent_reviews` (STUDIO-950)
+
+Go v0.4.0 has one daemon-wide concurrency budget, `max_concurrent_agents`, and this port matched it
+exactly: implementation runs and the ticketless review rounds both drew from the same pool. Live on
+2026-09-20 that produced an inversion — four implementations held all four slots while a review round
+for `makewhatis/strava#31` waited over an hour for a turn — because a review is what CLEARS a pull
+request and thereby frees an implementation slot, so the work that creates capacity was queued behind
+the work that spends it. The per-role concurrency design (D2, "reviews are free") had already
+separated the two at the per-teammate cap; it was never extended to the global one.
+
+Rhapsody adds one optional key, `agent.max_concurrent_reviews`, giving review runs their own global
+pool. It is **opt-in and inert when unset**: with the key absent, reviews keep drawing the shared
+`max_concurrent_agents` budget, so an existing install observes no scheduling change on upgrade. It
+lives in `WORKFLOW.md` and hot-reloads with the rest of the file. When it IS set the two pools are
+separated in BOTH directions — the two `select` ladders and the retry path subtract the running
+ticketless reviews from their global implementation draw, so a review in flight cannot cost an
+implementation a GLOBAL slot, and the review watcher draws only its own pool.
+
+The separation is **global only**, and the two directions see that boundary differently. A project's
+own `max_concurrent` ceiling is a separate budget and still counts a running ticketless review
+against implementations in its project (`running_in_project_group` mirrors Go and is deliberately
+untouched). So the key frees the **review** direction unconditionally — the review watcher draws only
+`max_concurrent_reviews` and consults no per-project cap at all — while it widens the
+**implementation** direction only against the global budget. On a `projects:` install whose project
+cap is or inherits `max_concurrent_agents`, implementations in that project can still be held by the
+project gate even with the key set, so raise that project's `max_concurrent` too if you want the
+implementation direction to benefit there.
+
+Total live agents may therefore exceed `max_concurrent_agents` by up to `max_concurrent_reviews`.
+That is the intended "reviews are free" semantics rather than a leak: the implementation cap still
+bounds implementations, and the review cap bounds reviews.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| global review budget | shared with implementations | `agent.max_concurrent_reviews` — its own pool when set |
+| default | n/a | **unset ⇒ shared with implementations**, byte-identical to before the key |
+| hot reload | n/a | yes, with `WORKFLOW.md` |
+
+A review held for want of a slot is a deliberate wait, not a fault, and the reconciliation sweep
+names it as `held for capacity` rather than reporting it as an unexplained stall (see the STUDIO-898
+entry above).
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)

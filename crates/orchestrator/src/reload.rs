@@ -50,6 +50,22 @@ pub enum ReloadError {
     Effective(#[from] crate::OrchestratorError),
 }
 
+/// The identity of the ACTIVE review budget a reload is switching to (STUDIO-950): the separate
+/// review pool when `agent.max_concurrent_reviews` is set, otherwise the shared
+/// `max_concurrent_agents` pool. Comparing this before and after a reload is what tells whether a
+/// retained capacity hold still describes the pool this daemon schedules reviews from — a hold is a
+/// statement about a pool, not about a duration, so a reload that changes the pool refutes it.
+///
+/// The `bool` distinguishes "separate review pool" from "shared pool" rather than collapsing to a
+/// bare number, because the two differ in composition even at equal capacity: in shared mode every
+/// running run holds the budget, in separate mode only ticketless reviews do.
+fn active_review_budget(eff: &crate::effective::Effective) -> (bool, i64) {
+    match eff.max_concurrent_reviews {
+        Some(reviews) => (true, reviews),
+        None => (false, eff.max_concurrent),
+    }
+}
+
 /// `filepath.Dir` for the workflow path: the parent directory, or `"."` for a bare filename (matching
 /// Go `filepath.Dir`, which never returns an empty string).
 fn workflow_dir(path: &str) -> String {
@@ -154,7 +170,22 @@ impl Orchestrator {
         };
         let inputs = project_warn_inputs(&eff);
         let checker = self.prompt_file_checker_for(&eff);
+        // STUDIO-950: the capacity holds name the budget that deferred each round, and that record
+        // deliberately outlives the tick that wrote it (a pull request the watcher's rotating cursor
+        // did not revisit keeps its hold). So a reload that changes the ACTIVE review budget —
+        // setting, changing or removing `agent.max_concurrent_reviews`, or (while the key is unset)
+        // changing `max_concurrent_agents` — makes every retained hold a statement about a pool this
+        // daemon no longer schedules reviews from. Drop them here, or reconciliation would keep
+        // telling an operator the superseded budget still blocks a review after scheduling has
+        // already moved it to the new pool, until the pull request is revisited or the TTL expires.
+        // A reload that leaves the active review budget alone keeps the holds, which is the whole
+        // point of the per-pull-request refresh.
+        let old_review_budget = self.eff.as_ref().map(active_review_budget);
+        let new_review_budget = active_review_budget(&eff);
         self.eff = Some(eff);
+        if old_review_budget != Some(new_review_budget) {
+            self.review_capacity_held.clear();
+        }
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
         // The project trackers and the same reload's dispatchable-state sets, published TOGETHER
         // under one write (STUDIO-672). Together because the off-loop triage task reads them as a
@@ -252,6 +283,8 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use crate::orchestrator::Orchestrator;
+    use crate::review::review_key;
+    use crate::reviewwatch::CapacityHold;
     use crate::testsupport::{TempDir, capture_events};
 
     // A full WORKFLOW.md (front matter + prompt body) mirroring Go `effective_test.go`'s `claudeWF`.
@@ -393,6 +426,130 @@ Do {{ issue.identifier }}.
         );
     }
 
+    /// STUDIO-950: `agent.max_concurrent_reviews` hot-reloads with the rest of WORKFLOW.md. Setting
+    /// it, changing it, and removing it all take effect on `on_reload` without a restart — the
+    /// knob's whole point is that an operator can tune the review pool live.
+    #[test]
+    fn reload_applies_a_changed_review_budget() {
+        let (path, _dir) = write_workflow(CLAUDE_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            None,
+            "absent on the first load ⇒ the shared budget"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 1\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            Some(1),
+            "the key must hot-reload without a restart"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 3\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            Some(3),
+            "a changed value must take effect"
+        );
+
+        std::fs::write(&path, CLAUDE_WF).unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            None,
+            "removing the key returns to the shared budget"
+        );
+    }
+
+    /// STUDIO-950 (round 11): a capacity hold is a statement about the ACTIVE review budget, so a
+    /// reload that changes that budget must refute every retained hold. The holds deliberately
+    /// outlive the tick that wrote them (the watcher's rotating cursor may not revisit a held pull
+    /// request for several ticks), so without this the reconciliation sweep keeps naming the old
+    /// pool — the API, console, advisory and WARN all telling the operator a budget still blocks a
+    /// review after scheduling has already moved it to a free pool.
+    ///
+    /// Mutation check: drop the `old_review_budget != Some(new_review_budget)` guard and every
+    /// clearing assertion reds while the companion control test stays green.
+    #[test]
+    fn reload_clears_a_capacity_hold_when_the_review_budget_changes() {
+        let hold = || CapacityHold {
+            holders: 4,
+            separate: false,
+            recorded: chrono::Utc::now(),
+        };
+        let id = review_key("makewhatis", "rhapsody", 31, "alice");
+
+        let (path, _dir) = write_workflow(CLAUDE_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+        // A hold recorded against the shared pool ...
+        o.review_capacity_held.insert(id.clone(), hold());
+
+        // ... is refuted by a reload that turns on the separate review pool: reviews now draw
+        // `max_concurrent_reviews`, which has a free slot, so the old shared-pool hold is superseded.
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 1\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_concurrent_reviews,
+            Some(1),
+            "the reload must move reviews to their own pool"
+        );
+        assert!(
+            o.review_capacity_held.is_empty(),
+            "a reload that changes the active review budget must drop the superseded hold"
+        );
+
+        // A reload that changes the separation VALUE also refutes it.
+        o.review_capacity_held.insert(id.clone(), hold());
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  max_concurrent_agents: 4\n",
+                "  max_concurrent_agents: 4\n  max_concurrent_reviews: 3\n",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert!(
+            o.review_capacity_held.is_empty(),
+            "raising the separate review budget supersedes a hold against the old value"
+        );
+
+        // Removing the key returns to the shared pool — also a different active budget.
+        o.review_capacity_held.insert(id.clone(), hold());
+        std::fs::write(&path, CLAUDE_WF).unwrap();
+        o.on_reload();
+        assert!(
+            o.review_capacity_held.is_empty(),
+            "removing the key returns to the shared pool and supersedes a separate-pool hold"
+        );
+    }
+
     // STUDIO-671: a `projects:` config with NO top-level `tracker.project_slug` — the shape
     // `config::validate` deliberately accepts, and the shape the daemon that wedged was running.
     // The account-level client is bound to that empty slug, so it is NOT a substitute for the
@@ -505,6 +662,41 @@ Do {{ issue.identifier }}.
         assert!(
             o.gh_source.is_none(),
             "onReload must rebuild gh_source after disabling github_summons"
+        );
+    }
+
+    /// The control for [`reload_clears_a_capacity_hold_when_the_review_budget_changes`]: a reload
+    /// that does NOT change the active review budget keeps the holds, because a pull request the
+    /// watcher's cursor did not revisit is still legitimately held and its annotation must not blink.
+    ///
+    /// Mutation check: clear unconditionally on every reload and this reds.
+    #[test]
+    fn reload_keeps_a_capacity_hold_when_the_review_budget_is_unchanged() {
+        let (path, _dir) = write_workflow(CLAUDE_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+
+        let id = review_key("makewhatis", "rhapsody", 31, "alice");
+        o.review_capacity_held.insert(
+            id.clone(),
+            CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: chrono::Utc::now(),
+            },
+        );
+
+        std::fs::write(&path, CLAUDE_WF.replace("max_turns: 7", "max_turns: 11")).unwrap();
+        o.on_reload();
+
+        assert_eq!(
+            o.eff.as_ref().unwrap().max_turns,
+            11,
+            "the reload must have applied"
+        );
+        assert!(
+            o.review_capacity_held.contains_key(&id),
+            "a reload that leaves the active review budget alone must keep the hold"
         );
     }
 

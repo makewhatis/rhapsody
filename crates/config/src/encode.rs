@@ -103,6 +103,9 @@ fn raw_from_config(c: &Config) -> Raw {
 
     r.agent.backend = c.agent.backend.clone();
     r.agent.max_concurrent_agents = Some(c.agent.max_concurrent_agents);
+    // STUDIO-950: emit only when set; `prune_empty` drops the `None` so an untouched workflow
+    // round-trips without the key (and stays byte-identical to the pre-key config).
+    r.agent.max_concurrent_reviews = c.agent.max_concurrent_reviews;
     r.agent.max_turns = Some(c.agent.max_turns);
     r.agent.max_retry_backoff_ms = Some(c.agent.max_retry_backoff_ms);
     r.agent.handoff_drain_grace_ms = Some(c.agent.handoff_drain_grace_ms);
@@ -520,6 +523,42 @@ mod tests {
         assert_eq!(c2.opencode.auto_approve, Some(true), "absent ⇒ enabled");
         // Stable under a second trip: Encode/Decode must be a fixed point here.
         assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
+    }
+
+    // ⚠️ A DATA-LOSS class, not a formatting one (STUDIO-950). `agent.max_concurrent_reviews` is
+    // Rhapsody-only and deliberately kept out of `effective_json` (so the Go config goldens stay
+    // byte-identical), which makes the console's typed Save the ONLY path that can carry it back to
+    // disk. That write path starts from the on-disk `Config` and overwrites only what the request
+    // carries, so the key survives a Save only if Encode writes back what Decode read. Without this
+    // test the assignment in `raw_from_config` can vanish and every other test stays green.
+    #[test]
+    fn max_concurrent_reviews_survives_an_encode_decode_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n\
+             agent:\n  max_concurrent_agents: 4\n  max_concurrent_reviews: 2\n",
+            "body",
+        );
+        assert_eq!(c1.agent.max_concurrent_reviews, Some(2));
+        let def = encode(&c1).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_concurrent_reviews"),
+            Some(&Value::from(2i64)),
+            "the key must be emitted so a Settings save does not drop it"
+        );
+        assert_eq!(re_encode_decode(&c1).agent.max_concurrent_reviews, Some(2));
+
+        // An untouched workflow (never wrote the key) materializes nothing — the shared budget.
+        let absent = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n",
+            "body",
+        );
+        let def = encode(&absent).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_concurrent_reviews"),
+            None,
+            "an unset key must not be materialized"
+        );
+        assert_eq!(re_encode_decode(&absent).agent.max_concurrent_reviews, None);
     }
 
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.

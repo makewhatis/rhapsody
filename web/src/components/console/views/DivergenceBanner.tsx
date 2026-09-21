@@ -4,7 +4,7 @@ import { useStateQuery } from "@/hooks/useStateQuery";
 /**
  * The console's view of a pull request whose review loop has stopped moving — either neither
  * progressing nor reported blocked, or stopped with a stated cause and remedy (STUDIO-898,
- * STUDIO-956).
+ * STUDIO-950, STUDIO-956).
  *
  * Six separate defects between 2026-09-12 and 2026-09-14 all presented as an idle board, and each
  * cost hours only because nobody could SEE it — eleven on STUDIO-875, six on STUDIO-893. The daemon
@@ -22,6 +22,14 @@ import { useStateQuery } from "@/hooks/useStateQuery";
  * unless its sweep reported something, so an ordinary console has no banner to suppress. That
  * silence is load-bearing — a permanent warning nobody reads is precisely the failure this exists to
  * prevent.
+ *
+ * A row the review watcher is HOLDING for want of a global slot carries a `capacity_held`
+ * annotation (STUDIO-950). That wait is deliberate and the daemon knows why, so the row says so and
+ * names the budget — the banner never implies a held round is an unexplained stall. A hold the
+ * watcher DENIED because GitHub stopped answering for the coordinate carries `capacity_unreadable`
+ * instead, and the banner names that silence for the same reason. The heading claims only what is
+ * always true of every row ("needs attention"); the original "neither progressing nor reported
+ * blocked" would have been false the moment either annotation was known.
  */
 export function DivergenceBanner() {
   const state = useStateQuery();
@@ -37,6 +45,11 @@ export function DivergenceBanner() {
           <span key={`${d.pr}:${d.reviewer}`} style={{ display: "block" }}>
             {d.pr}
             {d.ticket ? ` (${d.ticket})` : ""} — {d.detail}, {humanStale(d.stale_secs)}.
+            {d.capacity_held
+              ? ` It is held for capacity: ${d.capacity_held.holders} run(s) hold the ${d.capacity_held.budget} budget, so no reviewer run can start yet.`
+              : d.capacity_unreadable
+                ? ` Its GitHub state could not be read for ${d.capacity_unreadable.attempts} consecutive attempt(s), so the daemon cannot confirm it is still progressing.`
+                : ""}
           </span>
         ))}
         Nothing has been changed on your behalf — this is a report.

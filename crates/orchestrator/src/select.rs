@@ -81,7 +81,8 @@ impl Orchestrator {
 
         let mut running = self.running_id_set();
         let mut state_counts = self.running_state_counts();
-        let mut global_remaining = global_slots(eff.max_concurrent, self.running.len() as i64);
+        let mut global_remaining =
+            global_slots(eff.max_concurrent, self.implementation_pool_holders());
         // Boot-recovery guard: never dispatch an issue a pending recovered retry already owns by
         // IDENTIFIER (invisible to the opaque-ID-keyed `claimed`), or the recovered on-retry would
         // later release+delete the live run's claim row.
@@ -349,6 +350,35 @@ impl Orchestrator {
             .count() as i64
     }
 
+    /// How many running entries currently spend the IMPLEMENTATION global pool (STUDIO-950). With
+    /// `agent.max_concurrent_reviews` set, ticketless review runs draw their own pool and must NOT
+    /// occupy an implementation slot: leaving them in this count would admit one fewer
+    /// implementation for every review in flight, contradicting D2 ("reviews are free") at the
+    /// global cap it was never applied to — the inversion this ticket exists to fix. Unset ⇒ every
+    /// running entry, the shared `max_concurrent_agents` budget byte-identical to before the key.
+    ///
+    /// A quorum review is a real tracker ticket on this same ladder and is deliberately NOT
+    /// subtracted: only [`running_ticketless_reviews`](Orchestrator::running_ticketless_reviews)
+    /// (the entries carrying `review` coordinates) belong to the separate pool.
+    ///
+    /// `pub(crate)` because the RETRY ladder
+    /// ([`on_retry`](Orchestrator::on_retry)) is a third implementation draw that dispatches straight
+    /// from itself, bypassing both ladders above — it must ask the same question or a due retry is
+    /// refused a slot `select` would have given it.
+    ///
+    /// This is the GLOBAL draw only. The per-project ceiling
+    /// ([`running_in_project_group`](Orchestrator::running_in_project_group)) is a separate budget
+    /// and still counts ticketless reviews, so on a `projects:` install whose project cap is or
+    /// inherits `max_concurrent_agents` the project gate can bind first — see the README's
+    /// STUDIO-950 entry, which says so.
+    pub(crate) fn implementation_pool_holders(&self) -> i64 {
+        let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
+        match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
+            Some(_) => (total - self.running_ticketless_reviews()).max(0),
+            None => total,
+        }
+    }
+
     /// Sorts tagged candidates by the global dispatch order and greedily admits eligible issues while
     /// (a) a GLOBAL slot remains, (b) the issue's PROJECT cap is free, and (c) the per-STATE cap is
     /// free — accounting for issues admitted earlier in this pass. Per-state accounting is GLOBAL
@@ -406,7 +436,8 @@ impl Orchestrator {
         sort_tagged_stable(&mut tagged);
 
         let mut running = self.running_id_set();
-        let mut global_remaining = global_slots(eff.max_concurrent, self.running.len() as i64);
+        let mut global_remaining =
+            global_slots(eff.max_concurrent, self.implementation_pool_holders());
         let mut per_project: HashMap<String, i64> = HashMap::new(); // group -> remaining slots this pass
         let mut state_counts = self.running_state_counts(); // normState -> running-in-state across ALL projects
         let recovered_claims = self.recovered_claim_identifiers();
@@ -780,6 +811,24 @@ mod tests {
         }
     }
 
+    /// A running TICKETLESS review (STUDIO-950): the `review` coordinates are what mark it as
+    /// drawing the separate review pool, matching production's `pr:` dispatch.
+    fn ticketless_review_run(id: &str) -> RunningEntry {
+        let mut re = running_entry(running_state(id, "In Progress"), "", "");
+        re.review = Some(crate::review::ReviewRun::default());
+        re
+    }
+
+    /// A running QUORUM review (STUDIO-950): a real tracker ticket wearing
+    /// [`crate::quorum::REVIEW_TICKET_LABEL`], which is how that path is identified — it carries no
+    /// `review` coordinates, because it HAS a ticket. It runs on the implementation ladder and is
+    /// deliberately outside the separate review pool.
+    fn quorum_review_run(id: &str) -> RunningEntry {
+        let mut iss = running_state(id, "In Progress");
+        iss.labels = Some(vec![crate::quorum::REVIEW_TICKET_LABEL.to_string()]);
+        running_entry(iss, "", "")
+    }
+
     // --- select_test.go (single-project) ------------------------------------------------------
 
     // Mirrors Go `TestSelectDispatchRespectsGlobalSlots`.
@@ -792,6 +841,149 @@ mod tests {
             issue("3", "A-3", "Todo"),
         ];
         assert_eq!(o.select_dispatch(input).len(), 2, "global slots");
+    }
+
+    /// STUDIO-950: with `agent.max_concurrent_reviews` set, a ticketless review run draws its OWN
+    /// pool and must NOT occupy an implementation slot. `max_concurrent_agents: 1` with one review
+    /// in flight still admits one implementation; the unset control keeps the shared budget, so the
+    /// same review consumes the only slot and nothing dispatches.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw and the first assertion reds.
+    #[test]
+    fn a_ticketless_review_does_not_consume_an_implementation_slot() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+
+        assert_eq!(
+            o.select_dispatch(vec![issue("1", "A-1", "Todo")]).len(),
+            1,
+            "a review on its own pool must not hold the implementation slot"
+        );
+
+        // Control: unset ⇒ the review spends the shared `max_concurrent_agents` budget.
+        let mut unset = orch_for_select(1, HashMap::new(), None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert!(
+            unset
+                .select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .is_empty(),
+            "unset must keep the shared draw"
+        );
+    }
+
+    /// STUDIO-950: the multi-project ladder excludes the ticketless review from the implementation
+    /// draw too — two ladders, two call sites, or the fix is silently absent for whichever one is
+    /// missing it.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw and this reds.
+    #[test]
+    fn a_ticketless_review_does_not_consume_a_multi_project_implementation_slot() {
+        let mut o = orch_for_multi(1, vec![proj("rhapsody", 10, HashMap::new())], None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+
+        let got = o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]));
+        assert_eq!(
+            got.len(),
+            1,
+            "the multi-project ladder must leave reviews out of the implementation draw"
+        );
+
+        let mut unset = orch_for_multi(1, vec![proj("rhapsody", 10, HashMap::new())], None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert!(
+            unset
+                .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .is_empty(),
+            "unset must keep the shared draw"
+        );
+    }
+
+    /// STUDIO-950: the review/implementation separation is GLOBAL only, and this pins that boundary
+    /// so the README entry and `Agent::max_concurrent_reviews`'s doc cannot drift from it. A
+    /// project's own `max_concurrent` ceiling still counts a running ticketless review against
+    /// implementations in its project (`running_in_project_group` mirrors Go and is untouched), so
+    /// on a `projects:` install whose project cap is or inherits `max_concurrent_agents` the project
+    /// gate binds before the global one — even with the key set. The control is the identical
+    /// fixture with nothing running, so the refusal is the review and not the fixture.
+    #[test]
+    fn a_ticketless_review_still_counts_against_its_projects_own_cap() {
+        let mut o = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        let mut re = ticketless_review_run("rev-1");
+        re.project_slug = "rhapsody".to_string();
+        re.project_group = "rhapsody".to_string();
+        o.running.insert("rev-1".to_string(), re);
+
+        assert!(
+            o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .is_empty(),
+            "a ticketless review still spends its project's own cap: the separation is global only"
+        );
+
+        // Control: the IDENTICAL fixture — key still set — with no review in the group admits the
+        // implementation, so the refusal above is the running review and not the key or the fixture.
+        let mut clean = orch_for_multi(10, vec![proj("rhapsody", 1, HashMap::new())], None);
+        clean.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        assert_eq!(
+            clean
+                .select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")]))
+                .len(),
+            1,
+            "the project cap admits once the review is gone"
+        );
+    }
+
+    /// STUDIO-950's OTHER scope boundary, the one the PR body names and nothing pinned: only the
+    /// TICKETLESS review path draws the separate pool. A quorum review is a real tracker ticket on
+    /// this very ladder, so it still spends an implementation slot.
+    ///
+    /// This is not cosmetic. `select`'s greedy pass shares one `global_remaining` between active
+    /// dispatch and the review-reopen branch, and the review-reopen tickets are themselves review
+    /// tickets — so widening the subtraction from `running_ticketless_reviews()` to every
+    /// [`crate::teams::is_review_run`] entry would leave the reopen path drawing against a budget
+    /// nothing puts back, silently unbounding it. The body says so; before this test the whole
+    /// crate stayed green under exactly that substitution.
+    ///
+    /// Mutation check: subtract `self.running.values().filter(|re| teams::is_review_run(re))` in
+    /// `implementation_pool_holders` instead of `running_ticketless_reviews()`, and the first
+    /// assertion reds (`left: 1, right: 0`) while the ticketless control below stays green.
+    #[test]
+    fn a_running_quorum_review_still_counts_against_the_implementation_budget() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-ticket".to_string(), quorum_review_run("rev-ticket"));
+
+        assert!(
+            o.select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .is_empty(),
+            "a quorum review ticket runs on the implementation ladder and still spends its slot: \
+             the separate pool is the ticketless path only"
+        );
+
+        // Control: the IDENTICAL fixture — key still set, one run in flight, one candidate — with a
+        // TICKETLESS review instead admits the implementation. So the refusal above is the KIND of
+        // run, not the key, the cap or the candidate.
+        let mut ticketless = orch_for_select(1, HashMap::new(), None);
+        ticketless.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        ticketless
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        assert_eq!(
+            ticketless
+                .select_dispatch(vec![issue("1", "A-1", "Todo")])
+                .len(),
+            1,
+            "the ticketless review draws its own pool, so the implementation slot is free"
+        );
     }
 
     // Mirrors Go `TestSelectDispatchRespectsPerStateSlots`.
@@ -1392,6 +1584,68 @@ mod tests {
             ev.fields.get("max_concurrent").map(String::as_str),
             Some("1")
         );
+    }
+
+    /// STUDIO-950: the capacity line must report the pool the draw beside it USED. With
+    /// `agent.max_concurrent_reviews` set, a ticketless review spends the review pool, not the
+    /// implementation one — so a daemon exactly at its implementation cap logged
+    /// `max_concurrent=1 running=2`, a line that reads as an overrun where nothing overran. It is
+    /// the very line the ticket quotes as the incident's evidence, and `review_pool_holders`
+    /// already makes this argument on the review side.
+    ///
+    /// The total is not dropped, only moved: `live_runs` carries it, and the two fields are equal
+    /// on every install that never sets the key (the control below).
+    ///
+    /// Mutation check: restore `running = self.running.len()` in `log_capacity_hold` and the first
+    /// assertion reds (`Some("1")` vs `Some("0")`).
+    #[test]
+    fn the_capacity_line_reports_the_implementation_pool_not_every_live_run() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+        ];
+
+        let (_got, events) = capture_events(|| o.select_dispatch(input));
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("running").map(String::as_str),
+            Some("0"),
+            "the line must name the implementation pool the draw used, not the review on its own pool"
+        );
+        assert_eq!(
+            ev.fields.get("live_runs").map(String::as_str),
+            Some("1"),
+            "the total is beside it, not lost"
+        );
+        assert_eq!(
+            ev.fields.get("max_concurrent").map(String::as_str),
+            Some("1")
+        );
+
+        // Control: the key unset — every install that never writes it — keeps the two equal, so the
+        // line is byte-identical to before STUDIO-950 apart from the additive `live_runs`.
+        let mut unset = orch_for_select(1, HashMap::new(), None);
+        unset
+            .running
+            .insert("rev-1".to_string(), ticketless_review_run("rev-1"));
+        let (_g, unset_events) = capture_events(|| {
+            unset.select_dispatch(vec![issue("1", "A-1", "Todo"), issue("2", "A-2", "Todo")])
+        });
+        let ev = unset_events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(ev.fields.get("live_runs").map(String::as_str), Some("1"));
     }
 
     // STUDIO-949 round 7: a deliberate hold is NOT a capacity casualty, and the log must not say it

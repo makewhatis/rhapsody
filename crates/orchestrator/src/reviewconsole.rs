@@ -383,6 +383,14 @@ impl Orchestrator {
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no watched review of that pull request");
         }
+        // The dismissal's coordinate, taken from a MATCHED ROW rather than from the request, so the
+        // records removed below are keyed by the same source the watcher inserted them from. The
+        // operator's own coordinate is unnormalized (`check_coords` only rejects empties) while
+        // `PrCoord`'s derived `Eq` is case-sensitive, so removing `pr` directly would miss a record
+        // the watcher stored under the store row's casing — a dismissal typed `MakeWhatIs` matched
+        // this row case-insensitively but left its unreadability record behind (STUDIO-950 round 16).
+        // `mine` is non-empty by the check above, and every row in it is the same pull request.
+        let dismissed = PrCoord::new(&mine[0].key.owner, &mine[0].key.repo, mine[0].key.number);
         let mut dropped = 0usize;
         for row in mine {
             let id = review_key(
@@ -396,6 +404,11 @@ impl Orchestrator {
             // left standing it would keep `REVIEW_UNASSIGNABLE_WARNING` lit on every project for
             // the rest of the daemon's life, which is a warning that only ever latches.
             self.review_unassignable.remove(&id);
+            // STUDIO-950: same reasoning for the capacity hold, whose job is to annotate the
+            // reconciliation sweep's report of an OWED round. A dismissed pull request owes none,
+            // and the hold survives unreached ticks by design, so it must be dropped here rather
+            // than left to the TTL.
+            self.review_capacity_held.remove(&id);
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
@@ -407,7 +420,29 @@ impl Orchestrator {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
+            // ...and its durable counterpart, so a restart cannot resurrect the spent budget of
+            // a dismissed pull request (STUDIO-956). `churn_key` lowercases, so the operator's own
+            // casing is safe here in a way the coordinate-keyed record below is not.
             self.forget_review_bound(pr);
+            // ...and the unreadability record, keyed by coordinate for `retire_review_pr`'s reason:
+            // left behind it would outlive the pull request it names (STUDIO-950 round 14).
+            //
+            // Sits under `dropped > 0`, unlike the per-row removals above: those run whether or not
+            // the store drop succeeds (a row the operator is not waiting on must not keep
+            // `REVIEW_UNASSIGNABLE_WARNING` latched, or its hold annotated), while this record,
+            // the churn budget and its durable bound are keyed by coordinate rather than by row and
+            // so cannot be retired per row. A dismissal whose every store drop FAILED therefore
+            // leaves the failure count standing, which is still a live fact about a pull request
+            // the daemon continues to poll; once AT LEAST one row is gone the operator has said they are not waiting on it.
+            // In the mixed case — some rows dropped, some failed — the surviving row is still polled
+            // but loses the record, restarting its one-attempt grace period. That can only DELAY a
+            // denial, never invent one (the count climbs again from zero), so it is preferred to
+            // keeping a dismissed pull request's record named forever. It also drops the
+            // `capacity_unreadable` ANNOTATION from the surviving row's report until the count
+            // climbs back to `UNREADABLE_ATTEMPTS_TO_DROP_HOLD`, so that row reads as an ordinary
+            // divergence for one grace period while `gh` still refuses the coordinate — a delay of
+            // the same page, which is why this is the smaller harm, not a harm-free choice.
+            self.review_watch_unreadable.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
@@ -1274,6 +1309,95 @@ mod tests {
             "a dismissed pull request must not leave a stall counter behind"
         );
         assert!(!o.review_rounds_stalled());
+    }
+
+    /// STUDIO-950 (round 11, non-blocking B): a dismissal drops the dismissed round's capacity hold.
+    /// The hold survives unreached ticks by design, so a dismissed pull request would otherwise keep
+    /// naming a capacity wait until the watcher stops sweeping — a WRONG named cause for a pull
+    /// request nobody is waiting on. Pin the removal on the dismissal path.
+    ///
+    /// Mutation check: drop the `review_capacity_held.remove(&id)` in `handle_review_dismiss` and
+    /// this reds.
+    #[test]
+    fn a_dismissal_drops_a_capacity_hold() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let id = review_key("makewhatis", "rhapsody", 12, "bob");
+        o.review_capacity_held.insert(
+            id.clone(),
+            crate::reviewwatch::CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: chrono::Utc::now(),
+            },
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_capacity_held.contains_key(&id),
+            "a dismissed pull request must not keep a capacity hold"
+        );
+    }
+
+    /// STUDIO-950 (round 15, alice's non-blocking 1): a dismissal forgets the dismissed pull
+    /// request's unreadability record, keyed by coordinate for `retire_review_pr`'s reason. Left
+    /// behind it would outlive the pull request it names and sit in the map for the daemon's whole
+    /// life; a re-introduced coordinate could inherit a failure count it never earned and have its
+    /// first fresh hold denied.
+    ///
+    /// Mutation check: drop the `review_watch_unreadable.remove(pr)` in `handle_review_dismiss`
+    /// and this reds.
+    #[test]
+    fn a_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        assert!(
+            o.review_watch_unreadable.contains_key(&pr()),
+            "precondition: a failed lookup is recorded"
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "a dismissed pull request must not keep an unreadability record"
+        );
+    }
+
+    /// STUDIO-950 (round 16, jimmy's finding): the dismissal removes the unreadability record by the
+    /// MATCHED ROW's coordinate, not the operator's. `PrCoord`'s derived `Eq` is case-sensitive and
+    /// `check_coords` never normalizes, while `row_is` matches case-insensitively — so a dismissal
+    /// typed the way GitHub prints the repository used to drop the rows and the churn budget but
+    /// leave the record behind. Mutation check: remove `pr` instead of the matched row's coordinate
+    /// and this reds on the unreadable assertion only.
+    #[test]
+    fn a_case_mismatched_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        o.review_rounds.insert(churn_key(&pr()), 1);
+
+        // The operator's coordinate, typed in different casing from the store row the watcher
+        // keyed the record on.
+        let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
+        assert_eq!(
+            o.handle_review_dismiss(&typed),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_rounds.contains_key(&churn_key(&pr())),
+            "the churn budget goes with the rows"
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "so must the unreadability record, whatever casing the operator typed"
+        );
     }
 
     /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls without

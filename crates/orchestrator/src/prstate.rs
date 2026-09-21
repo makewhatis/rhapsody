@@ -101,8 +101,8 @@ impl std::fmt::Display for PrCoord {
     }
 }
 
-/// One pull request the sweep got an ANSWER for. A lookup that failed is not here — it is counted
-/// in [`PrSweep::failed`], because a caller must not read the absence of an observation as a state.
+/// One pull request the sweep got an ANSWER for. A lookup that failed is not here — it is named in
+/// [`PrSweep::failed`], because a caller must not read the absence of an observation as a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrObservation {
     pub pr: PrCoord,
@@ -124,9 +124,11 @@ pub struct PrSweep {
     pub observed: Vec<PrObservation>,
     /// Pull requests the per-tick budget (or a cancellation) did not reach this tick.
     pub deferred: usize,
-    /// Lookups that could not be made. Warned about here and left for the next tick; a failure is
-    /// never an answer, and in particular never [`PrLookup::Gone`].
-    pub failed: usize,
+    /// The pull requests whose lookup FAILED, in the order asked. A list rather than a count so a
+    /// caller can act on WHICH coordinate GitHub would not answer for: the review watcher must stop
+    /// trusting a capacity hold for a pull request its own lookup can no longer confirm
+    /// (STUDIO-950). A failure is never an answer, and in particular never [`PrLookup::Gone`].
+    pub failed: Vec<PrCoord>,
 }
 
 /// Asks GitHub about up to [`MAX_PR_STATE_CALLS_PER_TICK`] of `prs`, off the control loop.
@@ -166,11 +168,11 @@ pub async fn sweep_pr_states(
                 unchanged_from: Vec::new(),
             }),
             Err(e) => {
-                sweep.failed += 1;
+                sweep.failed.push(pr.clone());
                 tracing::warn!(
                     pr = %pr,
                     error = %e,
-                    "pr-state lookup failed; the pull request stays watched and is re-asked next tick"
+                    "pr-state lookup failed; the pull request stays watched and is re-asked next rotation"
                 );
             }
         }
@@ -290,7 +292,7 @@ mod tests {
         );
         assert_eq!(sweep.observed.len(), 3);
         assert_eq!(sweep.deferred, 0);
-        assert_eq!(sweep.failed, 0);
+        assert!(sweep.failed.is_empty());
         assert_eq!(sweep.observed[1].pr, PrCoord::new("o", "r", 2));
     }
 
@@ -315,7 +317,7 @@ mod tests {
         assert_eq!(sweep.deferred, 5);
     }
 
-    /// A failed lookup is counted, never observed, and never stops the sweep: one unreachable pull
+    /// A failed lookup is NAMED, never observed, and never stops the sweep: one unreachable pull
     /// request must not cost every other watched one its tick. In particular it does not become
     /// `Gone`, which is what would retire it from review permanently.
     #[tokio::test]
@@ -344,7 +346,11 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3, "the sweep runs to the end");
-        assert_eq!(sweep.failed, 1);
+        assert_eq!(
+            sweep.failed,
+            vec![PrCoord::new("o", "r", 2)],
+            "the failure names the coordinate, not just a total"
+        );
         assert_eq!(
             sweep
                 .observed

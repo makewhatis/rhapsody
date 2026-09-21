@@ -617,6 +617,17 @@ impl Orchestrator {
     /// The list is capped at [`HELD_SAMPLE`] names plus a remainder count: a busy board can hold
     /// dozens of candidates and the point of the line is to name the ones at the front of the
     /// queue, not to render the queue.
+    ///
+    /// `running` is the IMPLEMENTATION pool — the count the draw beside it actually used
+    /// ([`Orchestrator::implementation_pool_holders`]) — not every live run (STUDIO-950). With
+    /// `agent.max_concurrent_reviews` set, a daemon exactly at its implementation cap with two
+    /// reviews in flight would otherwise log `max_concurrent=4 running=6`: a line that reads as an
+    /// overrun where nothing overran, and the very line STUDIO-950's ticket quotes as the
+    /// incident's evidence. [`Orchestrator::review_pool_holders`] makes this argument on the review
+    /// side already (`holding=0` while four implementations spend the shared pool is a lie an
+    /// operator tuning the key cannot act on); this is the same correction applied symmetrically.
+    /// The total is not lost — it is beside it as `live_runs`, and the two are equal on every
+    /// install that never sets the key.
     pub(crate) fn log_capacity_hold(&self, held: &[String], max_concurrent: i64) {
         if held.is_empty() {
             return;
@@ -634,7 +645,8 @@ impl Orchestrator {
             not_considered = %sample,
             not_considered_count = held.len(),
             max_concurrent,
-            running = self.running.len(),
+            running = self.implementation_pool_holders(),
+            live_runs = self.running.len(),
             "skipping dispatch: no global concurrency slot; candidates not considered this tick"
         );
     }

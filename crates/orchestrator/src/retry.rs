@@ -1092,7 +1092,12 @@ impl Orchestrator {
         }
 
         let st = normalize_state(&iss.state);
-        let no_global = global_slots(cfg.global_cap, self.running.len() as i64) <= 0;
+        // STUDIO-950: this is the THIRD implementation draw (the two `select` ladders are the
+        // others), and it is easy to miss because a due retry dispatches straight from here,
+        // bypassing the tick. With `agent.max_concurrent_reviews` set, a ticketless review draws its
+        // own pool and must NOT occupy an implementation slot here either, or a continuation mid-work
+        // is requeued (and escalates to `failure_backoff_ms`) for a slot that is in fact free.
+        let no_global = global_slots(cfg.global_cap, self.implementation_pool_holders()) <= 0;
         let no_project = cfg
             .rp_group
             .as_ref()
@@ -2675,6 +2680,197 @@ mod tests {
         assert_eq!(
             re.project_slug, "a",
             "requeued retry should keep project slug a"
+        );
+    }
+
+    /// A running TICKETLESS review: `review` coordinates are what mark it as drawing the separate
+    /// review pool once `agent.max_concurrent_reviews` is set. Mirrors `select.rs`'s helper.
+    fn ticketless_review_run(id: &str) -> RunningEntry {
+        let mut re = running_entry(issue(id, id, "In Progress"), "", "");
+        re.review = Some(crate::review::ReviewRun::default());
+        re
+    }
+
+    /// STUDIO-950: `on_retry` is the THIRD implementation draw — a due retry dispatches straight from
+    /// here, bypassing both `select` ladders — so with `agent.max_concurrent_reviews` set a
+    /// ticketless review on its own pool must not refuse it an implementation slot. Unset keeps the
+    /// shared draw, byte-identical to before the key.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw at `on_retry` and the keyed
+    /// assertion reds (nothing dispatched, requeued with "no available orchestrator slots").
+    #[tokio::test]
+    async fn a_ticketless_review_does_not_consume_an_implementation_slot_on_retry() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 1);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("a1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "a1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "a review on its own pool must not hold the implementation slot on the retry path"
+        );
+
+        // Control: unset ⇒ the review spends the shared `max_concurrent_agents` budget and requeues.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let pb = proj_with_tracker("b", Arc::clone(&tr_b), "pb");
+        let (mut unset, dispatched_unset) = orch_for_retry_multi(vec![pb], 1);
+        unset
+            .running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("b1", "B-1", 1);
+        re.project_slug = "b".into();
+        unset.retry_attempts.insert("b1".into(), re);
+
+        unset
+            .on_retry(EvRetry {
+                issue_id: "b1".into(),
+            })
+            .await;
+
+        assert!(
+            dispatched_unset.lock().expect("lock").is_empty(),
+            "unset must keep the shared draw"
+        );
+        assert_eq!(
+            unset.retry_attempts.get("b1").expect("requeued").err,
+            "no available orchestrator slots"
+        );
+    }
+
+    /// STUDIO-950: the review/implementation separation is GLOBAL only, pinned here for the RETRY
+    /// ladder — `on_retry`'s `no_project` is the second site `running_in_project_group` gates. A
+    /// ticketless review still spends its project's own `max_concurrent` ceiling even with the key
+    /// set, so at the project cap the retry is requeued; the control (same fixture, no review in the
+    /// group) dispatches. See the README's STUDIO-950 entry, which states the boundary.
+    #[tokio::test]
+    async fn a_ticketless_review_still_counts_against_its_projects_own_cap_on_retry() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let mut pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        pa.max_concurrent = 1; // the project cap, not the global one, is the binding constraint
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 10);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        let mut rev = ticketless_review_run("rev-1");
+        rev.project_slug = "a".into();
+        rev.project_group = "a".into();
+        o.running.insert("rev-1".into(), rev);
+        o.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("a1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "a1".into(),
+        })
+        .await;
+
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "a review still spends its project's own cap on the retry path: global only"
+        );
+        assert_eq!(
+            o.retry_attempts.get("a1").expect("requeued").err,
+            "no available orchestrator slots"
+        );
+
+        // Control: the identical fixture with no review in the group dispatches.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let mut pb = proj_with_tracker("a", Arc::clone(&tr_b), "pb");
+        pb.max_concurrent = 1;
+        let (mut clean, dispatched_clean) = orch_for_retry_multi(vec![pb], 10);
+        clean.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        clean.claimed.insert("a1".into());
+        let mut re = retry_entry("a1", "A-1", 1);
+        re.project_slug = "a".into();
+        clean.retry_attempts.insert("a1".into(), re);
+
+        clean
+            .on_retry(EvRetry {
+                issue_id: "a1".into(),
+            })
+            .await;
+
+        assert_eq!(
+            dispatched_clean.lock().expect("lock").len(),
+            1,
+            "the project cap admits once the review is gone"
+        );
+    }
+
+    /// STUDIO-950: the RECOVERED requeue arm shares the same `no_global` draw, so it needs its own
+    /// pin — a boot-recovered implementation must dispatch once the key gives a ticketless review its
+    /// own pool, and still requeue on the shared budget when the key is unset.
+    ///
+    /// Mutation check: restore the shared `self.running.len()` draw at `on_retry` and the keyed
+    /// assertion reds (the recovered entry is requeued instead of dispatched).
+    #[tokio::test]
+    async fn a_recovered_retry_is_not_held_by_a_ticketless_review_on_its_own_pool() {
+        let mut fa = Fake::new();
+        fa.candidates = vec![issue("a1", "A-1", "Todo")];
+        let tr_a = Arc::new(fa);
+        let pa = proj_with_tracker("a", Arc::clone(&tr_a), "pa");
+        let (mut o, dispatched) = orch_for_retry_multi(vec![pa], 1);
+        o.eff.as_mut().expect("eff").max_concurrent_reviews = Some(1);
+        o.running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        // Recovered entries are keyed by identifier: the opaque id is unknown at restart.
+        let mut re = retry_entry("", "A-1", 1);
+        re.recovered = true;
+        re.project_slug = "a".into();
+        o.retry_attempts.insert("A-1".into(), re);
+
+        o.on_retry(EvRetry {
+            issue_id: "A-1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "the recovered arm must draw the implementation pool, not the raw run count"
+        );
+
+        // Control: unset ⇒ the recovered entry requeues on the shared draw.
+        let mut fb = Fake::new();
+        fb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let tr_b = Arc::new(fb);
+        let pb = proj_with_tracker("b", Arc::clone(&tr_b), "pb");
+        let (mut unset, dispatched_unset) = orch_for_retry_multi(vec![pb], 1);
+        unset
+            .running
+            .insert("rev-1".into(), ticketless_review_run("rev-1"));
+        let mut re = retry_entry("", "B-1", 1);
+        re.recovered = true;
+        re.project_slug = "b".into();
+        unset.retry_attempts.insert("B-1".into(), re);
+
+        unset
+            .on_retry(EvRetry {
+                issue_id: "B-1".into(),
+            })
+            .await;
+
+        assert!(
+            dispatched_unset.lock().expect("lock").is_empty(),
+            "unset must keep the shared draw"
         );
     }
 

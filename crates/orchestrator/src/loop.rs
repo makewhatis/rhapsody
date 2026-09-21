@@ -358,6 +358,14 @@ pub enum Event {
         slots: Option<i64>,
         reply: oneshot::Sender<(crate::reviewwatch::ReviewSweepReport, i64)>,
     },
+    /// The coordinates whose `gh` lookup FAILED on one watcher tick (STUDIO-950 round 14; NEW beyond
+    /// Go v0.4.0), so the control task stops trusting a capacity hold for a pull request it can no
+    /// longer read. A tick-level fact reported separately from [`Event::ReviewSweep`] because a
+    /// failed coordinate yields no observation, and a tick on which every lookup failed hands back
+    /// no observation at all. Fire-and-forget: nothing on the watcher's task depends on the write.
+    ReviewUnreadable {
+        failed: Vec<crate::prstate::PrCoord>,
+    },
     /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
     /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
     /// never reads the store the control task is the single writer of.
@@ -691,6 +699,9 @@ impl Orchestrator {
                 reply,
             } => {
                 let _ = reply.send(self.handle_review_sweep_slots(&observed, slots));
+            }
+            Event::ReviewUnreadable { failed } => {
+                self.handle_review_unreadable(&failed);
             }
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
