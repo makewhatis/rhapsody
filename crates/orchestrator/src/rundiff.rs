@@ -556,7 +556,7 @@ mod tests {
             prs,
             Arc::new(FakeState(
                 PrLookup::Found(crate::ghsummons::PrSnapshot {
-                    is_draft: false,
+                    is_draft: Some(false),
                     head_sha: HEAD.to_string(),
                     status: crate::ghsummons::PrStatus::Open,
                     merged_at: None,
@@ -784,7 +784,7 @@ mod tests {
                 open_prs(Some(URL)),
                 Arc::new(FakeState(
                     PrLookup::Found(crate::ghsummons::PrSnapshot {
-                        is_draft: false,
+                        is_draft: Some(false),
                         head_sha: HEAD.to_string(),
                         status: crate::ghsummons::PrStatus::Open,
                         merged_at: None,
