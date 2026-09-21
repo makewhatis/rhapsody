@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunCostBucket, RunProvenance,
-    RunSummary,
+    DayProviderRollup, DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunCostBucket,
+    RunProvenance, RunSummary,
 };
 use serde_json::{Value, json};
 
@@ -173,6 +173,42 @@ pub(crate) fn day_rollup_json(d: &DayRollup) -> Value {
         "completed": d.completed,
         "failed": d.failed,
         "total_tokens": d.total_tokens,
+    })
+}
+
+/// One provider's slice of one day (`store.DayProviderRollup` serialized).
+pub(crate) fn day_provider_rollup_json(d: &DayProviderRollup) -> Value {
+    json!({
+        "provider": d.provider,
+        "runs": d.runs,
+        "completed": d.completed,
+        "failed": d.failed,
+        "total_tokens": d.total_tokens,
+    })
+}
+
+/// `{days:[{date, providers:[…]}]}` — the `GET /api/v1/metrics/providers` payload (STUDIO-957). The
+/// per-day rollup decomposed by provider, grouped into one entry per date so a client reads a day as
+/// a day rather than re-folding a flat (date, provider) list. Rhapsody-only and ADDITIVE: the
+/// default `/api/v1/metrics` body is byte-pinned to the Go capture and cannot carry a provider
+/// dimension, so this is a route of its own (the `/api/v1/version` precedent).
+pub(crate) fn metrics_by_provider_response(days: &[DayProviderRollup]) -> Value {
+    let mut by_day: BTreeMap<&str, Vec<&DayProviderRollup>> = BTreeMap::new();
+    for d in days {
+        by_day.entry(d.date.as_str()).or_default().push(d);
+    }
+    json!({
+        "days": Value::Array(
+            by_day
+                .into_iter()
+                .map(|(date, providers)| json!({
+                    "date": date,
+                    "providers": Value::Array(
+                        providers.iter().map(|p| day_provider_rollup_json(p)).collect(),
+                    ),
+                }))
+                .collect(),
+        ),
     })
 }
 

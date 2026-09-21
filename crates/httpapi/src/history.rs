@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens, ReviewWatchRow,
-    RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
+    DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
+    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -51,6 +51,13 @@ pub trait HistoryStore: Send + Sync {
     /// Per-day run/success/token rollups over the last N days (`GET /api/v1/metrics`). Mirrors Go
     /// `Metrics`.
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+    /// Per-day run/token rollups decomposed by provider (`GET /api/v1/metrics/providers`,
+    /// STUDIO-957). Rhapsody-only; Go has no provider dimension.
+    fn metrics_by_provider(
+        &self,
+        since_days: i64,
+        project: &str,
+    ) -> Result<Vec<DayProviderRollup>, StoreError>;
     /// A run's operator messages with their delivery status, oldest first
     /// (`GET /api/v1/runs/{id}/messages`, INF-250). Mirrors Go `ListRunMessages`.
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
@@ -117,6 +124,13 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
         rhapsody_store::Store::metrics(self, since_days, project)
+    }
+    fn metrics_by_provider(
+        &self,
+        since_days: i64,
+        project: &str,
+    ) -> Result<Vec<DayProviderRollup>, StoreError> {
+        rhapsody_store::Store::metrics_by_provider(self, since_days, project)
     }
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
         rhapsody_store::Store::list_run_messages(self, run_id)

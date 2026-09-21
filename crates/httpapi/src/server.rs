@@ -32,7 +32,8 @@ use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_costs, handle_history_summary,
     handle_issue_counts, handle_issue_history, handle_issue_runs, handle_metrics,
-    handle_run_detail, handle_run_events, handle_run_provenance, handle_run_transcript,
+    handle_metrics_by_provider, handle_run_detail, handle_run_events, handle_run_provenance,
+    handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -603,6 +604,11 @@ where
         .route("/api/v1/history/costs", any(handle_history_costs))
         .route("/api/v1/events", any(handle_event_search))
         .route("/api/v1/metrics", any(handle_metrics))
+        // The same daily rollup split by provider (STUDIO-957). A route of its own rather than a
+        // field on `/metrics`: that body is byte-pinned to the Go capture and cannot gain the
+        // dimension. The metric that mattered in the incident — 361M of Claude, the only figure
+        // drawing on the constrained account — is otherwise only answerable by a hand-written join.
+        .route("/api/v1/metrics/providers", any(handle_metrics_by_provider))
         .route("/api/v1/runs/{id}/events", any(handle_run_events))
         .route("/api/v1/runs/{id}/transcript", any(handle_run_transcript))
         // What the run actually ran on (STUDIO-909). Rhapsody-only, and a route of its own rather
