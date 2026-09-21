@@ -1,8 +1,8 @@
 import type { RunDetail, RunProvenance, RunSummary, TicketCostRow } from "@/lib/api";
+import { ticketCostsByIssue } from "@/lib/console-jobs";
 import { formatTokens, runDuration } from "@/lib/format";
 import { fenceSpans, inlineText } from "@/lib/markdown";
 import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
-import { ticketCostsByIssue } from "@/lib/console-jobs";
 
 // console-trace-view — the derivations the "Trace" run detail needs on top of the slice-1 trace
 // model (design record `~/.rhapsody/docs/console-run-detail-design.md` §3; slice 2 of its §9 plan).
