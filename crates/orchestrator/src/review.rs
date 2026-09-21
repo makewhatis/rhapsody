@@ -880,10 +880,12 @@ mod tests {
     /// STUDIO-959: dispatch reads the reviewer's PRIOR commit off the existing row BEFORE it writes
     /// this head as requested.
     ///
-    /// Mutation: reading `requested_sha` (which the dispatch itself is about to overwrite) or
-    /// reading AFTER the writes would name this head as its own prior commit and red the delta
-    /// assertions here. And a reviewer with no row at all must carry nothing — a first round is
-    /// full, so the worker must not be handed a delta request it cannot honour.
+    /// Mutation: reading AFTER the writes would name this head as its own prior commit and red the
+    /// delta assertions here. Reading `requested_sha` rather than `last_reviewed_sha` is invisible
+    /// to this test — its two seeded SHA columns are equal, so either read returns the same answer —
+    /// which is why [`a_truncated_round_carries_no_prior_commit_so_the_next_head_is_full`] pins the
+    /// column. And a reviewer with no row at all must carry nothing — a first round is full, so the
+    /// worker must not be handed a delta request it cannot honour.
     #[test]
     fn dispatch_carries_the_reviewers_prior_commit_into_the_run() {
         let (mut o, dispatched) = orch_with_review(true);
