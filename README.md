@@ -1585,12 +1585,18 @@ run IS the runaway and the tokens already spent are the argument FOR stopping. T
 workspace are left intact, so work already committed survives; the run records its own outcome
 (`token_ceiling`, distinct from `failed`, `interrupted` and `stopped`) with the ceiling and the spend,
 and the ticket is held rather than immediately re-dispatched (a fresh run would re-burn the ceiling
-with nothing to show). The reconciliation sweep reports the held ticket as
-`author_token_ceiling_stopped`, so the stop is never an unexplained stall.
+with nothing to show). The reconciliation sweep reports a held ticket whose pull request it watches as
+`author_token_ceiling_stopped`, so a stop on a ticket already in review is never an unexplained stall.
+A ticket with no watched pull request yet is outside the sweep's scope — it is surfaced by its own
+`blocked` console row and the stop's WARN line, not by the sweep.
 
 Ticketless review runs are subject to the same ceiling: a review is a run too, and the review half is
 where much of the spend lives. A review stopped this way parks its watch row `truncated`, the same
-disposition a `max_turns` backstop gives a round that delivered no verdict.
+disposition a `max_turns` backstop gives a round that delivered no verdict, AND holds its `pr:` key
+for the rest of the session, so the watcher cannot re-offer the same head and re-burn a whole ceiling
+on a read that just failed to fit. The sweep names that held row as `review_token_ceiling_stopped`
+instead of the false "no reviewer run has started"; raising the ceiling and restarting re-offers the
+head.
 
 | | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |

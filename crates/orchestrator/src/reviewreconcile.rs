@@ -179,6 +179,16 @@ pub enum DivergenceKind {
     /// applied, so the sweep can and must name it. Reported at the ordinary staleness threshold
     /// because a later run may still resume the ticket.
     AuthorTokenCeilingStopped,
+    /// A ticketless REVIEW round stopped at its per-run token ceiling (STUDIO-967): the run was
+    /// killed mid-turn, so it delivered no verdict and the head is still owed a review.
+    ///
+    /// Its own kind rather than borrowing [`DivergenceKind::ReviewRequestedNoRun`], whose sentence
+    /// ("no reviewer run has started") is false here — a run started, and this daemon stopped it.
+    /// The `truncated` row alone would report the generic wording, and the run's `token_ceiling`
+    /// outcome is the fact that names the cause. The review half is where much of the spend lives
+    /// (the incident that motivated this bound was all reviews), so a resume that left it silent
+    /// would close the author's hole and leave the review's open.
+    ReviewTokenCeilingStopped,
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
@@ -234,6 +244,7 @@ impl DivergenceKind {
             DivergenceKind::ChangesRequestedNoRun => "changes_requested_no_run",
             DivergenceKind::ReviewRequestedNoRun => "review_requested_no_run",
             DivergenceKind::AuthorTokenCeilingStopped => "author_token_ceiling_stopped",
+            DivergenceKind::ReviewTokenCeilingStopped => "review_token_ceiling_stopped",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
             DivergenceKind::ReviewEscalated => "review_escalated",
@@ -254,6 +265,10 @@ impl DivergenceKind {
             DivergenceKind::AuthorTokenCeilingStopped => {
                 "the author's newest run stopped at its per-run token ceiling, so it made no \
                  progress and the ticket is still owed a run"
+            }
+            DivergenceKind::ReviewTokenCeilingStopped => {
+                "the review round was stopped at its per-run token ceiling before it delivered a \
+                 verdict, so the head is still owed a review"
             }
             DivergenceKind::ApprovedStillOpen => {
                 "every required reviewer approved and the pull request is still open"
@@ -574,6 +589,14 @@ fn row_owed(row: &RowFacts) -> Option<(DivergenceKind, DateTime<Utc>)> {
             let attempt = row.reviewer_run.as_ref()?;
             if attempt.in_flight() {
                 return None; // the retry is running
+            }
+            // STUDIO-967: a round stopped at its per-run token ceiling ended WITHOUT reading the
+            // head, and the daemon knows it did. The plain `ReviewRequestedNoRun` sentence ("no
+            // reviewer run has started") is false about it — one did start, and this daemon killed
+            // it — so name the ceiling. A genuine retry moves the status off `truncated`, which is
+            // why a row still here is still owed.
+            if attempt.outcome == rhapsody_store::OUTCOME_TOKEN_CEILING {
+                return Some((DivergenceKind::ReviewTokenCeilingStopped, attempt.last_at()));
             }
             Some((DivergenceKind::ReviewRequestedNoRun, attempt.last_at()))
         }
@@ -1206,6 +1229,29 @@ impl Orchestrator {
                     );
                     continue;
                 }
+                // STUDIO-967's review half: a ticketless REVIEW round was stopped at the same
+                // ceiling, so it read nothing and the head is owed a review. Same shape as the
+                // author arm — name the bound instead of the false "no reviewer run has started" —
+                // but the remedy differs: the stopped round's `pr:`
+                // key is held for the rest of this session (a re-offer would re-burn a whole
+                // ceiling on the same read), so the head is only re-offered after a restart.
+                if d.kind == DivergenceKind::ReviewTokenCeilingStopped {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        reviewer = %d.reviewer,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. The round was stopped by \
+                         `agent.max_run_tokens`; raise the ceiling, then restart the daemon to \
+                         re-offer this head (the stopped round's key stays held this session so it \
+                         cannot re-burn the ceiling). This sweep only reports, so it needs a human.",
+                        d.pr,
+                        d.kind.detail()
+                    );
+                    continue;
+                }
                 // STUDIO-923: when auto-merge has already said something about this exact pull
                 // request, name it instead of claiming nothing has. The sentence states no count:
                 // auto-merge's own attempts run on the review watcher's separate, configurable
@@ -1522,6 +1568,52 @@ mod tests {
         );
         let d = verdict(&facts, "2026-09-21T12:00:00Z").expect("reported");
         assert_eq!(d.kind, DivergenceKind::ChangesRequestedNoRun);
+    }
+
+    /// STUDIO-967's review half — alice's finding on PR #208. A ticketless REVIEW round stopped at
+    /// its per-run token ceiling parks its row `truncated`, which the plain rule reports as
+    /// `review_requested_no_run` ("no reviewer run has started"). That is false: a run started, and
+    /// this daemon killed it. The sweep must name the ceiling instead.
+    #[test]
+    fn reports_studio_967_review_round_stopped_at_its_token_ceiling() {
+        let facts = pr(
+            vec![row(
+                "alice",
+                REVIEW_STATUS_TRUNCATED,
+                "STUDIO-967",
+                // The round ran and was stopped at the ceiling; no ticket run is involved.
+                ran_at_ceiling("2026-09-21T09:00:00Z", "2026-09-21T09:25:00Z"),
+                None,
+            )],
+            false,
+        );
+        let d = verdict(&facts, "2026-09-21T12:00:00Z").expect("reported");
+        assert_eq!(d.kind, DivergenceKind::ReviewTokenCeilingStopped);
+        assert_eq!(d.reviewer, "alice");
+        assert!(
+            d.kind.detail().contains("token ceiling"),
+            "the operator must read the cause, got {:?}",
+            d.kind.detail()
+        );
+    }
+
+    /// The sibling guard: a `truncated` round whose attempt merely COMPLETED (the `max_turns`
+    /// backstop) must still report the ordinary `review_requested_no_run`. Without this, the check
+    /// above could decay into "report every truncated row as a ceiling stop".
+    #[test]
+    fn a_plain_truncated_round_is_not_reported_as_a_ceiling_stop() {
+        let facts = pr(
+            vec![row(
+                "alice",
+                REVIEW_STATUS_TRUNCATED,
+                "STUDIO-967",
+                ran("2026-09-21T09:00:00Z", "2026-09-21T09:25:00Z"),
+                None,
+            )],
+            false,
+        );
+        let d = verdict(&facts, "2026-09-21T12:00:00Z").expect("reported");
+        assert_eq!(d.kind, DivergenceKind::ReviewRequestedNoRun);
     }
 
     /// STUDIO-882 — 875's attachment WAS written, but resolved `sourceType: "api"`, so `is_github_pr`
@@ -2155,6 +2247,33 @@ mod store_tests {
         o.store()
             .mark_review_completed(&key, HEAD, REVIEW_STATUS_REVIEWED)
             .expect("completed");
+    }
+
+    /// Seeds one watch row parked `truncated` at `HEAD`: a round that ran and delivered no verdict
+    /// (the `max_turns` backstop, or a STUDIO-967 ceiling stop). Its `reviewer_run` is what tells
+    /// the two apart.
+    fn truncated_row(o: &Orchestrator, reviewer: &str, ticket: &str) {
+        let key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 164,
+            reviewer: reviewer.to_string(),
+        };
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "jimmy".to_string(),
+                introduced_by: format!("handoff:{ticket}"),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: String::new(),
+                open: true,
+            })
+            .expect("seed the row");
+        o.store()
+            .mark_review_requested(&key, HEAD)
+            .expect("requested");
+        o.store().mark_review_truncated(&key).expect("truncated");
     }
 
     /// Seeds one watch row that has been APPROVED at `HEAD` — divergence (b)'s shape, the one
@@ -3063,6 +3182,9 @@ mod store_tests {
             "rhapsody",
             "rhapsody",
         );
+        // Arm the signal, as every real dispatch does: the ceiling refuses to record a stop it
+        // cannot deliver (STUDIO-840), so an unarmed fixture would not stop at all.
+        re.cancel = crate::CancelSignal::new();
         re.started_at = t("2026-09-21T21:05:00Z");
         o.persist_start_run(&mut re, 0);
         o.running.insert("ID-967".into(), re);
@@ -3088,6 +3210,70 @@ mod store_tests {
         let found = o.review_divergences();
         assert_eq!(found.len(), 1, "one divergence, got {found:?}");
         assert_eq!(found[0].kind, DivergenceKind::AuthorTokenCeilingStopped);
+    }
+
+    /// STUDIO-967's REVIEW half, through the real store — alice's finding on PR #208. A ticketless
+    /// review stopped at the ceiling parks its row `truncated` and its run carries
+    /// `token_ceiling`; the sweep must name the ceiling on BOTH surfaces, not the
+    /// false `review_requested_no_run` ("no reviewer run has started"). MUTATION: drop the
+    /// `ReviewTokenCeilingStopped` arm from `row_owed` and the row reports
+    /// `ReviewRequestedNoRun` — with the generic "nothing has reported it blocked" copy — so this
+    /// reds on both the kind and the log line.
+    #[test]
+    fn a_ceiling_stopped_review_round_is_reported_on_both_surfaces() {
+        let o = &mut orch(false, "2026-09-21T23:30:00Z");
+        truncated_row(o, "alice", "STUDIO-967");
+        // The reviewer's own run: it ran head-first into the ceiling and was killed mid-turn.
+        // Verdict ended 21:00, now 23:30 — well past the 90-minute threshold.
+        run_outcome(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-21T20:00:00Z",
+            "2026-09-21T21:00:00Z",
+            rhapsody_store::OUTCOME_TOKEN_CEILING,
+        );
+
+        // Warm-up so the first WARN is captured deterministically (see the sibling tests).
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("token ceiling"),
+            "the line must name the ceiling, got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the copy that was false about a ceiling stop must not be reused: {}",
+            warn.message
+        );
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::ReviewTokenCeilingStopped);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].reviewer, "alice");
+
+        // Surface one: the per-project advisory.
+        let projects = o.project_statuses();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the advisory must reach /api/v1/projects, got {projects:?}"
+        );
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["kind"],
+            "review_token_ceiling_stopped"
+        );
     }
 
     /// **Acceptance.** An ESCALATE decision is reported by the sweep as an ESCALATION carrying the
