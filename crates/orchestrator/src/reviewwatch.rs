@@ -2146,9 +2146,16 @@ impl Orchestrator {
             }
             return;
         }
+        // DEFENCE IN DEPTH, not a live guard: `service_review_pr` — the one caller — returns on
+        // this same condition before it reaches here, so no tick can arrive with an empty head.
+        // Kept because every line below treats `head` as a real head SHA, and the cost of the
+        // check is one comparison per conflicted poll.
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
+        // This one IS load-bearing, even though the caller's adjudication block also tests it: the
+        // route-back reads `mine[0]` for the author and the origin below, so an empty slice would
+        // PANIC the control task rather than skip a tick.
         if mine.is_empty() {
             return;
         }
@@ -4079,6 +4086,20 @@ mod tests {
                 .iter()
                 .all(|c| c.reason == crate::reviewnotify::CompletionReason::Conflict),
             "both completions are conflict route-backs, not verdicts"
+        );
+        // ⚠️ `approved` is load-bearing TWICE at the consumer, and neither site is reached from
+        // here: `reviewnotify::route_back` REFUSES the tracker move outright when it is set
+        // (`reviewnotify.rs`, the approved-arm refusal), and the token-consistency check logs
+        // `error!` on every completion whose summons disagrees with it — a conflict comment
+        // deliberately carries the token, so an `approved: true` conflict would log an error on
+        // every route-back AND never move the ticket. Asserted on the completion the PRODUCER
+        // built, because that is the value the consumer reads.
+        //
+        // MUTATION: flip `approved` to `true` in `propose_conflict_route_back` and this reds.
+        assert!(
+            routed.iter().all(|c| !c.approved),
+            "a conflict route-back is not an approval: `approved` gates the move and the token \
+             consistency check at the consumer"
         );
         assert_eq!(routed[0].head_sha, HEAD_A);
         assert_eq!(routed[1].head_sha, HEAD_B);

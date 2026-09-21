@@ -3412,6 +3412,67 @@ mod store_tests {
         );
     }
 
+    /// ⚠️ STUDIO-961: the suppression is scoped to [`DivergenceKind::ApprovedStillOpen`], and the
+    /// scoping is the point — not an implementation detail of where the branch happens to sit.
+    ///
+    /// [`DivergenceKind::ChangesRequestedNoRun`] is the sibling kind, and it is PRECISELY the signal
+    /// that a route-back's tracker move landed but the author's run never reopened: findings (or a
+    /// conflict) on the record, and no authoring run since. Silencing it on the same record would
+    /// hide the one failure mode the route-back itself can produce — the summons that never took —
+    /// and it would be hidden for the whole life of the record rather than for the freshness window,
+    /// because this kind's own staleness clock keeps running.
+    ///
+    /// `a_conflict_route_back_in_flight_is_not_reported_as_needing_a_human` is the live control: the
+    /// SAME fresh record, on an approved-and-open pull request, is silent.
+    ///
+    /// Mutation check: lift the `conflict_routed` branch out of the `d.kind ==
+    /// DivergenceKind::ApprovedStillOpen` block in `reconcile_review_divergence` and this test reds
+    /// (the divergence disappears), while the control above stays green.
+    #[test]
+    fn a_conflict_route_back_does_not_silence_a_changes_requested_divergence() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        // The authoring run ended BEFORE the review, so nothing has answered the findings.
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        // A conflict route-back fired for this very pull request, moments ago — as fresh as the
+        // control's.
+        o.conflict_routed.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::reviewwatch::ConflictRoute {
+                head: HEAD.to_string(),
+                routed_at: t("2026-09-14T21:20:00Z"),
+            },
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "a route-back that moved the ticket but never reopened the author's run is exactly \
+             what this kind reports; it must not be suppressed: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ChangesRequestedNoRun);
+        assert!(
+            o.project_statuses()
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "and the advisory must still light"
+        );
+    }
+
     /// STUDIO-950 (round 20, alice's blocking finding; jimmy's round-20 BLOCKING 1): the unreadable
     /// annotation is not a capacity HOLD, so its suppression of the false page cannot be justified
     /// by the approved-and-open arm's `capacity_held: None`. During a `gh` outage the auto-merge
