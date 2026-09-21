@@ -542,6 +542,43 @@ mod tests {
         assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
     }
 
+    // STUDIO-974 review (jimmy): the console's Save path (`httpapi::config_view::apply_typed_config`)
+    // starts from the on-disk `Config` and writes `encode`, so a non-default
+    // `polling.pr_state_interval_ms` must survive the round trip — otherwise saving an unrelated
+    // setting silently resets the operator's watcher cadence to the default. Encode emits the key
+    // only when non-default, so an unset knob stays absent from the front matter.
+    #[test]
+    fn a_pr_state_interval_survives_an_encode_decode_round_trip() {
+        let explicit = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n\
+             polling:\n  interval_ms: 1234\n  pr_state_interval_ms: 45000\n",
+            "body",
+        );
+        assert_eq!(explicit.polling.pr_state_interval_ms, 45_000);
+        let def = encode(&explicit).expect("encode");
+        assert_eq!(
+            nested(&def.config, "polling", "pr_state_interval_ms"),
+            Some(&Value::Number(45_000.into())),
+            "encode must emit a non-default cadence so a console Save keeps it"
+        );
+        assert_eq!(
+            re_encode_decode(&explicit).polling.pr_state_interval_ms,
+            45_000,
+            "and the value must survive the full round trip"
+        );
+
+        let default = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n",
+            "body",
+        );
+        let def = encode(&default).expect("encode");
+        assert_eq!(
+            nested(&def.config, "polling", "pr_state_interval_ms"),
+            None,
+            "an unset cadence must not be materialized into the front matter"
+        );
+    }
+
     // ⚠️ A DATA-LOSS class, not a formatting one (STUDIO-950). `agent.max_concurrent_reviews` is
     // Rhapsody-only and deliberately kept out of `effective_json` (so the Go config goldens stay
     // byte-identical), which makes the console's typed Save the ONLY path that can carry it back to

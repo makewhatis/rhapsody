@@ -547,10 +547,10 @@ pub struct ReviewWatchDeps {
     pub diff_source: Option<Arc<dyn ReviewDiffSource>>,
     /// How often to sweep, in milliseconds, read fresh each tick (STUDIO-974). A shared atomic
     /// rather than a copied value so a hot reload of `polling.pr_state_interval_ms` applies on the
-    /// next tick without respawning the task. Defaults to the historical pinned
-    /// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL), so an install that never
-    /// writes the key is byte-identical; `<= 0` falls back to that same default rather than a busy
-    /// loop.
+    /// next tick without respawning the task. Defaults to
+    /// [`DEFAULT_PR_STATE_INTERVAL_MS`](rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS) (15s)
+    /// at boot; `<= 0` (a direct construction that skipped the field) falls back to that same
+    /// default rather than a busy loop.
     pub poll_interval_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
@@ -695,8 +695,8 @@ async fn unchanged_reviewed_shas(
 
 /// The effective watcher cadence in milliseconds, read fresh from the shared atomic (STUDIO-974).
 /// `<= 0` (unset, or a direct test construction that did not bother with the field) falls back to
-/// the pinned [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) rather than a
-/// zero-millisecond busy loop.
+/// [`DEFAULT_PR_STATE_INTERVAL_MS`](rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS) rather
+/// than a zero-millisecond busy loop.
 fn poll_interval(deps: &ReviewWatchDeps) -> i64 {
     let ms = deps
         .poll_interval_ms
@@ -704,12 +704,13 @@ fn poll_interval(deps: &ReviewWatchDeps) -> i64 {
     if ms > 0 {
         ms
     } else {
-        crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64
+        rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS
     }
 }
 
 /// Polls the watch set on the configured `polling.pr_state_interval_ms` (default
-/// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)) until `ctx` is cancelled.
+/// [`DEFAULT_PR_STATE_INTERVAL_MS`](rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS)) until
+/// `ctx` is cancelled.
 ///
 /// The interval is read from [`ReviewWatchDeps::poll_interval_ms`] at the TOP of each tick, so a hot
 /// reload of the key applies on the next sleep without respawning this task.
@@ -736,7 +737,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
     let mut cursor = 0usize;
     loop {
         // Re-read each iteration: the value is hot-reloadable, so a change applies on the NEXT
-        // sleep. `<= 0` is the unset/invalid case and falls back to the pinned default.
+        // sleep. `<= 0` is the unset/invalid case and falls back to the configured default.
         let interval_ms = poll_interval(&deps);
         tokio::select! {
             _ = ctx.cancelled() => return,
@@ -3073,9 +3074,11 @@ mod tests {
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HEAD_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
-    /// The watcher cadence a test's [`ReviewWatchDeps`] starts with: the pinned default, so the
-    /// paused-clock tests that advance [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)
-    /// still observe exactly one tick per interval (STUDIO-974).
+    /// The watcher cadence a test's [`ReviewWatchDeps`] starts with: the legacy pinned interval, so
+    /// the paused-clock tests that advance
+    /// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) still observe exactly one
+    /// tick per interval (STUDIO-974). A positive value, so the `<= 0` fallback to the real default
+    /// never applies in those tests.
     fn test_poll_interval() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
             crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64,
@@ -3084,7 +3087,7 @@ mod tests {
 
     /// STUDIO-974: the watcher reads its cadence from the shared atomic each tick, and a
     /// non-positive stored value (unset, or a direct construction that skipped the field) falls back
-    /// to the pinned default rather than a zero-millisecond busy loop.
+    /// to the configured default rather than a zero-millisecond busy loop.
     #[test]
     fn poll_interval_reads_the_shared_atomic() {
         let deps = |ms: i64| ReviewWatchDeps {
@@ -3098,7 +3101,7 @@ mod tests {
         assert_eq!(poll_interval(&deps(5_000)), 5_000);
         assert_eq!(
             poll_interval(&deps(0)),
-            crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64
+            rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS
         );
     }
 

@@ -97,7 +97,7 @@ impl ControlHandle {
         self.retention_loaded.load(Ordering::Relaxed)
     }
 
-    /// The effective `polling.pr_state_interval_ms` (default 120_000 until the first reload), read by
+    /// The effective `polling.pr_state_interval_ms` (default 15_000 until the first reload), read by
     /// the off-loop ticketless-review watcher each cycle from the shared atomic without racing the
     /// control task's reload (STUDIO-974). Rhapsody-only.
     pub fn current_pr_state_interval_ms(&self) -> i64 {

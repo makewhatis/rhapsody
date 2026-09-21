@@ -43,19 +43,22 @@ use rhapsody_config::teams::Teams;
 use crate::control_loop::CancelWait;
 use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource};
 
-/// How often a watched pull request is re-asked about.
+/// The historical pinned watcher cadence (120s), before STUDIO-974 made it a config knob.
 ///
-/// Two minutes is chosen against what is actually waiting on it: the answer drives a re-review of
-/// an author's pushed fixes, and a review run takes minutes, so shaving the detection latency below
-/// a couple of minutes buys nothing anybody can perceive. Against GitHub's 5,000-request hourly
-/// budget for an authenticated account it is deliberately cheap — a full sweep budget every tick is
-/// 600 requests an hour, roughly a tenth — because this daemon shares that budget with the summons
-/// enrichment poll, the quorum's PR lookups and every `gh` call an agent makes inside a run.
+/// This is **no longer the watcher's effective default** — that is
+/// `rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS` (15s), read through the orchestrator's
+/// hot-reloaded atomic; conditional requests made an unchanged poll free, so the old rate-limit
+/// argument for two minutes no longer holds. The constant is retained as a NOMINAL tick reference
+/// for the capacity-hold TTL and the paused-clock test timeouts, both of which are dominated by the
+/// lookup phases rather than the sleep.
 ///
+/// The reasoning it was pinned for: two minutes was chosen against what is actually waiting on it —
+/// the answer drives a re-review of an author's pushed fixes, and a review run takes minutes.
+/// Against GitHub's 5,000-request hourly budget for an authenticated account a full sweep every
+/// tick is 600 requests an hour, roughly a tenth, because this daemon shares that budget with the
+/// summons enrichment poll, the quorum's PR lookups and every `gh` call an agent makes inside a run.
 /// Since STUDIO-953 the watcher also re-reads each OPEN observation's head immediately before its
-/// dispatch, so a full-budget tick makes up to TWICE [`MAX_PR_STATE_CALLS_PER_TICK`] requests —
-/// 1,200 an hour at most, roughly a quarter of the budget. The rate reasoning above is stated
-/// against that doubled number, not the sweep alone.
+/// dispatch, so a full-budget tick makes up to TWICE [`MAX_PR_STATE_CALLS_PER_TICK`] requests.
 pub const PR_STATE_POLL_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How many pull requests ONE tick's SWEEP will ask about, the blast-radius bound on a blocking

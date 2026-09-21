@@ -12,7 +12,9 @@
 //! call the daemon and its agents make — and since STUDIO-953 a tick makes up to twice the sweep's
 //! calls. The budget is finite and shared, which is why the answer is to attack the COST of a poll
 //! rather than merely lower the constant; an earlier draft's claim that the budget was exhausted on
-//! 2026-09-21 was retracted (see the STUDIO-974 ticket), so nothing here rests on it.
+//! 2026-09-21 was retracted (see the STUDIO-974 ticket), so nothing here rests on it. With an
+//! unchanged poll now free, the configurable cadence defaults to 15s
+//! (`rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS`).
 //!
 //! GitHub answers a conditional `GET` with `304 Not Modified` when the sent `If-None-Match` ETag
 //! still matches, and a 304 does **not** count against the primary rate limit (verified against the

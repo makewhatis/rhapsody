@@ -426,9 +426,9 @@ Do {{ issue.identifier }}.
     }
 
     /// STUDIO-974: the ticketless PR-state watcher's cadence hot-reloads with WORKFLOW.md. Unset ⇒
-    /// the historical 120s default (byte-identical to before the key existed); a set value applies
-    /// on `on_reload`; a non-positive value falls back to the default rather than a busy loop, and a
-    /// positive value below `MIN_PR_STATE_INTERVAL_MS` is raised to that floor.
+    /// the default (15s); a set value applies on `on_reload`; a non-positive value falls back to the
+    /// default rather than a busy loop, and a positive value below `MIN_PR_STATE_INTERVAL_MS` is
+    /// raised to that floor.
     #[test]
     fn reload_applies_the_pr_state_interval() {
         let (path, _dir) = write_workflow(CLAUDE_WF);
@@ -436,8 +436,8 @@ Do {{ issue.identifier }}.
         o.reload_from_disk().expect("reload");
         assert_eq!(
             o.current_pr_state_interval_ms(),
-            120_000,
-            "an install that never writes the key keeps the pinned 120s watcher clock"
+            15_000,
+            "an install that never writes the key keeps the default watcher clock"
         );
 
         std::fs::write(
@@ -466,7 +466,7 @@ Do {{ issue.identifier }}.
         o.on_reload();
         assert_eq!(
             o.current_pr_state_interval_ms(),
-            120_000,
+            15_000,
             "a non-positive cadence falls back to the default, not a zero-millisecond loop"
         );
 

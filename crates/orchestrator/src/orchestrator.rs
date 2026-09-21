@@ -859,8 +859,8 @@ pub struct Orchestrator {
     pub(crate) retention_loaded: Arc<AtomicBool>,
     /// The effective `polling.pr_state_interval_ms` mirrored as an atomic so the off-loop review
     /// watcher reads a hot-reloaded cadence without racing the control task's reload (STUDIO-974).
-    /// Defaults to the historical pinned 120s, so an install that never writes the key is
-    /// byte-identical. Rhapsody-only; no Go counterpart.
+    /// Defaults to `DEFAULT_PR_STATE_INTERVAL_MS` (15s) at boot, then follows the decoded config.
+    /// Rhapsody-only; no Go counterpart.
     pub(crate) pr_state_interval_ms: Arc<AtomicI64>,
     /// Per-project-group warning strings surfaced on the project status (INF-277 / INF-279), resolved
     /// OFF the control task by the reload/worker-exit resolver. `Arc` so the off-loop resolver tasks
@@ -1082,7 +1082,7 @@ impl Orchestrator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The effective `polling.pr_state_interval_ms` (default 120_000 until the first reload), read by
+    /// The effective `polling.pr_state_interval_ms` (default 15_000 until the first reload), read by
     /// the off-loop review watcher each cycle without racing the control task's reload (STUDIO-974).
     /// `<= 0` is clamped to the default by the caller; this returns the raw stored value.
     pub fn current_pr_state_interval_ms(&self) -> i64 {

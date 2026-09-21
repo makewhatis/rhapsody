@@ -118,8 +118,11 @@ pub struct Polling {
     pub interval_ms: i64,
     /// How often the off-loop ticketless-review watcher re-asks GitHub where each watched pull
     /// request stands, in milliseconds. Rhapsody-only (no Go v0.4.0 counterpart, STUDIO-974):
-    /// defaulted in [`decode`](crate::decode) to 120_000 — today's pinned constant — so an
-    /// installation that sets nothing is byte-identical to before the key existed.
+    /// defaulted in [`decode`](crate::decode) to [`DEFAULT_PR_STATE_INTERVAL_MS`] (15s). The
+    /// conditional-request transport makes an unchanged poll cost no primary rate limit (see the
+    /// README Divergences entry), so the clock no longer has to be the historical 120s — the
+    /// maintainer's measured ~480–520 req/hr of the 5,000/hr shared budget leaves ample headroom
+    /// for a shorter one.
     ///
     /// Deliberately NOT surfaced in the `GET /api/v1/config` view ([`crate::effective_json`]): doing
     /// so would inject a key the frozen Go reference never emits and break the config goldens (the
@@ -128,10 +131,16 @@ pub struct Polling {
     pub pr_state_interval_ms: i64,
 }
 
-/// The default of [`Polling::pr_state_interval_ms`], matching the historical pinned constant
-/// `rhapsody_orchestrator::prstate::PR_STATE_POLL_INTERVAL` (120s). Held here so `decode` and the
+/// The default of [`Polling::pr_state_interval_ms`] (15s). Held here so `decode`, `encode` and the
 /// orchestrator's boot default cannot drift.
-pub const DEFAULT_PR_STATE_INTERVAL_MS: i64 = 120_000;
+///
+/// The historical pinned cadence was 120s — the `prstate::PR_STATE_POLL_INTERVAL` constant — a
+/// rate-limit argument, not a latency one, and the conditional-request transport (STUDIO-974) is
+/// what retires it: an unchanged poll is a free 304, so the same budget now buys a far shorter
+/// interval. An install that never writes the key still gets a working watcher; its *cadence* is no
+/// longer byte-identical to before the key existed, and the transport switch is a second,
+/// independent divergence (see the README Divergences entry).
+pub const DEFAULT_PR_STATE_INTERVAL_MS: i64 = 15_000;
 
 /// The floor the orchestrator applies to [`Polling::pr_state_interval_ms`] when mirroring it into
 /// the watcher's atomic. A conditional 304 is free against the PRIMARY budget, but GitHub still

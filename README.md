@@ -2350,12 +2350,15 @@ twice the sweep's calls. Go v0.4.0 has no review watcher at all, so this subsyst
 what is new here is that its clock is configurable and its unchanged polls are cheap.
 
 - **`polling.pr_state_interval_ms`** — a `WORKFLOW.md` key beside `polling.interval_ms`, read by the
-  watcher each tick so a hot reload applies on the next sleep. It **defaults to `120000`** (the pinned
-  clock), so an installation that never writes it is byte-identical to a daemon built before the key
-  existed; a positive value below `MIN_PR_STATE_INTERVAL_MS` (10s) is raised to that floor so a fast
-  cadence cannot busy-loop the watcher or the paid fallback. It is emitted by `encode` (so a console
-  Save keeps a non-default value) and deliberately kept out of `GET /api/v1/config`'s typed view
-  (`effective_json`), so the Go-captured config goldens stay byte-identical.
+  watcher each tick so a hot reload applies on the next sleep. It **defaults to `15000`** (15s),
+  chosen against the maintainer's measured ~480–520 req/hr of the 5,000/hr shared budget (~10% used)
+  so a merged pull request is observed within ~15s rather than the historical two minutes; a positive
+  value below `MIN_PR_STATE_INTERVAL_MS` (10s) is raised to that floor so a fast cadence cannot
+  busy-loop the watcher or the paid fallback. An installation that never writes the key still gets a
+  working watcher, but its **cadence** is no longer byte-identical to a daemon built before the key
+  existed (the transport below is a second, independent divergence). It is emitted by `encode` (so a
+  console Save keeps a non-default value) and deliberately kept out of `GET /api/v1/config`'s typed
+  view (`effective_json`), so the Go-captured config goldens stay byte-identical.
 - **A conditional-request transport for this one read.** When a token resolves (`GH_TOKEN` /
   `GITHUB_TOKEN` / `gh auth token`), the watcher reads PR state from `api.github.com`'s REST API with
   `If-None-Match` and a per-coordinate ETag cache; an unchanged pull request answers `304 Not

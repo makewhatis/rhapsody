@@ -90,14 +90,14 @@ pub const MAX_DRAFT_POKES: usize = 3;
 /// would park exactly as makewhatis/booch#537 did. A draft that stays at one head across this many
 /// sweeps is not an author mid-push; it is an author who is not coming.
 ///
-/// Thirty sweeps is about an hour at [`crate::prstate::PR_STATE_POLL_INTERVAL`] (120s) WHEN EVERY
-/// WATCHED PULL REQUEST ANSWERS EVERY TICK — the count advances only on a sweep that actually
-/// observed this pull request, and the watcher asks about a bounded number of coordinates per tick
-/// on a rotating cursor, so a larger watch set or a flaky `gh` makes an hour a floor rather than a
-/// promise. Either way it is long enough that a re-engaged run has time to start, push and publish,
-/// and far shorter than the 4h55m the incident sat refused. Counted in sweeps rather than a
-/// `Duration` for [`crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS`]'s reason: the state is already
-/// in sweeps, and a clock here would be a second unit to keep honest.
+/// Thirty sweeps was about an hour when the watcher's cadence was the pinned 120s
+/// ([`crate::prstate::PR_STATE_POLL_INTERVAL`]) and EVERY WATCHED PULL REQUEST ANSWERED EVERY TICK.
+/// STUDIO-974 made that cadence a hot-reloadable config key defaulting to 15s, so the same thirty
+/// sweeps is now about eight minutes at the default — the wall-clock grace this bound was sized for
+/// shrank with the tick, and re-scaling the sweep count is a decision for the maintainer rather than
+/// a silent one here. The count still advances only on a sweep that actually observed this pull
+/// request, and the watcher asks about a bounded number of coordinates per tick on a rotating cursor,
+/// so a larger watch set or a flaky `gh` makes the grace a floor rather than a promise.
 pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
 
 /// One pull request the daemon must poke: a run has finished, and its pull request is still a draft.
