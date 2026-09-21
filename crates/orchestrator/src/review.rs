@@ -407,7 +407,7 @@ impl Orchestrator {
         // have refused nothing.
         //
         // Keyed by the review IDENTITY (`id`, `pr:owner/repo#n@reviewer`), not by the pull request
-        // coordinate (alice round 2 on PR #199). Dispatch is per `(PR, reviewer)`: in a mixed
+        // coordinate (sol round 1 on PR #199). Dispatch is per `(PR, reviewer)`: in a mixed
         // roster one reviewer can be out of budget while another is not, and a coordinate key let
         // the second reviewer's successful dispatch release the first reviewer's still-active hold
         // (and let two held reviewers overwrite each other's provider/figures). The coordinate
@@ -900,7 +900,86 @@ mod tests {
         );
     }
 
-    /// **alice round 2 on PR #199, finding 1: the mixed-roster regression.** Dispatch is per
+    /// **alice round 2, non-blocking N1.** A review is gated ONCE, at its own door — `dispatch_review`
+    /// refuses before its watch-set writes and stages the review in `pending_review`. `dispatch_issue`
+    /// must therefore not re-gate it with a second provider derivation: the spend map may have been
+    /// re-fetched, and a refusal at that point would strand the already-consumed pending review and a
+    /// watch row recorded `requested` while the caller still answered `Dispatched`. This pins the
+    /// `review.is_none()` guard by staging a review and dispatching it directly with the ticket
+    /// gate's own budget spent: the review still spawns, and no TICKET hold is recorded for it.
+    ///
+    /// Mutation: drop `review.is_none() &&` in `Orchestrator::dispatch_issue` and the spawned count
+    /// reds to zero (a `BudgetHeld` return instead of a dispatch).
+    #[test]
+    fn a_staged_review_is_not_re_gated_by_dispatch_issue() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let (mut o, dispatched) = orch_with_review(true);
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.claude.model = "claude-opus-4-8".to_string();
+            eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
+            eff.cfg.budgets.insert(
+                "anthropic".to_string(),
+                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+            );
+        }
+        // Today's anthropic spend is already over the ceiling, so the TICKET gate would refuse.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        // Stage the review exactly as `dispatch_review` does at its tail — after its own gate has
+        // already passed — then dispatch it. The ticket gate must not run a second time.
+        let run = review_run("alice", HEAD_A);
+        let iss = run.synthetic_issue();
+        let route = o
+            .review_route(REPO_URL)
+            .expect("the project owns the review repo");
+        o.pending_review.insert(iss.id.clone(), run);
+        o.dispatch_issue(iss, None, Some(route), String::new());
+
+        assert_eq!(
+            dispatched.lock().expect("dispatched lock").len(),
+            1,
+            "a review already gated at its own door must still spawn"
+        );
+        assert!(
+            o.budget_ledger.held(o.budget_hold_ttl()).is_empty(),
+            "the ticket gate must record no hold for a review it does not gate"
+        );
+    }
+
+    /// **sol round 1 on PR #199, finding 1: the mixed-roster regression.** Dispatch is per
     /// `(PR, reviewer)`, so budget holds must be too. Alice reviews on Claude/Anthropic (out of
     /// budget) while Jerry reviews the SAME pull request on opencode/Fireworks (unspent). Alice is
     /// held; Jerry dispatches; Alice's hold must survive Jerry's success and still reach the

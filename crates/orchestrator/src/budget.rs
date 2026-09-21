@@ -44,10 +44,11 @@ const SPEND_CACHE_TTL: Duration = Duration::from_secs(3);
 ///
 /// It is a floor, not the rule: the real bound is
 /// [`Orchestrator::budget_hold_ttl`], which widens to two configured poll cadences whenever the
-/// operator's `polling.interval_ms` is longer than this. A fixed 300s was wrong (alice round 2 on
+/// operator's `polling.interval_ms` is longer than this. A fixed 300s was wrong (sol round 1 on
 /// PR #199): `polling.interval_ms` has no five-minute ceiling, so on a ten-minute poll a genuinely
 /// blocked ticket — refreshed only once per pass — disappeared from `/api/v1/state` for roughly
-/// half of every cycle.
+/// half of every cycle. A REVIEW hold takes the wider of that and the review watcher's own
+/// [`CAPACITY_HOLD_TTL`](crate::reviewwatch::CAPACITY_HOLD_TTL) — see [`Entry::ttl`].
 const HOLD_TTL_FLOOR: Duration = Duration::from_secs(300);
 
 /// Reports whether a provider's configured daily budget is SPENT. `limit <= 0` is unlimited (the
@@ -69,7 +70,7 @@ pub fn local_day_start() -> String {
 /// The local-day boundary for `now`, resolved through the ZONE's own transition rules rather than
 /// through `now`'s current offset.
 ///
-/// The difference is the whole point (alice round 2 on PR #199): on a DST transition day the offset
+/// The difference is the whole point (sol round 1 on PR #199): on a DST transition day the offset
 /// at local midnight differs from the offset now. After the US spring-forward, applying the current
 /// PDT (-07) to midnight yields 07:00Z although that midnight was PST (-08), 08:00Z — an extra hour
 /// of yesterday's spend inside today's budget. `Tz::from_local_datetime` consults the zone database
@@ -132,7 +133,7 @@ fn spent_by_provider(store: &dyn Store, since: &str) -> HashMap<String, i64> {
 /// `pr` is the pull request coordinate of a REVIEW refusal (`owner/repo#n`), empty for a ticket.
 /// It is carried separately from `subject` because dispatch is per `(PR, reviewer)` while a
 /// divergence is reported per pull request: keying the hold by the review IDENTITY keeps two
-/// reviewers of one PR independent (alice round 2 on PR #199 — one reviewer's successful dispatch
+/// reviewers of one PR independent (sol round 1 on PR #199 — one reviewer's successful dispatch
 /// used to erase a sibling reviewer's still-active hold), and this field is how the reconciliation
 /// sweep still finds every hold for a coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -165,8 +166,29 @@ struct Entry {
 }
 
 impl Entry {
-    fn fresh(&self, ttl: Duration) -> bool {
-        self.recorded.elapsed() < ttl
+    /// Whether this refusal is still live under the caller's base TTL. A REVIEW hold — one that
+    /// carries a pull request coordinate — ages against the wider of the base and the review
+    /// watcher's own cadence bound [`CAPACITY_HOLD_TTL`](crate::reviewwatch::CAPACITY_HOLD_TTL),
+    /// because that is what refreshes it. See [`Entry::ttl`].
+    fn fresh(&self, base: Duration) -> bool {
+        self.recorded.elapsed() < self.ttl(base)
+    }
+
+    /// The TTL this hold ages against. A ticket is re-offered every `polling.interval_ms` and is
+    /// refreshed on that cadence, so the caller's base (which already widens for the poll interval)
+    /// bounds it. A REVIEW is refreshed only when the off-loop watcher's rotating cursor next
+    /// reaches its pull request: a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial phases of
+    /// `gh` lookups, independent of `polling.interval_ms`. A review hold must therefore also clear
+    /// `CAPACITY_HOLD_TTL` — the same bound the codebase already gives a review capacity hold for
+    /// this exact reason (sol round 1 on PR #199; alice round 2 finding B1). Keying on the
+    /// coordinate (a non-empty `pr`) rather than on a caller-supplied flag keeps `held`, `get` and
+    /// `get_for_pr` consistent: they all pass the base and let the entry decide.
+    fn ttl(&self, base: Duration) -> Duration {
+        if self.held.pr.is_empty() {
+            base
+        } else {
+            base.max(crate::reviewwatch::CAPACITY_HOLD_TTL)
+        }
     }
 }
 
@@ -206,7 +228,8 @@ impl BudgetLedger {
 
     /// The hold recorded for a subject, if any and still fresh under `ttl` — the lookup the
     /// reconciliation sweep makes so it can name a budget hold instead of claiming nothing has
-    /// reported a divergence blocked.
+    /// reported a divergence blocked. A review hold ages against the review watcher's own cadence;
+    /// see [`Entry::ttl`].
     pub fn get(&self, subject: &str, ttl: Duration) -> Option<BudgetHeld> {
         self.lock()
             .holds
@@ -218,7 +241,8 @@ impl BudgetLedger {
     /// The first fresh hold recorded for a pull request coordinate, ordered by subject — the lookup
     /// that finds REVIEW holds, which are keyed by review identity rather than by coordinate. There
     /// can be more than one (a mixed roster with two reviewers out of budget); the sweep names one,
-    /// and the console lists them all.
+    /// and the console lists them all. A review hold ages against the review watcher's own cadence;
+    /// see [`Entry::ttl`].
     pub fn get_for_pr(&self, pr: &str, ttl: Duration) -> Option<BudgetHeld> {
         self.lock()
             .holds
@@ -229,7 +253,8 @@ impl BudgetLedger {
 
     /// The current refused set, ordered by subject, for `GET /api/v1/state`. Stale entries (a
     /// subject that stopped being offered without dispatching — moved to Done, merged) are dropped
-    /// rather than reported forever.
+    /// rather than reported forever. A review hold ages against the review watcher's own cadence;
+    /// see [`Entry::ttl`].
     pub fn held(&self, ttl: Duration) -> Vec<BudgetHeld> {
         self.lock()
             .holds
@@ -317,9 +342,14 @@ impl crate::orchestrator::Orchestrator {
 
     /// How long an un-refreshed hold may survive before the console stops reporting it. The FLOOR
     /// is [`HOLD_TTL_FLOOR`]; when the operator's poll interval is longer, two cadences, so a hold
-    /// re-confirmed once per selection/watch pass can never age out between two passes. Tied to the
+    /// re-confirmed once per selection pass can never age out between two passes. Tied to the
     /// configured cadence rather than a fixed wall-clock because `polling.interval_ms` has no
-    /// ceiling (alice round 2 on PR #199).
+    /// ceiling (sol round 1 on PR #199).
+    ///
+    /// This is the TICKET bound. A review is not refreshed on this cadence — the off-loop watcher
+    /// drives it, and its rotation can take far longer — so a review hold widens further, to
+    /// [`CAPACITY_HOLD_TTL`](crate::reviewwatch::CAPACITY_HOLD_TTL). [`Entry::ttl`] applies that per
+    /// entry, which is why callers pass this base to every lookup rather than choosing a TTL.
     pub(crate) fn budget_hold_ttl(&self) -> Duration {
         let poll_ms = self
             .eff
@@ -358,7 +388,7 @@ impl crate::orchestrator::Orchestrator {
     /// (`pr:owner/repo#n@reviewer`) and carrying its pull request coordinate for the sweep. The
     /// identity is the key because dispatch is per `(PR, reviewer)`: two reviewers of one pull
     /// request on different providers must not overwrite each other's hold, and one reviewer's
-    /// successful dispatch must not clear the other's still-active refusal (alice round 2 on PR
+    /// successful dispatch must not clear the other's still-active refusal (sol round 1 on PR
     /// #199).
     pub(crate) fn note_review_budget_hold(
         &self,
@@ -724,7 +754,7 @@ mod tests {
         );
     }
 
-    /// **alice round 2 on PR #199, finding 2.** The hold TTL is a FLOOR widened to two configured
+    /// **sol round 1 on PR #199, finding 2.** The hold TTL is a FLOOR widened to two configured
     /// poll cadences, so a hold refreshed once per pass cannot age out between two passes on a poll
     /// interval longer than 300s. A fixed 300s dropped a genuinely-held subject mid-cycle on a
     /// ten-minute poll, and the sweep then fell back to an unexplained divergence.
@@ -763,12 +793,12 @@ mod tests {
         );
     }
 
-    /// **alice round 2 on PR #199, finding 1.** Review holds are keyed by the review IDENTITY, so
+    /// **sol round 1 on PR #199, finding 1.** Review holds are keyed by the review IDENTITY, so
     /// one reviewer's successful dispatch cannot release a sibling reviewer's still-active hold on
     /// the same pull request. Before the fix both held under `owner/repo#n`, and dispatching the
     /// second reviewer erased the first.
     #[test]
-    fn three_reviewer_holds_on_one_pr_are_independent() {
+    fn two_reviewer_holds_on_one_pr_are_independent() {
         let l = BudgetLedger::default();
         let held = |provider: &str| BudgetHeld {
             subject: format!("pr:o/r#12@{provider}"),
@@ -795,10 +825,97 @@ mod tests {
         assert!(l.get_for_pr("o/r#12", HOLD_TTL_FLOOR).is_none());
     }
 
+    /// **alice round 2 on PR #199, blocker B1.** A REVIEW hold is refreshed on the review watcher's
+    /// cadence — a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` phases, not
+    /// `polling.interval_ms` — so tying its expiry to the poll TTL dropped a genuinely-held review
+    /// on the very path the incident was about (reviews). A review hold now also clears
+    /// [`CAPACITY_HOLD_TTL`](crate::reviewwatch::CAPACITY_HOLD_TTL); a ticket hold still ages against
+    /// the poll TTL alone.
+    ///
+    /// Mutation: age every entry against the caller's base (drop the `pr.is_empty()` branch in
+    /// [`Entry::ttl`]) and the review assertion reds at 301s old while `CAPACITY_HOLD_TTL` is fresh.
+    #[test]
+    fn a_review_hold_outlives_the_poll_ttl_on_the_watchers_cadence() {
+        let l = BudgetLedger::default();
+        let review = BudgetHeld {
+            subject: "pr:o/r#12@alice".into(),
+            title: String::new(),
+            project: "core".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200,
+            spent_tokens: 300,
+            pr: "o/r#12".into(),
+        };
+        let ticket = BudgetHeld {
+            subject: "MT-1".into(),
+            title: "t".into(),
+            project: "core".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200,
+            spent_tokens: 300,
+            pr: String::new(),
+        };
+        let old = Instant::now()
+            .checked_sub(HOLD_TTL_FLOOR + Duration::from_secs(1))
+            .expect("instant arithmetic");
+        l.hold_at(&review.subject, review.clone(), old);
+        l.hold_at(&ticket.subject, ticket.clone(), old);
+
+        assert!(
+            l.get_for_pr("o/r#12", HOLD_TTL_FLOOR).is_some(),
+            "a review hold aged past the poll TTL must stay: the watcher, not the poll, refreshes it"
+        );
+        assert!(
+            l.get("pr:o/r#12@alice", HOLD_TTL_FLOOR).is_some(),
+            "the review hold is visible by identity too"
+        );
+        assert!(
+            l.get("MT-1", HOLD_TTL_FLOOR).is_none(),
+            "a ticket hold of the same age still drops at the poll TTL"
+        );
+        let listed = l.held(HOLD_TTL_FLOOR);
+        assert!(
+            listed.iter().any(|h| h.subject == review.subject),
+            "the console lists the live review hold"
+        );
+        assert!(
+            !listed.iter().any(|h| h.subject == ticket.subject),
+            "the console drops the stale ticket hold"
+        );
+    }
+
+    /// `get_for_pr` matches the REQUESTED coordinate, not merely any hold that carries one.
+    /// Mutation: replace `e.held.pr == pr` with `!pr.is_empty()` and this reds, because the sweep
+    /// would then name an unrelated pull request's budget as a divergence's cause.
+    #[test]
+    fn get_for_pr_matches_only_the_requested_coordinate() {
+        let l = BudgetLedger::default();
+        let held = |coordinate: &str, subject: &str| BudgetHeld {
+            subject: subject.into(),
+            title: String::new(),
+            project: "core".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200,
+            spent_tokens: 300,
+            pr: coordinate.into(),
+        };
+        let one = held("o/r#1", "pr:o/r#1@alice");
+        let two = held("o/r#2", "pr:o/r#2@bob");
+        l.hold(&one.subject, one.clone());
+        l.hold(&two.subject, two.clone());
+
+        assert_eq!(l.get_for_pr("o/r#1", HOLD_TTL_FLOOR).as_ref(), Some(&one));
+        assert_eq!(l.get_for_pr("o/r#2", HOLD_TTL_FLOOR).as_ref(), Some(&two));
+        assert!(
+            l.get_for_pr("o/r#3", HOLD_TTL_FLOOR).is_none(),
+            "a coordinate with no hold must answer None, not some other PR's hold"
+        );
+    }
+
     /// A boundary computed through the zone's own rules uses MIDNIGHT's offset, not `now`'s. On the
     /// 2026-03-08 US spring-forward, noon local is PDT (-07) but midnight was PST (-08), so the day
     /// starts at 08:00Z — NOT the 07:00Z that applying noon's offset to midnight yields, which folded
-    /// an extra hour of yesterday's spend into today (alice round 2 on PR #199, finding 3).
+    /// an extra hour of yesterday's spend into today (sol round 1 on PR #199, finding 3).
     ///
     /// Mutation: compute the boundary from `now.date_naive()` shifted by `now.offset()` and this reds
     /// on `2026-03-08T07:00:00Z`.
@@ -930,6 +1047,61 @@ mod tests {
             day_start(now),
             "2026-09-06T04:00:00Z",
             "a midnight that does not exist must resolve to the first instant that does (01:00 -03)"
+        );
+    }
+
+    /// An AMBIGUOUS midnight (a fall-back that repeats the hour around 00:00) resolves to the
+    /// EARLIER instant, matching the "earliest" arm of `resolve_midnight`. Alice round 2 noted this
+    /// choice was unpinned: swapping in `latest` left the suite green. The fall-back is rare in
+    /// practice, but the day boundary is the budget's own input, so the tie-break is worth a pin.
+    ///
+    /// Mutation: take the later half of the `Ambiguous` pair and this reds on `05:00:00Z`.
+    #[test]
+    fn an_ambiguous_midnight_resolves_to_the_earliest_instant() {
+        use chrono::{FixedOffset, NaiveDate, NaiveDateTime, Offset};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Off(i32);
+        impl Offset for Off {
+            fn fix(&self) -> FixedOffset {
+                FixedOffset::east_opt(self.0).expect("valid offset seconds")
+            }
+        }
+
+        /// Every local instant maps to two: -04 first, then -05 (a fall-back landing on midnight).
+        #[derive(Clone, Debug)]
+        struct AmbiguousMidnight;
+        impl TimeZone for AmbiguousMidnight {
+            type Offset = Off;
+            fn from_offset(_o: &Off) -> Self {
+                AmbiguousMidnight
+            }
+            fn offset_from_local_date(&self, d: &NaiveDate) -> LocalResult<Off> {
+                self.offset_from_local_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_local_datetime(&self, _local: &NaiveDateTime) -> LocalResult<Off> {
+                LocalResult::Ambiguous(Off(-4 * 3600), Off(-5 * 3600))
+            }
+            fn offset_from_utc_date(&self, d: &NaiveDate) -> Off {
+                self.offset_from_utc_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight"))
+            }
+            fn offset_from_utc_datetime(&self, _utc: &NaiveDateTime) -> Off {
+                Off(-5 * 3600)
+            }
+        }
+
+        let noon = NaiveDate::from_ymd_opt(2026, 11, 1)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon");
+        let now = AmbiguousMidnight
+            .from_local_datetime(&noon)
+            .earliest()
+            .expect("noon is ambiguous but present in both halves");
+        assert_eq!(
+            day_start(now),
+            "2026-11-01T04:00:00Z",
+            "an ambiguous midnight must resolve to the earlier instant (-04), not the later (-05)"
         );
     }
 }

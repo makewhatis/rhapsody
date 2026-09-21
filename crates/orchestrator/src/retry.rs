@@ -555,7 +555,7 @@ impl Orchestrator {
         // Refused dispatches are recorded so `/api/v1/state` surfaces them and the reconciliation
         // sweep names the budget rather than claiming nothing has reported the ticket blocked.
         if attempt.is_none() {
-            // STUDIO-957 round 2 (alice finding 3): a REVIEW was already gated at its own door —
+            // STUDIO-957 round 1 (alice finding 3): a REVIEW was already gated at its own door —
             // `dispatch_review` refuses before its watch-set writes and stages this review in
             // `pending_review` — so re-gating here would use a second provider derivation and a
             // possibly re-fetched spend map, and a refusal at THIS point would strand the already-
