@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import type { BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import type { BoardCardFields } from "@/hooks/useBoardCardFields";
 import { teammateColor } from "@/theme/teammates";
-import type { BlockedEntry, HeldForHuman } from "@/lib/api";
+import type { BlockedEntry, BudgetHeld, HeldForHuman } from "@/lib/api";
 import {
   boardLaneTally,
   buildConsoleBoard,
@@ -63,6 +63,9 @@ export interface BoardViewProps {
   blocked: readonly BlockedEntry[];
   /** The live snapshot's `rhapsody:human` holds (STUDIO-949) — cards that no agent will ever run. */
   heldForHuman: readonly HeldForHuman[];
+  /** The live snapshot's per-provider budget holds (STUDIO-957/970) — cards the dispatcher refused
+   *  until local midnight. Its ticket half only; a review hold is the reconciliation sweep's. */
+  budgetHeld: readonly BudgetHeld[];
   /** The project Select's value ("" = all projects). */
   project: string;
   /** The daemon's whole-store tally, so the footer agrees with the Now strip above it. */
@@ -89,6 +92,7 @@ export function BoardView({
   rows,
   blocked,
   heldForHuman,
+  budgetHeld,
   project,
   counts,
   maxConcurrent,
@@ -108,8 +112,8 @@ export function BoardView({
   // surviving card of its chips, which is the one thing the board exists to show. Status is NOT
   // applied: the lanes are that axis (STUDIO-932).
   const lanes = useMemo(
-    () => buildConsoleBoard(rows, blocked, heldForHuman),
-    [rows, blocked, heldForHuman],
+    () => buildConsoleBoard(rows, blocked, heldForHuman, budgetHeld),
+    [rows, blocked, heldForHuman, budgetHeld],
   );
   // The Running lane's contents are RUNS, not only tickets (STUDIO-955): a live review's ticket is
   // parked in In Review, so the review has no card and the lane would otherwise read `5 / 6` beside
@@ -150,9 +154,10 @@ export function BoardView({
             key={lane.id}
             lane={lane}
             filtered={filtered}
-            // The lane's whole-store total, not the cards this page happens to hold (STUDIO-931).
-            // Gated off under a filter: the tally is project-blind and unfiltered, so beside a
-            // filter it would be a number about a different question — the card count is right there.
+            // The lane's whole-store total, which the lane falls back to only on a truncated page
+            // (STUDIO-931/STUDIO-965). Gated off under a filter: the tally is project-blind and
+            // unfiltered, so beside a filter it would be a number about a different question — the
+            // card count is right there.
             tally={filtered || counts === undefined ? undefined : boardLaneTally(lane.id, counts)}
             occupied={occupied}
             runs={lane.id === "running" ? runs : []}
@@ -222,15 +227,21 @@ function LaneView({
 }) {
   const isRunning = lane.id === "running";
   const freeSlots = isRunning && maxConcurrent > 0 ? Math.max(0, maxConcurrent - occupied) : 0;
-  // The tally knows cards the board has not rendered — an In-Review lane counted from the store
-  // while its rows are only on the loaded page, say. The Running lane is exempt: its occupancy
-  // header and idle slots already say everything a shortfall would (STUDIO-931).
-  const gap = !isRunning && tally !== undefined ? Math.max(0, tally - lane.cards.length) : 0;
   // The lane is empty only when it renders NOTHING — cards AND run rows (STUDIO-955). A live review
   // is a run row now, so the lane no longer claims an agent is busy elsewhere while showing five.
   const rendered = lane.cards.length + runs.length;
-  // A held seat with no card and no row in this lane is a live run the page has not loaded yet;
-  // "No agent is running." would contradict the `n / max` beside it.
+  // The store-wide tally may count cards the loaded page does not hold — but ONLY when the page is
+  // genuinely truncated (STUDIO-965). On a complete page the board holds every row there is, so the
+  // header is what the lane draws, and the "not among the jobs loaded" copy below is reserved for
+  // the one case where it is true: the store has more cards than this page could carry. Before this
+  // gate the copy also blamed pagination for a shortfall that was really a review row folded onto a
+  // Done card (defect 1) or a live ticket bucketed In Review (defect 2), sending the operator to
+  // look for cards in history that were never there.
+  const gap =
+    truncated && !isRunning && tally !== undefined ? Math.max(0, tally - lane.cards.length) : 0;
+  // A truncated page reports the whole-store number (with the honest gap note); a complete page
+  // reports what it draws, so the header can never disagree with the body on screen.
+  const count = truncated ? (tally ?? rendered) : rendered;
   const emptyLine = filtered
     ? FILTERED_LANE_EMPTY
     : isRunning && occupied > 0
@@ -245,7 +256,7 @@ function LaneView({
       <header className="bcolhd">
         <span className="bname">{lane.name}</span>
         <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
-          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? rendered)}
+          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : count}
         </span>
         <span className="bsub">{lane.caption}</span>
       </header>
@@ -362,6 +373,19 @@ function BoardCardView({
           </span>
         </div>
       ) : null}
+      {card.budgetHeld === undefined ? null : (
+        // A spent provider budget (STUDIO-957/970). Deliberately NOT the human-hold chip: nobody is
+        // needed, the hold clears at local midnight, and the provider is what makes it actionable.
+        // Its own teal (.bchip) keeps the two deliberate holds from reading alike at a glance.
+        <div className="bchips" aria-label="Held by a provider budget">
+          <span
+            className="dchip bchip"
+            title={`${card.budgetHeld} daily token budget is spent — the dispatcher resumes at local midnight`}
+          >
+            {card.budgetHeld} budget spent
+          </span>
+        </div>
+      )}
       {!fields.pullRequest || card.pr === undefined ? null : (
         // The anchor is wrapped rather than given its own `onClick`: `ExternalLink` deliberately
         // does not accept one (so its open-seam cannot be replaced), and the card underneath must not

@@ -94,6 +94,11 @@ fn raw_from_config(c: &Config) -> Raw {
     }
 
     r.polling.interval_ms = Some(c.polling.interval_ms);
+    // STUDIO-974 (Rhapsody-only): emit only when it differs from the 120s default, so an
+    // installation that never sets the key round-trips byte-identically to before it existed.
+    if c.polling.pr_state_interval_ms != crate::model::DEFAULT_PR_STATE_INTERVAL_MS {
+        r.polling.pr_state_interval_ms = Some(c.polling.pr_state_interval_ms);
+    }
 
     r.workspace.root = c.workspace.root.clone();
 
@@ -535,6 +540,43 @@ mod tests {
         assert_eq!(c2.opencode.auto_approve, Some(true), "absent ⇒ enabled");
         // Stable under a second trip: Encode/Decode must be a fixed point here.
         assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
+    }
+
+    // STUDIO-974 review (jimmy): the console's Save path (`httpapi::config_view::apply_typed_config`)
+    // starts from the on-disk `Config` and writes `encode`, so a non-default
+    // `polling.pr_state_interval_ms` must survive the round trip — otherwise saving an unrelated
+    // setting silently resets the operator's watcher cadence to the default. Encode emits the key
+    // only when non-default, so an unset knob stays absent from the front matter.
+    #[test]
+    fn a_pr_state_interval_survives_an_encode_decode_round_trip() {
+        let explicit = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n\
+             polling:\n  interval_ms: 1234\n  pr_state_interval_ms: 45000\n",
+            "body",
+        );
+        assert_eq!(explicit.polling.pr_state_interval_ms, 45_000);
+        let def = encode(&explicit).expect("encode");
+        assert_eq!(
+            nested(&def.config, "polling", "pr_state_interval_ms"),
+            Some(&Value::Number(45_000.into())),
+            "encode must emit a non-default cadence so a console Save keeps it"
+        );
+        assert_eq!(
+            re_encode_decode(&explicit).polling.pr_state_interval_ms,
+            45_000,
+            "and the value must survive the full round trip"
+        );
+
+        let default = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n",
+            "body",
+        );
+        let def = encode(&default).expect("encode");
+        assert_eq!(
+            nested(&def.config, "polling", "pr_state_interval_ms"),
+            None,
+            "an unset cadence must not be materialized into the front matter"
+        );
     }
 
     // ⚠️ A DATA-LOSS class, not a formatting one (STUDIO-950). `agent.max_concurrent_reviews` is

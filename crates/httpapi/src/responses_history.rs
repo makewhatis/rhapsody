@@ -373,10 +373,18 @@ pub(crate) struct IssueStatusKey {
 /// zero on the same terms as `lifecycle` and `review_run`, so a daemon with no such hold serves the
 /// pre-STUDIO-949 payload byte-for-byte.
 ///
+/// `budget_held` (STUDIO-970) is its sibling for the per-provider budget refusal: the same never-ran
+/// shape, a deliberate hold the console synthesizes a Queued card for, counted here by identity for
+/// exactly the reasons above. It is a SEPARATE key rather than a share of `held_for_human`, because
+/// the two holds clear by different clocks — one needs a person, the other local midnight — and the
+/// console must not tell an operator that a spent budget needs them. Only TICKET holds are counted;
+/// a review hold is surfaced by the reconciliation sweep and is not a console card.
+///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
 pub(crate) fn issue_counts_response(
     buckets: &BTreeMap<IssueStatusKey, i64>,
     held_for_human: i64,
+    budget_held: i64,
 ) -> Value {
     let mut issues: i64 = 0;
     let mut out: Vec<Value> = Vec::with_capacity(buckets.len());
@@ -398,6 +406,9 @@ pub(crate) fn issue_counts_response(
     body.insert("buckets".to_string(), Value::Array(out));
     if held_for_human > 0 {
         body.insert("held_for_human".to_string(), json!(held_for_human));
+    }
+    if budget_held > 0 {
+        body.insert("budget_held".to_string(), json!(budget_held));
     }
     Value::Object(body)
 }

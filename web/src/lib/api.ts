@@ -80,6 +80,12 @@ export interface StateResponse {
   // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
   // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.
   held_for_human?: HeldForHuman[];
+  // Dispatches the daemon refused because a provider's daily token budget is spent (STUDIO-957), or
+  // ABSENT when it refused none. Optional for `drain`'s reason. This holds BOTH halves: a TICKET
+  // refusal (`pr` empty — the console cards it) and a REVIEW refusal (`pr` names the coordinate —
+  // surfaced by the reconciliation sweep). Read the ticket half as
+  // `state.budget_held?.filter((h) => h.pr === "")`.
+  budget_held?: BudgetHeld[];
 }
 
 // HeldForHuman is one row of /api/v1/state's `held_for_human` key (STUDIO-949): a ticket the
@@ -89,6 +95,25 @@ export interface HeldForHuman {
   issue_identifier: string;
   title: string;
   project: string;
+}
+
+// BudgetHeld is one row of /api/v1/state's `budget_held` key (STUDIO-957/970): a dispatch the
+// dispatcher refused because the provider's daily token budget is spent. It is a DIFFERENT hold
+// from `HeldForHuman` — it clears on its own at local midnight, nobody is needed — so the console
+// must never render one as the other. `provider` is the actionable half: "anthropic daily budget
+// spent", not "budget spent".
+export interface BudgetHeld {
+  // The refused subject: a TICKET identifier, or (for a review) the review identity
+  // `pr:owner/repo#n@reviewer`.
+  subject: string;
+  title: string; // the ticket's title, or "" for a review hold
+  project: string; // Linear project slug, for agent/colour resolution
+  provider: string; // the account whose budget is spent
+  daily_tokens: number; // the configured ceiling
+  spent_tokens: number; // today's spend on that provider
+  // The pull request coordinate (`owner/repo#n`) of a REVIEW refusal, or "" for a ticket. The
+  // board's discriminator: only a ticket hold becomes a card.
+  pr: string;
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
@@ -359,6 +384,12 @@ export interface IssueCountsResponse {
   // because only the daemon can join its bucket rows to the snapshot's hold set; see
   // `consoleStoreCounts`. Absent when the daemon holds nothing with no stored row.
   held_for_human?: number;
+  // STUDIO-970: how many non-live TICKET budget holds have no stored row — the same never-ran shape
+  // as `held_for_human`, counted by the daemon for the same reason (it alone can join the buckets to
+  // the snapshot's hold set). A SEPARATE key, because the console adds it to `queued` while keeping
+  // it out of "needs you": this hold clears at local midnight, not by a person. Review holds are
+  // excluded (they are the sweep's surface). Absent when the daemon holds no ticket this way.
+  budget_held?: number;
 }
 
 // TicketCostRow is one entry of GET /api/v1/history/costs (STUDIO-926): the tokens EVERY run spent

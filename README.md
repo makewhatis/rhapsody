@@ -320,7 +320,7 @@ stopped|failed|interrupted` unbounded returns the genuinely-active pipeline, rat
 that ever passed through those outcomes, so a lane's cards can no longer be stale runs of finished
 tickets and `BOARD_ACTIVE_LIMIT` is bounded by the pipeline rather than by history.
 
-### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
+### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828, STUDIO-965)
 
 A third **additive**, Rhapsody-only history endpoint, for the same reason the two above exist and
 against the same rule: *a total is never a page.* The console's Now strip — running / queued /
@@ -330,32 +330,49 @@ Measured on the operator's own daemon, the strip could not name more than 50 of 
 
 | Endpoint | Serves |
 | --- | --- |
-| `GET /api/v1/history/issues/counts` | how many ISSUES in the whole store carry each distinct combination of status inputs |
+| `GET /api/v1/history/issues/counts` | how many ISSUES the whole store holds, grouped by each distinct combination of status inputs the console derives a card's status from |
 
 It takes no filters. The Seg and project Select the strip renders beside it are explicitly scoped to
 the loaded rows (the worklist says so in words), while the strip asks about the store.
 
-**It counts inputs, not statuses**, and that is the load-bearing decision. The count has to be
-derived by the same rule the row's pill is, or the strip and the table disagree — which is worse
-than either being wrong alone — and the only way to guarantee one rule is to keep one implementation
-of it. That implementation is the console's, which owns the vocabulary ("in review", "reviewing",
-"needs you"); the daemon does the half a client cannot, folding every issue rather than a page, and
-serves the same per-row facts `GET /api/v1/history/issues` already serves, grouped:
+**It counts the BOARD's unit — the TICKET, not the run row** (STUDIO-965). The board draws one card
+per ticket and folds a ticket's review runs onto it as chips, so the tally folds too: a
+`pr:owner/repo#n@reviewer` row is attributed to the ticket it reviews (through the same watch-set
+join the listing's `review_of` and the cost ledger use) and adds no bucket of its own. Before this,
+three failed or interrupted reviews of two finished tickets were billed as three Queued/Blocked jobs
+the board could never draw in those lanes — the operator's *"Queued 4 — only 1 actual card"*. A
+ticket with any number of review rounds counts once; a review whose origin resolves to a ticket with
+NO run row at all still counts once, keeping the review's OWN key so a finished review reads `done`
+rather than the `review` a completed ticket would mean. A review row whose origin names no ticket is
+not work and is dropped, exactly as the board drops it — as is any run row with no issue identifier,
+which the console never groups into a card.
+
+**The lane is the RUN's, not the lifecycle's** (STUDIO-965). A ticket the snapshot has in flight or
+parked for retry buckets as `running` whatever its tracker state says, because that is where the
+board's `boardLaneOf` draws its card; only an idle ticket takes its lifecycle's word. The client
+still owns the five words — the daemon sends the same per-row facts `GET /api/v1/history/issues`
+serves, grouped, not the console's statuses — and `consoleJobStatus` derives a status by one rule
+for both the listing row and the bucket, so the strip and the card cannot disagree:
 
 ```json
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
-             {"outcome": "completed", "review_run": true, "count": 7},
+             {"outcome": "completed", "lifecycle": "open", "count": 12},
              {"outcome": "running", "count": 1}],
  "held_for_human": 2}
 ```
 
-Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
-endpoints speak one vocabulary. The lifecycle lookup is filtered by `review::is_review_key` exactly
-as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@reviewer` id in a Linear
-`id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
-sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
-different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+Each bucket spells its fields exactly as a listing row spells them, absences included. The two
+endpoints no longer count the same SET — the listing pages RUNS and still returns a review row as
+its own row — but a bucket and the row of the same ticket describe the same facts, so one
+vocabulary. A `review_run: true` bucket survives only for a LIVE review run — a Running row the board
+draws, folded onto its ticket's card or not — or for an orphan review (an adopted pull request whose
+ticket never ran here). The lifecycle lookup
+is filtered by `review::is_review_key` exactly as the listing filters it (STUDIO-831) — one
+synthetic `pr:owner/repo#n@reviewer` id in a Linear `id: { in: … }` batch fails the whole request,
+silently — and the snapshot's `running`/`retrying` sets are folded in the way the worklist folds
+them, so a retry-parked ticket is not counted in a different bucket from its own row. Go has neither
+the issue listing nor an aggregate over it.
 
 **A hold the store has no row for is reported separately** (STUDIO-949). `held_for_human` counts the
 non-live `rhapsody:human` tickets the dispatcher is holding for which the run store has NO stored
@@ -1453,7 +1470,7 @@ here rather than implying the refusal holds while the daemon no longer owns the 
 validation, an armed drain, a dead agent credential — while **four** decision gates keep running
 anyway, none of them through the per-tick candidate pass: the reconciliation sweep is called from
 `on_tick` ABOVE those gates on purpose, the ticketless review watcher's **round** gate and its
-**auto-merge** gate are reached through the watcher's own 120s task, and the ticket-mode handoff
+**auto-merge** gate are reached through the watcher's own timer task, and the ticket-mode handoff
 quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not on `on_tick` at all.
 The handed-off run is LIVE, and on a gated daemon live runs come from the RETRY path, not from
 recovery: `boot_recovery` restores no running entry (it converts every interrupted claim into an
@@ -1467,7 +1484,7 @@ a drained daemon, irreversibly, how a real review round is dispatched at its pul
 held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
 therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
 ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
-both are re-offered — the watcher asks again in 120s), the reconciliation sweep reports nothing — a
+both are re-offered — the watcher asks again on its next tick), the reconciliation sweep reports nothing — a
 false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
 exists to prevent — and `plan_quorum` refuses the fan-out, logging at `warn!` and naming the ticket.
 That refusal is **one-shot and unrecoverable**: the handoff has already landed, the run winds down,
@@ -1489,7 +1506,7 @@ that could not read every enabled project neither clears nor primes. This is a d
 conservatism for a bounded window — though on a daemon gated since boot the window is the whole
 process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy daemon's
 first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act after it
-(the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation sweep —
+(the watcher's first sweep is one tick out, and a handoff has to arrive), and the reconciliation sweep —
 which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that first
 un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the board
 the set is real and the bounds above are the ones left. Those bounds are unchanged by this: after any
@@ -1705,9 +1722,11 @@ re-engaged run a review's findings reopened) is never poked.
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` pokes — an attempt counter, not a
 distinct-head counter: the ledger remembers only the head poked last, so `A → B → A` reaches the
 bound on two distinct heads. An author who does nothing at all — booch#537 never moved its head — is
-bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps at the same head (thirty, about an hour at the
-two-minute poll when every watched pull request answers every tick; the clock counts observations, so
-a larger watch set or a flaky `gh` makes an hour a floor). Either bound stops the poking and
+bounded by `MAX_DRAFT_POKE_UNANSWERED` of WALL CLOCK at the same head (one hour). The window opens at
+the poke, reopens when the head moves, and is re-anchored while the author's run is live, so the grace
+is the same hour whether the watcher ticks every 15s or every 120s — the earlier sweep count shrank
+with the tick once the cadence became configurable. GitHub being unable to answer for the coordinate
+does not restart it. Either bound stops the poking and
 ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly one
 comment and then silence forever, which is the parking this feature exists to end.
 
@@ -2322,3 +2341,37 @@ watcher's rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` 
 poll interval, so the poll bound alone under-covers it. And the local midnight is resolved through
 the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
 longer folds an extra hour of yesterday's spend into today.
+
+### The PR-state watcher polls with conditional requests — `polling.pr_state_interval_ms` (STUDIO-974)
+
+The ticketless review watcher re-asks GitHub where every watched pull request stands on a timer, and
+that timer was a pinned 120s constant because a full sweep is ~600 requests an hour against the
+account's shared 5,000/hour GitHub budget (shared with the summons enrichment poll, the quorum's PR
+lookups and every `gh` call an agent makes inside a run) — and since STUDIO-953 a tick makes up to
+twice the sweep's calls. Go v0.4.0 has no review watcher at all, so this subsystem is Rhapsody-only;
+what is new here is that its clock is configurable and its unchanged polls are cheap.
+
+- **`polling.pr_state_interval_ms`** — a `WORKFLOW.md` key beside `polling.interval_ms`, read by the
+  watcher each tick so a hot reload applies on the next sleep. It **defaults to `15000`** (15s),
+  chosen against the maintainer's measured ~480–520 req/hr of the 5,000/hr shared budget (~10% used)
+  so a merged pull request is observed within ~15s rather than the historical two minutes; a positive
+  value below `MIN_PR_STATE_INTERVAL_MS` (10s) is raised to that floor so a fast cadence cannot
+  busy-loop the watcher or the paid fallback. An installation that never writes the key still gets a
+  working watcher, but its **cadence** is no longer byte-identical to a daemon built before the key
+  existed (the transport below is a second, independent divergence). It is emitted by `encode` (so a
+  console Save keeps a non-default value) and deliberately kept out of `GET /api/v1/config`'s typed
+  view (`effective_json`), so the Go-captured config goldens stay byte-identical.
+- **A conditional-request transport for this one read.** When a token resolves (`GH_TOKEN` /
+  `GITHUB_TOKEN` / `gh auth token`), the watcher reads PR state from `api.github.com`'s REST API with
+  `If-None-Match` and a per-coordinate ETag cache; an unchanged pull request answers `304 Not
+  Modified`, which does **not** count against the primary rate limit. A cold start or an evicted
+  entry degrades to an ordinary 200. When no token resolves, or a lookup is refused with `401` after
+  the credential is re-resolved once, that lookup is answered through the existing `gh pr view`
+  source instead, so the watcher degrades rather than going quiet. This transport is **github.com
+  only** — a GHES/`GH_HOST` install takes the 401 path back to `gh`.
+
+`gh` itself exposes no way to send `If-None-Match` or read a response `ETag`, which is why this path
+speaks HTTP directly. Nothing else moves: `MAX_PR_STATE_CALLS_PER_TICK` and the rotating cursor still
+bound one tick, and STUDIO-953's pre-dispatch head re-read stays unconditional — it goes through
+`pr_state_unconditional`, which sends no `If-None-Match`, because acting on a stale head is the
+failure that re-read exists to prevent.

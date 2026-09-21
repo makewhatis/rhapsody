@@ -1834,6 +1834,39 @@ describe("the board view (STUDIO-925)", () => {
     );
   });
 
+  // STUDIO-970, end to end through the real view: a ticket the dispatcher refused for a spent
+  // provider budget has usually never run, so no history row exists for it and the hold in
+  // `state.budget_held` is the only evidence it does. The board must draw its card, name the
+  // provider and NOT read as a human hold. This is the whole production chain — `state.budget_held`
+  // → `mergeJobs` → `buildConsoleJobs` → `buildConsoleBoard` → chip — so a mutation dropping the
+  // hold from any link leaves it red. (The prop channel is not it: the row carries the fact.)
+  it("cards a never-ran budget-held ticket, naming the provider (STUDIO-970)", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      budget_held: [
+        {
+          subject: "STUDIO-970",
+          title: "meter spend per provider",
+          project: "rhapsody",
+          provider: "anthropic",
+          daily_tokens: 200_000_000,
+          spent_tokens: 361_000_000,
+          pr: "",
+        },
+      ],
+    });
+    serveStore([]);
+    mount();
+    await waitFor(() => expect(rowKeys()).toEqual(["STUDIO-970"]));
+    switchToBoard();
+
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(1));
+    const card = document.querySelector(".bcard") as HTMLElement;
+    expect(card.querySelector(".bchip")?.textContent).toBe("anthropic budget spent");
+    expect(card.querySelector(".hchip")).toBeNull();
+    expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-970");
+  });
+
   it("links the PR column that used to render a dash", async () => {
     boardStore();
     mount();

@@ -216,6 +216,18 @@ export interface JobRow {
    * comparison is how the two words would silently drift apart.
    */
   heldForHuman?: boolean;
+  /**
+   * The provider whose spent daily token budget is holding this ticket (`state.budget_held`,
+   * STUDIO-957/970), or undefined when it is not budget-held.
+   *
+   * A DIFFERENT hold from `heldForHuman` and carried as its own fact for the same reason: one needs
+   * a person, the other clears at local midnight, and the operator's next move is not the same. It
+   * names the provider rather than saying "budget held", because the whole point of the meter is
+   * that "361M of Claude" is actionable while a total is not. Review holds (`pr` non-empty) are
+   * excluded: the reconciliation sweep already surfaces those, and a ticket card for one would be
+   * work that does not exist.
+   */
+  budgetHeld?: string;
 }
 
 export interface ProjectMeta {
@@ -305,6 +317,9 @@ interface MergedRow {
   /** A synthetic `rhapsody:human` hold (from state.held_for_human, STUDIO-949) — deliberately held
    *  for a person, not blocked by a predecessor. Gives the row its own sub-label. */
   heldForHuman?: boolean;
+  /** A synthetic per-provider BUDGET hold (from state.budget_held, STUDIO-957/970) — the provider
+   *  whose daily budget is spent. Distinct from `heldForHuman`; gives the row its own sub-label. */
+  budgetHeld?: string;
   /** Failure reason (history rows only; drives the failed sub-label). */
   error: string;
 }
@@ -479,6 +494,36 @@ export function mergeJobs(
     });
   }
 
+  // Synthetic budget-held rows: one per TICKET the dispatcher refused for a spent provider budget
+  // (state.budget_held, STUDIO-957/970). Same shape and same reason as the human hold above — a
+  // refused ticket has usually never run, so nothing else contributes a row for it. `pr` is the
+  // discriminator: a REVIEW hold names a pull request coordinate and is surfaced by the
+  // reconciliation sweep, not as a ticket card, so only `pr === ""` becomes a row here.
+  for (const b of state?.budget_held ?? []) {
+    if (b.pr !== "") continue;
+    merged.push({
+      key: `budget-${b.subject}`,
+      runId: 0,
+      issue: b.subject,
+      title: b.title,
+      agent: agentName(b.project, "", meta),
+      agentColor: agentColor(b.project, meta),
+      project: b.project,
+      projectShort: projectDisplayName(b.project, meta),
+      turn: 0,
+      tokens: formatTokens(0),
+      duration: "",
+      durationAccent: false,
+      startedAtMs: 0,
+      outcome: "waiting",
+      live: false,
+      queued: false,
+      waiting: true,
+      budgetHeld: b.provider,
+      error: "",
+    });
+  }
+
   for (const h of rows) {
     if (h.id > 0 && liveIds.has(h.id)) continue; // already represented by the live row
     const live = h.outcome === "running";
@@ -523,6 +568,7 @@ export function mergeJobs(
     const liveRow = g.find((r) => r.live);
     const waitingRow = g.find((r) => r.waiting);
     const heldRow = g.find((r) => r.heldForHuman === true);
+    const budgetRow = g.find((r) => r.budgetHeld !== undefined);
     const newestReal = g.find((r) => !r.queued && !r.waiting); // a live or history row (never synthetic)
     const isWaiting = status === "waiting";
     // A current hold outlives a prior run (STUDIO-949). The dispatcher can hold a ticket that HAS
@@ -533,6 +579,13 @@ export function mergeJobs(
     // daemon does not hold a ticket it is mid-run on, so a hold beside a running row would be a
     // stale pass's ghost (and `consoleJobStatus` would wrongly repaint a live run "queued").
     const heldForHuman = heldRow !== undefined && status !== "running";
+    // A current BUDGET hold rides the same rules (STUDIO-970): it survives a prior run, keeps the
+    // real run's lane, and is suppressed only by a live run — the daemon does not hold what it is
+    // running. The two holds are independent facts and never share a row on this codebase's own
+    // dispatch order (a `rhapsody:human` label refuses BEFORE the budget gate), so neither can
+    // overwrite the other's sub-label.
+    const budgetHeld = budgetRow?.budgetHeld;
+    const budgetHeldActive = budgetHeld !== undefined && status !== "running";
     // For a held job that has never run, the waiting row owns the display (its title/project come
     // from the hold entry) and the row is never clickable (runId 0). Otherwise the live/newest-real
     // row wins, so a held ticket that HAS run stays openable on its real run.
@@ -555,12 +608,15 @@ export function mergeJobs(
       startedAtMs: rep.startedAtMs,
       subLabel: heldForHuman
         ? "held for a human"
-        : isWaiting
-          ? `waiting on ${waitingRow?.waitingOn ?? ""}`
-          : status === "failed"
-            ? failureSubLabel(newestReal?.error ?? "") || undefined
-            : undefined,
+        : budgetHeldActive
+          ? `${budgetHeld} daily budget spent`
+          : isWaiting
+            ? `waiting on ${waitingRow?.waitingOn ?? ""}`
+            : status === "failed"
+              ? failureSubLabel(newestReal?.error ?? "") || undefined
+              : undefined,
       heldForHuman,
+      budgetHeld: budgetHeldActive ? budgetHeld : undefined,
     });
   }
 

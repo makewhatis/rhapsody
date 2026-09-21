@@ -12,7 +12,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
 use rhapsody_orchestrator::{IssueKey, IssueLifecycleRow, review};
-use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, effective_run_limit};
+use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, RunSummary, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
@@ -398,6 +398,49 @@ pub(crate) async fn handle_history_costs(
 /// the live overlay, this is best-effort: a failed snapshot costs the reclassification, not the
 /// tally.
 ///
+/// THE BUDGET-HOLD RECLASSIFICATION (STUDIO-970). Its sibling for a spent provider budget, with the
+/// same shape and the same join: a ticket the dispatcher REFUSED before it ever started has no
+/// stored row, so the console synthesizes a Queued card for it and the tally reports it once in
+/// `budget_held`, which the client adds to queued. A ticket with a stored row (a prior stopped run)
+/// keeps its bucket, and one the daemon is mid-run on keeps its running bucket — the console's own
+/// exceptions, mirrored. It is a separate key rather than a share of `held_for_human` because the
+/// two holds clear differently: a human hold needs a person, a budget hold clears at local midnight,
+/// and a strip that conflated them would tell an operator a spent budget was their move. REVIEW
+/// budget holds are excluded: they name a pull request coordinate and are surfaced by the
+/// reconciliation sweep, not as tickets.
+///
+/// THE REVIEW-RUN FOLD (STUDIO-965). The tally must count the board's unit — the TICKET — so a
+/// `pr:owner/repo#n@reviewer` review row is attributed to the ticket it reviews (through the same
+/// watch-set join the listing's `review_of` and the cost ledger use) instead of being counted as a
+/// card of its own. The board draws a ticket's one card with its reviews folded on as CHIPS
+/// (`buildConsoleBoard`), so three failed reviews of two finished tickets are three chips, not four
+/// Queued/Blocked jobs the lane can never draw — the operator's "Queued 4 — only 1 actual card".
+/// Per trap 2, a ticket with three reviews still counts ONCE.
+///
+/// A review row whose origin ticket HAS a card row (stored, or live with no stored row yet) adds
+/// nothing: the ticket's own bucket already counts it. One whose origin resolves to a ticket with NO
+/// row at all still counts ONCE for that ticket (trap 4). Its several rounds are reduced to the one
+/// the board draws — a LIVE round if there is one (the board renders it as its own Running row and
+/// drops the finished rounds' chips, which have no card to fold onto), else the newest finished
+/// round — so a ticket with three reviews still counts once (trap 2) and the row is never an orphan
+/// that counts nowhere. It keeps the REVIEW's own key, though, so `review_run` survives and a
+/// finished review still reads `done` rather than the `review` a completed ticket would mean.
+///
+/// What that orphan can do on the board, exactly: a completed one lands in a bucket no lane tally
+/// carries (Done is deliberately uncounted), so it draws no card and no gap; a live one IS a
+/// Running row the board draws (`runningRuns`); only a failed, continued, interrupted or stopped
+/// orphan reaches a counted lane the board cannot draw it in, and on a truncated page that Queued
+/// lane can print its gap copy for a row that is loaded but never becomes a card. That residue is
+/// accepted rather than hidden — trap 4 requires the row to count somewhere — and it is unchanged
+/// from before this ticket; the operator's store has no orphan review today (every one of its
+/// watch rows resolves an origin that has a run row).
+/// A review row whose origin names no ticket is not work and is dropped, exactly as the board drops
+/// it.
+///
+/// The lane is the RUN's, not the lifecycle's (trap 2): a ticket the snapshot has in flight or
+/// parked for retry buckets as `running` whatever its tracker state says, because that is where
+/// `boardLaneOf` draws its card. The live override below is what keeps the two in one lane.
+///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
 pub(crate) async fn handle_issue_counts(
     method: Method,
@@ -423,6 +466,20 @@ pub(crate) async fn handle_issue_counts(
         .map(|r| r.issue_id.clone())
         .filter(|id| !review::is_review_key(id))
         .collect();
+    // Review-run key -> the TICKET each review is OF (STUDIO-965), through the same watch-set join
+    // the listing's `review_of` and the cost ledger use. The tally counts the board's unit — the
+    // ticket — so a review row must be attributed to the ticket it reviews instead of being counted
+    // as a card of its own, which is what billed three reviews of two finished tickets as four
+    // Queued/Blocked jobs the board folds onto Done cards. Resolved before the awaits because it is
+    // a store read, not a tracker one, exactly as the listing orders it. Best-effort like every
+    // other decoration: a store error yields no origins and each review row then keeps its own key,
+    // which is the pre-STUDIO-965 tally rather than a failed request.
+    let review_keys: HashSet<&str> = runs
+        .iter()
+        .map(|r| r.issue_id.as_str())
+        .filter(|id| review::is_review_key(id))
+        .collect();
+    let origins = review_origins_for_keys(provider.history().as_ref(), &review_keys);
     let (lifecycles, snap) = tokio::join!(
         provider.issue_lifecycles(&ids),
         tokio::time::timeout(SNAPSHOT_TIMEOUT, provider.snapshot()),
@@ -440,6 +497,11 @@ pub(crate) async fn handle_issue_counts(
     // the snapshot controls which ticket is held; neither alone can answer, so the daemon joins
     // them.
     let mut held: HashSet<String> = HashSet::new();
+    // The current per-provider BUDGET holds that are TICKET holds (STUDIO-970), the same shape the
+    // `held` set above carries for `rhapsody:human`. A REVIEW hold names a pull request coordinate
+    // (`pr` non-empty) and is surfaced by the reconciliation sweep; it is not a console card, so it
+    // is deliberately left out here rather than billed as a Queued ticket.
+    let mut budget_held: HashSet<String> = HashSet::new();
     if let Ok(Ok(snap)) = snap {
         for r in &snap.running {
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
@@ -452,6 +514,11 @@ pub(crate) async fn handle_issue_counts(
                 held.insert(h.issue_identifier.clone());
             }
         }
+        for h in &snap.budget_held {
+            if h.pr.is_empty() && !h.subject.is_empty() {
+                budget_held.insert(h.subject.clone());
+            }
+        }
     }
     let live: HashSet<&str> = live_work
         .iter()
@@ -459,21 +526,116 @@ pub(crate) async fn handle_issue_counts(
         .filter(|identifier| !identifier.is_empty())
         .collect();
 
-    let mut buckets: BTreeMap<IssueStatusKey, i64> = BTreeMap::new();
-    // Which identifiers a stored row already accounts for. The console groups by identifier and so
-    // does `list_issue_runs`, so a live run with a stored row is ONE row on both sides; an empty
-    // identifier never groups on either, so it never joins this set.
-    let mut counted: HashSet<&str> = HashSet::new();
-    for r in &runs {
-        let ident = r.issue_identifier.as_str();
-        if !ident.is_empty() {
-            counted.insert(ident);
+    // The tickets that have a CARD of their own: a stored non-review row, a live run the snapshot
+    // knows (a run dispatched between the store read and the snapshot read), or a `rhapsody:human`
+    // hold the console synthesizes a Queued card for. A review row whose origin ticket is in this
+    // set is FOLDED into that ticket and adds nothing of its own — the board draws the ticket's one
+    // card with the review as a chip (STUDIO-965 trap 2: a ticket with three failed reviews must
+    // still count once).
+    let mut card_idents: HashSet<&str> = runs
+        .iter()
+        .filter(|r| !review::is_review_key(&r.issue_id))
+        .map(|r| r.issue_identifier.as_str())
+        .filter(|ident| !ident.is_empty())
+        .collect();
+    for (identifier, _) in &live_work {
+        if !identifier.is_empty() {
+            card_idents.insert(identifier.as_str());
         }
-        // A stored row always lands in its lifecycle's bucket, held or not: a hold that has run
-        // keeps the run's lane on the console (its card is in Review, sub-labelled "held for a
-        // human"), so the strip must count it there. Only a hold with NO stored row is
-        // reclassified, below, in `held_for_human`.
-        let outcome = if live.contains(r.issue_identifier.as_str()) {
+    }
+    // A held ticket with no stored row still has a CARD: the console synthesizes a Queued one and
+    // folds the ticket's reviews onto it as chips. Leaving the held set out of this one made such a
+    // ticket's review an orphan, and the orphan branch's bookkeeping then kept the hold out of
+    // `held_for_human` below — a Queued card the header could not see (STUDIO-965 B2). Same class as
+    // the live no-row ticket above: a card source `card_idents` did not know about.
+    for identifier in &held {
+        card_idents.insert(identifier.as_str());
+    }
+    // A budget-held ticket with no stored row has a card too (STUDIO-970), for the identical reason:
+    // the console synthesizes a Queued card for it and folds its reviews onto it as chips, so its
+    // identifier must be known here or its review becomes an orphan and the hold is dropped.
+    for identifier in &budget_held {
+        card_idents.insert(identifier.as_str());
+    }
+
+    let mut buckets: BTreeMap<IssueStatusKey, i64> = BTreeMap::new();
+    // Which identifiers a stored row, a live run the snapshot knows, or the picked round of an
+    // orphan review accounts for. The console groups by identifier and so does `list_issue_runs`, so
+    // a live run with a stored row is ONE row on both sides; an empty identifier never groups on
+    // either, so it never joins this set.
+    let mut counted: HashSet<&str> = HashSet::new();
+    // The review rounds of each ticket with NO card of its own — an orphan: a review row whose
+    // origin resolves to a ticket that has neither a stored row nor a live run. Every such ticket
+    // is ONE unit (trap 2), so the rounds are grouped here and reduced to the one the board draws,
+    // below. A review whose origin names no ticket is not work (the board drops it,
+    // `buildConsoleBoard`) and never joins this map — it counts nowhere.
+    let mut orphan_rounds: HashMap<&str, Vec<&RunSummary>> = HashMap::new();
+    for r in &runs {
+        if !review::is_review_key(&r.issue_id) {
+            continue;
+        }
+        if let Some(origin) = origins.get(&r.issue_id)
+            && !card_idents.contains(origin.as_str())
+        {
+            orphan_rounds.entry(origin.as_str()).or_default().push(r);
+        }
+    }
+    for rounds in orphan_rounds.values() {
+        // The LIVE round wins the dedupe: `buildConsoleBoard` drops a finished review's chip (the
+        // orphan ticket has no card to fold it onto) while `runningRuns` draws the live round as
+        // its own Running row, so the one unit the tally reports must be the live round's bucket.
+        // Picking the newest round instead put a finished orphan in a finished lane while the body
+        // drew the live row in Running — the header/body disagreement this ticket removes, in the
+        // branch trap 4 added. With no live round, the newest finished round decides, as before
+        // (`runs` is newest-first).
+        let picked = rounds
+            .iter()
+            .copied()
+            .find(|r| live.contains(r.issue_id.as_str()))
+            .or_else(|| rounds.first().copied());
+        let Some(picked) = picked else {
+            continue;
+        };
+        // Only the PICKED round is marked counted. A non-picked round is always a finished one (the
+        // live round wins when there is one), and a finished round never enters the live overlay, so
+        // it can never be billed again. A SECOND live round, though, is a second Running row the
+        // board draws — `runningRuns` renders one row per live review run — so it must be left for
+        // the overlay below to count. Marking every round here swallowed that row, and the orphan
+        // lane then disagreed with the folded case, which counts each live review as its own unit.
+        counted.insert(picked.issue_id.as_str());
+        // The lifecycle is keyed by the store's ISSUE ID, which only a real ticket row has. An
+        // orphan review resolves no lifecycle, so it carries none and the client falls back to the
+        // run outcome exactly as the board does for a card it cannot decorate. Its key stays the
+        // REVIEW's OWN, though, so `review_run` survives: a finished review means the review
+        // finished (`done`), never that a ticket is owed one (`review`). Bucketing the orphan under
+        // its ticket's identifier dropped that bit and read every finished orphan as In Review —
+        // the same header/card disagreement this ticket removes.
+        let outcome = if live.contains(picked.issue_id.as_str()) {
+            OUTCOME_RUNNING
+        } else {
+            picked.outcome.as_str()
+        };
+        *buckets
+            .entry(status_key(&picked.issue_id, outcome, &lifecycles))
+            .or_insert(0) += 1;
+    }
+    // Every ordinary stored row (a ticket, not a review) is one bucket. A stored row always lands
+    // in its lifecycle's bucket, held or not: a hold that has run keeps the run's lane on the
+    // console (its card is in Review, sub-labelled "held for a human"), so the strip must count it
+    // there. Only a hold with NO stored row is reclassified, below, in `held_for_human`.
+    //
+    // The lane is the RUN's, not the lifecycle's (STUDIO-965 trap 2): a ticket with a live run
+    // counts in Running even when its tracker state says In Review, because that is where the board
+    // draws its card (`boardLaneOf`). The live override is what makes the two agree.
+    for r in &runs {
+        if review::is_review_key(&r.issue_id) {
+            continue;
+        }
+        let card = r.issue_identifier.as_str();
+        if card.is_empty() || !counted.insert(card) {
+            continue;
+        }
+        let outcome = if live.contains(card) {
             OUTCOME_RUNNING
         } else {
             r.outcome.as_str()
@@ -501,9 +663,21 @@ pub(crate) async fn handle_issue_counts(
         .iter()
         .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
         .count() as i64;
+    // Every budget-held TICKET that is not live AND has no stored row — the never-ran hold the
+    // console synthesizes a Queued card for (STUDIO-970). A budget hold that has run keeps its
+    // stored row's bucket, so the join is by identity rather than assumed absent. A hold beside a
+    // live run is not billed again either, but the `!live` guard is DEFENSIVE rather than
+    // load-bearing: the live-work loop above already inserted every non-empty live identifier into
+    // `counted`, so `!counted` alone would exclude it. It is kept only to read like the human hold's
+    // filter beside it (the dispatcher releases the hold before dispatch — `release_budget_hold` on
+    // the dispatch path — and the console keeps a running row live rather than queued).
+    let budget_held = budget_held
+        .iter()
+        .filter(|id| !live.contains(id.as_str()) && !counted.contains(id.as_str()))
+        .count() as i64;
     write_json(
         StatusCode::OK,
-        &issue_counts_response(&buckets, held_for_human),
+        &issue_counts_response(&buckets, held_for_human, budget_held),
     )
 }
 
@@ -952,9 +1126,9 @@ mod tests {
         EventRecord, IssueKey, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
     };
     use rhapsody_store::{
-        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, OUTCOME_STOPPED, ReviewWatchKey,
-        ReviewWatchRow, RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError,
-        StorePath,
+        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, OUTCOME_FAILED, OUTCOME_STOPPED,
+        ReviewWatchKey, ReviewWatchRow, RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store,
+        StoreError, StorePath,
     };
     use serde_json::{Value, json};
 
@@ -2126,6 +2300,11 @@ mod tests {
     // The failure mode is a SILENTLY empty result rather than an error a console can show, which is
     // why this is pinned rather than left to the filter's one-line obviousness: with the filter
     // gone, nothing here would fail except this assertion.
+    //
+    // STUDIO-965 — the review run also no longer reaches the buckets. It has no watch row, so the
+    // origin join names no ticket; the board drops such a row (it is not work, and there is no card
+    // for it to belong to), so the tally must drop it too or the header would count a card the lane
+    // can never draw. The lifecycle filter is what this test is really for, and it still holds.
     #[tokio::test]
     async fn issue_counts_keep_a_ticketless_review_id_out_of_the_tracker_batches() {
         let store = mem_store();
@@ -2154,11 +2333,402 @@ mod tests {
         );
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([
-                ("completed/-/review_run".to_string(), 1),
-                ("completed/done".to_string(), 1),
-            ]),
-            "the review run is counted, marked as its own kind, and the ticket keeps its answer",
+            std::collections::HashMap::from([("completed/done".to_string(), 1)]),
+            "the ticketless review is not a card: only the ticket is counted: {body}",
+        );
+        assert_eq!(
+            body["issues"], 1,
+            "the tally covers the card the board draws: {body}"
+        );
+    }
+
+    // STUDIO-965 — an UNATTRIBUTED run (`issue_identifier == ""`) is not a card: the console groups
+    // by identifier and `buildConsoleBoard` skips a row it cannot name, so the tally must skip it
+    // too. This is the same "count what the board draws" rule as the review fold; before the fold
+    // landed, such a row was counted and inflated the header with a card no lane can draw.
+    // MUTATION: drop the `card.is_empty() ||` guard and this reds with a `completed/-` bucket.
+    #[tokio::test]
+    async fn issue_counts_skip_a_run_with_no_identifier() {
+        let store = mem_store();
+        seed_run_for("iss_anon", "", "2026-08-01T00:00:00Z", &store);
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::new(),
+            "a row the board cannot name is not a card: {body}",
+        );
+        assert_eq!(body["issues"], 0, "{body}");
+    }
+
+    // STUDIO-965 — a ticket with a LIVE run and no stored row still absorbs its own reviews. The
+    // snapshot is the ticket's card (`buildConsoleBoard` draws it from the snapshot alone), so the
+    // review folds onto it and must not also count as an orphan, which would bill the strip twice.
+    // MUTATION: drop the `live_work` → `card_idents` insert and this reds with a second bucket.
+    #[tokio::test]
+    async fn issue_counts_a_live_ticket_with_no_row_absorbs_its_reviews() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#160@alice";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 160, "alice", "handoff:STUDIO-777");
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-777"));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+            "the live ticket is the card; its review is a chip on it: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 defect 1, and its trap 2. `buildConsoleBoard` folds a ticket's review rows onto
+    // its ONE card as chips, so the tally must count the ticket once no matter how many reviews it
+    // carries. Before this fix each review row was a distinct `pr:` key and each failed one billed
+    // the strip a `blocked`/`queued` job the board could never draw in Queued — the operator's
+    // "Queued 4, only 1 actual card". MUTATION: drop the fold (count every stored row as before)
+    // and this reds with three `failed/…/review_run` buckets beside the ticket's one.
+    #[tokio::test]
+    async fn issue_counts_fold_a_review_run_into_the_ticket_it_reviews() {
+        let store = mem_store();
+        seed_run_for("iss_done", "STUDIO-9", "2026-08-01T00:00:00Z", &store);
+        for (number, who) in [(147, "alice"), (148, "jimmy"), (149, "sol")] {
+            let key = format!("pr:makewhatis/rhapsody#{number}@{who}");
+            let id = store
+                .start_run(RunStart {
+                    issue_id: key.clone(),
+                    issue_identifier: key.clone(),
+                    started_at: "2026-08-01T01:00:00Z".into(),
+                    ..Default::default()
+                })
+                .expect("start review run");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_FAILED.into(),
+                        ended_at: "2026-08-01T01:00:00Z".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("end review run");
+            seed_watch(&store, number, who, "handoff:STUDIO-9");
+        }
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_done".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/done".to_string(), 1)]),
+            "three failed reviews of one Done ticket are three chips, not three blocked jobs: {body}",
+        );
+        assert_eq!(
+            body["issues"], 1,
+            "the ticket is the board's unit, so it is counted exactly once: {body}",
+        );
+    }
+
+    // STUDIO-965 trap 4. A review row whose ticket has NO stored row at all — an adopted pull
+    // request whose ticket never ran in this daemon — must not vanish from the tally: the board
+    // cannot draw the ticket (there is no row), so the header counts it and the lane reports the
+    // honest "not among the jobs loaded" gap. It is counted once, under the review's OWN key so
+    // `review_run` survives: a finished review reads `done`, not the `review` a completed ticket
+    // would mean. MUTATION: bucket it under the ticket's identifier (`status_key(card, …)`) and this
+    // reds with `completed/-`, which the client paints as In Review — the phantom the ticket exists
+    // to remove.
+    #[tokio::test]
+    async fn issue_counts_count_a_review_whose_ticket_has_no_row_under_the_ticket() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#150@alice";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 150, "alice", "adopt:STUDIO-838");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/-/review_run".to_string(), 1)]),
+            "the orphan review counts once, keeping its review_run bit: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 trap 2 applied to trap 4: several review ROUNDS of one ticket that never ran are
+    // still one card. The rounds are grouped and reduced to the one row that decides its bucket, so
+    // three orphan reviews count once, not three times. MUTATION: count every round of the orphan
+    // instead of reducing the group to the picked one and this reds with three `review_run` units.
+    #[tokio::test]
+    async fn issue_counts_fold_several_review_rounds_of_one_orphan_into_one() {
+        let store = mem_store();
+        for (number, who, started, outcome) in [
+            (150, "alice", "2026-08-01T01:00:00Z", OUTCOME_FAILED),
+            (151, "jimmy", "2026-08-01T02:00:00Z", OUTCOME_FAILED),
+            (152, "sol", "2026-08-01T03:00:00Z", OUTCOME_COMPLETED),
+        ] {
+            let key = format!("pr:makewhatis/rhapsody#{number}@{who}");
+            let id = store
+                .start_run(RunStart {
+                    issue_id: key.clone(),
+                    issue_identifier: key.clone(),
+                    started_at: started.into(),
+                    ..Default::default()
+                })
+                .expect("start review run");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: outcome.into(),
+                        ended_at: started.into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("end review run");
+            seed_watch(&store, number, who, "adopt:STUDIO-838");
+        }
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/-/review_run".to_string(), 1)]),
+            "three rounds of one orphan ticket are one card, the newest row deciding it: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 — the orphan case, but LIVE. A live review run is in the snapshot too, so the live
+    // overlay would count its `pr:` key a second time on top of the card it already stands in for.
+    // It must be exactly one unit either way (the operator sees one Running row), and the bucket
+    // keeps the review's own key so the client paints it `reviewing` rather than an ordinary run.
+    #[tokio::test]
+    async fn issue_counts_count_a_live_review_with_no_ticket_row_exactly_once() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#151@alice";
+        store
+            .start_run(RunStart {
+                issue_id: key.to_string(),
+                issue_identifier: key.to_string(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start review run");
+        seed_watch(&store, 151, "alice", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row(key));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
+            "the live orphan review is one card, not also a run of its own: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 trap 4, mixed ordering. An orphan ticket (a review row whose origin has no stored
+    // row) with an OLDER live review round and a NEWER finished one is still ONE unit, and it
+    // counts in the LIVE round's lane: `buildConsoleBoard` drops the finished review's chip (there
+    // is no card to fold it onto) and `runningRuns` draws the live round as its own Running row.
+    // Deduping by the newest round alone let the finished round claim the card, then the live
+    // overlay counted the live round again — two units, one of them in a lane the board cannot
+    // draw: the header/body disagreement this ticket removes, in the branch trap 4 added.
+    // MUTATION: pick the newest round regardless of `live` and this reds with a second bucket.
+    #[tokio::test]
+    async fn issue_counts_an_orphan_with_a_live_round_counts_once_in_running() {
+        let store = mem_store();
+        // The older round is still in flight; the newer one finished. Same adopted ticket, no row.
+        let live_key = "pr:makewhatis/rhapsody#151@alice";
+        store
+            .start_run(RunStart {
+                issue_id: live_key.to_string(),
+                issue_identifier: live_key.to_string(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start live review run");
+        let done_key = "pr:makewhatis/rhapsody#152@sol";
+        let done_id = store
+            .start_run(RunStart {
+                issue_id: done_key.to_string(),
+                issue_identifier: done_key.to_string(),
+                started_at: "2026-08-01T01:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start finished review run");
+        store
+            .end_run(
+                done_id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: "2026-08-01T01:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end finished review run");
+        seed_watch(&store, 151, "alice", "adopt:STUDIO-838");
+        seed_watch(&store, 152, "sol", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row(live_key));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
+            "the live round is the one the board draws; the finished one is a chip it drops: {body}",
+        );
+        assert_eq!(body["issues"], 1, "{body}");
+    }
+
+    // STUDIO-965 — a quorum of two live review rounds on one orphan ticket is TWO Running rows.
+    // `runningRuns` renders one row per live review run and `buildConsoleBoard` drops their chips
+    // (there is no parent card to fold them onto), so the lane body draws two units. The orphan
+    // branch reduces a ticket's rounds to the one round that represents it, but a live round is
+    // drawn on its own, so only the PICKED round may be marked counted: the other live round is a
+    // row of its own and the overlay below must bill it. Marking every round swallowed it and the
+    // orphan lane read one where the board drew two. MUTATION: mark every round of the orphan
+    // counted and this reds with a single Running unit.
+    #[tokio::test]
+    async fn issue_counts_count_each_live_round_of_an_orphan_ticket() {
+        let store = mem_store();
+        let alice = "pr:makewhatis/rhapsody#151@alice";
+        let sol = "pr:makewhatis/rhapsody#152@sol";
+        store
+            .start_run(RunStart {
+                issue_id: alice.to_string(),
+                issue_identifier: alice.to_string(),
+                started_at: "2026-08-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start alice's live review run");
+        store
+            .start_run(RunStart {
+                issue_id: sol.to_string(),
+                issue_identifier: sol.to_string(),
+                started_at: "2026-08-01T01:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start sol's live review run");
+        seed_watch(&store, 151, "alice", "adopt:STUDIO-838");
+        seed_watch(&store, 152, "sol", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        // A real review run's snapshot row carries the `pr:` key as BOTH its id and its identifier
+        // (`ReviewRun::synthetic_issue`), which is what keeps `review_run` on its bucket.
+        for key in [alice, sol] {
+            let mut row = running_row(key);
+            row.issue_id = key.to_string();
+            snap.running.push(row);
+        }
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-/review_run".to_string(), 2)]),
+            "one Running row per live review run, as the lane body draws them: {body}",
+        );
+        assert_eq!(body["issues"], 2, "{body}");
+    }
+
+    // STUDIO-965 B2. A `rhapsody:human` hold that has NEVER RUN is a Queued card the console
+    // synthesizes, and its reviews fold onto that card as chips — so the held ticket's identifier is
+    // one of the tickets that HAS a card of its own and the orphan branch must not claim it. Leaving
+    // the held set out of `card_idents` made the review an orphan and billed a `completed` review
+    // bucket with no card behind it, while the board drew one Queued held card — a regression from
+    // `main` for the Queued lane. MUTATION: drop the held identifiers from `card_idents` and this
+    // reds with a `completed/-/review_run` bucket beside the held card the board actually draws.
+    #[tokio::test]
+    async fn issue_counts_a_held_never_run_ticket_absorbs_its_review() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#150@alice";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 150, "alice", "adopt:STUDIO-838");
+        let mut snap = empty_snapshot();
+        snap.held_for_human
+            .push(rhapsody_orchestrator::dispatch::HeldForHuman {
+                issue_identifier: "STUDIO-838".into(),
+                title: "wire the stores".into(),
+                project: "booch".into(),
+            });
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["held_for_human"], 1,
+            "the held card is counted where the board draws it: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::new(),
+            "the review folds onto the held card and adds no bucket: {body}",
+        );
+        assert_eq!(body["issues"], 0, "{body}");
+    }
+
+    // STUDIO-965 defect 2. A ticket with a live run counts in Running even when its tracker state
+    // reads In Review, because that is where `boardLaneOf` draws its card: the run outranks the
+    // stale lifecycle. The live override is the thing that keeps the tally and the card in one
+    // lane, and this pins it against a bucket key that carries the lifecycle too.
+    // MUTATION: bucket the row by its lifecycle (drop the `live.contains` override) and this reds
+    // with `completed/in_review`.
+    #[tokio::test]
+    async fn issue_counts_bucket_a_live_ticket_by_its_run_not_its_lifecycle() {
+        let store = mem_store();
+        seed_run_for("iss_live", "STUDIO-963", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-963"));
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_live".to_string(),
+                    IssueLifecycleRow {
+                        state: "In Review".into(),
+                        lifecycle: IssueLifecycle::InReview,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/in_review".to_string(), 1)]),
+            "the run decides the lane; the lifecycle only decorates the key: {body}",
         );
     }
 
@@ -2348,6 +2918,175 @@ mod tests {
         assert!(
             body.get("held_for_human").is_none(),
             "no second queued for a ticket the daemon is running: {body}",
+        );
+    }
+
+    /// One ticket budget hold, with only the fields the tally reads spelled out.
+    fn budget_hold(subject: &str, pr: &str) -> rhapsody_orchestrator::budget::BudgetHeld {
+        rhapsody_orchestrator::budget::BudgetHeld {
+            subject: subject.into(),
+            title: "meter spend per provider".into(),
+            project: "rhapsody".into(),
+            provider: "anthropic".into(),
+            daily_tokens: 200_000_000,
+            spent_tokens: 361_000_000,
+            pr: pr.into(),
+        }
+    }
+
+    // STUDIO-970 — a ticket the dispatcher REFUSED for a spent provider budget has never run, so it
+    // has no stored row and the console synthesizes a Queued card for it. The daemon reports it once
+    // in `budget_held`, which the client adds to queued, and NOT in `held_for_human`: the hold clears
+    // at local midnight, not by a person, and telling an operator otherwise sends them looking for
+    // work that does not exist. MUTATION: fold the budget hold into `held_for_human` and the key
+    // assertion reds.
+    #[tokio::test]
+    async fn issue_counts_reclassify_a_never_run_budget_hold_as_queued() {
+        let store = mem_store();
+        seed_run_for("iss_other", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_other".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["budget_held"], 1,
+            "the never-ran budget hold is reported once, by the count the client adds to queued: {body}",
+        );
+        assert!(
+            body.get("held_for_human").is_none(),
+            "a budget hold is not a human hold: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/done".to_string(), 1)]),
+            "only the stored row is in the buckets: {body}",
+        );
+    }
+
+    // STUDIO-970 — a budget hold on a ticket that HAS run keeps its stored row's bucket, exactly as
+    // a human hold does: the console's card stays in the run's lane wearing the budget as a
+    // sub-label, so the strip must not add a second queued for it. MUTATION: reclassify every hold
+    // rather than only the never-ran one and this reds with `budget_held` present beside the bucket.
+    #[tokio::test]
+    async fn issue_counts_keep_a_non_live_budget_hold_that_has_run_in_its_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-970", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(
+            FakeProvider::ok(snap)
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_held".to_string(),
+                    IssueLifecycleRow {
+                        state: "In Review".into(),
+                        lifecycle: IssueLifecycle::InReview,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/in_review".to_string(), 1)]),
+            "a budget hold that has run keeps its bucket: {body}",
+        );
+        assert!(
+            body.get("budget_held").is_none(),
+            "and is NOT billed a second time in queued: {body}",
+        );
+    }
+
+    // STUDIO-970 — a budget hold beside a LIVE run must not be billed a second time: the dispatcher
+    // releases the hold before it dispatches, so the console keeps the ticket as a live Running row
+    // and the ticket's own running session already fills its bucket. The sibling of the live human
+    // hold above, and the budget half of "the daemon does not hold what it is running". MUTATION:
+    // drop the budget filter entirely (or its `!counted` term) and this reds with `budget_held` = 1
+    // beside the running bucket. The `!live` term alone is redundant — the live-work loop above
+    // already counted this ticket — so no test can isolate it; the comment on the filter says so.
+    #[tokio::test]
+    async fn issue_counts_keep_a_live_budget_hold_in_its_running_bucket() {
+        let store = mem_store();
+        seed_run_for("iss_held", "STUDIO-970", "2026-08-01T00:00:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("STUDIO-970"));
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+            "the live ticket fills its running bucket: {body}",
+        );
+        assert!(
+            body.get("budget_held").is_none(),
+            "no second queued hold for a ticket the daemon is running: {body}",
+        );
+    }
+
+    // STUDIO-970 — a REVIEW budget hold names a pull request coordinate and is surfaced by the
+    // reconciliation sweep. It is not a console card, so the tally must not bill it as a Queued
+    // ticket. MUTATION: drop the `h.pr.is_empty()` filter and this reds with `budget_held` = 1.
+    #[tokio::test]
+    async fn issue_counts_ignore_a_review_budget_hold() {
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold(
+            "pr:makewhatis/rhapsody#199@alice",
+            "makewhatis/rhapsody#199",
+        ));
+        let base = spawn(FakeProvider::ok(snap)).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.get("budget_held").is_none(),
+            "a review hold is the sweep's surface, not a ticket card: {body}",
+        );
+        assert_eq!(tally(&body), std::collections::HashMap::new(), "{body}");
+    }
+
+    // STUDIO-965 B2's shape, for the budget hold: a never-ran budget-held ticket is a Queued card the
+    // console synthesizes, so its reviews must fold onto that card and not become an orphan bucket.
+    // MUTATION: drop the budget identifiers from `card_idents` and this reds with a
+    // `completed/-/review_run` bucket beside the budget card the board actually draws.
+    #[tokio::test]
+    async fn issue_counts_a_budget_held_never_run_ticket_absorbs_its_review() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#150@alice";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 150, "alice", "adopt:STUDIO-970");
+        let mut snap = empty_snapshot();
+        snap.budget_held.push(budget_hold("STUDIO-970", ""));
+        let provider = Arc::new(FakeProvider::ok(snap).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["budget_held"], 1,
+            "the budget card is counted where the board draws it: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::new(),
+            "the review folds onto the budget card and adds no bucket: {body}",
         );
     }
 
