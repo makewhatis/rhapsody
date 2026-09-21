@@ -94,6 +94,15 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("stopped")).toBe("queued");
   });
 
+  // STUDIO-967 — a run stopped at its per-run token ceiling needs a person, exactly as a failure
+  // does: the daemon halted the ticket deliberately and the reconciliation sweep reports it rather
+  // than resuming it. Folding it into the default `queued` would hide the operator's cue.
+  it("maps a token-ceiling stop onto blocked, like a failure", () => {
+    expect(consoleJobStatus("token_ceiling")).toBe("blocked");
+    expect(consoleJobStatus("token_ceiling", "open")).toBe("blocked");
+    expect(needsOperator("blocked", "token_ceiling")).toBe(true);
+  });
+
   // STUDIO-702 — the ticket's real state outranks the run outcome. Without it every completed run
   // read as "in review" forever, however long ago the ticket merged.
   it("prefers the ticket's lifecycle over the run outcome", () => {

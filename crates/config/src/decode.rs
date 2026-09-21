@@ -129,6 +129,9 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // behaviour. A default of 0 would be ambiguous with an explicit 0, so the raw `Option`
         // carries through and the reader treats ≤ 0 as unset.
         max_concurrent_reviews: r.agent.max_concurrent_reviews,
+        // STUDIO-967: `0 = unlimited`, matching `max_concurrent_agents`' idiom — an unset or
+        // non-positive key must bound nothing, so the reader only acts on `> 0`.
+        max_run_tokens: or_int(r.agent.max_run_tokens, 0),
         max_turns: or_int(r.agent.max_turns, 20),
         max_retry_backoff_ms: or_int(r.agent.max_retry_backoff_ms, 300000),
         max_concurrent_agents_by_state: normalize_state_map(r.agent.max_concurrent_agents_by_state),
@@ -612,6 +615,10 @@ mod tests {
             c.agent.max_concurrent_reviews, None,
             "STUDIO-950: an install that never writes the key keeps the shared review budget"
         );
+        assert_eq!(
+            c.agent.max_run_tokens, 0,
+            "STUDIO-967: an unset per-run token ceiling is unlimited, never a finite default"
+        );
         assert_eq!(c.agent.max_turns, 20);
         assert_eq!(c.agent.max_retry_backoff_ms, 300000);
         assert_eq!(c.agent.handoff_drain_grace_ms, 10000);
@@ -644,6 +651,35 @@ mod tests {
 
         let absent = decode_yaml("agent:\n  max_concurrent_agents: 4\n", "body");
         assert_eq!(absent.agent.max_concurrent_reviews, None);
+    }
+
+    // STUDIO-967: `agent.max_run_tokens` is Rhapsody-only and `0 = unlimited`. Absent ⇒ 0 (bound
+    // nothing); present ⇒ carried verbatim, including a negative the reader also treats as unset.
+    #[test]
+    fn decode_max_run_tokens_defaults_to_zero_and_is_verbatim() {
+        assert_eq!(
+            decode_yaml("", "body").agent.max_run_tokens,
+            0,
+            "absent ⇒ 0"
+        );
+
+        let c = decode_yaml("agent:\n  max_run_tokens: 2500000\n", "body");
+        assert_eq!(
+            c.agent.max_run_tokens, 2_500_000,
+            "an explicit ceiling is carried verbatim"
+        );
+
+        let explicit_zero = decode_yaml("agent:\n  max_run_tokens: 0\n", "body");
+        assert_eq!(
+            explicit_zero.agent.max_run_tokens, 0,
+            "an explicit 0 is the same unlimited key"
+        );
+
+        let negative = decode_yaml("agent:\n  max_run_tokens: -5\n", "body");
+        assert_eq!(
+            negative.agent.max_run_tokens, -5,
+            "decode is verbatim; the reader treats a non-positive value as unlimited"
+        );
     }
 
     // STUDIO-974: the PR-state watcher's clock is a Rhapsody-only key beside `polling.interval_ms`.

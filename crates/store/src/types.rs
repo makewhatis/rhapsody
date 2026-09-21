@@ -23,6 +23,13 @@ pub const OUTCOME_STOPPED: &str = "stopped";
 pub const OUTCOME_FAILED: &str = "failed";
 /// daemon died mid-segment; boot recovery may continue the job
 pub const OUTCOME_INTERRUPTED: &str = "interrupted";
+/// The run exceeded its configured per-run token ceiling and was stopped mid-turn (STUDIO-967).
+/// **Rhapsody-only**, beyond Go's six-value set — the v4->v5 migration never produces it, and Go has
+/// no such bound. It is a distinct value on purpose: a ceiling stop is neither a run that failed nor
+/// one an operator stopped nor one the daemon was interrupted on, and borrowing any of those labels
+/// would be a lie in the history table. The console's `runOutcomeLabel` prints an unrecognised
+/// outcome verbatim, so this reads as itself everywhere.
+pub const OUTCOME_TOKEN_CEILING: &str = "token_ceiling";
 
 // --- claim states (claims.state) -------------------------------------------------------------
 

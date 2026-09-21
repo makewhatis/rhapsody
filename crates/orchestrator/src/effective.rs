@@ -181,6 +181,10 @@ pub struct Effective {
     pub claim_ttl: Duration,
     pub claim_settle_delay: Duration,
     pub max_turns: i64,
+    /// The per-run token ceiling (STUDIO-967), `0` when unset. A positive value stops a run that has
+    /// accumulated this many billed tokens within the turn it is in; `0` bounds nothing. The reader
+    /// ([`crate::agentupdate`]) gates on `> 0`, so an unset key is byte-identical to before it.
+    pub max_run_tokens: i64,
     pub max_retry_backoff_ms: i64,
     pub poll_interval: Duration,
     pub stall_timeout: Duration,
@@ -685,6 +689,8 @@ pub fn build_effective_with_runner(
         // global half, opt-in by construction so an existing install schedules identically).
         max_concurrent_reviews: cfg.agent.max_concurrent_reviews.filter(|n| *n > 0),
         max_turns: cfg.agent.max_turns,
+        // STUDIO-967: verbatim; the reader treats `0` (the default) as unlimited.
+        max_run_tokens: cfg.agent.max_run_tokens,
         max_retry_backoff_ms: cfg.agent.max_retry_backoff_ms,
         poll_interval: Duration::from_millis(cfg.polling.interval_ms.max(0) as u64),
         stall_timeout: stall,
@@ -792,6 +798,28 @@ claude:
                 .max_concurrent_reviews,
             None,
             "≤ 0 is unset, not a zero-slot pool that would starve every review"
+        );
+    }
+
+    /// STUDIO-967: `agent.max_run_tokens` reaches `Effective` verbatim, and `0` (the default) stays
+    /// `0` — the reader treats it as unlimited, so it must NOT be normalized into a finite bound.
+    #[test]
+    fn build_effective_carries_max_run_tokens() {
+        assert_eq!(
+            build_effective(&decode_cfg(CLAUDE_WF, "x"))
+                .expect("build")
+                .max_run_tokens,
+            0,
+            "absent ⇒ unlimited"
+        );
+
+        let set = decode_cfg(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\nagent:\n  max_run_tokens: 2500000\n",
+            "x",
+        );
+        assert_eq!(
+            build_effective(&set).expect("build").max_run_tokens,
+            2_500_000
         );
     }
 

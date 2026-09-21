@@ -178,6 +178,117 @@ impl Orchestrator {
         if turn_boundary && let Some(re) = self.running.get(&e.issue_id) {
             self.persist_progress(re);
         }
+        // STUDIO-967: enforce the per-run token ceiling on the freshly folded usage. This is the one
+        // place a run's live spend is visible ON the control task (assistant notifications carry the
+        // in-flight estimate, result events the authoritative per-turn total), which is what makes
+        // the bound a STOP rather than a report. An unset ceiling returns immediately.
+        self.enforce_run_token_ceiling(&e.issue_id);
+    }
+
+    /// Stops a run whose live spend has reached the configured per-run token ceiling (STUDIO-967).
+    ///
+    /// A positive `agent.max_run_tokens` bounds a single run's spend WITHIN its turn, which none of
+    /// the round-counting bounds do. It acts on the run IN FLIGHT — deliberately, unlike STUDIO-957's
+    /// per-provider daily budget, which refuses NEW dispatch: that rule's "do not kill an in-flight
+    /// run" protects a run that is innocent of the budget, whereas here the run IS the runaway, and
+    /// the 44.7M tokens already spent are the argument FOR stopping rather than against. The spend is
+    /// the committed total across finished turns plus the current turn's in-flight estimate
+    /// (`cur_total_tokens`, cumulative-within-a-turn and last-wins), so the check sees a single
+    /// monster turn as it grows rather than only after it ends.
+    ///
+    /// The stop is `terminate` — SIGKILL the agent's process tree — and it deliberately leaves the
+    /// WORKSPACE and its branch intact, so work the run already committed survives. The run records
+    /// its own outcome ([`store::OUTCOME_TOKEN_CEILING`]) with a reason naming the ceiling and the
+    /// spend, so it is distinguishable in the history table from `failed`, `interrupted` and
+    /// `stopped`; the claim/retry rows are dropped and the key is added to `claimed`, so the daemon
+    /// does not immediately re-dispatch the work and burn the ceiling again with nothing to show. The
+    /// reconciliation sweep reports the held ticket (`author_token_ceiling_stopped`) and the held
+    /// review row (`review_token_ceiling_stopped`), so a human decides what to do with it — an
+    /// unexplained halt would be exactly the silent stall this feature must not become.
+    ///
+    /// A ticketless review run is bounded by the same ceiling: it is a run like any other, and the
+    /// review half is where much of the spend lives. Its watch row is parked `truncated` (the same
+    /// disposition a `max_turns` backstop gives a round that delivered no verdict) AND its `pr:` key
+    /// is held, exactly as an author's ticket is. Without the hold the watcher would re-offer the same
+    /// head on its next tick and re-burn a whole ceiling on a read that just failed to fit; with the
+    /// hold the head is offered but the dispatch refuses it as in-flight. That held row is what the
+    /// sweep names, so the round is not silently re-run and the stop is not silent either. Raising
+    /// the ceiling (or a restart, which drops the in-memory hold) resumes it.
+    ///
+    /// `0` (the default) bounds nothing and returns before any state is touched, which is what keeps
+    /// an install that never configures the key byte-identical to one built before it existed.
+    fn enforce_run_token_ceiling(&mut self, issue_id: &str) {
+        let Some(limit) = self
+            .eff
+            .as_ref()
+            .map(|eff| eff.max_run_tokens)
+            .filter(|n| *n > 0)
+        else {
+            return;
+        };
+        let spent = match self.running.get(issue_id) {
+            Some(re) => re.total_tokens.saturating_add(re.cur_total_tokens),
+            None => return,
+        };
+        if spent < limit {
+            return;
+        }
+        // The stop below records a TERMINAL outcome and drops the entry, which is only honest if the
+        // kill is actually deliverable: on an unarmed `CancelSignal`, `terminate`'s `cancel()` is a
+        // silent no-op (STUDIO-840), so the agent would keep spending while this daemon reported it
+        // stopped — now invisible to this very ceiling. `handle_stop_run` refuses the same shape; do
+        // the same rather than report a kill that did not happen. Every production dispatch arms the
+        // signal, so this is unreachable in a live daemon.
+        if let Some(re) = self.running.get(issue_id)
+            && !re.cancel.is_armed()
+        {
+            tracing::error!(
+                issue_id = %issue_id,
+                issue_identifier = %re.issue.identifier,
+                run_id = re.run_id,
+                spent_tokens = spent,
+                max_run_tokens = limit,
+                "token ceiling reached but this run has no armed cancellation, so its agent cannot \
+                 be killed; refusing to record a stop that would not deliver"
+            );
+            return;
+        }
+        let Some(re) = self.terminate(issue_id) else {
+            return;
+        };
+        tracing::warn!(
+            issue_id = %issue_id,
+            issue_identifier = %re.issue.identifier,
+            run_id = re.run_id,
+            spent_tokens = spent,
+            max_run_tokens = limit,
+            "run exceeded its per-run token ceiling; stopping it (the workspace is left intact)"
+        );
+        // A review row would otherwise sit `in_flight` with no live run, which the watcher reads as
+        // a CRASH. Park it `truncated` instead — the honest disposition for a round that ended
+        // without delivering a verdict — so the sweep and the watcher both name it correctly.
+        if let Some(run) = re.review.as_ref() {
+            self.record_review_truncated(run);
+        }
+        // The reason names both numbers, so a history reader can see how far past the bound the run
+        // went without cross-referencing the config file.
+        let reason = format!(
+            "stopped at its per-run token ceiling: {spent} tokens spent against \
+             agent.max_run_tokens={limit}"
+        );
+        self.completed.remove(issue_id);
+        self.persist_end_run(&re, store::OUTCOME_TOKEN_CEILING, &reason);
+        self.persist_totals();
+        self.persist_complete(&re.issue.identifier);
+        // Suppress this session's re-dispatch of the work — the ticket, or the `pr:` key of a
+        // stopped review round. The claim is deliberately in-memory only: `persist_complete` above
+        // dropped the durable claim row, so a restart's ordinary selection re-offers the work once
+        // an operator has raised the ceiling or reshaped the ticket. The sweep names the held
+        // ticket (`author_token_ceiling_stopped`) or the held review row
+        // (`review_token_ceiling_stopped`); a `pr:` claim has no `on_review_exit` to clear it (the
+        // entry is already gone, so the worker's exit is a no-op), which is exactly why the sweep
+        // must report it rather than leaving it silent.
+        self.claimed.insert(issue_id.to_string());
     }
 }
 
@@ -188,9 +299,12 @@ mod tests {
         EVENT_NOTIFICATION, EVENT_SESSION_STARTED, EVENT_TURN_COMPLETED, EVENT_TURN_FAILED, Event,
         Usage,
     };
+    use std::sync::Arc;
 
     use super::*;
-    use crate::testsupport::{issue, running_entry};
+    use crate::testsupport::{
+        empty_effective, empty_resolved_project, issue, orch_with_store, running_entry,
+    };
 
     fn orch_with_running(id: &str) -> Orchestrator {
         let mut o = Orchestrator::new("WORKFLOW.md");
@@ -655,6 +769,287 @@ mod tests {
         assert_eq!(
             o.running["1"].pgid, 777,
             "capture must not be gated on session_started"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // STUDIO-967 — the per-run token ceiling.
+    // ---------------------------------------------------------------------------------------------
+
+    /// An orchestrator with an in-memory store and an `Effective` carrying `limit` as its
+    /// `agent.max_run_tokens`. `limit == 0` is the unset key.
+    fn orch_with_ceiling(limit: i64) -> (Orchestrator, Arc<dyn store::Store + Send + Sync>) {
+        let (mut o, st) = orch_with_store();
+        let mut eff = empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+        eff.max_run_tokens = limit;
+        o.eff = Some(eff);
+        (o, st)
+    }
+
+    /// One assistant notification carrying a billed cumulative-within-turn total — the live
+    /// mid-turn signal the ceiling watches.
+    fn live_usage(total: i64) -> Event {
+        notification(Some(Usage {
+            input_tokens: total,
+            total_tokens: total,
+            ..Default::default()
+        }))
+    }
+
+    fn first_run(st: &(dyn store::Store + Send + Sync)) -> store::RunSummary {
+        st.list_runs(store::RunFilter::default())
+            .expect("list runs")
+            .into_iter()
+            .next()
+            .expect("one run row")
+    }
+
+    /// Arms a running entry's cancellation, as every real dispatch does. The ceiling REFUSES to
+    /// record a stop it cannot deliver on an unarmed signal (STUDIO-840's rule), so any test that
+    /// expects a stop must arm it — the default [`running_entry`] fixture is deliberately unarmed.
+    fn armed(mut re: crate::orchestrator::RunningEntry) -> crate::orchestrator::RunningEntry {
+        re.cancel = crate::CancelSignal::new();
+        re
+    }
+
+    // ⚠️ STUDIO-967 mutation discipline: an unset ceiling must bound NOTHING. The mutation this pins
+    // is a default of some finite number — with `agent.max_run_tokens` left at 0, a run that has
+    // accumulated a colossal spend must keep running and record no terminal outcome.
+    #[test]
+    fn unset_ceiling_bounds_nothing() {
+        let (mut o, st) = orch_with_ceiling(0);
+        let mut re = running_entry(issue("ID-1", "MT-1", "In Progress"), "", "");
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-1".into(), re);
+
+        update(&mut o, "ID-1", live_usage(44_743_645));
+
+        assert!(
+            o.running.contains_key("ID-1"),
+            "an unset ceiling must never stop a run"
+        );
+        assert_eq!(
+            first_run(st.as_ref()).outcome,
+            store::OUTCOME_RUNNING,
+            "the run must keep its running outcome"
+        );
+    }
+
+    // Acceptance: reconstruct the STUDIO-957 shape. Its run was ONE turn that reached 44.7M tokens
+    // in 42 minutes and stayed green because every shipped bound counts rounds. Here a single
+    // in-flight turn (a live usage notification, no turn boundary ever seen) crosses the ceiling and
+    // the run stops.
+    #[test]
+    fn studio_957_single_turn_past_the_ceiling_stops() {
+        let (mut o, st) = orch_with_ceiling(2_000_000);
+        let mut re = armed(running_entry(
+            issue("ID-1", "STUDIO-957", "In Progress"),
+            "",
+            "",
+        ));
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-1".into(), re);
+
+        update(&mut o, "ID-1", live_usage(44_743_645));
+
+        assert!(
+            !o.running.contains_key("ID-1"),
+            "a single turn past the ceiling must stop"
+        );
+        let run = first_run(st.as_ref());
+        assert_eq!(
+            run.total_tokens, 44_743_645,
+            "the spend that triggered the stop is recorded on the run"
+        );
+        assert!(
+            run.error.contains("max_run_tokens"),
+            "the reason must name the ceiling, got {:?}",
+            run.error
+        );
+    }
+
+    // ⚠️ Acceptance + mutation discipline: the stop is its OWN outcome. Reusing `failed`,
+    // `stopped`, `interrupted` or `completed` is a lie in the history table (a ceiling stop is none
+    // of those), so this pins the distinct value AND its distinctness from each borrowed label.
+    #[test]
+    fn ceiling_stop_records_its_own_outcome() {
+        let (mut o, st) = orch_with_ceiling(1_000);
+        let mut re = armed(running_entry(issue("ID-1", "MT-1", "In Progress"), "", ""));
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-1".into(), re);
+
+        update(&mut o, "ID-1", live_usage(5_000));
+
+        let outcome = first_run(st.as_ref()).outcome;
+        assert_eq!(outcome, store::OUTCOME_TOKEN_CEILING);
+        for borrowed in [
+            store::OUTCOME_FAILED,
+            store::OUTCOME_STOPPED,
+            store::OUTCOME_INTERRUPTED,
+            store::OUTCOME_COMPLETED,
+        ] {
+            assert_ne!(outcome, borrowed, "must not borrow {borrowed}");
+        }
+    }
+
+    // The stop halts THIS session's re-dispatch of the ticket (a fresh dispatch would re-burn the
+    // ceiling with nothing to show), drops the claim/retry rows, and keeps the branch: nothing here
+    // removes a workspace, and the sweep is what surfaces it to a human.
+    //
+    // ⚠️ STUDIO-967 mutation discipline: the ticket is NOT pre-seeded into `claimed`, so the
+    // `claimed.contains` assertion below is what pins the hold. Delete
+    // `self.claimed.insert(issue_id.to_string())` from `enforce_run_token_ceiling` and this reds —
+    // the ticket would be re-dispatched on the very next selection.
+    #[test]
+    fn ceiling_stop_holds_the_ticket_and_drops_its_claim() {
+        let (mut o, st) = orch_with_ceiling(1_000);
+        let mut re = armed(running_entry(issue("ID-1", "MT-1", "In Progress"), "", ""));
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-1".into(), re);
+        assert!(
+            !o.claimed.contains("ID-1"),
+            "nothing is held before the stop"
+        );
+
+        update(&mut o, "ID-1", live_usage(5_000));
+
+        assert!(
+            o.claimed.contains("ID-1"),
+            "the ceiling stop must hold the ticket"
+        );
+        assert!(!o.running.contains_key("ID-1"));
+        let rec = st.load_recovery().expect("load recovery");
+        assert!(
+            rec.retries.is_empty() && rec.claims.is_empty(),
+            "claim/retry rows must be dropped: {rec:?}"
+        );
+    }
+
+    // The other half of STUDIO-840's rule: a stop that cannot deliver must NOT be recorded. An
+    // unarmed `CancelSignal` makes `terminate`'s `cancel()` a silent no-op, so recording
+    // `token_ceiling` and dropping the entry would report a kill that never happened while the agent
+    // kept spending. Refuse the whole stop — the entry stays running and unrecorded.
+    #[test]
+    fn a_ceiling_stop_is_refused_when_the_signal_is_unarmed() {
+        let (mut o, st) = orch_with_ceiling(1_000);
+        let mut re = running_entry(issue("ID-1", "MT-1", "In Progress"), "", "");
+        assert!(!re.cancel.is_armed(), "the fixture defaults to unarmed");
+        o.persist_start_run(&mut re, 0);
+        o.running.insert("ID-1".into(), re);
+
+        update(&mut o, "ID-1", live_usage(5_000));
+
+        assert!(
+            o.running.contains_key("ID-1"),
+            "a stop that cannot be delivered must be refused, not recorded"
+        );
+        assert!(!o.claimed.contains("ID-1"), "a refused stop holds nothing");
+        assert_eq!(
+            first_run(st.as_ref()).outcome,
+            store::OUTCOME_RUNNING,
+            "the run must not be recorded terminal"
+        );
+    }
+
+    // Acceptance: review runs are subject to the SAME ceiling as author runs — half the spend is
+    // reviews. The mutation this pins is applying the ceiling only to author runs.
+    //
+    // It also pins what the stop DOES to a review, which alice's review at d60ff4a found unpinned:
+    // the run is stopped, its watch row is parked `truncated` (the head owes a review), AND its
+    // `pr:` key is held in `claimed`, so the next `dispatch_review` of the same head is refused
+    // `AlreadyInFlight` rather than re-offered to re-burn a whole ceiling.
+    #[test]
+    fn a_review_run_is_subject_to_the_same_ceiling() {
+        use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
+
+        let (mut o, st) = orch_with_ceiling(1_000);
+        // Teams ON and a project owning the PR's repo, so `dispatch_review` reaches its overwrite
+        // guard rather than stopping at the Teams gate.
+        let tracker: Arc<dyn rhapsody_tracker::Tracker> =
+            Arc::new(rhapsody_tracker::fake::Fake::new());
+        let mut proj = empty_resolved_project("rhapsody", tracker);
+        proj.repo = "git@github.com:makewhatis/rhapsody.git".to_string();
+        o.eff.as_mut().expect("eff").projects = vec![proj];
+        o.set_store(Arc::clone(&st));
+        o.teams = Some(Teams {
+            enabled: true,
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: Vec::new(),
+                bank: String::new(),
+                max_concurrent: 0,
+            }],
+            ..Teams::disabled()
+        });
+
+        let key = "pr:makewhatis/rhapsody#12@alice";
+        let mut run = crate::review::ReviewRun {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 12,
+            reviewer: "alice".to_string(),
+            author: "bob".to_string(),
+            team_id: "T".to_string(),
+            repo_url: "git@github.com:makewhatis/rhapsody.git".to_string(),
+            head_sha: "deadbeef".to_string(),
+            introduced_by: "handoff".to_string(),
+            prior_sha: String::new(),
+        };
+        let watch_key = run.watch_key();
+        // The watch row the dispatch would have created, so `record_review_truncated` has a row to
+        // park (it is an UPDATE; without this it would silently touch nothing).
+        o.store()
+            .save_review_watch(store::ReviewWatchRow {
+                key: watch_key.clone(),
+                author: "bob".to_string(),
+                introduced_by: "handoff".to_string(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: store::REVIEW_STATUS_REQUESTED.to_string(),
+                open: true,
+            })
+            .expect("seed the watch row");
+        o.store()
+            .mark_review_requested(&watch_key, "deadbeef")
+            .expect("requested");
+        let mut re = armed(running_entry(issue(key, key, "In Progress"), "", ""));
+        re.review = Some(run.clone());
+        o.persist_start_run(&mut re, 0);
+        o.running.insert(key.to_string(), re);
+
+        update(&mut o, key, live_usage(5_000));
+
+        assert!(
+            !o.running.contains_key(key),
+            "a review run must be stopped by the same ceiling"
+        );
+        assert_eq!(first_run(st.as_ref()).outcome, store::OUTCOME_TOKEN_CEILING);
+        assert!(
+            o.claimed.contains(key),
+            "the stopped review's key must be held so the watcher cannot re-burn the ceiling"
+        );
+        assert_eq!(
+            o.store()
+                .get_review_watch(&watch_key)
+                .expect("read watch row")
+                .expect("a row was parked")
+                .status,
+            rhapsody_store::REVIEW_STATUS_TRUNCATED,
+            "the round is owed again, so the head stays owed rather than recorded as read"
+        );
+
+        // The held key is what the dispatch guard reads: the next sweep's offer of this head must
+        // be refused, not dispatched a second time.
+        run.head_sha = "cafebabe".to_string();
+        assert_eq!(
+            o.dispatch_review(run),
+            crate::review::ReviewDispatchOutcome::AlreadyInFlight,
+            "a held review key must refuse the next dispatch, not re-run it"
         );
     }
 }

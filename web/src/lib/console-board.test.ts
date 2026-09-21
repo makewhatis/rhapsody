@@ -3,6 +3,7 @@ import type { BlockedEntry } from "@/lib/api";
 import type { ConsoleJobRow } from "@/lib/console-jobs";
 import {
   type BoardLane,
+  BOARD_ACTIVE_OUTCOMES,
   boardLaneTally,
   buildConsoleBoard,
   boardLaneOf,
@@ -16,6 +17,13 @@ import {
 // review row (`review_run` true, `review_of` naming its ticket) is folded onto the card as a chip.
 
 let nextKey = 0;
+
+// STUDIO-967 — a ceiling-stopped run belongs to the board's ACTIVE fetch. It is a non-terminal
+// ticket's newest run (the daemon holds the ticket and the sweep reports it), so without it here the
+// card would drop out of every active lane and vanish while it waits for a human.
+it("fetches token-ceiling-stopped tickets as active", () => {
+  expect(BOARD_ACTIVE_OUTCOMES).toContain("token_ceiling");
+});
 
 const cards = (board: BoardLane[]) => board.flatMap((l) => l.cards);
 const laneIssues = (board: BoardLane[], id: BoardLane["id"]) =>
