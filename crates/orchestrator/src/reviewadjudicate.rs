@@ -218,6 +218,15 @@ impl Adjudication {
     /// head move carried no new work — the diff against the base is byte-identical to the one the
     /// verdict was made against — and a move that changed nothing does not re-open the decision.
     ///
+    /// **The proof must cover the ADJUDICATED head, not merely any head.** `unchanged_from` lists
+    /// individual historical reviewed SHAs whose patch matches the new head; it is not a PR-wide
+    /// statement. `handle_review_head_advanced` carries only the rows whose own
+    /// `last_reviewed_sha` appears in it, so a single matching row can be carried while an
+    /// unmatched row is re-armed and still owes a review of the new head. Reading a non-empty list
+    /// as proof for the whole decision would suppress that owed row. A `Ship` therefore survives
+    /// the move only when the head it was made at is itself proven unchanged to the new head
+    /// (`unchanged_from` contains [`Self::head`]).
+    ///
     /// Only a [`Verdict::Ship`] can stop governing. An [`Adjudication::Escalate`] names a HUMAN as
     /// the next actor; resuming it on a push the author made themselves would mean the escalation
     /// never reaches that human, so an escalation governs however far the head moves.
@@ -229,7 +238,11 @@ impl Adjudication {
             Adjudication::InFlight { .. } => true,
             // A push the author made themselves must never cancel a human escalation.
             Adjudication::Escalate { .. } => true,
-            Adjudication::Ship { .. } => self.head() == head || !unchanged_from.is_empty(),
+            // The decision's own head, or a no-op move that PROVES that head is what the branch now
+            // carries. Any other non-empty list is a partial proof for some other row's history.
+            Adjudication::Ship { .. } => {
+                self.head() == head || unchanged_from.iter().any(|old| old == self.head())
+            }
         }
     }
 
@@ -1201,12 +1214,19 @@ mod tests {
     // ── STUDIO-971: a decision governs only the head it was made at ──────────────────────────────
 
     /// **Acceptance.** A `ship` decision applies to the head the loop stopped at and to a no-op head
-    /// move (STUDIO-960's `unchanged_from`), and to nothing else. An escalation governs however far
-    /// the head moves — it named a human, and a push the author made themselves must not cancel it.
+    /// move that PROVES that same head (STUDIO-960's `unchanged_from`), and to nothing else. An
+    /// escalation governs however far the head moves — it named a human, and a push the author made
+    /// themselves must not cancel it.
+    ///
+    /// **The partial-proof case is the load-bearing one.** `unchanged_from` proves individual rows'
+    /// histories; a list that does not contain the adjudicated head is not proof the decision's head
+    /// is what the branch carries. Treating any non-empty list as PR-wide proof suppresses an
+    /// unmatched row's owed review, so `["other"]` must NOT govern a `Ship` at `"aaa"`.
     ///
     /// MUTATION: make `governs` return `true` unconditionally (gate on `settled()` alone) and the
     /// `governs("bbb", &[])` case below reds; make it ignore `unchanged_from` and the
-    /// `unchanged_from == ["aaa"]` case reds.
+    /// `unchanged_from == ["aaa"]` case reds; accept any non-empty `unchanged_from` and the
+    /// `unchanged_from == ["other"]` case reds.
     #[test]
     fn a_ship_decision_governs_only_the_head_it_was_made_at() {
         let ship = Adjudication::Ship {
@@ -1221,6 +1241,15 @@ mod tests {
         assert!(
             ship.governs("bbb", &["aaa".to_string()]),
             "a no-op head move carries the decision forward (STUDIO-960)"
+        );
+        assert!(
+            !ship.governs("bbb", &["other".to_string()]),
+            "a proof for a DIFFERENT head's history does not carry the decision — one matching row \
+             must not suppress an unmatched row's owed round"
+        );
+        assert!(
+            !ship.governs("bbb", &["other".to_string(), "another".to_string()]),
+            "nor does a list of proofs that still does not cover the adjudicated head"
         );
 
         let escalated = Adjudication::Escalate {
