@@ -116,6 +116,11 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
       return "review";
     case "failed":
     case "waiting":
+      // STUDIO-967: a run stopped at its per-run token ceiling needs a person, exactly as a failure
+      // does — the daemon halted the ticket deliberately and the reconciliation sweep reports it
+      // rather than resuming it. Folding it into the default `queued` would hide the one thing the
+      // operator has to act on.
+    case "token_ceiling":
       return "blocked";
     default:
       return "queued";

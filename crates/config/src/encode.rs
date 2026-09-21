@@ -113,6 +113,11 @@ fn raw_from_config(c: &Config) -> Raw {
     // STUDIO-950: emit only when set; `prune_empty` drops the `None` so an untouched workflow
     // round-trips without the key (and stays byte-identical to the pre-key config).
     r.agent.max_concurrent_reviews = c.agent.max_concurrent_reviews;
+    // STUDIO-967: emit only when a ceiling is set, so an install that never writes the key
+    // round-trips byte-identically to before it existed (like `max_concurrent_reviews` above).
+    if c.agent.max_run_tokens != 0 {
+        r.agent.max_run_tokens = Some(c.agent.max_run_tokens);
+    }
     r.agent.max_turns = Some(c.agent.max_turns);
     r.agent.max_retry_backoff_ms = Some(c.agent.max_retry_backoff_ms);
     r.agent.handoff_drain_grace_ms = Some(c.agent.handoff_drain_grace_ms);
@@ -613,6 +618,40 @@ mod tests {
             "an unset key must not be materialized"
         );
         assert_eq!(re_encode_decode(&absent).agent.max_concurrent_reviews, None);
+    }
+
+    // STUDIO-967: `agent.max_run_tokens` is Rhapsody-only and unset ⇒ 0 (unlimited), deliberately
+    // kept out of `effective_json` for the Go golden. The console's typed Save is the only path that
+    // can carry a set ceiling back to disk, so Encode must write back what Decode read — and an
+    // untouched workflow must materialize nothing.
+    #[test]
+    fn max_run_tokens_survives_an_encode_decode_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n\
+             agent:\n  max_concurrent_agents: 4\n  max_run_tokens: 2500000\n",
+            "body",
+        );
+        assert_eq!(c1.agent.max_run_tokens, 2_500_000);
+        let def = encode(&c1).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_run_tokens"),
+            Some(&Value::from(2_500_000i64)),
+            "a set ceiling must be emitted so a Settings save does not drop it"
+        );
+        assert_eq!(re_encode_decode(&c1).agent.max_run_tokens, 2_500_000);
+
+        // An untouched workflow (never wrote the key) materializes nothing — unlimited.
+        let absent = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n",
+            "body",
+        );
+        let def = encode(&absent).expect("encode");
+        assert_eq!(
+            nested(&def.config, "agent", "max_run_tokens"),
+            None,
+            "an unset key must not be materialized"
+        );
+        assert_eq!(re_encode_decode(&absent).agent.max_run_tokens, 0);
     }
 
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.
