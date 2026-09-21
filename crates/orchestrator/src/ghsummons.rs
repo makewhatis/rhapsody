@@ -1501,6 +1501,25 @@ pub trait PrStateSource: Send + Sync {
         number: i64,
         allow: &HeadAllowlist,
     ) -> PrStateResult;
+
+    /// The same lookup, but REQUIRED to ask GitHub afresh rather than answer from a conditional
+    /// cache (STUDIO-974).
+    ///
+    /// The watcher's per-observation pre-dispatch re-read (STUDIO-953) exists because acting on a
+    /// head observed earlier in the tick is the failure it was written for, so it must not be
+    /// served from an `If-None-Match` store that says "unchanged" about a head an author may have
+    /// just pushed past. A source that does no caching (the `gh`-subprocess [`GH`]) cannot satisfy
+    /// this differently from [`pr_state`](Self::pr_state), so the default simply delegates; the
+    /// conditional REST source overrides it to send no `If-None-Match`.
+    async fn pr_state_unconditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        allow: &HeadAllowlist,
+    ) -> PrStateResult {
+        self.pr_state(owner, repo, number, allow).await
+    }
 }
 
 /// The `gh` failure messages that mean "this pull request is not there", as opposed to "the lookup

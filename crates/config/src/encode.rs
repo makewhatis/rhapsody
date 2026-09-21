@@ -94,6 +94,11 @@ fn raw_from_config(c: &Config) -> Raw {
     }
 
     r.polling.interval_ms = Some(c.polling.interval_ms);
+    // STUDIO-974 (Rhapsody-only): emit only when it differs from the 120s default, so an
+    // installation that never sets the key round-trips byte-identically to before it existed.
+    if c.polling.pr_state_interval_ms != crate::model::DEFAULT_PR_STATE_INTERVAL_MS {
+        r.polling.pr_state_interval_ms = Some(c.polling.pr_state_interval_ms);
+    }
 
     r.workspace.root = c.workspace.root.clone();
 

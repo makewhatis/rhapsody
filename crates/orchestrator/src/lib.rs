@@ -55,6 +55,7 @@ pub mod message;
 pub mod obslog;
 pub mod orchestrator;
 pub mod persist;
+pub mod prconditional;
 pub mod preflight;
 pub mod prlink;
 pub mod promote;

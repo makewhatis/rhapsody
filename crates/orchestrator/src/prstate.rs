@@ -436,6 +436,11 @@ mod tests {
     /// `gh` parks the watcher's next tick and leaves the control task ticking. It re-resolves the
     /// pull request rather than reusing the sweep's observation ON PURPOSE: the merge is
     /// irreversible and the observation is already a tick old by the time it is acted on.
+    ///
+    /// `prconditional.rs` (STUDIO-974) is the conditional REST transport the watcher's sweep and
+    /// its STUDIO-953 pre-dispatch re-read are served from. It holds no `Orchestrator` either, and
+    /// is reached only from `reviewwatch.rs`'s own task (wired at the composition root), so a slow
+    /// HTTP round-trip parks that task and leaves the control task ticking.
     const OFF_LOOP_CALLERS: &[&str] = &[
         "prstate.rs",
         "ghsummons.rs",
@@ -443,6 +448,7 @@ mod tests {
         "runmerge.rs",
         "rundiff.rs",
         "runautomerge.rs",
+        "prconditional.rs",
     ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one

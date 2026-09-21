@@ -545,6 +545,13 @@ pub struct ReviewWatchDeps {
     /// this feature, so a daemon that cannot ask (or an installation that never wires it) loses the
     /// saving and never the review.
     pub diff_source: Option<Arc<dyn ReviewDiffSource>>,
+    /// How often to sweep, in milliseconds, read fresh each tick (STUDIO-974). A shared atomic
+    /// rather than a copied value so a hot reload of `polling.pr_state_interval_ms` applies on the
+    /// next tick without respawning the task. Defaults to the historical pinned
+    /// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL), so an install that never
+    /// writes the key is byte-identical; `<= 0` falls back to that same default rather than a busy
+    /// loop.
+    pub poll_interval_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Re-reads one OPEN observation's head once, off-loop, immediately before that observation is
@@ -591,7 +598,7 @@ async fn refresh_observed_head(
         return obs;
     }
     match src
-        .pr_state(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
+        .pr_state_unconditional(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
         .await
     {
         Ok(lookup) => PrObservation {
@@ -686,8 +693,26 @@ async fn unchanged_reviewed_shas(
     unchanged
 }
 
-/// Polls the watch set on [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) until
-/// `ctx` is cancelled.
+/// The effective watcher cadence in milliseconds, read fresh from the shared atomic (STUDIO-974).
+/// `<= 0` (unset, or a direct test construction that did not bother with the field) falls back to
+/// the pinned [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) rather than a
+/// zero-millisecond busy loop.
+fn poll_interval(deps: &ReviewWatchDeps) -> i64 {
+    let ms = deps
+        .poll_interval_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if ms > 0 {
+        ms
+    } else {
+        crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64
+    }
+}
+
+/// Polls the watch set on the configured `polling.pr_state_interval_ms` (default
+/// [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)) until `ctx` is cancelled.
+///
+/// The interval is read from [`ReviewWatchDeps::poll_interval_ms`] at the TOP of each tick, so a hot
+/// reload of the key applies on the next sleep without respawning this task.
 ///
 /// Sleeps BEFORE its first tick, deliberately: the daemon's own boot recovery has to load config
 /// and rebuild `running` first, and a tick that arrived before either would refuse everything and
@@ -700,7 +725,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         return;
     };
     tracing::info!(
-        interval_secs = crate::prstate::PR_STATE_POLL_INTERVAL.as_secs(),
+        interval_ms = poll_interval(&deps),
         "ticketless review watcher started (off-loop; the control task is never blocked on gh)"
     );
     // Where this tick starts in the watch list. The list comes back in a STABLE order (owner, repo,
@@ -710,9 +735,12 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
     // CALLER's to keep, and this is where it is kept.
     let mut cursor = 0usize;
     loop {
+        // Re-read each iteration: the value is hot-reloadable, so a change applies on the NEXT
+        // sleep. `<= 0` is the unset/invalid case and falls back to the pinned default.
+        let interval_ms = poll_interval(&deps);
         tokio::select! {
             _ = ctx.cancelled() => return,
-            () = tokio::time::sleep(crate::prstate::PR_STATE_POLL_INTERVAL) => {}
+            () = tokio::time::sleep(std::time::Duration::from_millis(interval_ms as u64)) => {}
         }
         let prs = deps.sink.watched().await;
         if prs.is_empty() {
@@ -3044,6 +3072,35 @@ mod tests {
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HEAD_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    /// The watcher cadence a test's [`ReviewWatchDeps`] starts with: the pinned default, so the
+    /// paused-clock tests that advance [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL)
+    /// still observe exactly one tick per interval (STUDIO-974).
+    fn test_poll_interval() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+            crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64,
+        ))
+    }
+
+    /// STUDIO-974: the watcher reads its cadence from the shared atomic each tick, and a
+    /// non-positive stored value (unset, or a direct construction that skipped the field) falls back
+    /// to the pinned default rather than a zero-millisecond busy loop.
+    #[test]
+    fn poll_interval_reads_the_shared_atomic() {
+        let deps = |ms: i64| ReviewWatchDeps {
+            pr_source: None,
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice"]),
+            sink: Arc::new(FakeSink::default()),
+            diff_source: None,
+            poll_interval_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(ms)),
+        };
+        assert_eq!(poll_interval(&deps(5_000)), 5_000);
+        assert_eq!(
+            poll_interval(&deps(0)),
+            crate::prstate::PR_STATE_POLL_INTERVAL.as_millis() as i64
+        );
+    }
 
     fn ident(name: &str, max_concurrent: i64) -> Identity {
         Identity {
@@ -8867,6 +8924,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FailingSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: Arc::new(FakeSink {
@@ -8894,6 +8952,86 @@ mod tests {
         );
     }
 
+    /// A [`PrStateSource`] that records which entry point the watcher used, so a test can prove the
+    /// pre-dispatch re-read bypasses any conditional cache (STUDIO-974).
+    struct MethodRecordingSource {
+        saw_unconditional: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PrStateSource for MethodRecordingSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: Some(false),
+                head_sha: HEAD_B.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
+            }))
+        }
+
+        async fn pr_state_unconditional(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            self.saw_unconditional.fetch_add(1, Ordering::SeqCst);
+            self.pr_state(owner, repo, number, allow).await
+        }
+    }
+
+    /// STUDIO-974 + STUDIO-953: the per-observation pre-dispatch re-read must go through
+    /// `pr_state_unconditional`, because a conditional source would otherwise answer a cached
+    /// "unchanged" and hide a head an author pushed after the sweep. Mutation check: point
+    /// `refresh_observed_head` back at `src.pr_state(..)` and this reds.
+    #[tokio::test]
+    async fn the_pre_dispatch_re_read_bypasses_a_conditional_cache() {
+        let saw = Arc::new(AtomicUsize::new(0));
+        let src = MethodRecordingSource {
+            saw_unconditional: Arc::clone(&saw),
+        };
+        let obs = PrObservation {
+            pr: coord(12),
+            lookup: PrLookup::Found(PrSnapshot {
+                is_draft: Some(false),
+                head_sha: HEAD_A.to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+                merge_state: String::new(),
+            }),
+            unchanged_from: Vec::new(),
+        };
+
+        let out = refresh_observed_head(
+            &crate::control_loop::CancelWait::default(),
+            &ticketless(&["alice"]),
+            &src,
+            &HeadAllowlist::none(),
+            obs,
+        )
+        .await;
+
+        assert_eq!(
+            saw.load(Ordering::SeqCst),
+            1,
+            "the re-read must use the unconditional entry point"
+        );
+        match out.lookup {
+            PrLookup::Found(snap) => assert_eq!(snap.head_sha, HEAD_B),
+            other => panic!("expected the fresh head, got {other:?}"),
+        }
+    }
+
     /// The task's whole shape: it asks the control task what to poll, asks GitHub about exactly
     /// that, and hands the answers back — never touching the store or the orchestrator itself.
     #[tokio::test(start_paused = true)]
@@ -8905,6 +9043,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: Arc::new(FakeSink {
@@ -9025,6 +9164,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FixedHeadSource(HEAD_B))),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             sink: Arc::new(FakeSink {
                 watched: vec![watched],
@@ -9113,6 +9253,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: Arc::new(FakeSink {
@@ -9174,6 +9315,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: Arc::new(FakeSink {
@@ -9213,6 +9355,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: teams_with(false, ReviewMode::Ticketless, vec![ident("bob", 0)]),
             diff_source: None,
             sink: Arc::new(FakeSink {
@@ -9479,6 +9622,7 @@ mod tests {
                 rest: HEAD_B.to_string(),
             })),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: sink.clone(),
@@ -9643,6 +9787,7 @@ mod tests {
                 later: 13,
             })),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: sink.clone(),
@@ -9690,6 +9835,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             })),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
             sink: sink.clone(),
@@ -9793,6 +9939,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
             diff_source: None,
             sink: sink.clone(),
@@ -9925,6 +10072,7 @@ mod tests {
         let deps = ReviewWatchDeps {
             pr_source: Some(Arc::new(FakeSource)),
             allow: HeadAllowlist::none(),
+            poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
             diff_source: None,
             sink: sink.clone(),

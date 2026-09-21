@@ -116,7 +116,22 @@ pub struct Tracker {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Polling {
     pub interval_ms: i64,
+    /// How often the off-loop ticketless-review watcher re-asks GitHub where each watched pull
+    /// request stands, in milliseconds. Rhapsody-only (no Go v0.4.0 counterpart, STUDIO-974):
+    /// defaulted in [`decode`](crate::decode) to 120_000 — today's pinned constant — so an
+    /// installation that sets nothing is byte-identical to before the key existed.
+    ///
+    /// Deliberately NOT surfaced in the `GET /api/v1/config` view ([`crate::effective_json`]): doing
+    /// so would inject a key the frozen Go reference never emits and break the config goldens (the
+    /// `mcp.allow_handoff` pattern). The watcher reads it through the orchestrator's atomic mirror,
+    /// which a hot reload refreshes.
+    pub pr_state_interval_ms: i64,
 }
+
+/// The default of [`Polling::pr_state_interval_ms`], matching the historical pinned constant
+/// `rhapsody_orchestrator::prstate::PR_STATE_POLL_INTERVAL` (120s). Held here so `decode` and the
+/// orchestrator's boot default cannot drift.
+pub const DEFAULT_PR_STATE_INTERVAL_MS: i64 = 120_000;
 
 /// Workspace root (Go `Workspace`; `root` normalized in Resolve, kept raw here).
 #[derive(Debug, Clone, PartialEq)]
@@ -491,6 +506,9 @@ pub(crate) struct RawTracker {
 #[serde(default)]
 pub(crate) struct RawPolling {
     pub interval_ms: Option<i64>,
+    /// STUDIO-974; Rhapsody-only (no Go v0.4.0 counterpart). `Option` so `decode` can tell an
+    /// explicit value from unset and apply the 120s default.
+    pub pr_state_interval_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

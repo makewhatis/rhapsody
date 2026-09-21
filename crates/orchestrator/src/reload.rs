@@ -208,6 +208,15 @@ impl Orchestrator {
         self.retention_days.store(retention, Ordering::Relaxed);
         // Mark retention as loaded so the prune scheduler's startup cycle stops using the New default.
         self.retention_loaded.store(true, Ordering::Relaxed);
+        // Mirror polling.pr_state_interval_ms into the atomic the off-loop review watcher reads
+        // (STUDIO-974). Stored on every (re)load so a hot-reloaded cadence applies. `<= 0` falls back
+        // to the 120s default rather than a zero-millisecond busy loop.
+        let interval = if cfg.polling.pr_state_interval_ms > 0 {
+            cfg.polling.pr_state_interval_ms
+        } else {
+            rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS
+        };
+        self.pr_state_interval_ms.store(interval, Ordering::Relaxed);
         Ok(())
     }
 
@@ -408,6 +417,51 @@ Do {{ issue.identifier }}.
             o.eff.as_ref().unwrap().max_turns,
             good_max,
             "an invalid reload must keep the last-good effective config"
+        );
+    }
+
+    /// STUDIO-974: the ticketless PR-state watcher's cadence hot-reloads with WORKFLOW.md. Unset ⇒
+    /// the historical 120s default (byte-identical to before the key existed); a set value applies
+    /// on `on_reload`; a non-positive value falls back to the default rather than a busy loop.
+    #[test]
+    fn reload_applies_the_pr_state_interval() {
+        let (path, _dir) = write_workflow(CLAUDE_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+        assert_eq!(
+            o.current_pr_state_interval_ms(),
+            120_000,
+            "an install that never writes the key keeps the pinned 120s watcher clock"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  interval_ms: 1234",
+                "  interval_ms: 1234\n  pr_state_interval_ms: 10000",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.current_pr_state_interval_ms(),
+            10000,
+            "a hot-reloaded cadence must apply without a restart"
+        );
+
+        std::fs::write(
+            &path,
+            CLAUDE_WF.replace(
+                "  interval_ms: 1234",
+                "  interval_ms: 1234\n  pr_state_interval_ms: 0",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            o.current_pr_state_interval_ms(),
+            120_000,
+            "a non-positive cadence falls back to the default, not a zero-millisecond loop"
         );
     }
 

@@ -56,6 +56,11 @@ tokio = { version = "1", features = ["sync", "time", "rt", "process"] }
 # Already in Cargo.lock via config/store/core; no new external crate enters the tree.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# reqwest: STUDIO-974's conditional PR-state transport talks to GitHub's REST API directly, because
+# the `gh` CLI cannot send `If-None-Match` or read a response ETag — the whole point of the change.
+# Already in Cargo.lock (config/tracker/mcp depend on it) with the same feature set the tracker uses,
+# so no new crate enters the tree.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 
 [dev-dependencies]
 # harness-fixtures (test-only): the O4 snapshot-shape cross-check renders a snapshot through
