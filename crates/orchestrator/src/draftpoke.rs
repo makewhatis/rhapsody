@@ -47,7 +47,7 @@
 //! * [`MAX_DRAFT_POKES`] pokes — the bound for an author who keeps pushing without ever publishing.
 //!   The ledger remembers only the head poked LAST, so this counts attempts, not distinct heads: a
 //!   force-push back to an earlier head is a fresh poke, and `A → B → A` spends the whole budget.
-//! * [`MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head — the bound for the shape that
+//! * [`MAX_DRAFT_POKE_UNANSWERED`] of WALL CLOCK at the SAME head — the bound for the shape that
 //!   actually happens (booch#537 never moved its head). A done-nothing author would otherwise be
 //!   poked once and then heard from never again, which is the parking this ticket's title names.
 //!
@@ -64,7 +64,7 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rhapsody_config::room::{Message, RoomLog};
 
 use crate::ghsummons::PrCommentSink;
@@ -80,25 +80,31 @@ use crate::triage::MANAGER_IDENTITY;
 /// repeating itself at a human is noise.
 pub const MAX_DRAFT_POKES: usize = 3;
 
-/// How many CONSECUTIVE watcher sweeps the SAME poked head may stay a draft before the daemon stops
-/// poking and asks a human.
+/// How long — by WALL CLOCK — the SAME poked head may stay a draft before the daemon stops poking
+/// and asks a human.
 ///
 /// This is the second bound, and it is the one that makes the human backstop reachable in the shape
 /// the ticket was filed for. [`MAX_DRAFT_POKES`] is only ever reached by a head that MOVES (the
 /// consecutive rule suppresses a repeat of the head last poked), so an author who does nothing —
 /// the head never moves — would be poked once and then heard from never again, and the pull request
-/// would park exactly as makewhatis/booch#537 did. A draft that stays at one head across this many
-/// sweeps is not an author mid-push; it is an author who is not coming.
+/// would park exactly as makewhatis/booch#537 did. A draft that stays at one head for this long
+/// after the poke is not an author mid-push; it is an author who is not coming.
 ///
-/// Thirty sweeps was about an hour when the watcher's cadence was the pinned 120s
-/// ([`crate::prstate::PR_STATE_POLL_INTERVAL`]) and EVERY WATCHED PULL REQUEST ANSWERED EVERY TICK.
-/// STUDIO-974 made that cadence a hot-reloadable config key defaulting to 15s, so the same thirty
-/// sweeps is now about eight minutes at the default — the wall-clock grace this bound was sized for
-/// shrank with the tick, and re-scaling the sweep count is a decision for the maintainer rather than
-/// a silent one here. The count still advances only on a sweep that actually observed this pull
-/// request, and the watcher asks about a bounded number of coordinates per tick on a rotating cursor,
-/// so a larger watch set or a flaky `gh` makes the grace a floor rather than a promise.
-pub const MAX_DRAFT_POKE_SWEEPS: usize = 30;
+/// WALL CLOCK, not a sweep count (STUDIO-974, jimmy's review). The bound used to be thirty watcher
+/// SWEEPS, which was about an hour only while the cadence was the pinned 120s
+/// ([`crate::prstate::PR_STATE_POLL_INTERVAL`]). STUDIO-974 made that cadence a hot-reloadable
+/// config key defaulting to 15s, so the same thirty sweeps shrank the grace to about eight minutes —
+/// short enough to escalate a poked author whose re-engaged run was still working. Measuring elapsed
+/// time instead makes the grace independent of the tick: it is an hour however fast the watcher runs,
+/// which is exactly one hour at the old 120s cadence and therefore the behaviour this bound always
+/// meant.
+///
+/// The window opens at the poke and RESTARTS only on evidence the author is acting: a moved head is
+/// a fresh poke with a fresh window ([`DraftPokeState::poked_head`]), and a live author run
+/// re-anchors it ([`crate::reviewwatch`]'s `plan_draft_poke`), because the grace is for an author
+/// who has STOPPED, not one mid-fix. GitHub being unable to answer for the coordinate does not
+/// restart it: the author was poked and has had the wall clock.
+pub const MAX_DRAFT_POKE_UNANSWERED: Duration = Duration::hours(1);
 
 /// One pull request the daemon must poke: a run has finished, and its pull request is still a draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,11 +162,11 @@ pub struct DraftPokeState {
     /// How many times this pull request has been poked — ATTEMPTS, not distinct heads. The ledger
     /// remembers only the head poked last, so `A → B → A` reaches three here with two distinct heads.
     pub pokes: usize,
-    /// How many CONSECUTIVE sweeps the [`Self::poked_head`] has been observed still a draft since it
-    /// was poked. Reset when the head moves (a new head is a fresh poke); never advanced while the
-    /// author's run is live; and never advanced on a tick GitHub could not answer, since an unstated
-    /// `isDraft` is not an observation. The escalation fires at [`MAX_DRAFT_POKE_SWEEPS`].
-    pub unanswered_sweeps: usize,
+    /// When the unanswered window for [`Self::poked_head`] opened. Set when the head is poked, and
+    /// re-anchored while the author's run is live, so a long re-engaged run does not spend the
+    /// grace. The escalation fires once the elapsed time reaches [`MAX_DRAFT_POKE_UNANSWERED`];
+    /// `None` before the first poke. A moved head is a fresh poke and re-anchors it.
+    pub unanswered_since: Option<DateTime<Utc>>,
     /// Whether the human escalation has already been made. Once true, this pull request is silent
     /// until it stops being a draft.
     ///

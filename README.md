@@ -1722,9 +1722,11 @@ re-engaged run a review's findings reopened) is never poked.
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` pokes — an attempt counter, not a
 distinct-head counter: the ledger remembers only the head poked last, so `A → B → A` reaches the
 bound on two distinct heads. An author who does nothing at all — booch#537 never moved its head — is
-bounded by `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps at the same head (thirty, about an hour at the
-two-minute poll when every watched pull request answers every tick; the clock counts observations, so
-a larger watch set or a flaky `gh` makes an hour a floor). Either bound stops the poking and
+bounded by `MAX_DRAFT_POKE_UNANSWERED` of WALL CLOCK at the same head (one hour). The window opens at
+the poke, reopens when the head moves, and is re-anchored while the author's run is live, so the grace
+is the same hour whether the watcher ticks every 15s or every 120s — the earlier sweep count shrank
+with the tick once the cadence became configurable. GitHub being unable to answer for the coordinate
+does not restart it. Either bound stops the poking and
 ESCALATES to a human. Without the second axis an ignored draft at a fixed head would get exactly one
 comment and then silence forever, which is the parking this feature exists to end.
 

@@ -1229,7 +1229,7 @@ impl Orchestrator {
                     // STUDIO-962: a finished run's pull request left in draft gets its author
                     // poked, once per head, before the review dispatch below — the two are
                     // independent and a draft may still owe a round.
-                    self.plan_draft_poke(&rows, &obs.pr, snap, &mut report);
+                    self.plan_draft_poke(&rows, &obs.pr, snap, swept_now, &mut report);
                     self.service_review_pr(
                         &rows,
                         &obs.pr,
@@ -1324,14 +1324,20 @@ impl Orchestrator {
     /// The poking is bounded on two axes (STUDIO-962, jimmy's round-1 finding): after
     /// [`crate::draftpoke::MAX_DRAFT_POKES`] pokes (ATTEMPTS — the ledger remembers only the head
     /// poked last, so `A → B → A` spends the budget), and after
-    /// [`crate::draftpoke::MAX_DRAFT_POKE_SWEEPS`] consecutive sweeps at the SAME head. The second
+    /// [`crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED`] of WALL CLOCK at the SAME head. The second
     /// is the one that matters for the incident this was filed on — a head that never moves would
     /// otherwise get one poke and then silence, which is the parking the ticket names.
+    ///
+    /// The second bound is wall clock and not a sweep count (STUDIO-974, jimmy's review): the
+    /// watcher's cadence is a hot-reloadable key now, so a sweep count would shrink the grace with
+    /// the tick. `now` is the tick's single clock instant, threaded rather than re-read, so every
+    /// decision this sweep makes uses the same instant.
     fn plan_draft_poke(
         &mut self,
         rows: &[ReviewWatchRow],
         pr: &PrCoord,
         snap: &PrSnapshot,
+        now: chrono::DateTime<chrono::Utc>,
         report: &mut ReviewSweepReport,
     ) {
         if snap.draft_published() {
@@ -1361,7 +1367,14 @@ impl Orchestrator {
             return;
         };
         if self.ticket_run_live(identifier) {
-            return; // the author is working on it; a draft is entirely normal there
+            // The author is working on it; a draft is entirely normal there. Re-anchor the
+            // unanswered window so a long re-engaged run does not spend the grace: the window is
+            // for an author who has STOPPED, not one mid-fix. (The old sweep count simply did not
+            // advance while the run was live; a wall clock has to be pushed forward explicitly.)
+            if let Some(state) = self.draft_pokes.get_mut(&churn_key(pr)) {
+                state.unanswered_since = Some(now);
+            }
+            return;
         }
         let author = mine
             .iter()
@@ -1374,12 +1387,16 @@ impl Orchestrator {
             return;
         }
         if state.pokes > 0 && state.poked_head == head {
-            // Already poked at this head: the author has not moved it. Count the sweeps it has
-            // stayed a draft and hand it to a human once the poke has clearly gone unanswered —
-            // the bound that makes the escalation reachable in the STATIC-head shape booch#537 had,
-            // where a distinct-head ceiling alone would poke once and then go silent forever.
-            state.unanswered_sweeps = state.unanswered_sweeps.saturating_add(1);
-            if state.unanswered_sweeps >= crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
+            // Already poked at this head: the author has not moved it. Hand it to a human once the
+            // poke has clearly gone unanswered for the wall-clock grace — the bound that makes the
+            // escalation reachable in the STATIC-head shape booch#537 had, where a distinct-head
+            // ceiling alone would poke once and then go silent forever. Wall clock, not sweeps
+            // (STUDIO-974): the cadence hot-reloads, so a sweep count would shrink the grace.
+            // A missing anchor opens the window now rather than reading as an already-expired one.
+            // The poke above always sets it, so this only covers an entry built without one. A
+            // clock that went backwards yields a negative elapsed, which is never >= the grace.
+            let since = *state.unanswered_since.get_or_insert(now);
+            if now.signed_duration_since(since) >= crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED {
                 state.escalated = true;
                 report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
                     crate::draftpoke::DraftEscalation {
@@ -1407,9 +1424,9 @@ impl Orchestrator {
         let pokes = state.pokes;
         state.poked_head = head.to_string();
         state.pokes += 1;
-        // A new head is a fresh poke: the unanswered-sweep clock restarts, because the author has
+        // A new head is a fresh poke: the unanswered window reopens, because the author has
         // demonstrably done something since the last poke.
-        state.unanswered_sweeps = 0;
+        state.unanswered_since = Some(now);
         report.nudges.push(crate::draftpoke::DraftNudge::Poke(
             crate::draftpoke::DraftPokePlan {
                 pr: pr.clone(),
@@ -3908,6 +3925,25 @@ mod tests {
         o.draft_pokes.get(&churn_key(&coord(number))).cloned()
     }
 
+    /// The fixed instant the wall-clock draft tests anchor on.
+    fn draft_clock() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-14T21:20:00Z")
+            .expect("test instant")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// One sweep with the control clock pinned at `at`. The unanswered-draft bound is WALL CLOCK
+    /// now, so a test advances time by moving the clock between sweeps — nothing in a sweep knows
+    /// the tick's cadence, which is the point.
+    fn sweep_at(
+        o: &mut Orchestrator,
+        at: chrono::DateTime<chrono::Utc>,
+        observed: &[PrObservation],
+    ) -> ReviewSweepReport {
+        o.now = Box::new(move || at);
+        o.handle_review_sweep(observed)
+    }
+
     /// Acceptance: a finished run's still-draft pull request produces ONE summons naming the pull
     /// request, its author and the head — the run is finished because the row exists (it was
     /// handoff-introduced), and the poke is what asks the author to publish it.
@@ -3979,78 +4015,81 @@ mod tests {
         );
     }
 
-    /// ⚠️ Acceptance (alice's round-3 blocker): the unanswered-sweep clock counts CONSECUTIVE sweeps
-    /// at the SAME head, so a pushed head RESTARTS it. Without the reset, the clock carried across a
-    /// push would escalate an author who demonstrably just acted a few sweeps into the new head — at
-    /// poke 2 of 3, not the `MAX_DRAFT_POKES` the distinct-head axis promises.
+    /// ⚠️ Acceptance (alice's round-3 blocker): the unanswered window is per-head, so a pushed head
+    /// RESTARTS it. Without the restart, the window carried across a push would escalate an author
+    /// who demonstrably just acted — at poke 2 of 3, not the `MAX_DRAFT_POKES` the distinct-head
+    /// axis promises.
     #[test]
-    fn a_new_head_restarts_the_unanswered_sweep_clock() {
+    fn a_new_head_restarts_the_unanswered_window() {
         let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
+        let base = draft_clock();
+        let half = crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED / 2;
 
-        // Poke HEAD_A, then sit at it for half the window — far enough that a carried clock would
-        // cross the bound soon after a push, but never crossing it at A.
+        // Poke HEAD_A: the window opens at the poke.
         assert_eq!(
-            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            poked_heads(&sweep_at(&mut o, base, &[draft_at(12, HEAD_A)])),
             vec![HEAD_A.to_string()]
         );
-        for _ in 0..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2 {
-            assert!(
-                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
-                    .nudges
-                    .is_empty()
-            );
-        }
-        let spent = crate::draftpoke::MAX_DRAFT_POKE_SWEEPS / 2;
         assert_eq!(
-            poke_state(&o, 12).map(|s| s.unanswered_sweeps),
-            Some(spent),
-            "the clock has advanced at the head that never moved"
+            poke_state(&o, 12).and_then(|s| s.unanswered_since),
+            Some(base),
+            "the window opens at the poke"
         );
+        // Sit at it for half the window — far enough that a carried window would cross the bound
+        // soon after a push, but never crossing it at A.
+        let half_way = sweep_at(&mut o, base + half, &[draft_at(12, HEAD_A)]);
+        assert!(half_way.nudges.is_empty(), "{:?}", half_way.nudges);
 
-        // The author pushes but leaves it a draft: the new head is a fresh poke AND a fresh clock.
-        let moved = o.handle_review_sweep(&[draft_at(12, HEAD_B)]);
+        // The author pushes but leaves it a draft: the new head is a fresh poke AND a fresh window.
+        let pushed_at = base + half;
+        let moved = sweep_at(&mut o, pushed_at, &[draft_at(12, HEAD_B)]);
         assert_eq!(poked_heads(&moved), vec![HEAD_B.to_string()]);
         assert_eq!(
-            poke_state(&o, 12).map(|s| (s.pokes, s.unanswered_sweeps)),
-            Some((2, 0)),
-            "a pushed head restarts the unanswered-sweep clock"
+            poke_state(&o, 12).map(|s| (s.pokes, s.unanswered_since)),
+            Some((2, Some(pushed_at))),
+            "a pushed head reopens the unanswered window"
         );
-        // And the new head gets the WHOLE window: a carried clock would escalate within a few sweeps.
-        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
-            assert!(
-                o.handle_review_sweep(&[draft_at(12, HEAD_B)])
-                    .nudges
-                    .is_empty(),
-                "sweep {sweep} at the new head: the clock restarted and the bound is not crossed"
-            );
-        }
+        // And the new head gets the WHOLE window: a carried window would escalate on the next tick.
+        let early = sweep_at(&mut o, pushed_at + half, &[draft_at(12, HEAD_B)]);
+        assert!(
+            early.nudges.is_empty(),
+            "the window restarted at the new head: {:?}",
+            early.nudges
+        );
     }
 
     /// ⚠️ Acceptance (jimmy's round-1 blocker): a draft IGNORED at a static head — the shape
     /// booch#537 actually had — escalates to a human instead of parking in silence forever. The
     /// distinct-head ceiling alone poked once and then heard from nobody, so this pins the SECOND
-    /// bound: the same head still draft for `MAX_DRAFT_POKE_SWEEPS` consecutive sweeps.
+    /// bound: the same head still draft after `MAX_DRAFT_POKE_UNANSWERED` of wall clock.
     #[test]
     fn a_static_draft_head_escalates_to_a_human_after_a_bounded_silence() {
         let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
+        let base = draft_clock();
 
         // The one poke, at the head the author never moves.
         assert_eq!(
-            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            poked_heads(&sweep_at(&mut o, base, &[draft_at(12, HEAD_A)])),
             vec![HEAD_A.to_string()]
         );
-        // The poke is unanswered and the head does not move: silence until the bound, then a human.
-        for sweep in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
-            assert!(
-                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
-                    .nudges
-                    .is_empty(),
-                "sweep {sweep}: the same head is never poked twice consecutively"
-            );
-        }
-        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        // The poke is unanswered and the head does not move: silence right up to the grace, then a
+        // human. The tick one second short is the boundary that says the bound is the GRACE and not
+        // the first sweep that happens to run after it.
+        let just_short =
+            base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED - chrono::Duration::seconds(1);
+        assert!(
+            sweep_at(&mut o, just_short, &[draft_at(12, HEAD_A)])
+                .nudges
+                .is_empty(),
+            "one second short of the grace is still silence"
+        );
+        let report = sweep_at(
+            &mut o,
+            base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED,
+            &[draft_at(12, HEAD_A)],
+        );
         assert_eq!(report.nudges.len(), 1, "{:?}", report.nudges);
         match &report.nudges[0] {
             crate::draftpoke::DraftNudge::Escalate(e) => {
@@ -4070,14 +4109,114 @@ mod tests {
             }
             other => panic!("expected an escalation, got {other:?}"),
         }
-        // And once a human holds it, the static head stays quiet forever rather than re-poking.
+        // And once a human holds it, the static head stays quiet forever rather than re-poking —
+        // however much further the wall clock runs.
+        let much_later = base + chrono::Duration::hours(5);
         for _ in 0..5 {
             assert!(
-                o.handle_review_sweep(&[draft_at(12, HEAD_A)])
+                sweep_at(&mut o, much_later, &[draft_at(12, HEAD_A)])
                     .nudges
                     .is_empty()
             );
         }
+    }
+
+    /// ⚠️ Acceptance (jimmy's round-6 blocker): the unanswered bound is WALL CLOCK, so the grace an
+    /// ignored draft gets does not depend on the watcher's cadence. The old sweep count gave a
+    /// static head 30 sweeps, which was about an hour at the pinned 120s and about EIGHT MINUTES
+    /// once STUDIO-974 made the cadence a hot-reloadable key defaulting to 15s. This drives the
+    /// same wall clock at two cadences and asserts the escalation lands at the same grace either
+    /// way — at 15s it takes ~240 sweeps, at 120s ~30, and both are one hour.
+    #[test]
+    fn the_unanswered_draft_bound_is_wall_clock_not_sweeps() {
+        let grace = crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED;
+        for cadence_secs in [15i64, 120] {
+            let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+            introduce(&o, row(12, "bob"));
+            let base = draft_clock();
+
+            // The one poke at t0.
+            assert_eq!(
+                poked_heads(&sweep_at(&mut o, base, &[draft_at(12, HEAD_A)])),
+                vec![HEAD_A.to_string()]
+            );
+
+            // Then observed, unanswered, one tick per `cadence_secs`. Escalation must land once the
+            // WALL CLOCK crosses the grace — not after a fixed number of ticks.
+            let mut elapsed = chrono::Duration::zero();
+            let mut escalated_at = None;
+            // Two ticks past the grace is plenty at either cadence.
+            let ticks = grace.num_seconds() / cadence_secs + 2;
+            for _ in 0..ticks {
+                elapsed += chrono::Duration::seconds(cadence_secs);
+                let report = sweep_at(&mut o, base + elapsed, &[draft_at(12, HEAD_A)]);
+                if report
+                    .nudges
+                    .iter()
+                    .any(|n| matches!(n, crate::draftpoke::DraftNudge::Escalate(_)))
+                {
+                    escalated_at = Some(elapsed);
+                    break;
+                }
+            }
+            let escalated_at =
+                escalated_at.unwrap_or_else(|| panic!("cadence {cadence_secs}s: never escalated"));
+            assert!(
+                escalated_at >= grace,
+                "cadence {cadence_secs}s: escalated before the wall-clock grace ({escalated_at:?})"
+            );
+            assert!(
+                escalated_at < grace + chrono::Duration::seconds(cadence_secs),
+                "cadence {cadence_secs}s: escalated more than one tick past the grace \
+                 ({escalated_at:?})"
+            );
+        }
+    }
+
+    /// ⚠️ Acceptance (jimmy's round-6 blocker, the case named in the review): a live author run
+    /// re-anchors the unanswered window, so a long re-engaged run does not ESCALATE the author it
+    /// re-engaged. The window is for an author who has stopped, not one mid-fix. The old sweep
+    /// count had this property by construction — it never advanced while a run was live — and a
+    /// wall clock has to re-anchor explicitly.
+    ///
+    /// Mutation check: delete the re-anchor in `plan_draft_poke`'s live-run branch and this reds
+    /// with an escalation when the run ends.
+    #[test]
+    fn a_live_author_run_does_not_spend_the_unanswered_grace() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        let base = draft_clock();
+
+        // Poke, then an hour passes with the author's run live: no escalation, and the window is
+        // pushed forward to the last tick the run was still working.
+        assert_eq!(
+            poked_heads(&sweep_at(&mut o, base, &[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
+        );
+        live_author_run(&mut o, "STUDIO-721");
+        let during = base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED;
+        let live = sweep_at(&mut o, during, &[draft_at(12, HEAD_A)]);
+        assert!(live.nudges.is_empty(), "{:?}", live.nudges);
+        assert_eq!(
+            poke_state(&o, 12).and_then(|s| s.unanswered_since),
+            Some(during),
+            "the live run re-anchors the window"
+        );
+
+        // The run ends and the draft is STILL there, but the author only just stopped: the full
+        // grace is theirs, so the very next tick is not an escalation. Without the re-anchor the
+        // window would already be an hour old here and this would escalate.
+        o.running.clear();
+        let just_after = sweep_at(
+            &mut o,
+            during + chrono::Duration::minutes(1),
+            &[draft_at(12, HEAD_A)],
+        );
+        assert!(
+            just_after.nudges.is_empty(),
+            "a just-finished run must get its full grace: {:?}",
+            just_after.nudges
+        );
     }
 
     /// ⚠️ Acceptance (alice's round-2 blocker): an UNSTATED `isDraft` is not a published draft. A
@@ -4089,22 +4228,28 @@ mod tests {
     fn an_unstated_draft_does_not_forget_the_poke_ledger() {
         let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
+        let base = draft_clock();
 
-        // Poke the static head, then let it reach the human escalation.
-        o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
-        for _ in 1..crate::draftpoke::MAX_DRAFT_POKE_SWEEPS {
-            o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
-        }
+        // Poke the static head, then let the wall clock reach the human escalation.
+        sweep_at(&mut o, base, &[draft_at(12, HEAD_A)]);
         assert!(matches!(
-            o.handle_review_sweep(&[draft_at(12, HEAD_A)])
-                .nudges
-                .first(),
+            sweep_at(
+                &mut o,
+                base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED,
+                &[draft_at(12, HEAD_A)],
+            )
+            .nudges
+            .first(),
             Some(crate::draftpoke::DraftNudge::Escalate(_))
         ));
 
         // GitHub does not say: no answer is not an answer, and the ledger — and the escalation —
         // stands. Nothing is poked, and the state is not dropped.
-        let unstated = o.handle_review_sweep(&[unstated_at(12, HEAD_A)]);
+        let unstated = sweep_at(
+            &mut o,
+            base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED + chrono::Duration::hours(1),
+            &[unstated_at(12, HEAD_A)],
+        );
         assert!(unstated.nudges.is_empty(), "{:?}", unstated.nudges);
         assert_eq!(
             poke_state(&o, 12).map(|s| s.escalated),
