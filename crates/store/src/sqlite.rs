@@ -947,8 +947,8 @@ impl Store for Sqlite {
         identifiers: &[String],
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError> {
-        // An empty set is an empty answer, not an `IN ()` — SQLite parses that as a syntax error
-        // rather than a predicate that matches nothing.
+        // Skip a pointless query for an empty set. SQLite accepts `IN ()` as a predicate that
+        // matches nothing, so this is an optimization, not a guard against a syntax error.
         if identifiers.is_empty() {
             return Ok(Vec::new());
         }
@@ -2783,7 +2783,7 @@ mod tests {
         );
         assert!(
             st.runs_for_issues(&[], 0).expect("empty set").is_empty(),
-            "an empty set is an empty answer, never an error",
+            "an empty set is an empty answer",
         );
     }
 

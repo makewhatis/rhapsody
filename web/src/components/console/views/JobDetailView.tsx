@@ -250,6 +250,7 @@ export function JobDetailView({
       ) : (
         <RunTrace
           run={run}
+          issue={issue}
           runs={runs}
           reviews={reviews}
           identities={identities}
@@ -271,6 +272,7 @@ export function JobDetailView({
 /** One attempt, rendered as the three zones. Keyed by run id so a switch resets every selection. */
 function RunTrace({
   run,
+  issue,
   runs,
   reviews,
   identities,
@@ -285,6 +287,10 @@ function RunTrace({
   onOpenRoom,
 }: {
   run: RunSummary;
+  /** The route-level ticket being viewed. A review run's own `issue_identifier` is its synthetic
+   * `pr:<owner>/<repo>#<n>@<reviewer>` key, which is not a Linear ticket — so the header's ticket
+   * link resolves from HERE, not from the selected run. */
+  issue: string;
   runs: readonly RunSummary[];
   /** The ticket's review runs (STUDIO-976), credited by the daemon's origin-ticket join. */
   reviews: readonly RunSummary[];
@@ -385,6 +391,7 @@ function RunTrace({
       <TraceHeader
         ref={headerRef}
         run={live}
+        issue={issue}
         attempts={attempts}
         who={who}
         resolvingWho={identityRead.isPending}
@@ -548,6 +555,7 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 function TraceHeader({
   ref,
   run,
+  issue,
   attempts,
   who,
   resolvingWho,
@@ -563,6 +571,9 @@ function TraceHeader({
 }: {
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
+  /** The route-level ticket being viewed — what "Open ticket" links to. A selected review run's
+   * own `issue_identifier` is a synthetic `pr:` key, never a Linear ticket. */
+  issue: string;
   /** Every attempt the ticket has, newest first, already labelled — see `attemptOptions`. */
   attempts: readonly AttemptOption[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -725,7 +736,7 @@ function TraceHeader({
       </div>
       <HeaderActions
         run={run}
-        ticketHref={ticketUrl(workspaceURLKey, run.issue_identifier)}
+        ticketHref={ticketUrl(workspaceURLKey, issue)}
         inFlight={inFlight}
         composerId={composerId}
         onCompose={onCompose}

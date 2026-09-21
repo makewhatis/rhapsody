@@ -579,6 +579,14 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(document.querySelector('.trrev[aria-pressed="true"]')?.textContent).toBe("review · alice");
     // No ATTEMPT is selected — a review is not an attempt.
     expect(document.querySelector('.trattempts button[aria-pressed="true"]')).toBeNull();
+    // "Open ticket" still opens the TICKET being viewed, not the review's synthetic
+    // `pr:<owner>/<repo>#<n>@<reviewer>` issue key. A review run's `issue_identifier` is not a
+    // Linear ticket, so the action must resolve the route-level identifier.
+    await waitFor(() =>
+      expect(action(/open ticket/i).getAttribute("href")).toBe(
+        "https://linear.app/studio49/issue/STUDIO-654",
+      ),
+    );
   });
 
   // A ticket whose author runs have been pruned from the store but whose review WATCH row survived
