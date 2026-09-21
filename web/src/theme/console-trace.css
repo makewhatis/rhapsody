@@ -302,6 +302,12 @@
 .rh-console .trreceipt { flex: 0 0 190px; border-left: 1px solid var(--line); padding-left: 18px; display: flex; flex-direction: column; gap: 9px; }
 .rh-console .trreceipt .rv { font-family: var(--mono); font-size: 12px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 10px; }
 .rh-console .trreceipt .rv b { color: var(--ink-4); font-weight: 500; }
+/* The whole-ticket cost (STUDIO-975). A rule ABOVE it separates the ticket's figure from the four
+   attempt-level `rv` rows, so the label is not the only thing keeping the two from blurring
+   together. The breakdown is quiet, smaller mono text — a supporting detail under the total, never
+   competing with it. */
+.rh-console .trreceipt .trticket { border-top: 1px solid var(--line); padding-top: 9px; }
+.rh-console .trreceipt .trticket .tbk { list-style: none; margin: 2px 0 0; padding: 0; font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); display: flex; flex-direction: column; gap: 2px; }
 
 /* ---- (C) The Split ---- */
 /* `overflow: clip`, NOT `hidden` (STUDIO-821). Both clip the children to the rounded corner, but

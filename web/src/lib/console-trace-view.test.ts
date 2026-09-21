@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LogEntry, RunDetail, RunProvenance, RunSummary } from "@/lib/api";
+import type { LogEntry, RunDetail, RunProvenance, RunSummary, TicketCostRow } from "@/lib/api";
 import { buildResult, buildTrace, type TracePhase } from "@/lib/trace-model";
 import {
   PROVENANCE_UNKNOWN,
@@ -24,7 +24,9 @@ import {
   runBranch,
   runTeammate,
   runVitals,
+  ticketCostView,
   ticketUrl,
+  UNKNOWN_PROVIDER,
 } from "@/lib/console-trace-view";
 
 // The slice-2 view model (STUDIO-742) — the derivations the three-zone run detail needs that are
@@ -839,5 +841,60 @@ describe("provenanceFields — the header's provenance line (STUDIO-909)", () =>
       value: "claude",
       origin: "agent.backend",
     });
+  });
+});
+
+// The run detail's whole-ticket token total (STUDIO-975) — the figure that used to require adding
+// up every attempt by hand. It reads only the daemon's per-(ticket, provider) ledger, never a fold
+// over the attempt list, and a ticket the ledger does not carry is an honest "—", not a 0.
+describe("ticketCostView — the run detail's whole-ticket total (STUDIO-975)", () => {
+  const cost = (
+    ticket: string,
+    provider: string,
+    total_tokens: number,
+    usage_estimated = false,
+  ): TicketCostRow => ({ ticket, provider, total_tokens, usage_estimated });
+
+  it("sums the ledger's provider buckets into one whole-ticket total, largest first", () => {
+    const v = ticketCostView(
+      [cost("STUDIO-974", "anthropic", 200_000), cost("STUDIO-974", "fireworks-ai", 607_780)],
+      "STUDIO-974",
+    );
+    expect(v?.total).toBe("807.8k");
+    expect(v?.buckets).toEqual(["607.8k fireworks-ai", "200.0k anthropic"]);
+  });
+
+  // A ticket's earlier rounds are absent from `/history/issues` (one row per key) — the ledger is
+  // the only input that carries them, so this view can never drop them the way that fold would.
+  it("totals every round the ledger carries, not only the newest", () => {
+    const v = ticketCostView(
+      [cost("STUDIO-974", "anthropic", 93_600_000), cost("STUDIO-974", "anthropic", 2_400_000)],
+      "STUDIO-974",
+    );
+    expect(v?.total).toBe("96.0M");
+  });
+
+  // The ticket's own warning: `provider: ""` is real spend. Dropping the bucket would make the
+  // parts stop summing to the whole.
+  it("labels the empty-provider bucket rather than hiding it, and counts it in the total", () => {
+    const v = ticketCostView([cost("STUDIO-1", "", 42), cost("STUDIO-1", "anthropic", 100)], "STUDIO-1");
+    expect(v?.total).toBe("142");
+    expect(v?.buckets).toEqual(["100 anthropic", `42 ${UNKNOWN_PROVIDER}`]);
+  });
+
+  // A bucket that ended without a clean `result` event is a floor; a total with one floored input
+  // is itself a floor, marked with the same "~" `runVitals.tokens` uses.
+  it("marks the total, and the floored bucket, with a leading tilde", () => {
+    const v = ticketCostView([cost("STUDIO-2", "anthropic", 1_000_000, true)], "STUDIO-2");
+    expect(v?.total).toBe("~1.0M");
+    expect(v?.buckets).toEqual(["~1.0M anthropic"]);
+  });
+
+  it("returns null — never a confident zero — for a ticket the ledger does not carry", () => {
+    expect(ticketCostView([cost("STUDIO-3", "anthropic", 5)], "STUDIO-4")).toBeNull();
+    // A zero-token row is "spent nothing". The SERVER's ledger does return such rows (its SQL has
+    // no HAVING); it is this module's `ticketCostsByIssue` that drops `total_tokens <= 0`. Either
+    // way the detail renders "—" for it exactly as it does for an absent ticket.
+    expect(ticketCostView([cost("STUDIO-5", "anthropic", 0)], "STUDIO-5")).toBeNull();
   });
 });
