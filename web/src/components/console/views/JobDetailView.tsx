@@ -31,7 +31,7 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
-import { useHistoryCosts } from "@/hooks/useHistory";
+import { useLiveHistoryCosts } from "@/hooks/useHistory";
 import {
   useMergeRun,
   useResumeRun,
@@ -407,6 +407,7 @@ function RunTrace({
             result={result}
             vitals={vitals}
             pending={transcript.isPending}
+            inFlight={inFlight}
             onJumpToFailure={
               failing === null
                 ? null
@@ -1013,12 +1014,15 @@ function ResultCardZone({
   result,
   vitals,
   pending,
+  inFlight,
   onJumpToFailure,
 }: {
   run: RunSummary;
   result: ResultCard;
   vitals: RunVitals;
   pending: boolean;
+  /** Whether the run this card receipts is still live — the ticket total's refresh cadence. */
+  inFlight: boolean;
   /** null when the trace holds no failing step for the banner to point at. */
   onJumpToFailure: (() => void) | null;
 }) {
@@ -1027,13 +1031,18 @@ function ResultCardZone({
   const lead = cardLead(result);
   // The whole-ticket cost (STUDIO-975) — every run that spent on this ticket, review rounds
   // included, over the whole store. It rides the SAME cache entry the Jobs surface already fills
-  // (`useHistoryCosts`, planted by `useJobsFeed`), so this adds no endpoint and no request of its
-  // own; where that entry is absent the figure is simply unknown, and an unknown cost renders "—".
+  // (`useLiveHistoryCosts`, planted by `useJobsFeed`), so this adds no endpoint and no request of
+  // its own; where that entry is absent the figure is simply unknown, and an unknown cost renders
+  // "—".
   //
   // `null` is not zero: a ticket missing from the ledger may have spent nothing, or may simply be
   // absent from the response, and a confident 0 would be a claim neither the daemon nor this view
   // can support. See `ticketCostView` for why it is not a fold over the attempt list.
-  const costRows = useHistoryCosts();
+  //
+  // It polls while this run is live — the ledger's per-turn writes are why — and takes one final
+  // pass on the live→terminal edge; a mount-time snapshot would sit stale beside the updating
+  // per-attempt vitals (STUDIO-975 round 1).
+  const costRows = useLiveHistoryCosts(inFlight);
   const ticketCost =
     costRows.data === undefined ? null : ticketCostView(costRows.data.costs, run.issue_identifier);
   return (

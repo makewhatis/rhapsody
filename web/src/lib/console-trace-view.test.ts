@@ -847,8 +847,9 @@ describe("ticketCostView — the run detail's whole-ticket total (STUDIO-975)", 
 
   it("returns null — never a confident zero — for a ticket the ledger does not carry", () => {
     expect(ticketCostView([cost("STUDIO-3", "anthropic", 5)], "STUDIO-4")).toBeNull();
-    // A zero-token row is "spent nothing", which the ledger omits; the detail renders "—" for it
-    // exactly as it does for an absent ticket.
+    // A zero-token row is "spent nothing". The SERVER's ledger does return such rows (its SQL has
+    // no HAVING); it is this module's `ticketCostsByIssue` that drops `total_tokens <= 0`. Either
+    // way the detail renders "—" for it exactly as it does for an absent ticket.
     expect(ticketCostView([cost("STUDIO-5", "anthropic", 0)], "STUDIO-5")).toBeNull();
   });
 });

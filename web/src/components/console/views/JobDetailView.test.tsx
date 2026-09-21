@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
 import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 import { HISTORY_COSTS_QUERY_KEY } from "@/hooks/useHistory";
+import { LIVE_POLL_MS } from "@/hooks/useStateQuery";
 
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
@@ -366,6 +367,9 @@ function action(name: string | RegExp): HTMLElement {
 
 afterEach(() => {
   cleanup();
+  // A test that drives the polls installs fake timers; leaving them in place would stall the next
+  // test's real-time waits.
+  vi.useRealTimers();
   vi.clearAllMocks();
   // `clearAllMocks` clears CALLS, not implementations, and `mountDetail`'s run-detail default is
   // installed only when there is none — so without this a test that configured the poll would
@@ -1468,6 +1472,46 @@ describe("the whole-ticket token total (STUDIO-975)", () => {
     ]);
     expect(block.textContent).toContain("—");
     expect(block.textContent).not.toContain("0");
+  });
+
+  // sol's round-1 blocker: the ledger is NOT terminal-only (`update_run_progress` writes
+  // `runs.total_tokens` after every turn), so a total fetched once when the detail opened froze
+  // while the per-attempt figure beside it kept moving — and stayed stale through completion. The
+  // total must ride the run's own cadence while it is live, plus one refetch on the live→terminal
+  // edge, which is where a run's final turn lands.
+  it("follows the ledger while the run is live, and makes one more pass when it ends", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const running = run({ id: 547, outcome: "running" });
+    let tokens = 100_000;
+    h.fetchHistoryCosts.mockImplementation(async () => ({
+      costs: [cost("STUDIO-654", "anthropic", tokens)],
+    }));
+    h.fetchRunDetail.mockImplementation(async () => detailOf(running));
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([running]);
+    await waitFor(() =>
+      expect(client.getQueryState(HISTORY_COSTS_QUERY_KEY)?.status).toBe("success"),
+    );
+    const block = () => document.querySelector(".trticket") as HTMLElement;
+    await waitFor(() => expect(block().textContent).toContain("100.0k"));
+
+    // A turn lands and the ledger climbs. Polling beside the per-attempt vitals must carry it.
+    tokens = 200_000;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 1);
+    });
+    expect(block().textContent).toContain("200.0k");
+
+    // The run ends and its final turn lands. The rendered total must follow the ledger here too —
+    // by the last scheduled poll or by the live→terminal edge refetch (`useHistory.test.tsx` pins
+    // that edge in isolation, since the two fire in the same 2s tick and this test cannot tell them
+    // apart).
+    tokens = 300_000;
+    h.fetchRunDetail.mockImplementation(async () => detailOf(run({ id: 547 })));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 1);
+    });
+    await waitFor(() => expect(block().textContent).toContain("300.0k"));
   });
 });
 
