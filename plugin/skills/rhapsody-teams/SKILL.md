@@ -54,6 +54,24 @@ immediately, identity-less, and triage never touches it.
 triage treats any `rhapsody:@` label as an occupied field and would never release it. Such a
 ticket dispatches identity-less, and the stale label is a human's to fix.
 
+### ⛔ `rhapsody:human` — the label that refuses dispatch (STUDIO-949)
+
+Not a routing hint: a **refusal**. A ticket carrying `rhapsody:human` is never dispatched, with
+or without Teams, and auto-promote never moves it to Todo. It is for work an agent cannot do —
+console work in a web dashboard, a purchase on a physical device, a legal form — which was
+previously communicated only in the title and enforced nowhere.
+
+Enforced at `dispatch::eligible()`, the single chokepoint every dispatch path flows through,
+plus `promote.rs` (so dag never promotes one into a Todo that will never run) and `triage.rs`
+(so no identity and no manager turn is spent on it). The refusal is logged once per ticket, not
+per tick, and the reconciliation sweep reports it as *held for a human* rather than as an
+unexplained stall.
+
+⚠️ **This is the fourth member of the label family and the only one that stops work.** When
+planning, `rhapsody:@<name>`, `rhapsody:solo` and topic labels all decide WHO runs a ticket;
+this one decides that NOBODY does. A ticket without it behaves byte-identically to before the
+label existed.
+
 ## What a teammate's run gets
 
 The turn-1 prompt gains one budgeted prepend (`prompt_budget_bytes`, default 16000):
@@ -153,6 +171,72 @@ the first `reviewers` in `required:` order, with one boot warning naming both nu
 A findings verdict also posts a completion comment carrying the summon token, which reopens
 the author's run. An approved one posts a deliberately **tokenless** note, so nothing wakes.
 
+### The loop is bounded, and the bound is durable (STUDIO-956)
+
+The edge trigger above answers "when does a round arm". It does **not** answer "how many". Two
+mechanisms do:
+
+- `REVIEW_ROUNDS_PER_PR_CAP` × reviewers — the long-standing hard cap. On reaching it the loop
+  stops and logs at DEBUG; the sweep does not read that line, so a capped pull request used to
+  page a human as *"nothing has reported it blocked"*.
+- `review.adjudicate_after_rounds` — **the opt-in that makes the stop a decision.** At the
+  configured round threshold the loop stops arming rounds and hands the pull request to the
+  **manager** for one adjudication: **ship it** (the open findings do not block) or **escalate**
+  (naming the specific findings, the round count and the head). `0` — the default — leaves the
+  loop exactly as it was.
+
+⚠️ **The round count and the manager's decision are DURABLE**, in `rhapsody_review_bound`
+(one row per pull request, rehydrated at boot). They were in memory until 2026-09-21, which is
+why five daemon restarts in one day turned a nominal 16-round cap into **46 review runs on one
+pull request** — every restart refunded every budget. Do not assume a restart clears a spent
+budget; it does not, by design.
+
+⚠️ **A settled decision governs only the head it was made at** (STUDIO-971). When the author
+pushes a content-changing commit the decision stops governing, the loop resumes and arms
+**one** round at the new head, and the durable count keeps climbing rather than resetting. A
+no-op rebase does not resume it (STUDIO-960's property). An `escalate` never resumes on the
+author's own push — an escalation names a human as the next actor.
+
+⚠️ **A `ship` verdict does not bypass the merge gate.** Approval-at-head, CI and the draft and
+conflict gates all still apply, so a *ship* on a pull request with open findings stops the loop
+and hands it to a human rather than merging it. In practice ship and escalate both end with a
+person, differing in what they say about the findings.
+
+**The operator's escape hatch is `POST /api/v1/reviews/clear`** — it forgets both halves (the
+count and the decision) for one pull request, and the loop resumes from zero. It is the only
+way to release a pull request the manager has settled, and the sweep's WARN names it.
+
+### What a round costs, and how many can run
+
+- **Rounds 2+ are delta reviews** (STUDIO-959): a reviewer is given the diff since *its own*
+  `last_reviewed_sha` plus its own prior findings, not a cold read of the whole pull request. A
+  reviewer new to a pull request, or one whose prior sha is not an ancestor of the head, still
+  gets a full review and says which mode it took.
+- **A verdict survives a head move that changed nothing** (STUDIO-960), so a rebase with no
+  content change no longer arms a fresh round for every reviewer.
+- `agent.max_concurrent_reviews` (STUDIO-950) — reviews draw from **their own** global pool
+  instead of competing with implementations for `max_concurrent_agents`. Unset ⇒ the shared
+  draw, byte-identical to before. Lives in `WORKFLOW.md`, so it hot-reloads.
+
+### Two more things the review path now does on its own
+
+- **A conflicted pull request routes back to its author** (STUDIO-961) — once per conflicted
+  head, only on a settled `mergeStateStatus`, and it respects `rhapsody:human`. Requires
+  `review.changes_state` to be set; without it the feature forms no plan at all.
+- **A finished run's still-draft pull request pokes its author** (STUDIO-962) — once per head,
+  never while the author's run is live, escalating to a human on two independent axes. The
+  daemon never marks a pull request ready itself.
+
+### Spend has a meter and a ceiling (STUDIO-957)
+
+`GET /api/v1/metrics/providers` answers "tokens by provider by day" without a hand-written SQL
+join. `budgets.<provider>.daily_tokens` in `WORKFLOW.md` refuses **new dispatch** on that
+provider once the day's spend crosses it, leaving other providers running; `<= 0` or an absent
+entry is unlimited, matching `max_concurrent`'s idiom. It hot-reloads.
+
+⚠️ **It bounds new dispatch, never a live run** — a single runaway turn passes any daily
+ceiling untouched. And the window is *local day*, so a trip clears at local midnight.
+
 **A review run can use its own model, scoped per harness.** `review.model` / `review.effort`
 override the routed reviewer's own profile for a review run specifically — unset, the default,
 means the review inherits whatever model that reviewer's profile would have used anyway. Both are
@@ -200,6 +284,11 @@ inherits `false` and keeps the repo human-merged.
   so an unassigned ticket is invisible however well it is labelled.
 - To aim work at a teammate, add `rhapsody:@<name>` at filing time; to let the manager
   decide, leave it unlabeled (requires `labels+model`).
+- ⚠️ **Labelled and Todo is not enough if the ticket is unassigned.** The assignee is the claim
+  lock, so a ticket filed by a tool that does not set it sits in Todo looking ready and is never
+  picked up. Set the assignee to the account the daemon authenticates as (`GET
+  /api/v1/linear/identity`) whenever you file or move a ticket into a dispatchable state.
+- To stop a ticket being dispatched at all, label it `rhapsody:human` — see the refusal above.
 - Instructions the run must see go in the **ticket description**. Summon-comment bodies reach
   freshly dispatched runs on current daemons too, but the description is the channel that
   never fails — and on an installation whose tracker↔GitHub attachments come back empty, the
