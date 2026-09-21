@@ -6,6 +6,7 @@ import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
 import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
+import { HISTORY_COSTS_QUERY_KEY } from "@/hooks/useHistory";
 
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
@@ -18,6 +19,7 @@ import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
   fetchRunDetail: vi.fn(),
+  fetchHistoryCosts: vi.fn(),
   fetchRunProvenance: vi.fn(),
   fetchRunTranscript: vi.fn(),
   fetchRunIdentityEvents: vi.fn(),
@@ -45,6 +47,7 @@ vi.mock("@/lib/api", async (orig) => {
     ...actual,
     fetchIssueHistory: h.fetchIssueHistory,
     fetchRunDetail: h.fetchRunDetail,
+    fetchHistoryCosts: h.fetchHistoryCosts,
     fetchRunProvenance: h.fetchRunProvenance,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchRunIdentityEvents: h.fetchRunIdentityEvents,
@@ -204,6 +207,11 @@ let client: QueryClient;
 
 function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
   h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs });
+  // The whole-ticket cost ledger (STUDIO-975). Empty by default, which is the "—" case; a test
+  // about the total configures it BEFORE mounting.
+  if (h.fetchHistoryCosts.getMockImplementation() === undefined) {
+    h.fetchHistoryCosts.mockResolvedValue({ costs: [] });
+  }
   // A test that cares what the poll says configures it BEFORE mounting; this is only the default.
   if (h.fetchRunDetail.getMockImplementation() === undefined) {
     h.fetchRunDetail.mockImplementation(async (id: number) => {
@@ -377,6 +385,7 @@ afterEach(() => {
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
   h.fetchRunIdentityEvents.mockReset();
+  h.fetchHistoryCosts.mockReset();
   // The scroll position is on the live document, which outlives a render. (The step list's own
   // geometry is reset by the `beforeEach` beside `sizeList`; the list itself is torn down with
   // the render, so there is nothing of it left here to clear.)
@@ -1376,6 +1385,89 @@ describe("zone B — the Result card (§3B)", () => {
     mountDetail([run({ id: 547 })]);
     await waitFor(() => expect(document.querySelector(".trrc h2")?.textContent).toBeTruthy());
     expect(document.querySelector(".trrc .trsect")).toBeNull();
+  });
+});
+
+// The whole-ticket token total on the run detail (STUDIO-975). The per-attempt vitals above show
+// the SELECTED attempt alone; on a nine-attempt ticket the operator had no way to read what the
+// ticket cost without clicking each one and adding up. The figure comes from the daemon's
+// whole-store ledger (`GET /api/v1/history/costs`), which already credits review runs to the
+// ticket they reviewed — never from a fold over the attempt list, which keeps one row per key.
+describe("the whole-ticket token total (STUDIO-975)", () => {
+  const cost = (
+    ticket: string,
+    provider: string,
+    total_tokens: number,
+    usage_estimated = false,
+  ) => ({ ticket, provider, total_tokens, usage_estimated });
+
+  async function mountWithCosts(runs: RunSummary[], costs: ReturnType<typeof cost>[]) {
+    h.fetchHistoryCosts.mockResolvedValue({ costs });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail(runs);
+    // Wait for the ledger query to SETTLE, not merely for the block to mount — a ticket the ledger
+    // does not carry renders the same "—" while the fetch is in flight, so the two are only
+    // distinguishable once the query is done.
+    await waitFor(() =>
+      expect(client.getQueryState(HISTORY_COSTS_QUERY_KEY)?.status).toBe("success"),
+    );
+    const block = document.querySelector(".trticket") as HTMLElement;
+    expect(block).toBeTruthy();
+    return block;
+  }
+
+  it("shows the ticket's whole-store total by provider, beside the per-attempt vitals", async () => {
+    const block = await mountWithCosts([run({ id: 547, total_tokens: 38_000 })], [
+      cost("STUDIO-654", "fireworks-ai", 607_780),
+      cost("STUDIO-654", "anthropic", 200_000),
+    ]);
+    expect(block.textContent).toContain("ticket total");
+    expect(block.textContent).toContain("807.8k");
+    expect(block.textContent).toContain("607.8k fireworks-ai");
+    expect(block.textContent).toContain("200.0k anthropic");
+    // The per-attempt number stays exactly where it was: this ADDS a total, it does not replace
+    // the vitals.
+    expect(document.querySelector(".trreceipt")?.textContent).toContain("38.0k");
+  });
+
+  // Mutation guard: "compute the total by summing the attempt list instead" must red. Here the
+  // selected attempt is 38.0k while the ticket's real cost — its earlier rounds, absent from the
+  // one-row-per-key listing — is 9.4M, and the ledger is the only input that carries them.
+  it("reads the ledger, never a fold over the attempt list", async () => {
+    const block = await mountWithCosts([run({ id: 547, total_tokens: 38_000 })], [
+      cost("STUDIO-654", "anthropic", 9_400_000),
+    ]);
+    expect(block.textContent).toContain("9.4M");
+    expect(block.textContent).not.toContain("38.0k");
+  });
+
+  // Mutation guard: dropping the `provider: ""` bucket must red. It is real spend, and without it
+  // the parts no longer sum to the whole.
+  it("shows the empty-provider bucket labelled, and counts it in the total", async () => {
+    const block = await mountWithCosts([run({ id: 547 })], [
+      cost("STUDIO-654", "", 42),
+      cost("STUDIO-654", "anthropic", 100),
+    ]);
+    expect(block.textContent).toContain("142");
+    expect(block.textContent).toContain("42 unknown");
+  });
+
+  // Mutation guard: ignoring `usage_estimated` must red.
+  it("marks an estimated bucket, and the total, as a floor", async () => {
+    const block = await mountWithCosts([run({ id: 547 })], [
+      cost("STUDIO-654", "anthropic", 1_000_000, true),
+    ]);
+    expect(block.textContent).toContain("~1.0M");
+  });
+
+  // Mutation guard: "render an absent ticket as 0" must red. A ticket missing from the response is
+  // unknown, not zero.
+  it("renders a dash, not a confident 0, for a ticket the ledger does not carry", async () => {
+    const block = await mountWithCosts([run({ id: 547 })], [
+      cost("STUDIO-999", "anthropic", 5_000),
+    ]);
+    expect(block.textContent).toContain("—");
+    expect(block.textContent).not.toContain("0");
   });
 });
 

@@ -31,6 +31,7 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
+import { useHistoryCosts } from "@/hooks/useHistory";
 import {
   useMergeRun,
   useResumeRun,
@@ -69,6 +70,7 @@ import {
   runBranch,
   runTeammate,
   runVitals,
+  ticketCostView,
   ticketUrl,
   type AttemptOption,
   type Baton,
@@ -1023,6 +1025,17 @@ function ResultCardZone({
   const eyebrow = resultEyebrow(run, result.source);
   const banner = resultBanner(run);
   const lead = cardLead(result);
+  // The whole-ticket cost (STUDIO-975) — every run that spent on this ticket, review rounds
+  // included, over the whole store. It rides the SAME cache entry the Jobs surface already fills
+  // (`useHistoryCosts`, planted by `useJobsFeed`), so this adds no endpoint and no request of its
+  // own; where that entry is absent the figure is simply unknown, and an unknown cost renders "—".
+  //
+  // `null` is not zero: a ticket missing from the ledger may have spent nothing, or may simply be
+  // absent from the response, and a confident 0 would be a claim neither the daemon nor this view
+  // can support. See `ticketCostView` for why it is not a fold over the attempt list.
+  const costRows = useHistoryCosts();
+  const ticketCost =
+    costRows.data === undefined ? null : ticketCostView(costRows.data.costs, run.issue_identifier);
   return (
     <div className={eyebrow.tone === "done" ? "trrc" : `trrc ${eyebrow.tone}`}>
       <div className="trbar" />
@@ -1097,6 +1110,24 @@ function ResultCardZone({
             {/* Unlike the three above it, this one is counted from the transcript — a bare 0
                 while that is still loading would read as "this run called no tools". */}
             {pending ? "—" : vitals.tools}
+          </div>
+          {/* The ticket's whole-store cost, distinguished from the per-attempt numbers above it by
+              its own label AND its own block: the four `.rv` rows are this ATTEMPT, this is the
+              TICKET. The provider breakdown is deliberately visible rather than tooltip-only —
+              "which provider did this ticket spend on" is the actionable half (STUDIO-957) — and a
+              `""` bucket is labelled `unknown` rather than hidden, so the parts sum to the total. */}
+          <div className="trticket">
+            <div className="rv">
+              <b>ticket total</b>
+              {ticketCost === null ? "—" : ticketCost.total}
+            </div>
+            {ticketCost === null ? null : (
+              <ul className="tbk">
+                {ticketCost.buckets.map((b) => (
+                  <li key={b}>{b}</li>
+                ))}
+              </ul>
+            )}
           </div>
         </div>
       </div>

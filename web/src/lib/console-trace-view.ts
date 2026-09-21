@@ -1,7 +1,8 @@
-import type { RunDetail, RunProvenance, RunSummary } from "@/lib/api";
+import type { RunDetail, RunProvenance, RunSummary, TicketCostRow } from "@/lib/api";
 import { formatTokens, runDuration } from "@/lib/format";
 import { fenceSpans, inlineText } from "@/lib/markdown";
 import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
+import { ticketCostsByIssue } from "@/lib/console-jobs";
 
 // console-trace-view — the derivations the "Trace" run detail needs on top of the slice-1 trace
 // model (design record `~/.rhapsody/docs/console-run-detail-design.md` §3; slice 2 of its §9 plan).
@@ -47,6 +48,47 @@ export function runVitals(run: RunSummary, phases: readonly TracePhase[]): RunVi
     tokens: `${run.usage_estimated ? "~" : ""}${formatTokens(run.total_tokens)}`,
     branch: branch === "" ? DASH : branch,
     tools: phases.reduce((n, phase) => n + phase.did.length, 0),
+  };
+}
+
+/** The label the run detail gives the ledger's empty-provider bucket (STUDIO-975). */
+export const UNKNOWN_PROVIDER = "unknown";
+
+/**
+ * The run detail's whole-ticket cost (STUDIO-975): one total, plus one labelled line per provider
+ * bucket. `total` carries the same "~" floor marker `runVitals.tokens` uses, and so does each
+ * floored bucket — a sum with one floored input is itself a floor.
+ *
+ * Built ONLY from the daemon's per-(ticket, provider) ledger (`GET /api/v1/history/costs`, via
+ * `ticketCostsByIssue`), which already credits review runs to the ticket they reviewed. It is
+ * deliberately not a fold over the attempt list: `/history/issues` keeps one row per key, so that
+ * sum drops every earlier round. `null` — never a zero — means the ledger carries no bucket for
+ * this ticket; the view renders "—".
+ *
+ * The empty-provider bucket is LABELLED rather than hidden, because those tokens are real spend:
+ * dropping them would make the parts stop summing to the whole.
+ */
+export interface TicketCostView {
+  total: string;
+  buckets: string[];
+}
+
+export function ticketCostView(
+  rows: readonly TicketCostRow[],
+  ticket: string,
+): TicketCostView | null {
+  const buckets = ticketCostsByIssue(rows).get(ticket);
+  if (buckets === undefined) return null;
+  const totalTokens = buckets.reduce((n, b) => n + b.totalTokens, 0);
+  const estimated = buckets.some((b) => b.estimated);
+  return {
+    total: `${estimated ? "~" : ""}${formatTokens(totalTokens)}`,
+    buckets: buckets.map(
+      (b) =>
+        `${b.estimated ? "~" : ""}${formatTokens(b.totalTokens)} ${
+          b.provider === "" ? UNKNOWN_PROVIDER : b.provider
+        }`,
+    ),
   };
 }
 
