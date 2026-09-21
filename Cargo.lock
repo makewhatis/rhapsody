@@ -1695,6 +1695,7 @@ dependencies = [
  "chrono",
  "harness-fixtures",
  "regex",
+ "reqwest 0.12.28",
  "rhapsody-agent",
  "rhapsody-config",
  "rhapsody-core",

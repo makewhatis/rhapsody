@@ -17,9 +17,9 @@ use rhapsody_core::normalize_state;
 use serde_yaml_ng::Value;
 
 use crate::model::{
-    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp,
-    Opencode, Otel, Polling, Project, ProviderBudget, Raw, RawClaudeOverride, RawProject, Server,
-    Storage, Tracker, Workspace,
+    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT,
+    DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Opencode, Otel, Polling, Project,
+    ProviderBudget, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker, Workspace,
 };
 use crate::workflow::Definition;
 
@@ -104,6 +104,9 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 
     let polling = Polling {
         interval_ms: or_int(r.polling.interval_ms, 30000),
+        // STUDIO-974 (Rhapsody-only): the off-loop PR-state watcher's clock, defaulting to the
+        // historical pinned 120s so an unset key behaves exactly as before.
+        pr_state_interval_ms: or_int(r.polling.pr_state_interval_ms, DEFAULT_PR_STATE_INTERVAL_MS),
     };
 
     // workspace.root resolved in C4; keep raw value for now.
@@ -600,6 +603,10 @@ mod tests {
     fn decode_applies_defaults() {
         let c = decode_yaml("", "body");
         assert_eq!(c.polling.interval_ms, 30000);
+        assert_eq!(
+            c.polling.pr_state_interval_ms, DEFAULT_PR_STATE_INTERVAL_MS,
+            "STUDIO-974: an install that never writes the key keeps the default watcher clock"
+        );
         assert_eq!(c.agent.max_concurrent_agents, 10);
         assert_eq!(
             c.agent.max_concurrent_reviews, None,
@@ -637,6 +644,25 @@ mod tests {
 
         let absent = decode_yaml("agent:\n  max_concurrent_agents: 4\n", "body");
         assert_eq!(absent.agent.max_concurrent_reviews, None);
+    }
+
+    // STUDIO-974: the PR-state watcher's clock is a Rhapsody-only key beside `polling.interval_ms`.
+    // Defaulted to `DEFAULT_PR_STATE_INTERVAL_MS` (15s; the conditional transport retires the
+    // historical 120s rate-limit argument) and carried verbatim when set. The engine's hot-reload
+    // mirror reads this value.
+    #[test]
+    fn decode_pr_state_interval_defaults_to_15s_and_takes_an_explicit_value() {
+        // Pin the LITERAL, not the constant: asserting `== DEFAULT_PR_STATE_INTERVAL_MS` here would
+        // hold for any default the constant is later changed to, which is no test at all. The
+        // literal is what the ticket's mutation discipline protects.
+        assert_eq!(decode_yaml("", "body").polling.pr_state_interval_ms, 15_000);
+        assert_eq!(DEFAULT_PR_STATE_INTERVAL_MS, 15_000);
+        assert_eq!(
+            decode_yaml("polling:\n  pr_state_interval_ms: 10000\n", "body")
+                .polling
+                .pr_state_interval_ms,
+            10000
+        );
     }
 
     // Mirrors Go `TestDecodeCanceledStates`.

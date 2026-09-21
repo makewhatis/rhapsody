@@ -97,6 +97,19 @@ impl ControlHandle {
         self.retention_loaded.load(Ordering::Relaxed)
     }
 
+    /// The effective `polling.pr_state_interval_ms` (default 15_000 until the first reload), read by
+    /// the off-loop ticketless-review watcher each cycle from the shared atomic without racing the
+    /// control task's reload (STUDIO-974). Rhapsody-only.
+    pub fn current_pr_state_interval_ms(&self) -> i64 {
+        self.pr_state_interval_ms.load(Ordering::Relaxed)
+    }
+
+    /// The shared interval atomic itself, so the daemon can hand the off-loop review watcher a live
+    /// handle to a hot-reloaded `polling.pr_state_interval_ms` (STUDIO-974).
+    pub fn pr_state_interval_cell(&self) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+        std::sync::Arc::clone(&self.pr_state_interval_ms)
+    }
+
     /// Prunes per-issue worktrees idle beyond `retention_days`, OFF the control loop: snapshots the
     /// GC plan (the live [`Manager`] + the running keep-set) via the control channel, then removes
     /// each stale worktree that is neither in the keep-set nor reported in-use by the authoritative

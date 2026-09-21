@@ -812,6 +812,18 @@ where
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
+    //
+    // STUDIO-974: resolve the conditional REST transport's token HERE, before the task is built and
+    // on the async path's own terms — `resolve_github_token` runs `gh auth token` on the blocking
+    // pool under `GH_EXEC_TIMEOUT`, so a hung `gh` costs a `None` (and the `gh`-source fallback)
+    // rather than a stalled boot (review finding 1). Resolved once: the token does not hot-reload
+    // (it is an environment/CLI fact, not a workflow key), and rebuilding the client per tick would
+    // defeat the ETag cache it exists to keep. A later 401 re-resolves it in place.
+    let conditional_pr_token = if spawn_watcher {
+        rhapsody_orchestrator::prconditional::resolve_github_token().await
+    } else {
+        None
+    };
     let review_watch_task = spawn_watcher.then(|| {
         let watch_ctx = shutdown.wait();
         let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
@@ -902,15 +914,28 @@ where
             sink
         };
         let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
-            pr_source: Some(
-                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
-            ),
+            // STUDIO-974: prefer a REST source that sends `If-None-Match`, so an unchanged tick costs
+            // no primary rate limit and the watcher can poll faster. It needs a token; when none can
+            // be found the `gh`-subprocess source is kept, so a daemon that cannot build the
+            // conditional transport still watches its pull requests. Only the SWEEP is affected —
+            // the pre-dispatch re-read goes through `pr_state_unconditional`, which this source
+            // answers with an unconditional request. The `gh` source is also wired as the REST
+            // source's 401 fallback, so a credential that is rotated or expires downgrades the
+            // watcher to its old (paid) path instead of silencing it until a restart.
+            pr_source: Some(conditional_pr_source(
+                conditional_pr_token.clone(),
+                Arc::clone(&gh),
+            )),
             // The base repository's own owner and nothing else — the default trust boundary. A
             // fork's head is refused rather than reviewed (design §14.1 F-SEC); there is no config
             // key to widen it, so widening is a code change a reviewer sees.
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
             teams: teams_cfg.clone(),
             sink: Arc::new(sink),
+            // The watcher cadence, read fresh each tick from the shared atomic the reload updates
+            // (STUDIO-974). Defaults to the historical 120s; a hot reload of
+            // `polling.pr_state_interval_ms` applies on the next tick.
+            poll_interval_ms: handle.pr_state_interval_cell(),
             // The two reads that prove a head move carried no new work (STUDIO-960), on the same
             // `gh` seam as the state lookup. Wired unconditionally: the decision it feeds is
             // internally gated (the row's status, and a comparison that actually came back
@@ -1249,6 +1274,45 @@ fn spawn_quorum(teams: &rhapsody_config::teams::Teams) -> bool {
 /// nothing for the task to do at all.
 fn spawn_review_intro(teams: &rhapsody_config::teams::Teams) -> bool {
     teams.review_ticketless() && !teams.roster.is_empty()
+}
+
+/// The watcher's `PrStateSource`: a REST client that sends `If-None-Match` when a GitHub token can
+/// be resolved, so an unchanged poll costs no primary rate limit (STUDIO-974). Falls back to the
+/// `gh`-subprocess source when no token is available — a daemon that cannot build the conditional
+/// transport must still watch its pull requests, at the old (paid) cost.
+///
+/// The choice is made ONCE, at boot (`token` is resolved by the caller, off the async worker and
+/// bounded; see `resolve_github_token`): the token does not hot-reload (it is an environment/CLI
+/// fact, not a workflow key), and rebuilding the client per tick would defeat the ETag cache it
+/// exists to keep. The `gh` source is ALSO attached as the REST source's 401 fallback, so a token
+/// that later stops being accepted has somewhere to go.
+fn conditional_pr_source(
+    token: Option<String>,
+    gh: Arc<rhapsody_orchestrator::ghsummons::GH>,
+) -> Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource> {
+    match token {
+        Some(token) => {
+            tracing::info!(
+                "pr-state watcher: using conditional REST requests (If-None-Match); an unchanged \
+                 tick consumes no primary rate limit"
+            );
+            Arc::new(
+                rhapsody_orchestrator::prconditional::ConditionalPrState::new(Arc::new(
+                    rhapsody_orchestrator::prconditional::GitHubRestTransport::new(token),
+                ))
+                .with_fallback(
+                    Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
+                ),
+            )
+        }
+        None => {
+            tracing::warn!(
+                "pr-state watcher: no GitHub token found (GH_TOKEN/GITHUB_TOKEN, or `gh auth \
+                 token`); falling back to the `gh` source, whose polls count against the rate limit"
+            );
+            gh as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
+        }
+    }
 }
 
 /// The claude command, effective billing guard and tracker credential the Teams triage turn runs

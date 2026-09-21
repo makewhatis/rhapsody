@@ -857,6 +857,11 @@ pub struct Orchestrator {
     /// effective retention_days, so the prune scheduler can skip the startup worktree GC while
     /// `current_retention_days` still returns the `New` default. Mirrors Go `retentionLoaded`.
     pub(crate) retention_loaded: Arc<AtomicBool>,
+    /// The effective `polling.pr_state_interval_ms` mirrored as an atomic so the off-loop review
+    /// watcher reads a hot-reloaded cadence without racing the control task's reload (STUDIO-974).
+    /// Defaults to `DEFAULT_PR_STATE_INTERVAL_MS` (15s) at boot, then follows the decoded config.
+    /// Rhapsody-only; no Go counterpart.
+    pub(crate) pr_state_interval_ms: Arc<AtomicI64>,
     /// Per-project-group warning strings surfaced on the project status (INF-277 / INF-279), resolved
     /// OFF the control task by the reload/worker-exit resolver. `Arc` so the off-loop resolver tasks
     /// share it while the control task reads it in `project_statuses`. Mirrors Go's `warningsMu` +
@@ -1010,6 +1015,9 @@ impl Orchestrator {
             gh_enrich_cursor: AtomicUsize::new(0),
             summon_drops: crate::ghenrich::SummonDropLog::default(),
             retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
+            pr_state_interval_ms: Arc::new(AtomicI64::new(
+                rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS,
+            )),
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
             lifecycle: Arc::new(crate::lifecycle::LifecycleCache::default()),
@@ -1071,6 +1079,14 @@ impl Orchestrator {
     /// `current_retention_days` would still return the `New` default. Mirrors Go `RetentionLoaded`.
     pub fn retention_loaded(&self) -> bool {
         self.retention_loaded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The effective `polling.pr_state_interval_ms` (default 15_000 until the first reload), read by
+    /// the off-loop review watcher each cycle without racing the control task's reload (STUDIO-974).
+    /// `<= 0` is clamped to the default by the caller; this returns the raw stored value.
+    pub fn current_pr_state_interval_ms(&self) -> i64 {
+        self.pr_state_interval_ms
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

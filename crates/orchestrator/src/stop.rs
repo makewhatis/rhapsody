@@ -108,6 +108,13 @@ pub struct ControlHandle {
     /// without racing the control task's reload (Go `CurrentRetentionDays` / `RetentionLoaded`).
     pub(crate) retention_days: std::sync::Arc<std::sync::atomic::AtomicI64>,
     pub(crate) retention_loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    /// The SAME `Arc`-shared interval atomic as [`Orchestrator::pr_state_interval_ms`] (STUDIO-974),
+    /// so the daemon's off-loop ticketless-review watcher reads a hot-reloaded cadence
+    /// (`polling.pr_state_interval_ms`) each cycle without racing the control task's reload. It rides
+    /// beside the retention atomics for their reason: both sides genuinely touch it and neither can
+    /// wait for the other, and being a lock-free atomic it is not a state seam.
+    pub(crate) pr_state_interval_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// The SAME `Arc`-shared Teams memory runtime as
     /// [`Orchestrator::teams_memory`](crate::orchestrator::Orchestrator::teams_memory), so the
     /// daemon's `/api/v1/teams/*` handlers read the live run bindings and drive the backend
@@ -196,6 +203,7 @@ impl crate::orchestrator::Orchestrator {
             workflow_path: self.workflow_path.clone(),
             retention_days: std::sync::Arc::clone(&self.retention_days),
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
+            pr_state_interval_ms: std::sync::Arc::clone(&self.pr_state_interval_ms),
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
             warnings: std::sync::Arc::clone(&self.warnings),
             quorum: self.quorum_tx.clone(),

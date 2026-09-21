@@ -43,19 +43,22 @@ use rhapsody_config::teams::Teams;
 use crate::control_loop::CancelWait;
 use crate::ghsummons::{HeadAllowlist, PrLookup, PrStateSource};
 
-/// How often a watched pull request is re-asked about.
+/// The historical pinned watcher cadence (120s), before STUDIO-974 made it a config knob.
 ///
-/// Two minutes is chosen against what is actually waiting on it: the answer drives a re-review of
-/// an author's pushed fixes, and a review run takes minutes, so shaving the detection latency below
-/// a couple of minutes buys nothing anybody can perceive. Against GitHub's 5,000-request hourly
-/// budget for an authenticated account it is deliberately cheap — a full sweep budget every tick is
-/// 600 requests an hour, roughly a tenth — because this daemon shares that budget with the summons
-/// enrichment poll, the quorum's PR lookups and every `gh` call an agent makes inside a run.
+/// This is **no longer the watcher's effective default** — that is
+/// `rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS` (15s), read through the orchestrator's
+/// hot-reloaded atomic; conditional requests made an unchanged poll free, so the old rate-limit
+/// argument for two minutes no longer holds. The constant is retained as a NOMINAL tick reference
+/// for the capacity-hold TTL and the paused-clock test timeouts, both of which are dominated by the
+/// lookup phases rather than the sleep.
 ///
+/// The reasoning it was pinned for: two minutes was chosen against what is actually waiting on it —
+/// the answer drives a re-review of an author's pushed fixes, and a review run takes minutes.
+/// Against GitHub's 5,000-request hourly budget for an authenticated account a full sweep every
+/// tick is 600 requests an hour, roughly a tenth, because this daemon shares that budget with the
+/// summons enrichment poll, the quorum's PR lookups and every `gh` call an agent makes inside a run.
 /// Since STUDIO-953 the watcher also re-reads each OPEN observation's head immediately before its
-/// dispatch, so a full-budget tick makes up to TWICE [`MAX_PR_STATE_CALLS_PER_TICK`] requests —
-/// 1,200 an hour at most, roughly a quarter of the budget. The rate reasoning above is stated
-/// against that doubled number, not the sweep alone.
+/// dispatch, so a full-budget tick makes up to TWICE [`MAX_PR_STATE_CALLS_PER_TICK`] requests.
 pub const PR_STATE_POLL_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How many pull requests ONE tick's SWEEP will ask about, the blast-radius bound on a blocking
@@ -436,6 +439,11 @@ mod tests {
     /// `gh` parks the watcher's next tick and leaves the control task ticking. It re-resolves the
     /// pull request rather than reusing the sweep's observation ON PURPOSE: the merge is
     /// irreversible and the observation is already a tick old by the time it is acted on.
+    ///
+    /// `prconditional.rs` (STUDIO-974) is the conditional REST transport the watcher's sweep and
+    /// its STUDIO-953 pre-dispatch re-read are served from. It holds no `Orchestrator` either, and
+    /// is reached only from `reviewwatch.rs`'s own task (wired at the composition root), so a slow
+    /// HTTP round-trip parks that task and leaves the control task ticking.
     const OFF_LOOP_CALLERS: &[&str] = &[
         "prstate.rs",
         "ghsummons.rs",
@@ -443,6 +451,7 @@ mod tests {
         "runmerge.rs",
         "rundiff.rs",
         "runautomerge.rs",
+        "prconditional.rs",
     ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one
@@ -471,7 +480,14 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(f) else {
                 continue;
             };
-            if !text.contains(".pr_state(") && !text.contains("sweep_pr_states(") {
+            // `.pr_state_unconditional(` is caught too: STUDIO-974 added it as the pre-dispatch
+            // re-read's entry point, and it is the SAME blocking lookup, so a control-loop caller of
+            // it is exactly the hazard this guard exists for. The two names do not overlap — the
+            // `(` after `pr_state` makes the substring match exact.
+            if !text.contains(".pr_state(")
+                && !text.contains(".pr_state_unconditional(")
+                && !text.contains("sweep_pr_states(")
+            {
                 continue;
             }
             let name = f

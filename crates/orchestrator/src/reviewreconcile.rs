@@ -1162,8 +1162,9 @@ impl Orchestrator {
                 }
                 // STUDIO-923: when auto-merge has already said something about this exact pull
                 // request, name it instead of claiming nothing has. The sentence states no count:
-                // auto-merge's own attempts run on the review watcher's separate
-                // `PR_STATE_POLL_INTERVAL` cadence (120s), not this sweep's `polling.interval_ms`
+                // auto-merge's own attempts run on the review watcher's separate, configurable
+                // cadence (`polling.pr_state_interval_ms`, default 15s; the legacy pinned
+                // `PR_STATE_POLL_INTERVAL` was 120s), not this sweep's `polling.interval_ms`
                 // (default 30s), so this sweep's own `sweeps` field would misstate auto-merge's
                 // tally as its own — trading the ticket's false negative for a false positive. No
                 // ledger entry (auto-merge off, or this head never reached a gate) falls back to the

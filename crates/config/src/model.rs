@@ -116,7 +116,38 @@ pub struct Tracker {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Polling {
     pub interval_ms: i64,
+    /// How often the off-loop ticketless-review watcher re-asks GitHub where each watched pull
+    /// request stands, in milliseconds. Rhapsody-only (no Go v0.4.0 counterpart, STUDIO-974):
+    /// defaulted in [`decode`](crate::decode) to [`DEFAULT_PR_STATE_INTERVAL_MS`] (15s). The
+    /// conditional-request transport makes an unchanged poll cost no primary rate limit (see the
+    /// README Divergences entry), so the clock no longer has to be the historical 120s — the
+    /// maintainer's measured ~480–520 req/hr of the 5,000/hr shared budget leaves ample headroom
+    /// for a shorter one.
+    ///
+    /// Deliberately NOT surfaced in the `GET /api/v1/config` view ([`crate::effective_json`]): doing
+    /// so would inject a key the frozen Go reference never emits and break the config goldens (the
+    /// `mcp.allow_handoff` pattern). The watcher reads it through the orchestrator's atomic mirror,
+    /// which a hot reload refreshes.
+    pub pr_state_interval_ms: i64,
 }
+
+/// The default of [`Polling::pr_state_interval_ms`] (15s). Held here so `decode`, `encode` and the
+/// orchestrator's boot default cannot drift.
+///
+/// The historical pinned cadence was 120s — the `prstate::PR_STATE_POLL_INTERVAL` constant — a
+/// rate-limit argument, not a latency one, and the conditional-request transport (STUDIO-974) is
+/// what retires it: an unchanged poll is a free 304, so the same budget now buys a far shorter
+/// interval. An install that never writes the key still gets a working watcher; its *cadence* is no
+/// longer byte-identical to before the key existed, and the transport switch is a second,
+/// independent divergence (see the README Divergences entry).
+pub const DEFAULT_PR_STATE_INTERVAL_MS: i64 = 15_000;
+
+/// The floor the orchestrator applies to [`Polling::pr_state_interval_ms`] when mirroring it into
+/// the watcher's atomic. A conditional 304 is free against the PRIMARY budget, but GitHub still
+/// enforces secondary concurrency/burst limits, and the `gh` fallback (no token) pays every call —
+/// so a sub-second cadence is exactly the exhaustion this key was added to avoid. Ten seconds is
+/// well under the ~10–15s the ticket targets and still far too slow to be a busy loop.
+pub const MIN_PR_STATE_INTERVAL_MS: i64 = 10_000;
 
 /// Workspace root (Go `Workspace`; `root` normalized in Resolve, kept raw here).
 #[derive(Debug, Clone, PartialEq)]
@@ -491,6 +522,9 @@ pub(crate) struct RawTracker {
 #[serde(default)]
 pub(crate) struct RawPolling {
     pub interval_ms: Option<i64>,
+    /// STUDIO-974; Rhapsody-only (no Go v0.4.0 counterpart). `Option` so `decode` can tell an
+    /// explicit value from unset and apply the 120s default.
+    pub pr_state_interval_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
