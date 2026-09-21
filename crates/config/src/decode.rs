@@ -18,8 +18,8 @@ use serde_yaml_ng::Value;
 
 use crate::model::{
     Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp,
-    Opencode, Otel, Polling, Project, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker,
-    Workspace,
+    Opencode, Otel, Polling, Project, ProviderBudget, Raw, RawClaudeOverride, RawProject, Server,
+    Storage, Tracker, Workspace,
 };
 use crate::workflow::Definition;
 
@@ -229,6 +229,22 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     // tell inherit from set; a workflow without `projects:` decodes to repo == "" and no projects.
     let projects = r.projects.into_iter().map(decode_project).collect();
 
+    // Per-provider daily token budgets (STUDIO-957). Rhapsody-only, and deliberately absent from
+    // `effective_json`/`encode` parity surfaces (the `allow_handoff` pattern): an absent value is
+    // unlimited, so a config that never sets one decodes to an empty map and changes nothing.
+    let budgets = r
+        .budgets
+        .into_iter()
+        .map(|(provider, b)| {
+            (
+                provider,
+                ProviderBudget {
+                    daily_tokens: b.daily_tokens.unwrap_or(0),
+                },
+            )
+        })
+        .collect();
+
     Ok(Config {
         tracker,
         polling,
@@ -257,6 +273,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // carries the Rust daemon's product name. Not part of the effective-config wire view, so no
         // byte-parity golden is affected.
         pr_label: or_str(r.pr_label, "rhapsody"),
+        budgets,
     })
 }
 
@@ -767,6 +784,31 @@ mod tests {
     fn decode_logging_override() {
         let c = decode_yaml("logging:\n  dir: /var/log/symphony\n", "");
         assert_eq!(c.logging.dir, "/var/log/symphony");
+    }
+
+    // STUDIO-957: per-provider daily budgets. Rhapsody-only, and the unset case is load-bearing —
+    // an absent `budgets:` block decodes to an empty map, which every budget gate reads as unlimited.
+    #[test]
+    fn decode_budgets_default_empty_and_parse() {
+        let unset = decode_yaml("tracker:\n  kind: linear\n", "body");
+        assert!(
+            unset.budgets.is_empty(),
+            "no budgets: block ⇒ empty map ⇒ unlimited"
+        );
+
+        let c = decode_yaml(
+            "budgets:\n  anthropic:\n    daily_tokens: 200000000\n  fireworks-ai:\n    daily_tokens: 0\n",
+            "body",
+        );
+        assert_eq!(c.budgets["anthropic"].daily_tokens, 200_000_000);
+        assert_eq!(
+            c.budgets["fireworks-ai"].daily_tokens, 0,
+            "0 is a configured UNLIMITED, kept distinct from unset only by presence"
+        );
+
+        // An entry with no daily_tokens still lands as 0 (unlimited) rather than failing.
+        let c = decode_yaml("budgets:\n  openai: {}\n", "body");
+        assert_eq!(c.budgets["openai"].daily_tokens, 0);
     }
 
     // Mirrors Go `TestDecodeOtelDefaults`.

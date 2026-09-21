@@ -184,6 +184,15 @@ pub trait Store {
     /// the question. It reads the existing `runs` table and adds no column, index or migration.
     fn earliest_run_start(&self) -> Result<Option<String>, StoreError>;
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+    /// [`Store::metrics`] decomposed by provider (STUDIO-957): the same day window and project
+    /// filter, one row per (`date`, `provider`) rather than per day. A run with no recorded
+    /// provenance lands in the empty-provider bucket (LEFT JOIN) so the series still sums to the
+    /// undifferentiated total. Rhapsody-only — Go has no provider dimension.
+    fn metrics_by_provider(
+        &self,
+        since_days: i64,
+        project: &str,
+    ) -> Result<Vec<DayProviderRollup>, StoreError>;
 
     // --- per-run provenance (STUDIO-909) ---
     // Additive Rhapsody-only surface with no Go counterpart: the frozen reference records nothing

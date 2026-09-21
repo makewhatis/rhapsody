@@ -34,6 +34,7 @@
 pub mod agentupdate;
 pub mod automerge;
 pub mod backoff;
+pub mod budget;
 pub mod claim;
 pub mod concurrency;
 // `loop` is a reserved word; the file mirrors Go `loop.go` while the module is `control_loop`.

@@ -563,6 +563,11 @@ pub struct Orchestrator {
     /// [`HumanHoldLedger`](crate::dispatch::HumanHoldLedger) and the seam list in
     /// `crates/orchestrator/CLAUDE.md`.
     pub(crate) human_holds: Arc<crate::dispatch::HumanHoldLedger>,
+    /// The per-provider daily budget ledger (STUDIO-957): the CURRENT refused set the console reads
+    /// off `/api/v1/state`, the once-per-subject log dedupe, and a short-lived spend cache. Behind an
+    /// [`Arc`] for [`human_holds`](Orchestrator::human_holds)'s reason — the gates take `&self` and
+    /// the control task assembles the snapshot from the same cell. Rhapsody-only.
+    pub(crate) budget_ledger: crate::budget::SharedBudgetLedger,
     /// Issue ids whose work has completed this process lifetime, a set.
     pub completed: HashSet<String>,
     /// Graphite-mode stacking facts carried from the auto-promote pass to the next tick's dispatch
@@ -967,6 +972,7 @@ impl Orchestrator {
             retry_attempts: HashMap::new(),
             held_for_capacity: HashMap::new(),
             human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),
+            budget_ledger: Arc::new(crate::budget::BudgetLedger::default()),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),

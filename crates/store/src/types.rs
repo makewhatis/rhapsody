@@ -299,6 +299,25 @@ pub struct DayRollup {
     pub total_tokens: i64,
 }
 
+/// One day's token/run rollup for ONE provider — the per-day decomposition of [`DayRollup`] by the
+/// account a run actually billed (STUDIO-957). A single undifferentiated daily total hides the only
+/// figure an operator can act on: implementation on Fireworks and reviews on Anthropic draw on
+/// different accounts, so "987M tokens" is one number over two budgets. Aggregated in SQL over the
+/// `runs` ⋈ `rhapsody_run_provenance` join, LEFT-joined so a run with no recorded provenance still
+/// counts (in the empty-provider bucket) rather than vanishing from the series.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DayProviderRollup {
+    /// YYYY-MM-DD (UTC), the same bucket [`DayRollup::date`] uses.
+    pub date: String,
+    /// The recorded provider; empty for a run that recorded none (a legacy row, or a harness whose
+    /// provider could not be determined). Reported as its own bucket rather than dropped.
+    pub provider: String,
+    pub runs: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub total_tokens: i64,
+}
+
 /// DayTotals is the whole-store aggregation over the runs that STARTED within a window — the
 /// header "today" figures (TRA-320). Computed in SQL over every matching row so the numbers never
 /// depend on which page of `/api/v1/history` a client happened to fetch.

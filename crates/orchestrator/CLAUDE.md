@@ -310,8 +310,8 @@ the `Orchestrator` struct itself. Concretely:
   with no durable store; that `None` is what keeps every teams-off and `labels`-only prompt
   byte-identical, so don't make it a `Noop` store instead.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
-  bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
-  issue/run/session id here, that's a correctness bug, not a style nit).
+  bounded metric-label cardinality contract — project/model/harness/provider/outcome/reason only;
+  never add an issue/run/session id here, that's a correctness bug, not a style nit).
 - `lib.rs` documents the historical O1–O8 porting-ticket chain and a "compiling-stub protocol":
   a not-yet-ported call is a typed `OrchestratorError::Unimplemented` stub tagged with its owning
   ticket, never `todo!()`/`panic!()`. That chain is complete (O8's gate: no stub markers remain),

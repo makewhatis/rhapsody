@@ -2236,6 +2236,17 @@ impl Orchestrator {
                 // A drain is armed: the row is untouched and this head is re-offered on the sweep
                 // after the drain is cancelled, exactly as a deferred one is.
                 ReviewDispatchOutcome::Draining => report.deferred += 1,
+                // The reviewer's provider is out of daily budget (STUDIO-957): the row is untouched
+                // and this head is re-offered once the budget resets, exactly as a deferred one is.
+                // `dispatch_review` does not log here (it records the hold, which the sweep and
+                // `/api/v1/state` carry); this is the watcher's own once-per-round line.
+                ReviewDispatchOutcome::BudgetHeld => {
+                    report.deferred += 1;
+                    tracing::info!(
+                        pr = %pr,
+                        "ticketless review: deferred — the reviewer's provider is out of daily budget"
+                    );
+                }
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
@@ -5717,6 +5728,77 @@ mod tests {
 
         o.note_author_round(&iss);
         assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&3));
+    }
+
+    /// **alice round 1 on PR #199, finding 1.** `note_author_round` is placed AFTER the provider
+    /// budget gate, so a budget-REFUSED fresh dispatch charges nothing. A ticket held every tick
+    /// would otherwise spend its pull request's shared review↔author budget on each poll and reach
+    /// adjudication without anyone having run.
+    ///
+    /// Mutation: move `note_author_round` back above the gate in `dispatch_issue` and the counter
+    /// reds to 2.
+    #[test]
+    fn a_budget_refused_dispatch_charges_no_author_round() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let (mut o, _d) = orch(adjudicating(&["alice"], 5));
+        o.eff.as_mut().expect("eff").cfg.claude.model = "claude-opus-4-8".to_string();
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".to_string(),
+            rhapsody_config::ProviderBudget { daily_tokens: 200 },
+        );
+
+        // Today's anthropic spend is over the ceiling.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        // The pull request already carries a shared review budget entry.
+        o.review_rounds.insert(churn_key(&coord(12)), 1);
+        let iss = author_issue("STUDIO-170", 12);
+
+        o.dispatch_issue(iss, None, None, String::new());
+
+        assert!(
+            o.budget_ledger
+                .get("STUDIO-170", o.budget_hold_ttl())
+                .is_some(),
+            "sanity: the dispatch was refused for budget"
+        );
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&1),
+            "a refused dispatch must charge no author round"
+        );
     }
 
     /// **Acceptance.** Once the adjudication threshold is reached, BOTH sides stop: the review sweep

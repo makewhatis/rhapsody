@@ -16,7 +16,7 @@
 
 // NOTE: typed structs derive `Debug, Clone, PartialEq` (the C1 house convention) — not `Eq`,
 // so a future float-bearing field never forces a churny de-derive.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -353,6 +353,21 @@ pub struct Project {
     pub enabled: Option<bool>,
 }
 
+/// One provider's daily token budget (STUDIO-957). Rhapsody-only — the frozen Go reference has no
+/// budget concept at all.
+///
+/// Tokens are metered PER PROVIDER and never aggregated: 500M Fireworks tokens and 360M Opus tokens
+/// are not the same money, and each draws on its own account. The key is the provider string
+/// [`derive_provider`](https://docs.rs/rhapsody-orchestrator) records on a run (`anthropic`,
+/// `fireworks-ai`, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderBudget {
+    /// Daily token ceiling for this provider. `<= 0` means UNLIMITED, matching the
+    /// `max_concurrent` idiom, so an unset or zero budget never refuses anything. An absent map
+    /// entry is likewise unlimited (the whole [`Config::budgets`] map defaults empty).
+    pub daily_tokens: i64,
+}
+
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -391,6 +406,10 @@ pub struct Config {
     /// GitHub label the post-run labeler adds; defaults to `"rhapsody"` in Decode (Rhapsody
     /// divergence from Go's `"symphony"`, AIE-301).
     pub pr_label: String,
+    /// Per-provider daily token budgets (STUDIO-957). Rhapsody-only; EMPTY (the default, and every
+    /// install that never configures one) is unlimited and byte-identical to today. Ordered so the
+    /// effective view and any serialization are deterministic.
+    pub budgets: BTreeMap<String, ProviderBudget>,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +448,16 @@ pub(crate) struct Raw {
     pub workspace_mode: String,
     pub pr_label: String,
     pub projects: Vec<RawProject>,
+    /// `budgets:` front-matter block (STUDIO-957). Rhapsody-only: absent ⇒ empty ⇒ unlimited.
+    pub budgets: BTreeMap<String, RawProviderBudget>,
+}
+
+/// Raw `budgets.<provider>` entry. `daily_tokens` is `Option` so an absent value is distinguishable
+/// from an explicit `0` (both end up unlimited, but the split mirrors the rest of the Raw tree).
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawProviderBudget {
+    pub daily_tokens: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
