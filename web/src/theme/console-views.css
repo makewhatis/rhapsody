@@ -172,12 +172,19 @@
 .rh-console .bpr .tk.pr:hover { border-color: var(--ok); }
 /* The compact row a live review run draws in the Running lane (STUDIO-955): a ticket parked in In
    Review has no card there, so the lane counts runs and shows runs. Quieter than a card — it is a
-   seat being held, not a work item — but still a target that opens the run's own trace. */
-.rh-console .brun { display: flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); font-size: 11px; color: var(--ink-3); cursor: pointer; }
+   seat being held, not a work item — but still a target that opens the run's own trace.
+   The row wraps rather than clipping (STUDIO-968). It carried up to four facts — who, which
+   ticket, which provider, how long — and a long provider ("fireworks-ai") already pressed the
+   Compact (224px) track before the verb was added, so the verb would turn a near-miss into a clip
+   of the ticket id or the badge. Wrapping keeps every element whole; the ticket id never breaks. */
+.rh-console .brun { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); font-size: 11px; color: var(--ink-3); cursor: pointer; }
 .rh-console .brun:hover { border-color: #34343c; background: var(--raise); }
 .rh-console .brun:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.rh-console .brun .rwho { color: var(--ink-2); }
-.rh-console .brun .rtk { font-family: var(--mono); font-size: 10.5px; color: var(--ticket); }
+.rh-console .brun .rwho { color: var(--ink-2); white-space: nowrap; }
+/* The relationship ("is reviewing …") reads as prose, not status: quiet ink so it never competes
+   with the ticket id or the provider badge (STUDIO-968). */
+.rh-console .brun .rverb { color: var(--ink-4); }
+.rh-console .brun .rtk { font-family: var(--mono); font-size: 10.5px; color: var(--ticket); white-space: nowrap; }
 .rh-console .brun .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
 .rh-console .brun .rel { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
 

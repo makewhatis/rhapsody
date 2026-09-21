@@ -1,9 +1,23 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ConsoleJobRow, ConsoleJobCounts } from "@/lib/console-jobs";
 import { DEFAULT_BOARD_CARD_FIELDS } from "@/hooks/useBoardCardFields";
 import { BoardView, type BoardViewProps } from "./BoardView";
+
+// The board's own stylesheet. The narrow-lane guard below reads it because jsdom lays nothing out:
+// the wrap and the nowrap ticket are the whole mechanism that keeps the row from clipping, so they
+// are asserted at their source rather than trusted to a rendered width no test can measure.
+const boardCss = readFileSync(path.resolve(__dirname, "../../../theme/console-views.css"), "utf8");
+
+/** The declaration block for one selector, from its opening brace to the closing one. */
+function cssRule(selector: string): string {
+  const at = boardCss.indexOf(selector);
+  expect(at, `no rule for ${selector}`).toBeGreaterThan(-1);
+  return boardCss.slice(at, boardCss.indexOf("}", at));
+}
 
 // The PR link is an ExternalLink, whose click seam calls `openExternal`; with no Tauri bridge that
 // falls back to `window.open`, which jsdom reports as "Not implemented" noise. The seam is not what
@@ -614,5 +628,71 @@ describe("the reviewer chip and the Running lane (STUDIO-955)", () => {
     expect(running.querySelectorAll(".brun")).toHaveLength(1);
     expect(running.querySelector(".bcount")?.textContent).toBe("2 / 6");
     expect(running.querySelectorAll(".bslot")).toHaveLength(4);
+  });
+});
+
+// STUDIO-968 — the row said two different things to two readers. A screen reader was told
+// "alice's review of STUDIO-957" while the visible row rendered a bare "alice STUDIO-957" with no
+// verb: the accessible name was MORE informative than the visible label, which is the wrong way
+// round. These pin the visible side, that both sides say the same phrase, and that a run whose
+// origin never resolved names a pull request rather than leaving a verb hanging off nothing.
+describe("the running review row's relationship (STUDIO-968)", () => {
+  const liveReview = (pr: string, of: string, over: Partial<ConsoleJobRow> = {}) =>
+    review(pr, of, {
+      status: "reviewing",
+      statusLabel: "reviewing",
+      runOutcome: "running",
+      live: true,
+      ...over,
+    });
+
+  /** Mount one ticket plus one live review run of it, and hand back the compact row. */
+  function mountRun(of: string, over: Partial<ConsoleJobRow> = {}) {
+    mount([
+      row({ issue: "STUDIO-957", status: "review", trackerState: "In Review" }),
+      liveReview("pr:makewhatis/rhapsody#186@alice", of, {
+        provider: "anthropic",
+        elapsed: "4m",
+        ...over,
+      }),
+    ]);
+    return document.querySelector('[data-lane="running"] .brun')!;
+  }
+
+  it("names the relationship in the visible row, not only in its accessible name", () => {
+    const run = mountRun("STUDIO-957");
+    // Reverting to the bare `{reviewer}{ticket}` render reds this line: the visible row would carry
+    // no verb a sighted reader could see. Asserting the aria-label alone would stay green — which is
+    // exactly how this shipped, so the visible text is what is asserted here.
+    expect(run.textContent).toContain("alice is reviewing STUDIO-957");
+    // The badge and clock the maintainer relies on survive the added prose.
+    expect(run.textContent).toContain("anthropic");
+    expect(run.textContent).toContain("4m");
+  });
+
+  it("keeps the visible text and the accessible name saying the same thing", () => {
+    const run = mountRun("STUDIO-957");
+    const phrase = "alice is reviewing STUDIO-957";
+    // One phrase is asserted against BOTH: diverging either the visible text or the accessible name
+    // alone reds this line, so the two cannot drift apart again with the sign flipped.
+    expect(run.textContent).toContain(phrase);
+    expect(run.getAttribute("aria-label")).toContain(phrase);
+  });
+
+  it("renders a ticketless review run as a review of a pull request, with no dangling verb", () => {
+    const run = mountRun("");
+    // "alice is reviewing" with nothing after it is the name-and-nothing shape the ticket calls out.
+    // A ticketless review is still of a pull request, so the verb gets an object rather than hanging.
+    expect(run.textContent).toContain("alice is reviewing a pull request");
+    expect(run.getAttribute("aria-label")).toContain("alice is reviewing a pull request");
+  });
+
+  // Compact is the 224px track. The row already carried up to four facts, and a long provider
+  // ("fireworks-ai") pressed that width on its own; the verb would turn a near-miss into a clip of
+  // the ticket id or the badge. jsdom lays nothing out, so the mechanism is asserted at its source:
+  // the row wraps rather than truncating, and the ticket id never breaks mid-key.
+  it("wraps at the narrowest lane instead of clipping the ticket", () => {
+    expect(cssRule(".rh-console .brun")).toMatch(/flex-wrap:\s*wrap/);
+    expect(cssRule(".rh-console .brun .rtk")).toMatch(/white-space:\s*nowrap/);
   });
 });
