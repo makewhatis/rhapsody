@@ -41,6 +41,14 @@ pub trait HistoryStore: Send + Sync {
         project: &str,
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError>;
+    /// Every run under one of `identifiers`, most-recent first (`GET /api/v1/issues/{id}/history`'s
+    /// review half, STUDIO-976). The caller resolves those identifiers from the watch set with
+    /// `reviewdone::origin_ticket`; this is only the run lookup. Rhapsody-only; Go has no reviews.
+    fn runs_for_issues(
+        &self,
+        identifiers: &[String],
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError>;
     /// A single run row by id — `Ok(None)` (not an error) when no such run exists, so the unified
     /// run-detail endpoint can answer 404 without treating "missing" as an error. Mirrors Go `GetRun`.
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError>;
@@ -112,6 +120,13 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError> {
         rhapsody_store::Store::issue_history(self, identifier, project, limit)
+    }
+    fn runs_for_issues(
+        &self,
+        identifiers: &[String],
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError> {
+        rhapsody_store::Store::runs_for_issues(self, identifiers, limit)
     }
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
         rhapsody_store::Store::get_run(self, run_id)

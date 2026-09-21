@@ -942,6 +942,29 @@ impl Store for Sqlite {
         }
     }
 
+    fn runs_for_issues(
+        &self,
+        identifiers: &[String],
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError> {
+        // Skip a pointless query for an empty set. SQLite accepts `IN ()` as a predicate that
+        // matches nothing, so this is an optimization, not a guard against a syntax error.
+        if identifiers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let holes = vec!["?"; identifiers.len()].join(", ");
+        let q = format!(
+            "SELECT {RUN_COLS} FROM runs WHERE issue_identifier IN ({holes}) \
+             ORDER BY started_at DESC, id DESC LIMIT ?"
+        );
+        let mut args: Vec<Value> = identifiers
+            .iter()
+            .map(|id| Value::Text(id.clone()))
+            .collect();
+        args.push(Value::Integer(effective_run_limit(limit)));
+        self.query_runs(&q, args)
+    }
+
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
         let q = format!("SELECT {RUN_COLS} FROM runs WHERE id = ?");
         let mut runs = self.query_runs(&q, vec![Value::Integer(run_id)])?;
@@ -2723,6 +2746,45 @@ mod tests {
         let alpha = st.issue_history("MT-9", "alpha", 0).expect("history alpha");
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].project_slug, "alpha");
+    }
+
+    // STUDIO-976 — the review half of a ticket's run detail: one query for a whole set of keys,
+    // newest first, and an EMPTY set is an empty answer rather than an `IN ()` SQLite rejects.
+    #[test]
+    fn runs_for_issues_reads_a_set_newest_first_and_survives_an_empty_one() {
+        let st = open_mem();
+        let alice = st
+            .start_run(RunStart {
+                issue_identifier: "pr:o/r#1@alice".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start alice");
+        let sol = st
+            .start_run(RunStart {
+                issue_identifier: "pr:o/r#1@sol".into(),
+                started_at: "2026-01-02T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start sol");
+        st.start_run(RunStart {
+            issue_identifier: "pr:o/r#2@jimmy".into(),
+            started_at: "2026-01-03T00:00:00Z".into(),
+            ..Default::default()
+        })
+        .expect("start jimmy");
+
+        let keys = vec!["pr:o/r#1@alice".to_string(), "pr:o/r#1@sol".to_string()];
+        let got = st.runs_for_issues(&keys, 0).expect("runs for issues");
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![sol, alice],
+            "the other pull request's review is not in the set, and the newest is first",
+        );
+        assert!(
+            st.runs_for_issues(&[], 0).expect("empty set").is_empty(),
+            "an empty set is an empty answer",
+        );
     }
 
     // Mirror TestAppendEventsAndRunEvents: ordered append + read-back, and an empty batch no-op.

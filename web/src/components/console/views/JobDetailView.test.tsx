@@ -206,8 +206,8 @@ function teammate(name: string) {
 /** The client the last mount rendered under — how a test simulates a poll tick landing. */
 let client: QueryClient;
 
-function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
-  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs });
+function mountDetail(runs: RunSummary[], onNavigate = vi.fn(), reviews: RunSummary[] = []) {
+  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs, reviews });
   // The whole-ticket cost ledger (STUDIO-975). Empty by default, which is the "—" case; a test
   // about the total configures it BEFORE mounting.
   if (h.fetchHistoryCosts.getMockImplementation() === undefined) {
@@ -516,6 +516,106 @@ describe("zone A — the sticky header (§3A)", () => {
       "attempt 3 · alice",
     );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+    // A ticket the daemon credited no reviews to renders exactly as it did before the strip: no
+    // review row at all, rather than an empty one.
+    expect(document.querySelector(".trreviews")).toBeNull();
+  });
+
+  // STUDIO-976 — the ticket's review runs, credited to it by the daemon's own origin-ticket join,
+  // shown beside the attempts. They live in their OWN strip, never in the attempt selector: an
+  // attempt's ordinal is its position in the ticket's run list, so folding reviews into
+  // `attemptOptions` would silently renumber every label. This test is the pin for that mutation —
+  // with two reviews present, the three attempt labels must read exactly as they did without them.
+  it("shows the ticket's review runs in their own strip, naming each reviewer, without renumbering the attempts", async () => {
+    const reviews = [
+      run({ id: 802, issue_identifier: "pr:makewhatis/rhapsody#204@sol", started_at: "2026-09-01T17:30:00Z" }),
+      run({ id: 801, issue_identifier: "pr:makewhatis/rhapsody#204@alice", started_at: "2026-09-01T17:00:00Z" }),
+    ];
+    mountDetail(
+      [
+        run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+        run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+        run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
+      ],
+      vi.fn(),
+      reviews,
+    );
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(2));
+    // A review names its reviewer and is never numbered as an attempt...
+    expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
+      "review · sol",
+      "review · alice",
+    ]);
+    // ...and the attempts keep their own ordinals, untouched by the two reviews above them.
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · alice", "attempt 1 · alice"],
+      ),
+    );
+    // A review carries its own run id and start time in the tooltip, exactly as an attempt does.
+    expect(document.querySelector(".trrev")?.getAttribute("title")).toMatch(
+      /^review · sol · run 802 · started /,
+    );
+  });
+
+  // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
+  // so selecting it drives the same detail fetch and the same header pill as an attempt.
+  it("opens a review run's own trace from the review strip", async () => {
+    const rows = [
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ];
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    h.fetchRunDetail.mockImplementation(async (id: number) => {
+      const row = [...rows, review].find((r) => r.id === id);
+      if (row === undefined) throw new Error(`no run with id: ${id}`);
+      return detailOf(row);
+    });
+    mountDetail(rows, vi.fn(), [review]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    fireEvent.click(document.querySelector(".trrev") as HTMLElement);
+    // The review's own run is opened — its transcript is fetched — the header pill follows it, and
+    // its reviewer is the header's assignee: one resolution, so the strip and the header cannot
+    // disagree about whose run it is.
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledWith(801));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 801 · started /,
+      ),
+    );
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice");
+    expect(document.querySelector('.trrev[aria-pressed="true"]')?.textContent).toBe("review · alice");
+    // No ATTEMPT is selected — a review is not an attempt.
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')).toBeNull();
+    // "Open ticket" still opens the TICKET being viewed, not the review's synthetic
+    // `pr:<owner>/<repo>#<n>@<reviewer>` issue key. A review run's `issue_identifier` is not a
+    // Linear ticket, so the action must resolve the route-level identifier.
+    await waitFor(() =>
+      expect(action(/open ticket/i).getAttribute("href")).toBe(
+        "https://linear.app/studio49/issue/STUDIO-654",
+      ),
+    );
+  });
+
+  // A ticket whose author runs have been pruned from the store but whose review WATCH row survived
+  // (a retirement is a soft delete) still shows its reviews: the strip must not vanish behind the
+  // "no recorded runs" empty state, which is what `runs` alone would render here.
+  it("shows a ticket's reviews even when it has no author runs left", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    mountDetail([], vi.fn(), [review]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    expect(document.querySelector(".trrev")?.textContent).toBe("review · alice");
+    expect(screen.queryByText("This ticket has no recorded runs.")).toBeNull();
   });
 
   // The acceptance's two degradations, which are DIFFERENT answers about the same absence.
@@ -1512,6 +1612,38 @@ describe("the whole-ticket token total (STUDIO-975)", () => {
       await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 1);
     });
     await waitFor(() => expect(block().textContent).toContain("300.0k"));
+  });
+
+  // STUDIO-976 meets STUDIO-975: a review run's own `issue_identifier` is its synthetic
+  // `pr:…@reviewer` key, which is not a ticket — the ledger keys on the TICKET. Selecting a review
+  // must keep the whole-ticket total on the ticket being viewed, not scope to a key the ledger
+  // cannot carry (the same trap sol blocked on the "Open ticket" action). The total is the whole
+  // point of the card; a review run's tokens are already inside it (`/history/costs` credits them).
+  it("keeps the ticket total on the viewed ticket when a review run is selected", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    h.fetchHistoryCosts.mockResolvedValue({
+      costs: [cost("STUDIO-654", "anthropic", 9_400_000)],
+    });
+    h.fetchRunDetail.mockImplementation(async (id: number) => {
+      const row = [run({ id: 547 }), review].find((r) => r.id === id);
+      if (row === undefined) throw new Error(`no run with id: ${id}`);
+      return detailOf(row);
+    });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 801, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })], vi.fn(), [review]);
+    await waitFor(() =>
+      expect(client.getQueryState(HISTORY_COSTS_QUERY_KEY)?.status).toBe("success"),
+    );
+    fireEvent.click(document.querySelector(".trrev") as HTMLElement);
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledWith(801));
+    const block = document.querySelector(".trticket") as HTMLElement;
+    expect(block.textContent).toContain("9.4M");
+    expect(block.textContent).not.toContain("—");
   });
 });
 

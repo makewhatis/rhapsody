@@ -67,6 +67,7 @@ import {
   relayBatons,
   resultBanner,
   resultEyebrow,
+  reviewOptions,
   runBranch,
   runTeammate,
   runVitals,
@@ -191,10 +192,22 @@ export function JobDetailView({
   const identityRead = { isPending: identityEvents.isPending, isError: identityEvents.isError };
 
   const runs = useMemo(() => runsNewestFirst(history.data?.runs ?? []), [history.data]);
+  // The ticket's REVIEW runs (STUDIO-976), already credited to it by the daemon's own origin-ticket
+  // join — this console never decides which ticket a review belongs to. Newest-first like `runs`, so
+  // the two feed one time order; empty on a ticket with no reviews, and on a daemon that predates
+  // the field, so the detail renders exactly as it did before it existed.
+  const reviews = useMemo(() => runsNewestFirst(history.data?.reviews ?? []), [history.data]);
   // The attempt the zones render. `null` follows the newest run, so a ticket that gains a run
-  // while the page is open moves with it; picking an attempt pins the choice.
+  // while the page is open moves with it; picking an attempt pins the choice. A REVIEW run is
+  // selectable too (its own trace, cost and outcome), so the pin resolves against both lists —
+  // `runs` alone would refuse a review id and silently fall back to the newest attempt.
+  //
+  // The default falls through to the newest REVIEW when the ticket has no author runs left. A
+  // ticket's runs can be pruned from the store while its review WATCH row survives (a retirement is
+  // a soft delete), so "reviews but no attempts" is a real shape, and rendering "no recorded runs"
+  // over a review that exists would hide exactly what the ticket asks the strip to keep.
   const [pinned, setPinned] = useState<number | null>(null);
-  const run = runs.find((r) => r.id === pinned) ?? runs[0];
+  const run = [...runs, ...reviews].find((r) => r.id === pinned) ?? runs[0] ?? reviews[0];
   // The live roster, which only ever names a RUNNING ticket — the gap-filler behind the durable
   // record for a run whose ledger has no routing row at all (`runTeammate`).
   //
@@ -239,7 +252,9 @@ export function JobDetailView({
       ) : (
         <RunTrace
           run={run}
+          issue={issue}
           runs={runs}
+          reviews={reviews}
           identities={identities}
           identityRead={identityRead}
           assignee={assignee}
@@ -259,7 +274,9 @@ export function JobDetailView({
 /** One attempt, rendered as the three zones. Keyed by run id so a switch resets every selection. */
 function RunTrace({
   run,
+  issue,
   runs,
+  reviews,
   identities,
   identityRead,
   assignee,
@@ -272,7 +289,13 @@ function RunTrace({
   onOpenRoom,
 }: {
   run: RunSummary;
+  /** The route-level ticket being viewed. A review run's own `issue_identifier` is its synthetic
+   * `pr:<owner>/<repo>#<n>@<reviewer>` key, which is not a Linear ticket — so the header's ticket
+   * link resolves from HERE, not from the selected run. */
+  issue: string;
   runs: readonly RunSummary[];
+  /** The ticket's review runs (STUDIO-976), credited by the daemon's origin-ticket join. */
+  reviews: readonly RunSummary[];
   /** Run id → the teammate that run was dispatched as; see `lib/run-identity` for the tri-state. */
   identities: ReadonlyMap<number, string>;
   /** How that map's own fetch is going — an empty map means nothing without it. */
@@ -311,6 +334,14 @@ function RunTrace({
   const attempts = useMemo(
     () => attemptOptions(runs, identities, assignee),
     [runs, identities, assignee],
+  );
+  // The review strip (STUDIO-976): the ticket's review runs, labelled by reviewer through the SAME
+  // resolution the attempts, the batons and the header's assignee use. Deliberately NOT folded into
+  // `attempts`: an attempt's ordinal is its position in the TICKET's run list, and inserting
+  // reviews there would renumber every attempt label quoted in tickets, PR comments and the room.
+  const reviewStrip = useMemo(
+    () => reviewOptions(reviews, identities, assignee),
+    [reviews, identities, assignee],
   );
   // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
   // "what <who> did" can never disagree about whose run this is — they did while only the header
@@ -362,6 +393,7 @@ function RunTrace({
       <TraceHeader
         ref={headerRef}
         run={live}
+        issue={issue}
         attempts={attempts}
         who={who}
         resolvingWho={identityRead.isPending}
@@ -384,6 +416,34 @@ function RunTrace({
         }}
       />
 
+      {/* The review strip (STUDIO-976). Its own row beneath the attempt selector, not folded into
+          it: the selector's single-row width budget is measured per ATTEMPT count (`attemptBucket`,
+          console-trace.css), and a one-attempt ticket with reviews would have them hidden by the
+          `[data-attempts="1"]` rule — while a heavily reviewed ticket's strip is long enough that
+          no threshold fits it either way. A review is a real run with its own trace, so each entry
+          opens it exactly as an attempt does; a review is never numbered, and it is styled as its
+          own kind of row rather than a fourth attempt. */}
+      {reviewStrip.length === 0 ? null : (
+        <div className="trreviews" role="group" aria-label="Reviews">
+          {reviewStrip.map((r) => (
+            <button
+              key={r.id}
+              type="button"
+              className={r.id === run.id ? "trrev on" : "trrev"}
+              aria-pressed={r.id === run.id}
+              title={
+                r.named
+                  ? `${r.label} · run ${r.id} · started ${formatDateTime(r.startedAt)}`
+                  : `run ${r.id} · started ${formatDateTime(r.startedAt)}`
+              }
+              onClick={() => selectRun(r.id)}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="trmode">
         <div className="rt">
           <Seg
@@ -404,6 +464,7 @@ function RunTrace({
         <>
           <ResultCardZone
             run={live}
+            ticket={issue}
             result={result}
             vitals={vitals}
             pending={transcript.isPending}
@@ -498,6 +559,7 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 function TraceHeader({
   ref,
   run,
+  issue,
   attempts,
   who,
   resolvingWho,
@@ -513,6 +575,9 @@ function TraceHeader({
 }: {
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
+  /** The route-level ticket being viewed — what "Open ticket" links to. A selected review run's
+   * own `issue_identifier` is a synthetic `pr:` key, never a Linear ticket. */
+  issue: string;
   /** Every attempt the ticket has, newest first, already labelled — see `attemptOptions`. */
   attempts: readonly AttemptOption[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -675,7 +740,7 @@ function TraceHeader({
       </div>
       <HeaderActions
         run={run}
-        ticketHref={ticketUrl(workspaceURLKey, run.issue_identifier)}
+        ticketHref={ticketUrl(workspaceURLKey, issue)}
         inFlight={inFlight}
         composerId={composerId}
         onCompose={onCompose}
@@ -1011,6 +1076,7 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
 
 function ResultCardZone({
   run,
+  ticket,
   result,
   vitals,
   pending,
@@ -1018,6 +1084,10 @@ function ResultCardZone({
   onJumpToFailure,
 }: {
   run: RunSummary;
+  /** The route-level ticket being viewed — the ledger's key. A selected review run's own
+   * `issue_identifier` is its synthetic `pr:…@reviewer` key, which is not a ticket, so the
+   * whole-ticket total must resolve from HERE (STUDIO-976). */
+  ticket: string;
   result: ResultCard;
   vitals: RunVitals;
   pending: boolean;
@@ -1044,7 +1114,7 @@ function ResultCardZone({
   // per-attempt vitals (STUDIO-975 round 1).
   const costRows = useLiveHistoryCosts(inFlight);
   const ticketCost =
-    costRows.data === undefined ? null : ticketCostView(costRows.data.costs, run.issue_identifier);
+    costRows.data === undefined ? null : ticketCostView(costRows.data.costs, ticket);
   return (
     <div className={eyebrow.tone === "done" ? "trrc" : `trrc ${eyebrow.tone}`}>
       <div className="trbar" />

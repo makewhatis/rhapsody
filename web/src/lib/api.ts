@@ -431,9 +431,17 @@ export interface DaySummary {
 }
 
 // IssueHistoryResponse is the GET /api/v1/issues/<id>/history payload.
+//
+// `reviews` is ADDITIVE and Rhapsody-only (STUDIO-976): the REVIEW RUNS credited to this ticket,
+// joined to it by the daemon's own watch-set fold (`reviewdone::origin_ticket`), which is the same
+// join `IssueRun.review_of` and the cost ledger use. Kept separate from `runs` because `runs` is
+// the ticket's own ATTEMPTS and the attempt ordinal is derived from a run's position in that list —
+// folding reviews in would renumber every attempt label. A review is a real run with a real id,
+// trace, cost and outcome, so an entry opens like any other; a ticket with no reviews gets `[]`.
 export interface IssueHistoryResponse {
   issue_identifier: string;
   runs: RunSummary[];
+  reviews: RunSummary[];
 }
 
 // RunTranscriptResponse is the GET /api/v1/runs/<id>/transcript payload: the RICH humanized
@@ -922,6 +930,8 @@ export async function fetchIssueHistory(identifier: string): Promise<IssueHistor
     `/api/v1/issues/${encodeURIComponent(identifier)}/history`,
   );
   h.runs ??= [];
+  // A daemon older than STUDIO-976 omits the field; the strip then renders as it did before it.
+  h.reviews ??= [];
   return h;
 }
 

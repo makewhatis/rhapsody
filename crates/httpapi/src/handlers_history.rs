@@ -843,7 +843,71 @@ pub(crate) async fn handle_issue_history(
         Ok(runs) => runs,
         Err(_) => return store_error("issue history query failed"),
     };
-    write_json(StatusCode::OK, &issue_history_response(&id, &runs))
+    // The review runs credited to this ticket (STUDIO-976), so the console's attempt strip can show
+    // the reviews in time order with the attempts they answered. The join is the server's existing
+    // one — see `review_runs_for_ticket` — never a second client-side rule.
+    let reviews = review_runs_for_ticket(provider.history().as_ref(), &id, limit);
+    write_json(
+        StatusCode::OK,
+        &issue_history_response(&id, &runs, &reviews),
+    )
+}
+
+/// The review runs credited to `ticket` (STUDIO-976): the watch rows whose recorded origin names
+/// this ticket, through the ONE reader of those spellings —
+/// [`rhapsody_orchestrator::reviewdone::origin_ticket`] — looked up as runs in one query.
+///
+/// THE JOIN IS THE SERVER'S, NOT A SECOND CLIENT-SIDE RULE. A `pr:owner/repo#n@reviewer` key names
+/// the repository, the number and the reviewer and no ticket whatever, so the link lives ONLY on
+/// the watch row's `introduced_by`; this reads it with the same function the orchestrator moves a
+/// ticket by, exactly as the listing's `review_of` and the cost ledger do. What the client is
+/// handed is run rows; it names each reviewer from the run's own key, as the header already does.
+///
+/// [`crate::HistoryStore::load_review_watch`] rather than its live-only sibling, because a
+/// RETIREMENT IS A SOFT DELETE: a merged or dismissed pull request leaves the live set, but the row
+/// survives and the review RUNS remain in the store, so the strip still shows the historical
+/// reviews (STUDIO-976 acceptance). Nothing prunes that table, so this reads it whole — the same
+/// read the listing makes for its page, done here for one ticket.
+///
+/// Best-effort, like the decorations beside it: a store error yields no reviews and the response
+/// carries an empty array rather than failing the whole request.
+fn review_runs_for_ticket(
+    history: &dyn crate::HistoryStore,
+    ticket: &str,
+    limit: i64,
+) -> Vec<RunSummary> {
+    if ticket.is_empty() {
+        return Vec::new();
+    }
+    let Ok(rows) = history.load_review_watch() else {
+        tracing::warn!("issue history: reading the review watch set failed");
+        return Vec::new();
+    };
+    let keys: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            rhapsody_orchestrator::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|origin| origin == ticket)
+        })
+        .map(|row| {
+            review::review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            )
+        })
+        .collect();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    match history.runs_for_issues(&keys, limit) {
+        Ok(runs) => runs,
+        Err(_) => {
+            tracing::warn!("issue history: reading review runs failed");
+            Vec::new()
+        }
+    }
 }
 
 /// `GET /api/v1/runs/{id}/events`: the captured events for one run, ordered by seq. `{id}` must be a
@@ -1369,6 +1433,13 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<RunSummary>, StoreError> {
             Store::issue_history(&self.inner, identifier, project, limit)
+        }
+        fn runs_for_issues(
+            &self,
+            identifiers: &[String],
+            limit: i64,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            Store::runs_for_issues(&self.inner, identifiers, limit)
         }
         fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
             Store::get_run(&self.inner, run_id)
@@ -1974,6 +2045,92 @@ mod tests {
         let rows = by_identifier(&body);
         assert_eq!(rows[handoff]["review_of"], "STUDIO-839");
         assert_eq!(rows[adopt]["review_of"], "STUDIO-838");
+    }
+
+    // STUDIO-976 — a ticket's run detail carries the REVIEW runs credited to it, joined by the SAME
+    // watch-set fold the listing's `review_of` and the cost ledger use, so the console can show the
+    // reviews in time order with the attempts. They arrive in their OWN array, never folded into
+    // `runs`: the console derives an attempt's ordinal from its position in `runs`, so mixing the
+    // two would renumber every attempt label (the ticket's trap 1).
+    #[tokio::test]
+    async fn issue_history_carries_the_review_runs_credited_to_the_ticket() {
+        let store = mem_store();
+        seed_run_for("iss_impl", "STUDIO-976", "2026-08-01T00:00:00Z", &store);
+        // Two reviewers of this ticket's pull request, plus a review of ANOTHER ticket that must
+        // not leak into this ticket's detail.
+        let alice = "pr:makewhatis/rhapsody#204@alice";
+        let sol = "pr:makewhatis/rhapsody#204@sol";
+        let other = "pr:makewhatis/rhapsody#205@jimmy";
+        seed_run_for(alice, alice, "2026-08-01T01:00:00Z", &store);
+        seed_run_for(sol, sol, "2026-08-01T02:00:00Z", &store);
+        seed_run_for(other, other, "2026-08-01T03:00:00Z", &store);
+        seed_watch(&store, 204, "alice", "handoff:STUDIO-976");
+        seed_watch(&store, 204, "sol", "adopt:STUDIO-976");
+        seed_watch(&store, 205, "jimmy", "handoff:STUDIO-999");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/issues/STUDIO-976/history")).await;
+        assert_eq!(status, 200);
+        // The attempts are exactly the ticket's own runs, unchanged.
+        let runs = body["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["issue_identifier"], "STUDIO-976");
+        // The reviews are the two credited to it, newest first, and NOT the other ticket's.
+        let reviews = body["reviews"].as_array().expect("reviews");
+        let keys: Vec<&str> = reviews
+            .iter()
+            .map(|r| r["issue_identifier"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(keys, vec![sol, alice]);
+    }
+
+    // STUDIO-976 trap 6 — a RETIRED pull request. `drop_review_watch` is a SOFT delete: the watch
+    // row leaves the live set but survives, so the review RUNS remain credited to their ticket and
+    // the strip still shows the history. A join over the LIVE set would lose them here.
+    #[tokio::test]
+    async fn issue_history_keeps_reviews_whose_pull_request_was_retired() {
+        let store = mem_store();
+        seed_run_for("iss_impl", "STUDIO-976", "2026-08-01T00:00:00Z", &store);
+        let review = "pr:makewhatis/rhapsody#204@alice";
+        seed_run_for(review, review, "2026-08-01T01:00:00Z", &store);
+        seed_watch(&store, 204, "alice", "handoff:STUDIO-976");
+        store
+            .drop_review_watch(&ReviewWatchKey {
+                owner: "makewhatis".into(),
+                repo: "rhapsody".into(),
+                number: 204,
+                reviewer: "alice".into(),
+            })
+            .expect("drop review watch");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/issues/STUDIO-976/history")).await;
+        assert_eq!(status, 200);
+        let reviews = body["reviews"].as_array().expect("reviews");
+        assert_eq!(
+            reviews.len(),
+            1,
+            "the retired review run is still shown: {body}"
+        );
+        assert_eq!(reviews[0]["issue_identifier"], review);
+    }
+
+    // STUDIO-976 — an origin that names no ticket credits no ticket, and a ticket with no reviews
+    // renders `reviews: []` rather than an absent field, exactly as it did before the field existed.
+    #[tokio::test]
+    async fn issue_history_reviews_are_empty_for_a_ticket_with_none() {
+        let store = mem_store();
+        seed_run_for("iss_impl", "STUDIO-976", "2026-08-01T00:00:00Z", &store);
+        let orphan = "pr:makewhatis/rhapsody#12@alice";
+        seed_run_for(orphan, orphan, "2026-08-01T01:00:00Z", &store);
+        seed_watch(&store, 12, "alice", "console:david");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (_status, body) = get_json(&format!("{base}/api/v1/issues/STUDIO-976/history")).await;
+        assert_eq!(body["reviews"], json!([]));
     }
 
     // STUDIO-926 — the cost endpoint sums EVERY run, not each key's newest, and credits a review

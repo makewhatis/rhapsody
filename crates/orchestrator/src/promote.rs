@@ -838,6 +838,9 @@ mod tests {
         fn issue_history(&self, _: &str, _: &str, _: i64) -> Result<Vec<RunSummary>, StoreError> {
             Err(StoreError::Disabled)
         }
+        fn runs_for_issues(&self, _: &[String], _: i64) -> Result<Vec<RunSummary>, StoreError> {
+            Err(StoreError::Disabled)
+        }
         fn start_run(&self, r: RunStart) -> Result<i64, StoreError> {
             self.0.start_run(r)
         }

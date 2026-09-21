@@ -234,6 +234,19 @@
 .rh-console .trhd[data-attempts="many"] { flex-wrap: wrap; gap: 14px; }
 .rh-console .trhd[data-attempts="many"] .trdup { display: contents; }
 
+/* ---- the review strip (STUDIO-976) ----
+   The ticket's review runs, in their own row beneath the attempt selector. Deliberately NOT folded
+   into `.trattempts`: that selector's single-row width budget is measured per ATTEMPT count
+   (`data-attempts`), and a one-attempt ticket with reviews would have them hidden by the
+   `[data-attempts="1"]` rule at the desktop default width — while a heavily reviewed ticket's strip
+   is too long to be one row at any threshold. A review is a real run with its own trace, so an entry
+   opens it exactly as an attempt does, but it is styled as its own kind: dashed, mono, and never
+   numbered. The row sits OUTSIDE `.trhd`, so it costs the sticky header's measured height nothing. */
+.rh-console .trreviews { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 10px; }
+.rh-console .trrev { font: inherit; font-family: var(--mono); font-size: 11px; color: var(--ink-3); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 3px 9px; cursor: pointer; }
+.rh-console .trrev:hover { color: var(--ink); border-color: var(--line-strong); }
+.rh-console .trrev.on { color: var(--ink); border-style: solid; border-color: var(--rust-text); }
+
 .rh-console .trtitle { margin: 0 0 10px; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 
 .rh-console .trmode { display: flex; align-items: center; gap: 8px; margin: 12px 0; }

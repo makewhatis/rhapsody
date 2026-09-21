@@ -403,6 +403,24 @@ counts as running either way, so it cannot move any of the five figures. Cutting
 further wants a TTL that knows a terminal ticket will not change again, which is again a change to
 the memo rather than to this endpoint.
 
+### A ticket's reviews on its run detail — `GET /api/v1/issues/{id}/history` (STUDIO-976)
+
+`GET /api/v1/issues/{id}/history` gains an **additive**, Rhapsody-only `reviews` array: the REVIEW
+runs credited to this ticket, so the console's attempt strip can show the reviews in time order with
+the attempts they answered rather than only every other beat. Each entry is a full run row — the same
+`run_summary_json` `runs` uses — because a review is a real run with a real id, trace, cost and
+outcome, so an entry opens its own run detail like any other. The `runs` array is unchanged and its
+Go golden is untouched; `reviews` is `[]` for a ticket with no reviews, so a client renders a
+review-free ticket exactly as it did before the field existed.
+
+The reviews are joined by the SAME watch-set fold `GET /api/v1/history/issues`'s `review_of` and the
+cost ledger use — `reviewdone::origin_ticket` over `load_review_watch` — so a
+`pr:owner/repo#n@reviewer` key is never parsed for a ticket, and a RETIRED pull request's reviews
+still resolve: a retirement is a soft delete, so the row survives and the historical reviews stay
+shown. They are kept OUT of `runs` deliberately: the console derives an attempt's ordinal from its
+position in that list, so folding reviews in would renumber every attempt label quoted in tickets,
+PR comments and the room.
+
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 
 Go has no analogue: an agent that finished its work moved its own ticket to the review state through

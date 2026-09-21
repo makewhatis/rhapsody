@@ -20,6 +20,7 @@ import {
   relayBatons,
   resultBanner,
   resultEyebrow,
+  reviewOptions,
   runBranch,
   runTeammate,
   runVitals,
@@ -641,6 +642,50 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
 
   it("survives a ticket with no runs at all", () => {
     expect(attemptOptions([], NONE, "")).toEqual([]);
+  });
+});
+
+describe("reviewOptions — the run detail's review strip (STUDIO-976)", () => {
+  const NONE = new Map<number, string>();
+  const labels = (opts: readonly { label: string }[]) => opts.map((o) => o.label);
+
+  // A review is NOT an attempt: it is never numbered, and it names its reviewer. The reviewer comes
+  // from the run's own `pr:…@reviewer` key, so a review run needs no ledger lookup at all.
+  it("labels each review by its reviewer and never by an ordinal", () => {
+    const reviews = [
+      run({ id: 601, issue_identifier: "pr:makewhatis/rhapsody#147@alice" }),
+      run({ id: 602, issue_identifier: "pr:makewhatis/rhapsody#147@sol" }),
+    ];
+    const opts = reviewOptions(reviews, NONE, "");
+    expect(labels(opts)).toEqual(["review · alice", "review · sol"]);
+    expect(opts.map((o) => o.named)).toEqual([true, true]);
+  });
+
+  // The identity invariant `JobDetailView` states: the entry's reviewer resolves through the SAME
+  // `runTeammate` the header assignee, the baton and the attempt labels use. A durable routing row
+  // that says somebody else for this run id may not make the strip disagree with the header — the
+  // review's own key wins, exactly as [`runTeammate`] specifies for a `pr:` run.
+  it("resolves the reviewer through the same source as the header, not the routing ledger", () => {
+    const review = run({ id: 601, issue_identifier: "pr:owner/repo#1@alice" });
+    const identities = new Map([[601, "bob"]]);
+    expect(labels(reviewOptions([review], identities, "carol"))).toEqual(["review · alice"]);
+    // Pinned against the shared resolver itself, so a second source here would disagree visibly.
+    expect(runTeammate(review, identities, "carol")).toBe("alice");
+  });
+
+  // A `pr:` key with no `@` names no reviewer; the run id is then the daemon's own handle, and the
+  // tooltip still owes the start time.
+  it("falls back to the bare run id when the key carries no reviewer", () => {
+    const reviews = [
+      run({ id: 601, issue_identifier: "pr:owner/repo#1", started_at: "2026-09-03T10:00:00Z" }),
+    ];
+    expect(reviewOptions(reviews, NONE, "")).toEqual([
+      { id: 601, label: "review 601", named: false, startedAt: "2026-09-03T10:00:00Z" },
+    ]);
+  });
+
+  it("renders nothing for a ticket the daemon credited no reviews to", () => {
+    expect(reviewOptions([], NONE, "")).toEqual([]);
   });
 });
 

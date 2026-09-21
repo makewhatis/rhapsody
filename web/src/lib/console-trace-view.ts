@@ -610,6 +610,59 @@ export function attemptOptions(
   });
 }
 
+/** One option in the run detail's review strip — a review run credited to this ticket (STUDIO-976). */
+export interface ReviewOption {
+  /** The review run this option selects — the daemon's own handle on it. */
+  id: number;
+  /** What the button reads: "review · alice", or "review 545" when no reviewer resolves. */
+  label: string;
+  /**
+   * Whether the label names the reviewer rather than being the bare run-id fallback. Mirrors
+   * [`AttemptOption.named`]: the view reads it to decide whether the tooltip still has to supply
+   * the run id — on a fallback label the id is already on the button.
+   */
+  named: boolean;
+  /** The run's `started_at`, verbatim — the view formats it for the tooltip. */
+  startedAt: string;
+}
+
+/**
+ * The run detail's review strip (STUDIO-976): the REVIEW runs the daemon credited to this ticket,
+ * labelled by their reviewer, in the same newest-first order the attempt selector uses.
+ *
+ * `reviews` is the daemon's own origin-ticket join's output (`reviewdone::origin_ticket` through
+ * the watch set) — this function never decides which ticket a review belongs to. That is the whole
+ * point: a second, client-side notion of it is the two-definitions drift this console has been
+ * bitten by twice (STUDIO-965 counts-vs-cards, STUDIO-966 lifecycle-vs-tracker-state). It is also
+ * why a review whose pull request has since been retired still appears — the daemon joins through
+ * the watch set's soft-deleted rows.
+ *
+ * A review is NEVER numbered. The ordinal is an ATTEMPT's, and the daemon numbers no review; a
+ * review entry therefore reads "review · alice", distinct from the selector's "attempt 2 · alice",
+ * and it renders in its own strip rather than in `attemptOptions`' list — folding it in would
+ * renumber every attempt label (the ticket's trap 1).
+ *
+ * The reviewer resolves through the SAME [`runTeammate`] the header assignee, the spine's baton and
+ * the attempt labels use, so a review entry can never name a different teammate than the header
+ * does once the review is selected — the identity invariant `JobDetailView` states. A review run
+ * carries its reviewer in its own `pr:…@reviewer` key, so nothing is fetched.
+ */
+export function reviewOptions(
+  reviews: readonly RunSummary[],
+  identities: ReadonlyMap<number, string>,
+  assignee: string,
+): ReviewOption[] {
+  return reviews.map((run) => {
+    const who = runTeammate(run, identities, assignee);
+    return {
+      id: run.id,
+      label: who === "" ? `review ${run.id}` : `review · ${who}`,
+      named: who !== "",
+      startedAt: run.started_at,
+    };
+  });
+}
+
 /**
  * How many attempts the header's selector is carrying, in the buckets its single-row breakpoints
  * are written against (STUDIO-763). The view publishes it as `data-attempts` on `.trhd`.

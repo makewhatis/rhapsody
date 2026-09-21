@@ -518,12 +518,26 @@ pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) ->
     Value::Object(obj)
 }
 
-/// `{issue_identifier, runs:[…]}` — the `GET /api/v1/issues/{id}/history` payload. Mirrors Go
-/// `issueHistoryResponse`.
-pub(crate) fn issue_history_response(identifier: &str, runs: &[RunSummary]) -> Value {
+/// `{issue_identifier, runs:[…], reviews:[…]}` — the `GET /api/v1/issues/{id}/history` payload.
+/// `runs` mirrors Go `issueHistoryResponse` and is unchanged; `reviews` is ADDITIVE and
+/// Rhapsody-only (STUDIO-976).
+///
+/// `reviews` is the ticket's review runs, joined to it by the same watch-set fold the listing's
+/// `review_of` uses, and rendered with the SAME `run_summary_json` as `runs`: a review is a real run
+/// with a real id, trace, cost and outcome, so it must be openable like any other. They are kept
+/// OUT of `runs` deliberately — that array is the ticket's own attempts, and `attemptOptions`
+/// derives an attempt's ordinal from its position in the list, so folding reviews in would silently
+/// renumber every attempt label (STUDIO-976 trap 1). An empty array rather than an absent field: a
+/// ticket with no reviews renders exactly as it did before this field existed.
+pub(crate) fn issue_history_response(
+    identifier: &str,
+    runs: &[RunSummary],
+    reviews: &[RunSummary],
+) -> Value {
     json!({
         "issue_identifier": identifier,
         "runs": Value::Array(runs.iter().map(run_summary_json).collect()),
+        "reviews": Value::Array(reviews.iter().map(run_summary_json).collect()),
     })
 }
 
