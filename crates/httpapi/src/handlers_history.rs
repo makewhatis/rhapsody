@@ -19,8 +19,8 @@ use crate::responses::{write_error, write_json};
 use crate::responses_history::{
     IssueStatusKey, event_search_response, history_costs_response, history_response,
     history_summary_response, issue_counts_response, issue_history_response, issue_runs_response,
-    metrics_response, run_detail_from_running, run_detail_from_summary, run_events_response,
-    run_provenance_response, run_transcript_json,
+    metrics_by_provider_response, metrics_response, run_detail_from_running,
+    run_detail_from_summary, run_events_response, run_provenance_response, run_transcript_json,
 };
 use crate::server::StateProvider;
 
@@ -944,6 +944,42 @@ pub(crate) async fn handle_metrics(
     write_json(StatusCode::OK, &metrics_response(&rollups))
 }
 
+/// `GET /api/v1/metrics/providers?days=30&project=`: the same daily rollup as [`handle_metrics`],
+/// decomposed by provider (STUDIO-957). `days` defaults to [`METRICS_DEFAULT_DAYS`] and must be a
+/// non-negative integer when present (else 400); `days=0` means "all time".
+///
+/// WHY A ROUTE AND NOT A FIELD ON `/api/v1/metrics`. That response body is byte-pinned to the
+/// Go-captured golden `harness/fixtures/api/metrics.json`, which has no `provider` anywhere, and the
+/// frozen reference can never regenerate one — so adding the dimension there would turn the golden
+/// test red with no legitimate way to make it green. A separate additive endpoint (the
+/// `/api/v1/version` precedent) leaves the default body byte-identical while answering the question
+/// the incident could only answer with a hand-written SQL join: how many tokens went to EACH
+/// account today. Rhapsody-only; Go has no provider dimension at all.
+pub(crate) async fn handle_metrics_by_provider(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let days = match qget(&q, "days") {
+        "" => METRICS_DEFAULT_DAYS,
+        raw => match parse_non_neg_int(raw, "days") {
+            Ok(n) => n,
+            Err(resp) => return *resp,
+        },
+    };
+    let rollups = match provider
+        .history()
+        .metrics_by_provider(days, qget(&q, "project"))
+    {
+        Ok(rollups) => rollups,
+        Err(_) => return store_error("metrics query failed"),
+    };
+    write_json(StatusCode::OK, &metrics_by_provider_response(&rollups))
+}
+
 /// `GET /api/v1/runs/{id}/transcript`: the humanized RICH transcript for a single historical run (the
 /// run's own concrete `*.jsonl`, in the SAME shape as the live `/log` response). `{id}` must be a
 /// positive integer (else 404); an unknown run is 404 `run_not_found`; a known run whose transcript
@@ -1306,6 +1342,13 @@ mod tests {
             project: &str,
         ) -> Result<Vec<rhapsody_store::DayRollup>, StoreError> {
             Store::metrics(&self.inner, since_days, project)
+        }
+        fn metrics_by_provider(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rhapsody_store::DayProviderRollup>, StoreError> {
+            Store::metrics_by_provider(&self.inner, since_days, project)
         }
         fn list_run_messages(
             &self,
@@ -3219,6 +3262,70 @@ mod tests {
         assert_eq!(days[0]["total_tokens"], 150);
     }
 
+    // STUDIO-957: the daily rollup split by provider, over the HTTP surface — the incident's own
+    // question answered without a hand-written SQL join. The key assertion is that the three
+    // accounts are DISTINCT buckets carrying their own totals; an implementation that kept one
+    // undifferentiated daily total (or grouped by model) cannot produce them.
+    #[tokio::test]
+    async fn metrics_by_provider_round_trip() {
+        let store = mem_store();
+        let seed = |provider: &str, started: &str, tokens: i64| {
+            let id = store
+                .start_run(RunStart {
+                    issue_identifier: "MT-x".into(),
+                    started_at: started.into(),
+                    ..Default::default()
+                })
+                .expect("start");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: rhapsody_store::OUTCOME_COMPLETED.into(),
+                        total_tokens: tokens,
+                        ended_at: started.into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+            store
+                .set_run_provenance(
+                    id,
+                    &rhapsody_store::RunProvenance {
+                        provider: provider.into(),
+                        harness: "opencode".into(),
+                        model: format!("{provider}/m"),
+                        ..Default::default()
+                    },
+                )
+                .expect("provenance");
+        };
+        // "now-1h" keeps the rows inside the default 30-day window, like seed_completed_run.
+        let start = rfc3339(Utc::now() - ChronoDuration::hours(1));
+        seed("fireworks-ai", &start, 524_883_057);
+        seed("anthropic", &start, 360_636_166);
+        seed("openai", &start, 101_642_859);
+
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/metrics/providers?days=30")).await;
+        assert_eq!(status, 200);
+        let days = body["days"].as_array().expect("days");
+        assert_eq!(days.len(), 1, "one day: {body}");
+        let providers = days[0]["providers"].as_array().expect("providers");
+        let total = |name: &str| {
+            providers
+                .iter()
+                .find(|p| p["provider"] == name)
+                .unwrap_or_else(|| panic!("no {name} bucket: {body}"))
+                .clone()
+        };
+        assert_eq!(total("fireworks-ai")["total_tokens"], 524_883_057);
+        assert_eq!(total("anthropic")["total_tokens"], 360_636_166);
+        assert_eq!(total("openai")["total_tokens"], 101_642_859);
+        // The default body is untouched by this route — the golden it is pinned to has no provider.
+        assert!(!body.to_string().contains("\"days\":[{\"completed\""));
+    }
+
     // Mirrors Go `TestHistoryNoopStoreEmpty`: every history endpoint degrades to [] (200) on Noop.
     #[tokio::test]
     async fn history_noop_store_empty() {
@@ -3229,6 +3336,7 @@ mod tests {
             ("/api/v1/runs/1/events", "events"),
             ("/api/v1/events?q=x", "hits"),
             ("/api/v1/metrics?days=7", "days"),
+            ("/api/v1/metrics/providers?days=7", "days"),
         ] {
             let (status, body) = get_json(&format!("{base}{path}")).await;
             assert_eq!(status, 200, "{path}");

@@ -56,7 +56,8 @@ flush), not on a sleep.
   `operator.rs::hostname()` is `pub(crate)` specifically so `resource.rs` can reuse it for
   `host.name` — the same syscall backs two different resource attributes; don't duplicate it.
 - `metrics.rs` — **bounded cardinality is a hard contract**, stated in the file's module doc:
-  metric attributes are restricted to `ATTR_PROJECT`/`ATTR_MODEL`/`ATTR_OUTCOME`/`ATTR_REASON`
+  metric attributes are restricted to `ATTR_PROJECT`/`ATTR_MODEL`/`ATTR_HARNESS`/`ATTR_PROVIDER`/
+  `ATTR_OUTCOME`/`ATTR_REASON`
   only. Never add an issue/run/session identifier as a metric attribute (unbounded cardinality
   blows up the collector) — identifiers belong on spans/logs, not metrics. This is enforced by
   convention/review, not the type system, so watch for it in review.

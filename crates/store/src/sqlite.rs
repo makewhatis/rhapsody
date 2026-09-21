@@ -1084,6 +1084,55 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn metrics_by_provider(
+        &self,
+        since_days: i64,
+        project: &str,
+    ) -> Result<Vec<DayProviderRollup>, StoreError> {
+        // Same day window + project filter as `metrics` (STUDIO-957), decomposed by the recorded
+        // provider. LEFT JOIN, unlike `tokens_by_provider`: a run with no provenance row still spent
+        // tokens and must appear in the empty-provider bucket, so the per-provider series sums to the
+        // undifferentiated total rather than being short by exactly the unattributed rows.
+        let mut args: Vec<Value> = Vec::new();
+        let mut q = "SELECT substr(r.started_at, 1, 10) AS day,
+                            COALESCE(p.provider, '') AS provider,
+                            COUNT(*) AS runs,
+                            SUM(CASE WHEN r.outcome = 'completed' THEN 1 ELSE 0 END) AS completed,
+                            SUM(CASE WHEN r.outcome = 'failed' THEN 1 ELSE 0 END) AS failed,
+                            COALESCE(SUM(r.total_tokens), 0) AS total_tokens
+                       FROM runs r
+                       LEFT JOIN rhapsody_run_provenance p ON p.run_id = r.id
+                      WHERE r.started_at <> ''"
+            .to_string();
+        if since_days > 0 {
+            q.push_str(" AND r.started_at >= ?");
+            args.push(Value::Text(days_ago_rfc3339(since_days)));
+        }
+        if !project.is_empty() {
+            q.push_str(" AND r.project_slug = ?");
+            args.push(Value::Text(project.to_string()));
+        }
+        q.push_str(" GROUP BY day, provider ORDER BY day, provider");
+
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&q)?;
+        let rows = stmt.query_map(params_from_iter(args), |row| {
+            Ok(DayProviderRollup {
+                date: row.get(0)?,
+                provider: row.get(1)?,
+                runs: row.get(2)?,
+                completed: row.get(3)?,
+                failed: row.get(4)?,
+                total_tokens: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for d in rows {
+            out.push(d?);
+        }
+        Ok(out)
+    }
+
     fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -2930,6 +2979,90 @@ mod tests {
         let beta = st.metrics(0, "beta").expect("beta metrics");
         assert_eq!(beta.len(), 1);
         assert_eq!(beta[0].failed, 1);
+    }
+
+    // STUDIO-957: the daily rollup split by provider — the meter the incident (a 987M-token day whose
+    // actionable figure was only the 361M touching the constrained Claude account) could not answer.
+    // A run with no provenance row must still appear (empty-provider bucket) so the split SUMS to the
+    // undifferentiated total rather than silently dropping unattributed spend.
+    #[test]
+    fn metrics_by_provider_splits_the_rollup_by_provider() {
+        let st = open_mem();
+        let seed = |provider: &str, started: &str, tokens: i64| {
+            let id = st
+                .start_run(RunStart {
+                    issue_identifier: "MT-x".into(),
+                    started_at: started.into(),
+                    ..Default::default()
+                })
+                .expect("start");
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: tokens,
+                    ended_at: started.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+            if !provider.is_empty() {
+                st.set_run_provenance(
+                    id,
+                    &RunProvenance {
+                        provider: provider.into(),
+                        harness: "opencode".into(),
+                        model: format!("{provider}/m"),
+                        ..Default::default()
+                    },
+                )
+                .expect("provenance");
+            }
+        };
+        // 2026-09-20, the incident's own figures, and one unattributed run on the same day.
+        seed("fireworks-ai", "2026-09-20T02:00:00Z", 524_883_057);
+        seed("anthropic", "2026-09-20T03:00:00Z", 360_636_166);
+        seed("openai", "2026-09-20T04:00:00Z", 101_642_859);
+        seed("", "2026-09-20T05:00:00Z", 7);
+        // A second day proves the bucketing is per (day, provider), not per provider alone.
+        seed("anthropic", "2026-09-21T03:00:00Z", 11);
+
+        let rows = st.metrics_by_provider(0, "").expect("metrics by provider");
+        let day_of = |date: &str, provider: &str| {
+            rows.iter()
+                .find(|r| r.date == date && r.provider == provider)
+                .unwrap_or_else(|| panic!("no {date}/{provider} bucket: {rows:?}"))
+                .clone()
+        };
+        assert_eq!(
+            day_of("2026-09-20", "fireworks-ai").total_tokens,
+            524_883_057
+        );
+        assert_eq!(day_of("2026-09-20", "anthropic").total_tokens, 360_636_166);
+        assert_eq!(day_of("2026-09-20", "openai").total_tokens, 101_642_859);
+        assert_eq!(
+            day_of("2026-09-20", "").total_tokens,
+            7,
+            "a run with no provenance is reported, not dropped"
+        );
+        assert_eq!(day_of("2026-09-21", "anthropic").total_tokens, 11);
+
+        // The decomposition is exhaustive: per-day sums equal the undifferentiated rollup.
+        let totals = st.metrics(0, "").expect("metrics");
+        let day1 = totals
+            .iter()
+            .find(|d| d.date == "2026-09-20")
+            .expect("day1");
+        let split: i64 = rows
+            .iter()
+            .filter(|r| r.date == "2026-09-20")
+            .map(|r| r.total_tokens)
+            .sum();
+        assert_eq!(
+            split, day1.total_tokens,
+            "the per-provider series must sum to the plain daily total"
+        );
+        assert_eq!(day1.total_tokens, 987_162_089);
     }
 
     // Mirror TestPrune: retentionDays 0 keeps everything; 30 removes only the OLD ended run and its

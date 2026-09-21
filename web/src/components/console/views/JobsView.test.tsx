@@ -28,6 +28,9 @@ const h = vi.hoisted(() => ({
   fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
   fetchRunTranscript: vi.fn(),
+  // The per-project `active_states` the parked classification resolves against (STUDIO-966). An
+  // empty answer by default — every test that does not set it reads no row as parked.
+  fetchTypedConfig: vi.fn(async () => ({})),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -40,6 +43,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchRunTranscript: h.fetchRunTranscript,
+    fetchTypedConfig: h.fetchTypedConfig,
     fetchVersion: vi.fn(async () => ({
       version: "v0.4.0",
       commit: "abc",
@@ -2092,5 +2096,54 @@ describe("the display options popover (STUDIO-932)", () => {
     await waitFor(() => expect(statusFilter()).not.toBeNull());
     expect(document.querySelector(".dpdot")).toBeNull();
     expect(screen.getByRole("button", { name: "Reviews" }).getAttribute("aria-pressed")).toBe("true");
+  });
+});
+
+// STUDIO-966 — the reported case, driven through the real view: STUDIO-958 sat in Backlog with one
+// finished run, and the card read "queued" under a lane whose copy promised an agent. The status is
+// decided in `consoleJobStatus` from the row's `tracker_state` against the project's active set.
+describe("a parked ticket on the worklist (STUDIO-966)", () => {
+  function pillText(identifier: string): string {
+    const tr = [...document.querySelectorAll(".jtbl tbody tr")].find((el) =>
+      el.querySelector(".ti")?.textContent?.startsWith(identifier),
+    );
+    return tr?.querySelector(".pill")?.textContent ?? "";
+  }
+
+  it("reads parked on the row, not queued, while a Todo row stays queued", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchTypedConfig.mockResolvedValue({
+      global: { active_states: ["Todo", "In Progress"], agent: { max_concurrent_agents: 4 } },
+      projects: [],
+    });
+    serveStore([
+      run({
+        issue_identifier: "STUDIO-958",
+        outcome: "completed",
+        lifecycle: "open",
+        tracker_state: "Backlog",
+      }),
+      run({
+        issue_identifier: "TODO-1",
+        outcome: "completed",
+        lifecycle: "open",
+        tracker_state: "Todo",
+      }),
+    ]);
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    await waitFor(() => expect(rowKeys()).toContain("STUDIO-958"));
+    // The parked card no longer claims an agent is coming, and names the run that left it there.
+    expect(pillText("STUDIO-958")).toContain("parked");
+    expect(pillText("STUDIO-958")).toContain("run done");
+    // The common case is untouched: a Todo ticket a run left behind really is queued.
+    expect(pillText("TODO-1")).toContain("queued");
   });
 });

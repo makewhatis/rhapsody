@@ -146,6 +146,14 @@ pub struct Snapshot {
     /// so a daemon with no human-gated ticket serves a `/api/v1/state` payload byte-identical to the
     /// Go daemon's — which is what `harness/fixtures/api/state.json` pins.
     pub held_for_human: Vec<crate::dispatch::HeldForHuman>,
+    /// The tickets/reviews the dispatcher refused because their provider's daily token budget is
+    /// spent (STUDIO-957), keyed by subject.
+    ///
+    /// Empty is the load-bearing half, exactly as [`Snapshot::held_for_human`]'s is:
+    /// [`crate::snapshot_json::render`] emits the `budget_held` key ONLY when this is non-empty, so
+    /// a daemon with no configured budget (the default) serves a `/api/v1/state` payload
+    /// byte-identical to the Go daemon's — which is what `harness/fixtures/api/state.json` pins.
+    pub budget_held: Vec<crate::budget::BudgetHeld>,
     /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
     ///
     /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
@@ -259,6 +267,9 @@ impl Orchestrator {
             // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
             // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.
             held_for_human: self.human_holds.held(),
+            // STUDIO-957: the current per-provider budget refusals; empty on a daemon with no
+            // configured budget, which keeps the wire payload — and the golden — unchanged.
+            budget_held: self.budget_ledger.held(self.budget_hold_ttl()),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {

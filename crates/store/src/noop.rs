@@ -89,6 +89,13 @@ impl Store for Noop {
     fn metrics(&self, _since_days: i64, _project: &str) -> Result<Vec<DayRollup>, StoreError> {
         Ok(Vec::new())
     }
+    fn metrics_by_provider(
+        &self,
+        _since_days: i64,
+        _project: &str,
+    ) -> Result<Vec<DayProviderRollup>, StoreError> {
+        Ok(Vec::new())
+    }
 
     // Provenance (STUDIO-909) disappears with the rest of the history: a store that holds nothing
     // has no run to attribute, so it answers "no row" and no per-provider tally.

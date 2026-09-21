@@ -2265,3 +2265,60 @@ per-tick **level** scan: it promotes whatever is *currently* clear, so a ticket 
 after `dag` is enabled. This narrows the blast radius to states the operator nominated; it does not
 eliminate it. Making promotion edge-triggered needs durable per-blocker last-seen state and restart
 semantics, and is deliberately out of scope here.
+
+### Tokens by provider by day, and a per-provider daily budget — STUDIO-957
+
+The frozen reference has no meter that attributes spend to an ACCOUNT, so a 987M-token day was
+discovered by eye five days into a weekly quota — and the number that mattered (361M of Claude, the
+only slice touching the constrained quota) had to be reconstructed with a hand-written SQL join.
+Rhapsody adds two additive surfaces, both absent from the Go daemon. A model name is not a provider:
+the quota pool is a property of the account, so neither surface aggregates the two.
+
+**Meter.** `GET /api/v1/metrics/providers?days=&project=` serves the same daily rollup
+`GET /api/v1/metrics` does, decomposed by the `provider` a run recorded in
+`rhapsody_run_provenance`. It is a route of its own rather than a field on `/metrics`: that body is
+byte-pinned to the Go-captured golden `harness/fixtures/api/metrics.json`, which has no `provider`
+anywhere and can never be regenerated with one. A run with no provenance row lands in the
+empty-provider bucket (LEFT JOIN), so the per-provider series still sums to the plain daily total.
+The token metric contract also gained `harness`/`provider` attribute keys
+(`crates/telemetry/src/metrics.rs`, `crates/orchestrator/src/telemetry_attrs.rs`), and `ATTR_MODEL`'s
+doc no longer claims "the claude model". The counters still have no live recording site (they are
+exported only when `otel.enabled`, which ships `false`); wiring that site is a separate concern, and
+this ticket fixes the attribute contract only.
+
+**Stop.** A top-level `budgets:` block sets a daily token ceiling per provider:
+
+```yaml
+budgets:
+  anthropic:
+    daily_tokens: 200000000
+  fireworks-ai:
+    daily_tokens: 0        # 0 = unlimited, matching max_concurrent's idiom
+```
+
+When a provider's budget is spent (spend since the daemon host's **local** midnight `>=` the limit),
+NEW dispatch on that provider is refused; other providers continue. The default is the
+safety-critical half: an **unset** (or empty) block, and any non-positive `daily_tokens`, is
+**unlimited** and byte-identical to a daemon built before this feature. Two properties are
+deliberate: a budget bounds **new** dispatch only, so an in-flight run is never terminated (a retry
+or continuation of an already-started ticket passes even when the budget is spent); and a refusal is
+not a silent stall — it is recorded in a ledger surfaced on `/api/v1/state` as `budget_held` (emitted
+only when non-empty, so the Go-pinned payload is unchanged) and named by the reconciliation sweep
+instead of the false "nothing has reported it blocked". Review runs are gated on the review path,
+before its watch-set writes, because the incident's whole Claude bill was reviews. Tokens are
+metered **per provider and never aggregated**: 500M Fireworks tokens and 360M Opus tokens are not
+the same money, and there are no per-model rates to convert them. The key is deliberately kept out
+of `GET /api/v1/config`'s typed `global`/`projects` view, like `promote_from_states`; it appears in
+the response's verbatim `config` block when present.
+
+Three refinements to the stop, each from review of the first cut. A **review** refusal is keyed by
+the review's own identity (`pr:owner/repo#n@reviewer`), not by the pull request coordinate, because
+dispatch is per `(PR, reviewer)`: in a mixed roster one reviewer's successful dispatch must not
+erase a sibling reviewer's still-active hold, and two held reviewers must not overwrite each other.
+The coordinate rides on the record so the reconciliation sweep still finds every hold for a
+divergence. The staleness window is `max(300s, 2 × polling.interval_ms)` for a ticket, and a
+**review** hold takes the wider of that and `CAPACITY_HOLD_TTL`: a review is refreshed on the review
+watcher's rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` phases), not on the
+poll interval, so the poll bound alone under-covers it. And the local midnight is resolved through
+the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
+longer folds an extra hour of yesterday's spend into today.

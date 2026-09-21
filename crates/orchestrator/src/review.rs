@@ -302,6 +302,11 @@ pub enum ReviewDispatchOutcome {
     /// than `&'static str` because the `review.model` refusal (STUDIO-908) names the reviewer's
     /// harness, the configured model and the `review.model` origin — all data, not literals.
     Refused(String),
+    /// The reviewer's provider is out of daily budget (STUDIO-957). Nothing was touched: the watch
+    /// row stays exactly where it was and the sweep re-offers this head once the budget resets,
+    /// exactly as [`ReviewDispatchOutcome::Draining`] defers. Distinct from `Refused` because it is
+    /// a deliberate, temporary hold an operator can act on, not a coordinate that can never work.
+    BudgetHeld,
 }
 
 impl Orchestrator {
@@ -392,6 +397,31 @@ impl Orchestrator {
         if let Some(why) = refused {
             tracing::warn!(review = %id, reason = %why, "ticketless review: refused");
             return ReviewDispatchOutcome::Refused(why);
+        }
+
+        // STUDIO-957: the per-provider daily budget, the drain gate's sibling. It must refuse HERE
+        // rather than inside `dispatch_issue` for the SAME reason the drain gate does: the writes
+        // below record this head as requested and mark the row in-flight, so a refusal further down
+        // would leave the watcher believing a review dispatched and never re-offer this head. The
+        // incident's whole Claude bill was REVIEWS, so a budget that could not see this path would
+        // have refused nothing.
+        //
+        // Keyed by the review IDENTITY (`id`, `pr:owner/repo#n@reviewer`), not by the pull request
+        // coordinate (sol round 1 on PR #199). Dispatch is per `(PR, reviewer)`: in a mixed
+        // roster one reviewer can be out of budget while another is not, and a coordinate key let
+        // the second reviewer's successful dispatch release the first reviewer's still-active hold
+        // (and let two held reviewers overwrite each other's provider/figures). The coordinate
+        // rides on the hold as `pr` so the reconciliation sweep still finds every hold for a
+        // divergence it reports.
+        if self.budgets_configured() {
+            let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
+            let provider = self.review_projected_provider(&iss, &route.slug);
+            if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
+                self.note_review_budget_hold(&id, &pr, &route.slug, &provider, limit, spent);
+                return ReviewDispatchOutcome::BudgetHeld;
+            }
+            // A dispatched review clears this reviewer's own stale hold — and only this reviewer's.
+            self.release_budget_hold(&id);
         }
 
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
@@ -650,8 +680,8 @@ mod tests {
 
     use rhapsody_config::teams::{HarnessScoped, Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, Store,
-        StorePath,
+        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED,
+        REVIEW_STATUS_TRUNCATED, Sqlite, Store, StorePath,
     };
     use rhapsody_tracker::fake::Fake;
     use rhapsody_workspace::sanitize_key;
@@ -768,6 +798,294 @@ mod tests {
         );
     }
 
+    /// STUDIO-957: the review path is the one that mattered — the incident's whole Claude bill was
+    /// REVIEWS — so a reviewer whose provider is out of daily budget must not dispatch, and the
+    /// refusal must be recorded rather than silently dropped. It must also refuse BEFORE the
+    /// watch-set writes, or the watcher would believe a review ran and never re-offer this head.
+    ///
+    /// Mutation check: drop the budget gate in [`Orchestrator::dispatch_review`] and this reds on
+    /// `Dispatched` (and on the untouched-watch-row assertion).
+    #[test]
+    fn a_review_is_refused_when_the_reviewers_provider_is_out_of_budget() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let (mut o, dispatched) = orch_with_review(true);
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.claude.model = "claude-opus-4-8".to_string();
+            // The review runs under the owning PROJECT, whose model is what
+            // `configured_model_for` reads first.
+            eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
+            eff.cfg.budgets.insert(
+                "anthropic".to_string(),
+                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+            );
+        }
+        // Today's spend is already over the ceiling.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        let outcome = o.dispatch_review(review_run("alice", HEAD_A));
+
+        assert_eq!(
+            outcome,
+            ReviewDispatchOutcome::BudgetHeld,
+            "a spent anthropic budget must refuse the review"
+        );
+        assert!(
+            dispatched.lock().expect("dispatched lock").is_empty(),
+            "no reviewer agent may be spawned"
+        );
+        // The hold is keyed by the review IDENTITY, and carries the pull request coordinate so the
+        // reconciliation sweep can still find it.
+        let ttl = o.budget_hold_ttl();
+        let held = o
+            .budget_ledger
+            .get(&review_run("alice", HEAD_A).key(), ttl)
+            .expect("the refusal is recorded under the review identity");
+        assert_eq!(held.provider, "anthropic");
+        assert_eq!(held.spent_tokens, 300);
+        assert_eq!(held.pr, "makewhatis/rhapsody#12");
+        assert_eq!(
+            o.budget_ledger
+                .get_for_pr("makewhatis/rhapsody#12", ttl)
+                .as_ref(),
+            Some(&held),
+            "the sweep finds the hold by pull request coordinate"
+        );
+        // The watch row was NOT marked in-flight: the watcher must re-offer this head, not believe
+        // a review ran.
+        let watch = o
+            .store()
+            .get_review_watch(&rhapsody_store::ReviewWatchKey {
+                owner: "makewhatis".to_string(),
+                repo: "rhapsody".to_string(),
+                number: 12,
+                reviewer: "alice".to_string(),
+            })
+            .expect("read watch");
+        assert!(
+            watch.is_none(),
+            "a budget refusal must leave the watch row exactly where it was, got: {watch:?}"
+        );
+    }
+
+    /// **alice round 2, non-blocking N1.** A review is gated ONCE, at its own door — `dispatch_review`
+    /// refuses before its watch-set writes and stages the review in `pending_review`. `dispatch_issue`
+    /// must therefore not re-gate it with a second provider derivation: the spend map may have been
+    /// re-fetched, and a refusal at that point would strand the already-consumed pending review and a
+    /// watch row recorded `requested` while the caller still answered `Dispatched`. This pins the
+    /// `review.is_none()` guard by staging a review and dispatching it directly with the ticket
+    /// gate's own budget spent: the review still spawns, and no TICKET hold is recorded for it.
+    ///
+    /// Mutation: drop `review.is_none() &&` in `Orchestrator::dispatch_issue` and the spawned count
+    /// reds to zero (a `BudgetHeld` return instead of a dispatch).
+    #[test]
+    fn a_staged_review_is_not_re_gated_by_dispatch_issue() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let (mut o, dispatched) = orch_with_review(true);
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.claude.model = "claude-opus-4-8".to_string();
+            eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
+            eff.cfg.budgets.insert(
+                "anthropic".to_string(),
+                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+            );
+        }
+        // Today's anthropic spend is already over the ceiling, so the TICKET gate would refuse.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        // Stage the review exactly as `dispatch_review` does at its tail — after its own gate has
+        // already passed — then dispatch it. The ticket gate must not run a second time.
+        let run = review_run("alice", HEAD_A);
+        let iss = run.synthetic_issue();
+        let route = o
+            .review_route(REPO_URL)
+            .expect("the project owns the review repo");
+        o.pending_review.insert(iss.id.clone(), run);
+        o.dispatch_issue(iss, None, Some(route), String::new());
+
+        assert_eq!(
+            dispatched.lock().expect("dispatched lock").len(),
+            1,
+            "a review already gated at its own door must still spawn"
+        );
+        assert!(
+            o.budget_ledger.held(o.budget_hold_ttl()).is_empty(),
+            "the ticket gate must record no hold for a review it does not gate"
+        );
+    }
+
+    /// **sol round 1 on PR #199, finding 1: the mixed-roster regression.** Dispatch is per
+    /// `(PR, reviewer)`, so budget holds must be too. Alice reviews on Claude/Anthropic (out of
+    /// budget) while Jerry reviews the SAME pull request on opencode/Fireworks (unspent). Alice is
+    /// held; Jerry dispatches; Alice's hold must survive Jerry's success and still reach the
+    /// reconciliation sweep by coordinate.
+    ///
+    /// Mutation: key the review hold (and its release) by the pull request coordinate and this reds
+    /// — Jerry's dispatch erases Alice's hold.
+    #[test]
+    fn a_held_reviewers_budget_hold_survives_a_sibling_reviewers_dispatch() {
+        use chrono::{SecondsFormat, Utc};
+        use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunProvenance, RunStart};
+
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "claude-reviewer",
+            "---\nextends: swe\nharness: claude\nmodel: claude-opus-4-8\n---\nClaude reviewer.\n",
+        );
+        write_profile(
+            &dir,
+            "opencode-reviewer",
+            "---\nextends: swe\nharness: opencode\nmodel: fireworks-ai/accounts/fireworks/models/x\n---\nOpencode reviewer.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "claude-reviewer".to_string();
+            teams.roster.push(Identity {
+                name: "jerry".to_string(),
+                profile: "opencode-reviewer".to_string(),
+                labels: Vec::new(),
+                bank: String::new(),
+                max_concurrent: 0,
+            });
+        }
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".to_string(),
+            rhapsody_config::ProviderBudget { daily_tokens: 200 },
+        );
+
+        // Today's anthropic spend is already over the ceiling; Fireworks has no budget at all.
+        let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "MT-seed".to_string(),
+                started_at: started.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        o.store()
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.to_string(),
+                    total_tokens: 300,
+                    ended_at: started,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        o.store()
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".to_string(),
+                    harness: "claude".to_string(),
+                    model: "claude-opus-4-8".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+
+        assert_eq!(
+            o.review_projected_provider(&review_run("alice", HEAD_A).synthetic_issue(), "rhapsody"),
+            "anthropic",
+            "sanity: alice reviews on anthropic"
+        );
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::BudgetHeld,
+            "alice's anthropic budget is spent"
+        );
+        assert_eq!(
+            o.dispatch_review(review_run("jerry", HEAD_B)),
+            ReviewDispatchOutcome::Dispatched,
+            "jerry is on fireworks, which has no budget"
+        );
+
+        let held = o
+            .budget_ledger
+            .get_for_pr("makewhatis/rhapsody#12", o.budget_hold_ttl())
+            .expect("alice's hold must survive jerry's dispatch");
+        assert_eq!(held.provider, "anthropic");
+        assert_eq!(
+            held.subject,
+            review_key("makewhatis", "rhapsody", 12, "alice"),
+            "the hold belongs to alice's review identity, not the shared coordinate"
+        );
+        assert_eq!(
+            dispatched.lock().expect("dispatched lock").len(),
+            1,
+            "only jerry's agent may be spawned"
+        );
+    }
+
     /// F-DUP, the acceptance criterion: dispatching the SAME (PR, reviewer) twice must refuse the
     /// second. `dispatch_issue` overwrites `running[id]`, which would drop the live entry's cancel
     /// handle and point a second agent at the first one's detached worktree.
@@ -880,10 +1198,14 @@ mod tests {
     /// STUDIO-959: dispatch reads the reviewer's PRIOR commit off the existing row BEFORE it writes
     /// this head as requested.
     ///
-    /// Mutation: reading `requested_sha` (which the dispatch itself is about to overwrite) or
-    /// reading AFTER the writes would name this head as its own prior commit and red the delta
-    /// assertions here. And a reviewer with no row at all must carry nothing — a first round is
-    /// full, so the worker must not be handed a delta request it cannot honour.
+    /// Mutation: reading `requested_sha` AFTER the writes would name this head as its own prior
+    /// commit and red the delta assertions here; the placement is otherwise unobservable, because
+    /// neither write moves `last_reviewed_sha` (see the production read above). Reading
+    /// `requested_sha` BEFORE the writes is invisible to this test — its two seeded SHA columns are
+    /// equal, so either read returns the same answer — which is why
+    /// [`a_truncated_round_carries_no_prior_commit_so_the_next_head_is_full`] pins the column. And a
+    /// reviewer with no row at all must carry nothing — a first round is full, so the worker must
+    /// not be handed a delta request it cannot honour.
     #[test]
     fn dispatch_carries_the_reviewers_prior_commit_into_the_run() {
         let (mut o, dispatched) = orch_with_review(true);
@@ -949,6 +1271,66 @@ mod tests {
         assert!(
             review.checkout().delta.is_none(),
             "a first round must not present a delta request"
+        );
+    }
+
+    /// A truncated round — one ASKED to review [`HEAD_A`] but which read NOTHING — must leave the
+    /// reviewer with no prior commit, so its next round at [`HEAD_B`] is FULL, not a delta
+    /// (STUDIO-963).
+    ///
+    /// This is the state `mark_review_truncated` leaves behind when a round dies on `max_turns`, a
+    /// drain or a worker failure: `requested_sha` stays at the head it was dispatched against while
+    /// `last_reviewed_sha` stays empty. `dispatch` must read the LATTER. Reading `requested_sha`
+    /// would tell this reviewer "you last read A — confirm those findings are addressed" when it
+    /// read A not at all and filed no findings: trap 2 of STUDIO-959 reintroduced, for the same
+    /// reviewer rather than a different one. The sibling
+    /// [`dispatch_carries_the_reviewers_prior_commit_into_the_run`] cannot see that defect because
+    /// its two SHA columns are equal.
+    #[test]
+    fn a_truncated_round_carries_no_prior_commit_so_the_next_head_is_full() {
+        let (mut o, dispatched) = orch_with_review(true);
+        let asked = review_run("alice", HEAD_A);
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: asked.watch_key(),
+                author: asked.author.clone(),
+                introduced_by: asked.introduced_by.clone(),
+                requested_sha: HEAD_A.to_string(),
+                last_reviewed_sha: String::new(),
+                status: REVIEW_STATUS_IN_FLIGHT.to_string(),
+                open: true,
+            })
+            .expect("seed the round dispatched at HEAD_A");
+        o.store()
+            .mark_review_truncated(&asked.watch_key())
+            .expect("record that the round read nothing");
+
+        // The row really is the divergent shape the defect needs: asked at A, reviewed nothing.
+        let seeded = o
+            .store()
+            .get_review_watch(&asked.watch_key())
+            .expect("read")
+            .expect("row");
+        assert_eq!(seeded.requested_sha, HEAD_A);
+        assert!(seeded.last_reviewed_sha.is_empty());
+        assert_eq!(seeded.status, REVIEW_STATUS_TRUNCATED);
+
+        let next = review_run("alice", HEAD_B);
+        assert_eq!(
+            o.dispatch_review(next.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let entries = dispatched.lock().expect("dispatched lock");
+        let re = entries.first().expect("one dispatch");
+        let review = re.review.as_ref().expect("the entry carries its review");
+        assert!(
+            review.prior_sha.is_empty(),
+            "a truncated round read nothing, so the next round has no prior commit to diff from"
+        );
+        assert!(
+            review.checkout().delta.is_none(),
+            "a truncated round must leave the next round FULL, not a delta"
         );
     }
 

@@ -2660,6 +2660,13 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::DayRollup>, rhapsody_store::StoreError> {
             self.0.metrics(a0, a1)
         }
+        fn metrics_by_provider(
+            &self,
+            a0: i64,
+            a1: &str,
+        ) -> Result<Vec<rhapsody_store::DayProviderRollup>, rhapsody_store::StoreError> {
+            self.0.metrics_by_provider(a0, a1)
+        }
         fn set_run_provenance(
             &self,
             a0: i64,

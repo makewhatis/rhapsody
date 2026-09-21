@@ -304,15 +304,6 @@ impl Orchestrator {
                  armed mid-tick; the run will wind down at its first turn boundary"
             );
         }
-        // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
-        // AUTHOR round to that pull request's shared review↔author budget. Charged here rather than
-        // in `select` because this is the one funnel every dispatch path shares, so no path can
-        // dispatch an author round the budget never saw. Retries and continuations (`attempt` is
-        // `Some`) are the SAME round and must not charge twice; a ticket whose pull request has
-        // never been reviewed carries no budget entry, so an ordinary first dispatch pays nothing.
-        if attempt.is_none() {
-            self.note_author_round(&iss);
-        }
         // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
         // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
         // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
@@ -550,6 +541,56 @@ impl Orchestrator {
                 r.group.clone()
             };
             re.project_repo = r.repo.clone();
+        }
+        // STUDIO-957: the per-provider daily budget, the STOP beside the concurrency gate. It
+        // bounds NEW dispatch only, and it is checked HERE — after the run's harness/model are
+        // resolved (so the provider it reads is the one [`persist_start_run`](Orchestrator::persist_start_run)
+        // will record) but BEFORE the claim, the run row and the worker spawn, so a refusal leaves
+        // nothing to unwind. A retry/continuation (`attempt` is `Some`) is the SAME ticket's
+        // already-started work and passes even when the budget is spent: killing or refusing to
+        // resume an in-flight run wastes everything it has already spent, strictly worse than
+        // letting it finish. Unset/zero ⇒ unlimited, so a daemon that configures no budget is
+        // byte-identical to one built before this feature.
+        //
+        // Refused dispatches are recorded so `/api/v1/state` surfaces them and the reconciliation
+        // sweep names the budget rather than claiming nothing has reported the ticket blocked.
+        if attempt.is_none() {
+            // STUDIO-957 round 1 (alice finding 3): a REVIEW was already gated at its own door —
+            // `dispatch_review` refuses before its watch-set writes and stages this review in
+            // `pending_review` — so re-gating here would use a second provider derivation and a
+            // possibly re-fetched spend map, and a refusal at THIS point would strand the already-
+            // consumed pending review and a watch row recorded as `requested`, while the caller
+            // still answered `Dispatched`. The per-provider gate therefore binds only a direct
+            // TICKET dispatch; a review's is the one in `dispatch_review`.
+            // No configured budget ⇒ nothing to check and no provider resolution is done, so the
+            // dispatch is byte-identical to one built before this feature.
+            if review.is_none() && self.budgets_configured() {
+                let provider =
+                    self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
+                if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
+                    self.note_budget_hold(
+                        &iss.identifier,
+                        &iss.title,
+                        &re.project_slug,
+                        &provider,
+                        limit,
+                        spent,
+                    );
+                    return;
+                }
+                // The ticket dispatched, so a stale hold from an earlier tick must not linger on
+                // the console. Best-effort and idempotent.
+                self.release_budget_hold(&iss.identifier);
+            }
+            // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
+            // AUTHOR round to that pull request's shared review↔author budget. Charged here rather
+            // than in `select` because this is the one funnel every dispatch path shares, so no path
+            // can dispatch an author round the budget never saw. Retries and continuations
+            // (`attempt` is `Some`) are the SAME round and must not charge twice; a ticket whose
+            // pull request has never been reviewed carries no budget entry, so an ordinary first
+            // dispatch pays nothing. Placed after the provider-budget gate so a REFUSED dispatch
+            // does not charge a round that never ran.
+            self.note_author_round(&iss);
         }
         // Arm the worker's cancellation before the spawn observes it (Go `wctx, cancel :=
         // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.

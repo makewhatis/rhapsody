@@ -192,6 +192,16 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(laneIssues(board, "queued")).toEqual(["LEGACY"]);
   });
 
+  // STUDIO-966 — a parked ticket keeps its own pill but rides in the Queued lane (it is not
+  // running, review or done), and the lane copy names it so the lane no longer promises an agent.
+  it("cards a parked ticket in Queued, and the lane copy names the hold", () => {
+    const board = buildConsoleBoard([
+      row({ issue: "STUDIO-958", trackerState: "Backlog", status: "parked", statusLabel: "parked" }),
+    ]);
+    expect(laneIssues(board, "queued")).toEqual(["STUDIO-958"]);
+    expect(board.find((l) => l.id === "queued")?.caption).toContain("parked");
+  });
+
   it("attaches a blocker chip from the live snapshot's held set", () => {
     const blocked: BlockedEntry[] = [
       {
@@ -348,6 +358,12 @@ describe("boardLaneOf", () => {
   it("treats a live run as running even when the status word is stale", () => {
     expect(boardLaneOf({ status: "queued", live: true, trackerState: "Todo" })).toBe("running");
     expect(boardLaneOf({ status: "queued", live: false, trackerState: "Todo" })).toBe("queued");
+  });
+
+  // STUDIO-966 — a parked ticket waits in Queued beside a not-yet-dispatched Todo one; its own pill
+  // is what distinguishes them, and the lane is not a fifth axis.
+  it("waits a parked ticket in Queued", () => {
+    expect(boardLaneOf({ status: "parked", live: false, trackerState: "Backlog" })).toBe("queued");
   });
 });
 

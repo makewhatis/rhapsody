@@ -1175,8 +1175,14 @@ impl Orchestrator {
                 // `requested`/`truncated` row can carry (auto-merge's belongs to `approved`), and it
                 // states the holder COUNT, which the operator tuning the budget needs. The count is
                 // the watcher's own, from its most recent sweep, not this sweep's `sweeps`.
-                match (d.capacity_held, d.auto_merge_reason) {
-                    (Some(hold), _) => {
+                // STUDIO-957: a divergence whose subject is budget-held has a cause this process
+                // already recorded (`Orchestrator::budget_hold_for`) — the provider's daily token
+                // budget is spent, so no run on it will start. Name that instead of the false
+                // "nothing has reported it blocked"; it sits between capacity (the immediate
+                // resource blocker) and auto-merge (a decline reason).
+                let budget_held = self.budget_hold_for(&d.pr, &d.ticket);
+                match (d.capacity_held, budget_held, d.auto_merge_reason) {
+                    (Some(hold), _, _) => {
                         let budget = hold.budget_key();
                         tracing::warn!(
                             pr = %d.pr,
@@ -1196,7 +1202,29 @@ impl Orchestrator {
                             budget
                         );
                     }
-                    (None, Some(reason)) => {
+                    (None, Some(hold), _) => {
+                        tracing::warn!(
+                            pr = %d.pr,
+                            kind = d.kind.as_str(),
+                            ticket = %d.ticket,
+                            reviewer = %d.reviewer,
+                            stale_secs = d.stale_secs,
+                            sweeps,
+                            provider = %hold.provider,
+                            daily_tokens = hold.daily_tokens,
+                            spent_tokens = hold.spent_tokens,
+                            "review reconciliation: {} — {}. It is held for budget: the provider \
+                             {}'s daily token budget is spent ({} of {}), so no run on it can start \
+                             yet. Work on other providers continues; this sweep only reports, so it \
+                             needs a human.",
+                            d.pr,
+                            d.kind.detail(),
+                            hold.provider,
+                            hold.spent_tokens,
+                            hold.daily_tokens
+                        );
+                    }
+                    (None, None, Some(reason)) => {
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -1212,7 +1240,7 @@ impl Orchestrator {
                             reason
                         );
                     }
-                    (None, None) if d.capacity_unreadable.is_some() => {
+                    (None, None, None) if d.capacity_unreadable.is_some() => {
                         // STUDIO-950 round 18: the hold (if any) was DENIED because GitHub stopped
                         // answering for this coordinate, so the fallback's "nothing has reported it
                         // blocked" is false — the watcher reports the failure every tick. Name the
@@ -1235,7 +1263,7 @@ impl Orchestrator {
                             attempts
                         );
                     }
-                    (None, None) => {
+                    (None, None, None) => {
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -2207,6 +2235,63 @@ mod store_tests {
             review_warns[2].message.contains("2 run(s) hold"),
             "a changed holder count must be reported on the sweep that saw it, got: {}",
             review_warns[2].message
+        );
+    }
+
+    /// STUDIO-957: a divergence whose subject is BUDGET-held must be named by that cause, not fall
+    /// through to the false "nothing has reported it blocked". The watcher recorded the refusal when
+    /// it deferred the round for the spent provider budget, so the sweep repeats a fact this process
+    /// already has rather than inventing a cause.
+    ///
+    /// Mutation check: drop the `(None, Some(hold), _)` arm in
+    /// [`Orchestrator::set_review_divergences`] and this reds on the fallback wording.
+    #[test]
+    fn a_budget_held_round_is_reported_as_held_for_budget() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        // The reviewer's provider is out of daily budget; the watcher recorded it against the
+        // reviewer's identity, with the PR coordinate carried for this lookup.
+        o.note_review_budget_hold(
+            "pr:makewhatis/rhapsody#164@alice",
+            "makewhatis/rhapsody#164",
+            "core",
+            "anthropic",
+            400_000_000,
+            410_000_000,
+        );
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.reconcile_review_divergence();
+        });
+        let warns: Vec<&crate::testsupport::CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message.contains("review reconciliation"))
+            .collect();
+        assert_eq!(warns.len(), 1, "one divergence, one line: {warns:?}");
+        let msg = &warns[0].message;
+        assert!(
+            msg.contains("held for budget"),
+            "the sweep must name the budget, not a stall: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic") && msg.contains("410000000"),
+            "the line must carry the provider and the two figures: {msg}"
+        );
+        assert!(
+            !msg.contains("nothing has reported it blocked"),
+            "the false fallback wording must not be used: {msg}"
         );
     }
 
