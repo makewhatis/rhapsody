@@ -146,6 +146,12 @@ fn turn_timeout(timeout_ms: i64) -> Duration {
     })
 }
 
+/// [`turn_timeout`] for callers outside this module — the review adjudication turn (STUDIO-956)
+/// runs under the same `manager.timeout_ms` and the same fallback, so the constant has one home.
+pub fn manager_turn_timeout(teams: &Teams) -> Duration {
+    turn_timeout(teams.manager.timeout_ms)
+}
+
 /// How many cycles of an UNCHANGED outcome pass before the schedule says so again (STUDIO-671).
 ///
 /// Applied as a WINDOW rather than a counter — `interval * IDLE_HEARTBEAT_CYCLES` — because cycles
@@ -1748,12 +1754,17 @@ pub(crate) fn has_any_identity_label(iss: &Issue) -> bool {
 }
 
 /// The candidates a triage pass may act on: **in a dispatchable state**, no `rhapsody:@` label,
-/// and not opted out.
+/// not opted out, and not human-gated.
 ///
 /// [`SOLO_LABEL`](crate::teams::SOLO_LABEL) is excluded here and not merely routed around later
 /// (§A.3.6: "triage never touches a solo ticket"). Excluding it at the candidate step is what makes
 /// that true of the model turn as well as of the write — a solo ticket's text never reaches an
 /// arbiter, so opting out of the team also opts out of being read by it.
+///
+/// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL) is excluded at the same step and for a stronger reason
+/// (STUDIO-949): the ticket will NEVER run, so assigning it an identity and spending a manager turn
+/// on it are both pure waste. There is no later step to route it around; the dispatcher refuses it
+/// outright, so triage must not see it as work at all.
 ///
 /// **The state test is the selection gate's own** (STUDIO-672), through the one shared
 /// [`dispatchable_state`](crate::dispatch::dispatchable_state) the gate's `eligibility` runs. The
@@ -1773,7 +1784,10 @@ pub(crate) fn unlabelled_candidates<'a>(
     issues
         .iter()
         .filter(|iss| {
-            states.admits(iss) && !has_any_identity_label(iss) && !crate::teams::is_solo(iss)
+            states.admits(iss)
+                && !has_any_identity_label(iss)
+                && !crate::teams::is_solo(iss)
+                && !crate::teams::is_human(iss)
         })
         .collect()
 }
@@ -1937,7 +1951,7 @@ impl crate::teamsears::RoomArbiter for ClaudeTriageArbiter {
 /// `kill_on_drop` so a timeout reaps the child, `--model` before `-p` because a flag trailing the
 /// prompt is at the mercy of positional parsing. Shared by both of this daemon's model turns; the
 /// only thing either adds is how it reads the answer.
-async fn run_turn(req: &TriageRequest) -> Result<String, String> {
+pub(crate) async fn run_turn(req: &TriageRequest) -> Result<String, String> {
     {
         let (name, base_args) = rhapsody_agent::claude::split_command(&req.command)
             .map_err(|e| format!("invalid claude command {:?}: {e}", req.command))?;
@@ -2415,6 +2429,25 @@ mod tests {
     fn a_capability_label_is_not_an_identity_label() {
         let issues = vec![labelled("i1", &["rhapsody:code-review"])];
         assert_eq!(unlabelled_candidates(&issues, &states()).len(), 1);
+    }
+
+    // STUDIO-949: a `rhapsody:human` ticket is never triaged. It can never run, so assigning it an
+    // identity and spending a manager turn on it are both pure waste — excluding it at the candidate
+    // step is what keeps its text out of the arbiter as well as the write.
+    //
+    // MUTATION: drop `!crate::teams::is_human(iss)` from `unlabelled_candidates` and this reds.
+    #[test]
+    fn a_human_gated_ticket_is_not_a_candidate() {
+        let issues = vec![
+            labelled("i1", &["rhapsody:human"]),
+            labelled("i2", &["Rhapsody:Human", "rust"]),
+            labelled("i3", &[]),
+        ];
+        let got: Vec<&str> = unlabelled_candidates(&issues, &states())
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(got, vec!["i3"]);
     }
 
     // ── load counting ───────────────────────────────────────────────────────────────────────────

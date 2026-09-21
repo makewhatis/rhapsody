@@ -76,10 +76,26 @@ export interface StateResponse {
   // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
   // mean the same thing.
   review_divergence?: ReviewDivergence[];
+  // Tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), or ABSENT
+  // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
+  // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.
+  held_for_human?: HeldForHuman[];
+}
+
+// HeldForHuman is one row of /api/v1/state's `held_for_human` key (STUDIO-949): a ticket the
+// dispatcher refuses because only a person can do it. The board reads it as deliberately held, not
+// mysteriously idle.
+export interface HeldForHuman {
+  issue_identifier: string;
+  title: string;
+  project: string;
 }
 
 // ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
-// that is neither progressing nor reported blocked.
+// whose review loop has stopped moving — either neither progressing nor reported blocked, or stopped
+// with a stated cause and remedy (review_escalated, review_shipped, round_budget_exhausted). When
+// `capacity_held` or `capacity_unreadable` is present it is instead a wait the daemon can name, so
+// never render the row as an unexplained stall without checking them.
 //
 // `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
 // of the wording is how the two drift apart. `kind` is still given because it is stable and a client
@@ -91,6 +107,17 @@ export interface ReviewDivergence {
   ticket: string; // "" when the origin names no ticket
   reviewer: string; // "" when the divergence is a property of every reviewer
   stale_secs: number;
+  // The capacity hold the review watcher recorded for this round (STUDIO-950), or absent when the
+  // round is not held. Present only when a review round was deferred for want of a global slot, so
+  // the console can say the wait is deliberate and name the budget an operator would loosen —
+  // rather than repeating the daemon's general "not reported blocked" framing. `budget` is the
+  // config key (`agent.max_concurrent_reviews` or `agent.max_concurrent_agents`).
+  capacity_held?: { holders: number; budget: string };
+  // The other capacity annotation (STUDIO-950), present when a round's hold was DENIED because
+  // GitHub stopped answering for the coordinate: the consecutive failed lookups the watcher has
+  // recorded. Mutually exclusive with `capacity_held`. Without it, an operator following the
+  // advisory's own "see review_divergence" pointer could not tell this row from an ordinary stall.
+  capacity_unreadable?: { attempts: number };
 }
 
 // DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
@@ -324,6 +351,14 @@ export interface IssueStatusBucket {
 export interface IssueCountsResponse {
   issues: number;
   buckets: IssueStatusBucket[];
+  // STUDIO-949: how many non-live `rhapsody:human` tickets the dispatcher is holding for which the
+  // run store has NO stored row — the never-ran hold, which reads "queued" on the console (a
+  // deliberate hold, not a fault) and which no bucket carries. A held ticket that HAS run keeps its
+  // stored row's bucket and is NOT included here, so this is not a duplicate of anything above and
+  // the strip adds it to `queued`. It is the daemon's count, not `state.held_for_human.length`,
+  // because only the daemon can join its bucket rows to the snapshot's hold set; see
+  // `consoleStoreCounts`. Absent when the daemon holds nothing with no stored row.
+  held_for_human?: number;
 }
 
 // TicketCostRow is one entry of GET /api/v1/history/costs (STUDIO-926): the tokens EVERY run spent
@@ -1635,7 +1670,14 @@ export async function postReviewDismiss(job: ReviewJob): Promise<ReviewActionRes
   return postJSON<ReviewActionResponse>("/api/v1/reviews/dismiss", prBody(job));
 }
 
-// Both controls act on the PULL REQUEST, so the body carries the coordinate and NOT the reviewer:
+// postReviewClear drops a pull request's shared review↔author round budget (STUDIO-956), so a bound
+// that otherwise clears only on a daemon restart or a pull-request close can be lifted in place. It
+// re-arms nothing: unlike a re-run, it dispatches only a round that was already due.
+export async function postReviewClear(job: ReviewJob): Promise<ReviewActionResponse> {
+  return postJSON<ReviewActionResponse>("/api/v1/reviews/clear", prBody(job));
+}
+
+// Every control acts on the PULL REQUEST, so the body carries the coordinate and NOT the reviewer:
 // a two-reviewer round is one round, and re-running half of it is not a thing to offer.
 function prBody(job: ReviewJob) {
   return { owner: job.owner, repo: job.repo, number: job.number };

@@ -142,6 +142,15 @@ pub struct WorkerDeps {
     /// `None` for every ticket dispatch — and, in this slice, for every dispatch, since nothing
     /// triggers a review yet.
     pub review: Option<crate::review::ReviewCheckout>,
+    /// The `gh` reads a DELTA review round needs (STUDIO-959): whether the commit the reviewer last
+    /// read is an ancestor of the head, and the findings already on the pull request. `None` on
+    /// every non-review run, and on a review daemon that could not build the seam — in which case
+    /// every round is FULL, which is the safe direction.
+    ///
+    /// Held here rather than reached through the control task because the reads happen when the
+    /// prompt is rendered, on the worker's own off-loop task: a hung `gh` parks this one run and
+    /// nothing else.
+    pub review_delta: Option<std::sync::Arc<dyn crate::ghsummons::ReviewDeltaSource>>,
     /// The daemon-wide "stop starting new work" flag (STUDIO-880), cloned from the orchestrator at
     /// dispatch. [`Self::run_turns`] consults it at each TURN BOUNDARY: an armed drain ends the loop
     /// NORMALLY rather than starting another turn, so the run is classified `continued` and keeps
@@ -300,7 +309,7 @@ pub(crate) fn has_handoff_marker(result_text: &str) -> bool {
 /// path the moment the transcript opens. Mirrors Go `runAgentAttempt`.
 pub async fn run_agent_attempt(
     deps: &WorkerDeps,
-    issue: Issue,
+    mut issue: Issue,
     attempt: Option<i32>,
     messages: Option<&mut mpsc::Receiver<String>>,
     on_event: &(dyn Fn(Event) + Send + Sync),
@@ -381,6 +390,30 @@ pub async fn run_agent_attempt(
             detail = %warn,
             "prompt_file fallback"
         );
+    }
+    // STUDIO-959: the host writes this round's FACTS into the synthetic issue's description, which
+    // lands inside the compiled `REVIEW_BASE_PROMPT` as `{{ issue.description }}`. A first round (no
+    // delta request) is an explicit FULL review; a round with a prior commit asks GitHub whether that
+    // commit is an ancestor of the head, and — only then — for the findings already on the pull
+    // request. Any read that does not answer falls back to FULL, so a delta is never taken on faith.
+    //
+    // Only the ticketless path reaches here: a quorum review ticket carries its host-written
+    // description already and has no `deps.review`, so this block is inert for it, exactly as the
+    // base-prompt selection above is inert for every implementation run.
+    if let Some(rev) = deps.review.as_ref() {
+        let mode = match rev.delta.as_ref() {
+            Some(request) => {
+                crate::reviewprompt::resolve_review_round(deps.review_delta.as_deref(), request)
+                    .await
+            }
+            None => crate::reviewprompt::ReviewRoundMode::Full(
+                crate::reviewprompt::FullReviewReason::NoPriorRound,
+            ),
+        };
+        issue.description = Some(crate::reviewprompt::review_round_description(
+            &mode,
+            &rev.head_sha,
+        ));
     }
     if let Err(e) = deps
         .workspace
@@ -710,6 +743,7 @@ mod tests {
             pr_label: String::new(),
             review_handoff_state: None,
             review: None,
+            review_delta: None,
             run_id: 0,
             drain: crate::drain::DrainSignal::new(),
         }
@@ -952,6 +986,7 @@ mod tests {
         d.review = Some(crate::review::ReviewCheckout {
             pr_number: 12,
             head_sha: head.clone(),
+            delta: None,
         });
         let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
 
@@ -998,6 +1033,195 @@ mod tests {
         drop(root);
     }
 
+    /// A fake [`crate::ghsummons::ReviewDeltaSource`] for the worker-level delta tests: each read is
+    /// an answer or a failure, and the calls are counted so a test can assert the worker did not ask
+    /// GitHub for a delta when the checkout said there was no prior round.
+    struct FakeDelta {
+        ancestor: Result<bool, String>,
+        findings: Result<crate::ghsummons::PriorFindings, String>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::ReviewDeltaSource for FakeDelta {
+        async fn is_ancestor(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _base: &str,
+            _head: &str,
+        ) -> crate::ghsummons::DeltaResult<bool> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.ancestor {
+                Ok(v) => Ok(*v),
+                Err(e) => Err(e.clone().into()),
+            }
+        }
+        async fn prior_findings(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+        ) -> crate::ghsummons::DeltaResult<crate::ghsummons::PriorFindings> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.findings {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(e.clone().into()),
+            }
+        }
+    }
+
+    /// A findings read whose bodies all arrived whole.
+    fn whole_findings(items: &[&str]) -> crate::ghsummons::PriorFindings {
+        crate::ghsummons::PriorFindings {
+            bodies: items.iter().map(|s| s.to_string()).collect(),
+            clipped: false,
+        }
+    }
+
+    /// Builds a local origin with one commit and a `refs/pull/12/head` at it, for the review
+    /// provisioning path: the branch-vs-detached distinction only exists in git.
+    fn review_origin() -> (TempDir, String) {
+        fn git_run(dir: &str, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").expect("write README");
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin.path)
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
+        (origin, head)
+    }
+
+    /// STUDIO-959, driven through the real turn: a review whose checkout carries a prior commit gets
+    /// the DELTA description — its prior commit and its findings — inside the compiled base prompt.
+    /// This is the end-to-end proof that the host's per-round facts reach the reviewer.
+    #[tokio::test]
+    async fn a_delta_review_reaches_the_agent_with_its_prior_commit_and_findings() {
+        let (origin, head) = review_origin();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src = FakeDelta {
+            ancestor: Ok(true),
+            findings: Ok(whole_findings(&["the parser drops the last line"])),
+            calls: Arc::clone(&calls),
+        };
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("pr:o/r#12@alice", "pr:o/r#12@alice", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 1);
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review_delta = Some(Arc::new(src));
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+            delta: Some(crate::review::ReviewDeltaRequest {
+                owner: "o".into(),
+                repo: "r".into(),
+                number: 12,
+                prior_sha: "abc1234abc1234abc1234abc1234abc1234abc1".into(),
+                head_sha: head.clone(),
+            }),
+        });
+
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("**Round mode:** delta review"),
+            "the delta round must say which mode it used:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("abc1234"),
+            "the prior commit must reach the reviewer:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("the parser drops the last line"),
+            "the prior findings must reach the reviewer:\n{prompt}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an ancestry answer plus a findings read"
+        );
+    }
+
+    /// The other half: a checkout with NO prior commit is a FULL round, it says so, and the worker
+    /// asks GitHub nothing — a first review must not depend on a `gh` excursion to know it is full.
+    #[tokio::test]
+    async fn a_first_round_review_is_full_and_asks_github_nothing() {
+        let (origin, head) = review_origin();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src = FakeDelta {
+            ancestor: Ok(true),
+            findings: Ok(whole_findings(&["must not be read"])),
+            calls: Arc::clone(&calls),
+        };
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("pr:o/r#12@alice", "pr:o/r#12@alice", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 1);
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review_delta = Some(Arc::new(src));
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+            delta: None,
+        });
+
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("**Round mode:** full review"),
+            "a first round must say it is a full review:\n{prompt}"
+        );
+        assert!(!prompt.contains("must not be read"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a first round must not spend a gh call deciding it is full"
+        );
+    }
     /// STUDIO-798, the acceptance criterion, driven through the real turn: a QUORUM review ticket,
     /// dispatched on an installation whose configured base prompt is THIS repository's own
     /// implementer prompt, must reach the agent with no instruction to merge in the text it is
@@ -1600,6 +1824,7 @@ mod tests {
         d.review = Some(crate::review::ReviewCheckout {
             pr_number: 12,
             head_sha: head.clone(),
+            delta: None,
         });
         d.drain
             .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
@@ -1820,6 +2045,7 @@ mod tests {
         d.review = Some(crate::review::ReviewCheckout {
             pr_number: 12,
             head_sha: "a".repeat(40),
+            delta: None,
         });
         let sess = ag
             .start_session("", review_issue(), None)

@@ -122,6 +122,10 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let agent = Agent {
         backend: or_str(r.agent.backend, "claude"),
         max_concurrent_agents: or_int(r.agent.max_concurrent_agents, 10),
+        // STUDIO-950: no default — absent means "share `max_concurrent_agents`", the pre-key
+        // behaviour. A default of 0 would be ambiguous with an explicit 0, so the raw `Option`
+        // carries through and the reader treats ≤ 0 as unset.
+        max_concurrent_reviews: r.agent.max_concurrent_reviews,
         max_turns: or_int(r.agent.max_turns, 20),
         max_retry_backoff_ms: or_int(r.agent.max_retry_backoff_ms, 300000),
         max_concurrent_agents_by_state: normalize_state_map(r.agent.max_concurrent_agents_by_state),
@@ -580,6 +584,10 @@ mod tests {
         let c = decode_yaml("", "body");
         assert_eq!(c.polling.interval_ms, 30000);
         assert_eq!(c.agent.max_concurrent_agents, 10);
+        assert_eq!(
+            c.agent.max_concurrent_reviews, None,
+            "STUDIO-950: an install that never writes the key keeps the shared review budget"
+        );
         assert_eq!(c.agent.max_turns, 20);
         assert_eq!(c.agent.max_retry_backoff_ms, 300000);
         assert_eq!(c.agent.handoff_drain_grace_ms, 10000);
@@ -594,6 +602,24 @@ mod tests {
         assert_eq!(c.claude.command, "claude");
         assert_eq!(c.codex.command, "codex app-server");
         assert_eq!(c.prompt_template, "body");
+    }
+
+    // STUDIO-950: `agent.max_concurrent_reviews` is optional and Rhapsody-only. Absent ⇒ `None`
+    // (the shared budget); present ⇒ carried verbatim, including a zero the reader normalizes away.
+    #[test]
+    fn decode_max_concurrent_reviews_is_optional_and_verbatim() {
+        let c = decode_yaml("agent:\n  max_concurrent_reviews: 2\n", "body");
+        assert_eq!(c.agent.max_concurrent_reviews, Some(2));
+
+        let explicit_zero = decode_yaml("agent:\n  max_concurrent_reviews: 0\n", "body");
+        assert_eq!(
+            explicit_zero.agent.max_concurrent_reviews,
+            Some(0),
+            "decode keeps the raw value; `Effective` normalizes ≤ 0 to unset"
+        );
+
+        let absent = decode_yaml("agent:\n  max_concurrent_agents: 4\n", "body");
+        assert_eq!(absent.agent.max_concurrent_reviews, None);
     }
 
     // Mirrors Go `TestDecodeCanceledStates`.

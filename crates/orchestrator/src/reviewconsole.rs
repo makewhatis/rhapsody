@@ -14,7 +14,7 @@
 //! all demand a fetched Linear issue, so a `pr:` key resolves to nothing there — and making it
 //! understand pull requests would be a second addressing subsystem whose targets come out of
 //! forgeable post text (§14.2, "room control is Linear-anchored"). So **this slice adds no `pr:`
-//! room Intent at all**; the two operator actions arrive as in-process control [`Event`]s from the
+//! room Intent at all**; the operator's controls arrive as in-process control [`Event`]s from the
 //! loopback HTTP API instead, which is the trusted path §15-e means.
 //!
 //! [`Event`]: crate::Event
@@ -22,7 +22,7 @@
 //! # Trusted in-process, still re-validated
 //!
 //! Being an in-process type is not the same as being a validated one — the rule
-//! [`crate::reviewintro`] states and this module inherits. Both handlers re-check the coordinates
+//! [`crate::reviewintro`] states and this module inherits. Every handler re-checks the coordinates
 //! they are handed, and [`Orchestrator::handle_review_rerun`] re-checks the watched-repo allowlist
 //! as well, because a re-run is a step towards checking that repository out.
 //!
@@ -33,7 +33,7 @@
 //!
 //! # Everything is loop-confined
 //!
-//! All three entry points run on the control task, for the reason
+//! All four entry points run on the control task, for the reason
 //! [`Orchestrator::handle_review_introduce`] does: the watch set stays single-writer, and the
 //! in-flight guard the two writers depend on reads `running`/`claimed`, which only the control task
 //! owns. The read is loop-confined too, following [`crate::Event::ReviewWatchList`] — the console's
@@ -269,18 +269,84 @@ impl Orchestrator {
         if armed > 0 {
             // One ROUND back, in the dispatches the counter is kept in — the same scaling
             // `service_review_pr` applies to the cap, so a two-reviewer config gets a two-dispatch
-            // round back rather than half of one. Saturating: a counter below one round's cost just
-            // returns to zero.
-            let round = self
-                .teams
-                .as_ref()
-                .map_or(1, |t| t.review.effective_reviewers().max(1));
-            if let Some(spent) = self.review_rounds.get_mut(&churn_key(pr)) {
+            // round back rather than half of one. Read from the one helper that defines the unit, so
+            // the refund and the charge can never disagree. Saturating: a counter below one round's
+            // cost just returns to zero.
+            let round = self.reviewers_per_round();
+            let key = churn_key(pr);
+            if let Some(spent) = self.review_rounds.get_mut(&key) {
                 *spent = spent.saturating_sub(round);
+                // The refund is durable too (STUDIO-956): a re-run whose refunded round only
+                // existed in memory would be undone by the next restart, which is the same defect
+                // as the charge only existing in memory — in the operator's face rather than the
+                // budget's.
+                self.persist_review_rounds(&key);
+            }
+            // The operator's re-run overrides a manager adjudication too (STUDIO-956): otherwise a
+            // settled `ship`/`escalate` would keep the loop stopped and the refunded round would
+            // never dispatch.
+            if let Some(ledger) = self.adjudication_ledger.as_ref() {
+                ledger.clear(pr);
             }
             tracing::info!(pr = %pr, rows = armed, "ticketless review: operator re-ran a review");
         }
         ReviewControlOutcome::Applied(armed)
+    }
+
+    /// **Clear the round budget** (`Event::ReviewClear`) — the operator's deliberate reset of a
+    /// pull request's review round budget — and any manager adjudication of it (STUDIO-956).
+    ///
+    /// §15-e's third lever, and the answer to that lever's own failure mode. A spent budget defers
+    /// every further review AND every author re-dispatch "until the daemon restarts or the pull
+    /// request closes" — which is a bound an operator cannot lift in place, and which is why three
+    /// pull requests sat unreviewable until an upgrade forced a restart. Re-run *refunds one round*
+    /// (its own test pins that), which is the right size for a pull request the cap merely reached;
+    /// this is for the one an operator has decided the budget itself was wrong about.
+    ///
+    /// It clears the COUNTER and touches no row: unlike re-run it does not re-arm anything, so
+    /// nothing is dispatched that was not already due. Dropping the entry is the whole of it, so a
+    /// cleared pull request starts its next round from zero exactly as a re-introduced one does.
+    ///
+    /// Deliberately NOT allowlist-gated, for [`Self::handle_review_dismiss`]'s reason: it performs
+    /// no checkout and no dispatch (dispatch re-checks the allowlist itself), and gating it would
+    /// make the budgets an operator most wants gone — the ones a paused or repointed project left
+    /// behind — the only ones that could never be cleared.
+    pub(crate) fn handle_review_clear(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
+        if !self.review_ticketless_enabled() {
+            return ReviewControlOutcome::Dormant; // §16
+        }
+        if let Some(why) = check_coords(pr) {
+            return ReviewControlOutcome::Refused(why);
+        }
+        // The ledger is cleared BEFORE the counter is read, so the two writes this function's doc
+        // binds together can never come apart. A decision genuinely can land after a Clear: the
+        // turn runs off-loop, `mark_in_flight` is on the control task, and `record` fires only after
+        // an un-timed comment POST. An operator who clears inside that window leaves a settled
+        // decision and no counter, and the old ordering then refused every later Clear as "no
+        // budget" — with the only stated recovery (the WARN and the README both name this POST) a
+        // `409`. Dropping a decision is as much a clear as dropping a counter.
+        let cleared_decision = self
+            .adjudication_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.clear(pr));
+        // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
+        // which is a different fact from "the budget is now clear" and worth saying.
+        let cleared_counter = self.review_rounds.remove(&churn_key(pr)).is_some();
+        // Durably, and unconditionally: the deliberate clear is the documented way to lift a bound
+        // now that a restart no longer does it (STUDIO-956), so it must leave nothing behind for a
+        // later boot to rehydrate — including a row this process never saw.
+        self.forget_review_bound(pr);
+        if !cleared_counter && !cleared_decision {
+            return ReviewControlOutcome::Refused(
+                "no review budget to clear for that pull request",
+            );
+        }
+        tracing::info!(
+            pr = %pr,
+            "ticketless review: operator cleared the pull request's review budget and any manager \
+             adjudication of it"
+        );
+        ReviewControlOutcome::Applied(1)
     }
 
     /// **Dismiss** (`Event::ReviewDismiss`) — the operator taking a pull request out of the watch
@@ -317,6 +383,14 @@ impl Orchestrator {
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no watched review of that pull request");
         }
+        // The dismissal's coordinate, taken from a MATCHED ROW rather than from the request, so the
+        // records removed below are keyed by the same source the watcher inserted them from. The
+        // operator's own coordinate is unnormalized (`check_coords` only rejects empties) while
+        // `PrCoord`'s derived `Eq` is case-sensitive, so removing `pr` directly would miss a record
+        // the watcher stored under the store row's casing — a dismissal typed `MakeWhatIs` matched
+        // this row case-insensitively but left its unreadability record behind (STUDIO-950 round 16).
+        // `mine` is non-empty by the check above, and every row in it is the same pull request.
+        let dismissed = PrCoord::new(&mine[0].key.owner, &mine[0].key.repo, mine[0].key.number);
         let mut dropped = 0usize;
         for row in mine {
             let id = review_key(
@@ -330,6 +404,11 @@ impl Orchestrator {
             // left standing it would keep `REVIEW_UNASSIGNABLE_WARNING` lit on every project for
             // the rest of the daemon's life, which is a warning that only ever latches.
             self.review_unassignable.remove(&id);
+            // STUDIO-950: same reasoning for the capacity hold, whose job is to annotate the
+            // reconciliation sweep's report of an OWED round. A dismissed pull request owes none,
+            // and the hold survives unreached ticks by design, so it must be dropped here rather
+            // than left to the TTL.
+            self.review_capacity_held.remove(&id);
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
@@ -341,6 +420,29 @@ impl Orchestrator {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
+            // ...and its durable counterpart, so a restart cannot resurrect the spent budget of
+            // a dismissed pull request (STUDIO-956). `churn_key` lowercases, so the operator's own
+            // casing is safe here in a way the coordinate-keyed record below is not.
+            self.forget_review_bound(pr);
+            // ...and the unreadability record, keyed by coordinate for `retire_review_pr`'s reason:
+            // left behind it would outlive the pull request it names (STUDIO-950 round 14).
+            //
+            // Sits under `dropped > 0`, unlike the per-row removals above: those run whether or not
+            // the store drop succeeds (a row the operator is not waiting on must not keep
+            // `REVIEW_UNASSIGNABLE_WARNING` latched, or its hold annotated), while this record,
+            // the churn budget and its durable bound are keyed by coordinate rather than by row and
+            // so cannot be retired per row. A dismissal whose every store drop FAILED therefore
+            // leaves the failure count standing, which is still a live fact about a pull request
+            // the daemon continues to poll; once AT LEAST one row is gone the operator has said they are not waiting on it.
+            // In the mixed case — some rows dropped, some failed — the surviving row is still polled
+            // but loses the record, restarting its one-attempt grace period. That can only DELAY a
+            // denial, never invent one (the count climbs again from zero), so it is preferred to
+            // keeping a dismissed pull request's record named forever. It also drops the
+            // `capacity_unreadable` ANNOTATION from the surviving row's report until the count
+            // climbs back to `UNREADABLE_ATTEMPTS_TO_DROP_HOLD`, so that row reads as an ordinary
+            // divergence for one grace period while `gh` still refuses the coordinate — a delay of
+            // the same page, which is why this is the smaller harm, not a harm-free choice.
+            self.review_watch_unreadable.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
@@ -381,6 +483,14 @@ impl ControlHandle {
     /// reason.
     pub async fn dismiss_review(&self, pr: PrCoord) -> ReviewControlOutcome {
         self.review_control(|reply| Event::ReviewDismiss { pr, reply })
+            .await
+    }
+
+    /// The operator's **clear** (`POST /api/v1/reviews/clear`) — drop a pull request's shared
+    /// review↔author round budget so both halves of the loop may run again, without a restart
+    /// (STUDIO-956). The same trusted path as the other two.
+    pub async fn clear_review(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.review_control(|reply| Event::ReviewClear { pr, reply })
             .await
     }
 
@@ -865,6 +975,199 @@ mod tests {
         );
     }
 
+    // ── clear the round budget (STUDIO-956) ─────────────────────────────────────────────────────
+
+    /// **Acceptance: the budget is clearable without a daemon restart.** An operator clears a spent
+    /// review budget and the pull request is unbounded again.
+    #[test]
+    fn an_operator_clear_lifts_a_spent_round_budget() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.review_rounds.insert(
+            "makewhatis/rhapsody#12".to_string(),
+            REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        assert!(o.round_budget_spent(&pr()));
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.review_rounds.get("makewhatis/rhapsody#12"),
+            None,
+            "a clear drops the counter outright, unlike re-run's one-round refund"
+        );
+        assert!(!o.round_budget_spent(&pr()));
+    }
+
+    /// **STUDIO-956.** Clear also drops the manager's adjudication of the pull request: a settled
+    /// `ship`/`escalate` keeps the loop stopped on its own, so leaving it behind would make the
+    /// operator's lever look applied while nothing could dispatch.
+    #[test]
+    fn an_operator_clear_also_drops_a_manager_adjudication() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes".to_string()],
+                reason: "needs a human".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.adjudication(&pr()),
+            None,
+            "the decision must go with the budget, or the loop stays stopped"
+        );
+    }
+
+    /// **A decision that lands AFTER a Clear can still be cleared.** The ordered window is real: the
+    /// manager's turn runs off-loop, `mark_in_flight` is on the control task, and `record` fires only
+    /// after an un-timed comment POST. An operator who clears inside it leaves a settled decision
+    /// with no counter, and the old counter-first check then refused every later Clear as "no
+    /// budget" — while the WARN and the README both name this POST as the recovery. Pinned with a
+    /// TWO-step clear: a single clear with both present passes under either ordering and would not
+    /// discriminate this.
+    #[test]
+    fn a_clear_after_a_decision_landed_without_a_counter_still_clears_it() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        // The operator clears while the adjudication plan is out: the counter goes, and nothing
+        // else is there yet.
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        // …then the off-loop turn lands its decision, with no counter to pair it with.
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec![],
+                reason: "needs a human".to_string(),
+            },
+        );
+        assert!(o.adjudication(&pr()).is_some());
+
+        // The second clear must still drop it, or the loop stays stopped with the lever reading 409.
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1),
+            "dropping a decision is as much a clear as dropping a counter"
+        );
+        assert_eq!(o.adjudication(&pr()), None);
+    }
+
+    /// **A settled decision must not survive an operator re-run.** Re-run refunds one round and
+    /// clears the decision so the refunded round can actually dispatch; without the clear the lever
+    /// reports `Applied(1)` while the settled `ship`/`escalate` keeps the loop stopped, so nothing
+    /// moves. Deleting the `ledger.clear` from the re-run path left every other test green.
+    #[test]
+    fn an_operator_rerun_also_drops_a_manager_adjudication() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let ledger = std::sync::Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr(),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes".to_string()],
+                reason: "needs a human".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));
+        o.review_rounds.insert(
+            "makewhatis/rhapsody#12".to_string(),
+            o.reviewers_per_round() * 2,
+        );
+
+        assert_eq!(
+            o.handle_review_rerun(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.adjudication(&pr()),
+            None,
+            "a re-run overrides a settled decision, or the refunded round never dispatches"
+        );
+    }
+
+    /// Clear touches no row: unlike re-run it re-arms nothing, so it dispatches only what was
+    /// already due. An approved pull request stays approved after its budget is cleared.
+    #[test]
+    fn an_operator_clear_does_not_re_arm_a_row() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 3);
+
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            row_of(&o, "bob").status,
+            REVIEW_STATUS_APPROVED,
+            "clearing a budget is not a re-run"
+        );
+    }
+
+    /// Clearing a pull request with no budget is a REFUSAL, not an `Applied(0)`: "there was nothing
+    /// to clear" is a different fact from "the budget is now clear".
+    #[test]
+    fn clearing_an_unbudgeted_pull_request_is_refused() {
+        let mut o = ticketless();
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Refused("no review budget to clear for that pull request")
+        );
+    }
+
+    /// Coordinates are re-validated even though the caller is in-process, and a dormant daemon
+    /// refuses without touching anything — the same rules the other two controls obey.
+    #[test]
+    fn a_clear_revalidates_its_coordinates_and_is_dormant_when_off() {
+        let mut o = ticketless();
+        assert_eq!(
+            o.handle_review_clear(&PrCoord::new("", "rhapsody", 12)),
+            ReviewControlOutcome::Refused("pull request has no owner/repo")
+        );
+        assert_eq!(
+            o.handle_review_clear(&PrCoord::new("makewhatis", "rhapsody", 0)),
+            ReviewControlOutcome::Refused("pull-request number is not positive")
+        );
+
+        o.teams = Some(teams_with(true, ReviewMode::Off));
+        assert_eq!(
+            o.handle_review_clear(&pr()),
+            ReviewControlOutcome::Dormant,
+            "mode off ⇒ dormant, even with a budget sitting in the counter"
+        );
+    }
+
     // ── dismiss ──────────────────────────────────────────────────────────────────────────────────
 
     /// **Acceptance 3.** Dismiss drops the pull request out of the watch set — every row of it, to
@@ -1006,6 +1309,95 @@ mod tests {
             "a dismissed pull request must not leave a stall counter behind"
         );
         assert!(!o.review_rounds_stalled());
+    }
+
+    /// STUDIO-950 (round 11, non-blocking B): a dismissal drops the dismissed round's capacity hold.
+    /// The hold survives unreached ticks by design, so a dismissed pull request would otherwise keep
+    /// naming a capacity wait until the watcher stops sweeping — a WRONG named cause for a pull
+    /// request nobody is waiting on. Pin the removal on the dismissal path.
+    ///
+    /// Mutation check: drop the `review_capacity_held.remove(&id)` in `handle_review_dismiss` and
+    /// this reds.
+    #[test]
+    fn a_dismissal_drops_a_capacity_hold() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let id = review_key("makewhatis", "rhapsody", 12, "bob");
+        o.review_capacity_held.insert(
+            id.clone(),
+            crate::reviewwatch::CapacityHold {
+                holders: 4,
+                separate: false,
+                recorded: chrono::Utc::now(),
+            },
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_capacity_held.contains_key(&id),
+            "a dismissed pull request must not keep a capacity hold"
+        );
+    }
+
+    /// STUDIO-950 (round 15, alice's non-blocking 1): a dismissal forgets the dismissed pull
+    /// request's unreadability record, keyed by coordinate for `retire_review_pr`'s reason. Left
+    /// behind it would outlive the pull request it names and sit in the map for the daemon's whole
+    /// life; a re-introduced coordinate could inherit a failure count it never earned and have its
+    /// first fresh hold denied.
+    ///
+    /// Mutation check: drop the `review_watch_unreadable.remove(pr)` in `handle_review_dismiss`
+    /// and this reds.
+    #[test]
+    fn a_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        assert!(
+            o.review_watch_unreadable.contains_key(&pr()),
+            "precondition: a failed lookup is recorded"
+        );
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "a dismissed pull request must not keep an unreadability record"
+        );
+    }
+
+    /// STUDIO-950 (round 16, jimmy's finding): the dismissal removes the unreadability record by the
+    /// MATCHED ROW's coordinate, not the operator's. `PrCoord`'s derived `Eq` is case-sensitive and
+    /// `check_coords` never normalizes, while `row_is` matches case-insensitively — so a dismissal
+    /// typed the way GitHub prints the repository used to drop the rows and the churn budget but
+    /// leave the record behind. Mutation check: remove `pr` instead of the matched row's coordinate
+    /// and this reds on the unreadable assertion only.
+    #[test]
+    fn a_case_mismatched_dismissal_forgets_the_unreadable_record() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.handle_review_unreadable(&[pr()]);
+        o.review_rounds.insert(churn_key(&pr()), 1);
+
+        // The operator's coordinate, typed in different casing from the store row the watcher
+        // keyed the record on.
+        let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
+        assert_eq!(
+            o.handle_review_dismiss(&typed),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_rounds.contains_key(&churn_key(&pr())),
+            "the churn budget goes with the rows"
+        );
+        assert!(
+            !o.review_watch_unreadable.contains_key(&pr()),
+            "so must the unreadability record, whatever casing the operator typed"
+        );
     }
 
     /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls without

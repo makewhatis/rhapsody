@@ -114,10 +114,59 @@ describe("DivergenceBanner", () => {
     );
     renderBanner();
     const banner = await screen.findByRole("status");
-    expect(banner.textContent).toContain("2 pull requests are neither progressing nor reported");
+    expect(banner.textContent).toContain("2 pull requests need attention");
     expect(banner.textContent).toContain("makewhatis/rhapsody#164");
     expect(banner.textContent).toContain("makewhatis/strava#21");
     expect(banner.textContent).toContain("for 3 days");
+  });
+
+  // STUDIO-950: a round the daemon is HOLDING for want of a global slot must not read as an
+  // unexplained stall. The row carries the watcher's own annotation, and the banner renders the
+  // holder count and the budget key, so an operator sees the wait is deliberate and which knob
+  // frees it. The heading stays true of every row — held or not.
+  it("names a capacity hold and the budget an operator would turn", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_requested_no_run",
+            detail: "a review round is owed and no reviewer run has started",
+            capacity_held: { holders: 4, budget: "agent.max_concurrent_agents" },
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("held for capacity");
+    expect(banner.textContent).toContain("4 run(s) hold the agent.max_concurrent_agents budget");
+    // A held round is still a report, not a control.
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  // STUDIO-950 round 21: the hold can be DENIED because GitHub stopped answering for the coordinate.
+  // That row carries `capacity_unreadable` instead, and the banner must name the silence for the same
+  // reason it names a hold — the advisory's own pointer to `review_divergence` cannot otherwise tell
+  // this row from an ordinary divergence.
+  it("names an unreadable coordinate rather than an unexplained stall", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_requested_no_run",
+            detail: "a review round is owed and no reviewer run has started",
+            capacity_unreadable: { attempts: 3 },
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("could not be read");
+    expect(banner.textContent).toContain("3 consecutive attempt(s)");
+    expect(banner.textContent).not.toContain("held for capacity");
+    // Still a report, not a control.
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   // The shortest staleness the daemon can actually report — just past its ninety-minute threshold —
@@ -130,5 +179,28 @@ describe("DivergenceBanner", () => {
     renderBanner();
     const banner = await screen.findByRole("status");
     expect(banner.textContent).toContain("for 1 hour");
+  });
+
+  // STUDIO-956: `round_budget_exhausted` has no staleness threshold and is reported the moment the
+  // budget is spent, so it is the one kind that reaches the minutes branch — often at zero seconds.
+  // It must read "1 minute" and never the ungrammatical "1 minutes".
+  it("renders a just-spent budget as a single minute, not '1 minutes'", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "round_budget_exhausted",
+            detail:
+              "the per-pull-request review round budget is spent, so no further review round will be dispatched until it is cleared",
+            reviewer: "",
+            stale_secs: 0,
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("for 1 minute");
+    expect(banner.textContent).not.toContain("1 minutes");
   });
 });

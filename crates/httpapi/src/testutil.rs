@@ -109,6 +109,7 @@ pub(crate) struct FakeProvider {
     review_outcome: Option<ReviewControlOutcome>,
     review_rerun_pr: Mutex<Option<PrCoord>>,
     review_dismiss_pr: Mutex<Option<PrCoord>>,
+    review_clear_pr: Mutex<Option<PrCoord>>,
     /// The canned outcome `merge_run` returns, and what the last call was asked — how a test
     /// asserts the handler forwarded only the run id and the confirmation (STUDIO-767).
     merge_outcome: Option<MergeControlOutcome>,
@@ -169,6 +170,7 @@ impl FakeProvider {
             review_outcome: None,
             review_rerun_pr: Mutex::new(None),
             review_dismiss_pr: Mutex::new(None),
+            review_clear_pr: Mutex::new(None),
             merge_outcome: None,
             merge_asked: Mutex::new(None),
             mergeability_outcome: None,
@@ -365,14 +367,14 @@ impl FakeProvider {
         self
     }
 
-    /// Set the canned outcome BOTH review controls return. Unset ⇒ the trait's `Dormant`.
+    /// Set the canned outcome EVERY review control returns. Unset ⇒ the trait's `Dormant`.
     pub(crate) fn with_review_outcome(mut self, outcome: ReviewControlOutcome) -> Self {
         self.review_outcome = Some(outcome);
         self
     }
 
-    /// The coordinates the last `review_rerun` / `review_dismiss` was called with — how a test
-    /// asserts the handler forwarded the body's own owner/repo/number and nothing else.
+    /// The coordinates the last `review_rerun` / `review_dismiss` / `review_clear` was called with —
+    /// how a test asserts the handler forwarded the body's own owner/repo/number and nothing else.
     pub(crate) fn review_rerun_pr(&self) -> Option<PrCoord> {
         self.review_rerun_pr
             .lock()
@@ -382,6 +384,13 @@ impl FakeProvider {
 
     pub(crate) fn review_dismiss_pr(&self) -> Option<PrCoord> {
         self.review_dismiss_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn review_clear_pr(&self) -> Option<PrCoord> {
+        self.review_clear_pr
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -634,6 +643,16 @@ impl StateProvider for FakeProvider {
             .unwrap_or(ReviewControlOutcome::Dormant)
     }
 
+    async fn review_clear(&self, pr: PrCoord) -> ReviewControlOutcome {
+        *self
+            .review_clear_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pr);
+        self.review_outcome
+            .clone()
+            .unwrap_or(ReviewControlOutcome::Dormant)
+    }
+
     async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
         *self
             .merge_asked
@@ -804,6 +823,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         drain: None,
         projects: Vec::new(),
         review_divergence: Vec::new(),
+        held_for_human: Vec::new(),
     }
 }
 

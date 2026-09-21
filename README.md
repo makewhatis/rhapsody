@@ -346,7 +346,8 @@ serves the same per-row facts `GET /api/v1/history/issues` already serves, group
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
              {"outcome": "completed", "review_run": true, "count": 7},
-             {"outcome": "running", "count": 1}]}
+             {"outcome": "running", "count": 1}],
+ "held_for_human": 2}
 ```
 
 Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
@@ -355,6 +356,14 @@ as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@review
 `id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
 sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
 different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+
+**A hold the store has no row for is reported separately** (STUDIO-949). `held_for_human` counts the
+non-live `rhapsody:human` tickets the dispatcher is holding for which the run store has NO stored
+row — the never-ran hold, for which the console synthesizes a Queued card and which no bucket could
+otherwise carry. It is emitted only while that count is positive, so a daemon with no such hold
+serves the pre-STUDIO-949 payload byte-for-byte. A held ticket that HAS run keeps its stored row's
+bucket (its lane), so it is deliberately not reclassified and not included here; `issues` remains
+the number of issues the buckets cover and the sum of their counts.
 
 What it costs the tracker is stated rather than left to be found, and this is the first caller that
 asks the daemon's lifecycle memo about more ids than one lookup will refresh. A lookup refreshes at
@@ -414,7 +423,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
+| `rhapsody.db` | no column, no new row *kind*; the two Teams-only tables (`rhapsody_review_watch` and `rhapsody_review_bound`, below) are created by the migration but stay **empty** — nothing writes to either unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -823,6 +832,45 @@ and every Go-pinned golden is untouched: the new table is prefix-gated, the new 
 additive, and the new fields appear only on the Rhapsody-only issue listing. `divergent_objects_are_gated_by_name_only`
 now pins the third name.
 
+### A fourth schema table with no Go counterpart — `rhapsody_review_bound` (STUDIO-956)
+
+The review↔author round bound was in memory, and a bound a restart refunds is not a bound. Measured
+on the operator's own store, 2026-09-20: **five daemon restarts**, every one of them to apply a
+boot-only `teams.yaml` change — i.e. caused by tuning the review configuration — and each one handed
+seven in-flight pull requests a fresh budget. **264 review runs that day; 46 on one pull request
+against a nominal cap of 16.** Worse, a pull request the manager had already ESCALATED forgot the
+decision on restart and resumed the loop from zero. At a threshold of 3, a daemon that restarts more
+often than every 3 rounds never reaches the threshold at all.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **11** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance` and `rhapsody_review_bound` |
+| the round counter | — | `rhapsody_review_bound.dispatches`, written at every charge, rehydrated at boot |
+| the manager's decision | — | `decision`/`head`/`rounds`/`findings`/`reason` on the same row |
+
+One row per PULL REQUEST (`owner/repo#number`, case-folded), not per (pull request, reviewer): the
+bound is shared by all of a pull request's reviewers, and putting it on `rhapsody_review_watch` would
+give N reviewers N budgets — the defect STUDIO-727 already fixed in memory. The key is what makes the
+value mean *"rounds spent on this pull request"* rather than *"rounds since some daemon booted"*.
+
+**The counter and the decision have different writers, so neither upsert carries the other's
+columns.** The control task charges rounds; the off-loop adjudication half records what the manager
+said. A last-write-wins row would let a charged round erase a landed decision.
+
+**An in-flight adjudication is deliberately NOT persisted.** The in-flight marker means "a turn is
+out right now, do not ask again", and the process that was going to land it is exactly what a restart
+destroys. Persisted, it would stop every further round for that pull request forever with no turn
+left anywhere to clear it — a permanent freeze in place of the temporary refund this fixes.
+Unpersisted, a restart mid-turn costs one re-asked turn.
+
+**A pull request that leaves the watch set deletes its row** — merged, closed, or dismissed from the
+console — so one that is later re-introduced, reopened or rebuilt under the same number never
+inherits a spent budget. `POST /api/v1/reviews/clear` is the deliberate clear and is now the only
+thing that lifts a bound in place; the operator's **Re-run** refunds one round and drops the decision
+without resetting the budget. **Off is still off:** with `storage.path: off` there is nowhere to
+remember a bound, so the daemon keeps the per-boot behaviour it had before this ticket.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
@@ -1199,6 +1247,28 @@ move, so has that party moved since the row started owing it? It **reports and n
 re-dispatching on a rule nobody has watched fire is how a stall becomes a loop, so acting is left to
 its own reviewed change.
 
+Detection stays cause-agnostic, but the report is not silent about a cause the daemon already knows.
+When the review watcher deferred a round for want of a global slot it records the hold (STUDIO-950),
+and the sweep names it — the holder count and which budget — instead of the unenriched "nothing has
+reported it blocked", exactly as it names auto-merge's decline reason (STUDIO-923). It annotates and
+never suppresses: the pull request is still reported. The hold's annotation reaches the surfaces, not
+just the log — the `/api/v1/state` row carries the holder count and the budget key under
+`capacity_held`, the console banner renders them, and the per-project advisory names a capacity hold
+rather than claiming nothing reported it blocked. It is a statement about the capacity the recording
+sweep found, not a duration: the row's 90-minute staleness is what makes it reportable, while the
+watcher's own liveness is re-stamped on every tick and a hold is refreshed whenever the rotating
+cursor next evaluates its pull request. A hold stops being named once the watcher's liveness stamp is
+more than `CAPACITY_HOLD_TTL` old — measured against the sweep's own clock, not the hold's age — and
+one whose pull request has failed enough consecutive lookups is no longer reported as a hold — and
+that denial is reported as an unreadable coordinate, with the attempt count, rather than falling back
+to the false "nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being
+named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall. The
+denial takes the same route to all three surfaces: the state row carries it under
+`capacity_unreadable`, the console banner names it, and the per-project advisory reports that the
+GitHub state could not be read rather than the plain "nothing has reported it blocked", so an
+operator following the advisory's own pointer to `review_divergence` can tell the row it is about
+from an ordinary divergence.
+
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | detection | none (the feature does not exist) | a threshold sweep, 90 min, cause-agnostic |
@@ -1218,6 +1288,263 @@ operator's own store (n=197 completed runs) run durations were p50 7.3 min, p90 
 eleven hours the incidents actually cost. A pull request mid-round is silent, an in-flight run is
 activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
+
+### The manager decides at the review round threshold — ship it or escalate (STUDIO-956)
+
+Go v0.4.0 has no manager turn at all, so this is additive surface. It exists because a
+convergence property that depends on an agent choosing to stop is not a property: before this, the
+review↔author loop ran until `REVIEW_ROUNDS_PER_PR_CAP` × reviewers (sixteen rounds at two
+reviewers), logged a DEBUG refusal, and stopped with **no decision and no escalation**. Three pull
+requests sat unreviewable on 2026-09-20 until an unrelated restart. Measured against the operator's
+own store, four tickets burned **353M tokens** — STUDIO-170 alone ran eleven author rounds and 23
+review runs on one pull request.
+
+`teams.review.adjudicate_after_rounds` is the opt-in round threshold. At it, the loop stops arming
+rounds and the **manager** makes exactly one decision:
+
+- **ship it** — the open findings do not block; the pull request proceeds to the normal merge gates.
+- **escalate** — a human is needed, and the escalation names the specific open findings, the round
+  count and the head the loop stopped at.
+
+| At the threshold | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| who ends the loop | nothing — there is no review loop | the manager, one turn |
+| the decision | — | `SHIP`, or `ESCALATE: <reason>` |
+| the audit | — | a room post **and** a pull-request comment, both naming the way it went |
+| the report | — | `review_escalated` / `review_shipped` on `/api/v1/state` and a WARN line |
+| default | — | **off**: `adjudicate_after_rounds: 0`, byte-identical to before this ticket |
+
+```yaml
+review:
+  adjudicate_after_rounds: 3     # the maintainer's number: three rounds, then escalate
+  auto_merge: false              # unchanged — a ship adjudicates findings, never the gates
+```
+
+**"Ship it" adjudicates the findings, NEVER the gates.** The manager decides whether the open review
+findings block; it can never override CI, approval-at-head, a draft, a conflict, or any other merge
+gate. A manager that could merge a red pull request would be worse than the loop it replaced. A
+shipped pull request whose rows are not all approved is therefore reported as `review_shipped` (the
+gate still holds it, and no round will ever arm), while one whose rows are all approved either
+merges or falls to the ordinary `approved_still_open` report after the staleness threshold.
+
+**Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
+assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot
+silently inherit that mode. It is gated by this key alone, runs through the daemon's one model-turn
+path with `manager.model` / `manager.timeout_ms`, and needs no `gh` on the control task: the control
+task decides and hands a plan to the watcher, which performs the turn and the writes off-loop.
+
+**Both halves are bounded, and a failed turn is bounded too.** Author re-dispatches charge the same
+counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
+the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
+`MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
+turn per sweep forever — through the same room post and pull-request comment every other decision
+gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —
+and the round budget — from the console (`POST /api/v1/reviews/clear`).
+
+**The bound and the decision are DURABLE.** Both live on `rhapsody_review_bound`, keyed by the pull
+request, and are rehydrated before the first tick — see that table's Divergences entry above for the
+measurement that forced it (five restarts in a day, 46 review rounds on one pull request) and for
+why an in-flight adjudication deliberately does not survive.
+
+**The adjudication turn's model.** `manager.model` is empty by default, and the turn path passes
+`--model` only when it is set — so an unset installation would decide ship-or-escalate on the CLI's
+own default while every review it is adjudicating ran on the pinned `review.model`. It now resolves
+in order: `manager.model` when set; else `review.model` scoped to the `claude` harness the turn
+actually runs on; else empty (the CLI default), which is the only honest answer when nothing is
+pinned anywhere. A `review.model` scoped to OTHER harnesses only is never borrowed — handing an
+`opencode` model to a `claude` turn is the mistake STUDIO-908 exists to prevent — and it falls
+through to the CLI default rather than refusing the turn, because refusing would freeze the loop at
+the threshold with no decision at all.
+
+**Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
+author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×
+reviewers review-only cap and its stop behave exactly as before. Adjudication is opt-in.
+
+**What `round_budget_exhausted` claims, and what it does not.** That report fires when the legacy
+review-only cap has stopped the loop and no manager decision exists — including on an installation
+that sets no threshold. Its copy therefore says only that **no further REVIEW round** will be
+dispatched: on an unset installation the author half is deliberately unbounded, so the earlier
+wording ("no further review or author re-run") was false in exactly the incident it printed in. It is
+reworded rather than gated on the threshold: gating it would restore the silent stop on the default
+installation, which is the incident that filed this ticket.
+
+### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
+
+Some tickets cannot be done by an agent at all — console work in a web dashboard, a purchase on a
+physical device, a legal form. The team had been saying so **in the title** (`(HUMAN-GATED)`,
+`[HUMAN — do not move to Todo]`, `— HUMAN, console work`), and the daemon cannot read a title. On
+2026-09-20 an audit found STUDIO-939 sitting in Backlog with its blocker already Done, so enabling
+`dependency_mode: dag` would have moved it straight to Todo and dispatched an agent at App Store
+Connect. Go Symphony v0.4.0 has no such label; this is Rhapsody-only.
+
+`rhapsody:human` is a constant beside `SOLO_LABEL`, matching the existing `rhapsody:*` family. The
+label is the entire opt-in: a ticket without it behaves byte-identically to today.
+
+| A `rhapsody:human` ticket | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| dispatch | n/a | refused in `eligible()` and, on the review-reopen ladder that bypasses it, in `review_reopen_eligible()` — both refuse, Teams on or off |
+| auto-promote | n/a | never moved Backlog→Todo (it would otherwise strand in Todo forever), and reported as a hold from that pass |
+| triage | n/a | never assigned an identity, never spending a manager turn |
+| visibility | n/a | a once-per-ticket INFO log; `/api/v1/state`'s `held_for_human` key, and the counts endpoint's `held_for_human` field for the never-ran hold the buckets cannot carry (a Backlog dependent included when its project has `dependency_mode` enabled — auto-promote is the only pass that ever sees it) |
+| Teams | n/a | **not** gated on it — the refusal holds on any install |
+
+The refusal is **distinguishable** from ordinary ineligibility (`EligibilityResult::held_for_human`,
+never the all-default miss), so the selection pass can log it once per ticket rather than per tick,
+and the console board can read a held card as deliberately held rather than mysteriously idle. A
+ticket that has never run has no worklist row, so the board synthesizes a Queued card for it — a hold
+that is visible nowhere would be the same silent stall the label exists to end.
+
+The refusal is also enforced on the paths that do not go through `eligible()`, because each would
+otherwise reach an agent: the review-reopen ladder refuses it in `review_reopen_eligible()`, the
+review-adoption sweep refuses it in `adopt_verdict`, an in-flight retry re-reads the ticket's current
+labels so a label added while it was backing off releases it, and the ticketless review watcher
+refuses to dispatch a round for a watch row whose origin ticket is currently held (the row is left
+armed, so a later label removal still gets the review it is owed). The **ticket-mode** review path
+is its sibling and refuses for the same reason: `plan_quorum` does not fan out a review quorum for a
+held parent, and the room's `file_review` answers an explicit "review this" the way its
+`confirm_assignment` answers "assign this" — both refuse, so a held parent cannot mint a new,
+unlabelled review ticket that no hold on the parent could reach. That handoff decision, and the
+ticketless watcher, the auto-merge gate and the reconciliation sweep with it, read the
+`HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing the label,
+**live runs included** — because the only mid-run hold shape is a ticket labelled while the daemon is
+running it, whose `RunningEntry` carries only its dispatch-time snapshot. A held origin ticket also holds
+back **auto-merge**: a pull request whose reviewers approved the current head before the label landed
+would otherwise merge, and the merge then moves the ticket to `review.done_state` — the daemon
+finishing work only a person may do, irreversibly. The reconciliation sweep is told the same state
+explicitly: a watch row whose origin ticket is held is dropped before the rules can date it, because
+a ticket labelled *after* it ran does have a row. The board reads a held ticket that has run as held
+too, independently of the historical run status, and keeps it in the run's lane (Review, with a
+"held for a human" sub-label) while the row stays openable on its real run; the hold key, the board
+and the Now strip all count such a ticket once, in that lane. The board's word for a hold keys on
+whether the ticket ever RAN (the row's own run), not on whether the tracker resolved a lifecycle: a
+cold lifecycle cache serves most rows without one, and a held ticket in that gap can still carry a
+real failed run, which must keep saying `failed` rather than being repainted `queued`.
+
+**How far the hold's reach extends is bounded by the candidate poll and the auto-promote pass.** The
+label that REFUSES dispatch is read from the candidate issue itself, so `eligible()`, the reopen
+ladder and the adoption sweep (`adopt_verdict`) refuse it wherever the daemon can see the ticket, and
+a ticket that never becomes a candidate is never dispatched either. The ticket-mode quorum
+(`plan_quorum`), the ticketless review watcher, the auto-merge gate and the reconciliation sweep
+instead read the `HumanHoldLedger`'s current-**label** set — every ticket the last pass saw wearing
+the label, deliberately including a ticket the daemon is running — while the console's
+`held_for_human` key reads the reported-hold subset of the same pass, which excludes live work.
+
+That current-label set has **two writers**, and the second is why the reach is not simply the
+candidate poll. The selection pass records every candidate it walks wearing the label (active ∪
+review states, narrowed by `claim_mode`). The DAG auto-promote pass records the Backlog dependent it
+refuses to move — a ticket the candidate fetch by construction never returns, since that fetch is
+active ∪ review and a Backlog ticket is neither. So under `dependency_mode` enabled the decision set
+reaches a class of ticket the candidate poll cannot. Under `claim_mode: pool` the pool claim ASSIGNS
+the ticket and nothing ever clears it, so a ticket that has run leaves the candidate query and its
+label stops reaching the selection-pass half; in assignee mode the same happens the moment the ticket
+is reassigned to the person taking it over. And a project whose candidate fetch fails is skipped for
+that tick (`poll_all_projects`), so its tickets contribute nothing to that pass. `begin_pass` clears
+both current sets only when EVERY enabled project answered, so a partial read neither clears nor
+primes (`STUDIO-949` rounds 13-15): the failed project's holds SURVIVE from the last full pass and the
+previous answer stands rather than being emptied. The same holds when NO project is enabled — an
+all-paused install has nothing to poll, so the board has not been read and the gates stay closed
+instead of publishing an empty set as a settled "no hold". The cost is over-holding: one permanently
+unreadable project freezes the clear, so a label that comes OFF keeps refusing until every enabled
+project answers again — the conservative direction for a gate in front of an irreversible merge.
+These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
+here rather than implying the refusal holds while the daemon no longer owns the ticket.
+
+**Every one of those writers sits below `on_tick`'s three early-return gates** — a failed config
+validation, an armed drain, a dead agent credential — while **four** decision gates keep running
+anyway, none of them through the per-tick candidate pass: the reconciliation sweep is called from
+`on_tick` ABOVE those gates on purpose, the ticketless review watcher's **round** gate and its
+**auto-merge** gate are reached through the watcher's own 120s task, and the ticket-mode handoff
+quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not on `on_tick` at all.
+The handed-off run is LIVE, and on a gated daemon live runs come from the RETRY path, not from
+recovery: `boot_recovery` restores no running entry (it converts every interrupted claim into an
+immediate retry), and `on_retry` is gated by the drain only — not by `validate()`, which returns
+before dispatch on every tick. So a daemon whose config validation has failed **since boot** keeps
+dispatching healthy runs off the last-good config while no tick ever primes, and each of their
+handoffs reaches the quorum gate. On a daemon held by one of those gates **since boot**, no selection
+pass has ever read the board, so the current-label set is not "no hold" but "nothing has looked". An
+empty set read as the former is how a `rhapsody:human` ticket's approved pull request self-merges on
+a drained daemon, irreversibly, how a real review round is dispatched at its pull request, or how a
+held parent's handoff mints a fresh unlabelled review ticket the hold cannot reach. All four gates
+therefore **fail closed** on a ledger no pass has primed: while `HumanHoldLedger` is un-primed the
+ticketless round gate and the auto-merge gate refuse (each logging at `debug!` why, honest because
+both are re-offered — the watcher asks again in 120s), the reconciliation sweep reports nothing — a
+false `review_divergence` WARN on the exact ticket the operator took over is the alarm that filter
+exists to prevent — and `plan_quorum` refuses the fan-out, logging at `warn!` and naming the ticket.
+That refusal is **one-shot and unrecoverable**: the handoff has already landed, the run winds down,
+and `request_quorum` is the only feeder of the fan-out, so the review is dropped for good. Because a
+`WARN` line alone is the state STUDIO-822 decided was not enough, the refusal also records a
+lost-review advisory on the project's status surface (`record_lost_review`, as `give_up` does for
+an exhausted fan-out) — but only once the review-state move it rides on has LANDED: `plan_quorum`
+runs at plan time, before the move is attempted, and a move the tracker refused is not a handoff.
+The advisory is keyed by ticket, so the refusal re-firing on every handoff attempt refreshes one
+line rather than letting one ticket's repeats evict the group's other lost reviews. A team-less
+ticket is refused above this branch — it was never reviewable, so no review was lost and no
+advisory is recorded. The quorum is the one that matters most for a TICKET-mode install, because
+it is the only `labelled()` gate such an install runs: `quorum_enabled()` is
+`teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
+auto-merge branch are simply absent there. Priming means a pass actually **read the WHOLE board**,
+not that a pass ran: the multi-project ladder is reached even when a project's candidate fetch
+failed, and even when no project is enabled at all, and the fetch verdict is threaded in so a pass
+that could not read every enabled project neither clears nor primes. This is a deliberate
+conservatism for a bounded window — though on a daemon gated since boot the window is the whole
+process lifetime, and the quorum's refusal inside it is not deferral but loss. A healthy daemon's
+first tick runs immediately; the auto-merge gate and the ticket-mode quorum can only act after it
+(the watcher's first sweep is 120s out, and a handoff has to arrive), and the reconciliation sweep —
+which `on_tick` deliberately runs above the gates, before dispatch — publishes nothing on that first
+un-primed sweep of each process, one poll interval of quiet. Once a single pass has read the board
+the set is real and the bounds above are the ones left. Those bounds are unchanged by this: after any
+pass the set is only as fresh as that pass, so a daemon gated *after* it dispatched freezes the set
+at the last one and a label that lands during the gate is unseen until dispatch resumes. That is the
+same "as fresh as the last pass" property the two-writer paragraph names; the fail-closed branch
+closes the strictly larger "never looked at all" case, not this one.
+
+**The `held_for_human` key on `/api/v1/state` is emitted ONLY while the dispatcher holds at least one
+such ticket**, for the `drain` key's reason and under the same two guards: the golden still passes
+unchanged, and a second test asserts the key is ABSENT on a daemon with no hold so the conditional
+cannot decay into an unconditional `[]` on a Go-pinned surface.
+
+
+### A separate global budget for review runs — `agent.max_concurrent_reviews` (STUDIO-950)
+
+Go v0.4.0 has one daemon-wide concurrency budget, `max_concurrent_agents`, and this port matched it
+exactly: implementation runs and the ticketless review rounds both drew from the same pool. Live on
+2026-09-20 that produced an inversion — four implementations held all four slots while a review round
+for `makewhatis/strava#31` waited over an hour for a turn — because a review is what CLEARS a pull
+request and thereby frees an implementation slot, so the work that creates capacity was queued behind
+the work that spends it. The per-role concurrency design (D2, "reviews are free") had already
+separated the two at the per-teammate cap; it was never extended to the global one.
+
+Rhapsody adds one optional key, `agent.max_concurrent_reviews`, giving review runs their own global
+pool. It is **opt-in and inert when unset**: with the key absent, reviews keep drawing the shared
+`max_concurrent_agents` budget, so an existing install observes no scheduling change on upgrade. It
+lives in `WORKFLOW.md` and hot-reloads with the rest of the file. When it IS set the two pools are
+separated in BOTH directions — the two `select` ladders and the retry path subtract the running
+ticketless reviews from their global implementation draw, so a review in flight cannot cost an
+implementation a GLOBAL slot, and the review watcher draws only its own pool.
+
+The separation is **global only**, and the two directions see that boundary differently. A project's
+own `max_concurrent` ceiling is a separate budget and still counts a running ticketless review
+against implementations in its project (`running_in_project_group` mirrors Go and is deliberately
+untouched). So the key frees the **review** direction unconditionally — the review watcher draws only
+`max_concurrent_reviews` and consults no per-project cap at all — while it widens the
+**implementation** direction only against the global budget. On a `projects:` install whose project
+cap is or inherits `max_concurrent_agents`, implementations in that project can still be held by the
+project gate even with the key set, so raise that project's `max_concurrent` too if you want the
+implementation direction to benefit there.
+
+Total live agents may therefore exceed `max_concurrent_agents` by up to `max_concurrent_reviews`.
+That is the intended "reviews are free" semantics rather than a leak: the implementation cap still
+bounds implementations, and the review cap bounds reviews.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| global review budget | shared with implementations | `agent.max_concurrent_reviews` — its own pool when set |
+| default | n/a | **unset ⇒ shared with implementations**, byte-identical to before the key |
+| hot reload | n/a | yes, with `WORKFLOW.md` |
+
+A review held for want of a slot is a deliberate wait, not a fault, and the reconciliation sweep
+names it as `held for capacity` rather than reporting it as an unexplained stall (see the STUDIO-898
+entry above).
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
@@ -1330,8 +1657,10 @@ inside the last window.
 console armed an auto-merge on a behind branch that could never land. A behind branch's approval is
 for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
 otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
-approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
-which already caps the review dispatches one pull request may draw.
+approval of the new head can clear the gate again. The REVIEW side of the loop is bounded by
+`REVIEW_ROUNDS_PER_PR_CAP`; the AUTHOR side by the opt-in manager adjudication above
+(`review.adjudicate_after_rounds`) — an install that sets no threshold keeps the review-only cap and
+its stop, exactly as before STUDIO-956.
 
 **Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
 sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's

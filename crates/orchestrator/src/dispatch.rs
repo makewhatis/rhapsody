@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use rhapsody_config::{DEPENDENCY_MODE_DAG, DEPENDENCY_MODE_GRAPHITE};
@@ -79,6 +80,222 @@ pub struct EligibilityGate<'a> {
     pub mode: &'a str,
     pub review: &'a HashSet<String>,
     pub canceled: &'a HashSet<String>,
+}
+
+/// One ticket the dispatcher is holding because it wears
+/// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL) (STUDIO-949). The console board's own shape: the
+/// ticket key, a title for the card, and the project slug it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldForHuman {
+    pub issue_identifier: String,
+    pub title: String,
+    pub project: String,
+}
+
+/// How many distinct tickets [`HumanHoldLedger`] remembers having announced before it forgets the
+/// oldest set wholesale. Comfortably above any plausible set of human-gated tickets; the cost of
+/// hitting it is one repeated log line per ticket.
+const HUMAN_HOLD_CAPACITY: usize = 256;
+
+/// The once-per-ticket memory behind the human-hold report (STUDIO-949).
+///
+/// A `rhapsody:human` ticket in a dispatchable state is refused on EVERY selection pass — twice a
+/// minute at the default poll interval — and a refusal repeated forever is indistinguishable from a
+/// daemon that is stuck. So the LOG fires when the hold is NEWS: the first time this process sees
+/// the ticket, and never again. That is [`crate::runautomerge::AutoMergeLedger`]'s idiom, and the
+/// reason for it is the same.
+///
+/// It also carries the CURRENT hold set for the console's `/api/v1/state` key, and beside it the
+/// CURRENT-LABEL set (`labelled`): every candidate the pass saw wearing `rhapsody:human`, live work
+/// included. The two are kept apart because they answer different questions — "is this a deliberate
+/// hold to show an operator" (no live work) and "does this ticket wear the label right now" (yes,
+/// live work too) — and only the second is the dispatch refusal's signal on a RUNNING ticket. The
+/// jobs live in one ledger because all are per-selection-pass facts:
+/// [`begin_pass`](Self::begin_pass) clears both current sets (a ticket no longer held stops being
+/// reported, a delisted label stops refusing), while the announced set survives so re-holding the
+/// next tick is not news again.
+///
+/// Unlike [`Orchestrator::held_for_capacity`](crate::orchestrator::Orchestrator), the current set is
+/// deliberately NOT retired on the tick's three early returns (a failed preflight, an armed drain, a
+/// dead credential). A leftover capacity tally would be a stale claim about a pass that no longer
+/// ran; a deliberate human hold does not depend on dispatch being enabled at all — the ticket still
+/// needs a person while the daemon is gated — so keeping a populated set is the honest answer.
+///
+/// The converse is also load-bearing: on a daemon held by one of those gates since boot, NO pass has
+/// ever READ THE BOARD, so an empty set is not "no hold" but "nothing has looked", and reading it as
+/// the former is how a `rhapsody:human` ticket's pull request self-merges on a drained daemon
+/// (STUDIO-949 rounds 11-13). [`HumanHoldState::primed`] carries that distinction; every `labelled()`
+/// decision gate that does not flow through the per-tick candidate pass — the ticketless watcher's
+/// round and auto-merge gates, the reconciliation sweep and the ticket-mode handoff quorum — fails
+/// closed while it is `false`.
+///
+/// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
+/// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
+/// and never across an `.await`; see `crates/orchestrator/CLAUDE.md`'s seam list.
+pub struct HumanHoldLedger {
+    inner: Mutex<HumanHoldState>,
+}
+
+#[derive(Default)]
+struct HumanHoldState {
+    /// Ticket identifiers already announced this process lifetime (the dedupe).
+    announced: HashSet<String>,
+    /// Tickets held by the MOST RECENT selection pass, for the console.
+    held: Vec<HeldForHuman>,
+    /// Every ticket the most recent selection pass OBSERVED wearing
+    /// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), whether or not it already has a live run —
+    /// lowercased, for case-insensitive comparison.
+    ///
+    /// This is the CURRENT-LABEL signal, deliberately separate from [`Self::held`]. The reporting
+    /// rule excludes a ticket the daemon is running right now, because a live run is not yet a
+    /// deliberate hold (see [`Self::held`]); but the refusal itself is absolute, and the handoff's
+    /// review decision (STUDIO-949 round 8) must see a label added mid-run even though the run's own
+    /// issue snapshot predates it. Kept separate so tightening a decision gate never makes the
+    /// console call live work "held".
+    labelled: HashSet<String>,
+    /// Whether a selection pass has READ THE BOARD in this process — set by the first
+    /// [`HumanHoldLedger::begin_pass`] that was told the candidate fetch succeeded, and never
+    /// cleared (STUDIO-949 rounds 11-13).
+    ///
+    /// `labelled` is written ONLY from inside a selection pass (both ladders) or from the
+    /// auto-promote pass that runs immediately after one, and every one of those writers sits BELOW
+    /// `on_tick`'s three early-return gates (a failed config validation, an armed drain, a dead
+    /// agent credential). On a daemon held by one of those gates `labelled` is therefore empty for
+    /// the WHOLE process lifetime, and a decision gate reading it would see "no hold" rather than
+    /// "no information". FOUR gates turn on it and none flows through the per-tick candidate pass:
+    /// the ticketless watcher's round gate and its auto-merge gate (both `Event::ReviewSweep` from
+    /// the watcher's 120s task), the reconciliation sweep's held-row filter (from `on_tick` ABOVE
+    /// the gates) and the ticket-mode handoff quorum (from the `evHandoffRun` handler, which is not
+    /// on `on_tick` at all). All four keep executing while dispatch is gated.
+    ///
+    /// `primed` is that distinction: `false` until a pass has actually looked, so those four gates
+    /// fail CLOSED instead of silently open. `begin_pass` is the only writer on purpose — the
+    /// auto-promote pass observes only Backlog dependents, a partial view, and must not be able to
+    /// make an unknown label set look known.
+    ///
+    /// It is deliberately "read the WHOLE board", not "ran a pass" (STUDIO-949 rounds 13-15): a
+    /// `projects:` install's ladder is reached unconditionally even when a project's candidate fetch
+    /// failed (`poll_all_projects` `continue`s past each error), and `begin_pass` clears both sets
+    /// WHOLESALE with no per-project scope. So a pass that could only see SOME of the board is the
+    /// unknown-set case this latch exists to forbid — priming on it would erase the holds of the
+    /// project that failed and mark the result known. The verdict is threaded in through
+    /// [`HumanHoldLedger::begin_pass`], and it is "EVERY enabled project answered", with an
+    /// all-paused install (`zero`) counting as NOT read; a pass that could not look neither clears
+    /// nor primes, leaving the last good answer (or the un-primed state) standing.
+    primed: bool,
+}
+
+impl Default for HumanHoldLedger {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HumanHoldState::default()),
+        }
+    }
+}
+
+impl HumanHoldLedger {
+    /// Starts a fresh selection pass over a board the caller COULD SEE: the CURRENT hold set is
+    /// dropped, so a ticket that stopped wearing the label — or left the candidate set — stops being
+    /// reported. The announced set is deliberately NOT touched, and the **primed** flag is set: this
+    /// is the first moment the process can be said to have looked at all, which is what lets the
+    /// fail-closed decision gates (the ticketless watcher's round and auto-merge gates, the
+    /// reconciliation sweep's held-row filter, the ticket-mode handoff quorum) read an answer.
+    ///
+    /// `read_the_board` is the candidate fetch's verdict (STUDIO-949 rounds 13-15): `true` when
+    /// EVERY enabled project answered. When it is `false` the pass could not see the whole board —
+    /// any project's fetch failed, or there are no enabled projects at all (an all-paused install) —
+    /// so this does NOTHING: the sets are neither cleared nor primed, and the last answer (or the
+    /// un-primed state) stands. Clearing on a partial fetch would reopen every gate for the failed
+    /// project's holds by emptying the set; priming would mark an unknown set known. The over-hold
+    /// cost of the all-projects predicate is deliberate: a label that comes OFF keeps refusing while
+    /// any project is unreadable. The legacy single-tracker path passes `true` by construction (its
+    /// failed fetch returns before the ladder). No other method sets `primed`; see
+    /// [`HumanHoldState::primed`].
+    pub(crate) fn begin_pass(&self, read_the_board: bool) {
+        if !read_the_board {
+            return;
+        }
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.held.clear();
+        st.labelled.clear();
+        st.primed = true;
+    }
+
+    /// Records a ticket the pass OBSERVED wearing [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), with
+    /// no log and no console row — the CURRENT-LABEL half, independent of the reporting rule that
+    /// excludes live work (STUDIO-949 round 8). Called for every candidate that wears the label,
+    /// including one the daemon is running, so a decision made on the RUNNING ticket's handoff can
+    /// see a label added after it was dispatched.
+    pub(crate) fn note_human_label(&self, issue_identifier: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .labelled
+            .insert(issue_identifier.to_ascii_lowercase());
+    }
+
+    /// Records a hold and returns whether it is NEWS (the first time this ticket has been announced
+    /// this process lifetime). Only a news hold is logged.
+    ///
+    /// The CURRENT set is unique by identifier (STUDIO-949 round 5). It is cleared by
+    /// [`begin_pass`](Self::begin_pass), but that only runs when a selection pass runs: on the
+    /// legacy/top-level tracker path a candidate-fetch ERROR returns before either ladder calls it,
+    /// while `promote_unblocked` still runs and re-notes the same Backlog dependent — so an
+    /// unconditional `push` appended one identical `/api/v1/state.held_for_human` row per outage
+    /// tick, and the Now strip's `+held_for_human` grew with it while the board still had one card.
+    /// A second note for a ticket already held replaces the row (the later note carries the same
+    /// facts; the project slug differs only between the ladders and the Backlog pass).
+    pub(crate) fn hold(&self, entry: HeldForHuman) -> bool {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        // A reported hold is by definition an observed current label, so the decision half is fed
+        // here too (STUDIO-949 round 8).
+        st.labelled
+            .insert(entry.issue_identifier.to_ascii_lowercase());
+        if st.announced.len() >= HUMAN_HOLD_CAPACITY
+            && !st.announced.contains(&entry.issue_identifier)
+        {
+            st.announced.clear();
+        }
+        let news = st.announced.insert(entry.issue_identifier.clone());
+        match st
+            .held
+            .iter_mut()
+            .find(|h| h.issue_identifier == entry.issue_identifier)
+        {
+            Some(existing) => *existing = entry,
+            None => st.held.push(entry),
+        }
+        news
+    }
+
+    /// The tickets the most recent selection pass OBSERVED wearing the human label, including any
+    /// the daemon is running right now — lowercased — TOGETHER WITH the priming latch, read under
+    /// ONE lock (STUDIO-949 round 13).
+    ///
+    /// This is the decision signal for a gate on a RUNNING ticket (the handoff review decision, the
+    /// ticketless origin gate); the console reads [`Self::held`] instead, which excludes live work.
+    /// The latch distinguishes "the last pass saw no hold" from "no pass has read the board yet":
+    /// while it is `false` the set is an absence of information, and a gate that treated it as "no
+    /// hold" would fail open on a daemon whose dispatch is gated (see [`HumanHoldState::primed`]).
+    ///
+    /// The two are returned together rather than by separate accessors because read separately a
+    /// pass landing between the two calls looks like this: the gate reads an empty (un-primed) set,
+    /// the pass primes it with a real one, the gate then reads `primed == true` and treats the empty
+    /// set it already holds as a settled "no hold". One lock returns the pair one pass produced.
+    pub(crate) fn labelled_and_primed(&self) -> (HashSet<String>, bool) {
+        let st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        (st.labelled.clone(), st.primed)
+    }
+
+    /// The tickets held by the most recent selection pass, for the snapshot. Empty until a pass has
+    /// run, which is what keeps a daemon with no human-gated ticket serving the Go-identical payload.
+    pub(crate) fn held(&self) -> Vec<HeldForHuman> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held
+            .clone()
+    }
 }
 
 /// The STATE half of dispatch eligibility: is `st` (already normalized) a state the daemon
@@ -156,10 +373,20 @@ impl DispatchStates {
 /// non-empty only when `ok` is false AND non-terminal blockers were the operative reason — so the
 /// dispatch loop can surface exactly that (otherwise silent) drop and nothing else. Mirrors Go
 /// `eligibilityResult`.
+///
+/// `held_for_human` is the Rhapsody-only third outcome (STUDIO-949): the issue wears
+/// [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL) and is refused because only a person can do it. It is
+/// a deliberate hold, not ordinary ineligibility, so it is a named field rather than the all-default
+/// [`EligibilityResult::default`] — a caller MUST be able to tell "held for a human" from "not a
+/// candidate", or the ticket sits in Todo dispatching nothing and saying nothing, which is the new
+/// silent-stall class this field exists to prevent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct EligibilityResult {
     pub ok: bool,
     pub blocked_by: Vec<BlockerRef>,
+    /// True when the refusal was [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL). Never true together
+    /// with a non-empty `blocked_by`: the human gate short-circuits above the blocker rule.
+    pub held_for_human: bool,
 }
 
 /// Reports whether an issue is intrinsically dispatch-eligible (upstream §8.2). Slot availability is
@@ -206,6 +433,19 @@ pub(crate) fn eligibility(
     if running.contains(&iss.id) || claimed.contains(&iss.id) {
         return EligibilityResult::default();
     }
+    // Human-only gate (STUDIO-949): a ticket wearing `rhapsody:human` cannot be done by an agent at
+    // all, so the dispatcher refuses it here — the one chokepoint every dispatch path flows through,
+    // Teams on or off. Deliberately BEFORE the required-label gate and the blocker rule: the hold is
+    // absolute and owes no explanation from either. It sets `held_for_human` (rather than returning
+    // the all-default result) so the caller can distinguish it from ordinary ineligibility and
+    // report it once; `reviewreconcile.rs` records why the sweep cannot mistake a hold for a stall.
+    if crate::teams::is_human(iss) {
+        return EligibilityResult {
+            ok: false,
+            blocked_by: Vec::new(),
+            held_for_human: true,
+        };
+    }
     // Label gate: when required labels are configured, the issue must carry AT LEAST ONE of them
     // (match-ANY, case-insensitive). A miss short-circuits with empty `blocked_by` so it is never
     // mislabeled as blocker-held. Empty set ⇒ no filter, so the verdict is byte-identical to the
@@ -225,12 +465,14 @@ pub(crate) fn eligibility(
             return EligibilityResult {
                 ok: false,
                 blocked_by: blocked,
+                held_for_human: false,
             };
         }
     }
     EligibilityResult {
         ok: true,
         blocked_by: Vec::new(),
+        held_for_human: false,
     }
 }
 
@@ -318,6 +560,25 @@ pub(crate) fn blocker_state_name(b: &BlockerRef) -> String {
 }
 
 impl Orchestrator {
+    /// Records and reports a `rhapsody:human` hold (STUDIO-949). The refusal itself is
+    /// [`eligibility`]'s; this is the otherwise-silent half — one `tracing::info!` line the FIRST
+    /// time the ticket is held, and the entry the console reads. A hold that repeats every tick is
+    /// not a signal anyone reads, so the ledger dedupes it; `project` is the owning project slug
+    /// (empty on the legacy single-tracker path), carried for the console card.
+    pub(crate) fn note_human_hold(&self, iss: &Issue, project: &str) {
+        let entry = HeldForHuman {
+            issue_identifier: iss.identifier.clone(),
+            title: iss.title.clone(),
+            project: project.to_string(),
+        };
+        if self.human_holds.hold(entry) {
+            tracing::info!(
+                issue_identifier = %iss.identifier,
+                "skipping dispatch: held for a human (rhapsody:human); only a person can do this ticket"
+            );
+        }
+    }
+
     /// Surfaces the otherwise-silent drop of a Todo candidate held back by non-terminal blockers
     /// (INF-249): one `tracing::info!` line per non-terminal blocker, each naming the blocked issue,
     /// the blocker, and the blocker's state. `blockers` is the [`EligibilityResult::blocked_by`]
@@ -356,6 +617,17 @@ impl Orchestrator {
     /// The list is capped at [`HELD_SAMPLE`] names plus a remainder count: a busy board can hold
     /// dozens of candidates and the point of the line is to name the ones at the front of the
     /// queue, not to render the queue.
+    ///
+    /// `running` is the IMPLEMENTATION pool — the count the draw beside it actually used
+    /// ([`Orchestrator::implementation_pool_holders`]) — not every live run (STUDIO-950). With
+    /// `agent.max_concurrent_reviews` set, a daemon exactly at its implementation cap with two
+    /// reviews in flight would otherwise log `max_concurrent=4 running=6`: a line that reads as an
+    /// overrun where nothing overran, and the very line STUDIO-950's ticket quotes as the
+    /// incident's evidence. [`Orchestrator::review_pool_holders`] makes this argument on the review
+    /// side already (`holding=0` while four implementations spend the shared pool is a lie an
+    /// operator tuning the key cannot act on); this is the same correction applied symmetrically.
+    /// The total is not lost — it is beside it as `live_runs`, and the two are equal on every
+    /// install that never sets the key.
     pub(crate) fn log_capacity_hold(&self, held: &[String], max_concurrent: i64) {
         if held.is_empty() {
             return;
@@ -373,7 +645,8 @@ impl Orchestrator {
             not_considered = %sample,
             not_considered_count = held.len(),
             max_concurrent,
-            running = self.running.len(),
+            running = self.implementation_pool_holders(),
+            live_runs = self.running.len(),
             "skipping dispatch: no global concurrency slot; candidates not considered this tick"
         );
     }
@@ -433,8 +706,21 @@ impl Orchestrator {
     /// nor claimed, carries a `team_id` (required to promote it), carries a summons, AND that
     /// summons is strictly newer than the START of the daemon's last run on it. No run / store
     /// disabled / unparseable start ⇒ NOT eligible (the daemon never grabs a human-managed review
-    /// ticket it has never worked; the check converges). Mirrors Go `reviewReopenEligible`.
+    /// ticket it has never worked; the check converges). A `rhapsody:human` ticket is NEVER eligible
+    /// (STUDIO-949) — this ladder bypasses `eligibility`, so the human gate must be repeated here or
+    /// the label leaks dispatch through the one path that does not consult it. Mirrors Go
+    /// `reviewReopenEligible`.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
+        // Human-only gate (STUDIO-949). This ladder runs BEFORE `eligibility` — a review-state issue
+        // is never active, so `eligibility` rejects it outright and the reopen path is the only one
+        // that can move it back to an active state and dispatch it. Without the gate here, a
+        // `rhapsody:human` ticket that had run once and then been parked in review with a newer
+        // `@symphony` summons would leak straight back to an agent, contradicting the README's claim
+        // that the label refuses every dispatch path. Absolute, like the gate in `eligibility`: it
+        // does not consult the summons, the store, or Teams.
+        if crate::teams::is_human(iss) {
+            return false;
+        }
         if iss.id.is_empty() || iss.identifier.is_empty() || iss.team_id.is_empty() {
             return false;
         }
@@ -481,6 +767,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::*;
+    use std::sync::Arc;
 
     // Mirrors Go `TestSortForDispatchPriorityThenCreatedThenIdentifier`.
     #[test]
@@ -662,6 +949,124 @@ mod tests {
         assert!(
             !res.ok && res.blocked_by.is_empty(),
             "label-miss must not be a blocker drop"
+        );
+    }
+
+    // STUDIO-949: a `rhapsody:human` ticket in a dispatchable state is refused outright, and the
+    // refusal is DISTINGUISHABLE from ordinary ineligibility — `held_for_human` is set and
+    // `blocked_by` stays empty, so a caller can tell "held for a human" from "not a candidate".
+    //
+    // MUTATION: delete the `is_human` gate from `eligibility` and this reds.
+    #[test]
+    fn eligible_refuses_human_label() {
+        let g = GateData::standard();
+        let mut human = base_issue();
+        human.labels = Some(vec!["rhapsody:human".into()]);
+
+        assert!(
+            !eligible(&human, &no_ids(), &no_ids(), &g.gate()),
+            "a human-gated ticket must never dispatch"
+        );
+        let res = eligibility(&human, &no_ids(), &no_ids(), &g.gate());
+        assert!(!res.ok, "refused");
+        assert!(
+            res.held_for_human,
+            "the refusal must be distinguishable from a plain miss"
+        );
+        assert!(res.blocked_by.is_empty(), "not a blocker drop");
+
+        // An ordinary ticket is NOT reported as held.
+        assert!(
+            !eligibility(&base_issue(), &no_ids(), &no_ids(), &g.gate()).held_for_human,
+            "only a labelled ticket is held"
+        );
+    }
+
+    // STUDIO-949: the label match normalizes at compare time (`trim` + lowercase), exactly as
+    // `has_any_label` does.
+    #[test]
+    fn human_label_match_is_case_insensitive() {
+        let g = GateData::standard();
+        for spelling in [
+            "rhapsody:human",
+            "Rhapsody:Human",
+            "RHAPSODY:HUMAN",
+            " rhapsody:human ",
+        ] {
+            let mut human = base_issue();
+            human.labels = Some(vec![spelling.into()]);
+            assert!(
+                eligibility(&human, &no_ids(), &no_ids(), &g.gate()).held_for_human,
+                "spelling {spelling:?} must be held"
+            );
+        }
+    }
+
+    // STUDIO-949: the review-reopen ladder is the one dispatch path that bypasses `eligibility` (a
+    // review-state issue is never active), so `review_reopen_eligible` carries the human gate itself.
+    // The control below — the same ticket without the label — IS eligible, so the refusal is the
+    // label's work and this function is pinned directly, not only through the select ladders.
+    //
+    // MUTATION: delete the `is_human` gate from `review_reopen_eligible` and the second assertion reds.
+    #[test]
+    fn review_reopen_refuses_a_human_ticket() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        let store = o.store();
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        store
+            .end_run(run, rhapsody_store::RunEnd::default())
+            .expect("end run");
+
+        let summoned = |labels: Option<Vec<String>>| Issue {
+            id: "1".into(),
+            identifier: "A-1".into(),
+            team_id: "team-1".into(),
+            state: "In Review".into(),
+            latest_summon_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+            labels,
+            ..Default::default()
+        };
+        let none: HashSet<String> = HashSet::new();
+        assert!(
+            o.review_reopen_eligible(&summoned(None), &none),
+            "the reopen path is otherwise live; the label is the only refusal"
+        );
+        assert!(
+            !o.review_reopen_eligible(&summoned(Some(vec!["rhapsody:human".into()])), &none),
+            "a human ticket is never reopened"
+        );
+    }
+
+    // STUDIO-949 acceptance: a ticket WITHOUT the label behaves identically to today. Written
+    // against `eligible()`'s bool ONLY — the exact call the pre-STUDIO-949 code answered — so it
+    // compiles and passes against both the old and the new implementation.
+    #[test]
+    fn eligible_unaffected_without_human_label() {
+        let g = GateData::standard();
+        assert!(
+            eligible(&base_issue(), &no_ids(), &no_ids(), &g.gate()),
+            "an ordinary ticket still dispatches"
+        );
+        let mut labelled = base_issue();
+        labelled.labels = Some(vec!["infra".into()]);
+        assert!(
+            eligible(&labelled, &no_ids(), &no_ids(), &g.gate()),
+            "an unrelated label must not change the verdict"
+        );
+        // The ordinary blocker rule is untouched.
+        let mut blocked = issue("2", "MT-2", "Todo");
+        blocked.blocked_by = Some(vec![blocker(Some("MT-9"), Some("In Progress"))]);
+        assert!(
+            !eligible(&blocked, &no_ids(), &no_ids(), &g.gate()),
+            "a blocked Todo is still refused for the ordinary reason"
         );
     }
 
@@ -972,5 +1377,36 @@ mod tests {
                 "mode={mode:?}: must surface for logging"
             );
         }
+    }
+
+    // STUDIO-949 round 5 — the CURRENT hold set must be unique by identifier across notes that never
+    // had a `begin_pass` between them. `begin_pass` runs only when a selection pass runs; a
+    // candidate-fetch error returns before either ladder clears the set, yet `promote_unblocked`
+    // still notes the same Backlog dependent on every outage tick. Without this the set grows one
+    // identical row per tick and the Now strip's `held_for_human` count inflates.
+    //
+    // MUTATION: revert the find/replace in `hold` to an unconditional `push` and this reds (2 rows).
+    #[test]
+    fn human_hold_set_is_unique_by_identifier_across_notes() {
+        let ledger = HumanHoldLedger::default();
+        let entry = |project: &str| HeldForHuman {
+            issue_identifier: "STUDIO-939".into(),
+            title: "wire the stores".into(),
+            project: project.into(),
+        };
+        assert!(ledger.hold(entry("booch")), "the first note is news");
+        assert!(
+            !ledger.hold(entry("")),
+            "a repeat is not news, so it is not logged again"
+        );
+        assert_eq!(
+            ledger.held().len(),
+            1,
+            "two notes with no begin_pass between them are ONE held ticket: {:?}",
+            ledger.held()
+        );
+        ledger.begin_pass(true);
+        assert!(ledger.held().is_empty(), "begin_pass still clears the set");
+        assert!(!ledger.hold(entry("booch")), "the announced set survives");
     }
 }

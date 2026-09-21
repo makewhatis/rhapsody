@@ -365,6 +365,43 @@ pub trait Store {
     /// pre-STUDIO-885 behaviour of seeing only what is inside the lookback window right now).
     fn summon_watermark(&self, identifier: &str) -> Result<Option<SummonWatermark>, StoreError>;
 
+    // --- durable review bound (STUDIO-956; no Go counterpart — see [`ReviewBoundRow`]) ---
+
+    /// Records `pr`'s review↔author round counter, in dispatches, creating the row when it is the
+    /// first thing known about that pull request and leaving any settled adjudication alone.
+    ///
+    /// The value is the caller's total rather than an increment. The counter has exactly one
+    /// writer — the control task — and it is rehydrated into memory at boot, so the in-memory
+    /// figure is authoritative and a last-write-wins column can never drift from it. An increment
+    /// in SQL would put the arithmetic in two places and make a dropped write silently permanent.
+    fn set_review_rounds(&self, pr: &str, dispatches: i64) -> Result<(), StoreError>;
+
+    /// Records the manager's SETTLED decision about `pr`, creating the row when the counter has
+    /// not been written yet and leaving the counter alone when it has.
+    ///
+    /// Only a settled decision reaches here; see [`ReviewAdjudication`] for why an in-flight marker
+    /// is deliberately not durable.
+    fn record_review_adjudication(
+        &self,
+        pr: &str,
+        adjudication: &ReviewAdjudication,
+    ) -> Result<(), StoreError>;
+
+    /// Forgets the manager's decision about `pr` WITHOUT touching its round counter — the operator's
+    /// re-run, which refunds one round and overrides the decision but does not reset the budget. A
+    /// no-op when the row is absent.
+    fn clear_review_adjudication(&self, pr: &str) -> Result<(), StoreError>;
+
+    /// Forgets everything durable about `pr` — counter and decision both. The terminal for a pull
+    /// request that left the watch set (merged, closed, dismissed) and for the operator's
+    /// deliberate `POST /api/v1/reviews/clear`, so a pull request that is later re-introduced,
+    /// reopened or rebuilt never inherits a spent budget. Idempotent.
+    fn clear_review_bound(&self, pr: &str) -> Result<(), StoreError>;
+
+    /// Every durable review bound, in `pr` order — the boot snapshot the round counter and the
+    /// adjudication ledger are rehydrated from.
+    fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

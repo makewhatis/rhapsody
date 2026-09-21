@@ -17,9 +17,13 @@ the `Orchestrator` struct itself. Concretely:
 
 - Modules whose functions take `&mut self` / `&Orchestrator` and are called from the loop
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
-  `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
-  they never lock anything and must never be called from another task.
-- Seven exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+  `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined and
+  must never be called from another task. They hold no lock of their own; the one exception is the
+  `HumanHoldLedger`'s lock, taken on `&self` by every module that touches the `rhapsody:human` hold:
+  `dispatch` and `select` (write it), `promote` (write it), `snapshot` (read the reported set), and
+  the decision readers `quorum`, `reviewwatch` and `reviewreconcile` (read the current-label set)
+  (see the seam list below).
+- Eight exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -28,7 +32,11 @@ the `Orchestrator` struct itself. Concretely:
   - `warnings.rs`'s `WarningsState` (`Orchestrator::warnings: Arc<WarningsState>`, wrapping an
     `RwLock<WarningMaps>`) — mutated by spawned resolver tasks running off the control task, with a
     generation-counter guard so a slow/older pass can't clobber a newer reload's warnings (see
-    "API-facing views" below).
+    "API-facing views" below). Two producers carry no generation guard because they are recorded
+    directly rather than recomputed wholesale: the poll loop's fetch/enrichment streaks on the
+    control task, and the lost-review advisory written by the off-loop quorum task's `give_up` and
+    by the HANDOFF task's landed-move gate, which is why `ControlHandle` carries this same `Arc`
+    (STUDIO-949 round 18).
   - `teamsmemory.rs`'s `TeamsMemory` (`Orchestrator::teams_memory: Option<Arc<TeamsMemory>>`,
     STUDIO-645) — the `/api/v1/teams/*` handlers drive it entirely on the HTTP task, with **no
     control round-trip at all**, because the design requires a `teams_retain` never to block the
@@ -91,9 +99,50 @@ the `Orchestrator` struct itself. Concretely:
     second write path here would need its own deliberate exception to "a refusal is not surfaced
     outside the log", which that module's doc still states and this read does not weaken.
 
+  - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
+    STUDIO-949) — a `Mutex`-guarded handle over three sets behind a `&self`-callable API: the ticket
+    identifiers already ANNOUNCED (the once-per-ticket log dedupe), the CURRENT `rhapsody:human`
+    **reported**-hold set the console reads (`held`, unworked tickets only), and the CURRENT-**label**
+    set (`labelled`, every candidate the last pass saw wearing the label, live runs included) that
+    the decision gates read — the handoff review quorum, the ticketless watcher, auto-merge and the
+    reconciliation sweep.
+    Keeping the last two apart is deliberate: a running ticket is not yet a deliberate hold for an
+    operator, but its label must still refuse a decision made on that running ticket. It is a seam
+    because the selection pass (`select.rs`, both ladders)
+    discovers the holds while taking `&self` by design, and the control task's `build_snapshot`
+    reads the same cell. Never held across an `.await` — two map operations and out. Unlike
+    `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
+    SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets and sets the
+    ledger's **primed** flag — the boolean that distinguishes "the last pass read the board and saw
+    no hold" from "no pass has read the board yet". `begin_pass` takes the caller's candidate-FETCH
+    verdict and does nothing at all when it is false — any enabled project's fetch failed on a
+    multi-project install, OR no project is enabled at all — so a pass that could not read the WHOLE
+    board neither clears nor primes (STUDIO-949 rounds 13-15; the clear is wholesale, with no
+    per-project scope, so a partial read must not erase the failed project's holds). Every writer is
+    below `on_tick`'s three early-return gates while FOUR decision gates keep running independently
+    of them — the ticketless watcher's round gate and its auto-merge gate, the reconciliation sweep,
+    and the ticket-mode handoff quorum (`plan_quorum`, reached from `evHandoffRun`, off the `on_tick`
+    path entirely) — so on a daemon gated since boot `labelled` is empty for the whole process
+    lifetime. All four therefore fail CLOSED while the ledger is un-primed — the round gate defers,
+    auto-merge refuses, the sweep reports nothing, `plan_quorum` refuses the fan-out (STUDIO-949
+    rounds 11-18). Those gates read the label set and the latch TOGETHER, under one lock
+    (`labelled_and_primed`), so the pair is always the pair one pass produced. The quorum's refusal
+    is the one that must be LOUD: it is one-shot and unrecoverable, so it logs at `warn!` and carries
+    a `DroppedQuorum` on the `HandoffPlan` for the handoff to record on the project advisory — but
+    ONLY once the review-state move lands, because `plan_quorum` runs before the move and a refused
+    move is not a handoff.
+    The quorum is the one a TICKET-mode install depends on, since `quorum_enabled()` excludes the
+    ticketless watcher and its auto-merge branch. Don't move the primed write into
+    `hold`/`note_human_label`: the
+    auto-promote pass writes those with a partial (Backlog-only) view, and letting it mark the set
+    "known" would reopen the silent hole.
+    This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
+    both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  seven seams; if none fits, that's a real design decision — don't reach for an eighth ad hoc
+  eight seams; if none fits, that's a real design decision — don't reach for a ninth ad hoc
   `Arc<Mutex<..>>` without updating this list.
+
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.
