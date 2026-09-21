@@ -320,7 +320,7 @@ stopped|failed|interrupted` unbounded returns the genuinely-active pipeline, rat
 that ever passed through those outcomes, so a lane's cards can no longer be stale runs of finished
 tickets and `BOARD_ACTIVE_LIMIT` is bounded by the pipeline rather than by history.
 
-### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
+### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828, STUDIO-965)
 
 A third **additive**, Rhapsody-only history endpoint, for the same reason the two above exist and
 against the same rule: *a total is never a page.* The console's Now strip — running / queued /
@@ -330,32 +330,48 @@ Measured on the operator's own daemon, the strip could not name more than 50 of 
 
 | Endpoint | Serves |
 | --- | --- |
-| `GET /api/v1/history/issues/counts` | how many ISSUES in the whole store carry each distinct combination of status inputs |
+| `GET /api/v1/history/issues/counts` | how many ISSUES the whole store holds, grouped by each distinct combination of status inputs the console derives a card's status from |
 
 It takes no filters. The Seg and project Select the strip renders beside it are explicitly scoped to
 the loaded rows (the worklist says so in words), while the strip asks about the store.
 
-**It counts inputs, not statuses**, and that is the load-bearing decision. The count has to be
-derived by the same rule the row's pill is, or the strip and the table disagree — which is worse
-than either being wrong alone — and the only way to guarantee one rule is to keep one implementation
-of it. That implementation is the console's, which owns the vocabulary ("in review", "reviewing",
-"needs you"); the daemon does the half a client cannot, folding every issue rather than a page, and
-serves the same per-row facts `GET /api/v1/history/issues` already serves, grouped:
+**It counts the BOARD's unit — the TICKET, not the run row** (STUDIO-965). The board draws one card
+per ticket and folds a ticket's review runs onto it as chips, so the tally folds too: a
+`pr:owner/repo#n@reviewer` row is attributed to the ticket it reviews (through the same watch-set
+join the listing's `review_of` and the cost ledger use) and adds no bucket of its own. Before this,
+three failed or interrupted reviews of two finished tickets were billed as three Queued/Blocked jobs
+the board could never draw in those lanes — the operator's *"Queued 4 — only 1 actual card"*. A
+ticket with any number of review rounds counts once; a review whose origin resolves to a ticket with
+NO run row at all still counts once, keeping the review's OWN key so a finished review reads `done`
+rather than the `review` a completed ticket would mean. A review row whose origin names no ticket is
+not work and is dropped, exactly as the board drops it — as is any run row with no issue identifier,
+which the console never groups into a card.
+
+**The lane is the RUN's, not the lifecycle's** (STUDIO-965). A ticket the snapshot has in flight or
+parked for retry buckets as `running` whatever its tracker state says, because that is where the
+board's `boardLaneOf` draws its card; only an idle ticket takes its lifecycle's word. The client
+still owns the five words — the daemon sends the same per-row facts `GET /api/v1/history/issues`
+serves, grouped, not the console's statuses — and `consoleJobStatus` derives a status by one rule
+for both the listing row and the bucket, so the strip and the card cannot disagree:
 
 ```json
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
-             {"outcome": "completed", "review_run": true, "count": 7},
+             {"outcome": "completed", "lifecycle": "open", "count": 12},
              {"outcome": "running", "count": 1}],
  "held_for_human": 2}
 ```
 
-Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
-endpoints speak one vocabulary. The lifecycle lookup is filtered by `review::is_review_key` exactly
-as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@reviewer` id in a Linear
-`id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
-sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
-different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+Each bucket spells its fields exactly as a listing row spells them, absences included. The two
+endpoints no longer count the same SET — the listing pages RUNS and still returns a review row as
+its own row — but a bucket and the row of the same ticket describe the same facts, so one
+vocabulary. A `review_run: true` bucket survives only for an orphan review (an adopted pull request
+whose ticket never ran here), and a LIVE one is a Running row the board draws. The lifecycle lookup
+is filtered by `review::is_review_key` exactly as the listing filters it (STUDIO-831) — one
+synthetic `pr:owner/repo#n@reviewer` id in a Linear `id: { in: … }` batch fails the whole request,
+silently — and the snapshot's `running`/`retrying` sets are folded in the way the worklist folds
+them, so a retry-parked ticket is not counted in a different bucket from its own row. Go has neither
+the issue listing nor an aggregate over it.
 
 **A hold the store has no row for is reported separately** (STUDIO-949). `held_for_human` counts the
 non-live `rhapsody:human` tickets the dispatcher is holding for which the run store has NO stored

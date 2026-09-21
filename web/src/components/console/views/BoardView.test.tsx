@@ -3,7 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import type { ConsoleJobRow, ConsoleJobCounts } from "@/lib/console-jobs";
+import type { IssueCountsResponse } from "@/lib/api";
+import {
+  consoleStoreCounts,
+  type ConsoleJobCounts,
+  type ConsoleJobRow,
+} from "@/lib/console-jobs";
 import { DEFAULT_BOARD_CARD_FIELDS } from "@/hooks/useBoardCardFields";
 import { BoardView, type BoardViewProps } from "./BoardView";
 
@@ -465,11 +470,25 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
         live: true,
       }),
     ];
-    // The PRE-FIX store tally, exactly as the operator's daemon served it: the three review rows
-    // billed as their own queued/blocked jobs, the live ticket counted In Review. A complete page has
-    // no such gap to explain, so every header is the fold's card count and the pagination copy never
-    // appears — THE MUTATION: make that copy unconditional and the `/in this lane/` assertion reds.
-    mount(rows, vi.fn(), { running: 1, review: 1, queued: 3, blocked: 2, needsYou: 2 }, 6);
+    // The buckets `handle_issue_counts` serves for this store: the three review rows folded onto
+    // their two Done tickets, the live ticket overridden to `running`, so the tally is 1 Queued
+    // (STUDIO-958), 1 Running (STUDIO-963) and no review bucket. On a COMPLETE page every header is
+    // the fold's card count and the tally is inert, so no lane claims a phantom and the pagination
+    // copy never appears — THE MUTATION: make that copy unconditional and the `/in this lane/`
+    // assertion reds. (The page where the tally is NOT inert is pinned just below.)
+    mount(
+      rows,
+      vi.fn(),
+      consoleStoreCounts({
+        issues: 4,
+        buckets: [
+          { outcome: "completed", lifecycle: "done", count: 2 },
+          { outcome: "completed", lifecycle: "open", count: 1 },
+          { outcome: "running", lifecycle: "in_review", count: 1 },
+        ],
+      })!,
+      6,
+    );
 
     const lane = (id: string) => document.querySelector(`[data-lane="${id}"]`)!;
     const count = (id: string) => lane(id).querySelector(".bcount")?.textContent;
@@ -489,6 +508,70 @@ describe("the lane header matches the lane body (STUDIO-965)", () => {
     expect(lane("done").querySelectorAll(".bcard")).toHaveLength(2);
     expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(3);
     expect(document.body.textContent).not.toMatch(/in this lane|not among the jobs loaded/);
+  });
+
+  // B2 — THE GUARD THE TICKET REQUIRED, and the page the operator actually reported. The test above
+  // mounts a COMPLETE page, where `count = rendered` and the daemon's tally is inert: nothing there
+  // reads the server's number, so deleting the tally from the header would leave it green. The
+  // reported screen was TRUNCATED (585 issues against a 50-row page, the pagination copy on show),
+  // and on a truncated page the lane header IS the tally — the one place the fix lives. So this
+  // starts from a payload shaped exactly as `handle_issue_counts` serves it and drives it through
+  // `consoleStoreCounts` into `BoardView` at `hasMore: true`, with ONE genuine truncation gap (a
+  // Queued card on an older page) so the tally is load-bearing. MUTATION: make the header ignore the
+  // tally on a truncated page (`count = rendered`) and the Queued assertion reds; make the gap copy
+  // unconditional and the review-lane no-phantom assertion reds.
+  it("reads the daemon's tally on a truncated page, and claims no card the page cannot draw", () => {
+    const rows = [
+      row({ issue: "STUDIO-949", trackerState: "Done", status: "done", statusLabel: "done" }),
+      review("pr:makewhatis/rhapsody#186@sol", "STUDIO-949", {
+        status: "blocked",
+        statusLabel: "blocked",
+        runOutcome: "failed",
+      }),
+      row({ issue: "STUDIO-956", trackerState: "Done", status: "done", statusLabel: "done" }),
+      row({ issue: "STUDIO-958", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+      // A live run whose tracker state reads In Review: `boardLaneOf` puts its card in Running.
+      row({
+        issue: "STUDIO-963",
+        trackerState: "In Review",
+        status: "run",
+        statusLabel: "running",
+        live: true,
+      }),
+    ];
+    // What the daemon serves for this store: the review folds onto STUDIO-949 and adds no bucket,
+    // the live ticket is overridden to `running`, and an OLDER Queued ticket the 50-row page did not
+    // carry is still counted — the truncation the copy is reserved for.
+    const payload: IssueCountsResponse = {
+      issues: 5,
+      buckets: [
+        { outcome: "completed", lifecycle: "done", count: 2 },
+        { outcome: "completed", lifecycle: "open", count: 2 },
+        { outcome: "running", lifecycle: "in_review", count: 1 },
+      ],
+    };
+    mount(rows, vi.fn(), consoleStoreCounts(payload)!, 6, { hasMore: true });
+
+    const lane = (id: string) => document.querySelector(`[data-lane="${id}"]`)!;
+    const count = (id: string) => lane(id).querySelector(".bcount")?.textContent;
+
+    // Queued: the store holds 2 and the page drew 1, so the header is the tally beside the one card
+    // and the honest gap note. Ignoring the tally here would read 1.
+    expect(count("queued")).toBe("2");
+    expect(lane("queued").querySelectorAll(".bcard")).toHaveLength(1);
+    expect(lane("queued").textContent).toMatch(/1 more in this lane/);
+    // Running: the live ticket is drawn where its card is, holding one seat of six.
+    expect(count("running")).toBe("1 / 6");
+    expect(lane("running").querySelectorAll(".bcard")).toHaveLength(1);
+    expect(lane("running").textContent).toContain("STUDIO-963");
+    // In Review: tally 0, cards 0 — no lane claims a phantom. Its emptiness is the page's own cut,
+    // so it says only that older jobs are not loaded, never that the store has one it cannot draw.
+    expect(count("review")).toBe("0");
+    expect(lane("review").querySelectorAll(".bcard")).toHaveLength(0);
+    expect(lane("review").textContent).not.toMatch(/in this lane|not among the jobs loaded/);
+    // The folded review is a chip on its Done card, so nothing counts nowhere.
+    expect(lane("done").querySelectorAll(".bcard")).toHaveLength(2);
+    expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(1);
   });
 });
 

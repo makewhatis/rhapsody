@@ -413,10 +413,17 @@ pub(crate) async fn handle_history_costs(
 /// drops the finished rounds' chips, which have no card to fold onto), else the newest finished
 /// round — so a ticket with three reviews still counts once (trap 2) and the row is never an orphan
 /// that counts nowhere. It keeps the REVIEW's own key, though, so `review_run` survives and a
-/// finished review still reads `done` rather than the `review` a completed ticket would mean; the
-/// board cannot draw the ticket's card (there is no row), so the lane reports the honest "not among
-/// the jobs loaded" gap. A review row whose origin names no ticket is not work and is dropped,
-/// exactly as the board drops it.
+/// finished review still reads `done` rather than the `review` a completed ticket would mean.
+///
+/// What that orphan can do on the board, exactly: a completed one lands in a bucket no lane tally
+/// carries (Done is deliberately uncounted), so it draws no card and no gap; a live one IS a Running
+/// row the board draws (`runningRuns`); only a FAILED orphan reaches a counted lane the board cannot
+/// draw it in, and on a truncated page that Queued lane can print its gap copy for a row that is
+/// loaded but never becomes a card. That residue is accepted rather than hidden — trap 4 requires
+/// the row to count somewhere — and it is unchanged from before this ticket; the operator's store
+/// has no orphan review today (every one of its watch rows resolves an origin that has a run row).
+/// A review row whose origin names no ticket is not work and is dropped, exactly as the board drops
+/// it.
 ///
 /// The lane is the RUN's, not the lifecycle's (trap 2): a ticket the snapshot has in flight or
 /// parked for retry buckets as `running` whatever its tracker state says, because that is where
@@ -516,17 +523,18 @@ pub(crate) async fn handle_issue_counts(
     }
     // A held ticket with no stored row still has a CARD: the console synthesizes a Queued one and
     // folds the ticket's reviews onto it as chips. Leaving the held set out of this one made such a
-    // ticket's review an orphan, and the orphan branch's `counted.insert(origin)` then hid the hold
-    // from `held_for_human` below — a Queued card the header could not see (STUDIO-965 B2). Same
-    // class as the live no-row ticket above: a card source `card_idents` did not know about.
+    // ticket's review an orphan, and the orphan branch's bookkeeping then kept the hold out of
+    // `held_for_human` below — a Queued card the header could not see (STUDIO-965 B2). Same class as
+    // the live no-row ticket above: a card source `card_idents` did not know about.
     for identifier in &held {
         card_idents.insert(identifier.as_str());
     }
 
     let mut buckets: BTreeMap<IssueStatusKey, i64> = BTreeMap::new();
-    // Which identifiers a stored row (or a review folded to its origin) accounts for. The console
-    // groups by identifier and so does `list_issue_runs`, so a live run with a stored row is ONE
-    // row on both sides; an empty identifier never groups on either, so it never joins this set.
+    // Which identifiers a stored row, a live run the snapshot knows, or the picked round of an
+    // orphan review accounts for. The console groups by identifier and so does `list_issue_runs`, so
+    // a live run with a stored row is ONE row on both sides; an empty identifier never groups on
+    // either, so it never joins this set.
     let mut counted: HashSet<&str> = HashSet::new();
     // The review rounds of each ticket with NO card of its own — an orphan: a review row whose
     // origin resolves to a ticket that has neither a stored row nor a live run. Every such ticket
@@ -539,13 +547,12 @@ pub(crate) async fn handle_issue_counts(
             continue;
         }
         if let Some(origin) = origins.get(&r.issue_id)
-            && !origin.is_empty()
             && !card_idents.contains(origin.as_str())
         {
             orphan_rounds.entry(origin.as_str()).or_default().push(r);
         }
     }
-    for (origin, rounds) in &orphan_rounds {
+    for rounds in orphan_rounds.values() {
         // The LIVE round wins the dedupe: `buildConsoleBoard` drops a finished review's chip (the
         // orphan ticket has no card to fold it onto) while `runningRuns` draws the live round as
         // its own Running row, so the one unit the tally reports must be the live round's bucket.
@@ -568,7 +575,6 @@ pub(crate) async fn handle_issue_counts(
         // the overlay below to count. Marking every round here swallowed that row, and the orphan
         // lane then disagreed with the folded case, which counts each live review as its own unit.
         counted.insert(picked.issue_id.as_str());
-        counted.insert(origin);
         // The lifecycle is keyed by the store's ISSUE ID, which only a real ticket row has. An
         // orphan review resolves no lifecycle, so it carries none and the client falls back to the
         // run outcome exactly as the board does for a card it cannot decorate. Its key stays the
@@ -2618,12 +2624,10 @@ mod tests {
     // STUDIO-965 B2. A `rhapsody:human` hold that has NEVER RUN is a Queued card the console
     // synthesizes, and its reviews fold onto that card as chips — so the held ticket's identifier is
     // one of the tickets that HAS a card of its own and the orphan branch must not claim it. Leaving
-    // the held set out of `card_idents` made the review an orphan, and the orphan branch's
-    // `counted.insert(origin)` then hid the hold from the `held_for_human` count below: the board
-    // drew one Queued held card while the header reported `held_for_human` absent and a
-    // `completed` review bucket with no card behind it — a regression from `main` for the Queued
-    // lane. MUTATION: drop the held identifiers from `card_idents` and this reds with
-    // `held_for_human` absent and a `completed/-/review_run` bucket.
+    // the held set out of `card_idents` made the review an orphan and billed a `completed` review
+    // bucket with no card behind it, while the board drew one Queued held card — a regression from
+    // `main` for the Queued lane. MUTATION: drop the held identifiers from `card_idents` and this
+    // reds with a `completed/-/review_run` bucket beside the held card the board actually draws.
     #[tokio::test]
     async fn issue_counts_a_held_never_run_ticket_absorbs_its_review() {
         let store = mem_store();
