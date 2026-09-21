@@ -199,8 +199,13 @@ export function JobDetailView({
   // while the page is open moves with it; picking an attempt pins the choice. A REVIEW run is
   // selectable too (its own trace, cost and outcome), so the pin resolves against both lists —
   // `runs` alone would refuse a review id and silently fall back to the newest attempt.
+  //
+  // The default falls through to the newest REVIEW when the ticket has no author runs left. A
+  // ticket's runs can be pruned from the store while its review WATCH row survives (a retirement is
+  // a soft delete), so "reviews but no attempts" is a real shape, and rendering "no recorded runs"
+  // over a review that exists would hide exactly what the ticket asks the strip to keep.
   const [pinned, setPinned] = useState<number | null>(null);
-  const run = [...runs, ...reviews].find((r) => r.id === pinned) ?? runs[0];
+  const run = [...runs, ...reviews].find((r) => r.id === pinned) ?? runs[0] ?? reviews[0];
   // The live roster, which only ever names a RUNNING ticket — the gap-filler behind the durable
   // record for a run whose ledger has no routing row at all (`runTeammate`).
   //

@@ -581,6 +581,22 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(document.querySelector('.trattempts button[aria-pressed="true"]')).toBeNull();
   });
 
+  // A ticket whose author runs have been pruned from the store but whose review WATCH row survived
+  // (a retirement is a soft delete) still shows its reviews: the strip must not vanish behind the
+  // "no recorded runs" empty state, which is what `runs` alone would render here.
+  it("shows a ticket's reviews even when it has no author runs left", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#204@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "2026-09-01T17:20:00Z",
+    });
+    mountDetail([], vi.fn(), [review]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    expect(document.querySelector(".trrev")?.textContent).toBe("review · alice");
+    expect(screen.queryByText("This ticket has no recorded runs.")).toBeNull();
+  });
+
   // The acceptance's two degradations, which are DIFFERENT answers about the same absence.
   it("degrades to the run id, or to a dash, only where no identity resolves", async () => {
     h.fetchTeamsOverview.mockResolvedValue({
