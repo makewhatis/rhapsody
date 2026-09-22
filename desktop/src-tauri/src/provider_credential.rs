@@ -14,11 +14,12 @@
 //! guards a read also guards every mutation, so a blocked read and a racing mutation cannot
 //! interleave into an inconsistent snapshot (see `a_blocked_read_forces_a_concurrent_remove_to_
 //! wait_and_keeps_its_old_revision` below). Every `read_bound`/mutation makes exactly ONE
-//! `get_password` call, via [`ProviderCredentialOwner::locked_snapshot`] — see its doc comment for
-//! why: an earlier two-call shape (a separate access-probe call, then a separate decode call) let a
-//! caller drop the guard and re-acquire a fresh one in between, which sol's review of rhapsody#213
-//! found and reproduced. One call under one guard makes that gap impossible to reintroduce by
-//! construction, not merely unlikely.
+//! `get_password` call and takes ITS returned revision (never a separately captured one) from
+//! [`ProviderCredentialOwner::locked_snapshot`] — see its doc comment for the two review-found
+//! defect shapes this closes and what "closes" does and does not guarantee. Neither is provable
+//! by a black-box test alone (see the race test's own doc comment); this module's actual defense
+//! is that both shapes now require a visibly deliberate code change to reintroduce, not a subtle
+//! one-line oversight.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -136,20 +137,25 @@ impl ProviderCredentialOwner {
         ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
     }
 
-    /// Reads and classifies the Keychain item in exactly ONE `get_password` call, under the
-    /// caller's already-held revision lock. `read_bound` and every mutation used to make this call
-    /// in two pieces (`probe_access` for the denied/locked check, then `locked_read` for the
-    /// decode) — sol's review of rhapsody#213 found and reproduced the exact defect that shape
-    /// invited: a caller drops the guard between the two calls and re-acquires a fresh one before
-    /// the second, letting a concurrent mutation interleave and pair an old revision with
-    /// post-mutation state. Folding both into one call removes the seam entirely — there is no
-    /// longer a second call for a guard to be dropped and re-acquired around, so the property this
-    /// module depends on ("state and revision are captured from the exact same point in time") is
-    /// now true by construction, not by caller discipline. `guard` is unused beyond documenting
-    /// that requirement at every call site.
-    fn locked_snapshot(&self, guard: &MutexGuard<'_, Revision>) -> Snapshot {
-        let _ = guard;
-        match self.keyring.get_password() {
+    /// Reads the current revision AND classifies the Keychain item in exactly ONE `get_password`
+    /// call, under the caller's already-held revision lock, returning both PAIRED from this single
+    /// call so a caller physically receives them together rather than assembling them from two
+    /// separate reads. `read_bound` and every mutation used to make the Keychain call in two pieces
+    /// (`probe_access` for the denied/locked check, then `locked_read` for the decode) — sol's
+    /// review of rhapsody#213 found and reproduced the exact defect that shape invited: a caller
+    /// drops the guard between the two calls and re-acquires a fresh one before the second, letting
+    /// a concurrent mutation interleave and pair an old revision with post-mutation state. Folding
+    /// the Keychain access into one call closed that gap. jimmy's follow-up review found a second,
+    /// narrower version of the same defect: a caller could still capture the revision from its OWN
+    /// separate `*guard` read (or an even-earlier, already-dropped temporary lock) instead of from
+    /// this call's result, reintroducing a torn pair without ever touching the Keychain call twice.
+    /// Returning `(Revision, Snapshot)` from here closes that too: `read_bound` and every mutation
+    /// below build their returned/compared revision only from this pair, so reintroducing either
+    /// shape of the defect requires a caller to visibly discard this return value's revision and
+    /// substitute a different one, not merely to add one extra line.
+    fn locked_snapshot(&self, guard: &MutexGuard<'_, Revision>) -> (Revision, Snapshot) {
+        let revision = **guard;
+        let snapshot = match self.keyring.get_password() {
             Ok(raw) if raw.is_empty() => Snapshot::Absent,
             Ok(raw) => match serde_json::from_str::<Envelope>(&raw) {
                 Ok(env) if env.version == ENVELOPE_VERSION && env.kind == ENVELOPE_KIND => {
@@ -162,7 +168,8 @@ impl ProviderCredentialOwner {
             },
             Err(KeyringError::NoEntry) => Snapshot::Absent,
             Err(KeyringError::Other(_)) => Snapshot::DeniedOrLocked,
-        }
+        };
+        (revision, snapshot)
     }
 
     /// §2.5 `read_bound`: `Present` only when the stored envelope's binding matches
@@ -170,7 +177,8 @@ impl ProviderCredentialOwner {
     /// `BindingMismatch`, never a partial/raw disclosure of the stored endpoint or key.
     pub fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
         let guard = lock_revision(&self.revision);
-        let state = match self.locked_snapshot(&guard) {
+        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let state = match snapshot {
             Snapshot::DeniedOrLocked => CredentialState::DeniedOrLocked,
             Snapshot::Malformed => CredentialState::Malformed,
             Snapshot::Absent => CredentialState::Absent,
@@ -179,10 +187,7 @@ impl ProviderCredentialOwner {
             }
             Snapshot::Present(_) => CredentialState::BindingMismatch,
         };
-        CredentialRead {
-            revision: *guard,
-            state,
-        }
+        CredentialRead { revision, state }
     }
 
     /// Connect: requires `Absent` at `expected_revision`. Stores `value` under `binding`.
@@ -193,12 +198,12 @@ impl ProviderCredentialOwner {
         value: String,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        let snapshot = self.locked_snapshot(&guard);
+        let (revision, snapshot) = self.locked_snapshot(&guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
-        if *guard != expected_revision {
-            return Err(MutationError::StaleRevision(*guard));
+        if revision != expected_revision {
+            return Err(MutationError::StaleRevision(revision));
         }
         if !matches!(snapshot, Snapshot::Absent) {
             return Err(MutationError::PreconditionFailed);
@@ -217,12 +222,12 @@ impl ProviderCredentialOwner {
         new_value: String,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        let snapshot = self.locked_snapshot(&guard);
+        let (revision, snapshot) = self.locked_snapshot(&guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
-        if *guard != expected_revision {
-            return Err(MutationError::StaleRevision(*guard));
+        if revision != expected_revision {
+            return Err(MutationError::StaleRevision(revision));
         }
         let matches_binding =
             matches!(&snapshot, Snapshot::Present(env) if env.binding == *current_binding);
@@ -243,12 +248,12 @@ impl ProviderCredentialOwner {
         new_binding: Binding,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        let snapshot = self.locked_snapshot(&guard);
+        let (revision, snapshot) = self.locked_snapshot(&guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
-        if *guard != expected_revision {
-            return Err(MutationError::StaleRevision(*guard));
+        if revision != expected_revision {
+            return Err(MutationError::StaleRevision(revision));
         }
         let value = match snapshot {
             Snapshot::Present(env) => env.value,
@@ -265,15 +270,15 @@ impl ProviderCredentialOwner {
     /// the Keychain item, so it stays observable after the secret bytes are gone.
     pub fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        let snapshot = self.locked_snapshot(&guard);
+        let (revision, snapshot) = self.locked_snapshot(&guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
-        if *guard != expected_revision {
-            return Err(MutationError::StaleRevision(*guard));
+        if revision != expected_revision {
+            return Err(MutationError::StaleRevision(revision));
         }
         if matches!(snapshot, Snapshot::Absent) {
-            return Ok(MutationOutcome::AlreadyAbsent(*guard));
+            return Ok(MutationOutcome::AlreadyAbsent(revision));
         }
         self.keyring
             .delete_credential()
@@ -721,19 +726,20 @@ mod tests {
     }
 
     // Mutation discipline: "Delete revision state with the credential; a blocked old Present read
-    // after Remove must incorrectly win and fail the race test." This test pins the opposite: a
-    // read genuinely paused INSIDE the locked critical section still returns a self-consistent
-    // pre-Remove snapshot (Present paired with its own old revision, never Absent paired with a
-    // stale revision or vice versa), and Remove cannot advance the revision until that read
-    // releases the lock — and now genuinely cannot, deterministically, because `locked_snapshot`
-    // (see its doc comment) makes only one `get_password` call under one continuously held guard,
-    // so there is no gap left for a mutation to interleave into even in principle. Two prior
-    // shapes of this test (a `Barrier` that ran the two operations sequentially on one thread each,
-    // then a sleep-based two-call version that paused only the first of two separate calls) were
-    // both shown, by sol's and jimmy's review of rhapsody#213, to stay green under a reintroduced
-    // drop-and-reacquire defect; that defect is no longer expressible without undoing the
-    // `locked_snapshot` merge itself, which this test's use of the single-call `BlockingKeyring`
-    // would immediately fail to compile against (both `probe_access`/`locked_read` are gone).
+    // after Remove must incorrectly win and fail the race test." This test pins what it CAN pin
+    // deterministically: while `locked_snapshot`'s one `get_password` call is paused, it genuinely
+    // holds the revision lock (proven below by `!remove_handle.is_finished()`, not merely asserted
+    // in a comment), so a concurrent Remove cannot advance the revision until this read releases it
+    // — real mutual exclusion, not a `Barrier` ordering two sequential operations on one thread
+    // each, which is what an earlier shape of this test did (sol's review of rhapsody#213) and
+    // which a Keychain-call-count mutation (probe/read split, jimmy's B4) later showed to still
+    // pass green. What this test does NOT and cannot pin, because it is a black-box test with no
+    // I/O to intercept in the gap: a caller that captures the revision from a SEPARATE, already-
+    // released lock instead of from `locked_snapshot`'s returned pair (jimmy's follow-up, B6). That
+    // shape is closed by `locked_snapshot` returning `(Revision, Snapshot)` together and every
+    // caller using only that pair — see its doc comment — which makes the defect require a caller
+    // to visibly discard the returned revision and substitute a different one, not something this
+    // or any black-box test can observe directly.
     #[test]
     fn a_blocked_read_forces_a_concurrent_remove_to_wait_and_keeps_its_old_revision() {
         let backing = MockKeyring::empty();
