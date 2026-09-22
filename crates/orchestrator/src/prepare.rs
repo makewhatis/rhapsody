@@ -842,8 +842,10 @@ impl Orchestrator {
     }
 
     /// Handles a resolver completion on the control task. Accepts only the CURRENT token and config
-    /// generation, revalidates drain/eligibility, then either dispatches or writes the zero-turn
-    /// refusal. Any stale completion drops its move-only payload and changes no state.
+    /// generation, re-checks drain, revalidates the CURRENT board/review state (see
+    /// [`prepared_target_still_current`](Self::prepared_target_still_current)), then either
+    /// dispatches or writes the zero-turn refusal. Any stale completion drops its move-only payload
+    /// and changes no state.
     pub(crate) async fn handle_dispatch_prepared(
         &mut self,
         id: String,
