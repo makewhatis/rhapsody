@@ -1640,9 +1640,12 @@ is injected.
 When it engages, the control task inserts a loop-owned `preparing` reservation (keyed by ticket or
 review identity) before spawning resolver work, so a preparation counts against every duplicate and
 concurrency gate exactly as a live run does — and the selection ladder skips a gate-suppressed
-candidate *before* spending a slot, so one refused ticket cannot starve the queue behind it. The
-resolver reports back over the control channel; a completion is accepted only for the current token
-**and** config generation and the loop's expected credential revision, after re-checking drain and
+candidate *before* spending a slot, on the review-reopen ladder as well as the ordinary one, so one
+refused ticket cannot starve the queue behind it. The resolver reports back over the control channel;
+a completion is accepted only for the current token **and** config generation and the loop's expected
+credential revision — a READY payload must carry that revision *and* agree with the envelope that
+delivered it, while a typed timeout or failure that never reached a credential is a refusal rather
+than a mismatch — after re-checking drain and
 revalidating the CURRENT board — the ticket's tracker state, labels, existence and selection
 fingerprint, or the review's last observed head/open state — so a state flap, a label change, a
 disappearance or a dismissed review cannot launch stale work. The SAME revalidation runs before a
