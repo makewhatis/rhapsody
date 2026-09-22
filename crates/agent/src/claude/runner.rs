@@ -155,7 +155,7 @@ impl crate::Runner for Runner {
 /// belongs to slice 7/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
 /// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
 /// the mailbox.
-const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     events: EventFidelity::Structured {
         tool_level: ToolEventGranularity::FileLevel,
     },
@@ -2412,6 +2412,11 @@ mod tests {
         let happy = read("happy.jsonl");
         let resume = read("resume.jsonl");
         let caps = *Runner::new(Config::default()).capabilities();
+        assert_eq!(
+            crate::harness::declared_capabilities(HarnessId::Claude),
+            caps,
+            "the by-name reader must return the SAME constant this adapter declares"
+        );
 
         // events: FileLevel — the happy capture carries a typed tool_use block, which a
         // command-only harness cannot emit.

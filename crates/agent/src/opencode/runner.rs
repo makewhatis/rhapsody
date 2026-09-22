@@ -117,7 +117,7 @@ impl Runner {
 /// * `budgets: false` — the turn deadline below is the daemon's, not a CLI-enforced budget;
 ///   opencode has no budget flag at all (design §7.2).
 /// * `stdin: ClosedAtStart` — the measured difference from claude (module doc).
-const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     events: EventFidelity::Structured {
         tool_level: ToolEventGranularity::FileLevel,
     },
@@ -1656,6 +1656,11 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         let happy = read("happy.jsonl");
         let resume = read("resume.jsonl");
         let caps = *Runner::new(Config::default()).capabilities();
+        assert_eq!(
+            crate::harness::declared_capabilities(HarnessId::Opencode),
+            caps,
+            "the by-name reader must return the SAME constant this adapter declares"
+        );
 
         // events: FileLevel — the happy capture carries typed read/edit/bash tool events, the
         // granularity a command-only harness (codex) cannot reach.

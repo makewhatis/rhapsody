@@ -3850,6 +3850,41 @@ mod tests {
         );
         assert_eq!(body["model_origin"], "review.model.opencode");
         assert_eq!(body["provider"], "fireworks-ai");
+        // STUDIO-978: the observability fidelity the console renders, derived from the harness the
+        // run actually ran on. opencode emits structured per-step events and can be steered between
+        // turns, so the Trace spine is real and the steering field is shown.
+        assert_eq!(body["harness_events"], "structured");
+        assert_eq!(body["harness_steering"], "between_turns");
+    }
+
+    /// STUDIO-978: an UNKNOWN or known-but-unimplemented harness name has no declared capabilities,
+    /// so the fidelity fields are OMITTED — the console says "unknown" rather than assuming a shape.
+    #[tokio::test]
+    async fn run_provenance_omits_fidelity_for_an_unimplemented_harness() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        store
+            .set_run_provenance(
+                run_id,
+                &rhapsody_store::RunProvenance {
+                    harness: "codex".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("set provenance");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["harness"], "codex");
+        assert!(
+            body.get("harness_events").is_none(),
+            "no shape for codex: {body}"
+        );
+        assert!(
+            body.get("harness_steering").is_none(),
+            "no shape for codex: {body}"
+        );
     }
 
     /// A run that predates the feature records nothing, so the endpoint answers its id and omits
@@ -3866,6 +3901,10 @@ mod tests {
         assert!(body.get("harness").is_none(), "no harness: {body}");
         assert!(body.get("model").is_none(), "no model: {body}");
         assert!(body.get("provider").is_none(), "no provider: {body}");
+        assert!(
+            body.get("harness_events").is_none(),
+            "no harness ⇒ no fidelity shape: {body}"
+        );
     }
 
     /// An unknown run is 404 (never a fabricated provenance), an unparseable id is 404, and POST is

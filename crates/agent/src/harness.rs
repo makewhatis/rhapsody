@@ -488,6 +488,32 @@ pub fn validate(
     Ok(DispatchVerdict { degradations })
 }
 
+/// The [`HarnessId`] a recorded or configured name denotes, when this build implements it. `None`
+/// for a known-but-unimplemented name (`codex`, `goose`) and for anything unknown — the same
+/// boundary that makes those a [`CapabilityRefusal::HarnessNotImplemented`] rather than a fall back.
+pub fn harness_id_for_name(name: &str) -> Option<HarnessId> {
+    match name {
+        "claude" => Some(HarnessId::Claude),
+        "opencode" => Some(HarnessId::Opencode),
+        _ => None,
+    }
+}
+
+/// The declared capabilities of an implemented harness, addressed by id rather than through a live
+/// [`Harness`] object. For a reader that has only the harness NAME a run recorded (the console's run
+/// provenance, for one) and must render its fidelity honestly, without constructing a runner.
+///
+/// SINGLE-SOURCED: each arm returns the adapter's own `CAPABILITIES` constant, so a reader here and
+/// a validator reading `Harness::capabilities()` can never disagree. A test in each adapter pins
+/// that equality (`declared_capabilities(id) == *Runner::new(...).capabilities()`), which is what
+/// keeps this function honest rather than a second declaration to drift.
+pub fn declared_capabilities(id: HarnessId) -> HarnessCapabilities {
+    match id {
+        HarnessId::Claude => crate::claude::runner::CAPABILITIES,
+        HarnessId::Opencode => crate::opencode::runner::CAPABILITIES,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +752,33 @@ mod tests {
         }
     }
 
+    /// [`declared_capabilities`] is what a console reader uses when it has only a recorded harness
+    /// NAME, and it must return exactly what the live adapter declares — otherwise the run detail
+    /// would render fidelity the validator disagreed with.
+    #[test]
+    fn declared_capabilities_and_name_lookup_agree_with_the_adapters() {
+        assert_eq!(
+            declared_capabilities(HarnessId::Claude),
+            crate::claude::runner::CAPABILITIES
+        );
+        assert_eq!(
+            declared_capabilities(HarnessId::Opencode),
+            crate::opencode::runner::CAPABILITIES
+        );
+        assert_eq!(harness_id_for_name("claude"), Some(HarnessId::Claude));
+        assert_eq!(harness_id_for_name("opencode"), Some(HarnessId::Opencode));
+        assert_eq!(
+            harness_id_for_name("codex"),
+            None,
+            "known-but-unimplemented is not addressable"
+        );
+        assert_eq!(
+            harness_id_for_name(""),
+            None,
+            "empty means inherit, not a harness"
+        );
+    }
+
     /// Compile-time shape check: [`validate`] returns a [`DispatchVerdict`] (so callers can read
     /// `.degradations`), not a bare list — a regression that returned the list directly would drop
     /// the "is this dispatch degraded" question the console asks.
@@ -805,6 +858,63 @@ mod tests {
         assert_ne!(Resume::Flags, Resume::Protocol);
         // The contract can still say "no continuation", which is what the multi-turn rule needs.
         assert_ne!(Resume::None, Resume::Protocol);
+    }
+
+    /// MEASURED FUTURE-ADAPTER SHAPES (design §3's four defects; STUDIO-869/872). This slice does
+    /// not implement goose or codex, but the contract must be able to EXPRESS what those spikes
+    /// measured — otherwise the next adapter widens these enums under pressure. Each assertion pins
+    /// one measured shape so collapsing it back to a shared default reds here.
+    ///
+    /// MUTATION GUARD: collapse event fidelity to one structured boolean, or child stdin to one
+    /// default, and the corresponding assertion fails to compile or reds.
+    #[test]
+    fn measured_future_adapter_shapes_are_representable_and_distinct() {
+        // Defect 4: opencode emits typed file-level `read`/`edit`/`bash`; codex emits only an
+        // undifferentiated `command_execution`. Two granularities, not one boolean.
+        assert_ne!(
+            ToolEventGranularity::FileLevel,
+            ToolEventGranularity::CommandOnly,
+            "event fidelity must separate file-level tools from command-only events"
+        );
+        // §7.2: claude REQUIRES stdin held open (the INF-250 mailbox); codex hangs forever if it is.
+        // Not one shared default.
+        assert_ne!(
+            StdinPolicy::HeldOpen,
+            StdinPolicy::ClosedAtStart,
+            "child stdin must be a per-harness policy, not one shared default"
+        );
+
+        // A codex-shaped harness: command-only events, closed stdin, subcommand resume, separate
+        // tool-name fields, and the mcp/sandbox coupling its approval policy forces. It is
+        // representable (this compiles), and the validator refuses a dispatch that requires BOTH
+        // the daemon's tools and a sandbox on it. The id only labels the refusal — codex has no
+        // `HarnessId` variant on purpose, so a shipped one stands in.
+        let codex_shaped = HarnessCapabilities {
+            events: EventFidelity::Structured {
+                tool_level: ToolEventGranularity::CommandOnly,
+            },
+            steering: Steering::BetweenTurns,
+            resume: Resume::Subcommand,
+            mcp: true,
+            sandbox: Sandbox::Modes,
+            mcp_sandbox: McpSandboxCoupling::MutuallyExclusive,
+            usage: UsageDetail::Tokens,
+            budgets: false,
+            tool_naming: ToolNaming::SeparateFields,
+            stdin: StdinPolicy::ClosedAtStart,
+        };
+        let both = WorkRequirements {
+            team_tools: true,
+            sandbox: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate(HarnessId::Claude, &codex_shaped, &both),
+            Err(CapabilityRefusal::McpSandboxMutuallyExclusive {
+                harness: HarnessId::Claude
+            }),
+            "the measured codex coupling must be expressible and refused"
+        );
     }
 
     /// The refusal's `Display` must be actionable: it names what could not be honored. The reason is

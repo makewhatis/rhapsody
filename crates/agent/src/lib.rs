@@ -29,7 +29,7 @@ pub use harness::{
     CapabilityRefusal, Degradation, DispatchVerdict, EventFidelity, Harness, HarnessCapabilities,
     HarnessId, HarnessKnobs, HarnessSpec, McpSandboxCoupling, Provider, ProviderAuth, Resume,
     Sandbox, StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
-    WorkRequirements, validate,
+    WorkRequirements, declared_capabilities, harness_id_for_name, validate,
 };
 pub use humanize::{LogEntry, humanize_stream_line};
 
