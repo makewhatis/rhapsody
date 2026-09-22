@@ -438,6 +438,13 @@ mod tests {
     /// a broken implementation would wait for (the fixtures use 5–30s), so the guard still reds.
     const TIMEOUT_SLACK: Duration = Duration::from_secs(2);
 
+    /// The probe timeout the process-tree fixtures use. Generous on purpose: a heavily loaded CI
+    /// runner can stall the exec of a freshly written script past a tighter bound, which reds these
+    /// tests even though the probe is correct (observed at 3s on the shared `test` job). It stays
+    /// far below the 30s `sleep` a broken implementation would wait for, so the timing guards below
+    /// still red under mutation.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Whether `pid` is still running. SIGKILL cannot be caught; signal 0 checks for existence only.
     fn process_alive(pid: i32) -> bool {
         // SAFETY: signal 0 delivers nothing, it only performs `kill(2)`'s error checking.
@@ -629,18 +636,18 @@ mod tests {
         let (_script_dir, command) = script(&body);
 
         let start = Instant::now();
-        let err = probe_with_timeout(&command, Duration::from_secs(3)).unwrap_err();
+        let err = probe_with_timeout(&command, FIXTURE_TIMEOUT).unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err, ProbeError::TimedOut);
-        // Without the tree kill, `sleep 30` outlives the 3s deadline by a wide margin.
+        // Without the tree kill, `sleep 30` outlives the probe's deadline by a wide margin.
         assert!(
-            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
             "the probe waited for the descendant: {elapsed:?}"
         );
 
         let pid = read_pid(&pidfile);
         assert!(
-            wait_until_dead(pid, Duration::from_secs(3)),
+            wait_until_dead(pid, FIXTURE_TIMEOUT),
             "descendant {pid} survived the probe's process-tree kill"
         );
     }
@@ -660,17 +667,17 @@ mod tests {
         );
         let (_script_dir, command) = script(&body);
         let start = Instant::now();
-        let row = probe_with_timeout(&command, Duration::from_secs(3))
+        let row = probe_with_timeout(&command, FIXTURE_TIMEOUT)
             .expect("the version line is still read from the bounded pipe");
         let elapsed = start.elapsed();
         assert_eq!(row.opencode_version, "1.18.30");
         // Without the tree kill the read blocks on the descendant's `sleep 30`, far past the bound.
         assert!(
-            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
             "a descendant holding stdout outran the deadline: {elapsed:?}"
         );
         let pid = read_pid(&pidfile);
-        let dead = wait_until_dead(pid, Duration::from_secs(3));
+        let dead = wait_until_dead(pid, FIXTURE_TIMEOUT);
         if !dead {
             reap(pid);
         }
@@ -697,7 +704,7 @@ mod tests {
         let (_script_dir, command) = script(&body);
 
         let start = Instant::now();
-        let result = probe_with_timeout(&command, Duration::from_secs(3));
+        let result = probe_with_timeout(&command, FIXTURE_TIMEOUT);
         let elapsed = start.elapsed();
         // The survivor is the wrapper's leaked process, not something the probe can reach; reap it
         // FIRST, so a failing assertion below cannot leave a sleeper behind.
@@ -714,7 +721,7 @@ mod tests {
         );
         // The pipe is held, not blocked on: the non-blocking drain still returns on time.
         assert!(
-            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
             "the probe waited on the escaped descendant: {elapsed:?}"
         );
     }
