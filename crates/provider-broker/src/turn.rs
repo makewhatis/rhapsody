@@ -113,8 +113,8 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
         let encoded = encode_token(&raw);
         let digest = TokenDigest::of(&encoded);
         {
-            // The liveness re-check, the registry insert, and `mark_issued` (which records the
-            // digest) all happen under the registry lock that `revoke_grant` also takes. A
+            // The liveness re-check and `Registry::publish` (which inserts the grant *and* records
+            // its digest) happen under the registry lock that `revoke_grant` also takes. A
             // concurrent revocation therefore either sets `revoked` before this re-check and the
             // mint refuses, or acquires the lock afterwards, sees the recorded digest, and removes
             // the grant — it can never skip removal because the digest was not yet visible.
@@ -128,8 +128,7 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
             if registry.grants.contains_key(&digest) {
                 continue;
             }
-            registry.grants.insert(digest, Arc::clone(inner));
-            inner.mark_issued(digest);
+            registry.publish(digest, inner);
         }
         // Test-only: pause once the grant is published so a race test can interleave a receipt drop
         // after the registry lock is released. Compiled out of production builds.

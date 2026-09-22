@@ -316,7 +316,14 @@ impl TurnInner {
         }
     }
 
-    pub(crate) fn mark_issued(&self, digest: TokenDigest) {
+    /// Record the digest this grant was published under, and flip `issued`.
+    ///
+    /// Deliberately private and taking the registry guard: the only call site is
+    /// [`Registry::publish`], which holds the lock while it inserts the grant. Recording the digest
+    /// anywhere other than inside that critical section would let a concurrent [`Registry::revoke_grant`]
+    /// miss a just-inserted grant and strand it in the map, so the signature makes such a split a
+    /// compile error rather than a race a test would have to chase.
+    fn mark_issued(&self, _registry: &mut Registry, digest: TokenDigest) {
         *lock(&self.digest) = Some(digest);
         self.issued.store(true, Ordering::Release);
     }
@@ -415,16 +422,13 @@ impl TurnInner {
 
     /// Set the revoked flag and drop the grant from the registry if one was issued.
     ///
-    /// The flag and the digest lookup happen under the registry lock that mint reserves the digest
-    /// under, so mint and revocation cannot interleave: mint either inserts (and a concurrent
-    /// revocation then finds the digest and removes the grant), or mint observes `revoked` and
-    /// refuses before inserting. No revoked grant can be left registered by a racing mint.
+    /// The whole operation is delegated to [`Registry::revoke_grant`] under the registry lock, the
+    /// same lock [`Registry::publish`] holds. Keeping the flag set and the digest lookup inside that
+    /// one method means neither can be hoisted above the lock: a mint that has inserted its grant
+    /// but holds the lock is still publishing, and a revocation that read the digest before taking
+    /// the lock could miss it and strand the grant.
     fn revoke_grant(&self) {
-        let mut registry = lock(&self.session.broker.registry);
-        self.revoked.store(true, Ordering::Release);
-        if let Some(digest) = self.digest() {
-            registry.remove_grant(&digest);
-        }
+        lock(&self.session.broker.registry).revoke_grant(self);
     }
 
     fn build_ledger(&self, outcome: TurnOutcome, snapshot: ReservationSnapshot) -> TurnLedger {
@@ -501,8 +505,21 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    pub(crate) fn remove_grant(&mut self, digest: &TokenDigest) {
-        self.grants.remove(digest);
+    /// Publish a freshly minted grant atomically: insert it under `digest` and record that digest on
+    /// the grant in the same critical section. `revoke_grant` removes a grant *by the digest recorded
+    /// here*, so the insert and the record must not be separable — hence this method owns both, and
+    /// [`TurnInner::mark_issued`] cannot be reached without this guard.
+    pub(crate) fn publish(&mut self, digest: TokenDigest, inner: &Arc<TurnInner>) {
+        self.grants.insert(digest, Arc::clone(inner));
+        inner.mark_issued(self, digest);
+    }
+
+    /// Mark a grant revoked and, if it was published, remove it — both under the one registry lock.
+    pub(crate) fn revoke_grant(&mut self, inner: &TurnInner) {
+        inner.revoked.store(true, Ordering::Release);
+        if let Some(digest) = inner.digest() {
+            self.grants.remove(&digest);
+        }
     }
 
     pub(crate) fn revoke_session(&mut self, id: &SessionId) {
