@@ -90,19 +90,37 @@ impl BootstrapListener {
     /// `read_bound` requests — matching "only one connection is served at a time (the daemon holds
     /// exactly one)"; a second authenticated connection (e.g. the daemon reconnecting after its own
     /// restart) waits for the first's connection to end.
+    ///
+    /// Every per-connection task is tracked in a [`tokio::task::JoinSet`] owned by this call's own
+    /// stack frame rather than fire-and-forgotten via a bare `tokio::spawn` (sol's review of
+    /// rhapsody#213: an already-authenticated child task used to outlive this method being
+    /// cancelled/dropped, keeping its `Arc<ProviderCredentialOwner>` and the launch token alive and
+    /// still answering `read_bound` after the listener itself had shut down). Dropping a `JoinSet`
+    /// aborts every task it still holds, so cancelling or dropping this future — the same thing the
+    /// supervisor does to revoke a channel on stop/restart — now also tears down every connection
+    /// spawned from it.
     pub async fn accept_and_serve(self, owner: Arc<ProviderCredentialOwner>) {
         let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (stream, _addr) = match self.listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
-            let owner = owner.clone();
-            let token = self.token.clone();
-            let serving_slot = serving_slot.clone();
-            tokio::spawn(async move {
-                serve_one(stream, token, owner, serving_slot).await;
-            });
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (stream, _addr) = match accepted {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    let owner = owner.clone();
+                    let token = self.token.clone();
+                    let serving_slot = serving_slot.clone();
+                    connections.spawn(async move {
+                        serve_one(stream, token, owner, serving_slot).await;
+                    });
+                }
+                // Reap finished connections so `connections` doesn't grow without bound; the `if`
+                // guard keeps this branch out of the poll set entirely while empty, rather than
+                // resolving to `None` every iteration and busy-looping.
+                _ = connections.join_next(), if !connections.is_empty() => {}
+            }
         }
     }
 }
@@ -430,6 +448,59 @@ mod tests {
         drop(silent);
         drop(client);
         serve.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // sol's review of rhapsody#213: dropping/aborting the outer `accept_and_serve` task used to
+    // leave an already-authenticated connection's own spawned task running, still holding the
+    // owner and still answering `read_bound`. A second read over the SAME already-authenticated
+    // client, issued only after the outer serve task has been awaited to completion following
+    // `abort()`, must now fail instead of succeeding.
+    #[tokio::test]
+    async fn aborting_the_listener_task_drops_authenticated_child_connections() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+        let owner = owner_with_secret();
+
+        let serve = tokio::spawn(listener.accept_and_serve(owner));
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+
+        let read = client
+            .read_bound(
+                "v1:spike-test-provider".into(),
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+            )
+            .await
+            .expect("first read succeeds while the listener task is alive");
+        assert_eq!(read.state.tag(), CredentialStateTag::Present);
+
+        serve.abort();
+        let _ = serve.await;
+
+        let second = client
+            .read_bound(
+                "v1:spike-test-provider".into(),
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+            )
+            .await;
+        assert!(
+            second.is_err(),
+            "an authenticated child task must not retain the credential owner after the listener task shuts down"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
