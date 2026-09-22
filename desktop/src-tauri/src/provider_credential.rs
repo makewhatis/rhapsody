@@ -36,6 +36,14 @@ struct Envelope {
 const ENVELOPE_VERSION: u32 = 1;
 const ENVELOPE_KIND: &str = "api_key";
 
+/// Recovers a poisoned lock rather than propagating the panic (mirrors `supervisor::lock`) — the
+/// guarded critical section is a plain revision read/CAS with no I/O held across an `.await`, so a
+/// poisoned value is still internally consistent; there is no recoverable "error value" a caller
+/// could act on differently than simply continuing with the value as it stood.
+fn lock_revision(m: &Mutex<Revision>) -> MutexGuard<'_, Revision> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One CAS mutation's success outcome (§2.5's table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationOutcome {
@@ -155,7 +163,7 @@ impl ProviderCredentialOwner {
     /// `expected_binding` exactly; a well-formed envelope with a different binding is
     /// `BindingMismatch`, never a partial/raw disclosure of the stored endpoint or key.
     pub fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
-        let guard = self.revision.lock().expect("revision mutex poisoned");
+        let guard = lock_revision(&self.revision);
         if self.probe_access().is_err() {
             return CredentialRead {
                 revision: *guard,
@@ -183,7 +191,7 @@ impl ProviderCredentialOwner {
         binding: Binding,
         value: String,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = self.revision.lock().expect("revision mutex poisoned");
+        let mut guard = lock_revision(&self.revision);
         self.probe_access()?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
@@ -206,7 +214,7 @@ impl ProviderCredentialOwner {
         current_binding: &Binding,
         new_value: String,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = self.revision.lock().expect("revision mutex poisoned");
+        let mut guard = lock_revision(&self.revision);
         self.probe_access()?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
@@ -229,7 +237,7 @@ impl ProviderCredentialOwner {
         expected_revision: Revision,
         new_binding: Binding,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = self.revision.lock().expect("revision mutex poisoned");
+        let mut guard = lock_revision(&self.revision);
         self.probe_access()?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
@@ -249,7 +257,7 @@ impl ProviderCredentialOwner {
     /// UNCHANGED. The revision itself is never deleted — it lives in this owner's `Mutex`, not in
     /// the Keychain item, so it stays observable after the secret bytes are gone.
     pub fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
-        let mut guard = self.revision.lock().expect("revision mutex poisoned");
+        let mut guard = lock_revision(&self.revision);
         self.probe_access()?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
@@ -274,7 +282,7 @@ impl ProviderCredentialOwner {
     /// observe the revision after a Remove without going through `read_bound` (which would report
     /// `Absent` and could otherwise be mistaken for "no revision to observe").
     pub fn current_revision(&self) -> Revision {
-        *self.revision.lock().expect("revision mutex poisoned")
+        *lock_revision(&self.revision)
     }
 
     fn store_envelope(&self, binding: Binding, value: String) -> Result<(), MutationError> {
