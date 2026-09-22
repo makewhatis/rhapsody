@@ -154,7 +154,7 @@ mod tests {
     }
 
     async fn post_message(url: &str, body: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -209,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn message_get_is_405() {
         let base = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .get(format!("{base}/api/v1/runs/7/message"))
             .send()
             .await

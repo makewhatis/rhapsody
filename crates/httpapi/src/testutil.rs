@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -122,6 +122,10 @@ pub(crate) struct FakeProvider {
     /// (STUDIO-749).
     diff_outcome: Option<DiffOutcome>,
     diff_asked: Mutex<Option<i64>>,
+    /// Every [`StateProvider`] call made on this fake, of any kind. The operator-write guard's tests
+    /// (STUDIO-982) assert a refused request leaves this at zero, i.e. the guard ran before any
+    /// read or side effect.
+    calls: AtomicUsize,
 }
 
 impl FakeProvider {
@@ -177,6 +181,7 @@ impl FakeProvider {
             mergeability_asked: Mutex::new(None),
             diff_outcome: None,
             diff_asked: Mutex::new(None),
+            calls: AtomicUsize::new(0),
         }
     }
 
@@ -430,6 +435,15 @@ impl FakeProvider {
         self
     }
 
+    /// How many [`StateProvider`] calls this fake has served.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn touch(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// The run id the last `run_diff` read asked about — `None` proves the daemon was never asked.
     pub(crate) fn diff_asked(&self) -> Option<i64> {
         *self
@@ -442,6 +456,7 @@ impl FakeProvider {
 #[async_trait]
 impl StateProvider for FakeProvider {
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+        self.touch();
         match &self.snap_err {
             Some(message) => Err(SnapshotError::new(message.clone())),
             None => Ok(self.snap.clone()),
@@ -449,6 +464,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn issue_lifecycles(&self, ids: &[String]) -> HashMap<String, IssueLifecycleRow> {
+        self.touch();
         *self
             .issue_lifecycles_asked
             .lock()
@@ -463,6 +479,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn review_tickets(&self, ids: &[String]) -> HashSet<String> {
+        self.touch();
         *self
             .review_tickets_asked
             .lock()
@@ -474,6 +491,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn issue_assignees(&self, keys: &[IssueKey]) -> HashMap<String, String> {
+        self.touch();
         *self
             .issue_assignees_asked
             .lock()
@@ -488,14 +506,17 @@ impl StateProvider for FakeProvider {
     }
 
     fn history(&self) -> Arc<dyn HistoryStore> {
+        self.touch();
         self.history.clone()
     }
 
     fn run_transcript(&self, _run_id: i64) -> Option<Vec<LogEntry>> {
+        self.touch();
         self.transcript.clone()
     }
 
     async fn list_linear_projects(&self) -> Result<Vec<Project>, ReadsError> {
+        self.touch();
         if self.projects_config_not_loaded {
             return Err(ReadsError::ConfigNotLoaded);
         }
@@ -503,12 +524,14 @@ impl StateProvider for FakeProvider {
     }
 
     async fn connected_viewer(&self) -> (Identity, Option<String>) {
+        self.touch();
         // The resolution-error (Option) is only logged by the handler; no mirrored test exercises it
         // (Go's linear_test.go leaves `identityErr` unset), so the fake never surfaces one.
         (self.identity.clone(), None)
     }
 
     async fn stop_run(&self, run_id: i64) -> Result<StopResult, RunActionError> {
+        self.touch();
         self.stop_run_id.store(run_id, Ordering::SeqCst);
         match &self.stop_err {
             Some(message) => Err(RunActionError::new(message.clone())),
@@ -517,6 +540,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError> {
+        self.touch();
         self.resume_run_id.store(run_id, Ordering::SeqCst);
         match &self.resume_err {
             Some(message) => Err(RunActionError::new(message.clone())),
@@ -525,6 +549,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError> {
+        self.touch();
         self.handoff_run_id.store(run_id, Ordering::SeqCst);
         match &self.handoff_err {
             Some(message) => Err(RunActionError::new(message.clone())),
@@ -533,16 +558,19 @@ impl StateProvider for FakeProvider {
     }
 
     async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.touch();
         self.message_run_id.store(run_id, Ordering::SeqCst);
         *self.message_text.lock().expect("message_text lock") = text.to_string();
         self.message_result.clone()
     }
 
     fn refresh(&self) -> RefreshResult {
+        self.touch();
         self.refresh_result.clone()
     }
 
     fn drain_status(&self) -> rhapsody_orchestrator::drain::DrainStatus {
+        self.touch();
         self.drain.status()
     }
 
@@ -551,6 +579,7 @@ impl StateProvider for FakeProvider {
         active: bool,
         reason: rhapsody_orchestrator::drain::DrainReason,
     ) -> rhapsody_orchestrator::drain::DrainStatus {
+        self.touch();
         if active {
             self.drain.arm(chrono::Utc::now(), reason);
         } else {
@@ -560,10 +589,12 @@ impl StateProvider for FakeProvider {
     }
 
     fn workflow_path(&self) -> &str {
+        self.touch();
         &self.workflow_path
     }
 
     fn validate_config(&self, def: &Definition) -> Result<(), ConfigValidateError> {
+        self.touch();
         // Mirror the Go fake's ValidateConfig: Decode → Resolve → ValidateDispatch (the real
         // orchestrator additionally runs buildEffective; that extra gate is covered by the
         // orchestrator crate's own validate_config test). `resolve` bases relative paths on the
@@ -585,6 +616,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::RoomView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.room(limit)
     }
 
@@ -594,6 +626,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::RosterView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.roster()
     }
 
@@ -603,18 +636,22 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::TeamsView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.overview()
     }
 
     fn teams_enabled(&self) -> bool {
+        self.touch();
         self.teams_memory.as_ref().is_some_and(|m| m.enabled())
     }
 
     fn teams_config_path(&self) -> &str {
+        self.touch();
         &self.teams_config_path
     }
 
     async fn reviews(&self) -> Result<ReviewsView, rhapsody_store::StoreError> {
+        self.touch();
         match &self.reviews_err {
             Some(message) => Err(rhapsody_store::StoreError::Io(std::io::Error::other(
                 message.clone(),
@@ -624,6 +661,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn review_rerun(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.touch();
         *self
             .review_rerun_pr
             .lock()
@@ -634,6 +672,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.touch();
         *self
             .review_dismiss_pr
             .lock()
@@ -644,6 +683,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn review_clear(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.touch();
         *self
             .review_clear_pr
             .lock()
@@ -654,6 +694,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
+        self.touch();
         *self
             .merge_asked
             .lock()
@@ -665,6 +706,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
+        self.touch();
         *self
             .mergeability_asked
             .lock()
@@ -675,6 +717,7 @@ impl StateProvider for FakeProvider {
     }
 
     async fn run_diff(&self, run_id: i64) -> DiffOutcome {
+        self.touch();
         *self
             .diff_asked
             .lock()
@@ -693,6 +736,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::RecallView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.recall(identity, query, state).await
     }
 
@@ -705,6 +749,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::InvalidateView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.invalidate(identity, fact_id, reason).await
     }
 
@@ -716,6 +761,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::ReinstateView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.reinstate(identity, fact_id).await
     }
 
@@ -727,6 +773,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::RetainView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?
             .retain_for_run(run_id, content, fixed_instant())
             .await
@@ -747,6 +794,7 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::PostView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?
             .post_for_run(run_id, body, to, refs, fixed_instant())
     }
@@ -762,10 +810,12 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::PostView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
+        self.touch();
         self.teams()?.post_as_operator(body, refs, fixed_instant())
     }
 
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
+        self.touch();
         self.capabilities_registry.clone()
     }
 }
@@ -787,13 +837,34 @@ impl FakeProvider {
     }
 }
 
+/// A client whose every request carries `X-Rhapsody-Operator: 1` — the operator's own client, as
+/// the dashboard, `rhapsodyd mcp` and the desktop proxy are (STUDIO-982). Handler tests that exercise
+/// a write's behaviour use it so the request gets past the operator-write guard; the guard's own
+/// tests in `operator_guard` cover the requests that must not.
+pub(crate) fn operator_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        crate::operator_guard::OPERATOR_HEADER,
+        reqwest::header::HeaderValue::from_static(crate::operator_guard::OPERATOR_HEADER_VALUE),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build operator client")
+}
+
 pub(crate) async fn spawn_router(router: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
     let addr = listener.local_addr().expect("resolve bound address");
     tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<crate::operator_guard::BoundAddr>(),
+        )
+        .await
+        .expect("serve");
     });
     format!("http://{addr}")
 }

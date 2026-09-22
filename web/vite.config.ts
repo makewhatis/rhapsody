@@ -44,8 +44,16 @@ export default defineConfig({
       "/api": {
         // Defaults to the daemon's local port (Makefile `run` => PORT ?= 8799);
         // override with SYMPHONY_API_URL. Dev-server only — not in the built bundle.
-        target: process.env.SYMPHONY_API_URL ?? "http://localhost:8799",
+        // 127.0.0.1, not localhost, and no Origin/Cookie forwarded: the daemon's operator-write
+        // guard (STUDIO-982) wants Host 127.0.0.1:<port> and a same-origin, cookie-free write.
+        target: process.env.SYMPHONY_API_URL ?? "http://127.0.0.1:8799",
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyReq) => {
+            proxyReq.removeHeader("origin");
+            proxyReq.removeHeader("cookie");
+          });
+        },
       },
     },
   },
