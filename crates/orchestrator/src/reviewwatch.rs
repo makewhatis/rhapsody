@@ -6388,9 +6388,7 @@ mod tests {
         );
 
         assert!(
-            o.author_rounds_pending
-                .get(&churn_key(&coord(12)))
-                .is_none(),
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
             "the clear drops the pending author round with the budget"
         );
         o.settle_author_round(&coord(12), HEAD_B);
@@ -6530,6 +6528,7 @@ mod tests {
                 last_state: String::new(),
                 // The max_turns backstop, not a declared hand-off.
                 declared_handoff: false,
+                refused: false,
             },
         );
 
