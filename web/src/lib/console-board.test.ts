@@ -25,6 +25,13 @@ it("fetches token-ceiling-stopped tickets as active", () => {
   expect(BOARD_ACTIVE_OUTCOMES).toContain("token_ceiling");
 });
 
+// STUDIO-988 — a zero-turn refusal is a non-terminal ticket's newest run (no agent ran; the daemon
+// refused before the claim), so it must stay on the board's active fetch rather than vanish while
+// the operator fixes the credential.
+it("fetches refused tickets as active", () => {
+  expect(BOARD_ACTIVE_OUTCOMES).toContain("refused");
+});
+
 const cards = (board: BoardLane[]) => board.flatMap((l) => l.cards);
 const laneIssues = (board: BoardLane[], id: BoardLane["id"]) =>
   board.find((l) => l.id === id)?.cards.map((c) => c.issue);

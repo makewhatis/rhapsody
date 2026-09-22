@@ -2377,6 +2377,13 @@ impl Orchestrator {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
                 }
+                // STUDIO-988: preparation began (or the refusal gate suppressed an identical
+                // refusal). The watch row was NOT written, so this head is re-offered next sweep —
+                // a re-offer joins the existing reservation rather than spawning a second review.
+                ReviewDispatchOutcome::Preparing => {
+                    report.deferred += 1;
+                    tracing::debug!(pr = %pr, "ticketless review: preparation in flight");
+                }
             }
         }
 

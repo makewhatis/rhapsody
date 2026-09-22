@@ -1628,6 +1628,48 @@ preserved by `encode` (a console Save keeps it) but deliberately NOT rendered by
 whose response is byte-pinned to the Go config goldens.
 
 
+### Asynchronous prepared dispatch and zero-turn refusals (STUDIO-988)
+
+Go v0.4.0 resolves a run's credential inline on the control goroutine and has no concept of a
+refused-before-dispatch run. Rhapsody adds one generic off-loop preparation state ahead of every
+claim/workspace/active-run/mailbox/review-watch side effect. With no preparation resolver installed
+— the default until the provider/broker lane (PB7) lands — every dispatch path runs inline and is
+**byte-identical** to a daemon built before this change; the mechanism only engages when a resolver
+is injected.
+
+When it engages, the control task inserts a loop-owned `preparing` reservation (keyed by ticket or
+review identity) before spawning resolver work, so a preparation counts against every duplicate and
+concurrency gate exactly as a live run does. The resolver reports back over the control channel; a
+completion is accepted only for the current token **and** config generation, after re-checking drain
+and eligibility, and a stale completion drops its move-only payload without touching loop state.
+Cancellation (Stop/reload/shutdown/a departed issue) releases a reservation exactly once, and the
+concurrency permit for a resolver task is held by that task for its whole lifetime even after the
+loop-side timeout, so retries cannot accumulate unbounded resolver work.
+
+A typed preparation failure is a **refusal**, not a failed agent attempt: it writes exactly one
+zero-turn run row with the new Rhapsody-only outcome `refused` (distinct from `failed` and from
+queued work; the console renders it `blocked`, like a token-ceiling stop) and arms a bounded refusal
+gate keyed by `(identity, selection fingerprint, opaque credential revision)`. The gate re-probes on
+a bounded backoff or immediately when an input changes — a workflow reload, an explicit
+`POST /api/v1/refresh`, or a credential mutation — and repeating an identical refusal advances the
+backoff without appending a second history row. No claim, workspace, mailbox, or review-watch row is
+created for a refusal.
+
+No credential value or bound lease appears in `Debug`/`Display`, telemetry, provenance, API JSON, or
+error strings: the completion carries the opaque revision only, and `PreparedDispatch` is move-only
+(never `Clone`), so no second consumer can retain it.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| credential resolution | inline on the control goroutine | off-loop, evented `preparing` reservation |
+| refused-before-dispatch | no such outcome | its own zero-turn `refused` run outcome |
+| duplicate/concurrency gate | running/claimed only | `preparing` participates too |
+| refusal re-arm | n/a | bounded backoff + reload/refresh/credential-mutation |
+
+The ticketless review path shares the same machinery: its watch-set writes move behind the
+preparation gate, and a review preparation or suppression returns `Preparing` without writing a row.
+
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it

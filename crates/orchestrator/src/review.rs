@@ -307,6 +307,11 @@ pub enum ReviewDispatchOutcome {
     /// exactly as [`ReviewDispatchOutcome::Draining`] defers. Distinct from `Refused` because it is
     /// a deliberate, temporary hold an operator can act on, not a coordinate that can never work.
     BudgetHeld,
+    /// Preparation for this review is in flight (STUDIO-988), or the refusal gate suppressed an
+    /// identical refusal. Nothing observable was written: the watch-set writes happen only once
+    /// preparation is accepted, so the sweep can re-offer this head — a re-offer hits the same
+    /// reservation (or the gate) rather than spawning a second review.
+    Preparing,
 }
 
 impl Orchestrator {
@@ -325,7 +330,7 @@ impl Orchestrator {
     /// and pointing a second agent at the first one's detached worktree (design §14.1 F-DUP). The
     /// running/claimed half of the eligibility check is therefore reproduced here, where the review
     /// path cannot forget it.
-    pub fn dispatch_review(&mut self, mut run: ReviewRun) -> ReviewDispatchOutcome {
+    pub fn dispatch_review(&mut self, run: ReviewRun) -> ReviewDispatchOutcome {
         // §16: gated on teams.enabled, structurally, before anything is observed or written.
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
             return ReviewDispatchOutcome::TeamsOff;
@@ -424,6 +429,40 @@ impl Orchestrator {
             self.release_budget_hold(&id);
         }
 
+        // STUDIO-988: the review path shares the same preparation machinery as a ticket dispatch.
+        // With no resolver installed this returns `NoResolver` and the dispatch below runs inline,
+        // byte-identical to the pre-feature behavior; with one, the watch-set writes move into
+        // `finish_review_dispatch` and only run once preparation is accepted — so a refused review
+        // leaves no watch row behind.
+        let target = crate::prepare::PreparedTarget::Review {
+            issue: iss.clone(),
+            run: Box::new(run.clone()),
+            route: route.clone(),
+        };
+        match self.begin_preparation(target, false) {
+            crate::prepare::BeginPreparation::NoResolver => {
+                self.finish_review_dispatch(run, route, iss);
+                ReviewDispatchOutcome::Dispatched
+            }
+            crate::prepare::BeginPreparation::Started(_)
+            | crate::prepare::BeginPreparation::AlreadyPreparing
+            | crate::prepare::BeginPreparation::Suppressed => ReviewDispatchOutcome::Preparing,
+            crate::prepare::BeginPreparation::AlreadyInFlight => {
+                ReviewDispatchOutcome::AlreadyInFlight
+            }
+        }
+    }
+
+    /// The tail of a review dispatch: record the dispatched head, stage the pending review, and
+    /// dispatch the synthetic issue. Extracted (STUDIO-988) so an asynchronous preparation can run it
+    /// only after a successful completion, keeping every watch-set write behind the preparation gate.
+    pub(crate) fn finish_review_dispatch(
+        &mut self,
+        mut run: ReviewRun,
+        route: DispatchRoute,
+        iss: Issue,
+    ) {
+        let id = run.key();
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
         // watcher's re-review condition is level-triggered and stays true on every tick between
         // introduction and first completion, which is what produced the duplicate dispatch the guard
@@ -469,7 +508,6 @@ impl Orchestrator {
         // call rather than stamped onto the running entry after it.
         self.pending_review.insert(id, run);
         self.dispatch_issue(iss, None, Some(route), String::new());
-        ReviewDispatchOutcome::Dispatched
     }
 
     /// Resolves the dispatch routing for a pull request's repository: the enabled project whose

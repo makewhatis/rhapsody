@@ -227,6 +227,10 @@ const GH_ENRICH_BUDGET_DIVISOR: u32 = 2;
 pub enum Event {
     /// A poll-timer fire (Go `evTick`).
     Tick,
+    /// An explicit operator refresh (`POST /api/v1/refresh`, STUDIO-988): re-arms the refusal gate so
+    /// a suppressed fingerprint is re-probed immediately, then runs the ordinary tick. Distinct from
+    /// [`Event::Tick`] only in that re-arm.
+    Refresh,
     /// A worker task's terminal report (Go `evWorkerExit`).
     WorkerExit(EvWorkerExit),
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
@@ -424,6 +428,14 @@ pub enum Event {
         plan: Box<crate::runmerge::MergePlan>,
         outcome: crate::runmerge::MergeControlOutcome,
         reply: oneshot::Sender<()>,
+    },
+    /// An off-loop preparation's completion (STUDIO-988, P6; NEW beyond Go v0.4.0). The resolver task
+    /// sends this back; the control task accepts it only for the CURRENT token/config generation and
+    /// drops a stale payload without touching loop state.
+    DispatchPrepared {
+        id: String,
+        token: crate::prepare::PreparationToken,
+        completion: crate::prepare::PreparationCompletion,
     },
 }
 
@@ -625,6 +637,10 @@ impl Orchestrator {
     async fn handle(&mut self, ev: Event) {
         match ev {
             Event::Tick => self.on_tick().await,
+            Event::Refresh => {
+                self.rearm_refusal_gate();
+                self.on_tick().await;
+            }
             Event::WorkerExit(e) => self.on_worker_exit(e),
             Event::AgentUpdate(e) => self.on_agent_update(e),
             Event::TranscriptOpened { issue_id, path } => {
@@ -632,6 +648,11 @@ impl Orchestrator {
             }
             Event::Retry(e) => self.on_retry(e).await,
             Event::Reload => self.on_reload(),
+            Event::DispatchPrepared {
+                id,
+                token,
+                completion,
+            } => self.handle_dispatch_prepared(id, token, completion),
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
             }
@@ -932,6 +953,13 @@ impl Orchestrator {
                 tagged.iter().map(|t| (&t.iss, t.proj)),
                 std::time::Instant::now(),
             );
+            // STUDIO-988: an issue that dropped out of this tick's candidate set must not keep a
+            // preparation reservation / resolver task / slot.
+            if !self.preparing.is_empty() {
+                let present: std::collections::HashSet<String> =
+                    tagged.iter().map(|t| t.iss.id.clone()).collect();
+                self.cancel_dropped_preparations(&present);
+            }
             let (picked, reopen, held_for_capacity) =
                 self.select_dispatch_multi_after_fetch(tagged, read_the_board);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
@@ -952,11 +980,11 @@ impl Orchestrator {
                 }
             }
             for (iss, route) in direct {
-                self.dispatch_issue(iss, None, route, String::new());
+                self.dispatch_or_prepare(iss, None, route, String::new());
             }
             for ti in self.claim_winners(pool_picks).await {
                 let route = self.route_for(ti.proj);
-                self.dispatch_issue(ti.iss, None, route, String::new());
+                self.dispatch_or_prepare(ti.iss, None, route, String::new());
             }
             // Review-reopens: promote (Linear WRITE) THEN dispatch.
             for ti in reopen {
@@ -1022,6 +1050,12 @@ impl Orchestrator {
             issues.iter().map(|iss| (iss, None)),
             std::time::Instant::now(),
         );
+        // STUDIO-988: cancel any preparation whose issue dropped out of this tick's candidate set.
+        if !self.preparing.is_empty() {
+            let present: std::collections::HashSet<String> =
+                issues.iter().map(|i| i.id.clone()).collect();
+            self.cancel_dropped_preparations(&present);
+        }
         let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
@@ -1037,11 +1071,11 @@ impl Orchestrator {
                 .map(|iss| TaggedIssue { iss, proj: None })
                 .collect();
             for ti in self.claim_winners(pool_picks).await {
-                self.dispatch_issue(ti.iss, None, None, String::new());
+                self.dispatch_or_prepare(ti.iss, None, None, String::new());
             }
         } else {
             for iss in active {
-                self.dispatch_issue(iss, None, None, String::new());
+                self.dispatch_or_prepare(iss, None, None, String::new());
             }
         }
         for iss in reopen {
@@ -1406,6 +1440,10 @@ impl Orchestrator {
         let reopen_summons = iss
             .latest_summon_at
             .map(|at| (iss.id.clone(), at, iss.latest_summon_body.clone()));
+        // NOTE (STUDIO-988): this reopen path seeds its summons into the run's mailbox immediately
+        // after dispatch, which cannot survive an asynchronous preparation. It therefore keeps the
+        // inline dispatch until PB7 lands the provider integration; see the PR body's residual-scope
+        // note.
         self.dispatch_issue(iss, None, route, String::new());
         if let Some((id, at, body)) = reopen_summons {
             self.seed_reopen_summons(&id, at, &body);
@@ -1474,6 +1512,9 @@ impl Orchestrator {
         for re in self.running.values() {
             re.cancel.cancel();
         }
+        // STUDIO-988: an in-flight preparation is work this daemon is abandoning; cancel it so its
+        // resolver task stops waiting and a late completion is stale.
+        self.cancel_all_preparations();
         if let Some(t) = self.tick_timer.take() {
             t.abort();
         }
@@ -1804,7 +1845,8 @@ impl ControlHandle {
     pub fn refresh(&self) -> RefreshResult {
         // Best-effort: a send failure means the loop is already gone (the daemon is shutting down), in
         // which case the tick is moot; still report `queued` to match Go's unconditional result shape.
-        let _ = self.events.send(Event::Tick);
+        // STUDIO-988: an explicit refresh also re-arms the refusal gate (see `Event::Refresh`).
+        let _ = self.events.send(Event::Refresh);
         RefreshResult {
             queued: true,
             coalesced: false,

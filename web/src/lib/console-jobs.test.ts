@@ -103,6 +103,15 @@ describe("consoleJobStatus", () => {
     expect(needsOperator("blocked", "token_ceiling")).toBe(true);
   });
 
+  // STUDIO-988 — a prepared-dispatch refusal is its own outcome: no agent ran, so it is never
+  // "queued" work and never a failed agent attempt, but it still needs a person to fix the
+  // credential. It maps onto `blocked` for the same reason a token-ceiling stop does.
+  it("maps a zero-turn refusal onto blocked, distinctly from queued", () => {
+    expect(consoleJobStatus("refused")).toBe("blocked");
+    expect(consoleJobStatus("refused", "open")).toBe("blocked");
+    expect(needsOperator("blocked", "refused")).toBe(true);
+  });
+
   // STUDIO-702 — the ticket's real state outranks the run outcome. Without it every completed run
   // read as "in review" forever, however long ago the ticket merged.
   it("prefers the ticket's lifecycle over the run outcome", () => {

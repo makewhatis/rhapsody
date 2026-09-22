@@ -99,6 +99,7 @@ pub(crate) struct RetryTarget<'a> {
 /// The owning resolved project's routing snapshot, passed by value to [`Orchestrator::dispatch_issue`]
 /// (Go passes a `*resolvedProject`; the Rust borrow checker forbids holding that borrow across the
 /// `&mut self` dispatch, so the fields the dispatch stamps are cloned out).
+#[derive(Debug, Clone)]
 pub(crate) struct DispatchRoute {
     pub slug: String,
     pub group: String,
@@ -1253,7 +1254,7 @@ impl Orchestrator {
             }
         }
         let attempt = re.attempt;
-        self.dispatch_issue(iss, Some(attempt), cfg.route, String::new());
+        self.dispatch_or_prepare(iss, Some(attempt), cfg.route, String::new());
     }
 
     /// Resolves a fired retry's routing against the current effective set. Snapshots the config into

@@ -902,6 +902,27 @@ pub struct Orchestrator {
     /// when the previous tick found the drain armed, which is what makes the cancel transition
     /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
     pub(crate) drain_gate: Option<crate::drain::DrainGateLog>,
+
+    // --- STUDIO-988: asynchronous prepared-dispatch + zero-turn refusal (Rhapsody-only; `prepare.rs`). ---
+    /// The loop-owned `preparing` reservations — the duplicate/concurrency gate that exists before a
+    /// `RunningEntry`. Control-task-confined, like every scheduling map here. Empty (and never read)
+    /// unless a preparation resolver is installed, so the default daemon is byte-identical.
+    pub(crate) preparing: crate::prepare::PreparingReservations,
+    /// The injected preparation resolver. `None` ⇒ no asynchronous preparation: every dispatch path
+    /// runs inline exactly as before the feature existed (the default for tests and any build PB7 has
+    /// not wired yet).
+    pub(crate) prepare_resolver: Option<Arc<dyn crate::prepare::PreparationResolver>>,
+    /// The config generation a preparation began under; bumped on every reload so a stale completion
+    /// can never mutate state.
+    pub(crate) prepare_generation: u64,
+    /// The per-preparation timeout. A field (not a const) so tests can shrink it.
+    pub(crate) prepare_timeout: std::time::Duration,
+    /// The daemon-wide bound on concurrent resolver tasks. Shared with each spawned task, which holds
+    /// its permit for the task's whole lifetime.
+    pub(crate) prepare_semaphore: Arc<tokio::sync::Semaphore>,
+    /// The bounded refusal gate: suppresses the identical `(identity, selection, credential
+    /// revision)` refusal until an input changes or its next-probe time arrives.
+    pub(crate) refusal_gate: crate::prepare::RefusalGate,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -1031,6 +1052,16 @@ impl Orchestrator {
             // inert, i.e. byte-identical to a daemon built before the feature.
             drain: crate::drain::DrainSignal::new(),
             drain_gate: None,
+            // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
+            // default and every dispatch path is byte-identical to a daemon built before the feature.
+            preparing: crate::prepare::PreparingReservations::default(),
+            prepare_resolver: None,
+            prepare_generation: 0,
+            prepare_timeout: crate::prepare::DEFAULT_PREPARATION_TIMEOUT,
+            prepare_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                crate::prepare::MAX_PREPARATION_CONCURRENCY,
+            )),
+            refusal_gate: crate::prepare::RefusalGate::default(),
         }
     }
 
@@ -1092,16 +1123,30 @@ impl Orchestrator {
 
     /// Returns the set of currently-running issue ids (Go `runningIDSet`). The selection pass seeds
     /// its per-tick reservation set from this so one tick cannot re-dispatch an in-flight issue.
+    ///
+    /// STUDIO-988 folds in the loop-owned `preparing` reservations: a preparation holds the same
+    /// duplicate/concurrency reservation a running entry would, so the next tick's ladder must skip
+    /// it exactly as it skips a live run.
     pub(crate) fn running_id_set(&self) -> HashSet<String> {
-        self.running.keys().cloned().collect()
+        let mut ids: HashSet<String> = self.running.keys().cloned().collect();
+        ids.extend(self.preparing.ids().cloned());
+        ids
     }
 
     /// Counts running issues per NORMALIZED state (Go `runningStateCounts`) — the base the selection
-    /// pass measures the per-state cap against.
+    /// pass measures the per-state cap against. STUDIO-988 adds the `preparing` reservations to the
+    /// in-flight count so a preparation counts against its state's slot before a `RunningEntry`
+    /// exists.
     pub(crate) fn running_state_counts(&self) -> HashMap<String, i64> {
         let mut counts: HashMap<String, i64> = HashMap::new();
         for re in self.running.values() {
             *counts.entry(normalize_state(&re.issue.state)).or_insert(0) += 1;
+        }
+        for entry in self.preparing.values() {
+            let state = entry.issue_state();
+            if !state.is_empty() {
+                *counts.entry(normalize_state(state)).or_insert(0) += 1;
+            }
         }
         counts
     }
