@@ -745,6 +745,10 @@ impl Orchestrator {
     /// Runs come back newest-first, so the first qualifying start is the newest. Mirrors Go
     /// `lastRunStartedAt` (its zero-`time.Time` sentinel becomes `None`).
     pub(crate) fn last_run_started_at(&self, identifier: &str) -> Option<DateTime<Utc>> {
+        // Newest 10 rows only (Go's `issueHistory(…, 10)` bound) — enough to find a recent start and
+        // bound the store read on the dispatch path. A ticket whose ten newest rows were ALL refusal
+        // episodes (ten separate episodes, so unlikely) reads as "never worked"; the window is
+        // deliberately not widened here (STUDIO-988 review round 5, jimmy smaller).
         let runs = self.store().issue_history(identifier, "", 10).ok()?;
         for r in runs {
             // `refused` rows are skipped for the same reason `interrupted` ones are: a zero-turn

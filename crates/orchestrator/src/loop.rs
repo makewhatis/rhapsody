@@ -3033,6 +3033,14 @@ mod tests {
             eff.review_states = set_of(&["in review"]);
             eff.active_states = set_of(&["todo", "in progress"]);
             eff.review_promote_state = "In Progress".to_string();
+            // The multi-project reopen ladder offers a reopen from the OWNING project's
+            // `review_states`/`active_states`, and completion revalidation now reads those same sets
+            // (STUDIO-988 review round 6, alice #1). A fixture whose routed project named no review
+            // state would describe a reopen the ladder never offers; set both so it is reachable.
+            for p in eff.projects.iter_mut() {
+                p.review_states = set_of(&["in review"]);
+                p.active_states = set_of(&["todo", "in progress"]);
+            }
         }
         let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
             rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),

@@ -1122,13 +1122,21 @@ impl Orchestrator {
                 // Current eligibility, excluding this identity's own claim/reservation.
                 let mut running = self.running_id_set();
                 running.remove(&issue.id);
+                // The eligibility inputs are the ROUTED project's when the slug resolves, else the
+                // top-level effective. The multi-project reopen ladder offers a reopen from the
+                // owning project's `review_states`/`active_states`, so the reopen arm below must read
+                // those same sets — reading the top-level ones made every reopen on a project with its
+                // own `review_states` override `Stale`, and since `Stale` arms no gate the ladder
+                // re-offered it every tick and the summons was never acted on (STUDIO-988 review
+                // round 6, alice #1). Building the gate once keeps both questions on one resolution.
+                let mut gate = eligibility_gate_for(eff, route.as_ref());
                 if reopen.is_some() {
                     // A review-reopen target is still in its REVIEW state (the promote is deferred
                     // until acceptance), so the board question is the reopen ladder's — still a
                     // review-state ticket with a fresh summons — not active-state eligibility, which
                     // would reject it outright (STUDIO-988 review round 4, jimmy #3).
                     let st = normalize_state(&cur.state);
-                    if !eff.review_states.contains(&st) || eff.active_states.contains(&st) {
+                    if !gate.review.contains(&st) || gate.active.contains(&st) {
                         return PreparedValidity::Stale;
                     }
                     if !self.review_reopen_eligible(&cur, &running) {
@@ -1144,7 +1152,6 @@ impl Orchestrator {
                 }
                 let mut claimed = self.claimed.clone();
                 claimed.remove(&issue.id);
-                let mut gate = eligibility_gate_for(eff, route.as_ref());
                 if entry.claim_already_held {
                     // A claim-held retry is admitted by `on_retry` with NO required-label gate, so
                     // revalidation must ask the same question or a label stripped mid-run livelocks
@@ -3870,6 +3877,39 @@ mod tests {
         assert!(o.preparing.is_empty());
     }
 
+    // MUTATION GUARD (STUDIO-988 review round 6, alice #2): a REFUSED completion carrying a
+    // NON-EMPTY revision that disagrees with the loop's expected revision is stale and must be
+    // dropped without arming the gate — the refusal read a credential the loop has since moved past,
+    // so it is not a verdict about the current credential. Replacing the `Refused` arm's comparison
+    // with `false` leaves the suite green without this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_at_a_stale_credential_revision_is_dropped() {
+        let (mut o, _sink, _calls) =
+            orch_with_resolver(Scripted::Refused(RefusalReason::CredentialAbsent));
+        o.set_prepare_expected_revision(Some("rev-2".to_string()));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: "rev-1".to_string(),
+                resolved: fake_selection(),
+            },
+        )
+        .await;
+        assert_eq!(
+            o.refusal_gate.len(),
+            0,
+            "a refusal read at a superseded revision must not arm the gate"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
     // MUTATION GUARD (STUDIO-988 review round 5, sol #1 / alice C): compare the observed revision
     // unconditionally and a typed TIMEOUT that never reached a credential (empty observed revision)
     // is dropped as stale — no refusal row, no armed gate, so a locked credential is re-probed every
@@ -4018,6 +4058,93 @@ mod tests {
             sink.lock().expect("dispatch sink").len(),
             1,
             "the reopen dispatches once the budget is free"
+        );
+    }
+
+    // STUDIO-988 review round 6 (alice #1): the reopen arm of `prepared_target_still_current` must
+    // revalidate against the ROUTED project's `review_states`/`active_states`, not the top-level sets.
+    // The multi-project reopen ladder offers a reopen from the owning project's sets, so reading the
+    // top-level ones (empty here) judged the target `Stale` — and, because `Stale` arms no gate, the
+    // ladder re-offered it every tick while the summons was never acted on.
+    //
+    // MUTATION GUARD: read `eff.review_states`/`eff.active_states` instead of `gate.review`/
+    // `gate.active` and neither the promote nor the dispatch below happens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_routed_reopen_revalidates_against_the_projects_review_states() {
+        let mut tr = Fake::new();
+        let mut iss = issue("1", "MT-1", "In Review");
+        iss.team_id = "team-1".to_string();
+        iss.latest_summon_at = Some(
+            Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
+                .single()
+                .expect("summon instant"),
+        );
+        tr.by_id.insert("1".to_string(), iss.clone());
+        let tracker = Arc::new(tr);
+        let mut eff = empty_effective(Arc::clone(&tracker) as Arc<dyn rhapsody_tracker::Tracker>);
+        // The TOP-LEVEL review set is empty; only the routed project names the review state.
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.review_promote_state = "In Progress".to_string();
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        let mut alpha = crate::testsupport::empty_resolved_project(
+            "alpha",
+            Arc::clone(&tracker) as Arc<dyn rhapsody_tracker::Tracker>,
+        );
+        alpha.active_states = set_of(&["todo", "in progress"]);
+        alpha.review_states = set_of(&["in review"]);
+        eff.projects = vec![alpha];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        crate::testsupport::seed_run(
+            store.as_ref(),
+            "1",
+            "MT-1",
+            Utc.with_ymd_and_hms(2029, 1, 1, 0, 0, 0)
+                .single()
+                .expect("prior run instant"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Ready),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+
+        let target = PreparedTarget::Ticket {
+            issue: iss,
+            attempt: None,
+            route: Some(sample_route()),
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: Some(ReopenPromote {
+                state: "In Progress".to_string(),
+                summon: None,
+            }),
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            tracker.move_calls().len(),
+            1,
+            "a reopen routed to a project that names the review state must promote"
+        );
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a reopen routed to a project that names the review state must dispatch"
         );
     }
 
