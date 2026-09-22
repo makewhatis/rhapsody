@@ -1804,13 +1804,15 @@ impl Orchestrator {
     /// **What bounds the runaway, stated exactly.** The threshold bounds ANSWERED exchanges: an
     /// author round advances the counter only when some reviewer actually read the head it produced.
     /// An unreviewed author loop therefore charges ZERO BY DESIGN — that is the ticket's acceptance 3,
-    /// not a gap in the bound, and it is why the two leaks below have to be named rather than waved
-    /// at as "one-shot".
+    /// not a gap in the bound, and it is why the leaks below have to be named rather than waved at as
+    /// "one-shot".
     ///
     /// The author can never summon ITSELF: both ladders in [`crate::select`] require a summons, and
-    /// the only summoner an author's own amending can sustain is a COMPLETED review — the very
-    /// completion that answers the pending round and charges it. So an author amending in a loop is
-    /// bounded exactly as before: one round per ANSWERED amendment, stopped by the threshold.
+    /// the only summoner that sustains an ANSWERED loop is a COMPLETED review — the very completion
+    /// that answers the pending round and charges it. So the loop the counter exists to bound is
+    /// still stopped at the threshold, one round per ANSWERED amendment. (The unreviewed summonses
+    /// listed below are named separately; they drive no charge, and before this change the charge
+    /// was per DISPATCH, so it climbed to that same threshold faster.)
     ///
     /// The writers that can summon the author with no review completing are NOT all one-shot, and
     /// the wording must say so rather than wave them away:
