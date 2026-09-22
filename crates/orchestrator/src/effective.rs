@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rhapsody_agent::{HarnessId, HarnessKnobs, HarnessSpec, Runner, claude, opencode};
+use rhapsody_agent::{Harness, HarnessId, HarnessKnobs, HarnessSpec, claude, opencode};
 use rhapsody_config::{Config, EffectiveConfig, effective_for, resolve_projects};
 use rhapsody_core::normalize_state;
 use rhapsody_tracker::{self as tracker, Tracker};
@@ -109,12 +109,12 @@ pub struct ResolvedProject {
     pub gh_owner: String,
     pub gh_repo: String,
 
-    pub agent: Arc<dyn Runner>,
+    pub agent: Arc<dyn Harness>,
     /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
     /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
     /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
     /// dispatch that names no harness uses, which is what keeps this additive.
-    pub agents: BTreeMap<String, Arc<dyn Runner>>,
+    pub agents: BTreeMap<String, Arc<dyn Harness>>,
     pub workspace: Arc<Manager>,
 }
 
@@ -124,12 +124,12 @@ pub struct Effective {
     pub cfg: Config,
     pub tracker: Arc<dyn Tracker>,
     pub workspace: Arc<Manager>,
-    pub agent: Arc<dyn Runner>,
+    pub agent: Arc<dyn Harness>,
     /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
     /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
     /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
     /// dispatch that names no harness uses, which is what keeps this additive.
-    pub agents: BTreeMap<String, Arc<dyn Runner>>,
+    pub agents: BTreeMap<String, Arc<dyn Harness>>,
     pub prompt_tmpl: String,
     pub active_states: HashSet<String>,
     pub terminal_states: HashSet<String>,
@@ -222,7 +222,7 @@ impl Effective {
 /// Claude's own config (design §1.2's "the seam cannot construct a non-Claude runner"); it now
 /// takes the harness-agnostic spec, though `"claude"` remains the only backend
 /// [`runner_for_backend`] implements — see that function's doc.
-pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
+pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Harness>;
 
 /// The production seam: build the runner the spec names. Mirrors Go `defaultRunnerFactory`
 /// (`claude.New`), generalized over [`HarnessKnobs`]'s variants.
@@ -230,7 +230,7 @@ pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
 /// Matched exhaustively with no wildcard arm on purpose: a third harness must stop this function
 /// compiling rather than silently resolve to claude. (Until STUDIO-902 there was one variant and
 /// this destructured it directly, for the same reason.)
-fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
+fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Harness> {
     match spec.knobs {
         HarnessKnobs::Claude(cc) => Arc::new(claude::Runner::new(cc)),
         HarnessKnobs::Opencode(oc) => Arc::new(opencode::Runner::new(oc)),
@@ -247,7 +247,7 @@ fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
 fn runner_for_backend(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
-) -> Result<Arc<dyn Runner>, OrchestratorError> {
+) -> Result<Arc<dyn Harness>, OrchestratorError> {
     match cfg.agent.backend.as_str() {
         "claude" | "opencode" => Ok(new_runner(harness_spec_from_cfg(cfg))),
         other => Err(OrchestratorError::UnsupportedBackend(other.to_string())),
@@ -264,9 +264,10 @@ pub(crate) const IMPLEMENTED_BACKENDS: &[&str] = &["claude", "opencode"];
 /// Whether THIS build can actually run `name` — the membership test `spawn_worker` makes against
 /// a resolved project's runner pool (built from [`IMPLEMENTED_BACKENDS`]) when a teammate profile
 /// names a harness (STUDIO-902). Exposed so `rhapsodyd teams show` can report a harness the
-/// dispatcher would silently fall back from, rather than printing it as though it would run
-/// (STUDIO-903). `""` is not implemented on purpose: an empty harness means "inherit
-/// `agent.backend`", which dispatch resolves before it ever asks this question.
+/// dispatcher would REFUSE, rather than printing it as though it would run (STUDIO-903; the refusal
+/// replaced the old silent fall back in STUDIO-978). `""` is not implemented on purpose: an empty
+/// harness means "inherit `agent.backend`", which dispatch resolves before it ever asks this
+/// question.
 pub fn harness_is_implemented(name: &str) -> bool {
     IMPLEMENTED_BACKENDS.contains(&name)
 }
@@ -285,7 +286,7 @@ pub fn harness_is_implemented(name: &str) -> bool {
 fn runners_by_harness(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
-) -> BTreeMap<String, Arc<dyn Runner>> {
+) -> BTreeMap<String, Arc<dyn Harness>> {
     let mut out = BTreeMap::new();
     for name in IMPLEMENTED_BACKENDS {
         let mut c = cfg.clone();
@@ -488,10 +489,11 @@ fn stall_timeout_ms_for(cfg: &Config, backend: &str) -> Option<i64> {
 /// 300000, so this changes nothing until an operator tunes one — which is exactly the operator who
 /// would be misled.
 ///
-/// An unrecognized harness name yields `None`, the same skip-don't-refuse posture
-/// `Loop::spawn_worker` takes when a profile names a harness this build has no runner for: the run
-/// is still perfectly runnable on the default, so it keeps the default's liveness window rather than
-/// losing stall detection to a typo.
+/// An unrecognized harness name yields `None`, which leaves the config's own timeout in force. That
+/// is now moot for such a run: `spawn_worker` REFUSES a profile naming a harness this build cannot
+/// run (STUDIO-978), so it never reaches a turn and never stalls. The `None` is kept as the honest
+/// "this build has no timeout knob for that name" answer rather than reinstating the old
+/// skip-don't-refuse assumption that the run would proceed on the default.
 pub(crate) fn stall_timeout_for_harness(cfg: &Config, harness: &str) -> Option<Duration> {
     if harness.is_empty() || harness == cfg.agent.backend {
         return None;
@@ -1026,7 +1028,7 @@ claude:
         // asserted to be well-formed and then built, so this test keeps measuring the thing it was
         // written to measure (which claude::Config each project's runner gets) rather than
         // accidentally measuring the new pre-build.
-        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Harness> {
             match spec.knobs {
                 HarnessKnobs::Claude(cc) => {
                     assert_eq!(spec.harness, HarnessId::Claude);
@@ -1084,7 +1086,7 @@ claude:
         // asserted to be well-formed and then built, so this test keeps measuring the thing it was
         // written to measure (which claude::Config each project's runner gets) rather than
         // accidentally measuring the new pre-build.
-        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Harness> {
             match spec.knobs {
                 HarnessKnobs::Claude(cc) => {
                     assert_eq!(spec.harness, HarnessId::Claude);
@@ -1241,6 +1243,24 @@ opencode:
             !harness_is_implemented(""),
             "the empty name is the inherit sentinel"
         );
+    }
+
+    /// STUDIO-978: the console derives a run's event fidelity and steering from
+    /// `rhapsody_agent::harness_id_for_name`, which is a SECOND string→harness map living in the
+    /// agent crate. It must cover every harness this crate's dispatch pool builds, or a newly
+    /// added backend would silently render as "unknown" (no fidelity, composer shown) while
+    /// actually running. Pin the two together at the pool's own edge so adding a backend to
+    /// `IMPLEMENTED_BACKENDS` without the name map reds here rather than drifting in production.
+    #[test]
+    fn the_name_map_covers_every_implemented_backend() {
+        for name in IMPLEMENTED_BACKENDS {
+            assert!(
+                rhapsody_agent::harness_id_for_name(name).is_some(),
+                "{name:?} is in the dispatch pool but the console's name map cannot address it"
+            );
+        }
+        assert_eq!(rhapsody_agent::harness_id_for_name("codex"), None);
+        assert_eq!(rhapsody_agent::harness_id_for_name(""), None);
     }
 
     /// `validate`'s `UnsupportedAgentBackend` check used to hardcode its own notion of "which

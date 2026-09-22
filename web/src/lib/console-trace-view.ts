@@ -16,6 +16,31 @@ import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "
 
 const DASH = "—";
 
+/**
+ * The observability a run's harness actually offers, read from the run's provenance (STUDIO-978).
+ *
+ * The daemon records the harness a run ran on and derives these two values from that harness's
+ * DECLARED capabilities, so the console renders what is true rather than assuming every harness
+ * looks like Claude. Two rules, both from the design's §5.1 dividing line:
+ *
+ *   * `reducedEvents` — the harness emits only final text, so there is no per-step spine to draw.
+ *     The Trace zone must SAY so instead of rendering an unexplained empty spine, which is
+ *     indistinguishable from a run that recorded nothing.
+ *   * `steeringAvailable` — the harness cannot be steered, so the message composer is HIDDEN (D7).
+ *     `undefined` (a run before this field existed, or an unknown harness) is treated as available,
+ *     because the field's ABSENCE is "unknown", not "none" — hiding on unknown would remove a
+ *     working control from every legacy run.
+ */
+export function harnessFidelity(p?: RunProvenance): {
+  reducedEvents: boolean;
+  steeringAvailable: boolean;
+} {
+  return {
+    reducedEvents: p?.harness_events === "final_text_only",
+    steeringAvailable: p?.harness_steering !== "none",
+  };
+}
+
 /** The spine's filter chips (design record §3C), All first. */
 export type TraceFilter = "all" | "edits" | "bash" | "errors";
 

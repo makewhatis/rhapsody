@@ -765,16 +765,24 @@ impl Orchestrator {
             .map_or_else(String::new, |e| e.cfg.agent.backend.clone())
     }
 
-    /// The harness a run actually runs on, given the harness its profile named (STUDIO-908): the
-    /// named one when this build implements it, else the configured backend. Mirrors the fallback
-    /// `spawn_worker` makes (STUDIO-902) — an unrecognized or unimplemented name runs on the
-    /// backend with a warning rather than refusing — so the review model this resolves to is the
-    /// model the run really uses.
-    pub(crate) fn harness_actually_run(&self, named: &str) -> String {
-        if !named.is_empty() && crate::effective::harness_is_implemented(named) {
-            named.to_string()
-        } else {
+    /// The harness a run RESOLVES to, given the harness its profile named (STUDIO-908): the named
+    /// harness whenever the profile names one, else the configured backend.
+    ///
+    /// Deliberately NOT a fall back (STUDIO-978). Before slice 5 an unrecognized or unimplemented
+    /// name silently ran on `agent.backend`; `spawn_worker` now REFUSES it instead. Recording the
+    /// backend for such a run described a harness that was never chosen on a run that never
+    /// happened, and the console then rendered the backend's event fidelity for it. So the named
+    /// harness is kept verbatim — an unimplemented one included — which is what lets
+    /// [`crate::httpapi`]'s provenance reader (via `harness_id_for_name`) omit the fidelity shape
+    /// and say "unknown" rather than assume the backend's.
+    ///
+    /// `""` — every profile that names none — still resolves to the configured backend, so a
+    /// dispatch that routes to nobody is byte-identical to before.
+    pub(crate) fn effective_harness(&self, named: &str) -> String {
+        if named.is_empty() {
             self.configured_backend()
+        } else {
+            named.to_string()
         }
     }
 
@@ -790,53 +798,50 @@ impl Orchestrator {
             .route_identity(teams, iss)
             .identity
             .map_or_else(String::new, |id| self.identity_harness(teams, &id));
-        self.harness_actually_run(&named)
+        self.effective_harness(&named)
     }
 
-    /// The required reviewers ([`Teams::review_required`]) a review cannot use as pinned
-    /// specialists, for [`crate::quorum::rank_reviewers`] to skip so a pinned identity can never
-    /// block a round (STUDIO-951). Two sets, because the two conditions it finds have opposite
-    /// consequences for the ranked fill (see [`ReviewerExclusions`]).
+    /// The roster identities a review cannot dispatch, for [`crate::quorum::rank_reviewers`] to
+    /// remove from BOTH the pinned prefix and the ranked fill (STUDIO-951, STUDIO-978).
     ///
-    /// Neither question is visible to the pure selector, which is why the orchestrator answers
-    /// them here:
+    /// Every roster member is classified, not only the pinned ones: the ranked fill can select any
+    /// of them, and a candidate the dispatch is refused for would re-offer a review row that never
+    /// completes. Two conditions make an identity undispatchable:
     ///
-    /// * **An unimplemented harness** (`unpinnable`) — the identity's profile names a harness this
-    ///   build has no runner for. `spawn_worker` silently falls back to `agent.backend` for such a
-    ///   profile, so the specialist the operator pinned is not the one who would review. Dropping
-    ///   the pin keeps the guarantee honest; keeping the name a ranked candidate keeps the teammate
-    ///   reviewing, which an operator who pinned them plainly wants.
-    /// * **A `review.model` refusal** (`unselectable`) — on the ticketless path,
-    ///   [`Teams::review_model_for`] answers `Refuse` when the operator scoped `review.model` to
-    ///   other harnesses than this reviewer's. `dispatch_review` refuses that review before any
-    ///   watch write, so the row would be re-offered every tick and never complete — exactly the
-    ///   merge-stalling shape the ticket forbids. This one is removed from the ranked fill too.
+    /// * **An unimplemented harness** — the identity's profile names a harness this build has no
+    ///   runner for. `spawn_worker` REFUSES such a dispatch (STUDIO-978) rather than falling back to
+    ///   `agent.backend` as it once did, so leaving the name a candidate would re-offer a review that
+    ///   can never run.
+    /// * **A `review.model` refusal** — on the ticketless path, [`Teams::review_model_for`] answers
+    ///   `Refuse` when the operator scoped `review.model` to other harnesses than this reviewer's.
+    ///   `dispatch_review` refuses that review before any watch write, so the row would be
+    ///   re-offered every tick and never complete.
     ///
-    /// Off-roster names are **not** included: the selector drops them itself (it only ever names
-    /// roster members) and the daemon reports them at boot
-    /// ([`Teams::unknown_required_reviewers`]). Empty whenever nothing is pinned, so the ranked
-    /// selection is then byte-identical to before this feature existed.
+    /// Both land in [`ReviewerExclusions::unselectable`] for the same reason: the dispatch is refused,
+    /// so the identity must not be offered as a reviewer at all. Off-roster names are **not**
+    /// included: the selector drops them itself (it only ever names roster members) and the daemon
+    /// reports them at boot ([`Teams::unknown_required_reviewers`]). Empty for a roster whose
+    /// profiles all name runnable harnesses, so the ranked selection is then byte-identical to before
+    /// this feature existed.
     pub(crate) fn reviewer_exclusions(&self, teams: &Teams) -> ReviewerExclusions {
         let backend = self.configured_backend();
         let mut exclusions = ReviewerExclusions::default();
-        for name in teams.review_required() {
-            if !teams.roster.iter().any(|i| i.name == name) {
+        for ident in &teams.roster {
+            let profile_harness = self.identity_harness(teams, &ident.name);
+            // A named harness this build cannot run is refused at spawn (STUDIO-978): the identity
+            // can never review, so it is removed from the ranked fill entirely.
+            if !profile_harness.is_empty()
+                && !crate::effective::harness_is_implemented(&profile_harness)
+            {
+                exclusions.unselectable.insert(ident.name.clone());
                 continue;
             }
-            // The harness the run would actually use, and separately the one its profile named: an
-            // explicit unimplemented name falls back to `backend`, which is real but is not the
-            // pinned specialist.
-            let profile_harness = self.identity_harness(teams, name);
-            let explicit_unimplemented = !profile_harness.is_empty()
-                && !crate::effective::harness_is_implemented(&profile_harness);
-            let harness = self.harness_actually_run(&profile_harness);
+            let harness = self.effective_harness(&profile_harness);
             if matches!(
                 teams.review_model_for(&harness, &backend),
                 rhapsody_config::teams::ReviewModelChoice::Refuse(_)
             ) {
-                exclusions.unselectable.insert(name.to_string());
-            } else if explicit_unimplemented {
-                exclusions.unpinnable.insert(name.to_string());
+                exclusions.unselectable.insert(ident.name.clone());
             }
         }
         exclusions
@@ -3195,19 +3200,20 @@ mod tests {
         );
     }
 
-    // ── required reviewers that cannot run (STUDIO-951) ─────────────────────────────────────────
+    // ── reviewers that cannot be dispatched (STUDIO-951, STUDIO-978) ─────────────────────────────
 
-    /// Edge 3's live half: a pin whose profile names a harness this build cannot run is reported
-    /// **unpinnable** — dropped as the pinned specialist but still a ranked candidate, because
-    /// `spawn_worker` falls back to `agent.backend` and the teammate really does review. A
+    /// A profile naming a harness this build cannot run is now **unselectable**: `spawn_worker`
+    /// REFUSES such a dispatch rather than falling back to `agent.backend` (STUDIO-978), so the
+    /// identity can never review and must be removed from the ranked fill, not merely unpinned. A
     /// teammate with no profile is not excluded at all: it runs on `agent.backend` like any other.
     /// An off-roster name is not reported here either — the pure selector drops it and the daemon
     /// warns at boot.
     ///
     /// Mutation check: make `reviewer_exclusions` return the default and the first assertion goes
-    /// red; put the unimplemented name in `unselectable` instead and the second goes red.
+    /// red; leave the unimplemented name out of `unselectable` (the pre-978 `unpinnable` behaviour)
+    /// and the second goes red.
     #[test]
-    fn reviewer_exclusions_mark_an_unimplemented_harness_unpinnable_not_unselectable() {
+    fn reviewer_exclusions_mark_an_unimplemented_harness_unselectable() {
         let dir = crate::testsupport::TempDir::new();
         write_profile(
             &dir,
@@ -3221,19 +3227,15 @@ mod tests {
         o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
         let got = o.reviewer_exclusions(&teams);
         assert!(
-            got.unpinnable.contains("sol"),
-            "a profile naming an unimplemented harness drops the pin: {got:?}"
+            got.unselectable.contains("sol"),
+            "a profile naming an unimplemented harness can never be dispatched: {got:?}"
         );
         assert!(
-            !got.unselectable.contains("sol"),
-            "but it still runs on the backend, so it stays a ranked candidate: {got:?}"
-        );
-        assert!(
-            !got.unpinnable.contains("ghost") && !got.unselectable.contains("ghost"),
+            !got.unselectable.contains("ghost"),
             "off the roster is the selector's own drop and the daemon's boot warning: {got:?}"
         );
         assert!(
-            !got.unpinnable.contains("alice") && !got.unselectable.contains("alice"),
+            !got.unselectable.contains("alice"),
             "no profile ⇒ runs on the backend: {got:?}"
         );
     }
@@ -3241,7 +3243,7 @@ mod tests {
     /// The refusal shape that would otherwise stall: on the ticketless path `review.model` scoped
     /// to another harness makes `dispatch_review` REFUSE this reviewer before any watch write, so
     /// the row is re-offered every tick and never completes. That identity is **unselectable** —
-    /// removed from the ranked fill too, unlike the unimplemented-harness case.
+    /// removed from both the pinned prefix and the ranked fill.
     #[test]
     fn reviewer_exclusions_mark_a_review_model_refusal_unselectable() {
         let dir = crate::testsupport::TempDir::new();
@@ -3262,10 +3264,128 @@ mod tests {
             got.unselectable.contains("sol"),
             "dispatch_review would refuse this review: {got:?}"
         );
-        assert!(
-            !got.unpinnable.contains("sol"),
-            "a refusal removes the candidate, it does not merely drop the pin: {got:?}"
+    }
+
+    /// STUDIO-978: an unimplemented-harness teammate is excluded from the ranked fill even when it
+    /// is NOT a required reviewer — otherwise `rank_reviewers` could hand it a round that
+    /// `spawn_worker` then refuses, re-offering a review that never completes.
+    #[test]
+    fn reviewer_exclusions_cover_the_ranked_fill_not_only_pins() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
         );
+        let mut teams = teams_with(vec![ident("alice", &[], 0), ident("sol", &[], 0)]);
+        teams.roster[1].profile = "codexer".to_string();
+        // No `review.required` at all: `sol` is only ever a ranked candidate.
+        let (mut o, _) = orch_with_teams(teams.clone());
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        let got = o.reviewer_exclusions(&teams);
+        assert!(
+            got.unselectable.contains("sol"),
+            "an unimplemented harness is undispatchable as fill, not only as a pin: {got:?}"
+        );
+    }
+
+    /// STUDIO-978, the PRODUCTION path: a profile that names a harness this build has no runner for
+    /// is refused by `spawn_worker` ITSELF, not by a hand-set flag on the worker deps. The recorder
+    /// seam is cleared so `dispatch_issue` launches the real worker, and the refusal must reach the
+    /// control channel with `start_calls() == 0` — no session was ever started.
+    ///
+    /// MUTATION GUARD: restore the STUDIO-902 fall back in `spawn_worker` (warn and dispatch on
+    /// `agent.backend`, dropping the `harness_refusal` stamp) and the worker starts a session, so
+    /// both `exit.refused` and `start_calls() == 0` go red. This is the guard the previous, hand-set
+    /// version of this test lacked.
+    #[tokio::test]
+    async fn spawn_worker_refuses_an_unimplemented_harness_without_starting_a_session() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "codexer".to_string();
+        let (mut o, _) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        // A fake backend whose session starts are observable, standing in for `agent.backend`.
+        let ag = Arc::new(rhapsody_agent::fake::Fake::new());
+        o.eff.as_mut().expect("effective").agent = ag.clone();
+        // Drive the real spawn, not the recording seam.
+        o.spawn = None;
+        let mut rx = o.take_events_rx().expect("control-event receiver");
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(crate::control_loop::Event::WorkerExit(e)) => return e,
+                    Some(_) => continue,
+                    None => panic!("control channel closed before a worker exit"),
+                }
+            }
+        })
+        .await
+        .expect("the refused worker must post an exit");
+
+        assert!(exit.failed, "the refused dispatch fails the run");
+        assert!(exit.refused, "and carries the typed refusal flag");
+        assert!(
+            exit.err_msg.contains("codex"),
+            "the refusal names the harness: {}",
+            exit.err_msg
+        );
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a refused dispatch must never start a session"
+        );
+    }
+
+    /// STUDIO-978 / alice's F1 — the DISPATCH→PROVENANCE path, not a directly seeded row. A profile
+    /// naming a harness this build cannot run must record THAT harness (`codex`) with `profile` as
+    /// its origin on the run row. The pre-978 sibling resolved the name to `agent.backend` and wrote
+    /// `harness: claude` / `origin: agent.backend` — a harness that was never chosen, describing a
+    /// run that never happened — which the console then rendered as claude's event fidelity. The row
+    /// is written by the real `dispatch_issue` path, so reverting either `effective_harness`
+    /// (`teams.rs`) or the `harness_origin` rule (`retry.rs`) to the pre-978 fallback reds here; the
+    /// seeded-HTTP-row test could not see either.
+    ///
+    /// MUTATION GUARD: `effective_harness`'s `named.is_empty()` → `named.is_empty() ||
+    /// !harness_is_implemented(named)`, or `retry.rs`'s `harness_origin` rule → the same
+    /// `!harness_is_implemented(&re.harness)` guard.
+    #[test]
+    fn dispatch_records_the_refused_harness_the_profile_named_not_the_backend() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "codexer".to_string();
+        let (mut o, store) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "claude".to_string();
+        }
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(
+            p.harness, "codex",
+            "the profile named codex; the row must not claim the configured backend ran"
+        );
+        assert_eq!(p.harness_origin, "profile");
     }
 
     /// A profile that fails to resolve must not block work — and must not smuggle a half-resolved

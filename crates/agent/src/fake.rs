@@ -11,6 +11,11 @@
 use crate::{AgentError, Event, Runner, Session, TURN_SUCCEEDED, Transcript, TurnResult};
 use async_trait::async_trait;
 use rhapsody_core::Issue;
+
+use crate::harness::{
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
+    StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
+};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
@@ -32,8 +37,34 @@ pub struct Fake {
     pub turns: Vec<TurnScript>,
     /// When set, returned by `start_session` (the call is still recorded).
     pub start_err: Option<AgentError>,
+    /// The capabilities this fake declares (STUDIO-978). Settable so a test can parameterize the
+    /// capability-validator behaviour — a fake harness that claims no MCP, no resume, or
+    /// [`crate::harness::McpSandboxCoupling::MutuallyExclusive`] is how the refusal path is driven
+    /// without installing any CLI. Defaults to a fully-capable harness, so every pre-STUDIO-978 test
+    /// that never touches this field keeps passing the validator.
+    pub capabilities: HarnessCapabilities,
     /// Recorded state mutated by the `&self` methods, shared with started sessions.
     recorded: Arc<Mutex<Recorded>>,
+}
+
+/// The default capabilities of [`Fake`]: a fully-capable harness, matching what the shipped claude
+/// and opencode adapters declare. Chosen so the fake is dispatchable under every requirement until a
+/// test deliberately narrows it.
+fn default_capabilities() -> HarnessCapabilities {
+    HarnessCapabilities {
+        events: EventFidelity::Structured {
+            tool_level: ToolEventGranularity::FileLevel,
+        },
+        steering: Steering::Live,
+        resume: Resume::Flags,
+        mcp: true,
+        sandbox: Sandbox::ToolAllowlist,
+        mcp_sandbox: McpSandboxCoupling::Independent,
+        usage: UsageDetail::TokensAndCost,
+        budgets: false,
+        tool_naming: ToolNaming::McpDoubleUnderscore,
+        stdin: StdinPolicy::HeldOpen,
+    }
 }
 
 /// Recorded state guarded by [`Fake::recorded`] and shared with each [`FakeSession`].
@@ -70,6 +101,7 @@ impl Fake {
             thread_id_value: "thread-fake".to_string(),
             turns: Vec::new(),
             start_err: None,
+            capabilities: default_capabilities(),
             recorded: Arc::new(Mutex::new(Recorded::default())),
         }
     }
@@ -141,6 +173,21 @@ impl Runner for Fake {
             turn_n: AtomicI64::new(0),
             recorded: Arc::clone(&self.recorded),
         }))
+    }
+}
+
+/// [`Fake`] is also the design's "capability-parameterized fake" (design §8): it declares
+/// [`Fake::capabilities`] so the refusal path can be exercised for every requirement/capability
+/// combination without installing any CLI. It reports [`HarnessId::Claude`] because it stands in for
+/// the configured backend; a test that needs the unknown/unimplemented-harness refusal drives it
+/// through the orchestrator's name-based seam, not through this identity.
+impl Harness for Fake {
+    fn id(&self) -> HarnessId {
+        HarnessId::Claude
+    }
+
+    fn capabilities(&self) -> &HarnessCapabilities {
+        &self.capabilities
     }
 }
 

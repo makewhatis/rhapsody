@@ -1748,6 +1748,19 @@ describe("zone C — The Split (§3C)", () => {
     await mountSplit([]);
     expect(screen.getByText("No transcript recorded for this run.")).toBeTruthy();
   });
+
+  // STUDIO-978 (design §5.1): a FinalTextOnly harness has no per-step spine, and the Trace zone must
+  // SAY that rather than draw an empty spine the operator cannot tell from a silent run.
+  it("states reduced fidelity, not a blank spine, for a final-text-only harness", async () => {
+    h.fetchRunProvenance.mockResolvedValue({ run_id: 547, harness_events: "final_text_only" });
+    await mountSplit([]);
+    expect(
+      screen.getByText(
+        "This run's harness emits only a final result, not per-step events, so there is no step spine to show.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("No transcript recorded for this run.")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1944,6 +1957,23 @@ describe("the watch-tabs rail (§3C)", () => {
     expect(
       (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
     ).toBe("btw the branch moved");
+  });
+
+  // STUDIO-978 (design D7): a harness that cannot be steered hides the message composer rather
+  // than offering a control that silently drops what it is given. The timeline still renders.
+  it("hides the message composer for a harness that cannot be steered", async () => {
+    h.fetchRunProvenance.mockResolvedValue({ run_id: 547, harness_steering: "none" });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+
+    expect(screen.queryByLabelText(/message the running agent/i)).toBeNull();
+    expect(
+      screen.getByText(
+        "This run's harness cannot be steered, so there is no way to message its agent.",
+      ),
+    ).toBeTruthy();
   });
 
   // `role="tablist"` is a promise about the keyboard, not only about the screen reader: an

@@ -4,6 +4,7 @@ import { buildResult, buildTrace, type TracePhase } from "@/lib/trace-model";
 import {
   PROVENANCE_UNKNOWN,
   TRACE_FILTERS,
+  harnessFidelity,
   attemptBucket,
   attemptOptions,
   cardLead,
@@ -896,5 +897,37 @@ describe("ticketCostView — the run detail's whole-ticket total (STUDIO-975)", 
     // no HAVING); it is this module's `ticketCostsByIssue` that drops `total_tokens <= 0`. Either
     // way the detail renders "—" for it exactly as it does for an absent ticket.
     expect(ticketCostView([cost("STUDIO-5", "anthropic", 0)], "STUDIO-5")).toBeNull();
+  });
+
+  // STUDIO-978: the observability a harness actually offers, read from run provenance. The two
+  // rules map the DESIGN's dividing line onto the view: reduced event fidelity is stated, and a
+  // harness that cannot be steered hides the composer.
+  describe("harnessFidelity", () => {
+    it("reduces the spine only for a final-text-only harness", () => {
+      expect(harnessFidelity({ run_id: 1, harness_events: "final_text_only" }).reducedEvents).toBe(
+        true,
+      );
+      expect(harnessFidelity({ run_id: 1, harness_events: "structured" }).reducedEvents).toBe(false);
+    });
+
+    // MUTATION GUARD: treat FinalTextOnly as structured (e.g. `!== "structured"` or reading the
+    // wrong field) and the first assertion reds — the operator would see a blank spine with no
+    // explanation.
+    it("does not reduce the spine when the shape is unknown or structured", () => {
+      expect(harnessFidelity({ run_id: 1 }).reducedEvents).toBe(false);
+      expect(harnessFidelity(undefined).reducedEvents).toBe(false);
+    });
+
+    // MUTATION GUARD: expose steering for Steering::None and this reds.
+    it("hides the composer ONLY when the harness explicitly cannot be steered", () => {
+      expect(harnessFidelity({ run_id: 1, harness_steering: "none" }).steeringAvailable).toBe(false);
+      expect(harnessFidelity({ run_id: 1, harness_steering: "live" }).steeringAvailable).toBe(true);
+      expect(
+        harnessFidelity({ run_id: 1, harness_steering: "between_turns" }).steeringAvailable,
+      ).toBe(true);
+      // Absence is "unknown", not "none": a legacy run keeps its working composer.
+      expect(harnessFidelity({ run_id: 1 }).steeringAvailable).toBe(true);
+      expect(harnessFidelity(undefined).steeringAvailable).toBe(true);
+    });
   });
 });
