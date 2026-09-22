@@ -690,6 +690,54 @@ mod tests {
         assert_ne!(blocked_snapshot.revision, current);
     }
 
+    // --- Behavior across a simulated desktop/daemon restart ---------------------------------------
+
+    // A "restart" is a fresh `ProviderCredentialOwner` over the SAME persisted Keychain backend
+    // (the real OS Keychain survives a process restart; only this owner's in-memory revision
+    // counter does not). The acceptance requirement is behavioral: BindingMismatch/Present
+    // detection must still be correct against the persisted envelope after restart, with no lease
+    // released until an explicit Rebind — restarting the revision counter's own numeric baseline is
+    // a deliberate, documented P0c-scope simplification (a caller must always re-`read_bound`
+    // rather than reuse a pre-restart cached revision across a reconnect; see the module doc), not
+    // a violation of this requirement.
+    #[test]
+    fn binding_mismatch_and_present_detection_survive_a_simulated_restart() {
+        let backend = MockKeyring::empty();
+        let original = binding("https://api.example/v1");
+
+        // "Before restart": connect under the original binding.
+        let before_restart = owner_over(backend.clone());
+        before_restart
+            .connect(Revision::INITIAL, original.clone(), "sk-1".into())
+            .expect("connect before restart");
+
+        // "After restart": a brand-new owner instance, same persisted backend.
+        let after_restart = owner_over(backend);
+
+        // The persisted secret is still readable under its original binding...
+        match after_restart.read_bound(&original).state {
+            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            other => panic!("expected Present to survive restart, got {other:?}"),
+        }
+        // ...but a changed canonical endpoint reports BindingMismatch, not a lease.
+        let changed = binding("https://api.example/v2");
+        assert_eq!(
+            after_restart.read_bound(&changed).state.tag(),
+            CredentialStateTag::BindingMismatch
+        );
+
+        // Only an explicit Rebind (against the post-restart owner's own current revision) may
+        // change the binding; it still preserves the value.
+        let post_restart_revision = after_restart.current_revision();
+        after_restart
+            .rebind(post_restart_revision, changed.clone())
+            .expect("rebind after restart");
+        match after_restart.read_bound(&changed).state {
+            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            other => panic!("expected Present under the new binding, got {other:?}"),
+        }
+    }
+
     // --- Redaction -------------------------------------------------------------------------------
 
     #[test]
