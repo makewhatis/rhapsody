@@ -1655,8 +1655,9 @@ impl Orchestrator {
     /// re-arms `reviewed` to `requested` (preserving `last_reviewed_sha`) and an unfinished round
     /// parks at `truncated`, so at the instant the loop reaches its threshold both halves of a
     /// `status == reviewed && last_reviewed_sha == head` filter can fail at once and the plan would
-    /// carry no findings at all. That is the rule rather than the exception on an EVEN threshold,
-    /// which the author's own summoned dispatch is what crosses. Three shapes are named instead:
+    /// carry no findings at all. That is the routine shape, not the exception: a review's findings
+    /// summon the author, whose push moves the head the loop is about to be decided at. Three shapes
+    /// are named instead:
     ///
     /// * a row that posted findings at the current head — `{reviewer} asked for changes at {head}`;
     /// * a row whose last read predates the head — the author has pushed since and nobody has read
@@ -1714,12 +1715,13 @@ impl Orchestrator {
     ///
     /// A decision must not be made over a round mid-flight: new findings could still land, and a fix
     /// the author is actively writing is about to supersede the head the manager would decide
-    /// against. The author half is easy to miss because the counter is charged at DISPATCH
-    /// ([`crate::retry`]), so an author run is in flight from the very instant its charge lands —
-    /// and with the loop alternating review→author, any EVEN threshold is crossed by the author's
-    /// own dispatch. [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an
-    /// in-flight run as activity that silences the whole pull request; this is the same rule on the
-    /// decision path.
+    /// against. The author half is easy to miss because the author's run is a normal ticket run,
+    /// reachable only through the pull request's origin ticket rather than through a review row's own
+    /// id — and the author a review's findings summoned is exactly who is likely to be pushing while
+    /// the loop sits at its threshold (STUDIO-1004 moved the counter charge to the reviewer's answer,
+    /// so an in-flight author run is no longer what the counter reports either).
+    /// [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an in-flight run as
+    /// activity that silences the whole pull request; this is the same rule on the decision path.
     fn review_round_in_flight(&self, mine: &[&ReviewWatchRow]) -> bool {
         let review_live = mine.iter().any(|r| {
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
@@ -1793,27 +1795,185 @@ impl Orchestrator {
                 .any(|entry| entry.identifier == identifier)
     }
 
-    /// Charges one AUTHOR round to every linked pull request of `iss` that already carries a budget,
-    /// so the author half of the loop counts toward the adjudication threshold (STUDIO-956).
+    /// Records an AUTHOR round for every linked pull request of `iss` that already carries a budget,
+    /// so the author half of the loop counts toward the adjudication threshold — but only once a
+    /// reviewer has answered it (STUDIO-1004).
     ///
     /// **A no-op unless the threshold is set.** Under an unset threshold the counter bounds REVIEW
     /// rounds only, and charging author runs to it would change what a default install does — the
     /// byte-identical property the revised ticket's last ⚠️ requires. Also a no-op for a ticket
     /// whose pull requests have never been reviewed, so an ordinary first dispatch is free.
     ///
+    /// **The counter is NOT charged here** (STUDIO-1004). An author dispatch is only one half of an
+    /// exchange: charging it at dispatch counted a round whether a reviewer ever read the head the
+    /// author produced or was still sitting in a queue, so a pull request whose reviewers were
+    /// backed up escalated to the manager with no disagreement to adjudicate. Instead the round is
+    /// recorded as PENDING against the head the pull request STOOD AT when it was dispatched, and
+    /// [`Orchestrator::settle_author_round`] charges it the moment a reviewer's verdict lands at a
+    /// different head — i.e. once somebody has actually read what the author produced. Until then
+    /// the exchange is incomplete and charges nothing.
+    ///
+    /// **At most ONE pending round per standing head SET, by containment.** An author dispatched
+    /// again while the pull request still stands at the same heads — which is the routine shape while
+    /// the reviewers are queued, because a draft poke, a conflict route-back, a second reviewer's
+    /// findings or a human `@symphony` comment can each summon the author with no review completing
+    /// in between — is the SAME unfinished exchange, not a second one. Recording it once keeps the
+    /// pending queue from growing a dispatch at a time while the queue drains.
+    ///
+    /// The dedup is by SET CONTAINMENT: a dispatch whose standing set introduces no head an
+    /// outstanding round had not already seen (a subset) is that same round and records nothing.
+    /// Equality alone cannot see that — a redundant dispatch against a stale sibling records a
+    /// SUPERSET, and a following dispatch against the reduced state records a subset of it.
+    /// [`Orchestrator::settle_author_round`] charges the verdicts that answer those entries ONCE, so
+    /// containment bounds the queue and is not the sole guard against a same-produced-head
+    /// over-charge; a truncated intermediate review can still leave a superset behind, which is why
+    /// the settle aggregation exists (sol round 5 on PR #216).
+    ///
     /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
     /// run its review's findings bought is the loop's other half, so it costs the same as the review
     /// round did at any reviewer count.
+    ///
+    /// **What bounds the runaway, stated exactly.** The threshold bounds ANSWERED exchanges: an
+    /// author round advances the counter only when some reviewer actually read the head it produced.
+    /// An unreviewed author loop therefore charges ZERO BY DESIGN — that is the ticket's acceptance 3,
+    /// not a gap in the bound, and it is why the leaks below have to be named rather than waved at as
+    /// "one-shot".
+    ///
+    /// The author can never summon ITSELF: both ladders in [`crate::select`] require a summons, and
+    /// the only summoner that sustains an ANSWERED loop is a COMPLETED review — the very completion
+    /// that answers the pending round and charges it. So the loop the counter exists to bound is
+    /// still stopped at the threshold, one round per ANSWERED amendment. (The unreviewed summonses
+    /// listed below are named separately; they drive no charge, and before this change the charge
+    /// was per DISPATCH, so it climbed to that same threshold faster.)
+    ///
+    /// The writers that can summon the author with no review completing are NOT all one-shot, and
+    /// the wording must say so rather than wave them away:
+    /// - the draft poke fires again on each new head, but is independently capped by its own
+    ///   [`crate::draftpoke::MAX_DRAFT_POKES`] ceiling;
+    /// - a human `@symphony` comment is an external, human-driven event;
+    /// - the **conflict route-back is per still-DIRTY HEAD, not one-shot** (`conflict_routed` guards
+    ///   one head at a time and a head advance re-arms it): an author that keeps pushing while the
+    ///   pull request stays conflicted earns a fresh route-back per push, and while the reviewers
+    ///   stay queued every one of those dispatches collapses into the same pending set and is
+    ///   deliberately uncharged. That loop is bounded by neither this threshold nor the review cap;
+    ///   it is the concrete case acceptance 3 leaves uncharged, and it is named here so the claim is
+    ///   not overstated.
+    ///
+    /// A store read that fails records NO pending round, which fails toward "not charged": the whole
+    /// point is to stop advancing a pull request nobody has read, and a monitoring read that cannot
+    /// answer must not manufacture an escalation. The next author dispatch re-reads.
     pub(crate) fn note_author_round(&mut self, iss: &Issue) {
         if self.adjudication_threshold().is_none() {
             return;
         }
-        let round = self.reviewers_per_round();
-        for pr in self.charged_linked_prs(iss) {
-            let key = churn_key(&pr);
-            *self.review_rounds.entry(key.clone()).or_default() += round;
-            self.persist_review_rounds(&key);
+        let charged = self.charged_linked_prs(iss);
+        if charged.is_empty() {
+            return;
         }
+        let rows = match self.store().load_live_review_watch() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "ticketless review: the watch set could not be read; the author round is not \
+                     recorded and no round is charged until a reviewer is seen to answer it"
+                );
+                return;
+            }
+        };
+        for pr in charged {
+            let standing = standing_heads(&rows, &pr);
+            // No head to record against means no answer can be told from a non-answer, and the safe
+            // direction is NOT to charge: this whole path exists to stop advancing a pull request
+            // nobody has read. A charged pull request normally has a `requested_sha`, so this only
+            // skips a row the store has not yet seen a dispatch for.
+            if standing.is_empty() {
+                continue;
+            }
+            // Deduplicated by SET CONTAINMENT, not equality: a dispatch that saw only heads an
+            // outstanding exchange had already seen (a SUBset) introduced nothing new, so it is that
+            // same exchange. Equality also collapses, since a set is contained in itself. Recording
+            // a subset as a second entry would let two reviewers' verdicts at the same produced head
+            // charge two rounds for one exchange.
+            let pending = self
+                .author_rounds_pending
+                .entry(churn_key(&pr))
+                .or_default();
+            if !pending
+                .iter()
+                .any(|base| standing.iter().all(|h| base.contains(h)))
+            {
+                pending.push(standing);
+            }
+        }
+    }
+
+    /// Charges one pending AUTHOR round of `pr` because a reviewer's verdict landed at `head`
+    /// (STUDIO-1004) — the moment an author dispatch becomes an answered EXCHANGE rather than a
+    /// one-sided push.
+    ///
+    /// The completing review's head is a NEW head whenever it answers an author round: the round was
+    /// recorded against the set of heads the pull request stood at when the author was dispatched,
+    /// and a reviewer reaching a head OUTSIDE that set is reading the work the author produced. A
+    /// completion at a head INSIDE the set read work a sibling of the same exchange was already
+    /// reading — an in-flight review of the previous round, completing after the author's push — and
+    /// answers nothing, so its entry is left pending. The set (not one head) is what keeps a queued
+    /// sibling's verdict at the already-answered head from charging a round nobody read (jimmy round
+    /// 2 on PR #216).
+    ///
+    /// **ONE verdict answers EVERY outstanding round it lands outside, and charges ONCE.** Every
+    /// pending standing set that does not contain `head` describes an author round this verdict read
+    /// past, so they are all retired together and the whole set costs a single round — one reviewer
+    /// verdict is one half of one exchange however many stale entries accumulated behind it.
+    /// Charging per verdict instead let a TRUNCATED intermediate review double-charge: a round that
+    /// wrote a new `requested_sha` and then died left a strict superset behind, and two reviewers'
+    /// verdicts at the eventual head consumed one entry each (sol round 5 on PR #216). The
+    /// queue-time backlog does not reappear here as a charge per verdict because
+    /// [`Orchestrator::note_author_round`] also records at most ONE pending round per standing head
+    /// SET by containment (alice round 1 on PR #216).
+    ///
+    /// Called only from a DECLARED review completion ([`Orchestrator::on_review_exit`]); a truncated
+    /// or crashed round advances no `last_reviewed_sha`, and a STUDIO-960 carried verdict is
+    /// deliberately not an answer either — no reviewer read new work, and charging a no-op rebase
+    /// would undo the very saving that ticket bought.
+    pub(crate) fn settle_author_round(&mut self, pr: &PrCoord, head: &str) {
+        if head.is_empty() {
+            return;
+        }
+        let key = churn_key(pr);
+        // The threshold can be turned OFF by a hot reload between an author's dispatch and the
+        // verdict that would answer it. Once it is off the author half is unbounded by definition,
+        // so nothing is charged — the pending record is dropped rather than held for a reload that
+        // may never come.
+        if self.adjudication_threshold().is_none() {
+            self.author_rounds_pending.remove(&key);
+            return;
+        }
+        // Retire EVERY pending set this verdict answers at once — each entry whose standing set does
+        // not contain `head` describes a round the reviewer read past — and charge the answer once,
+        // not once per entry. A verdict INSIDE a set (the entry still contains `head`) read work a
+        // sibling of the same exchange was already reading, so it stays pending.
+        let answered = match self.author_rounds_pending.get_mut(&key) {
+            Some(pending) => {
+                let before = pending.len();
+                pending.retain(|base| base.iter().any(|h| h == head));
+                before - pending.len()
+            }
+            None => return,
+        };
+        if answered == 0 {
+            return;
+        }
+        if self
+            .author_rounds_pending
+            .get(&key)
+            .is_some_and(|pending| pending.is_empty())
+        {
+            self.author_rounds_pending.remove(&key);
+        }
+        let round = self.reviewers_per_round();
+        *self.review_rounds.entry(key.clone()).or_default() += round;
+        self.persist_review_rounds(&key);
     }
 
     /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
@@ -1912,6 +2072,10 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // And the author rounds awaiting an answer (STUDIO-1004), for the same two reasons: a
+        // re-introduced pull request starts from zero, and a record for a gone pull request would
+        // sit here for the daemon's whole life.
+        self.author_rounds_pending.remove(&churn_key(pr));
         // Durably too (STUDIO-956) — counter and decision in one delete, so a pull request that is
         // rebuilt or reopened under the same number starts from zero rather than inheriting a
         // budget the pull request it replaced had spent.
@@ -2854,6 +3018,43 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
         && row.key.number == pr.number
 }
 
+/// The set of heads a watched pull request STANDS AT, read from its watch rows (STUDIO-1004): for
+/// every live row BOTH the SHA its reviewer was last ASKED about
+/// ([`ReviewWatchRow::requested_sha`]) and the SHA last READ
+/// ([`ReviewWatchRow::last_reviewed_sha`]), deduplicated and sorted.
+///
+/// This is the set an AUTHOR round recorded at DISPATCH is pending against: every head already in
+/// play when the author was summoned. A reviewer's verdict at a head OUTSIDE this set is the head
+/// the author produced, so it settles the round; a verdict AT one of these heads read work a
+/// sibling of the same exchange was already reading, so it answers nothing.
+///
+/// **A SET, not one row's head** (jimmy round 2 on PR #216). The rows of one round are dispatched at
+/// different times under review concurrency, so they routinely disagree about `requested_sha` for a
+/// whole queue wait — not "briefly mid-transition". Reading one row's request recorded the pending
+/// round against a STALE head whenever that row was the one still queued, so a queued sibling's
+/// later verdict at the head its partner had already answered charged an author round nobody had
+/// read. Collecting every row's heads closes that: whichever row the author's summon answered, its
+/// head is in the set, and only a genuinely new head can settle the round.
+///
+/// Empty when the pull request has no live row carrying a SHA — which the caller treats as "cannot
+/// answer" rather than as a head set, so no round is charged against it. Sorted and deduplicated so
+/// two dispatches against the same standing state record the SAME set and dedup as one exchange.
+fn standing_heads(rows: &[ReviewWatchRow], pr: &PrCoord) -> Vec<String> {
+    let mut heads: Vec<String> = Vec::new();
+    for r in rows
+        .iter()
+        .filter(|r| row_is(r, pr) && r.open && r.status != REVIEW_STATUS_DROPPED)
+    {
+        for sha in [&r.requested_sha, &r.last_reviewed_sha] {
+            if !sha.is_empty() && !heads.iter().any(|h| h == sha) {
+                heads.push(sha.clone());
+            }
+        }
+    }
+    heads.sort();
+    heads
+}
+
 /// Whether every LIVE row of `pr` is an APPROVAL — the convergence question
 /// [`crate::automerge::auto_merge_verdict`] answers from a live head, reduced here to the rows' own
 /// verdicts so the author half (which holds no GitHub observation) can ask it too.
@@ -2878,6 +3079,19 @@ fn converged(rows: &[ReviewWatchRow], pr: &PrCoord) -> bool {
 
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
 pub type ReviewRounds = HashMap<String, usize>;
+
+/// The AUTHOR rounds each pull request has dispatched but that no reviewer has answered yet
+/// (STUDIO-1004), keyed by [`churn_key`] as [`ReviewRounds`] is. Each entry is the SET of heads the
+/// pull request STOOD AT when that round was recorded — every `requested_sha` and
+/// `last_reviewed_sha` its live rows carried, deduplicated and sorted — because the rows of one
+/// round disagree about `requested_sha` for a whole queue wait under review concurrency. A new
+/// dispatch recording a set CONTAINED IN an existing entry adds nothing (the same exchange seen with
+/// fewer heads), so a repeated dispatch against an unanswered state is one entry, not many. A
+/// reviewer's verdict at a head OUTSIDE a set settles EVERY such entry — the reviewer read past all
+/// of them — for a single charge; a verdict INSIDE the set read work a sibling was already reading
+/// and answers nothing.
+/// See [`Orchestrator::note_author_round`] and [`Orchestrator::settle_author_round`].
+pub type PendingAuthorRounds = HashMap<String, Vec<Vec<String>>>;
 
 /// The auto-merge plan each watched pull request has already been ANNOUNCED for: its head and the
 /// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
@@ -3686,7 +3900,8 @@ mod tests {
     }
 
     /// Ends the live review of `(number, reviewer)` as a clean, DECLARED completion at `head` —
-    /// what `on_review_exit` does, without needing a worker.
+    /// what `on_review_exit` does, without needing a worker. Runs the same STUDIO-1004 author-round
+    /// settle that path runs, so a test's answered author round charges exactly as production's does.
     fn complete(o: &mut Orchestrator, number: i64, reviewer: &str, head: &str) {
         let id = review_key(OWNER, REPO, number, reviewer);
         o.running.remove(&id);
@@ -3694,6 +3909,7 @@ mod tests {
         o.store()
             .mark_review_completed(&key(number, reviewer), head, REVIEW_STATUS_REVIEWED)
             .expect("complete");
+        o.settle_author_round(&coord(number), head);
     }
 
     /// [`complete`] as a clean APPROVAL — the verdict a rebase must carry forward rather than make
@@ -6458,20 +6674,596 @@ mod tests {
         );
     }
 
+    /// A watch row whose reviewer READ `sha` and asked for changes — the terminal a round that
+    /// summoned the author leaves. STUDIO-1004's fixtures need a row that is NOT converged, so the
+    /// author half's convergence exemption does not answer for it.
+    fn reviewed_row(number: i64, reviewer: &str, sha: &str) -> ReviewWatchRow {
+        let mut r = approved_row(number, reviewer, sha);
+        r.status = REVIEW_STATUS_REVIEWED.to_string();
+        r
+    }
+
     /// An author round costs one ROUND, not one dispatch: the budget is counted in rounds at every
     /// reviewer count (STUDIO-727), so a two-reviewer pull request charges two dispatches per author
     /// round exactly as it charges two per review round. Under the opt-in threshold, where author
     /// rounds count at all.
+    ///
+    /// STUDIO-1004: the charge lands when a REVIEWER answers the round, not when the author is
+    /// dispatched — so the round is recorded first and the counter is asserted unchanged, and only
+    /// a verdict at a head the round was not recorded against moves it.
+    ///
+    /// Mutation check (STUDIO-727): drop the `reviewers_per_round()` scaling from the settle and
+    /// this reds at the second assert (2, not 3).
     #[test]
     fn an_author_round_charges_one_round_at_every_reviewer_count() {
         let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
         teams.review.reviewers = 2;
         let (mut o, _d) = orch(teams);
         let iss = author_issue("STUDIO-1", 12);
+        // The reviewer's prior round, so the head the author round is recorded against exists.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         o.review_rounds.insert(churn_key(&coord(12)), 1);
 
         o.note_author_round(&iss);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&1),
+            "an un-answered author round charges nothing"
+        );
+
+        // The reviewer reads the head the author produced: ONE round, two dispatches at two
+        // reviewers.
+        complete(&mut o, 12, "bob", HEAD_B);
         assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&3));
+    }
+
+    // --- STUDIO-1004: a round is an EXCHANGE, not an author dispatch --------------------------
+
+    /// **Acceptance 1 and 3.** An author round charges only once a reviewer's `last_reviewed_sha`
+    /// reaches a head the round was not recorded against — the head that round produced. A verdict
+    /// at the head the round was RECORDED against (a sibling reviewer of the PREVIOUS round,
+    /// completing after the push) answers nothing.
+    ///
+    /// Mutation check (STUDIO-1004 ⚠️): restore the unconditional `*entry += round` in
+    /// [`Orchestrator::note_author_round`] and the FIRST assert reds — the dispatch alone charges.
+    #[test]
+    fn an_author_round_advances_only_once_a_reviewer_reaches_the_head_it_produced() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // The author is dispatched. The counter must NOT move: no reviewer has read the head this
+        // round produces.
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&round),
+            "an author dispatch with no answering review must not advance the counter"
+        );
+
+        // A verdict at the head the round was recorded against read the work the author RESPONDED
+        // to, not the work it produced. Not an answer.
+        o.settle_author_round(&coord(12), HEAD_A);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&round),
+            "a completion at the standing head answers nothing"
+        );
+
+        // A verdict at a NEW head did read the author's work. That is the exchange, and it charges.
+        o.settle_author_round(&coord(12), HEAD_B);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "a reviewer reaching the head the author produced completes the exchange"
+        );
+    }
+
+    /// **Acceptance 3.** An author that pushes N times while every reviewer is queued advances the
+    /// counter by zero, and the pull request does not escalate on that basis.
+    ///
+    /// Mutation check (STUDIO-1004 ⚠️): restore the unconditional `*entry += round` in
+    /// [`Orchestrator::note_author_round`] and the counter climbs with the pushes, so the first
+    /// assert reds.
+    #[test]
+    fn an_author_pushing_while_reviewers_are_queued_advances_nothing() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        // Two of the three rounds are spent; the reviewers for the third are queued for capacity.
+        let spent = 2 * o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), spent);
+        let iss = author_issue("STUDIO-1", 12);
+
+        for _ in 0..5 {
+            o.note_author_round(&iss);
+        }
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&spent),
+            "five author pushes nobody reviewed must charge exactly nothing"
+        );
+        assert_eq!(
+            o.author_rounds_pending
+                .get(&churn_key(&coord(12)))
+                .map(Vec::len),
+            Some(1),
+            "and the five pushes against one unanswered head are ONE pending exchange, not five"
+        );
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "and must not escalate the pull request as if the author and reviewers disagreed"
+        );
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "no review was dispatched, so nothing can have answered"
+        );
+    }
+
+    /// **alice round 1 on PR #216, finding 1.** The backlog a queued author builds must not
+    /// resurface as a charge per verdict when the queue finally drains: five unanswered pushes at
+    /// two reviewers, answered by BOTH reviewers reading the head the author produced, is **one**
+    /// exchange and charges exactly one round — not one per sibling verdict.
+    ///
+    /// Mutation check: drop the per-standing-head dedup from [`Orchestrator::note_author_round`] so
+    /// the five pushes record five pending entries, and bob's verdict and carol's verdict each
+    /// charge one — the counter then overshoots to three rounds and the assert reds.
+    #[test]
+    fn a_queued_backlog_drains_as_one_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 3);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        // Two reviewers, both having read HEAD_A: one round is spent.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // The author keeps pushing while the queue is stuck.
+        for _ in 0..5 {
+            o.note_author_round(&iss);
+        }
+
+        // The queue drains: BOTH reviewers read HEAD_B, the head the author produced. That is ONE
+        // exchange, so it costs ONE round however many reviewers answered it.
+        complete(&mut o, 12, "bob", HEAD_B);
+        complete(&mut o, 12, "carol", HEAD_B);
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus ONE answered exchange; the queued backlog must not charge again"
+        );
+        assert!(
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
+            "and the answered exchange leaves nothing pending behind"
+        );
+    }
+
+    /// **jimmy round 2 on PR #216.** The rows of one round are dispatched at DIFFERENT times under
+    /// review concurrency, so they disagree about `requested_sha` for a whole queue wait. Recording
+    /// the pending round against only one row's head — the alphabetically-first row, which
+    /// `load_live_review_watch` orders by reviewer — recorded a STALE head whenever that row was the
+    /// one still queued. A queued sibling's later verdict at the head its partner had already
+    /// answered then charged an author round nobody had read: the incident this ticket fixes, reached
+    /// on the FIRST real exchange.
+    ///
+    /// The sequence below is jimmy's repro with the queued row sorting FIRST (`bob` < `carol`); the
+    /// outcome must not depend on reviewer names. Mutation check: take one row's `requested_sha`
+    /// (the pre-fix `standing_head`) instead of the set, and this reds at `Some(6)`, not `Some(4)`.
+    #[test]
+    fn a_sibling_verdict_at_an_answered_head_charges_no_author_round() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 3);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        // Both reviewers read HEAD_A: one round is spent.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // The author is summoned, pushes HEAD_B, and carol gets capacity first: one answered
+        // exchange, charged once.
+        o.note_author_round(&iss);
+        o.store()
+            .mark_review_requested(&key(12, "carol"), HEAD_B)
+            .expect("carol dispatched at the pushed head");
+        complete(&mut o, 12, "carol", HEAD_B);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "sanity: the first exchange is charged"
+        );
+
+        // Carol's findings summon the author AGAIN. bob is still queued with its requested head
+        // stale at HEAD_A, so the order the rows come back in must not decide what this round is
+        // recorded against.
+        o.note_author_round(&iss);
+
+        // bob reaches HEAD_B — the head carol's verdict already answered — and reads nothing new.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("bob dispatched at the current head");
+        complete(&mut o, 12, "bob", HEAD_B);
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "a verdict at a head a sibling already answered must charge no author round"
+        );
+        assert!(
+            !o.author_round_budget_spent(&iss),
+            "and must not escalate the pull request as if the author and reviewers disagreed"
+        );
+    }
+
+    /// **Round 3, the dedup must be by SET CONTAINMENT, not equality.** A dispatch recorded while a
+    /// stale sibling head is still in play sees a SUPERSET of every head an outstanding exchange
+    /// already saw; recording it as a second entry would then let two reviewers' verdicts at the
+    /// SAME produced head charge TWO rounds for ONE exchange — an over-escalation, the failure class
+    /// this ticket exists to end. A state that introduces no head the outstanding exchange had not
+    /// already seen is the SAME exchange, so a set contained in an existing one is not recorded.
+    ///
+    /// Mutation check: compare the sets for EQUALITY only, and this reds at `Some(4 * round)` —
+    /// bob's and carol's HEAD_C verdicts each charge one, for one exchange.
+    #[test]
+    fn a_redundant_dispatch_does_not_double_charge_the_next_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // Author dispatch #1 against HEAD_A.
+        o.note_author_round(&iss);
+        // The author pushes HEAD_B and bob picks it up; carol is still queued at HEAD_A, so a
+        // second, redundant dispatch (a human `@symphony`, say) records the superset {A, B}.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("bob dispatched at the pushed head");
+        o.note_author_round(&iss);
+
+        // carol now reads HEAD_B too. Both reviewers at HEAD_B are ONE exchange, charged once.
+        o.store()
+            .mark_review_requested(&key(12, "carol"), HEAD_B)
+            .expect("carol dispatched at the pushed head");
+        complete(&mut o, 12, "bob", HEAD_B);
+        complete(&mut o, 12, "carol", HEAD_B);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus ONE answered HEAD_B exchange"
+        );
+
+        // The findings summon the author against HEAD_B. Both rows now stand at {B}, a subset of the
+        // outstanding {A, B}: the SAME exchange, so it must not be recorded a second time.
+        o.note_author_round(&iss);
+
+        // Both reviewers read HEAD_C, the head the author produced. ONE exchange, ONE round.
+        complete(&mut o, 12, "bob", HEAD_C);
+        complete(&mut o, 12, "carol", HEAD_C);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(3 * round)),
+            "one spent round, the answered HEAD_B exchange, and exactly ONE answered HEAD_C exchange"
+        );
+    }
+
+    /// **sol round 5 on PR #216.** A TRUNCATED intermediate review must not let one answered
+    /// exchange charge twice. Containment only suppresses a new standing set that is a subset of an
+    /// existing entry; a review that writes a new `requested_sha` and then truncates without a
+    /// verdict EXPANDS the standing set, so a later dispatch records a strict SUPERSET as a second
+    /// pending entry. Two reviewers declaring a verdict at the eventual head then consume one entry
+    /// each — two author rounds charged for one conclusive exchange.
+    ///
+    /// This is the case neither the truncation test (one pending entry) nor the containment test
+    /// (a declared verdict at the intermediate head) covers.
+    ///
+    /// Mutation check: retire only the FIRST pending entry a verdict answers (the pre-fix
+    /// [`Orchestrator::settle_author_round`]) and this reds at `Some(6)`, not `Some(4)`.
+    #[test]
+    fn a_truncated_intermediate_review_does_not_double_charge_the_final_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        // Both reviewers read HEAD_A: one round is spent.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // Author dispatch #1 records the standing set {A}; the author pushes HEAD_B.
+        o.note_author_round(&iss);
+        // bob picks HEAD_B up and the round TRUNCATES — a max_turns backstop, no declared verdict.
+        // The row keeps its `requested_sha` (a truncated round is re-reviewed at the same head), so
+        // the live set is now {A, B}.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("bob dispatched at the pushed head");
+        o.store()
+            .mark_review_truncated(&key(12, "bob"))
+            .expect("truncate");
+
+        // A second dispatch (a human `@symphony`, say) sees the superset {A, B} and records it,
+        // because it is not contained in the outstanding {A}. Two pending entries now describe ONE
+        // unfinished exchange.
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.author_rounds_pending
+                .get(&churn_key(&coord(12)))
+                .map(Vec::len),
+            Some(2),
+            "sanity: the truncated intermediate head leaves a second pending entry"
+        );
+
+        // The author pushes HEAD_C and BOTH reviewers declare a verdict there: one answered
+        // exchange, and it must charge exactly one round.
+        complete(&mut o, 12, "bob", HEAD_C);
+        complete(&mut o, 12, "carol", HEAD_C);
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus exactly ONE answered exchange; the truncated intermediate head \
+             must not let a sibling verdict charge a second round"
+        );
+        assert!(
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
+            "and the answered exchange leaves nothing pending behind"
+        );
+    }
+
+    /// **The operator's Clear still lifts everything.** A clear drops the author rounds awaiting an
+    /// answer along with the budget, so a queued review that finally lands afterwards charges
+    /// nothing against the fresh state — "both halves may run" means there is no half-charged round
+    /// waiting to fire at the new budget.
+    #[test]
+    fn an_operator_clear_drops_the_author_rounds_awaiting_an_answer() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.reviewers_per_round());
+        let iss = author_issue("STUDIO-1", 12);
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.author_rounds_pending
+                .get(&churn_key(&coord(12)))
+                .map(Vec::len),
+            Some(1),
+            "sanity: one author round is awaiting an answer"
+        );
+
+        assert_eq!(
+            o.handle_review_clear(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+
+        assert!(
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
+            "the clear drops the pending author round with the budget"
+        );
+        o.settle_author_round(&coord(12), HEAD_B);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            None,
+            "and a later verdict does not charge the cleared pull request"
+        );
+    }
+
+    /// **The runaway bound still holds after the move.** An author amending in a loop — a rebase
+    /// chain, a CI-driven force-push — is still bounded: each amendment a reviewer READS charges a
+    /// round, and the threshold stops the loop. This is the author half in isolation, so the bound
+    /// is the adjudication threshold and not the review cap.
+    ///
+    /// Mutation check: make [`Orchestrator::settle_author_round`] charge nothing (remove the
+    /// runaway bound's only source of author rounds) and this runs all eleven rounds and reds.
+    #[test]
+    fn an_author_amending_after_every_answered_round_is_still_bounded() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        let mut amendments = 0;
+        for i in 0..11 {
+            if o.author_round_budget_spent(&iss) {
+                break;
+            }
+            o.note_author_round(&iss);
+            // The amendment is pushed and a reviewer reads it.
+            o.settle_author_round(&coord(12), &format!("{i:040}"));
+            amendments += 1;
+        }
+
+        assert_eq!(
+            amendments, 2,
+            "one review round plus two answered amendments reaches the threshold of three"
+        );
+        assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **Acceptance 2, unchanged from before the fix.** A converging loop — author pushes, reviewer
+    /// reads, author pushes, reviewer reads — reaches the threshold on exactly the same sweep it did
+    /// with the charge at dispatch: the third round is crossed by the second answered exchange, and
+    /// the second exchange is not yet enough to escalate.
+    #[test]
+    fn a_converging_loop_reaches_the_threshold_in_the_same_rounds_as_before() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        let iss = author_issue("STUDIO-1", 12);
+
+        // Exchange 1: the review reads HEAD_A and summons the author.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_A);
+        o.note_author_round(&iss);
+
+        // Exchange 2: the author pushed HEAD_B; the review of it is one round, and one answered
+        // exchange is not yet the threshold of three.
+        let second = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(second.dispatched, 1);
+        assert!(
+            second.adjudicate.is_empty(),
+            "two exchanges is not yet the threshold of three"
+        );
+        complete(&mut o, 12, "bob", HEAD_B);
+
+        // The third round is crossed exactly here — by the answer to the second exchange.
+        let third = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            third.adjudicate.len(),
+            1,
+            "the threshold is crossed by the second answered exchange, as it was before the fix"
+        );
+    }
+
+    /// **Mutation check (STUDIO-1004 ⚠️): a dispatched-but-VERDICTLESS review is not an answer.**
+    /// The author round is recorded, the author pushes, a review is dispatched at the new head and
+    /// then TRUNCATES — it read nothing conclusively. The counter must not move, on the dispatch or
+    /// on the truncation, and the row must not advance.
+    ///
+    /// Mutation check: settle from the review's DISPATCH, or from `record_review_truncated`, and
+    /// this reds.
+    #[test]
+    fn a_truncated_review_does_not_answer_the_author_round() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+
+        // A first round, completed cleanly at HEAD_A: this pulls the pull request into the budget
+        // (charged at DISPATCH) and leaves the row reviewed there.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_A);
+        let charged = o.reviewers_per_round();
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&charged),
+            "sanity: one round is spent"
+        );
+
+        // The author is dispatched and pushes HEAD_B.
+        let iss = author_issue("STUDIO-1", 12);
+        o.note_author_round(&iss);
+        let dispatch = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(dispatch.dispatched, 1);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(charged + o.reviewers_per_round())),
+            "the review dispatch charges the REVIEW half only; the author round is still pending"
+        );
+
+        // The dispatched review truncates at HEAD_B — a max_turns backstop, no declared verdict.
+        let run = ReviewRun {
+            owner: OWNER.to_string(),
+            repo: REPO.to_string(),
+            number: 12,
+            reviewer: "bob".to_string(),
+            head_sha: HEAD_B.to_string(),
+            ..ReviewRun::default()
+        };
+        let id = run.key();
+        let re = o
+            .running
+            .get(&id)
+            .cloned()
+            .expect("the review is running after its dispatch");
+        o.on_review_exit(
+            &re,
+            &run,
+            &crate::EvWorkerExit {
+                issue_id: id.clone(),
+                failed: false,
+                started_at: re.started_at,
+                err_msg: String::new(),
+                last_state: String::new(),
+                // The max_turns backstop, not a declared hand-off.
+                declared_handoff: false,
+                refused: false,
+            },
+        );
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(charged + o.reviewers_per_round())),
+            "a truncated review answers no author round"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "bob").last_reviewed_sha,
+            HEAD_A,
+            "and the row's last read head is not advanced by a truncated round"
+        );
+    }
+
+    /// **The wiring, positively.** The truncated test above pins which exits must NOT settle; this
+    /// pins that the exit that MUST — a declared verdict from a live run — really does, through the
+    /// production path (`on_review_exit`), not only through the test helper. A refactor that drops
+    /// the `settle_author_round` call from `on_review_exit`, or places it below the truncated
+    /// branch, reds one of the two.
+    #[test]
+    fn a_declared_review_exit_answers_the_author_round() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_A);
+        let charged = o.reviewers_per_round();
+
+        let iss = author_issue("STUDIO-1", 12);
+        o.note_author_round(&iss);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+
+        let run = ReviewRun {
+            owner: OWNER.to_string(),
+            repo: REPO.to_string(),
+            number: 12,
+            reviewer: "bob".to_string(),
+            head_sha: HEAD_B.to_string(),
+            ..ReviewRun::default()
+        };
+        let id = run.key();
+        let re = o
+            .running
+            .get(&id)
+            .cloned()
+            .expect("the review is running after its dispatch");
+        o.on_review_exit(
+            &re,
+            &run,
+            &crate::EvWorkerExit {
+                issue_id: id.clone(),
+                failed: false,
+                started_at: re.started_at,
+                err_msg: String::new(),
+                last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
+                declared_handoff: true,
+                refused: false,
+            },
+        );
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(charged * 3)),
+            "a declared verdict at the pushed head answers the author round: the review half of \
+             round one, the review half of round two, and the answered author round"
+        );
+        assert_eq!(watch_row(&o, 12, "bob").last_reviewed_sha, HEAD_B);
     }
 
     /// **alice round 1 on PR #199, finding 1.** `note_author_round` is placed AFTER the provider
@@ -6600,11 +7392,12 @@ mod tests {
         );
     }
 
-    /// **A decision is never made over an in-flight AUTHOR run.** The counter is charged at
-    /// DISPATCH, so the summoned author's run is live from the instant its charge lands — and with
-    /// the loop alternating review→author, every EVEN threshold is crossed by that dispatch. The
-    /// guard used to look only at review rows, so the manager was handed findings somebody was
-    /// actively fixing and a head about to be superseded.
+    /// **A decision is never made over an in-flight AUTHOR run.** A review's findings summon the
+    /// author, whose run is live while it pushes — and since STUDIO-1004 the round it is answering
+    /// settles (and the threshold is crossed) at the very review completion that summoned it, so the
+    /// author's run is the one most likely to be in flight as the loop reaches its bound. The guard
+    /// used to look only at review rows, so the manager was handed findings somebody was actively
+    /// fixing and a head about to be superseded.
     #[test]
     fn an_in_flight_author_run_defers_the_adjudication() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
@@ -7604,45 +8397,44 @@ mod tests {
         );
     }
 
-    /// **The EVEN-threshold shape, where a blank prompt was the rule rather than the exception.**
+    /// **The head the manager would decide against has moved past the last one read.** When the
+    /// threshold is crossed by an ANSWERED author round and the author then pushes again, every row
+    /// is still at the head that round was answered at, so a finding filter keyed on
+    /// `status == reviewed && last_reviewed_sha == head` names nothing at all and the manager is
+    /// asked to decide on a blank prompt. The plan must instead name the head that was actually
+    /// read and the unread head the author pushed.
     ///
-    /// With the loop alternating review→author, an even threshold is crossed by the AUTHOR's own
-    /// summoned dispatch, and the deferral then holds the decision until their run ends — which is
-    /// after they have pushed. By then every row has been re-armed to `requested`, so a finding
-    /// filter keyed on `status == reviewed && last_reviewed_sha == head` names nothing at all and
-    /// the manager is asked to decide on a blank prompt. The plan must instead name the head that
-    /// was actually read and the unread head the author pushed.
+    /// STUDIO-1004 moved the round that crosses an EVEN threshold from the author's dispatch (which
+    /// no longer charges) to a reviewer's verdict, so this is the shape that replaces the old
+    /// "the author's own dispatch crossed it" reproduction: the push that follows the crossing is
+    /// what leaves an unread head.
     ///
     /// Mutation check: restoring the exact-head/`reviewed`-only filter reds this test.
     #[test]
-    fn the_plan_names_the_unread_head_on_an_even_threshold() {
-        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 4));
+    fn the_plan_names_the_unread_head_when_a_push_follows_an_answered_round() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
-        // bob read HEAD_A and asked for changes; three rounds are charged through the real site.
-        o.store()
-            .mark_review_requested(&key(12, "bob"), HEAD_A)
-            .expect("requested");
-        o.store()
-            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
-            .expect("completed");
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        // The review half is at two of the three rounds: one more answered author round crosses it.
         o.review_rounds
-            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+            .insert(churn_key(&coord(12)), 2 * o.reviewers_per_round());
 
-        // The author's summoned re-dispatch charges the fourth (even) round, and the author's run
-        // pushes HEAD_B before it ends.
+        // The author is summoned, pushes HEAD_B, and a reviewer reads it — the round that crosses.
         let iss = author_issue("STUDIO-956", 12);
         assert!(
             !o.author_round_budget_spent(&iss),
-            "at three of four the author's summon is still allowed"
+            "at two of three the author's summon is still allowed"
         );
         o.note_author_round(&iss);
+        complete(&mut o, 12, "bob", HEAD_B);
 
-        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        // A second summon, and the author pushes HEAD_C, which NOBODY has read.
+        o.note_author_round(&iss);
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
 
         assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
         let plan = &report.adjudicate[0];
-        assert_eq!(plan.head, HEAD_B);
+        assert_eq!(plan.head, HEAD_C);
         assert!(
             !plan.findings.is_empty(),
             "the manager must not be handed a blank prompt when the head has moved: {:?}",
@@ -7651,7 +8443,7 @@ mod tests {
         assert!(
             plan.findings
                 .iter()
-                .any(|f| f.contains(&HEAD_A[..7]) && f.contains(&HEAD_B[..7])),
+                .any(|f| f.contains(&HEAD_B[..7]) && f.contains(&HEAD_C[..7])),
             "the finding names the head that was last read AND the unread head: {:?}",
             plan.findings
         );
@@ -7718,31 +8510,41 @@ mod tests {
     /// the sibling test gives: charging whole cycles would let the review cap stop the loop even if
     /// the author half were removed.
     ///
-    /// Mutation check (the ticket's ⚠️): removing the author-side threshold count (letting
-    /// [`Orchestrator::author_round_budget_spent`] consult only the legacy cap) makes this run all
-    /// eleven rounds and reds it.
+    /// STUDIO-1004 moved the charge from the author's DISPATCH to the moment a reviewer answers it,
+    /// so this fixture now contributes the ANSWER too — that is the runaway bound's whole mechanism:
+    /// an author that keeps amending is bounded because each amendment a reviewer reads charges a
+    /// round, and an amendment nobody reads charges none. The bound must survive the move, and the
+    /// number of rounds that fit is UNCHANGED.
+    ///
+    /// Mutation check (the ticket's ⚠️): making the settle charge nothing (removing the runaway
+    /// bound's only source of rounds) makes this run all eleven rounds and reds it.
     #[test]
     fn the_studio_170_shape_stops_at_the_adjudication_threshold() {
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         let iss = author_issue("STUDIO-170", 12);
-        // The review round that first armed the loop.
+        // The review round that first armed the loop, and the row it read.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         o.review_rounds
             .insert(churn_key(&coord(12)), o.reviewers_per_round());
 
         let mut author_rounds = 0;
-        for _ in 0..11 {
+        for i in 0..11 {
             if o.author_round_budget_spent(&iss) {
                 break;
             }
+            // The author is dispatched (the round is recorded) and their run pushes the head the
+            // reviewer then reads (the round is answered).
+            let pushed = format!("{i:040}");
             o.note_author_round(&iss);
             author_rounds += 1;
+            o.settle_author_round(&coord(12), &pushed);
         }
 
         assert_eq!(
             author_rounds, 2,
-            "one review round plus two author rounds reaches the threshold of three; eleven must \
-             not all run"
+            "one review round plus two ANSWERED author rounds reaches the threshold of three; \
+             eleven must not all run"
         );
         assert!(o.author_round_budget_spent(&iss));
     }

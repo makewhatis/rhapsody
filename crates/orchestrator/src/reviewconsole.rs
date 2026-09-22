@@ -332,6 +332,11 @@ impl Orchestrator {
         // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
         // which is a different fact from "the budget is now clear" and worth saying.
         let cleared_counter = self.review_rounds.remove(&churn_key(pr)).is_some();
+        // The author rounds still awaiting a reviewer's answer (STUDIO-1004) go with the budget.
+        // They are not a bound — nothing is charged for them yet — but a clear promises a state
+        // where both halves may run, and an un-answered author round left behind would charge a
+        // round against the fresh budget the moment some queued review finally landed.
+        self.author_rounds_pending.remove(&churn_key(pr));
         // Durably, and unconditionally: the deliberate clear is the documented way to lift a bound
         // now that a restart no longer does it (STUDIO-956), so it must leave nothing behind for a
         // later boot to rehydrate — including a row this process never saw.
@@ -420,6 +425,8 @@ impl Orchestrator {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
+            // ...and the author rounds awaiting an answer (STUDIO-1004), for the same reason.
+            self.author_rounds_pending.remove(&churn_key(pr));
             // ...and its durable counterpart, so a restart cannot resurrect the spent budget of
             // a dismissed pull request (STUDIO-956). `churn_key` lowercases, so the operator's own
             // casing is safe here in a way the coordinate-keyed record below is not.
