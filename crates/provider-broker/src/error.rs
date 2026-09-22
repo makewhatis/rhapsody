@@ -70,6 +70,12 @@ pub enum BrokerError {
     /// The parent session was revoked.
     #[error("the broker session is revoked")]
     SessionRevoked,
+    /// The turn was released or revoked before the attempt could mint a capability.
+    ///
+    /// Dropping the retained [`TurnReceipt`](crate::TurnReceipt) without draining it is a caller
+    /// bug; it revokes the armed turn so a capability can neither be minted nor keep spending.
+    #[error("the turn was revoked before a capability could be minted")]
+    TurnRevoked,
     /// The presented capability is missing, malformed, unknown, expired, or revoked.
     ///
     /// All of those cases collapse to this one variant on purpose: the design requires that an

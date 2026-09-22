@@ -53,7 +53,9 @@ impl BrokerTurnAttempt {
     /// Consume the attempt and mint the one capability it can ever produce.
     ///
     /// All failure paths finalize the armed receipt with `no_capability` and release the session's
-    /// capacity-one turn gate, so a refused or failed turn never leaves custody dangling.
+    /// capacity-one turn gate, so a refused or failed turn never leaves custody dangling. A turn
+    /// whose receipt was already dropped (revoked) fails closed with [`BrokerError::TurnRevoked`]
+    /// rather than hand back a dead handle.
     pub fn mint_access(mut self) -> Result<TurnAccess, BrokerError> {
         let inner = self.inner.take().ok_or(BrokerError::AttemptConsumed)?;
         let gate = self.gate.take();
@@ -93,6 +95,9 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
     if session.is_revoked() {
         return Err(BrokerError::SessionRevoked);
     }
+    if inner.is_revoked() || inner.is_finalized() {
+        return Err(BrokerError::TurnRevoked);
+    }
     if inner.is_expired(session.broker.clock.now()) {
         return Err(BrokerError::TurnExpired);
     }
@@ -107,6 +112,11 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
         let digest = TokenDigest::of(&encoded);
         {
             let mut registry = lock(&session.broker.registry);
+            // Re-check under the registry lock (which a concurrent `revoke_grant` also takes)
+            // so a released receipt cannot race into a live grant.
+            if inner.is_revoked() || inner.is_finalized() {
+                return Err(BrokerError::TurnRevoked);
+            }
             if registry.grants.contains_key(&digest) {
                 continue;
             }
@@ -177,8 +187,10 @@ impl Drop for TurnAccess {
 /// The supervisor half, retained outside the cancellable turn future. Once the attempt/access has
 /// finished or dropped, the receipt is guaranteed finalized and can be taken without waiting.
 ///
-/// Dropping a receipt without taking it still finalizes the slot (so no account is lost) and drains
-/// it so the next turn may arm.
+/// The receipt acts only on the ledger for *its own* turn ordinal, so keeping it alive past `take`
+/// cannot steal or erase a later turn's ledger. Dropping a receipt without taking it still finalizes
+/// the slot, and it also revokes the armed turn (a caller bug) so no capability can be minted or
+/// keep spending unwatched.
 pub struct TurnReceipt {
     inner: Arc<TurnInner>,
 }
@@ -193,10 +205,11 @@ impl TurnReceipt {
         self.inner.is_finalized()
     }
 
-    /// Drain the finalized ledger. `None` if the attempt/access has not finished or dropped yet; the
-    /// slot is left intact so the caller can take it later.
+    /// Drain the finalized ledger for this receipt's turn. `None` if the attempt/access has not
+    /// finished or dropped yet, or if the slot currently holds a different turn's ledger; the slot
+    /// is left intact so the caller can take it later.
     pub fn take(&self) -> Option<TurnLedger> {
-        self.inner.slot.take()
+        self.inner.slot.take(self.inner.ordinal)
     }
 
     /// The monotonic ordinal of the turn this receipt accounts for.
@@ -215,8 +228,10 @@ impl fmt::Debug for TurnReceipt {
 
 impl Drop for TurnReceipt {
     fn drop(&mut self) {
-        self.inner.finalize(TurnOutcome::SupervisorReleased);
-        self.inner.slot.drain();
+        // Revoke first so a receipt dropped before the attempt/access finishes cannot leave a
+        // capability live and unaccounted; `supervisor_release` finalizes exactly once.
+        self.inner.supervisor_release();
+        self.inner.slot.drain(self.inner.ordinal);
     }
 }
 

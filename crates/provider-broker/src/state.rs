@@ -191,10 +191,14 @@ impl ReceiptSlot {
         true
     }
 
-    /// Drain a finalized receipt (`Finalized -> Empty`); `None` if it is not finalized yet.
-    pub(crate) fn take(&self) -> Option<TurnLedger> {
+    /// Drain the finalized ledger that belongs to `ordinal` (`Finalized -> Empty`); `None` if the
+    /// slot is not finalized or holds a *different* turn's ledger.
+    ///
+    /// The slot is session-local and reused across turns, so a receipt retained past `take` must
+    /// not steal or erase the next turn's ledger: it acts only on the ledger with its own ordinal.
+    pub(crate) fn take(&self, ordinal: u64) -> Option<TurnLedger> {
         let mut state = lock(&self.state);
-        if matches!(*state, SlotState::Finalized(_)) {
+        if matches!(&*state, SlotState::Finalized(ledger) if ledger.turn_ordinal() == ordinal) {
             let SlotState::Finalized(ledger) = std::mem::replace(&mut *state, SlotState::Empty)
             else {
                 return None;
@@ -204,10 +208,11 @@ impl ReceiptSlot {
         None
     }
 
-    /// Drop a finalized receipt without handing it back, so the next turn may arm.
-    pub(crate) fn drain(&self) {
+    /// Drop the finalized ledger that belongs to `ordinal` without handing it back, so the next
+    /// turn may arm. A ledger for any other turn is left intact.
+    pub(crate) fn drain(&self, ordinal: u64) {
         let mut state = lock(&self.state);
-        if matches!(*state, SlotState::Finalized(_)) {
+        if matches!(&*state, SlotState::Finalized(ledger) if ledger.turn_ordinal() == ordinal) {
             *state = SlotState::Empty;
         }
     }
@@ -322,6 +327,10 @@ impl TurnInner {
         now > self.not_after
     }
 
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_finalized(&self) -> bool {
         lock(&self.finalized).is_some()
     }
@@ -340,10 +349,7 @@ impl TurnInner {
 
     /// Revoke the grant and finalize with the outcome implied by the declared one and the clock.
     pub(crate) fn revoke_and_finalize(&self, declared: TurnOutcome) -> Option<TurnLedger> {
-        self.revoked.store(true, Ordering::Release);
-        if let Some(digest) = self.digest() {
-            lock(&self.session.broker.registry).remove_grant(&digest);
-        }
+        self.revoke_grant();
         let now = self.session.broker.clock.now();
         let outcome = if self.is_expired(now) {
             TurnOutcome::Expired
@@ -353,6 +359,26 @@ impl TurnInner {
             TurnOutcome::Revoked
         };
         self.finalize(outcome)
+    }
+
+    /// The supervisor dropped the retained receipt without draining it (a caller bug). Fail closed:
+    /// revoke the grant so a capability can no longer be minted or spend, then publish a
+    /// `SupervisorReleased` receipt with the counters as of now. A turn that already finalized keeps
+    /// its outcome; `finalize` is also exactly-once, so a racing attempt/access drop cannot double up.
+    pub(crate) fn supervisor_release(&self) -> Option<TurnLedger> {
+        if self.is_finalized() {
+            return None;
+        }
+        self.revoke_grant();
+        self.finalize(TurnOutcome::SupervisorReleased)
+    }
+
+    /// Set the revoked flag and drop the grant from the registry if one was issued.
+    fn revoke_grant(&self) {
+        self.revoked.store(true, Ordering::Release);
+        if let Some(digest) = self.digest() {
+            lock(&self.session.broker.registry).remove_grant(&digest);
+        }
     }
 
     fn build_ledger(&self, outcome: TurnOutcome) -> TurnLedger {
@@ -410,33 +436,36 @@ mod tests {
     use crate::ledger::TurnOutcome;
 
     #[test]
-    fn capacity_one_admits_a_single_holder_under_a_barrier() {
+    fn capacity_one_refuses_a_second_holder_while_one_is_held() {
         let gate = Arc::new(CapacityOne::new());
-        let barrier = Arc::new(std::sync::Barrier::new(16));
-        let successes = Arc::new(AtomicU64::new(0));
+        // Hold the single slot before any contender runs.
+        let held = gate.try_acquire().expect("the first holder");
+        let threads = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut handles = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..threads {
             let gate = Arc::clone(&gate);
             let barrier = Arc::clone(&barrier);
-            let successes = Arc::clone(&successes);
+            let tx = tx.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                if let Some(guard) = gate.try_acquire() {
-                    // Hold while others try.
-                    thread::yield_now();
-                    successes.fetch_add(1, Ordering::AcqRel);
-                    drop(guard);
-                }
+                let acquired = gate.try_acquire().is_some();
+                tx.send(acquired).expect("send");
             }));
+        }
+        drop(tx);
+        for acquired in rx {
+            assert!(!acquired, "no second holder while the gate is held");
         }
         for handle in handles {
             handle.join().expect("thread");
         }
-        // Serialized acquisition: with a held guard, another thread's acquire fails, so some
-        // threads may lose; the invariant is that the count never exceeds the number of successful
-        // & serialized acquisitions, and the gate is free at the end.
-        assert!(successes.load(Ordering::Acquire) >= 1);
-        assert!(gate.try_acquire().is_some());
+        drop(held);
+        assert!(
+            gate.try_acquire().is_some(),
+            "releasing the holder admits the next turn"
+        );
     }
 
     #[test]
@@ -453,9 +482,59 @@ mod tests {
         );
         assert!(slot.finalize(ledger.clone()));
         assert!(!slot.finalize(ledger.clone()));
-        assert_eq!(slot.take(), Some(ledger));
-        assert_eq!(slot.take(), None);
+        assert_eq!(slot.take(1), Some(ledger));
+        assert_eq!(slot.take(1), None);
         assert_eq!(slot.begin_armed(), Ok(()));
+    }
+
+    #[test]
+    fn receipt_slot_only_acts_on_its_own_ordinal() {
+        let slot = ReceiptSlot::new();
+        assert_eq!(slot.begin_armed(), Ok(()));
+
+        let first = TurnLedger::new(
+            1,
+            TurnOutcome::Completed,
+            true,
+            ReservationCounters::default(),
+            None,
+        );
+        assert!(slot.finalize(first.clone()));
+        // A stale receipt for turn 2 must neither hand back nor drain turn 1's ledger.
+        assert_eq!(slot.take(2), None);
+        slot.drain(2);
+        assert_eq!(slot.take(1), Some(first));
+
+        // Turn 2 arms on the now-empty slot and finalizes; a stale turn-1 receipt must leave it be.
+        assert_eq!(slot.begin_armed(), Ok(()));
+        let second = TurnLedger::new(
+            2,
+            TurnOutcome::Completed,
+            true,
+            ReservationCounters::default(),
+            None,
+        );
+        assert!(slot.finalize(second.clone()));
+        assert_eq!(slot.take(1), None, "turn 1 must not steal turn 2's ledger");
+        slot.drain(1);
+        assert_eq!(slot.take(2), Some(second), "turn 2's ledger survives");
+    }
+
+    #[test]
+    fn receipt_slot_drains_only_its_own_ordinal_after_a_stale_drop() {
+        let slot = ReceiptSlot::new();
+        let _ = slot.begin_armed();
+        let second = TurnLedger::new(
+            2,
+            TurnOutcome::Completed,
+            true,
+            ReservationCounters::default(),
+            None,
+        );
+        assert!(slot.finalize(second.clone()));
+        // A dropped turn-1 receipt drains only its own ledger, never turn 2's.
+        slot.drain(1);
+        assert_eq!(slot.take(2), Some(second));
     }
 
     #[test]

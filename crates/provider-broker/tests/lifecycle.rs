@@ -230,7 +230,7 @@ fn a_dropped_access_revokes_and_finalizes_with_revoked() {
 }
 
 #[test]
-fn a_dropped_receipt_still_finalizes_and_frees_the_slot_but_not_the_turn_gate() {
+fn a_dropped_receipt_revokes_the_live_turn_and_frees_the_slot_but_not_the_turn_gate() {
     let clock = Arc::new(ManualClock::new());
     let rng = Arc::new(ScriptedRandom::new());
     let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
@@ -241,7 +241,16 @@ fn a_dropped_receipt_still_finalizes_and_frees_the_slot_but_not_the_turn_gate() 
         .arm_turn(TurnMeta::without_deadline())
         .expect("arm");
     let access = attempt.mint_access().expect("mint");
+    let token = access.api_key.expose_for_child(str::to_owned);
+    assert!(broker.lookup_capability(&token).is_ok());
+
     drop(receipt);
+    // Dropping the receipt is a caller bug: it revokes the turn so the capability cannot keep
+    // spending unaccounted.
+    assert_eq!(
+        broker.lookup_capability(&token).unwrap_err(),
+        BrokerError::Unauthorized
+    );
 
     // The receipt is gone, but the live access still holds the session's turn gate.
     assert_eq!(
@@ -256,6 +265,128 @@ fn a_dropped_receipt_still_finalizes_and_frees_the_slot_but_not_the_turn_gate() 
         .ledgers
         .arm_turn(TurnMeta::without_deadline())
         .expect("arm after access drop");
+}
+
+#[test]
+fn a_stale_receipt_cannot_steal_a_later_turns_ledger() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt1, receipt1) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm 1");
+    attempt1.mint_access().expect("mint 1").finish();
+    let ledger1 = receipt1.take().expect("turn 1 ledger");
+    assert_eq!(ledger1.turn_ordinal(), 1);
+
+    // Turn 1's receipt object is still alive, as a worker loop that holds it to end of scope would.
+    let (attempt2, receipt2) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm 2");
+    attempt2.mint_access().expect("mint 2").finish();
+
+    assert!(
+        receipt1.take().is_none(),
+        "a stale receipt must not hand back turn 2's ledger"
+    );
+    let ledger2 = receipt2
+        .take()
+        .expect("turn 2 ledger must still be drainable");
+    assert_eq!(ledger2.turn_ordinal(), 2);
+    assert_eq!(ledger2.outcome(), TurnOutcome::Completed);
+}
+
+#[test]
+fn a_stale_receipt_drop_does_not_erase_a_later_turns_ledger() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt1, receipt1) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm 1");
+    attempt1.mint_access().expect("mint 1").finish();
+    let _ = receipt1.take().expect("turn 1 ledger");
+
+    let (attempt2, receipt2) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm 2");
+    attempt2.mint_access().expect("mint 2").finish();
+    assert!(receipt2.is_finalized());
+
+    // The stale turn-1 receipt drops after turn 2 finalized; it must not drain turn 2's ledger.
+    drop(receipt1);
+    let ledger2 = receipt2
+        .take()
+        .expect("turn 2 ledger survives a stale drop");
+    assert_eq!(ledger2.turn_ordinal(), 2);
+}
+
+#[test]
+fn dropping_the_receipt_before_mint_revokes_the_turn_and_refuses_mint() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt, receipt) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm");
+    drop(receipt);
+
+    // Cancellation-before-mint leaves no live capability: the mint fails closed.
+    assert_eq!(attempt.mint_access().unwrap_err(), BrokerError::TurnRevoked);
+
+    // The slot was drained and the gate released, so the next turn may arm.
+    let (attempt2, receipt2) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm after revoked turn");
+    let access2 = attempt2
+        .mint_access()
+        .expect("the next turn mints normally");
+    access2.finish();
+    let ledger2 = receipt2.take().expect("ledger");
+    assert_eq!(ledger2.turn_ordinal(), 2);
+    assert!(ledger2.capability_issued());
+}
+
+#[test]
+fn dropping_the_receipt_after_mint_revokes_the_live_capability() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt, receipt) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm");
+    let access = attempt.mint_access().expect("mint");
+    let token = access.api_key.expose_for_child(str::to_owned);
+    let grant = broker.lookup_capability(&token).expect("live");
+
+    drop(receipt);
+
+    // The live grant is revoked: it leaves the registry and refuses all further spend.
+    assert_eq!(
+        broker.lookup_capability(&token).unwrap_err(),
+        BrokerError::Unauthorized
+    );
+    assert!(grant.is_revoked());
+    assert_eq!(
+        grant.reserve_request(1, 1, 1).unwrap_err(),
+        BrokerError::Unauthorized
+    );
+    drop(access);
 }
 
 #[test]
@@ -440,12 +571,13 @@ fn collision_exhaustion_fails_closed_with_a_no_capability_receipt() {
     let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
 
     let mut a = register(&broker, "provider-a");
-    let (attempt_a, _) = a
+    // Keep session A's turn live (named binding) so its digest still occupies the registry.
+    let (attempt_a, _receipt_a) = a
         .ledgers
         .arm_turn(TurnMeta::without_deadline())
         .expect("arm a");
-    let _access_a = attempt_a.mint_access().expect("mint a");
-    let token_a = _access_a.api_key.expose_for_child(str::to_owned);
+    let access_a = attempt_a.mint_access().expect("mint a");
+    let token_a = access_a.api_key.expose_for_child(str::to_owned);
     assert!(broker.lookup_capability(&token_a).is_ok());
 
     let mut b = register(&broker, "provider-a");

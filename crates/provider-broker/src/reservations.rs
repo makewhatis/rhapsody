@@ -171,8 +171,9 @@ impl Reservations {
         })
     }
 
-    /// Count one locally denied authenticated request. Reaching the configured threshold refuses
-    /// further denials so the caller can revoke the turn.
+    /// Count one locally denied authenticated request. *Reaching* the configured threshold refuses
+    /// the request and returns an error so the caller can revoke the turn (design §8.2); the
+    /// threshold denial is still counted, and further denials keep returning the same error.
     pub(crate) fn record_denied(&self) -> Result<(), BrokerError> {
         let mut state = lock(&self.counters);
         let next = state
@@ -183,6 +184,9 @@ impl Reservations {
             return Err(BrokerError::TurnBudgetExhausted("max_denied_requests"));
         }
         state.denied_requests = next;
+        if next >= u64::from(self.limits.max_denied_requests) {
+            return Err(BrokerError::TurnBudgetExhausted("max_denied_requests"));
+        }
         Ok(())
     }
 
@@ -327,5 +331,28 @@ mod tests {
         );
         assert_eq!(reservations.snapshot().forwarded_requests, 0);
         assert_eq!(session.reserved(), 0);
+    }
+
+    #[test]
+    fn reaching_the_denial_threshold_refuses_and_counts_the_threshold_denial() {
+        let reservations = Reservations::new(BrokerLimits {
+            max_denied_requests: 3,
+            ..limits()
+        });
+        assert_eq!(reservations.record_denied(), Ok(()));
+        assert_eq!(reservations.record_denied(), Ok(()));
+        // The third denial *reaches* the threshold: it is counted, and it refuses so the caller
+        // can revoke the turn (design §8.2).
+        assert_eq!(
+            reservations.record_denied(),
+            Err(BrokerError::TurnBudgetExhausted("max_denied_requests"))
+        );
+        assert_eq!(reservations.snapshot().denied_requests, 3);
+        // Further denials keep refusing without incrementing past the cap.
+        assert_eq!(
+            reservations.record_denied(),
+            Err(BrokerError::TurnBudgetExhausted("max_denied_requests"))
+        );
+        assert_eq!(reservations.snapshot().denied_requests, 3);
     }
 }

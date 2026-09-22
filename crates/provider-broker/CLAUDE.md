@@ -30,9 +30,11 @@ is authoritative.
   `CapabilityToken` is reachable only through `expose_for_child`; the registry key is
   `SHA-256("rhapsody-provider-turn-v1\0" || presented)`. The `state.rs` unit tests are the canary.
 - **Capacity-one, twice over.** `ReceiptSlot` refuses a new arm until the prior receipt is drained;
-  `CapacityOne` refuses a new turn until the prior attempt/access drops. The receipt slot may be
-  drained by a dropped receipt, but the turn gate is released only by the attempt/access drop —
-  keep that split.
+  `CapacityOne` refuses a new turn until the prior attempt/access drops. A receipt acts only on the
+  ledger for its own turn ordinal, so a stale receipt cannot steal or erase a later turn's ledger.
+  Dropping a receipt without draining it revokes the armed turn (a caller bug) so no capability can
+  be minted or keep spending unwatched; the turn gate is still released only by the attempt/access
+  drop — keep that split.
 - **Synchronous RAII.** Revocation and receipt finalization happen in `Drop`, never in an async task.
   Finalization is exactly-once via the `TurnInner::finalized` mutex.
 - **No panics on production paths.** `lock()` recovers poisoned mutexes; every error is a returned
