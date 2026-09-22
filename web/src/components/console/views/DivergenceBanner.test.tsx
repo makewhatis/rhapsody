@@ -203,4 +203,62 @@ describe("DivergenceBanner", () => {
     expect(banner.textContent).toContain("for 1 minute");
     expect(banner.textContent).not.toContain("1 minutes");
   });
+
+  // STUDIO-1005: an escalation's reason is a snapshot written once and never revalidated, so an
+  // operator can act on findings the author already fixed. When the daemon has OBSERVED the branch
+  // move past the head the reason was computed at, the console must say so where the operator reads
+  // the reason — inline, with both heads and the manager's own words. This is the console half of
+  // the #210 incident's fix.
+  it("marks a superseded escalation and shows the reason that is now a snapshot", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_escalated",
+            detail:
+              "the manager adjudicated the review loop and escalated it: the open findings need a human",
+            reviewer: "",
+            stale_secs: 0,
+            adjudicated_head: "31ee051",
+            current_head: "b02fc72",
+            superseded: true,
+            reason: "sol's REQUEST CHANGES at 0052489 is still unaddressed",
+            findings: ["alice asked for changes at 0052489"],
+            supersession:
+              "This escalation was computed at head `31ee051`; the branch has since moved to `b02fc72`, so these findings may already be addressed — treat the reason below as evidence, not a verdict.",
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("computed at head `31ee051`");
+    expect(banner.textContent).toContain("b02fc72");
+    expect(banner.textContent).toContain("sol's REQUEST CHANGES at 0052489 is still unaddressed");
+    // Still a report, not a control — superseding an escalation does not conjure a button.
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  // The other direction: an escalation whose head has NOT moved carries no supersession fields, so
+  // the banner reads exactly as it did before STUDIO-1005. That silence is the load-bearing half —
+  // a marker shown on every escalation would be the permanent unread warning this banner avoids.
+  it("does not mark an escalation whose head has not moved", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "review_escalated",
+            detail:
+              "the manager adjudicated the review loop and escalated it: the open findings need a human",
+            reviewer: "",
+            stale_secs: 0,
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).not.toContain("may already be addressed");
+    expect(banner.textContent).not.toContain("The manager's reason was");
+  });
 });

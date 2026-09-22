@@ -695,6 +695,25 @@ pub struct Orchestrator {
     /// rate-limit from blinking a live annotation off and on; a second consecutive failure — two
     /// ticks on which GitHub would not answer — is enough to stop naming the hold.
     pub(crate) review_watch_unreadable: HashMap<crate::prstate::PrCoord, u32>,
+    /// The head SHA the review watcher most recently OBSERVED for each open pull request
+    /// (STUDIO-1005), keyed by coordinate. Written by the watcher's loop-side handler
+    /// ([`Orchestrator::handle_review_sweep_slots`]) from the head its own `gh` lookup already
+    /// returned, and read by the reconciliation sweep to tell whether an escalation's recorded head
+    /// is still the branch's current head.
+    ///
+    /// **This is the whole point of the ticket.** An adjudication's `reason` is written once and
+    /// never revalidated; before this map existed, nothing local knew the head had moved, so the
+    /// operator-facing report repeated the escalation's present-tense findings as current fact long
+    /// after an author had pushed past them. Comparing a stored string is not a network call, which
+    /// is what keeps the sweep local-only — the head here is a by-product of a lookup the watcher had
+    /// already made.
+    ///
+    /// In-memory rather than durable on purpose: this is a derived freshness signal, not a decision.
+    /// A restart empties it, and the next watcher tick (one `polling.pr_state_interval_ms`, 15s by
+    /// default) refills it, so the worst case is one cadence in which an escalation renders exactly
+    /// as it did before this ticket — never a false claim that a current escalation is stale. The
+    /// escalation itself, and the head it was computed at, are durable in `rhapsody_review_bound`.
+    pub(crate) review_observed_head: HashMap<crate::prstate::PrCoord, String>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -989,6 +1008,7 @@ impl Orchestrator {
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
             review_watch_swept: None,
             review_watch_unreadable: HashMap::new(),
+            review_observed_head: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,

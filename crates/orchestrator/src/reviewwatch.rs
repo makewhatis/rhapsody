@@ -1226,6 +1226,17 @@ impl Orchestrator {
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
+                    // STUDIO-1005: remember the head the watcher just observed for this pull
+                    // request, whether or not the loop is stopped. The reconciliation sweep reads
+                    // it to tell whether an escalation's recorded head is still the current head —
+                    // a stored-string comparison, never a new lookup. Recorded here rather than at
+                    // dispatch because the job is to know the head even when no round will be
+                    // armed: an escalation deliberately stops arming rounds, and that is exactly
+                    // when the operator most needs to know the branch has moved.
+                    if !snap.head_sha.is_empty() {
+                        self.review_observed_head
+                            .insert(obs.pr.clone(), snap.head_sha.clone());
+                    }
                     // STUDIO-962: a finished run's pull request left in draft gets its author
                     // poked, once per head, before the review dispatch below — the two are
                     // independent and a draft may still owe a round.
@@ -1908,6 +1919,10 @@ impl Orchestrator {
         // still an ANSWER); relying on that caller's ordering would make this function silently
         // incomplete if the loop were ever reordered.
         self.review_watch_unreadable.remove(pr);
+        // And the observed-head memo (STUDIO-1005): a coordinate that left the watch set has no
+        // current head to compare an escalation against, and leaving the entry would grow this map
+        // for the daemon's whole life.
+        self.review_observed_head.remove(pr);
         for id in retired_ids {
             self.review_unassignable.remove(&id);
             // A round cannot be held for capacity once its pull request has left the watch set
@@ -3490,6 +3505,39 @@ mod tests {
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// STUDIO-1005: the watcher remembers the head it OBSERVED, not merely the one it dispatched
+    /// against. This is the escalation surface's only local record that the branch has moved — an
+    /// escalation deliberately stops arming rounds, so a push past it never advances `requested_sha`
+    /// or `last_reviewed_sha`, and without this memo the reconciliation sweep could not tell the
+    /// operator their reason had become a snapshot.
+    #[test]
+    fn the_watcher_records_the_head_it_observes() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            Some(HEAD_A),
+            "the observed head is recorded"
+        );
+
+        // The author pushes: the memo follows the branch even though the loop may be stopped.
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            Some(HEAD_B),
+            "a later observation updates the memo"
+        );
+
+        // A pull request that leaves the watch set forgets its head, so the map does not grow.
+        o.handle_review_sweep(&[observed(12, PrLookup::Gone)]);
+        assert!(
+            !o.review_observed_head.contains_key(&coord(12)),
+            "a retired pull request carries no current head"
+        );
     }
 
     // --- STUDIO-960: a head move that carried no new work -------------------------------------

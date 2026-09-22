@@ -347,8 +347,16 @@ pub struct Divergence {
     pub capacity_unreadable: Option<u32>,
     /// The head the manager stopped at — only meaningful for [`DivergenceKind::ReviewEscalated`],
     /// `""` otherwise. Read by [`Orchestrator::set_review_divergences`] to name where the loop
-    /// stopped, never rendered onto `/api/v1/state`.
+    /// stopped. Rendered onto `/api/v1/state` ONLY when the escalation is SUPERSEDED, so a
+    /// still-current escalation keeps the row shape it had before STUDIO-1005.
     pub adjudicated_head: String,
+    /// The head the review watcher most recently OBSERVED for this pull request, or `""` when no
+    /// observation is available (STUDIO-1005). Filled in from
+    /// [`Orchestrator::review_observed_head`] for a [`DivergenceKind::ReviewEscalated`] row; `""`
+    /// for every other kind. When it differs from [`Divergence::adjudicated_head`] the escalation is
+    /// SUPERSEDED — its reason was computed against a head the branch no longer carries — and the
+    /// operator must be told so. See [`Divergence::superseded`] and [`Divergence::supersession`].
+    pub current_head: String,
     /// How many review↔author rounds the loop ran before the escalation — `0` for every kind but
     /// [`DivergenceKind::ReviewEscalated`]. Rendered onto the escalation log line, not the wire.
     pub rounds: usize,
@@ -357,9 +365,47 @@ pub struct Divergence {
     pub findings: Vec<String>,
     /// The manager's OWN words for an escalation — empty for every kind but
     /// [`DivergenceKind::ReviewEscalated`]. Read by [`Orchestrator::set_review_divergences`] so the
-    /// WARN carries the reason rather than only the room post and the pull-request comment; like
-    /// [`Divergence::adjudicated_head`] it is not rendered onto `/api/v1/state`.
+    /// WARN carries the reason rather than only the room post and the pull-request comment. Rendered
+    /// onto `/api/v1/state` only when the escalation is SUPERSEDED (STUDIO-1005): a superseded row
+    /// shows the manager's reason beside the supersession notice, so the operator can see the text
+    /// they must not act on as current fact.
     pub reason: String,
+}
+
+impl Divergence {
+    /// Whether this escalation's reason is no longer known to describe the current head
+    /// (STUDIO-1005).
+    ///
+    /// True only for a [`DivergenceKind::ReviewEscalated`] whose recorded
+    /// [`Divergence::adjudicated_head`] is non-empty and differs from an OBSERVED
+    /// [`Divergence::current_head`]. A missing observation (`current_head` empty) is "unknown", not
+    /// "stale": the ticket forbids claiming staleness the daemon cannot stand behind, and this is the
+    /// direction that renders exactly as before the feature existed. A moved head is a signal that
+    /// the text MAY be stale, never a verdict that the findings were addressed — a merge, a
+    /// CHANGELOG bump or a force-push all move the head without touching a finding.
+    pub fn superseded(&self) -> bool {
+        self.kind == DivergenceKind::ReviewEscalated
+            && !self.adjudicated_head.is_empty()
+            && !self.current_head.is_empty()
+            && self.current_head != self.adjudicated_head
+    }
+
+    /// The operator-facing supersession sentence, or `None` when the escalation is not superseded.
+    ///
+    /// Deliberately states only what the daemon knows: the head the reason was computed at and the
+    /// head the branch now carries. It does NOT claim the findings were fixed — the signal is "this
+    /// text may be stale", not "this text is wrong" — and it does not count commits, because a local
+    /// string comparison cannot honestly answer that without a `git`/`gh` call the sweep may not make.
+    pub fn supersession(&self) -> Option<String> {
+        self.superseded().then(|| {
+            format!(
+                "This escalation was computed at head `{}`; the branch has since moved to `{}`, so \
+                 these findings may already be addressed — treat the reason below as evidence, not a \
+                 verdict.",
+                self.adjudicated_head, self.current_head
+            )
+        })
+    }
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -500,6 +546,7 @@ pub(crate) fn reconcile_pr(
                 // (which has the per-coordinate count [`reconcile_pr`] deliberately does not).
                 capacity_unreadable: None,
                 adjudicated_head: String::new(),
+                current_head: String::new(),
                 rounds: 0,
                 findings: Vec::new(),
                 reason: String::new(),
@@ -536,6 +583,7 @@ fn row_divergence(
         capacity_held: row.capacity_held,
         capacity_unreadable: row.capacity_unreadable,
         adjudicated_head: String::new(),
+        current_head: String::new(),
         rounds: 0,
         findings: Vec::new(),
         reason: String::new(),
@@ -881,6 +929,13 @@ impl Orchestrator {
                         capacity_held: None,
                         capacity_unreadable: None,
                         adjudicated_head: head,
+                        // STUDIO-1005: the head the watcher last observed. `""` until it has
+                        // observed this pull request, which renders exactly as before this ticket.
+                        current_head: self
+                            .review_observed_head
+                            .get(pr)
+                            .cloned()
+                            .unwrap_or_default(),
                         rounds,
                         findings,
                         reason,
@@ -915,6 +970,9 @@ impl Orchestrator {
                             capacity_held: None,
                             capacity_unreadable: None,
                             adjudicated_head: head,
+                            // A ship is not an escalation's reason, so it carries no observed head
+                            // (STUDIO-1005): the supersession notice is the escalation surface's.
+                            current_head: String::new(),
                             rounds,
                             findings: Vec::new(),
                             reason: String::new(),
@@ -950,6 +1008,7 @@ impl Orchestrator {
                             capacity_held: None,
                             capacity_unreadable: None,
                             adjudicated_head: String::new(),
+                            current_head: String::new(),
                             rounds: 0,
                             findings: Vec::new(),
                             reason: String::new(),
@@ -1186,6 +1245,20 @@ impl Orchestrator {
                             d.findings.join("; ")
                         }
                     );
+                    // STUDIO-1005: when the watcher has seen the branch move past the head the
+                    // escalation was computed at, say so ON THE LINE THAT CARRIES THE REASON — the
+                    // same defect one surface over. The operator reading "still unaddressed" must not
+                    // have to infer that the text is a snapshot; the log is the third place this
+                    // reason reaches a human after the room post and the pull-request comment.
+                    if let Some(note) = d.supersession() {
+                        tracing::warn!(
+                            pr = %d.pr,
+                            adjudicated_head = %d.adjudicated_head,
+                            current_head = %d.current_head,
+                            "review reconciliation: the escalation above is SUPERSEDED — {}",
+                            note
+                        );
+                    }
                     continue;
                 }
                 // STUDIO-956's decider: the manager SHIPPED the loop and the merge gate still holds
@@ -3354,6 +3427,175 @@ mod store_tests {
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
+    }
+
+    /// Records an ESCALATE at `head` for PR #164 with the incident's own reason text, returning the
+    /// coordinate so a test can seed the watcher's observed-head memo beside it.
+    fn escalated_at(o: &mut Orchestrator, head: &str) {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Escalate {
+                head: head.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes at 0052489".to_string()],
+                reason: "sol's REQUEST CHANGES at 0052489 is still unaddressed".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+    }
+
+    /// **STUDIO-1005 acceptance: the #210 replay.** An escalation's reason is a snapshot written
+    /// once and never revalidated; when the author pushes past the head it was computed at, the
+    /// sweep must say so — and must compare against the head the WATCHER OBSERVED, not the
+    /// reviewer's `last_reviewed_sha`. In this fixture the escalation's head IS the reviewed head
+    /// (the author pushed since, and the loop is stopped so nothing advanced `last_reviewed_sha`),
+    /// so comparing against `last_reviewed_sha` would read as still-current and the operator would
+    /// act on findings the author already addressed.
+    ///
+    /// MUTATION (the ticket's ⚠️): compare `adjudicated_head` against the watch row's
+    /// `last_reviewed_sha` instead of `review_observed_head`, and the `superseded` assertion reds.
+    #[test]
+    fn a_superseded_escalation_is_reported_with_both_heads() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005"); // last_reviewed_sha == HEAD, and stays there
+        escalated_at(o, HEAD);
+        // The watcher observed a head that is NOT the escalation's: the author pushed after it.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            "b02fc72".to_string(),
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "a superseded escalation must NOT be dropped — the push may be unrelated: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ReviewEscalated);
+        assert!(
+            found[0].superseded(),
+            "a head move past the escalation's head marks it stale"
+        );
+        assert_eq!(found[0].adjudicated_head, HEAD);
+        assert_eq!(found[0].current_head, "b02fc72");
+        assert_eq!(
+            found[0].reason, "sol's REQUEST CHANGES at 0052489 is still unaddressed",
+            "the manager's own reason is still reported — as evidence, not silently deleted"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = &rendered["review_divergence"][0];
+        assert_eq!(row["superseded"], true);
+        assert_eq!(row["adjudicated_head"], HEAD);
+        assert_eq!(row["current_head"], "b02fc72");
+        assert_eq!(
+            row["reason"],
+            "sol's REQUEST CHANGES at 0052489 is still unaddressed"
+        );
+        assert_eq!(
+            row["findings"][0], "alice asked for changes at 0052489",
+            "the stale findings travel with the reason"
+        );
+        let note = row["supersession"].as_str().unwrap_or_default();
+        assert!(
+            note.contains(HEAD) && note.contains("b02fc72"),
+            "the notice must name both heads so the operator can see the snapshot moved, got: {note}"
+        );
+    }
+
+    /// The ticket's single-commit mutation: the supersession marker must fire on ANY head move, not
+    /// only a move of more than one commit. The sweep compares two SHA strings and cannot count
+    /// commits locally, so a one-commit difference is simply a difference.
+    ///
+    /// MUTATION: require the head to differ by more than one commit (e.g. a commit count the sweep
+    /// cannot obtain) and this reds.
+    #[test]
+    fn a_single_commit_head_move_still_marks_the_escalation_superseded() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            "c0a54eb1".to_string(), // one commit past HEAD
+        );
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].superseded(), "one commit is still a moved head");
+    }
+
+    /// **STUDIO-1005 acceptance: an escalation whose head has NOT moved adds NOTHING to the wire
+    /// row.** This is the ticket's last acceptance and it is deliberately a test that passes against
+    /// BOTH the old and the new code: it asserts the row's exact key set, referencing none of the
+    /// supersession fields, so the pre-ticket implementation produces the same object.
+    #[test]
+    fn an_escalation_at_the_current_head_renders_byte_identically_to_today() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        // The watcher observed exactly the head the escalation was computed at: no supersession.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD.to_string(),
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            !o.review_divergences()[0].superseded(),
+            "the head has not moved, so the escalation is current"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = rendered["review_divergence"][0]
+            .as_object()
+            .expect("a review_divergence row is an object");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["detail", "kind", "pr", "reviewer", "stale_secs", "ticket",],
+            "a still-current escalation must carry today's fields and no supersession annotation, \
+             got: {row:?}"
+        );
+        assert_eq!(row["kind"], "review_escalated");
+    }
+
+    /// **STUDIO-1005 acceptance: the sweep stays local-only.** The reconciliation sweep runs on
+    /// `on_tick`, above the validate/drain/credential gates, and must never make a `gh`, tracker or
+    /// model call. This asserts it directly on the source, so a future edit that reaches for a
+    /// lookup to "refresh" the escalation's text reds here instead of shipping an agent run per tick.
+    ///
+    /// MUTATION (the ticket's ⚠️): introduce any of these calls into the sweep and this reds.
+    #[test]
+    fn the_reconciliation_sweep_makes_no_network_call() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/reviewreconcile.rs"
+        ))
+        .expect("read the sweep's own source");
+        // Assembled rather than written literally so the tokens do not appear in THIS test's own
+        // source and match themselves.
+        let tokens = [
+            format!(".pr_state{}", "("),
+            format!(".pr_state_unconditional{}", "("),
+            format!("sweep_pr_states{}", "("),
+            format!("Command::{}", "new"),
+            format!("req{}", "west"),
+            format!("run{}", "_turn"),
+            format!("post_pr{}", "_comment"),
+        ];
+        for token in tokens {
+            assert!(
+                !src.contains(token.as_str()),
+                "the reconciliation sweep must stay local-only; found `{token}`"
+            );
+        }
     }
 
     /// **A shipped pull request the merge gate cannot clear is REPORTED, not hidden.** A `ship`

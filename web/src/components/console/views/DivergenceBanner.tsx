@@ -50,6 +50,20 @@ export function DivergenceBanner() {
               : d.capacity_unreadable
                 ? ` Its GitHub state could not be read for ${d.capacity_unreadable.attempts} consecutive attempt(s), so the daemon cannot confirm it is still progressing.`
                 : ""}
+            {/* STUDIO-1005: an ESCALATE reason is written once and never revalidated, so an operator
+                can otherwise act on findings the author already fixed. When the daemon has OBSERVED
+                the branch move past the head the reason was computed at it says so HERE, inline in
+                the row the operator reads — not in a tooltip or a detail pane. The manager's own
+                reason travels with it, because seeing exactly which present-tense claim is now a
+                snapshot is the point. Rendered only when `superseded` is present, so a still-current
+                escalation reads exactly as before. */}
+            {d.superseded ? (
+              <>
+                {" "}
+                <strong>{d.supersession}</strong>
+                {d.reason ? ` The manager's reason was: ${d.reason}` : ""}
+              </>
+            ) : null}
           </span>
         ))}
         Nothing has been changed on your behalf — this is a report.
