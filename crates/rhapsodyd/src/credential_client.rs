@@ -184,9 +184,15 @@ where
     };
     match client.read_bound(account, expected_binding).await {
         Ok(read) => read,
-        // A connection that dies with no bytes ever received back, right after we sent Hello, is
-        // exactly the shape of a rejected authentication attempt (not a generic transport failure
-        // partway through an otherwise-successful exchange).
+        // A clean EOF here is the ONLY signal a rejected `Hello` ever produces (the server closes
+        // silently rather than answering — see `credential_bootstrap::serve_one`), so this is the
+        // closest available approximation of `OwnerUnauthorized`. It is not perfectly precise: an
+        // owner that authenticated us and then crashed/closed before answering this exact request
+        // produces the identical EOF and would also be classified `OwnerUnauthorized` rather than
+        // `OwnerUnavailable`. Disambiguating the two needs the server to distinguish them on the
+        // wire, which the deliberate no-oracle rejection design does not do; accepted here as a
+        // P0c-scope approximation rather than population of a state PB7 depends on for anything
+        // safety-critical (both states already forbid any credential use).
         Err(ClientError::Frame(FrameError::Eof)) => CredentialRead {
             revision: Revision::INITIAL,
             state: CredentialState::OwnerUnauthorized,
