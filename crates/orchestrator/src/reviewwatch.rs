@@ -1625,8 +1625,9 @@ impl Orchestrator {
     /// re-arms `reviewed` to `requested` (preserving `last_reviewed_sha`) and an unfinished round
     /// parks at `truncated`, so at the instant the loop reaches its threshold both halves of a
     /// `status == reviewed && last_reviewed_sha == head` filter can fail at once and the plan would
-    /// carry no findings at all. That is the rule rather than the exception on an EVEN threshold,
-    /// which the author's own summoned dispatch is what crosses. Three shapes are named instead:
+    /// carry no findings at all. That is the routine shape, not the exception: a review's findings
+    /// summon the author, whose push moves the head the loop is about to be decided at. Three shapes
+    /// are named instead:
     ///
     /// * a row that posted findings at the current head — `{reviewer} asked for changes at {head}`;
     /// * a row whose last read predates the head — the author has pushed since and nobody has read
@@ -1684,12 +1685,13 @@ impl Orchestrator {
     ///
     /// A decision must not be made over a round mid-flight: new findings could still land, and a fix
     /// the author is actively writing is about to supersede the head the manager would decide
-    /// against. The author half is easy to miss because the counter is charged at DISPATCH
-    /// ([`crate::retry`]), so an author run is in flight from the very instant its charge lands —
-    /// and with the loop alternating review→author, any EVEN threshold is crossed by the author's
-    /// own dispatch. [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an
-    /// in-flight run as activity that silences the whole pull request; this is the same rule on the
-    /// decision path.
+    /// against. The author half is easy to miss because the author's run is a normal ticket run,
+    /// reachable only through the pull request's origin ticket rather than through a review row's own
+    /// id — and the author a review's findings summoned is exactly who is likely to be pushing while
+    /// the loop sits at its threshold (STUDIO-1004 moved the counter charge to the reviewer's answer,
+    /// so an in-flight author run is no longer what the counter reports either).
+    /// [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an in-flight run as
+    /// activity that silences the whole pull request; this is the same rule on the decision path.
     fn review_round_in_flight(&self, mine: &[&ReviewWatchRow]) -> bool {
         let review_live = mine.iter().any(|r| {
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
@@ -6725,11 +6727,12 @@ mod tests {
         );
     }
 
-    /// **A decision is never made over an in-flight AUTHOR run.** The counter is charged at
-    /// DISPATCH, so the summoned author's run is live from the instant its charge lands — and with
-    /// the loop alternating review→author, every EVEN threshold is crossed by that dispatch. The
-    /// guard used to look only at review rows, so the manager was handed findings somebody was
-    /// actively fixing and a head about to be superseded.
+    /// **A decision is never made over an in-flight AUTHOR run.** A review's findings summon the
+    /// author, whose run is live while it pushes — and since STUDIO-1004 the round it is answering
+    /// settles (and the threshold is crossed) at the very review completion that summoned it, so the
+    /// author's run is the one most likely to be in flight as the loop reaches its bound. The guard
+    /// used to look only at review rows, so the manager was handed findings somebody was actively
+    /// fixing and a head about to be superseded.
     #[test]
     fn an_in_flight_author_run_defers_the_adjudication() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));

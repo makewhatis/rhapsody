@@ -110,12 +110,12 @@ pub struct ReviewAdjudicationPlan {
     /// How many review↔author rounds the pull request ran before the threshold.
     pub rounds: usize,
     /// The decision-relevant open facts at the threshold, one human-readable line per live watch
-    /// row. Not only "verdicts at this exact head": the head may have moved since the last review
-    /// (the author's own summoned dispatch is what crosses an EVEN threshold, and they push before
-    /// their run ends), in which case the line says which head was last read and that nobody has
-    /// read the new one. It is verdict-neutral there because a head advance re-arms the row without
-    /// preserving whether the old read was findings or an approval. The manager names these on an
-    /// escalation, so an operator gets the specific findings rather than "needs a human".
+    /// row. Not only "verdicts at this exact head": the head may have moved since the last review —
+    /// an author summoned by that review's findings pushes before their run ends — in which case the
+    /// line says which head was last read and that nobody has read the new one. It is verdict-neutral
+    /// there because a head advance re-arms the row without preserving whether the old read was
+    /// findings or an approval. The manager names these on an escalation, so an operator gets the
+    /// specific findings rather than "needs a human".
     pub findings: Vec<String>,
 }
 
