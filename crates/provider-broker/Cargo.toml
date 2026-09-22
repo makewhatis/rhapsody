@@ -1,0 +1,35 @@
+[package]
+name = "rhapsody-provider-broker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# zeroize: the primary credential/capability buffer is wrapped in `Zeroizing` so the allocation
+# Rhapsody owns is wiped on drop (PB1 acceptance: secret types zeroize their primary allocation).
+# Already in Cargo.lock (a rustls/ring transitive); no new crate enters the lock.
+zeroize = "1"
+# sha2: turn tokens are stored and looked up only by `SHA-256("rhapsody-provider-turn-v1\0" || token)`
+# and binding fingerprints are the same shape of non-secret digest. Already in the lock.
+sha2 = "0.10"
+# base64: the turn token is 32 CSPRNG bytes encoded as 43 unpadded base64url ASCII characters
+# (provider-broker-design §4.1). Already in the lock.
+base64 = "0.22"
+# getrandom: the OS CSPRNG behind `OsRandom` (design §4.1). Injected/scripted in tests. Already in
+# the lock.
+getrandom = "0.2"
+# thiserror: typed, actionable broker errors (refusals are values, never panics). Already in the lock.
+thiserror = "1"
+
+[dev-dependencies]
+# serde: the compile-guard test asserts the secret-bearing types do NOT implement `Serialize`.
+# Already in the lock; test-only here.
+serde = "1"
+# static_assertions: `assert_not_impl_any!` is the standard stable-Rust negative-impl guard
+# (`CapabilityToken` is not `Clone`/`Display`/`Serialize`, custody handles are not `Clone`). Already
+# in the lock as a transitive; test-only here.
+static_assertions = "1"
+
+[lints]
+workspace = true
