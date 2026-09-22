@@ -47,8 +47,8 @@ use tokio::time::Instant;
 
 use crate::claude::{TRACKER_ENV_VARS, append_me_env, append_review_env, scrub_env, split_command};
 use crate::harness::{
-    EventFidelity, Harness, HarnessCapabilities, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
-    ToolEventGranularity, ToolNaming, UsageDetail,
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
+    StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
 };
 use crate::opencode::args::{Config, build_args};
 use crate::opencode::mcpinject::{inject_daemon_mcp, rewrite_tool_names};
@@ -125,6 +125,7 @@ const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     resume: Resume::Flags,
     mcp: true,
     sandbox: Sandbox::None,
+    mcp_sandbox: McpSandboxCoupling::Independent,
     usage: UsageDetail::TokensAndCost,
     budgets: false,
     tool_naming: ToolNaming::ServerUnderscoreTool,
@@ -1638,5 +1639,73 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
             err.is_some(),
             "a workspace outside the root must be refused"
         );
+    }
+
+    /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline). Every declared capability
+    /// the committed STUDIO-869 capture can witness is crossed against it, so a declaration that
+    /// claims something the measured CLI does not do reds here rather than silently breaking the
+    /// refusal logic. Committed in-tree; no provider or CLI needed.
+    #[test]
+    fn declared_capabilities_match_the_committed_capture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/harness-spike/opencode");
+        let read = |name: &str| {
+            let p = root.join(name);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let happy = read("happy.jsonl");
+        let resume = read("resume.jsonl");
+        let caps = *Runner::new(Config::default()).capabilities();
+
+        // events: FileLevel — the happy capture carries typed read/edit/bash tool events, the
+        // granularity a command-only harness (codex) cannot reach.
+        assert_eq!(
+            caps.events,
+            EventFidelity::Structured {
+                tool_level: ToolEventGranularity::FileLevel
+            }
+        );
+        assert!(
+            happy.contains("\"tool\":\"read\"")
+                && happy.contains("\"tool\":\"edit\"")
+                && happy.contains("\"tool\":\"bash\""),
+            "FileLevel evidence: happy.jsonl must carry typed read/edit/bash events"
+        );
+
+        // mcp: true + tool_naming: ServerUnderscoreTool — the capture calls the daemon's own tool
+        // and spells it `<server>_<tool>`.
+        assert!(
+            caps.mcp,
+            "the capture proves opencode reaches the daemon's tools"
+        );
+        assert!(
+            happy.contains("symphony_symphony_state"),
+            "ServerUnderscoreTool evidence: happy.jsonl must name the daemon's tool that way"
+        );
+        assert_eq!(caps.tool_naming, ToolNaming::ServerUnderscoreTool);
+
+        // resume: Flags — the resume capture continues the SAME session the happy capture opened.
+        assert_eq!(caps.resume, Resume::Flags);
+        let session_id = |text: &str| {
+            text.split("\"sessionID\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_string)
+        };
+        let happy_sid = session_id(&happy).expect("happy capture carries a sessionID");
+        let resume_sid = session_id(&resume).expect("resume capture carries a sessionID");
+        assert_eq!(
+            happy_sid, resume_sid,
+            "resume evidence: the resume capture must continue the happy capture's session"
+        );
+
+        // opencode has approval (`--auto`), not a sandbox mode or a tool allowlist; it honours MCP
+        // and that approval at once, so the pair is independent.
+        assert_eq!(caps.sandbox, Sandbox::None);
+        assert_eq!(caps.mcp_sandbox, McpSandboxCoupling::Independent);
+
+        // stdin: ClosedAtStart is the measured difference from claude; the runner test
+        // `the_prompt_is_a_positional_...` asserts the child observes it closed.
+        assert_eq!(caps.stdin, StdinPolicy::ClosedAtStart);
     }
 }

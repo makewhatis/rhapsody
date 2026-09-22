@@ -510,6 +510,12 @@ fn worker_deps_for(
         // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
         // can be restarted, and there is no restart of one project.
         drain: drain.clone(),
+        // MCP injection is a daemon-wide config knob (`cfg.mcp.enabled`), read once per dispatch so
+        // the worker can require the daemon's tools of the selected harness (STUDIO-978).
+        mcp_enabled: eff.cfg.mcp.enabled,
+        // Per-dispatch: `spawn_worker` stamps a refusal when the routed profile names an
+        // unimplemented harness; every other dispatch leaves `None`.
+        harness_refusal: None,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1549,23 +1555,31 @@ impl Orchestrator {
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
         //
-        // An unrecognized name FALLS BACK to the configured backend with a warning rather than
-        // refusing the run: one mistyped profile field would otherwise strand every ticket routed
-        // to that teammate, and the run itself is still perfectly runnable on the default harness.
-        // Validating the name at config-load time is slice 4's resolution chain, which is where a
-        // typo can be reported once instead of per dispatch.
+        // An unrecognized name is a TYPED REFUSAL, never a fall back (STUDIO-978; design §5's
+        // "known-but-unimplemented and unknown harnesses remain typed refusals; never fall back to
+        // `agent.backend`"). STUDIO-902 warned and dispatched on the configured backend, which
+        // silently ran work on a harness the operator did not choose — and could not reach the
+        // harness's provider, model or security posture. The refusal is decided HERE, before the
+        // worker task is spawned, and the worker turns it into the run's recorded failure without
+        // ever starting a session.
         if !harness.is_empty() {
             let pool = eff
                 .project_by_slug(&project_slug)
                 .map_or(&eff.agents, |rp| &rp.agents);
             match pool.get(&harness) {
                 Some(runner) => deps.agent = Arc::clone(runner),
-                None => tracing::warn!(
-                    issue = %iss.identifier,
-                    harness = %harness,
-                    "teammate profile names a harness this build has no runner for; \
-                     dispatching on the configured backend instead"
-                ),
+                None => {
+                    tracing::warn!(
+                        issue = %iss.identifier,
+                        harness = %harness,
+                        "teammate profile names a harness this build has no runner for; \
+                         refusing the dispatch rather than falling back"
+                    );
+                    deps.harness_refusal =
+                        Some(rhapsody_agent::CapabilityRefusal::HarnessNotImplemented {
+                            name: harness.clone(),
+                        });
+                }
             }
         }
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and

@@ -18,10 +18,11 @@
 //!
 //! 1. **`mcp` and `sandbox` are not independent fields** (codex honours one or the other, never
 //!    both — a real CLI constraint `HarnessCapabilities` cannot express as two plain fields).
-//!    **Deferred to slice 5** — needs a product call before the refusal path (§5) can be designed;
-//!    see the doc comments on [`HarnessCapabilities::mcp`] and [`HarnessCapabilities::sandbox`].
-//!    Claude's own values for the two fields ARE independent (it always honours both), so nothing
-//!    about Claude's behavior is affected by leaving this unresolved.
+//!    **Fixed (STUDIO-978, slice 5)**: [`HarnessCapabilities::mcp_sandbox`] declares the coupling,
+//!    and [`validate`] refuses a dispatch that requires both on a
+//!    [`McpSandboxCoupling::MutuallyExclusive`] harness even when it can provide either alone.
+//!    Claude's and opencode's own values for the two fields ARE independent (they honour both), so
+//!    they declare [`McpSandboxCoupling::Independent`] and nothing about their behavior changes.
 //! 2. **A single declared `FailureSignal` value is too coarse** (codex needs three-way
 //!    discrimination between two non-terminal `error` shapes and a terminal `turn.failed`;
 //!    classification has to be a per-adapter *function*, not a value). **Resolved by omission**:
@@ -34,10 +35,9 @@
 //!    back — even a richer one — would reintroduce the defect this fix removes.
 //! 3. **`Resume` assumed continuation differs only by flags.** Codex resumes via a subcommand with a
 //!    positional id (`codex exec resume <thread_id>`), not a flag `claude`/`opencode` share
-//!    (`--resume <id>` / `-s <id>`). **Fixed for codex, NOT for goose** (see the STUDIO-872 section
-//!    below — this fix is not the full close of the defect): [`Resume`] has a `Subcommand` variant
-//!    alongside `Flags`, so the shape can name codex's difference instead of forcing every harness
-//!    through one.
+//!    (`--resume <id>` / `-s <id>`). **Fully fixed (STUDIO-978, slice 5)**: [`Resume`] carries
+//!    `Flags`, `Subcommand` AND `Protocol` (goose over ACP's `session/load`), so all three measured
+//!    continuation shapes are representable.
 //! 4. **`EventFidelity::Structured { tool_level: bool }` couldn't separate opencode from codex**
 //!    (opencode emits typed `read`/`edit`/`bash` events; codex has no file-level events at all — it
 //!    shells `cat`/`printf`, so everything is `command_execution`). **Fixed**: `tool_level` is now
@@ -64,6 +64,9 @@
 //!   the same "nothing to validate it against" reason, §3's own `Resume::Narrowed { drops }` variant
 //!   is dropped rather than carried forward: no measured harness (STUDIO-869 or STUDIO-872)
 //!   exercises a resume that narrows scope.
+//! - **[`Resume`] now carries goose's protocol-call shape too** (STUDIO-978): the `Protocol` variant
+//!   was added to the shape without a goose adapter to exercise it, which is the one measured shape
+//!   a future adapter no longer has to widen this enum for.
 //! - **[`ToolNaming`]'s three variants have no case for goose.** goose's real tool name lives in a
 //!   vendor `_meta.goose.toolCall.toolName` field; ACP's own standard `title` field is lossy human
 //!   prose — for the daemon's own `symphony_state` tool it renders as `"symphony: symphony state"`,
@@ -200,19 +203,47 @@ pub enum Steering {
     None,
 }
 
-/// How a harness continues a prior conversation (design §3, defect 3 — fixed for codex, NOT for
-/// goose; see the module doc's STUDIO-872 section). `Flags` covers claude (`--resume <id>`) and
-/// opencode (`-s <id>`) — genuinely the same shape, an unchanged flag added to an otherwise-normal
-/// invocation. `Subcommand` covers codex (`codex exec resume <thread_id>`), whose continuation is a
-/// different positional-argument invocation shape entirely, not an extra flag on the same one.
-/// Collapsing these into one `SameFlags` variant (the original §3 shape) was the defect codex
-/// motivated fixing — but goose's `session/load` protocol-method resume fits neither variant here,
-/// so this enum does not yet cover every harness the design names.
+/// How a harness continues a prior conversation (design §3, defect 3; completed by STUDIO-978).
+///
+/// The design's original `SameFlags | Narrowed | None` assumed continuation differs only in flags.
+/// Three measured shapes disagree, and this enum names all three (the ticket's "resume must
+/// represent flag, positional-subcommand, and protocol-call continuation"):
+///
+/// * `Flags` — claude (`--resume <id>`) and opencode (`-s <id>`): an unchanged flag added to an
+///   otherwise-normal invocation.
+/// * `Subcommand` — codex (`codex exec resume <thread_id> …`): a different positional-argument
+///   invocation shape, not an extra flag on the same one (STUDIO-869).
+/// * `Protocol` — goose over ACP (`session/load {sessionId, cwd, mcpServers}`): a *protocol method*
+///   over the SAME argv on every turn, neither a flag nor a subcommand (STUDIO-872). STUDIO-900
+///   deferred this variant because no adapter could validate it; no goose adapter exists yet, but
+///   the measured shape must be representable so slice 9 does not have to widen this enum under
+///   pressure. Declaring `Protocol` here does NOT implement goose — it only stops the contract
+///   collapsing the third shape.
+///
+/// The design's `Narrowed { drops }` variant stays dropped: no measured harness exercises a resume
+/// that narrows scope (STUDIO-869/872), so carrying it would be a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resume {
     None,
     Flags,
     Subcommand,
+    Protocol,
+}
+
+/// Whether [`HarnessCapabilities::mcp`] and [`HarnessCapabilities::sandbox`] can be honored
+/// TOGETHER. This is the contract's answer to the STUDIO-869 finding that the two are not
+/// independent fields for every harness: codex can honour a sandbox or an MCP server, never both,
+/// and fails by reporting `turn.completed` after refusing every tool call. A pair of plain booleans
+/// could not express that, so §5's refuse-if-`mcp`-absent rule could not be evaluated correctly for
+/// codex. `MutuallyExclusive` lets the validator refuse a dispatch that requires both even when the
+/// harness can provide either one alone. The shipped claude and opencode adapters honour both
+/// simultaneously and declare [`McpSandboxCoupling::Independent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpSandboxCoupling {
+    /// Both may be required at once.
+    Independent,
+    /// At most one of `mcp` / `sandbox` may be required; a requirement for both is refused.
+    MutuallyExclusive,
 }
 
 /// How a harness constrains what its tool calls can touch.
@@ -268,13 +299,18 @@ pub struct HarnessCapabilities {
     pub events: EventFidelity,
     pub steering: Steering,
     pub resume: Resume,
-    /// Whether this harness can reach the daemon's own MCP tools at all. **Known incomplete**: for
-    /// codex this is not independent of [`Self::sandbox`] — the CLI honours a sandbox or an MCP
-    /// server, never both (defect 1, deferred to slice 5's product call). Claude's `mcp` and
-    /// `sandbox` values are genuinely independent, so this deferral does not affect Claude.
+    /// Whether this harness can reach the daemon's own MCP tools at all. For codex this is not
+    /// independent of [`Self::sandbox`] — the CLI honours a sandbox or an MCP server, never both
+    /// (defect 1) — which is why [`Self::mcp_sandbox`] must be consulted alongside this field. A
+    /// harness that offers MCP but couples it to the sandbox sets this `true` AND declares
+    /// [`McpSandboxCoupling::MutuallyExclusive`].
     pub mcp: bool,
-    /// See [`Self::mcp`] — the same deferred defect 1 from the other side.
+    /// See [`Self::mcp`] — the other half of the coupled pair.
     pub sandbox: Sandbox,
+    /// Whether [`Self::mcp`] and [`Self::sandbox`] may both be honored at once (defect 1's fix).
+    /// Independent booleans cannot say "either one, never both"; this field can, and
+    /// [`validate`] consults it so a dispatch requiring both is refused rather than half-honored.
+    pub mcp_sandbox: McpSandboxCoupling,
     pub usage: UsageDetail,
     /// Whether the harness's own CLI enforces its own wall-clock/tool-call limits, independent of
     /// the daemon's timeout (design §7.4).
@@ -289,6 +325,167 @@ pub struct HarnessCapabilities {
 pub trait Harness: Runner {
     fn id(&self) -> HarnessId;
     fn capabilities(&self) -> &HarnessCapabilities;
+}
+
+/// What one dispatch NEEDS from its resolved harness (design §5's table). This is the PURE input to
+/// [`validate`]: it is computed from the work and the installation, never from the harness, so the
+/// validator can answer "can this harness do this work?" before anything is spawned.
+///
+/// Every field is a *requirement*, and the split between refusing and degrading is the design's
+/// §5.1 line: `team_tools`/`multi_turn`/`sandbox` change whether the work is done correctly (a
+/// missing one refuses the dispatch); `trace_console`/`steering` change only what an operator can
+/// see or do (a missing one degrades visibly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkRequirements {
+    /// The agent must reach the daemon's own MCP tools (room, memory, handoff). Refused when absent
+    /// because a run that cannot reach the team's tools produces work that looks finished and is not.
+    pub team_tools: bool,
+    /// The work may run more than one turn, so the harness must continue a prior conversation.
+    /// Refused when absent because turn 2 would start cold (design §5.1).
+    pub multi_turn: bool,
+    /// The work must run under a declared sandbox. Refused when absent — and, together with
+    /// [`Self::team_tools`], subject to the [`McpSandboxCoupling`] rule.
+    pub sandbox: bool,
+    /// The operator console wants the structured Trace spine. Degrades visibly, never refuses.
+    pub trace_console: bool,
+    /// The operator wants to steer a live turn. Where the harness cannot, the console hides the
+    /// field (D7) rather than offering a control that silently drops what it is given.
+    pub steering: bool,
+}
+
+/// A dispatch-time REFUSAL: the resolved harness cannot honor a correctness requirement, or the
+/// resolved harness is not one this build can run (design §5.1, ticket's "Known-but-unimplemented
+/// and unknown harnesses remain typed refusals"). Typed rather than a formatted string so every
+/// caller can name exactly what was refused, and so a refusal is never a silent downgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityRefusal {
+    /// `team_tools` was required but the harness cannot reach the daemon's MCP tools.
+    McpUnavailable { harness: HarnessId },
+    /// `multi_turn` was required but the harness declares [`Resume::None`].
+    ResumeUnavailable { harness: HarnessId },
+    /// `sandbox` was required but the harness declares [`Sandbox::None`].
+    SandboxUnavailable { harness: HarnessId },
+    /// Both `team_tools` and `sandbox` were required, but the harness declares
+    /// [`McpSandboxCoupling::MutuallyExclusive`] — it can honour one or the other, never both.
+    McpSandboxMutuallyExclusive { harness: HarnessId },
+    /// A profile named a harness this build has no runner for (known-but-unimplemented, e.g. codex,
+    /// or unknown). A typed refusal — NEVER a fall back to `agent.backend`.
+    HarnessNotImplemented { name: String },
+}
+
+impl fmt::Display for CapabilityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::McpUnavailable { harness } => write!(
+                f,
+                "harness {harness:?} cannot reach the daemon's MCP tools, but this run requires \
+                 team participation (room, memory, handoff)"
+            ),
+            Self::ResumeUnavailable { harness } => write!(
+                f,
+                "harness {harness:?} cannot resume a prior turn, but this run may take more than \
+                 one turn; turn 2 would start cold"
+            ),
+            Self::SandboxUnavailable { harness } => write!(
+                f,
+                "harness {harness:?} declares no sandbox, but this run requires one"
+            ),
+            Self::McpSandboxMutuallyExclusive { harness } => write!(
+                f,
+                "harness {harness:?} can honour MCP or a sandbox, never both, but this run requires \
+                 both"
+            ),
+            Self::HarnessNotImplemented { name } => write!(
+                f,
+                "harness {name:?} is not implemented by this build; refusing rather than falling \
+                 back to another harness"
+            ),
+        }
+    }
+}
+
+/// An observability-only loss the operator should see stated where it shows (design §5.1). These
+/// never refuse a dispatch; a `FinalTextOnly` harness is dispatchable and its run detail reports the
+/// reduced fidelity instead of rendering a blank Trace spine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Degradation {
+    /// The harness emits no structured per-step events, so the Trace spine cannot be built.
+    NoStructuredEvents { harness: HarnessId },
+    /// The harness cannot be steered, so the console hides the steering field (D7).
+    SteeringHidden { harness: HarnessId },
+}
+
+impl fmt::Display for Degradation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoStructuredEvents { harness } => write!(
+                f,
+                "harness {harness:?} emits only final text; the trace shows the run result, not \
+                 per-step events"
+            ),
+            Self::SteeringHidden { harness } => write!(
+                f,
+                "harness {harness:?} cannot be steered; the steering field is hidden"
+            ),
+        }
+    }
+}
+
+/// The outcome of a successful capability check: the run is dispatchable, and any observability-only
+/// losses are stated rather than silently absorbed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DispatchVerdict {
+    pub degradations: Vec<Degradation>,
+}
+
+impl DispatchVerdict {
+    /// Whether the operator loses any observability the console should state.
+    pub fn is_degraded(&self) -> bool {
+        !self.degradations.is_empty()
+    }
+}
+
+/// The PURE capability/requirement validator (design §5, ticket's "one pure capability/requirement
+/// validator, one typed refusal contract"). It takes the DECLARED capabilities and the computed
+/// requirements and returns either the degradations to state or the refusal that stops the dispatch
+/// — it performs no I/O, spawns nothing, and can be called before any workspace exists.
+///
+/// The order is deliberate and mirrors §5.1: every CORRECTNESS requirement is checked first, so a
+/// refusal names a capability that would have changed whether the work is done correctly, ahead of
+/// any observability loss. `mcp`-and-`sandbox` is checked as a COUPLED requirement after the
+/// individual fields, so a harness that provides neither is refused for the field it lacks rather
+/// than for the coupling.
+pub fn validate(
+    harness: HarnessId,
+    capabilities: &HarnessCapabilities,
+    needs: &WorkRequirements,
+) -> Result<DispatchVerdict, CapabilityRefusal> {
+    if needs.team_tools && !capabilities.mcp {
+        return Err(CapabilityRefusal::McpUnavailable { harness });
+    }
+    if needs.multi_turn && capabilities.resume == Resume::None {
+        return Err(CapabilityRefusal::ResumeUnavailable { harness });
+    }
+    if needs.sandbox && capabilities.sandbox == Sandbox::None {
+        return Err(CapabilityRefusal::SandboxUnavailable { harness });
+    }
+    // The coupled case (design §3 defect 1): both are individually available, but the harness can
+    // honour only one at a time. Refuse rather than half-honor.
+    if needs.team_tools
+        && needs.sandbox
+        && capabilities.mcp_sandbox == McpSandboxCoupling::MutuallyExclusive
+    {
+        return Err(CapabilityRefusal::McpSandboxMutuallyExclusive { harness });
+    }
+
+    let mut degradations = Vec::new();
+    if needs.trace_console && !matches!(capabilities.events, EventFidelity::Structured { .. }) {
+        degradations.push(Degradation::NoStructuredEvents { harness });
+    }
+    if needs.steering && capabilities.steering == Steering::None {
+        degradations.push(Degradation::SteeringHidden { harness });
+    }
+    Ok(DispatchVerdict { degradations })
 }
 
 #[cfg(test)]
@@ -338,6 +535,295 @@ mod tests {
         assert!(
             !rendered.contains("lin-tracker-secret"),
             "Debug output leaked the tracker key: {rendered}"
+        );
+    }
+
+    /// A fully-capable harness: the baseline every table row starts from, so each row isolates the
+    /// ONE field it flips. Mirrors what claude and opencode actually declare.
+    fn capable() -> HarnessCapabilities {
+        HarnessCapabilities {
+            events: EventFidelity::Structured {
+                tool_level: ToolEventGranularity::FileLevel,
+            },
+            steering: Steering::Live,
+            resume: Resume::Flags,
+            mcp: true,
+            sandbox: Sandbox::ToolAllowlist,
+            mcp_sandbox: McpSandboxCoupling::Independent,
+            usage: UsageDetail::TokensAndCost,
+            budgets: false,
+            tool_naming: ToolNaming::McpDoubleUnderscore,
+            stdin: StdinPolicy::HeldOpen,
+        }
+    }
+
+    /// Every requirement off: any harness is dispatchable and nothing degrades. The zero value of
+    /// [`WorkRequirements`] must be the permissive one, or a caller that forgets a field silently
+    /// refuses work.
+    #[test]
+    fn no_requirements_never_refuses_and_never_degrades() {
+        let bare = HarnessCapabilities {
+            events: EventFidelity::FinalTextOnly,
+            steering: Steering::None,
+            resume: Resume::None,
+            mcp: false,
+            sandbox: Sandbox::None,
+            mcp_sandbox: McpSandboxCoupling::MutuallyExclusive,
+            usage: UsageDetail::None,
+            budgets: false,
+            tool_naming: ToolNaming::SeparateFields,
+            stdin: StdinPolicy::ClosedAtStart,
+        };
+        let v = validate(HarnessId::Claude, &bare, &WorkRequirements::default())
+            .expect("nothing required");
+        assert!(!v.is_degraded(), "nothing wanted, nothing degraded: {v:?}");
+    }
+
+    /// The §5 table as a table. Each row names the one requirement + the one capability flip and the
+    /// expected outcome, so a regression in any single rule is isolated by the failing row rather
+    /// than by an all-or-nothing assertion.
+    #[test]
+    fn requirement_capability_table() {
+        // (label, needs, caps-mutation, expected)
+        struct Row {
+            label: &'static str,
+            needs: WorkRequirements,
+            caps: HarnessCapabilities,
+            expect: Result<DispatchVerdict, CapabilityRefusal>,
+        }
+        let caps = capable();
+        let only_team = WorkRequirements {
+            team_tools: true,
+            ..Default::default()
+        };
+        let only_multi = WorkRequirements {
+            multi_turn: true,
+            ..Default::default()
+        };
+        let only_sandbox = WorkRequirements {
+            sandbox: true,
+            ..Default::default()
+        };
+        let both = WorkRequirements {
+            team_tools: true,
+            sandbox: true,
+            ..Default::default()
+        };
+        let trace = WorkRequirements {
+            trace_console: true,
+            ..Default::default()
+        };
+        let steer = WorkRequirements {
+            steering: true,
+            ..Default::default()
+        };
+        let rows = vec![
+            Row {
+                label: "team_tools + mcp:false ⇒ refuse",
+                needs: only_team,
+                caps: HarnessCapabilities { mcp: false, ..caps },
+                expect: Err(CapabilityRefusal::McpUnavailable {
+                    harness: HarnessId::Claude,
+                }),
+            },
+            Row {
+                label: "team_tools + mcp:true ⇒ ok",
+                needs: only_team,
+                caps,
+                expect: Ok(DispatchVerdict::default()),
+            },
+            Row {
+                label: "multi_turn + resume:None ⇒ refuse",
+                needs: only_multi,
+                caps: HarnessCapabilities {
+                    resume: Resume::None,
+                    ..caps
+                },
+                expect: Err(CapabilityRefusal::ResumeUnavailable {
+                    harness: HarnessId::Claude,
+                }),
+            },
+            Row {
+                label: "multi_turn + resume:Flags ⇒ ok",
+                needs: only_multi,
+                caps,
+                expect: Ok(DispatchVerdict::default()),
+            },
+            Row {
+                label: "sandbox + sandbox:None ⇒ refuse",
+                needs: only_sandbox,
+                caps: HarnessCapabilities {
+                    sandbox: Sandbox::None,
+                    ..caps
+                },
+                expect: Err(CapabilityRefusal::SandboxUnavailable {
+                    harness: HarnessId::Claude,
+                }),
+            },
+            Row {
+                label: "team+sandbox + MutuallyExclusive ⇒ refuse",
+                needs: both,
+                caps: HarnessCapabilities {
+                    mcp_sandbox: McpSandboxCoupling::MutuallyExclusive,
+                    ..caps
+                },
+                expect: Err(CapabilityRefusal::McpSandboxMutuallyExclusive {
+                    harness: HarnessId::Claude,
+                }),
+            },
+            Row {
+                label: "team+sandbox + Independent ⇒ ok",
+                needs: both,
+                caps,
+                expect: Ok(DispatchVerdict::default()),
+            },
+            Row {
+                // THE §5.1 LINE: FinalTextOnly is DISPATCHABLE, degraded, never refused.
+                label: "trace_console + FinalTextOnly ⇒ degrade, not refuse",
+                needs: trace,
+                caps: HarnessCapabilities {
+                    events: EventFidelity::FinalTextOnly,
+                    ..caps
+                },
+                expect: Ok(DispatchVerdict {
+                    degradations: vec![Degradation::NoStructuredEvents {
+                        harness: HarnessId::Claude,
+                    }],
+                }),
+            },
+            Row {
+                label: "trace_console + Structured ⇒ no degradation",
+                needs: trace,
+                caps,
+                expect: Ok(DispatchVerdict::default()),
+            },
+            Row {
+                label: "steering + Steering::None ⇒ hide, not refuse",
+                needs: steer,
+                caps: HarnessCapabilities {
+                    steering: Steering::None,
+                    ..caps
+                },
+                expect: Ok(DispatchVerdict {
+                    degradations: vec![Degradation::SteeringHidden {
+                        harness: HarnessId::Claude,
+                    }],
+                }),
+            },
+            Row {
+                label: "steering + BetweenTurns ⇒ no degradation",
+                needs: steer,
+                caps: HarnessCapabilities {
+                    steering: Steering::BetweenTurns,
+                    ..caps
+                },
+                expect: Ok(DispatchVerdict::default()),
+            },
+        ];
+        for row in rows {
+            let got = validate(HarnessId::Claude, &row.caps, &row.needs);
+            assert_eq!(got, row.expect, "row: {}", row.label);
+        }
+    }
+
+    /// Compile-time shape check: [`validate`] returns a [`DispatchVerdict`] (so callers can read
+    /// `.degradations`), not a bare list — a regression that returned the list directly would drop
+    /// the "is this dispatch degraded" question the console asks.
+    #[test]
+    fn validate_returns_a_dispatch_verdict() {
+        let _: DispatchVerdict =
+            validate(HarnessId::Claude, &capable(), &WorkRequirements::default()).expect("ok");
+    }
+
+    /// MUTATION GUARD: a dispatch that needs both MCP and a sandbox must be REFUSED on a harness
+    /// that declares they are mutually exclusive — even though each is individually available. Model
+    /// them as independent booleans and this row returns `Ok`, silently dispatching work that cannot
+    /// reach the team's tools.
+    #[test]
+    fn coupled_requirements_are_not_independent_booleans() {
+        let needs = WorkRequirements {
+            team_tools: true,
+            sandbox: true,
+            ..Default::default()
+        };
+        let exclusive = HarnessCapabilities {
+            mcp: true,
+            sandbox: Sandbox::Modes,
+            mcp_sandbox: McpSandboxCoupling::MutuallyExclusive,
+            ..capable()
+        };
+        assert_eq!(
+            validate(HarnessId::Claude, &exclusive, &needs),
+            Err(CapabilityRefusal::McpSandboxMutuallyExclusive {
+                harness: HarnessId::Claude
+            }),
+        );
+
+        // Either requirement ALONE is still honored: the coupling refuses the combination, not the
+        // harness.
+        let team_only = WorkRequirements {
+            team_tools: true,
+            ..Default::default()
+        };
+        assert!(validate(HarnessId::Claude, &exclusive, &team_only).is_ok());
+        let sandbox_only = WorkRequirements {
+            sandbox: true,
+            ..Default::default()
+        };
+        assert!(validate(HarnessId::Claude, &exclusive, &sandbox_only).is_ok());
+    }
+
+    /// MUTATION GUARD: `FinalTextOnly` must NEVER be treated as structured. If `validate` (or a
+    /// renderer keyed on `matches!(Structured { .. })`) accepted it, the trace would render a blank
+    /// spine the operator cannot distinguish from a run that emitted nothing.
+    #[test]
+    fn final_text_only_is_never_structured() {
+        let needs = WorkRequirements {
+            trace_console: true,
+            ..Default::default()
+        };
+        let caps = HarnessCapabilities {
+            events: EventFidelity::FinalTextOnly,
+            ..capable()
+        };
+        let v = validate(HarnessId::Opencode, &caps, &needs).expect("dispatchable");
+        assert!(
+            v.degradations.contains(&Degradation::NoStructuredEvents {
+                harness: HarnessId::Opencode
+            }),
+            "FinalTextOnly must degrade the trace: {v:?}"
+        );
+    }
+
+    /// MUTATION GUARD: the three measured continuation shapes must all be representable and
+    /// DISTINCT. Collapse resume back to flags-only (the original §3 defect) and this fails to
+    /// compile or the distinctness assertion reds.
+    #[test]
+    fn resume_names_flag_subcommand_and_protocol_continuation() {
+        assert_ne!(Resume::Flags, Resume::Subcommand);
+        assert_ne!(Resume::Subcommand, Resume::Protocol);
+        assert_ne!(Resume::Flags, Resume::Protocol);
+        // The contract can still say "no continuation", which is what the multi-turn rule needs.
+        assert_ne!(Resume::None, Resume::Protocol);
+    }
+
+    /// The refusal's `Display` must be actionable: it names what could not be honored. The reason is
+    /// the whole point of a typed refusal, so a generic "refused" string would be a regression.
+    #[test]
+    fn refusal_display_names_the_unhonored_requirement() {
+        let r = CapabilityRefusal::McpUnavailable {
+            harness: HarnessId::Claude,
+        };
+        let s = r.to_string();
+        assert!(s.contains("MCP"), "refusal reason must name MCP: {s}");
+
+        let r = CapabilityRefusal::HarnessNotImplemented {
+            name: "codex".to_string(),
+        };
+        let s = r.to_string();
+        assert!(
+            s.contains("codex") && s.contains("not implemented"),
+            "unknown-harness refusal must name the harness and say it is unimplemented: {s}"
         );
     }
 }

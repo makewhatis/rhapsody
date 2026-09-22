@@ -27,7 +27,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rhapsody_agent::{self as agent, Event, Runner, Session, Transcript};
+use rhapsody_agent::{
+    self as agent, CapabilityRefusal, Event, Harness, Session, Transcript, WorkRequirements,
+    validate,
+};
 use rhapsody_config::WORKSPACE_MODE_CLONE;
 use rhapsody_core::{Issue, normalize_state};
 use rhapsody_tracker::Tracker;
@@ -72,6 +75,12 @@ pub enum WorkerError {
     /// A tracker state-refresh failure during the turn loop.
     #[error(transparent)]
     Tracker(#[from] rhapsody_tracker::TrackerError),
+    /// The resolved harness cannot honor a correctness requirement, or it is not implemented by
+    /// this build (STUDIO-978). Raised BEFORE any session is started, so a refusal never spawns an
+    /// agent that would produce work looking finished and not be (design §5.1). The typed reason's
+    /// `Display` is what the run row records and what an operator reads.
+    #[error("capability refused: {0}")]
+    CapabilityRefused(rhapsody_agent::CapabilityRefusal),
 }
 
 /// The dependencies a single worker attempt needs (Go `WorkerDeps`). The `Arc`-held deps are the
@@ -81,7 +90,10 @@ pub enum WorkerError {
 /// `DispatchSpanContext`, and the `RunID` that fed the unported `SetRunID` (see the module docs).
 pub struct WorkerDeps {
     pub workspace: Arc<Manager>,
-    pub agent: Arc<dyn Runner>,
+    /// The selected harness. `Harness: Runner`, so every turn still runs through the same
+    /// `Runner`/`Session` boundary; the extra trait is what lets the worker READ the harness's
+    /// declared capabilities BEFORE it spawns anything (STUDIO-978).
+    pub agent: Arc<dyn Harness>,
     pub tracker: Arc<dyn Tracker>,
     pub prompt_tmpl: String,
     /// When non-empty, WINS over `prompt_tmpl`: the template is read from this path at run time (a
@@ -160,6 +172,15 @@ pub struct WorkerDeps {
     /// Default (never armed) makes the check inert, so every pre-drain construction site — and any
     /// daemon nobody drains — behaves exactly as it did before.
     pub drain: crate::drain::DrainSignal,
+    /// Whether the daemon's own MCP tools are injected into this run's agent child
+    /// (`cfg.mcp.enabled`). Drives the `team_tools` requirement: with injection on, a harness that
+    /// cannot reach those tools is refused rather than run (STUDIO-978). Absent/false keeps every
+    /// existing dispatch's requirements false, so nothing changes for a daemon with MCP off.
+    pub mcp_enabled: bool,
+    /// A typed refusal DECIDED before this attempt was even built (STUDIO-978) — a profile naming a
+    /// harness this build has no runner for. `Some` makes [`run_agent_attempt`] fail immediately
+    /// with this reason and start NO session; it is never a fall back to another harness.
+    pub harness_refusal: Option<CapabilityRefusal>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -315,6 +336,67 @@ pub async fn run_agent_attempt(
     on_event: &(dyn Fn(Event) + Send + Sync),
     on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> (String, bool, Option<WorkerError>) {
+    // CAPABILITY VALIDATION, BEFORE ANYTHING IS SPAWNED (STUDIO-978; design §5).
+    //
+    // The ticket's mutation discipline is explicit: moving this check after the runner spawn must
+    // turn a no-spawn test red. It sits at the very top — ahead of workspace provisioning, ahead of
+    // `start_session` — so a refused dispatch creates no worktree and starts no process. The
+    // requirement set is computed from the run, never from the harness, and the harness's declared
+    // capabilities are read straight off the selected runner: `refusal without declaration is
+    // guesswork`, and reading a default here would be exactly the guess the contract exists to
+    // forbid.
+    if let Some(refusal) = deps.harness_refusal.clone() {
+        tracing::warn!(
+            issue_identifier = %issue.identifier,
+            reason = %refusal,
+            "refusing dispatch: harness requirement cannot be honored"
+        );
+        return (
+            issue.state.clone(),
+            false,
+            Some(WorkerError::CapabilityRefused(refusal)),
+        );
+    }
+    let needs = WorkRequirements {
+        team_tools: deps.mcp_enabled,
+        // A run whose turn budget is exactly one can never reach turn 2, so it does not need
+        // continuation. Every default installation runs many turns.
+        multi_turn: deps.max_turns != 1,
+        // Sandbox enforcement is not a daemon-side requirement today; the coupled mcp+sandbox rule
+        // is exercised by the validator's own tests and by any future adapter that couples them.
+        sandbox: false,
+        // The console always wants the structured Trace spine and the steering field — both are
+        // observability, so a harness that cannot provide one degrades visibly, never refuses.
+        trace_console: true,
+        steering: true,
+    };
+    let id = deps.agent.id();
+    match validate(id, deps.agent.capabilities(), &needs) {
+        Err(refusal) => {
+            tracing::warn!(
+                issue_identifier = %issue.identifier,
+                reason = %refusal,
+                "refusing dispatch: harness requirement cannot be honored"
+            );
+            return (
+                issue.state.clone(),
+                false,
+                Some(WorkerError::CapabilityRefused(refusal)),
+            );
+        }
+        Ok(verdict) => {
+            // Observability-only losses are STATED, never swallowed (design §5.1). Logged here; the
+            // run's harness capability record (run provenance) is what the console renders from.
+            for d in &verdict.degradations {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    harness = ?id,
+                    degradation = %d,
+                    "dispatch proceeds with reduced observability fidelity"
+                );
+            }
+        }
+    }
     // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
     // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
     // overrides `workspace_mode` — a review is never a `symphony/<key>` checkout in either shape.
@@ -692,8 +774,8 @@ mod tests {
 
     use rhapsody_agent::fake as agentfake;
     use rhapsody_agent::{
-        AgentError, EVENT_NOTIFICATION, EVENT_SESSION_STARTED, Event, TURN_FAILED, TURN_SUCCEEDED,
-        TurnResult,
+        AgentError, EVENT_NOTIFICATION, EVENT_SESSION_STARTED, Event, Runner as _, TURN_FAILED,
+        TURN_SUCCEEDED, TurnResult,
     };
     use rhapsody_core::Issue;
     use rhapsody_tracker::fake as trackerfake;
@@ -716,7 +798,7 @@ mod tests {
     /// Builds `WorkerDeps` over the given workspace with the standard active set (Go `baseDeps`).
     fn make_deps(
         ws: Arc<Manager>,
-        ag: Arc<dyn Runner>,
+        ag: Arc<dyn Harness>,
         tr: Arc<dyn Tracker>,
         tmpl: &str,
         max_turns: i64,
@@ -746,6 +828,10 @@ mod tests {
             review_delta: None,
             run_id: 0,
             drain: crate::drain::DrainSignal::new(),
+            // STUDIO-978: a fully-capable fake, MCP injection on, no pre-decided refusal — the
+            // honest default for the pre-978 tests, none of which exercises the refusal path.
+            mcp_enabled: true,
+            harness_refusal: None,
         }
     }
 
@@ -936,6 +1022,130 @@ mod tests {
             Some(412),
             "the dispatch run id must reach the session"
         );
+    }
+
+    /// STUDIO-978: a harness that cannot reach the daemon's own tools is REFUSED before anything is
+    /// spawned. `mcp_enabled` is true (the default daemon), the fake declares `mcp: false`, and the
+    /// attempt must fail with the TYPED refusal while `start_session` was never called — no process,
+    /// no worktree, no run that looks finished and is not.
+    ///
+    /// MUTATION GUARD: move the validation below `deps.agent.start_session(..)` and the
+    /// `start_calls() == 0` assertion reds.
+    #[tokio::test]
+    async fn a_harness_without_mcp_is_refused_before_spawn() {
+        let mut fake = agentfake::Fake::new();
+        fake.turns = vec![succeeded_turn()];
+        fake.capabilities.mcp = false;
+        let ag = Arc::new(fake);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(
+            matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(
+                    rhapsody_agent::CapabilityRefusal::McpUnavailable { .. }
+                ))
+            ),
+            "err = {err:?}"
+        );
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a refused dispatch must never start a session"
+        );
+    }
+
+    /// STUDIO-978: the multi-turn rule is derived from the run, not the harness. A run with a turn
+    /// budget of 1 cannot reach turn 2, so a `resume: None` harness is fine; the SAME harness on a
+    /// budget of 20 is refused. That asymmetry is what proves the requirement comes from the work.
+    #[tokio::test]
+    async fn resume_is_required_only_for_multi_turn_runs() {
+        let mk = |max_turns: i64| {
+            let mut fake = agentfake::Fake::new();
+            fake.turns = vec![succeeded_turn()];
+            fake.capabilities.resume = rhapsody_agent::Resume::None;
+            let ag = Arc::new(fake);
+            let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+            let (ws, _root) = test_workspace(HookScripts::default());
+            (make_deps(ws, ag.clone(), tr, "p", max_turns), ag)
+        };
+
+        let (single, ag) = mk(1);
+        let (_l, _d, err) =
+            run_agent_attempt(&single, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "single-turn run must dispatch: {err:?}");
+        assert_eq!(ag.start_calls(), 1);
+
+        let (multi, ag) = mk(20);
+        let (_l, _d, err) =
+            run_agent_attempt(&multi, dispatched(), None, None, &noop_event(), None).await;
+        assert!(
+            matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(
+                    rhapsody_agent::CapabilityRefusal::ResumeUnavailable { .. }
+                ))
+            ),
+            "err = {err:?}"
+        );
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a refused multi-turn run starts nothing"
+        );
+    }
+
+    /// STUDIO-978: a profile naming a harness this build has no runner for is a TYPED REFUSAL, not a
+    /// fall back. `harness_refusal` is what `spawn_worker` stamps; the worker must turn it into the
+    /// run's failure without starting a session, and the reason must name the harness.
+    ///
+    /// MUTATION GUARD: restore the STUDIO-902 fall back (warn and dispatch on the default) and the
+    /// `start_calls() == 0` assertion reds.
+    #[tokio::test]
+    async fn an_unimplemented_harness_is_refused_not_fallen_back_from() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.harness_refusal = Some(rhapsody_agent::CapabilityRefusal::HarnessNotImplemented {
+            name: "codex".to_string(),
+        });
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(err, Some(WorkerError::CapabilityRefused(_))),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("codex"),
+            "the refusal must name the harness: {msg}"
+        );
+        assert_eq!(ag.start_calls(), 0, "no fall back may start a session");
+    }
+
+    /// STUDIO-978, the §5.1 dividing line: a `FinalTextOnly` harness cannot feed the Trace spine,
+    /// but that is OBSERVABILITY — it must still dispatch. Only correctness gaps refuse.
+    #[tokio::test]
+    async fn final_text_only_degrades_but_still_dispatches() {
+        let mut fake = agentfake::Fake::new();
+        fake.turns = vec![succeeded_turn()];
+        fake.capabilities.events = rhapsody_agent::EventFidelity::FinalTextOnly;
+        fake.capabilities.steering = rhapsody_agent::Steering::None;
+        let ag = Arc::new(fake);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "FinalTextOnly must be dispatchable: {err:?}");
+        assert_eq!(ag.start_calls(), 1, "a degraded run still runs");
     }
 
     /// STUDIO-715: `deps.review` makes the worker take the review provisioning path — a DETACHED

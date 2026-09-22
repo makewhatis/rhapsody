@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rhapsody_agent::{HarnessId, HarnessKnobs, HarnessSpec, Runner, claude, opencode};
+use rhapsody_agent::{Harness, HarnessId, HarnessKnobs, HarnessSpec, claude, opencode};
 use rhapsody_config::{Config, EffectiveConfig, effective_for, resolve_projects};
 use rhapsody_core::normalize_state;
 use rhapsody_tracker::{self as tracker, Tracker};
@@ -109,12 +109,12 @@ pub struct ResolvedProject {
     pub gh_owner: String,
     pub gh_repo: String,
 
-    pub agent: Arc<dyn Runner>,
+    pub agent: Arc<dyn Harness>,
     /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
     /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
     /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
     /// dispatch that names no harness uses, which is what keeps this additive.
-    pub agents: BTreeMap<String, Arc<dyn Runner>>,
+    pub agents: BTreeMap<String, Arc<dyn Harness>>,
     pub workspace: Arc<Manager>,
 }
 
@@ -124,12 +124,12 @@ pub struct Effective {
     pub cfg: Config,
     pub tracker: Arc<dyn Tracker>,
     pub workspace: Arc<Manager>,
-    pub agent: Arc<dyn Runner>,
+    pub agent: Arc<dyn Harness>,
     /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
     /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
     /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
     /// dispatch that names no harness uses, which is what keeps this additive.
-    pub agents: BTreeMap<String, Arc<dyn Runner>>,
+    pub agents: BTreeMap<String, Arc<dyn Harness>>,
     pub prompt_tmpl: String,
     pub active_states: HashSet<String>,
     pub terminal_states: HashSet<String>,
@@ -222,7 +222,7 @@ impl Effective {
 /// Claude's own config (design §1.2's "the seam cannot construct a non-Claude runner"); it now
 /// takes the harness-agnostic spec, though `"claude"` remains the only backend
 /// [`runner_for_backend`] implements — see that function's doc.
-pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
+pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Harness>;
 
 /// The production seam: build the runner the spec names. Mirrors Go `defaultRunnerFactory`
 /// (`claude.New`), generalized over [`HarnessKnobs`]'s variants.
@@ -230,7 +230,7 @@ pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
 /// Matched exhaustively with no wildcard arm on purpose: a third harness must stop this function
 /// compiling rather than silently resolve to claude. (Until STUDIO-902 there was one variant and
 /// this destructured it directly, for the same reason.)
-fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
+fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Harness> {
     match spec.knobs {
         HarnessKnobs::Claude(cc) => Arc::new(claude::Runner::new(cc)),
         HarnessKnobs::Opencode(oc) => Arc::new(opencode::Runner::new(oc)),
@@ -247,7 +247,7 @@ fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
 fn runner_for_backend(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
-) -> Result<Arc<dyn Runner>, OrchestratorError> {
+) -> Result<Arc<dyn Harness>, OrchestratorError> {
     match cfg.agent.backend.as_str() {
         "claude" | "opencode" => Ok(new_runner(harness_spec_from_cfg(cfg))),
         other => Err(OrchestratorError::UnsupportedBackend(other.to_string())),
@@ -285,7 +285,7 @@ pub fn harness_is_implemented(name: &str) -> bool {
 fn runners_by_harness(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
-) -> BTreeMap<String, Arc<dyn Runner>> {
+) -> BTreeMap<String, Arc<dyn Harness>> {
     let mut out = BTreeMap::new();
     for name in IMPLEMENTED_BACKENDS {
         let mut c = cfg.clone();
@@ -1026,7 +1026,7 @@ claude:
         // asserted to be well-formed and then built, so this test keeps measuring the thing it was
         // written to measure (which claude::Config each project's runner gets) rather than
         // accidentally measuring the new pre-build.
-        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Harness> {
             match spec.knobs {
                 HarnessKnobs::Claude(cc) => {
                     assert_eq!(spec.harness, HarnessId::Claude);
@@ -1084,7 +1084,7 @@ claude:
         // asserted to be well-formed and then built, so this test keeps measuring the thing it was
         // written to measure (which claude::Config each project's runner gets) rather than
         // accidentally measuring the new pre-build.
-        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Harness> {
             match spec.knobs {
                 HarnessKnobs::Claude(cc) => {
                     assert_eq!(spec.harness, HarnessId::Claude);

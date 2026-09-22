@@ -26,9 +26,10 @@ pub mod opencode;
 pub mod proctree;
 
 pub use harness::{
-    EventFidelity, Harness, HarnessCapabilities, HarnessId, HarnessKnobs, HarnessSpec, Provider,
-    ProviderAuth, Resume, Sandbox, StdinPolicy, Steering, ToolEventGranularity, ToolNaming,
-    UsageDetail,
+    CapabilityRefusal, Degradation, DispatchVerdict, EventFidelity, Harness, HarnessCapabilities,
+    HarnessId, HarnessKnobs, HarnessSpec, McpSandboxCoupling, Provider, ProviderAuth, Resume,
+    Sandbox, StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
+    WorkRequirements, validate,
 };
 pub use humanize::{LogEntry, humanize_stream_line};
 
