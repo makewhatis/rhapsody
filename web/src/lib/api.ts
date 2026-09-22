@@ -143,6 +143,21 @@ export interface ReviewDivergence {
   // recorded. Mutually exclusive with `capacity_held`. Without it, an operator following the
   // advisory's own "see review_divergence" pointer could not tell this row from an ordinary stall.
   capacity_unreadable?: { attempts: number };
+  // STUDIO-1005: present ONLY when an ESCALATION's reason was computed at a head the branch has
+  // since moved past. `adjudicated_head` is the head the reason was computed at, `current_head` the
+  // head the watcher last observed, `reason` the manager's own words (the row does not carry them
+  // otherwise) and `findings` the open findings it named — both rendered beside the supersession
+  // notice by DivergenceBanner, so neither is shipped-but-unread. `supersession` is the daemon's own
+  // operator sentence, carried on the wire so the console cannot drift from it. ABSENT on a
+  // still-current escalation, whose row is byte-identical to before this ticket. Never read
+  // `superseded` as "the findings were addressed" — it means the text MAY be stale (a merge, a
+  // CHANGELOG bump or a force-push moves the head without touching a finding).
+  adjudicated_head?: string;
+  current_head?: string;
+  superseded?: boolean;
+  reason?: string;
+  findings?: string[];
+  supersession?: string;
 }
 
 // DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
