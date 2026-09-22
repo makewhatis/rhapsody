@@ -188,6 +188,7 @@ env -i \
   OPENCODE_DISABLE_MODELS_FETCH=1 \
   OPENCODE_DISABLE_AUTOUPDATE=1 \
   OPENCODE_DISABLE_SHARE=1 \
+  OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
   "$OPENCODE_BIN" --version > "$HERE/probe.txt" 2>/dev/null
 
 echo "capture.sh: wrote $HERE/requests/*.json and $HERE/probe.txt"

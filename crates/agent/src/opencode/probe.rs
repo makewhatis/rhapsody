@@ -10,17 +10,19 @@
 //!
 //! * it runs the resolved executable with `env_clear()` plus the small allow-list in
 //!   [`probe_env`] — no credential, no auth/config content, no inherited `OPENCODE_*`;
-//! * it passes only `--version`, which does not consult project or global config, and sets
-//!   `stdin` to null;
-//! * it bounds stdout and enforces a process-tree timeout;
+//! * it passes only `--version`, which does not consult project or global config, sets `stdin` to
+//!   null, and runs outside the target worktree with project/plugin discovery disabled;
+//! * it drains stdout while it waits and enforces a process-tree timeout, killing the whole tree on
+//!   every exit path so a leftover descendant can neither hold the pipe nor outlive the probe;
 //! * unknown, unparseable, or unreachable versions refuse with
 //!   [`UNSUPPORTED_HARNESS_VERSION`] / [`PROBE_FAILED`] rather than being treated as compatible.
 //!
 //! Wiring this probe into preparation is a later slice (PB5); PB0 only defines and tests it.
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The error reason a caller records for an unknown or unparseable version.
@@ -103,6 +105,11 @@ pub fn probe_env() -> Vec<(&'static str, &'static str)> {
         ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
         ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
         ("OPENCODE_DISABLE_SHARE", "1"),
+        // §9.1 disables plugin discovery too. Verified against the pinned binary's `RuntimeFlags`,
+        // which maps `OPENCODE_DISABLE_DEFAULT_PLUGINS` onto `disableDefaultPlugins` (the default
+        // plugin set); configured external plugins are suppressed by `--pure`, which `--version`
+        // never reaches because it returns before plugin loading.
+        ("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1"),
     ]
 }
 
@@ -170,6 +177,14 @@ pub fn probe_with_timeout(
 
 /// Runs `command --version` under the allow-listed environment, bounded in bytes and by a
 /// process-tree timeout. The child's stdin is null; stderr is discarded.
+///
+/// The bound covers the WHOLE probe, not just `try_wait` on the direct child. stdout is drained
+/// while the child is waited on, so a `--version` larger than the pipe buffer cannot block the
+/// child into a false timeout, and a background descendant that keeps stdout open after the child
+/// exits cannot outlive the deadline: every exit path reaps the process tree, which closes the pipe
+/// the descendant was holding. (A descendant that escaped the tree before the sweep is the one gap
+/// [`crate::proctree`] documents; the drain is non-blocking, so even then the probe returns on
+/// time rather than blocking on the read.)
 fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
     let mut child = Command::new(command)
         .arg("--version")
@@ -178,8 +193,11 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
         .stderr(Stdio::null())
         .env_clear()
         .envs(probe_env())
-        // Its own process group, so the timeout's tree kill catches anything the probe spawned —
-        // the same shape the agent runners use before arming `proctree::kill_tree`.
+        // The probe runs OUTSIDE the target worktree (§9.1); a neutral cwd keeps a configured
+        // wrapper from discovering a project even though `--version` never reads one itself.
+        .current_dir("/")
+        // Its own process group, so the tree kill catches anything the probe spawned — the same
+        // shape the agent runners use before arming `proctree::kill_tree`.
         .process_group(0)
         .spawn()
         .map_err(|e| ProbeError::Spawn {
@@ -187,14 +205,25 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
         })?;
 
     let pid = child.id();
+    let mut stdout = child.stdout.take().ok_or_else(|| ProbeError::Spawn {
+        message: "the probe child has no piped stdout".to_string(),
+    })?;
+    set_nonblocking(&stdout)?;
+
     let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut timed_out = false;
     loop {
+        if drain(&mut stdout, &mut buf, &mut chunk, deadline) {
+            timed_out = true;
+            break;
+        }
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                crate::proctree::kill_tree(pid);
-                let _ = child.wait();
-                return Err(ProbeError::TimedOut);
+                timed_out = true;
+                break;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
@@ -205,17 +234,80 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
         }
     }
 
-    let mut buf = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        // `take` bounds the read; a `--version` that printed more is already unparseable.
-        let _ = stdout.take(MAX_PROBE_OUTPUT as u64).read_to_end(&mut buf);
+    // Reap the whole tree on EVERY exit path, success included: a descendant left holding stdout
+    // would otherwise keep the pipe open (blocking the final drain) and go on running.
+    crate::proctree::kill_tree(pid);
+    let _ = child.wait();
+    // The child is dead and the tree reaped, so the pipe reaches EOF once its buffered bytes are
+    // read; the read is non-blocking, so an unreachable descendant cannot hang it.
+    drain(&mut stdout, &mut buf, &mut chunk, deadline);
+
+    if timed_out {
+        return Err(ProbeError::TimedOut);
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Puts the child's stdout pipe in non-blocking mode so a read never blocks past the deadline.
+fn set_nonblocking(stdout: &ChildStdout) -> Result<(), ProbeError> {
+    let fd = stdout.as_raw_fd();
+    // SAFETY: `fd` is an open pipe read end; both `fcntl` forms take an int and touch no memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ProbeError::Spawn {
+            message: "fcntl(F_GETFL) on the probe pipe failed".to_string(),
+        });
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(ProbeError::Spawn {
+            message: "fcntl(F_SETFL, O_NONBLOCK) on the probe pipe failed".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Reads everything currently available into `buf`, keeping at most [`MAX_PROBE_OUTPUT`] bytes but
+/// discarding the rest so a chatty `--version` cannot fill the pipe and block the child. Returns
+/// `true` once `deadline` has passed, which is how an unending output is bounded.
+fn drain(
+    stdout: &mut ChildStdout,
+    buf: &mut Vec<u8>,
+    chunk: &mut [u8; 8192],
+    deadline: Instant,
+) -> bool {
+    loop {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        match stdout.read(chunk) {
+            Ok(0) => return false, // EOF: every write end of the pipe is closed
+            Ok(n) => {
+                let room = MAX_PROBE_OUTPUT.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slack over the configured timeout for the timing assertions. It must swallow the ~200ms
+    /// process-tree sweep plus scheduler noise on a loaded runner, yet stay well under the `sleep`
+    /// a broken implementation would wait for (the fixtures use 5–30s), so the guard still reds.
+    const TIMEOUT_SLACK: Duration = Duration::from_secs(2);
+
+    /// Whether `pid` is still running. SIGKILL cannot be caught; signal 0 checks for existence only.
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 delivers nothing, it only performs `kill(2)`'s error checking.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
 
     fn script(body: &str) -> (crate::opencode::testdir::TempDir, String) {
         use std::io::Write;
@@ -333,9 +425,87 @@ mod tests {
     #[test]
     fn probe_enforces_a_process_tree_timeout() {
         let (_dir, command) = script("sleep 5\n");
+        let start = Instant::now();
         let err = probe_with_timeout(&command, Duration::from_millis(150)).unwrap_err();
+        let elapsed = start.elapsed();
         assert_eq!(err.reason(), PROBE_FAILED);
         assert_eq!(err, ProbeError::TimedOut);
+        // The assertion is on wall-clock time, not the variant: without the tree kill the probe
+        // would simply `wait()` out the child's `sleep 5`.
+        assert!(
+            elapsed < Duration::from_millis(150) + TIMEOUT_SLACK,
+            "the probe outran its deadline: {elapsed:?}"
+        );
+    }
+
+    /// The timeout path must kill the process TREE, not wait the leader out. A descendant that the
+    /// script left behind has to be gone, and the probe must still return on its deadline.
+    #[test]
+    fn probe_timeout_kills_a_descendant_instead_of_waiting_for_it() {
+        let dir = crate::opencode::testdir::TempDir::new();
+        let pidfile = dir.path().join("descendant.pid");
+        let body = format!(
+            "sleep 30 &\necho $! > {pidfile}\nsleep 30\n",
+            pidfile = pidfile.display()
+        );
+        let (_script_dir, command) = script(&body);
+
+        let start = Instant::now();
+        let err = probe_with_timeout(&command, Duration::from_secs(3)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err, ProbeError::TimedOut);
+        // Without the tree kill, `sleep 30` outlives the 3s deadline by a wide margin.
+        assert!(
+            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            "the probe waited for the descendant: {elapsed:?}"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the script recorded its descendant's pid")
+            .trim()
+            .parse()
+            .expect("descendant pid");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(pid),
+            "descendant {pid} survived the probe's process-tree kill"
+        );
+    }
+
+    /// B1 regression: a wrapper that prints one version line and exits while a background descendant
+    /// keeps stdout open. The probe must read the version and stay bounded, and it must not leak the
+    /// descendant — killing the tree closes the pipe the descendant held.
+    #[test]
+    fn probe_bounds_a_wrapper_whose_descendant_holds_stdout() {
+        let (_dir, command) = script("sleep 30 &\necho 1.18.30\n");
+        let start = Instant::now();
+        let row = probe_with_timeout(&command, Duration::from_secs(3))
+            .expect("the version line is still read from the bounded pipe");
+        let elapsed = start.elapsed();
+        assert_eq!(row.opencode_version, "1.18.30");
+        // Without the tree kill the read blocks on the descendant's `sleep 30`, far past the bound.
+        assert!(
+            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            "a descendant holding stdout outran the deadline: {elapsed:?}"
+        );
+    }
+
+    /// Output larger than one pipe buffer must be drained, not deadlocked: a `--version` that floods
+    /// stdout is unparseable, but it has to be read (and bounded) rather than reported as a timeout.
+    #[test]
+    fn probe_drains_output_larger_than_the_pipe_buffer() {
+        let (_dir, command) = script("yes 1.18.30 | head -c 200000\n");
+        let start = Instant::now();
+        let err = probe_with_timeout(&command, Duration::from_secs(5)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err, ProbeError::UnparseableOutput);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the drain deadlocked: {elapsed:?}"
+        );
     }
 
     /// `env_clear()` is the guard, not the allow-list: an ambient credential must not reach the

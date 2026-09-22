@@ -282,14 +282,24 @@ fn subagent_requests_stay_on_the_generated_model_and_closed_schema() {
 #[test]
 fn no_secret_or_machine_path_is_committed() {
     let dir = broker_dir();
-    let mut checked = 0;
-    let entries = std::fs::read_dir(dir.join("requests")).expect("requests dir");
-    for entry in entries {
-        let path = entry.expect("entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).expect("fixture text");
+    // Every committed capture artifact is scanned, not just the request snapshots: `probe.txt` and
+    // `compatibility.json` are written by the same `capture.sh` and are equally capable of carrying
+    // a leaked key or a machine path.
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir.join("requests"))
+        .expect("requests dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    paths.push(dir.join("probe.txt"));
+    paths.push(dir.join("compatibility.json"));
+    assert_eq!(
+        paths.len(),
+        7,
+        "expected five scenarios plus probe.txt and compatibility.json"
+    );
+
+    for path in &paths {
+        let text = std::fs::read_to_string(path).expect("fixture text");
         for needle in FORBIDDEN_SUBSTRINGS {
             assert!(
                 !text.contains(needle),
@@ -300,7 +310,5 @@ fn no_secret_or_machine_path_is_committed() {
             !text.contains("<UNEXPECTED>"),
             "{path:?} proves the wrong auth path"
         );
-        checked += 1;
     }
-    assert_eq!(checked, 5, "expected every scenario fixture to be scanned");
 }
