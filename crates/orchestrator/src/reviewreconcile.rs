@@ -1161,13 +1161,17 @@ impl Orchestrator {
         // the same false page on the second sweep. The count is deliberately NOT compared, only its
         // presence: it climbs on every failed lookup, so comparing the number would make every
         // outage sweep a transition and defeat the rate limit.
-        let previous: HashMap<&str, (Option<CapacityHold>, bool)> = self
+        let previous: HashMap<&str, (Option<CapacityHold>, bool, bool)> = self
             .review_divergence
             .iter()
             .map(|d| {
                 (
                     d.pr.as_str(),
-                    (d.capacity_held, d.capacity_unreadable.is_some()),
+                    (
+                        d.capacity_held,
+                        d.capacity_unreadable.is_some(),
+                        d.superseded(),
+                    ),
                 )
             })
             .collect();
@@ -1185,12 +1189,19 @@ impl Orchestrator {
             // re-stamped when the rotating cursor next evaluates the pull request, not every sweep,
             // so comparing it would log a rotation as a transition and defeat the rate limit; the
             // unreadable count is likewise reduced to presence for the same reason.
-            let (prev_hold, prev_unreadable) = previous
+            let (prev_hold, prev_unreadable, prev_superseded) = previous
                 .get(d.pr.as_str())
                 .copied()
-                .unwrap_or((None, false));
+                .unwrap_or((None, false, false));
+            // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
+            // annotations' reason one paragraph up: the head move is the news, and waiting out the
+            // steady-state rate limit would leave the log repeating "still unaddressed" for a full
+            // `RECONCILE_LOG_EVERY` window after the branch moved. Presence only — `current_head`
+            // can change again without the superseded FACT changing, and comparing the SHA would
+            // make every push a logged transition.
             let annotation_changed = !same_capacity(prev_hold, d.capacity_held)
-                || prev_unreadable != d.capacity_unreadable.is_some();
+                || prev_unreadable != d.capacity_unreadable.is_some()
+                || prev_superseded != d.superseded();
             // The crossing sweep, an annotation transition, and the rate-limited repeats in ONE
             // condition: at the crossing the count is 1, and `1 - 1` is a multiple of everything.
             if annotation_changed || (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
@@ -3429,8 +3440,8 @@ mod store_tests {
         assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
     }
 
-    /// Records an ESCALATE at `head` for PR #164 with the incident's own reason text, returning the
-    /// coordinate so a test can seed the watcher's observed-head memo beside it.
+    /// Records an ESCALATE at `head` for PR #164 with the incident's own reason text, so a test can
+    /// seed the watcher's observed-head memo beside it and watch the supersession follow.
     fn escalated_at(o: &mut Orchestrator, head: &str) {
         use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
         let pr = PrCoord::new("makewhatis", "rhapsody", 164);
@@ -3505,6 +3516,36 @@ mod store_tests {
         assert!(
             note.contains(HEAD) && note.contains("b02fc72"),
             "the notice must name both heads so the operator can see the snapshot moved, got: {note}"
+        );
+    }
+
+    /// A supersession APPEARING is its own log transition: the sweep that learns the head moved
+    /// says so at once rather than waiting out `RECONCILE_LOG_EVERY` (~30 min), which would leave the
+    /// log repeating "still unaddressed" long after the branch moved.
+    ///
+    /// MUTATION: drop `prev_superseded != d.superseded()` from `annotation_changed` and the second
+    /// sweep logs nothing, so this reds.
+    #[test]
+    fn a_newly_superseded_escalation_logs_on_the_sweep_that_learns_it() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        o.review_observed_head.insert(pr.clone(), HEAD.to_string());
+
+        // First sweep: the escalation is current.
+        o.reconcile_review_divergence();
+        assert!(!o.review_divergences()[0].superseded());
+
+        // The author pushes. The very NEXT sweep must log the supersession, not wait for the
+        // steady-state rate limit.
+        o.review_observed_head.insert(pr, "b02fc72".to_string());
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "WARN" && e.message.contains("SUPERSEDED")),
+            "the sweep that learns the head moved must log it, got: {events:?}"
         );
     }
 
