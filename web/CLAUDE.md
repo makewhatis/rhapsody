@@ -25,7 +25,7 @@ bare `invoke()` call escape into shared component code.
 ## Dev server / env
 
 `npm run dev` proxies `/api` to the daemon at `SYMPHONY_API_URL` (default
-`http://localhost:8799`, matching the Makefile's `PORT` default) — see the `server.proxy`
+`http://127.0.0.1:8799`, matching the Makefile's `PORT` default) — see the `server.proxy`
 block in `vite.config.ts`. `SYMPHONY_API_URL` is a dev-only convenience var, not one of
 the cross-process `SYMPHONY_*` contract vars from the root CLAUDE.md.
 

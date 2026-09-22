@@ -2592,3 +2592,47 @@ Preserved-code surfaces are unchanged: `effective_json` emits the provider block
 own provider definitions entry-by-entry through the existing decode→validate→effective→encode
 pipeline.
 
+### Every loopback write passes an operator-write guard (STUDIO-982)
+
+Go v0.4.0 accepts any `POST` that reaches its loopback listener. Binding to `127.0.0.1` keeps other
+machines out, but not a web page open in the operator's own browser. Such a page can send a
+cross-site form post without a CORS preflight. After a DNS rebind, it can also send a same-origin
+request under a hostile hostname. Before provider configuration can authorize credentialed egress
+(`~/.rhapsody/docs/provider-auth-design.md` §P0d), Rhapsody **tightens every existing local write
+endpoint**. `/refresh`, `/drain`, `/config`, `/teams/config`, `/teams/{invalidate,reinstate,room}`,
+`/reviews/{rerun,dismiss,clear}` and `/runs/{id}/{stop,resume,merge,handoff,retain,post,message}`
+all sit behind one shared guard (`crates/httpapi/src/operator_guard.rs`). On `POST`, and on any CORS
+preflight (`OPTIONS`) to those routes, it requires:
+
+| | required |
+|---|---|
+| `Host` | exactly `127.0.0.1:<port>`; the port is the accepted socket's own bound port. `X-Forwarded-*` is never read |
+| `X-Rhapsody-Operator` | exactly one header, value `1`; a repeated or comma-joined header is refused |
+| `Origin` | absent, or exactly `http://127.0.0.1:<port>`; `null` and every other origin are refused |
+| `Sec-Fetch-Site` | absent, `same-origin` or `none` |
+| `Cookie` | absent |
+| `Content-Type` | not a form type (`application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`) |
+
+Every refusal is the same `403 {"error":{"code":"operator_write_forbidden",…}}`. It is returned
+before the body is read and before any daemon state is touched. Reads (`GET`/`HEAD`) and the 405 a
+wrong method gets are unchanged, and so is each body endpoint's own JSON schema and size limit. What
+changes for callers:
+
+- **The dashboard** sends every write through one helper (`web/src/lib/api.ts` `operatorPost`) with
+  the header, a JSON body (`{}` where the endpoint takes none), and `credentials: "omit"`. Cookies are
+  scoped by host, not by port, so a cookie from another local app could otherwise ride along.
+  Open the dashboard at `http://127.0.0.1:<port>/`: writes made from `http://localhost:<port>/` are
+  refused.
+- **`rhapsodyd mcp`** sends the header and a JSON body (`{}` for stop/resume/handoff) on every
+  write tool.
+- **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` and
+  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
+  header, but only for requests carrying exactly one `Origin: rhapsody://localhost`, the bundled
+  origin. A request with no `Origin` gets no header. Its native drain request sends the header too.
+- **Hand-written clients** (`curl`, scripts) must do the same:
+  `curl -X POST http://127.0.0.1:$PORT/api/v1/refresh -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'`.
+  The plugin skill's `operating.md` documents this.
+
+This is a **browser-origin gate, not authentication**. Any local process running as the operator
+can set every one of these headers, exactly as it could already read `~/.rhapsody`. Routing,
+branch names, the `SYMPHONY_*` agent env vars and every read's wire shape are unchanged.

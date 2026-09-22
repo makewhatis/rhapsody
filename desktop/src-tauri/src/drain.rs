@@ -108,6 +108,24 @@ pub enum DrainOutcome {
     RestartFailed { error: String },
 }
 
+/// The `POST /api/v1/drain` request. It is a daemon mutation, so it carries exactly one operator
+/// header for the daemon's operator-write guard (STUDIO-982). The `Host` is the one reqwest derives
+/// from the supervisor's `127.0.0.1:<port>` URL.
+fn drain_request(
+    client: &reqwest::Client,
+    url: &str,
+    active: bool,
+    reason: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .header(
+            crate::apiproxy::OPERATOR_HEADER,
+            crate::apiproxy::OPERATOR_HEADER_VALUE,
+        )
+        .json(&serde_json::json!({ "active": active, "reason": reason }))
+}
+
 impl App {
     /// Arms (`active`) or cancels a drain on the running daemon via `POST /api/v1/drain`.
     ///
@@ -122,10 +140,7 @@ impl App {
             return Err("daemon is not running".to_string());
         }
         let url = format!("{}/api/v1/drain", sup.url());
-        let resp = self
-            .http_client()
-            .post(&url)
-            .json(&serde_json::json!({ "active": active, "reason": reason }))
+        let resp = drain_request(self.http_client(), &url, active, reason)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -441,6 +456,40 @@ mod tests {
                 error: "spawn failed".into()
             }),
             "the restart was attempted and FAILED — the daemon is still on the old build"
+        );
+    }
+
+    // STUDIO-982: the native drain request is a daemon mutation, so it carries exactly one operator
+    // header, a JSON body, and no Origin or Cookie.
+    #[test]
+    fn the_drain_request_carries_the_operator_header() {
+        let req = drain_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:8799/api/v1/drain",
+            true,
+            REASON_OPERATOR,
+        )
+        .build()
+        .expect("build");
+        assert_eq!(req.method(), reqwest::Method::POST);
+        let operator: Vec<_> = req
+            .headers()
+            .get_all(crate::apiproxy::OPERATOR_HEADER)
+            .iter()
+            .collect();
+        assert_eq!(operator, ["1"]);
+        assert_eq!(
+            req.headers().get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+        assert!(req.headers().get("origin").is_none());
+        assert!(req.headers().get("cookie").is_none());
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body().and_then(|b| b.as_bytes()).expect("body"))
+                .expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({"active": true, "reason": REASON_OPERATOR})
         );
     }
 }

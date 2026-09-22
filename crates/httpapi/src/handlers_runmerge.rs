@@ -303,7 +303,7 @@ mod tests {
     }
 
     async fn post(url: &str, body: &str) -> reqwest::Response {
-        let mut req = reqwest::Client::new().post(url);
+        let mut req = crate::testutil::operator_client().post(url);
         if !body.is_empty() {
             req = req
                 .header("content-type", "application/json")
