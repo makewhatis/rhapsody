@@ -223,9 +223,12 @@ describe("DivergenceBanner", () => {
             current_head: "b02fc72",
             superseded: true,
             reason: "sol's REQUEST CHANGES at 0052489 is still unaddressed",
-            findings: ["alice asked for changes at 0052489"],
+            findings: [
+              "alice asked for changes at 0052489",
+              "sol asked for a pin on the mint/release race",
+            ],
             supersession:
-              "This escalation was computed at head `31ee051`; the branch has since moved to `b02fc72`, so these findings may already be addressed — treat the reason below as evidence, not a verdict.",
+              "This escalation was computed at head `31ee051`; the branch has since moved to `b02fc72`, so these findings may already be addressed — treat the manager's reason as evidence, not a verdict.",
           }),
         ],
       }),
@@ -235,6 +238,12 @@ describe("DivergenceBanner", () => {
     expect(banner.textContent).toContain("computed at head `31ee051`");
     expect(banner.textContent).toContain("b02fc72");
     expect(banner.textContent).toContain("sol's REQUEST CHANGES at 0052489 is still unaddressed");
+    // The findings the stale reason named are rendered too, not shipped-but-unread: the #210
+    // incident was specifically about an operator acting on findings, so the operator reads them
+    // beside the reason rather than having to trust the reason's summary of them.
+    expect(banner.textContent).toContain("It named these open findings:");
+    expect(banner.textContent).toContain("alice asked for changes at 0052489");
+    expect(banner.textContent).toContain("sol asked for a pin on the mint/release race");
     // Still a report, not a control — superseding an escalation does not conjure a button.
     expect(screen.queryByRole("button")).toBeNull();
   });
@@ -260,5 +269,6 @@ describe("DivergenceBanner", () => {
     const banner = await screen.findByRole("status");
     expect(banner.textContent).not.toContain("may already be addressed");
     expect(banner.textContent).not.toContain("The manager's reason was");
+    expect(banner.textContent).not.toContain("It named these open findings:");
   });
 });

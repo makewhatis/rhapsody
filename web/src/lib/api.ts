@@ -146,7 +146,8 @@ export interface ReviewDivergence {
   // STUDIO-1005: present ONLY when an ESCALATION's reason was computed at a head the branch has
   // since moved past. `adjudicated_head` is the head the reason was computed at, `current_head` the
   // head the watcher last observed, `reason` the manager's own words (the row does not carry them
-  // otherwise) and `findings` the open findings it named. `supersession` is the daemon's own
+  // otherwise) and `findings` the open findings it named — both rendered beside the supersession
+  // notice by DivergenceBanner, so neither is shipped-but-unread. `supersession` is the daemon's own
   // operator sentence, carried on the wire so the console cannot drift from it. ABSENT on a
   // still-current escalation, whose row is byte-identical to before this ticket. Never read
   // `superseded` as "the findings were addressed" — it means the text MAY be stale (a merge, a

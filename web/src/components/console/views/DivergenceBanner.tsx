@@ -62,6 +62,9 @@ export function DivergenceBanner() {
                 {" "}
                 <strong>{d.supersession}</strong>
                 {d.reason ? ` The manager's reason was: ${d.reason}` : ""}
+                {d.findings && d.findings.length > 0
+                  ? ` It named these open findings: ${d.findings.join("; ")}.`
+                  : ""}
               </>
             ) : null}
           </span>

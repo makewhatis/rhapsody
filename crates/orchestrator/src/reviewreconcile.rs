@@ -400,8 +400,8 @@ impl Divergence {
         self.superseded().then(|| {
             format!(
                 "This escalation was computed at head `{}`; the branch has since moved to `{}`, so \
-                 these findings may already be addressed — treat the reason below as evidence, not a \
-                 verdict.",
+                 these findings may already be addressed — treat the manager's reason as evidence, \
+                 not a verdict.",
                 self.adjudicated_head, self.current_head
             )
         })
@@ -2250,6 +2250,14 @@ mod store_tests {
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const HEAD: &str = "c0a54eb0000000000000000000000000000000000";
+    /// A head one commit past [`HEAD`] — the SAME length and prefix, differing only in the character
+    /// that encodes the commit — so the single-commit test proves the supersession rule is a plain
+    /// string inequality and not an artifact of a prefix or abbreviation mismatch.
+    const HEAD_ONE_COMMIT_LATER: &str = "c0a54eb1000000000000000000000000000000000";
+    /// A head well past [`HEAD`] — the incident's current head, full-length like every head the
+    /// watcher records, so the fixtures cannot pass by comparing two DIFFERENT abbreviation lengths
+    /// (which would render every escalation permanently superseded).
+    const HEAD_PUSHED: &str = "b02fc72000000000000000000000000000000000";
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -3476,7 +3484,7 @@ mod store_tests {
         // The watcher observed a head that is NOT the escalation's: the author pushed after it.
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            "b02fc72".to_string(),
+            HEAD_PUSHED.to_string(),
         );
 
         o.reconcile_review_divergence();
@@ -3493,7 +3501,7 @@ mod store_tests {
             "a head move past the escalation's head marks it stale"
         );
         assert_eq!(found[0].adjudicated_head, HEAD);
-        assert_eq!(found[0].current_head, "b02fc72");
+        assert_eq!(found[0].current_head, HEAD_PUSHED);
         assert_eq!(
             found[0].reason, "sol's REQUEST CHANGES at 0052489 is still unaddressed",
             "the manager's own reason is still reported — as evidence, not silently deleted"
@@ -3503,7 +3511,7 @@ mod store_tests {
         let row = &rendered["review_divergence"][0];
         assert_eq!(row["superseded"], true);
         assert_eq!(row["adjudicated_head"], HEAD);
-        assert_eq!(row["current_head"], "b02fc72");
+        assert_eq!(row["current_head"], HEAD_PUSHED);
         assert_eq!(
             row["reason"],
             "sol's REQUEST CHANGES at 0052489 is still unaddressed"
@@ -3514,7 +3522,7 @@ mod store_tests {
         );
         let note = row["supersession"].as_str().unwrap_or_default();
         assert!(
-            note.contains(HEAD) && note.contains("b02fc72"),
+            note.contains(HEAD) && note.contains(HEAD_PUSHED),
             "the notice must name both heads so the operator can see the snapshot moved, got: {note}"
         );
     }
@@ -3539,7 +3547,7 @@ mod store_tests {
 
         // The author pushes. The very NEXT sweep must log the supersession, not wait for the
         // steady-state rate limit.
-        o.review_observed_head.insert(pr, "b02fc72".to_string());
+        o.review_observed_head.insert(pr, HEAD_PUSHED.to_string());
         let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
         assert!(
             events
@@ -3551,10 +3559,14 @@ mod store_tests {
 
     /// The ticket's single-commit mutation: the supersession marker must fire on ANY head move, not
     /// only a move of more than one commit. The sweep compares two SHA strings and cannot count
-    /// commits locally, so a one-commit difference is simply a difference.
+    /// commits locally, so a one-commit difference is simply a difference. The two heads share a
+    /// length and differ in one character, and the test asserts both the struct flag and the wire
+    /// marker.
     ///
-    /// MUTATION: require the head to differ by more than one commit (e.g. a commit count the sweep
-    /// cannot obtain) and this reds.
+    /// MUTATION (the ticket's ⚠️): require the head to differ by more than one commit — a rule the
+    /// sweep could only satisfy by acquiring a commit count, which needs the network call
+    /// [`the_reconciliation_sweep_makes_no_network_call`] forbids. The comparison is deliberately
+    /// plain string inequality so that rule cannot be expressed; this test pins the inequality.
     #[test]
     fn a_single_commit_head_move_still_marks_the_escalation_superseded() {
         let o = &mut orch(false, "2026-09-22T16:14:00Z");
@@ -3562,13 +3574,30 @@ mod store_tests {
         escalated_at(o, HEAD);
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            "c0a54eb1".to_string(), // one commit past HEAD
+            HEAD_ONE_COMMIT_LATER.to_string(), // one commit past HEAD
         );
 
         o.reconcile_review_divergence();
         let found = o.review_divergences();
         assert_eq!(found.len(), 1);
         assert!(found[0].superseded(), "one commit is still a moved head");
+        // The fixture really is a ONE-commit move: same length, one differing character. Without
+        // this the test could pass on a prefix/length mismatch instead.
+        assert_eq!(HEAD.len(), HEAD_ONE_COMMIT_LATER.len());
+        assert_eq!(
+            HEAD.chars()
+                .zip(HEAD_ONE_COMMIT_LATER.chars())
+                .filter(|(a, b)| a != b)
+                .count(),
+            1,
+            "the two heads must differ in exactly one character"
+        );
+        // And the marker reaches the wire for that minimal move, not only in the struct.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["superseded"], true,
+            "a one-commit head move must mark the escalation superseded on the wire"
+        );
     }
 
     /// **STUDIO-1005 acceptance: an escalation whose head has NOT moved adds NOTHING to the wire
@@ -3615,11 +3644,19 @@ mod store_tests {
     /// MUTATION (the ticket's ⚠️): introduce any of these calls into the sweep and this reds.
     #[test]
     fn the_reconciliation_sweep_makes_no_network_call() {
-        let src = std::fs::read_to_string(concat!(
+        let full = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/reviewreconcile.rs"
         ))
         .expect("read the sweep's own source");
+        // Scan only the module's production half. `read_to_string` would otherwise fold in this
+        // file's own `#[cfg(test)]` module, where a future test may legitimately need one of these
+        // tokens (e.g. a `Command::new` fixture) and would red here pointing at a test rather than
+        // the sweep. The `#[cfg(test)]` marker is where the production text ends.
+        let src = full
+            .split_once("#[cfg(test)]")
+            .map(|(prod, _)| prod)
+            .unwrap_or(&full);
         // Assembled rather than written literally so the tokens do not appear in THIS test's own
         // source and match themselves.
         let tokens = [
