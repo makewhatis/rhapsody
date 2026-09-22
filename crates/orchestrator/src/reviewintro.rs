@@ -711,9 +711,9 @@ impl Orchestrator {
                         tracing::info!(
                             pr = %pr, reviewer = %key.reviewer, from = %reviewed_sha,
                             head = head_sha, status = %carried_status,
-                            "ticketless review: the head moved but its diff against the base is \
-                             byte-identical to the reviewed one; the verdict carries forward and no \
-                             review round is armed"
+                            "ticketless review: the head moved but the change against the base is \
+                             the same as the reviewed one (a patch-id comparison); the verdict \
+                             carries forward and no review round is armed"
                         );
                         advance.skipped.push(key);
                     }

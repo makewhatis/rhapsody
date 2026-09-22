@@ -249,11 +249,12 @@ pub struct ReviewSweepReport {
     /// Rows re-armed to `requested` by the head-advance signal (design §14.1's in-process Event,
     /// standing in for the room post it forbids).
     pub armed: usize,
-    /// Rows whose head moved but whose diff against the base was proven byte-identical to the one
-    /// the row's verdict was made against, so the head move cost NO review round (STUDIO-960). A
-    /// SUBSET of the rows the advance would otherwise have re-armed; they are disjoint from
-    /// [`ReviewSweepReport::armed`]. Reported rather than silently no-op'd, because "the author
-    /// pushed" and "the author rebased onto main" look identical in every other line this tick logs.
+    /// Rows whose head moved but whose change against the base was proven the same as the one the
+    /// row's verdict was made against (a patch-id comparison, STUDIO-977), so the head move cost NO
+    /// review round (STUDIO-960). A SUBSET of the rows the advance would otherwise have re-armed;
+    /// they are disjoint from [`ReviewSweepReport::armed`]. Reported rather than silently no-op'd,
+    /// because "the author pushed" and "the author rebased onto main" look identical in every other
+    /// line this tick logs.
     pub skipped: usize,
     /// The implementation tickets whose pull request MERGED this tick, and the terminal state each
     /// is going to (STUDIO-712). A work LIST rather than a count, because the move itself is a
@@ -690,8 +691,10 @@ async fn unchanged_reviewed_shas(
         }
         match src.merge_base_patch(&pr.owner, &pr.repo, &base, old).await {
             // A patch-id comparison, never a byte comparison (STUDIO-977): a merge from the base
-            // rewrites the hunk line numbers and the `index` blob hashes while carrying the same
-            // change, and only the patch-id is blind to those.
+            // rewrites the hunk line numbers of every changed file — and, for a `git diff`-shaped
+            // input, the `index` blob hashes — while carrying the same change, and only the patch-id
+            // is blind to those. (GitHub's compare `patch` has no `index` line; it is dropped anyway
+            // because a `git diff`-shaped fixture is the other shape this reads.)
             Ok(patch) if crate::ghsummons::same_change(&patch, &head_patch) => {
                 unchanged.push(old.to_string())
             }
@@ -1673,22 +1676,36 @@ impl Orchestrator {
     /// carry no findings at all. That is the rule rather than the exception on an EVEN threshold,
     /// which the author's own summoned dispatch is what crosses. Three shapes are named instead:
     ///
-    /// * a row that posted findings at the current head — `{reviewer} asked for changes at {head}`;
-    /// * a row whose last read predates the head — the author has pushed since and nobody has read
-    ///   the new head, which is the single most decision-relevant fact available here and is stated
-    ///   verdict-neutrally because the re-arm preserved the SHA but not whether it was findings or
-    ///   an approval;
+    /// * a row that posted findings on the change `head` carries — `{reviewer} asked for changes at
+    ///   {head}`;
+    /// * a row whose last read is of a DIFFERENT change — the author has pushed since and nobody has
+    ///   read the new head, which is the single most decision-relevant fact available here and is
+    ///   stated verdict-neutrally because the re-arm preserved the SHA but not whether it was
+    ///   findings or an approval;
     /// * a `truncated` row — the round was attempted and never finished, so it posted nothing.
     ///
-    /// Skipped are the rows with nothing to say: one approved at the current head, and one that has
-    /// never been reviewed at all and is not in the unfinished-round state.
-    fn open_findings(&self, mine: &[&ReviewWatchRow], head: &str) -> Vec<String> {
+    /// Skipped are the rows with nothing to say: one approved on this change, and one that has never
+    /// been reviewed at all and is not in the unfinished-round state.
+    ///
+    /// `proven` is the patch-id proof (STUDIO-977): the heads whose CHANGE is the same as `head`'s.
+    /// A verdict at one of those is a verdict about this change — `handle_review_head_advanced`
+    /// carries a `reviewed` row across a patch-preserving move WITHOUT clearing its status, so a
+    /// head-exact read here would name a thoroughly-read change as unread and drop the very finding
+    /// the manager is asked to adjudicate. The reading is the same proof `ship_available` uses, or
+    /// the plan's `ship_available: true` would contradict its own findings.
+    fn open_findings(&self, mine: &[&ReviewWatchRow], head: &str, proven: &[&str]) -> Vec<String> {
         let mut findings = Vec::new();
         for r in mine
             .iter()
             .filter(|r| r.open && r.status != REVIEW_STATUS_DROPPED)
         {
-            if r.last_reviewed_sha == head {
+            // A read of THIS change: at `head`, or at a head the watcher proved carries the same
+            // change. The explicit `== head` is subsumed by `proven` (which always contains `head`)
+            // but kept so the exact case reads the way it always has.
+            let read_this_change = r.last_reviewed_sha == head
+                || (!r.last_reviewed_sha.is_empty()
+                    && proven.contains(&r.last_reviewed_sha.as_str()));
+            if read_this_change {
                 if r.status == REVIEW_STATUS_REVIEWED {
                     findings.push(format!(
                         "{} asked for changes at {}",
@@ -1696,7 +1713,7 @@ impl Orchestrator {
                         short_sha(head)
                     ));
                 }
-                // An `approved` row at this head is the only genuinely closed one; every other
+                // An `approved` row on this change is the only genuinely closed one; every other
                 // status here (`truncated` after a completed read of the same head, say) falls
                 // through to the unfinished-round arm below.
             } else if !r.last_reviewed_sha.is_empty() {
@@ -2172,7 +2189,7 @@ impl Orchestrator {
                     return;
                 }
                 let rounds = self.rounds_used(pr);
-                let findings = self.open_findings(&mine, head);
+                let findings = self.open_findings(&mine, head, &proven);
                 // STUDIO-977 C: `ship` is available only when every required reviewer has READ the
                 // change `head` carries — an `approved` or a `reviewed` verdict at `head`, or at a
                 // head the watcher proved patch-identical. A reviewer still owing a round (or a
@@ -4159,8 +4176,7 @@ mod tests {
     /// SHAPE the daemon's own compare data has (`compare/main...1050386` and `compare/main...19fc650`
     /// are byte-EQUAL, as alice's review of PR #219 established), which STUDIO-960's predicate
     /// already carried. It pins the end-to-end outcome the ticket asks for on that shape (carry, no
-    /// round, merge); the literal pair is covered by the `#213` test above, which is the
-    /// byte-different case this PR actually fixes. The handoff re-arm that killed `#209` in
+    /// round, merge). The handoff re-arm that killed `#209` in
     /// production is STUDIO-838's deliberate behaviour (a re-introduced pull request is re-reviewed
     /// on purpose) and is out of scope here — a real, separate follow-up.
     #[tokio::test]
@@ -7909,12 +7925,18 @@ mod tests {
     ///
     /// (2) A `reviewed` (findings) verdict at `HEAD_A`, proven identical to the observed `HEAD_B`,
     /// is a READ of this change — so `ship_available == true` and there is no failure to explain.
+    /// The plan's FINDINGS must read the same proof: they name bob's findings at the observed head
+    /// rather than claiming nobody has read it. Reading the findings head-exactly while `ship` reads
+    /// through the proof makes the plan contradict its own flag and drops the finding the manager is
+    /// asked to adjudicate (alice's round-3 blocker).
+    ///
     /// This pins BOTH halves of the predicate: holding `ship` to the merge gate (which refuses a
     /// `reviewed` row as `ChangesRequested`) reds (2); dropping the patch-id proof (`&[head]` for
     /// `&proven`) reds (2) too, because the `HEAD_A` verdict stops counting.
     ///
     /// MUTATION: hard-code `ship_available: true` and (1) reds; refuse a `reviewed` row and (2)
-    /// reds; pass `&[head]` instead of `&proven` and (2) reds.
+    /// reds; pass `&[head]` instead of `&proven` and (2) reds; read the findings against `head`
+    /// alone and (2) reds on the unread-head line.
     #[test]
     fn the_sweep_computes_ship_availability_from_the_rows() {
         // (1) A reviewer still owes a round at HEAD_B: nobody read the observed change.
@@ -7964,6 +7986,12 @@ mod tests {
         assert!(
             report2.adjudicate[0].ship_unavailable_reason.is_empty(),
             "and there is no failure to explain"
+        );
+        assert_eq!(
+            report2.adjudicate[0].findings,
+            vec![format!("bob asked for changes at {}", &HEAD_B[..7])],
+            "the findings read the same proof: bob's findings on this change, not the unread-head \
+             line — a plan whose flag says shippable must not tell the manager nobody read it"
         );
     }
 
@@ -9826,9 +9854,11 @@ mod tests {
                     .to_string()),
             }
         }
-        /// **`#209`'s data, byte-EQUAL.** `1050386` → `19fc650`, verified from the daemon's own
-        /// compare data: identical fingerprints, so STUDIO-960's byte comparison already carried it.
-        /// Kept so the ticket's first incident is reproduced (and merges), not misattributed.
+        /// **A pair SHAPED LIKE `#209`'s, byte-EQUAL.** The real `1050386` → `19fc650`, verified from
+        /// the daemon's own compare data, was identical fingerprints, so STUDIO-960's byte comparison
+        /// already carried it — this fixture reproduces that SHAPE (identical old/head fingerprints)
+        /// on a synthetic patch, not the literal bytes. Kept so the ticket's first incident's shape
+        /// is exercised end to end (and merges), not misattributed.
         fn merged_from_base_209() -> FakeDiffSource {
             let patch = "src/lib.rs\u{0}modified\u{0}@@ -42,7 +42,7 @@ fn foo() {\n ctx\n-old\n+new\n ctx\n\u{0}";
             FakeDiffSource {
