@@ -74,7 +74,7 @@ mod testutil;
 
 pub use history::HistoryStore;
 pub use logs::{LogEntry, LogSource};
-pub use operator_guard::{BoundAddr, OPERATOR_HEADER, OPERATOR_HEADER_VALUE};
+pub use operator_guard::BoundAddr;
 pub use server::{
     ConfigValidateError, RunActionError, Server, SnapshotError, StateProvider, new_handler,
 };

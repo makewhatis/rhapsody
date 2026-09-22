@@ -41,10 +41,10 @@ use crate::responses::write_error;
 
 /// The custom header every mutating request must carry exactly once, with exactly
 /// [`OPERATOR_HEADER_VALUE`].
-pub const OPERATOR_HEADER: &str = "x-rhapsody-operator";
+pub(crate) const OPERATOR_HEADER: &str = "x-rhapsody-operator";
 
 /// The one accepted value of [`OPERATOR_HEADER`].
-pub const OPERATOR_HEADER_VALUE: &str = "1";
+pub(crate) const OPERATOR_HEADER_VALUE: &str = "1";
 
 /// The code of the single denial envelope.
 pub(crate) const DENIED_CODE: &str = "operator_write_forbidden";

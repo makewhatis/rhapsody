@@ -15,10 +15,10 @@
 //! `Host` is the daemon's own `127.0.0.1:<port>`, it carries exactly one `X-Rhapsody-Operator: 1`,
 //! and it has no foreign `Origin` and no `Cookie`. The window's requests arrive from the bundled
 //! origin ([`BUNDLED_ORIGIN`]), which the daemon would refuse. So the proxy never forwards what the
-//! webview sent for those headers. It drops any `Host`, `Origin`, `Cookie` or operator header,
-//! sets `Host` to the daemon target itself, and injects exactly one operator header, but only
-//! when the request came from the bundled origin ([`from_bundled_origin`]). Any other request is
-//! forwarded without the header, so the daemon refuses its writes.
+//! webview sent for those headers. It drops any `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` or
+//! operator header, sets `Host` to the daemon target itself, and injects exactly one operator
+//! header, but only when the request came from the bundled origin ([`from_bundled_origin`]). Any
+//! other request is forwarded without the header, so the daemon refuses its writes.
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, header};
@@ -198,12 +198,15 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
 }
 
 /// Reports whether `name` is one of the headers the daemon's operator-write guard judges, which the
-/// proxy never forwards from the webview: `Host`, `Origin`, `Cookie`, and the operator header.
+/// proxy never forwards from the webview: `Host`, `Origin`, `Cookie`, the operator header, and the
+/// `Sec-Fetch-*` metadata. That metadata describes the webview's own fetch, not the proxy's request
+/// to the daemon, which the proxy vouches for itself.
 fn is_guard_header(name: &http::HeaderName) -> bool {
     name == header::HOST
         || name == header::ORIGIN
         || name == header::COOKIE
         || name.as_str() == OPERATOR_HEADER
+        || name.as_str().starts_with("sec-fetch-")
 }
 
 /// Reports whether `name` is a hop-by-hop / framing header that must not be forwarded across the
@@ -456,6 +459,10 @@ mod tests {
             headers.insert(header::ORIGIN, http::HeaderValue::from_static(origin));
         }
         headers.insert(header::COOKIE, http::HeaderValue::from_static("session=x"));
+        headers.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("cross-site"),
+        );
         headers.append(OPERATOR_HEADER, http::HeaderValue::from_static("1"));
         headers.append(OPERATOR_HEADER, http::HeaderValue::from_static("1"));
         headers.insert(
@@ -513,6 +520,7 @@ mod tests {
             assert_eq!(values(&headers, OPERATOR_HEADER), ["1"], "{origin:?}");
             assert!(values(&headers, "origin").is_empty(), "{origin:?}");
             assert!(values(&headers, "cookie").is_empty(), "{origin:?}");
+            assert!(values(&headers, "sec-fetch-site").is_empty(), "{origin:?}");
             assert_eq!(
                 values(&headers, "content-type"),
                 ["application/json"],

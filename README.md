@@ -2562,8 +2562,8 @@ changes for callers:
   refused.
 - **`rhapsodyd mcp`** sends the header and a JSON body (`{}` for stop/resume/handoff) on every
   write tool.
-- **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie` and operator headers
-  the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
+- **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` and
+  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
   header, but only for requests from the bundled `rhapsody://localhost` origin (or with no `Origin`,
   which only its own webview can produce). Its native drain request sends the header too.
 - **Hand-written clients** (`curl`, scripts) must do the same:
