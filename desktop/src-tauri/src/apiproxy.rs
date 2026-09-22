@@ -63,16 +63,15 @@ pub const BUNDLED_ORIGIN: &str = "rhapsody://localhost";
 pub const OPERATOR_HEADER: &str = "x-rhapsody-operator";
 pub const OPERATOR_HEADER_VALUE: &str = "1";
 
-/// Reports whether a window request came from the bundled origin. That is true when it carries
-/// exactly one `Origin` equal to [`BUNDLED_ORIGIN`], or none at all: only the app's own webview
-/// loads the `rhapsody` scheme, and a browser always attaches an `Origin` to a cross-origin write.
-/// `null`, a repeated `Origin`, or any other origin is not the bundled one.
+/// Reports whether a window request came from the bundled origin: it carries exactly one `Origin`,
+/// equal to [`BUNDLED_ORIGIN`]. A missing `Origin` is not evidence of the bundled origin, so it is
+/// refused like `null`, a repeated `Origin`, or any other origin. WebKit attaches `Origin` to every
+/// fetch whose method is not GET or HEAD, same-origin included, so the window's own writes carry it.
 pub fn from_bundled_origin(headers: &HeaderMap) -> bool {
     let mut origins = headers.get_all(header::ORIGIN).iter();
     match (origins.next(), origins.next()) {
-        (None, _) => true,
         (Some(origin), None) => origin.as_bytes() == BUNDLED_ORIGIN.as_bytes(),
-        (Some(_), Some(_)) => false,
+        _ => false,
     }
 }
 
@@ -510,24 +509,28 @@ mod tests {
     async fn a_bundled_origin_write_gets_exactly_one_operator_header_and_the_daemon_host() {
         let backend = start_backend().await;
         let authority = backend.url.trim_start_matches("http://").to_string();
-        for origin in [Some(BUNDLED_ORIGIN), None] {
-            let (headers, body) = forwarded(&backend, hostile_post(origin)).await;
-            assert_eq!(
-                values(&headers, "host"),
-                std::slice::from_ref(&authority),
-                "{origin:?}"
-            );
-            assert_eq!(values(&headers, OPERATOR_HEADER), ["1"], "{origin:?}");
-            assert!(values(&headers, "origin").is_empty(), "{origin:?}");
-            assert!(values(&headers, "cookie").is_empty(), "{origin:?}");
-            assert!(values(&headers, "sec-fetch-site").is_empty(), "{origin:?}");
-            assert_eq!(
-                values(&headers, "content-type"),
-                ["application/json"],
-                "{origin:?}"
-            );
-            assert_eq!(&body[..], b"{}", "{origin:?}");
-        }
+        let (headers, body) = forwarded(&backend, hostile_post(Some(BUNDLED_ORIGIN))).await;
+        assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
+        assert_eq!(values(&headers, OPERATOR_HEADER), ["1"]);
+        assert!(values(&headers, "origin").is_empty());
+        assert!(values(&headers, "cookie").is_empty());
+        assert!(values(&headers, "sec-fetch-site").is_empty());
+        assert_eq!(values(&headers, "content-type"), ["application/json"]);
+        assert_eq!(&body[..], b"{}");
+    }
+
+    // A request with no `Origin` carries no evidence of the bundled origin, so it gets no operator
+    // header and the daemon refuses its write. The forged copies it sent are still dropped.
+    #[tokio::test]
+    async fn a_write_without_an_origin_never_gets_the_operator_header() {
+        let backend = start_backend().await;
+        let authority = backend.url.trim_start_matches("http://").to_string();
+        let (headers, body) = forwarded(&backend, hostile_post(None)).await;
+        assert!(values(&headers, OPERATOR_HEADER).is_empty());
+        assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
+        assert!(values(&headers, "cookie").is_empty());
+        assert!(values(&headers, "sec-fetch-site").is_empty());
+        assert_eq!(&body[..], b"{}");
     }
 
     // Any other origin gets no operator header, even a forged one of its own, so the daemon's

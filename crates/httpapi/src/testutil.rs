@@ -435,7 +435,6 @@ impl FakeProvider {
         self
     }
 
-    /// The run id the last `run_diff` read asked about — `None` proves the daemon was never asked.
     /// How many [`StateProvider`] calls this fake has served.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -445,6 +444,7 @@ impl FakeProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// The run id the last `run_diff` read asked about — `None` proves the daemon was never asked.
     pub(crate) fn diff_asked(&self) -> Option<i64> {
         *self
             .diff_asked

@@ -830,7 +830,35 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::testutil::{FakeProvider, empty_snapshot};
+    use crate::operator_guard::DENIED_CODE;
+    use crate::testutil::{FakeProvider, empty_snapshot, operator_client};
+
+    /// A write through a `Server` the daemon's own way: `POST /api/v1/refresh` with the operator
+    /// header and `{}` is accepted, and the same write without the header gets the guard's 403
+    /// envelope. The guard reads the bound port from connect info, so a serve path that drops
+    /// `into_make_service_with_connect_info` refuses the first write too (STUDIO-982).
+    async fn assert_guarded_write_accepted(addr: SocketAddr) {
+        let url = format!("http://{addr}/api/v1/refresh");
+        let resp = operator_client()
+            .post(&url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("POST /api/v1/refresh");
+        assert_eq!(resp.status(), 202, "an operator write is accepted");
+
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("POST /api/v1/refresh");
+        assert_eq!(resp.status(), 403, "a write without the header is refused");
+        let body: serde_json::Value = resp.json().await.expect("json envelope");
+        assert_eq!(body["error"]["code"], DENIED_CODE);
+    }
 
     // The loopback Server binds an ephemeral port, serves /healthz, and shuts down gracefully when
     // signaled (exercises bind / local_addr / serve_with_shutdown together).
@@ -860,6 +888,7 @@ mod tests {
             .await
             .expect("GET /healthz");
         assert_eq!(resp.status(), 200);
+        assert_guarded_write_accepted(addr).await;
 
         // Signal shutdown and confirm the server task drains and returns.
         let _ = tx.send(());
@@ -884,6 +913,7 @@ mod tests {
             .await
             .expect("GET /healthz");
         assert_eq!(resp.status(), 200);
+        assert_guarded_write_accepted(addr).await;
 
         handle.abort();
     }

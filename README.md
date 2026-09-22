@@ -2564,8 +2564,8 @@ changes for callers:
   write tool.
 - **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` and
   operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
-  header, but only for requests from the bundled `rhapsody://localhost` origin (or with no `Origin`,
-  which only its own webview can produce). Its native drain request sends the header too.
+  header, but only for requests carrying exactly one `Origin: rhapsody://localhost`, the bundled
+  origin. A request with no `Origin` gets no header. Its native drain request sends the header too.
 - **Hand-written clients** (`curl`, scripts) must do the same:
   `curl -X POST http://127.0.0.1:$PORT/api/v1/refresh -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'`.
   The plugin skill's `operating.md` documents this.
