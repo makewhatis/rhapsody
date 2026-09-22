@@ -3632,6 +3632,76 @@ mod store_tests {
         assert_eq!(row["kind"], "review_escalated");
     }
 
+    /// **STUDIO-1005 acceptance: a MISSING observation is "unknown", not "stale".** The memo is empty
+    /// on every daemon restart until the rotating watcher reaches the pull request (it visits only
+    /// `MAX_PR_STATE_CALLS_PER_TICK` coordinates a tick), and immediately after the pre-read `_` arm
+    /// clears it for a `Gone`, `Untrusted` or headless `Found`. In that window `superseded()` must
+    /// stay false: an absent `current_head` is the daemon not knowing, never a claim that a current
+    /// escalation went stale — the safety promise carried by the `!self.current_head.is_empty()`
+    /// guard (see the `review_observed_head` doc in `orchestrator.rs`).
+    ///
+    /// MUTATION: delete that guard and this reds — an unobserved escalation becomes `superseded`
+    /// with an empty `current_head` on the console and in the WARN.
+    #[test]
+    fn an_unobserved_escalation_is_unknown_not_superseded() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        // No `review_observed_head` entry: the watcher has not reached this coordinate yet.
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "the live escalation is still reported");
+        assert!(
+            !found[0].superseded(),
+            "a missing observation is unknown, not stale"
+        );
+        assert_eq!(
+            found[0].current_head, "",
+            "no observation ⇒ no current head"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = rendered["review_divergence"][0]
+            .as_object()
+            .expect("a review_divergence row is an object");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["detail", "kind", "pr", "reviewer", "stale_secs", "ticket",],
+            "an unobserved escalation must carry today's fields and no supersession annotation, \
+             got: {row:?}"
+        );
+        assert_eq!(row["kind"], "review_escalated");
+    }
+
+    /// The companion guard: an escalation whose recorded head is EMPTY is not "superseded" either.
+    /// `head` is written together with `decision` in `rhapsody_review_bound`, so this is defensive —
+    /// but an empty `adjudicated_head` gives the comparison nothing to have moved FROM, and must
+    /// read as unknown rather than as a move to whatever the watcher happened to observe.
+    ///
+    /// MUTATION: delete `!self.adjudicated_head.is_empty()` and this reds.
+    #[test]
+    fn an_escalation_with_no_recorded_head_is_not_superseded() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, "");
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD_PUSHED.to_string(),
+        );
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "the live escalation is still reported");
+        assert!(
+            !found[0].superseded(),
+            "an escalation with no recorded head cannot be called stale"
+        );
+        assert_eq!(found[0].adjudicated_head, "");
+    }
+
     /// **STUDIO-1005 acceptance: the sweep stays local-only.** The reconciliation sweep runs on
     /// `on_tick`, above the validate/drain/credential gates, and must never make a `gh`, tracker or
     /// model call. This asserts it directly on the source, so a future edit that reaches for a

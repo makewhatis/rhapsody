@@ -709,9 +709,11 @@ pub struct Orchestrator {
     /// already made.
     ///
     /// In-memory rather than durable on purpose: this is a derived freshness signal, not a decision.
-    /// A restart empties it, and the next watcher tick (one `polling.pr_state_interval_ms`, 15s by
-    /// default) refills it, so the worst case is one cadence in which an escalation renders exactly
-    /// as it did before this ticket — never a false claim that a current escalation is stale. The
+    /// A restart empties it, and the watcher refills it as its rotating cursor reaches the
+    /// coordinate — at most `MAX_PR_STATE_CALLS_PER_TICK` coordinates a tick, so within
+    /// `ceil(N / MAX_PR_STATE_CALLS_PER_TICK)` ticks (one `polling.pr_state_interval_ms`, 15s by
+    /// default) on a watch set of N. Until then the entry is absent, and an absent entry renders
+    /// exactly as before this ticket — never a false claim that a current escalation is stale. The
     /// escalation itself, and the head it was computed at, are durable in `rhapsody_review_bound`.
     pub(crate) review_observed_head: HashMap<crate::prstate::PrCoord, String>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
