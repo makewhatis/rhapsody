@@ -65,6 +65,14 @@ pub struct EvWorkerExit {
     /// True when the agent's final result text ended with a `HANDOFF:` line. A clean exit into a
     /// non-terminal, non-active state records `completed` only when declared, else `stopped`. (INF-272)
     pub declared_handoff: bool,
+    /// True when the exit is a TYPED CAPABILITY REFUSAL decided before any session was spawned
+    /// (STUDIO-978): the resolved harness cannot honor a correctness requirement, or it is not
+    /// implemented by this build. A refusal is terminal — the profile's harness name and the
+    /// adapter's declared capabilities cannot change between attempts, so the failure backoff
+    /// would retry it forever. `on_worker_exit` records it `failed` ONCE, holds the in-memory claim
+    /// so the next tick does not re-dispatch it, and schedules no retry; `err_msg` carries the
+    /// typed reason.
+    pub refused: bool,
 }
 
 /// The ceiling on an armed retry delay. A real retry is minutes-scale by construction (the 1s
@@ -435,7 +443,7 @@ impl Orchestrator {
             && let Some(teams) = self.teams.as_ref()
         {
             let harness = self
-                .harness_actually_run(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
+                .effective_harness(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
             // The harness the legacy bare-scalar `review.model`/`review.effort` spelling belongs
             // to (STUDIO-908): the installation's configured `agent.backend`, not a hardcoded
             // `claude`. `dispatch_review` derives it the same way, so the refusal and the override
@@ -500,17 +508,18 @@ impl Orchestrator {
         // unreproducible `Model not found` — becomes a fact on the run row rather than something an
         // operator has to reconstruct from the config that happens to be live now.
         //
-        // The harness origin names the key that ACTUALLY took effect: a profile that names a harness
-        // this build has no runner for falls back to the configured backend (spawn_worker logs the
-        // fallback), so the origin is `agent.backend` there rather than a `profile` claim the run did
-        // not honour.
-        let actual_harness = self.harness_actually_run(&re.harness);
-        re.harness_origin =
-            if !re.harness.is_empty() && crate::effective::harness_is_implemented(&re.harness) {
-                "profile".to_string()
-            } else {
-                "agent.backend".to_string()
-            };
+        // The harness origin names the key that supplied the harness: a profile that names one
+        // supplies it whether or not this build can run it (STUDIO-978). There is no fall back any
+        // more — an unimplemented name is REFUSED, and its run row records the name the profile gave
+        // rather than `agent.backend`, which would describe a harness that was never chosen on a run
+        // that never happened. Only an EMPTY name — a dispatch routed to a profile that names none —
+        // resolves to the configured backend.
+        let actual_harness = self.effective_harness(&re.harness);
+        re.harness_origin = if re.harness.is_empty() {
+            "agent.backend".to_string()
+        } else {
+            "profile".to_string()
+        };
         re.model_origin = if review_model_overrode {
             // The legacy bare-scalar spelling is `review.model`; the per-harness map spelling names
             // the harness. `HarnessScoped::legacy` is the one reader that tells them apart, so the
@@ -825,6 +834,39 @@ impl Orchestrator {
         if let Some(run) = re.review.as_ref() {
             self.on_review_exit(&re, run, &e);
             self.rearm_tick_for_held_capacity();
+            return;
+        }
+        // A TYPED CAPABILITY REFUSAL is terminal and NOT retryable (STUDIO-978). The failure branch
+        // below would schedule exponential backoff forever: a profile's harness name and the
+        // adapter's declared capabilities do not change between attempts, so every retry re-refuses
+        // and writes another `failed` row for as long as the ticket stays active. Record the failure
+        // ONCE and schedule nothing.
+        //
+        // The claim is held IN MEMORY ONLY, exactly as a per-run token-ceiling stop is
+        // (`agentupdate::enforce_run_token_ceiling`): `persist_complete` drops the durable claim row
+        // — there is no retry to rewrite it as `retry_queued`, and leaving it would greet boot
+        // recovery as a live claim — while the in-memory claim keeps the ordinary selection pass
+        // from re-dispatching the same ticket on the very next tick. A restart's ordinary selection
+        // re-offers it once the operator has fixed the profile's harness.
+        if e.refused {
+            self.completed.remove(&e.issue_id);
+            let reason = if e.err_msg.is_empty() {
+                "capability refused".to_string()
+            } else {
+                e.err_msg.clone()
+            };
+            tracing::warn!(
+                run_id = re.run_id,
+                issue_id = %e.issue_id,
+                issue_identifier = %re.issue.identifier,
+                reason = %reason,
+                "dispatch refused: the resolved harness cannot honor this run; recording failed \
+                 once and scheduling no retry (fix the profile and restart to re-offer it)"
+            );
+            self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            self.claimed.insert(e.issue_id.clone());
             return;
         }
         if !e.failed {
@@ -1533,6 +1575,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Review".into(),
             declared_handoff: false,
+            refused: false,
         });
 
         assert!(
@@ -1716,6 +1759,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: state.into(),
                 declared_handoff: false,
+                refused: false,
             });
             let runs = store_handle
                 .list_runs(rhapsody_store::RunFilter {
@@ -1824,6 +1868,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
         assert!(
             !o.running.contains_key("1"),
@@ -1857,6 +1902,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
         assert_eq!(
             o.retry_attempts.get("1").expect("backoff retry").identity,
@@ -1878,6 +1924,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
         assert_eq!(
             o.retry_attempts.get("1").expect("backoff retry").identity,
@@ -1898,9 +1945,65 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: false,
+            refused: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
         assert_eq!(re.attempt, 3);
+    }
+
+    /// STUDIO-978: a TYPED CAPABILITY REFUSAL must NOT enter the failure-backoff loop. A refusal can
+    /// never succeed on retry — the profile's harness name and the adapter's declared capabilities do
+    /// not change between attempts — so the exit records the run `failed` ONCE, drops the durable
+    /// claim row, and schedules nothing. The in-memory claim is HELD (as a token-ceiling stop holds
+    /// one) so the very next selection pass does not re-dispatch the same ticket; a restart re-offers
+    /// it once the operator fixes the profile. Before this branch existed the refusal went out as an
+    /// ordinary failed exit, so a profile naming `codex` wrote a new `failed` run row every
+    /// `max_retry_backoff_ms` for as long as the ticket stayed active.
+    ///
+    /// MUTATION GUARD: fold the refusal into the ordinary failure branch (or drop the `refused`
+    /// flag) and `retry_attempts` is populated, so the first assertion reds.
+    #[test]
+    fn a_capability_refusal_records_failed_once_and_schedules_no_retry() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store_handle));
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "capability refused: harness \"codex\" is not implemented by this build"
+                .into(),
+            last_state: "Todo".into(),
+            declared_handoff: false,
+            refused: true,
+        });
+
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "a refusal is terminal and must schedule no retry"
+        );
+        assert!(
+            o.claimed.contains("1"),
+            "the ticket stays claimed in memory so the next tick does not re-dispatch it"
+        );
+        assert!(!o.running.contains_key("1"), "the run entry is gone");
+        let runs = store_handle
+            .list_runs(rhapsody_store::RunFilter {
+                issue: "MT-1".to_string(),
+                ..Default::default()
+            })
+            .expect("list runs");
+        assert_eq!(runs.len(), 1, "the refusal records exactly one run row");
+        assert_eq!(runs[0].outcome, store::OUTCOME_FAILED);
+        assert_eq!(
+            runs[0].error,
+            "capability refused: harness \"codex\" is not implemented by this build"
+        );
     }
 
     // Mirrors Go `TestOnWorkerExitUnknownIsNoop`.
@@ -1914,6 +2017,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: false,
+            refused: false,
         });
         assert!(
             o.retry_attempts.is_empty(),
@@ -1970,6 +2074,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "Done".into(),
             declared_handoff: true,
+            refused: false,
         });
 
         assert!(
@@ -1999,6 +2104,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: true,
+            refused: false,
         });
 
         assert!(
@@ -2025,6 +2131,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "Done".into(),
             declared_handoff: true,
+            refused: false,
         });
 
         assert!(
@@ -2056,6 +2163,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
 
         assert!(
@@ -2085,6 +2193,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
 
         assert!(

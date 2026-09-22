@@ -59,7 +59,7 @@ use crate::retry::{DispatchRoute, EvRetry, EvWorkerExit};
 use crate::select::TaggedIssue;
 use crate::snapshot::{RefreshResult, Snapshot};
 use crate::stop::{ControlHandle, ResumePlan, StopPlan};
-use crate::worker::{WorkerDeps, run_agent_attempt};
+use crate::worker::{WorkerDeps, WorkerError, run_agent_attempt};
 use crate::workspace_gc::WorkspaceGcPlan;
 
 /// A set-once cancellation trigger — the Rust stand-in for a cancelable `context.Context`'s
@@ -510,6 +510,12 @@ fn worker_deps_for(
         // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
         // can be restarted, and there is no restart of one project.
         drain: drain.clone(),
+        // MCP injection is a daemon-wide config knob (`cfg.mcp.enabled`), read once per dispatch so
+        // the worker can require the daemon's tools of the selected harness (STUDIO-978).
+        mcp_enabled: eff.cfg.mcp.enabled,
+        // Per-dispatch: `spawn_worker` stamps a refusal when the routed profile names an
+        // unimplemented harness; every other dispatch leaves `None`.
+        harness_refusal: None,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1549,23 +1555,31 @@ impl Orchestrator {
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
         //
-        // An unrecognized name FALLS BACK to the configured backend with a warning rather than
-        // refusing the run: one mistyped profile field would otherwise strand every ticket routed
-        // to that teammate, and the run itself is still perfectly runnable on the default harness.
-        // Validating the name at config-load time is slice 4's resolution chain, which is where a
-        // typo can be reported once instead of per dispatch.
+        // An unrecognized name is a TYPED REFUSAL, never a fall back (STUDIO-978; design §5's
+        // "known-but-unimplemented and unknown harnesses remain typed refusals; never fall back to
+        // `agent.backend`"). STUDIO-902 warned and dispatched on the configured backend, which
+        // silently ran work on a harness the operator did not choose — and could not reach the
+        // harness's provider, model or security posture. The refusal is decided HERE, before the
+        // worker task is spawned, and the worker turns it into the run's recorded failure without
+        // ever starting a session.
         if !harness.is_empty() {
             let pool = eff
                 .project_by_slug(&project_slug)
                 .map_or(&eff.agents, |rp| &rp.agents);
             match pool.get(&harness) {
                 Some(runner) => deps.agent = Arc::clone(runner),
-                None => tracing::warn!(
-                    issue = %iss.identifier,
-                    harness = %harness,
-                    "teammate profile names a harness this build has no runner for; \
-                     dispatching on the configured backend instead"
-                ),
+                None => {
+                    tracing::warn!(
+                        issue = %iss.identifier,
+                        harness = %harness,
+                        "teammate profile names a harness this build has no runner for; \
+                         refusing the dispatch rather than falling back"
+                    );
+                    deps.harness_refusal =
+                        Some(rhapsody_agent::CapabilityRefusal::HarnessNotImplemented {
+                            name: harness.clone(),
+                        });
+                }
             }
         }
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
@@ -1613,6 +1627,10 @@ impl Orchestrator {
                 res = run => res,
                 _ = cancel.cancelled() => (iss.state.clone(), false, None),
             };
+            // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
+            // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
+            // succeed, and the failure backoff would loop forever.
+            let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
             let exit = EvWorkerExit {
                 issue_id,
                 failed: err.is_some(),
@@ -1620,6 +1638,7 @@ impl Orchestrator {
                 err_msg: err.map(|e| e.to_string()).unwrap_or_default(),
                 last_state: final_state,
                 declared_handoff: declared,
+                refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
@@ -1906,6 +1925,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: String::new(),
                 declared_handoff: false,
+                refused: false,
             }));
         }));
         (o, spawned)

@@ -1901,6 +1901,7 @@ mod tests {
             states: states(),
             facts: Vec::new(),
             summon_token: String::new(),
+            ..Default::default()
         });
         let got = o.control().issue_lifecycles(&ids).await;
         assert_eq!(got["a"].lifecycle, IssueLifecycle::Done);

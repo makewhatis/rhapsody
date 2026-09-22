@@ -22,6 +22,7 @@ use rhapsody_tracker::{Tracker, TrackerError};
 
 use crate::dispatch::DispatchStates;
 use crate::orchestrator::Orchestrator;
+use crate::quorum::ReviewerExclusions;
 use crate::stop::ControlHandle;
 
 /// The error surface of the read-only Linear endpoints. [`ReadsError::ConfigNotLoaded`] is the
@@ -94,6 +95,12 @@ pub struct TriageSnapshot {
     /// The configured summon token (e.g. `@symphony`), so host-composed reviewer instructions name
     /// the token THIS installation re-engages on rather than a hard-coded guess.
     pub summon_token: String,
+    /// The roster identities a review dispatch would be REFUSED for (STUDIO-978), resolved on the
+    /// control task from the same reload as the rest of the snapshot. Published here so the
+    /// off-loop manager room reader ([`crate::teamsears::file_review`]) can drop an impossible
+    /// reviewer — the live harness question it cannot ask for itself — instead of filing a review
+    /// ticket that `spawn_worker` then refuses, leaving the parent "under review" forever.
+    pub reviewer_exclusions: ReviewerExclusions,
 }
 
 /// The account-level tracker + resolved key backing the read-only Linear surfaces, guarded by
@@ -125,6 +132,10 @@ pub struct ReadsTarget {
     pub project_facts: Vec<ProjectFacts>,
     /// The configured summon token, published with the rest of the reload for the same reason.
     pub summon_token: String,
+    /// The roster identities a review dispatch would be refused for, resolved on the control task
+    /// (STUDIO-978). Written with the rest of [`Self`] under one lock so the off-loop manager room
+    /// reader never sees exclusions from one reload beside trackers from another.
+    pub reviewer_exclusions: ReviewerExclusions,
 }
 
 /// The resolved "connected as" account for the Settings identity endpoint (INF-224). `masked_token`
@@ -178,6 +189,7 @@ impl Orchestrator {
         w.states = snapshot.states;
         w.project_facts = snapshot.facts;
         w.summon_token = snapshot.summon_token;
+        w.reviewer_exclusions = snapshot.reviewer_exclusions;
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -290,6 +302,7 @@ impl ControlHandle {
             states: r.states.clone(),
             facts: r.project_facts.clone(),
             summon_token: r.summon_token.clone(),
+            reviewer_exclusions: r.reviewer_exclusions.clone(),
         })
     }
 }

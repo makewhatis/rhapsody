@@ -518,6 +518,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
 
         let msgs = st.list_run_messages(run_id).expect("list");
