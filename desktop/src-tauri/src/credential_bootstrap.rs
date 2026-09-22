@@ -79,11 +79,19 @@ impl BootstrapListener {
     }
 
     /// Accepts connections and serves `read_bound` requests against `owner` until `owner`'s
-    /// underlying process/task is dropped or the listener errors. Only one connection is served at a
-    /// time (the daemon holds exactly one). A connection that never completes its `Hello` handshake
-    /// within [`HELLO_TIMEOUT`] is dropped so it cannot hold this slot against a later connection —
-    /// including the real daemon reconnecting after its own restart — forever.
+    /// underlying process/task is dropped or the listener errors. Each accepted connection's
+    /// pre-`Hello` phase runs in its own task, bounded by [`HELLO_TIMEOUT`] independently of every
+    /// other connection — so any number of same-user processes that connect and never send `Hello`
+    /// cannot serialize-starve a later, legitimate connection's own `Hello` read behind
+    /// `HELLO_TIMEOUT` multiplied by however many came before it (jimmy's review of rhapsody#213,
+    /// B3: five silent connections cost the real daemon `5 × HELLO_TIMEOUT` before its own `Hello`
+    /// was even read, exceeding the daemon-side `RESPONSE_TIMEOUT`). Only an AUTHENTICATED
+    /// connection ever contends for `serving_slot`, the single slot that actually answers
+    /// `read_bound` requests — matching "only one connection is served at a time (the daemon holds
+    /// exactly one)"; a second authenticated connection (e.g. the daemon reconnecting after its own
+    /// restart) waits for the first's connection to end.
     pub async fn accept_and_serve(self, owner: Arc<ProviderCredentialOwner>) {
+        let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
         loop {
             let (stream, _addr) = match self.listener.accept().await {
                 Ok(pair) => pair,
@@ -91,23 +99,28 @@ impl BootstrapListener {
             };
             let owner = owner.clone();
             let token = self.token.clone();
-            // Deliberately awaited in this same loop (not `tokio::spawn`ed per-connection): exactly
-            // one credential-bearing connection is ever meant to be active, so a second accept only
-            // proceeds once the previous connection has ended (e.g. the daemon reconnecting after
-            // its own restart), never two live connections racing the same owner concurrently.
-            serve_one(stream, token, owner).await;
+            let serving_slot = serving_slot.clone();
+            tokio::spawn(async move {
+                serve_one(stream, token, owner, serving_slot).await;
+            });
         }
     }
 }
 
-async fn serve_one(mut stream: UnixStream, token: String, owner: Arc<ProviderCredentialOwner>) {
+async fn serve_one(
+    mut stream: UnixStream,
+    token: String,
+    owner: Arc<ProviderCredentialOwner>,
+    serving_slot: Arc<tokio::sync::Semaphore>,
+) {
     let mut session = ServerSession::new(Token::new(token));
 
     let hello: HelloFrame = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut stream)).await
     {
         Ok(Ok(h)) => h,
         // A timed-out or errored/EOF'd Hello read are the same outcome here: give up on this
-        // connection and let `accept_and_serve` move on to the next one rather than blocking it.
+        // connection — its own task simply ends, never blocking any other connection's Hello phase
+        // or the single serving slot.
         Ok(Err(_)) | Err(_) => return,
     };
     // An unauthorized connection gets no response at all — closing the stream, not answering with
@@ -115,6 +128,13 @@ async fn serve_one(mut stream: UnixStream, token: String, owner: Arc<ProviderCre
     if session.accept_hello(&hello.token).is_err() {
         return;
     }
+
+    // Only an authenticated connection reaches here, and only one at a time ever serves
+    // `read_bound` requests. `acquire` only errors if the semaphore itself was closed, which never
+    // happens here.
+    let Ok(_permit) = serving_slot.acquire().await else {
+        return;
+    };
 
     loop {
         let frame: ClientFrame = match read_frame(&mut stream).await {
@@ -362,6 +382,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // jimmy's review of rhapsody#213 (B3): a single silent connection being bounded by
+    // `HELLO_TIMEOUT` is not enough if connections are still handled one at a time — N silent
+    // connections queued ahead of the real daemon's own connection would then cost it
+    // `N * HELLO_TIMEOUT` before its `Hello` is even read, which can exceed the daemon-side
+    // `RESPONSE_TIMEOUT` for a large enough N. Five silent connections (jimmy's own reproduction
+    // count), all opened and held open BEFORE the legitimate one connects, must not delay the
+    // legitimate client's `read_bound` past the real client's own `RESPONSE_TIMEOUT`-equivalent
+    // wait — proving each connection's pre-`Hello` phase is handled independently, not serially.
+    #[tokio::test]
+    async fn five_silent_connections_cannot_starve_a_later_legitimate_client() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+        let owner = owner_with_secret();
+        let serve = tokio::spawn(listener.accept_and_serve(owner));
+
+        let mut silent = Vec::new();
+        for _ in 0..5 {
+            silent.push(
+                UnixStream::connect(&msg.socket_path)
+                    .await
+                    .expect("connect silent"),
+            );
+        }
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect legit");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+        let read = client
+            .read_bound(
+                "v1:spike-test-provider".into(),
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+            )
+            .await
+            .expect(
+                "a legitimate client must be served promptly regardless of how many silent \
+                 connections were opened ahead of it",
+            );
+        assert_eq!(read.state.tag(), CredentialStateTag::Present);
+
+        drop(silent);
+        drop(client);
+        serve.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // A minimal client double built directly on the wire/session primitives (rather than importing
     // the daemon crate, which this crate does not and should not depend on) — exercises the exact
     // same `ClientSession`/framing the real `rhapsodyd` client uses.
@@ -401,11 +472,12 @@ mod tests {
             )
             .await
             .map_err(|_| ())?;
-            // Comfortably above `HELLO_TIMEOUT` so a test that first parks a silent connection (to
-            // prove it cannot wedge a later legitimate one) never races its own client-side wait
-            // against the server-side timeout that frees the slot this client needs.
+            // Mirrors the real daemon client's own `RESPONSE_TIMEOUT` (`crates/rhapsodyd/src/
+            // credential_client.rs`) rather than using a more generous value — a test double whose
+            // wait is longer than the real client's would let a fix pass here while the real client
+            // still gave up too soon against the exact same server.
             let frame: ServerFrame = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(2),
                 read_frame(&mut self.stream),
             )
             .await
