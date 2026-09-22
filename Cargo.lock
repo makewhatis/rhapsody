@@ -1712,6 +1712,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhapsody-provider-broker"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.2.17",
+ "serde",
+ "sha2 0.10.9",
+ "static_assertions",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "rhapsody-store"
 version = "0.1.0"
 dependencies = [
