@@ -335,10 +335,26 @@ impl CapabilityGrant {
                 biased;
                 _ = &mut turn => {}
                 _ = &mut session => {}
-                _ = shutdown.changed() => {}
+                changed = shutdown.changed() => {
+                    // A *closed* channel means the listener exited without broadcasting (an
+                    // `accept()` error, an aborted serving task): treat it as shutdown rather than
+                    // re-looping on an immediately-ready `changed()` and never cancelling
+                    // (design §7.2).
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
                 _ = tokio::time::sleep(remaining) => {}
             }
         }
+    }
+
+    /// Revoke this grant immediately: it is removed from the registry, so no further request can
+    /// authenticate against it, and any in-flight request waiting in [`CapabilityGrant::wait_cancelled`]
+    /// wakes. Called by the adapter when the authenticated-denial threshold is reached (design §8.2);
+    /// the turn's owner still finalizes the receipt when the access/attempt drops.
+    pub(crate) fn revoke(&self) {
+        self.inner.revoke_grant();
     }
 
     /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that

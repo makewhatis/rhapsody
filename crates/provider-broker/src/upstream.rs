@@ -165,18 +165,31 @@ impl NormalizedEndpoint {
             format!("{scheme}://{authority}{trimmed}")
         };
 
-        // Round-trip: the hand-rolled authority/path split must agree with the URL library, or an
-        // encoded form (a backslash or control byte in the authority) would silently move the
-        // destination (design §6.1).
+        // Round-trip: the hand-rolled authority/path split must describe the same destination the
+        // URL library will actually use, or an encoded form (a backslash or control byte in the
+        // authority) would silently move the request (design §6.1). Compare the *normalized*
+        // destination — `Host::parse` normalizes case/IPv6/IDNA, and the path is compared through
+        // the URL library's own encoding — so normalization-equivalent forms are accepted while a
+        // form whose authority/path actually changes is refused.
         let parsed = url::Url::parse(&canonical).map_err(|_| EndpointError::InvalidUrl)?;
-        let expected_path = if trimmed.is_empty() { "/" } else { trimmed };
+        let parsed_host = parsed.host().ok_or(EndpointError::RoundTripRefused)?;
+        // `Host::parse` expects an IPv6 literal to be bracketed.
+        let host_for_parse = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let our_host =
+            url::Host::parse(&host_for_parse).map_err(|_| EndpointError::RoundTripRefused)?;
+        let host_matches = our_host == parsed_host;
         let default_port = if scheme == "https" { 443 } else { 80 };
         let effective_port = port.unwrap_or(default_port);
-        let host_matches = parsed
-            .host_str()
-            .is_some_and(|parsed_host| trim_ipv6_brackets(parsed_host).eq_ignore_ascii_case(&host));
         let port_matches = parsed.port_or_known_default() == Some(effective_port);
-        if !host_matches || !port_matches || parsed.path() != expected_path {
+        let expected_path = if trimmed.is_empty() { "/" } else { trimmed };
+        let path_probe = url::Url::parse(&format!("https://example.invalid{expected_path}"))
+            .map_err(|_| EndpointError::InvalidUrl)?;
+        let path_matches = path_probe.path() == parsed.path();
+        if !(host_matches && port_matches && path_matches) {
             return Err(EndpointError::RoundTripRefused);
         }
 
@@ -206,13 +219,6 @@ impl NormalizedEndpoint {
     pub fn is_insecure_http(&self) -> bool {
         self.insecure_http
     }
-}
-
-/// Strip the brackets `Url::host_str` may include around an IPv6 literal.
-fn trim_ipv6_brackets(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host)
 }
 
 /// Split an authority into its host (IPv6 brackets removed) and an optional `u16` port.
@@ -295,6 +301,14 @@ impl UpstreamClient {
             .no_proxy()
             // HTTP/1 only for v1; keeps the response parsing surface closed.
             .http1_only()
+            // Decompression is explicitly disabled rather than left to feature unification: if any
+            // crate in the daemon build later enables reqwest's `gzip`/`brotli`/`deflate`/`zstd`,
+            // transparent decoding would hide the encoding from `has_non_identity_encoding` and
+            // silently break §6.2's identity-only rule. These builders exist regardless of features.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             // Platform trust roots with hostname validation; never disable verification.
             .https_only(false)
             .tls_built_in_root_certs(true)
@@ -514,6 +528,24 @@ mod tests {
             ipv6.chat_completions_url(),
             "https://[::1]:9000/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn round_trip_accepts_normalization_equivalent_endpoints() {
+        // An expanded IPv6 literal normalizes to the same address the URL library uses.
+        let expanded =
+            NormalizedEndpoint::parse("https://[0:0:0:0:0:0:0:1]/v1", false).expect("expanded ipv6");
+        assert_eq!(
+            expanded.chat_completions_url(),
+            "https://[0:0:0:0:0:0:0:1]/v1/chat/completions"
+        );
+        // An IDNA/Unicode host normalizes to the same punycode destination.
+        let idna = NormalizedEndpoint::parse("https://bücher.example/v1", false).expect("idna host");
+        assert_eq!(idna.canonical(), "https://bücher.example/v1");
+        // A raw Unicode path is encoded identically on both sides of the comparison.
+        let unicode_path =
+            NormalizedEndpoint::parse("https://api.example.com/v1/ünïcode", false).expect("path");
+        assert!(unicode_path.chat_completions_url().contains("/v1/ünïcode/chat/completions"));
     }
 
     #[test]

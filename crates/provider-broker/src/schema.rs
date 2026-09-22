@@ -527,13 +527,25 @@ impl Parser<'_> {
     }
 }
 
-/// Whether a JSON number literal survives a `serde_json` parse/serialize round-trip unchanged, so
-/// the re-serialized outbound body is exactly the validated value.
+/// Whether a JSON number literal survives a `serde_json` parse/serialize round-trip without changing
+/// its *value*, so the re-serialized outbound body is the validated value (design §5.3.9).
+///
+/// The check is on value preservation, not lexical identity: `1e0`, `1E+2`, `0.50` and `-0` are
+/// ordinary spellings that `serde_json` keeps numerically. An integer literal must fit `i64`/`u64`
+/// (a wider integer would re-serialize as a lossy float), and a fractional/exponent literal must
+/// parse to a finite `f64` (a value like `1e400` would otherwise become `null`).
 fn number_round_trips(text: &str) -> bool {
-    match text.parse::<serde_json::Number>() {
-        Ok(number) => number.to_string() == text,
-        Err(_) => false,
+    let integer_lexeme = !text.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'));
+    if integer_lexeme {
+        // An integer must fit a signed or unsigned 64-bit integer exactly.
+        return text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok();
     }
+    // A fractional/exponent form must parse to a finite `f64` (`1e400` would otherwise become
+    // `null` on re-serialization).
+    text.parse::<serde_json::Number>()
+        .ok()
+        .and_then(|number| number.as_f64())
+        .is_some_and(f64::is_finite)
 }
 
 fn utf8_width(lead: u8) -> usize {
@@ -922,8 +934,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_scalars_and_nesting() {
-        assert_eq!(parse("null"), Json::Null);
+    fn number_guards_preserve_value_not_lexical_spelling() {
+        // Ordinary spellings of representable values are accepted...
+        for text in ["1e0", "1E+2", "-0", "0.000001", "0.50", "1e3", "32000"] {
+            assert!(number_round_trips(text), "{text} is representable");
+        }
+        // ...but an integer too wide for i64/u64, or a float that overflows f64, is refused.
+        for text in [
+            "123456789012345678901234567890",
+            "1e400",
+            "-1e400",
+        ] {
+            assert!(!number_round_trips(text), "{text} is not representable");
+        }
+    }
+
+    #[test]
+    fn parses_scalars_and_nesting() {        assert_eq!(parse("null"), Json::Null);
         assert_eq!(parse("true"), Json::Bool(true));
         assert_eq!(parse("[]"), Json::Array(vec![]));
         assert_eq!(parse("{}"), Json::Object(vec![]));

@@ -10,6 +10,7 @@
 //! (base64, URL-encoding, split across events); that residual risk is explicit in the design.
 
 use crate::secret::ZeroizingBytes;
+use crate::upstream::contains_secret;
 
 /// The fixed marker substituted for the exact upstream credential.
 pub const REDACTION_MARKER: &[u8] = b"[redacted-provider-key]";
@@ -20,6 +21,11 @@ pub const REDACTION_MARKER: &[u8] = b"[redacted-provider-key]";
 /// suffix that could still become the secret is held until more bytes arrive (or the stream ends).
 pub struct StreamingRedactor {
     secret: ZeroizingBytes,
+    /// The bytes substituted for each exact secret match. The fixed marker normally, but an empty
+    /// replacement when the marker itself contains the secret (a valid credential such as
+    /// `provider` occurs verbatim inside `[redacted-provider-key]`), so the emitted output can never
+    /// contain the exact credential.
+    replacement: Vec<u8>,
     /// Bytes held back because they might be the beginning of the secret.
     pending: Vec<u8>,
     finished: bool,
@@ -29,8 +35,16 @@ impl StreamingRedactor {
     /// Build a redactor for `secret`. An empty secret (never produced by credential validation)
     /// degrades to a pass-through.
     pub fn new(secret: ZeroizingBytes) -> Self {
+        // `contains_secret` is the same exact-byte check used for response headers: if the marker
+        // would itself contain the secret, remove the match instead of emitting a leaking marker.
+        let replacement = if contains_secret(REDACTION_MARKER, secret.as_slice()) {
+            Vec::new()
+        } else {
+            REDACTION_MARKER.to_vec()
+        };
         Self {
             secret,
+            replacement,
             pending: Vec::new(),
             finished: false,
         }
@@ -68,7 +82,7 @@ impl StreamingRedactor {
         let mut out = Vec::new();
         {
             let secret = self.secret.as_slice();
-            scan(&self.pending, secret, REDACTION_MARKER, true, &mut out);
+            scan(&self.pending, secret, &self.replacement, true, &mut out);
         }
         self.pending.clear();
         out
@@ -83,7 +97,7 @@ impl StreamingRedactor {
         let mut out = Vec::new();
         let retained_from = {
             let secret = self.secret.as_slice();
-            scan(&self.pending, secret, REDACTION_MARKER, false, &mut out)
+            scan(&self.pending, secret, &self.replacement, false, &mut out)
         };
         // Keep only the not-yet-decidable tail.
         let tail = self.pending.split_off(retained_from);
@@ -183,5 +197,26 @@ mod tests {
             .expect("push");
         assert_eq!(out.len(), "a very long ordinary sentence".len());
         assert_eq!(redactor.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_replacement_that_contains_the_secret_never_emits_the_secret() {
+        // `provider` occurs verbatim inside `[redacted-provider-key]`; emitting that marker would
+        // leak a valid credential, so the match is removed instead.
+        for secret in [&b"provider"[..], b"key", b"redacted-provider-key", b"a"] {
+            let body = [b"before ", secret, b" after"].concat();
+            let out = redact_all(secret, &[&body]);
+            assert!(
+                !out.windows(secret.len()).any(|window| window == secret),
+                "secret {secret:?} leaked through the replacement: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_secret_split_across_chunks_is_still_removed() {
+        let out = redact_all(b"prov", &[b"xpro", b"videry"]);
+        assert!(!out.windows(4).any(|window| window == b"prov"));
     }
 }

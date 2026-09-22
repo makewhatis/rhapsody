@@ -27,7 +27,8 @@ use futures_util::StreamExt;
 use futures_util::stream::{Stream, unfold};
 use http::header::{
     ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, CONNECTION,
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, TE, UPGRADE,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, TE, TRAILER, TRANSFER_ENCODING,
+    UPGRADE,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use http_body_util::BodyExt;
@@ -40,9 +41,10 @@ use tower::Service;
 
 use crate::broker::Broker;
 use crate::budget::{
-    BUFFERED_RESPONSE_BUDGET, REQUEST_MEMORY_BUDGET, WeightedBudget, buffered_response_weight,
-    request_weight,
+    BUFFERED_RESPONSE_BUDGET, REQUEST_MEMORY_BUDGET, WeightedBudget, WeightedGuard,
+    buffered_response_weight, request_weight,
 };
+use crate::error::BrokerError;
 use crate::redact::StreamingRedactor;
 use crate::refusal::{PolicyRefusal, refusal_response};
 use crate::reservations::ConcurrencyPermit;
@@ -191,6 +193,10 @@ impl BrokerListener {
             shutdown_tx,
             ..
         } = self;
+        // A closed shutdown channel must mean "shutdown" even when the loop exits through an early
+        // `?` (an `accept()` error) or the serving task is aborted, so broadcasting is tied to the
+        // guard's `Drop` rather than to the normal `break` path (design §7.2).
+        let _broadcast = ShutdownBroadcast(shutdown_tx);
         tokio::pin!(shutdown);
         loop {
             let permit = tokio::select! {
@@ -209,10 +215,18 @@ impl BrokerListener {
                 serve_connection(stream, router).await;
             });
         }
-        // Cancel every in-flight connection handler: a detached streaming response must not survive
-        // daemon shutdown (design §7.2).
-        let _ = shutdown_tx.send(true);
         Ok(())
+    }
+}
+
+/// Broadcasts the shutdown signal when dropped, so every exit path from
+/// [`BrokerListener::run_with_shutdown`] (normal break, an error return, or an aborted serving task)
+/// cancels the detached in-flight connection handlers (design §7.2).
+struct ShutdownBroadcast(watch::Sender<bool>);
+
+impl Drop for ShutdownBroadcast {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
     }
 }
 
@@ -291,7 +305,21 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     if parts.uri.query().is_some() {
         return refusal_response(PolicyRefusal::InvalidRequest);
     }
-    if parts.headers.contains_key(UPGRADE) || parts.headers.contains_key(TE) {
+    // Upgrades, hop-by-hop `TE`, and request trailers are all refused before the body is read
+    // (design §5.1): a declared `Trailer:` frame would otherwise let a trailer section reach the
+    // schema, and a hop-by-hop upgrade changes the connection's framing.
+    if parts.headers.contains_key(UPGRADE)
+        || parts.headers.contains_key(TE)
+        || parts.headers.contains_key(TRAILER)
+    {
+        return refusal_response(PolicyRefusal::InvalidRequest);
+    }
+    // `Transfer-Encoding` combined with `Content-Length` is a request-smuggling signal (RFC 9112
+    // §6.1): hyper keeps a `Content-Length` that precedes `Transfer-Encoding: chunked` in the
+    // header map while decoding the body as chunked, so the header would no longer describe the
+    // body and a chunked read could be charged as a tiny fixed-length one (design §5.1/§5.2). The
+    // combination is refused rather than trusted, before the body is read.
+    if parts.headers.contains_key(TRANSFER_ENCODING) && parts.headers.contains_key(CONTENT_LENGTH) {
         return refusal_response(PolicyRefusal::InvalidRequest);
     }
     // The exact expected Host emitted by the generated 127.0.0.1 base URL.
@@ -387,6 +415,22 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         return deny(&grant, PolicyRefusal::RequestTooLarge);
     }
 
+    // A non-streaming response buffers its whole body, so its broker-wide weighted budget is
+    // reserved *before* the request goes out: an exhausted budget must not bill provider work or
+    // consume a forwarded slot (design §7.1). A streaming response uses only the bounded working
+    // buffer instead.
+    let buffered_budget = if request.stream {
+        None
+    } else {
+        let Some(weight) = buffered_response_weight(grant.limits().max_response_bytes) else {
+            return deny(&grant, PolicyRefusal::BudgetExhausted);
+        };
+        match state.response_budget.try_acquire(weight) {
+            Some(guard) => Some(guard),
+            None => return deny(&grant, PolicyRefusal::BudgetExhausted),
+        }
+    };
+
     // Outbound admission: consume the forwarded-request slot immediately before construction.
     if grant
         .reserve_request(
@@ -435,12 +479,12 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     };
 
     forward_response(
-        &state,
         grant,
         request.stream,
         upstream,
         secret,
         permit,
+        buffered_budget,
         shutdown,
     )
     .await
@@ -459,12 +503,12 @@ fn cancelled_response(grant: &CapabilityGrant) -> Response {
 /// Build the downstream response from a received upstream response: fresh headers, media-type
 /// validation, and a bounded/redacted body (streamed for a successful SSE turn, buffered otherwise).
 async fn forward_response(
-    state: &BrokerState,
     grant: CapabilityGrant,
     streaming: bool,
     upstream: crate::upstream::UpstreamResponse,
     secret: ZeroizingBytes,
     permit: ConcurrencyPermit,
+    buffered_budget: Option<WeightedGuard>,
     shutdown: watch::Receiver<bool>,
 ) -> Response {
     if upstream.has_non_identity_encoding() {
@@ -507,22 +551,23 @@ async fn forward_response(
             shutdown,
         ))
     } else {
-        // The permit is held across buffering, redaction and usage parsing.
+        // The permit is held across buffering, redaction and usage parsing; the broker-wide weighted
+        // budget was reserved at admission, before egress.
         let _permit = permit;
-        // Buffered non-streaming response: reserve the broker-wide weighted budget.
-        let Some(weight) = buffered_response_weight(max_response_bytes) else {
-            return refusal_response(PolicyRefusal::BudgetExhausted);
-        };
-        let Some(_reserved) = state.response_budget.try_acquire(weight) else {
-            return refusal_response(PolicyRefusal::BudgetExhausted);
-        };
+        let _budget = buffered_budget;
         let stream = upstream.into_byte_stream();
+        let require_json = status.is_success();
         let buffered = {
             let mut shutdown = shutdown;
             tokio::select! {
                 biased;
                 _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
-                result = buffer_body(stream, StreamingRedactor::new(secret), max_response_bytes) => result,
+                result = buffer_body(
+                    stream,
+                    StreamingRedactor::new(secret),
+                    max_response_bytes,
+                    require_json,
+                ) => result,
             }
         };
         match buffered {
@@ -650,11 +695,14 @@ where
 /// Buffer a non-streaming body under the response byte ceiling, redacting and observing it.
 ///
 /// A non-streaming response is a JSON document: its top-level `usage` object is read directly
-/// (design §7.3), not by scanning it for SSE `data:` lines.
+/// (design §7.3), not by scanning it for SSE `data:` lines. A *successful* non-streaming response
+/// must be valid JSON; `require_json` is set only for success statuses, since a bounded error body
+/// may legitimately be JSON or plain text (design §6.3).
 async fn buffer_body<S>(
     stream: S,
     mut redactor: StreamingRedactor,
     max_bytes: u64,
+    require_json: bool,
 ) -> Result<Bytes, PolicyRefusal>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
@@ -682,6 +730,11 @@ where
         out.extend_from_slice(&tail);
     }
     if out.len() as u64 > max_bytes {
+        return Err(PolicyRefusal::UpstreamProtocol);
+    }
+    // A successful non-streaming body that is not a JSON document is a protocol violation, not a
+    // 200 to pass through to the child (design §6.3, §7.1).
+    if require_json && serde_json::from_slice::<serde_json::Value>(&out).is_err() {
         return Err(PolicyRefusal::UpstreamProtocol);
     }
     observer.observe_json(&out);
@@ -796,12 +849,16 @@ async fn read_body_frames(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyR
     Ok(buffer)
 }
 
-/// Map a schema rejection to its pinned policy refusal.
 /// Refuse an authenticated request and count the local denial against the turn's bounded abuse
-/// counter (design §5.2, §8.2). Reaching the configured threshold is counted and refused here; the
-/// turn's owner (the worker retaining the receipt) performs the revocation.
+/// counter (design §5.2, §8.2). The denial that *reaches* the configured threshold revokes the turn
+/// token here, so a subsequent request cannot authenticate at all.
 fn deny(grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
-    let _ = grant.record_denied();
+    if matches!(
+        grant.record_denied(),
+        Err(BrokerError::TurnBudgetExhausted("max_denied_requests"))
+    ) {
+        grant.revoke();
+    }
     refusal_response(refusal)
 }
 

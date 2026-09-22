@@ -439,7 +439,7 @@ impl TurnInner {
     /// one method means neither can be hoisted above the lock: a mint that has inserted its grant
     /// but holds the lock is still publishing, and a revocation that read the digest before taking
     /// the lock could miss it and strand the grant.
-    fn revoke_grant(&self) {
+    pub(crate) fn revoke_grant(&self) {
         lock(&self.session.broker.registry).revoke_grant(self);
     }
 

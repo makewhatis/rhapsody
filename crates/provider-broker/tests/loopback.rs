@@ -1069,10 +1069,9 @@ async fn a_client_disconnect_releases_the_concurrency_permit() {
     };
     let harness = Harness::with(response, limits, true).await;
     let capability = harness.capability.clone();
-    let resp = harness
+    let mut resp = harness
         .post(Some(&capability), &[], &chat_body(MODEL, true))
         .await;
-    let mut resp = resp;
     let first = resp.chunk().await.expect("first").expect("first ok");
     assert!(String::from_utf8_lossy(&first).contains("first"));
     drop(resp);
@@ -1149,21 +1148,33 @@ async fn a_client_disconnect_during_buffering_releases_the_permit() {
     harness.shutdown().await;
 }
 
-/// §5.2/§8.2: authenticated denials increment the turn's bounded abuse counter, capped at
-/// `max_denied_requests`, without consuming a forwarded-request slot.
+/// §5.2/§8.2: authenticated denials increment the turn's bounded abuse counter; reaching
+/// `max_denied_requests` revokes the capability, so a later request is a 401 that never reaches
+/// upstream, without consuming a forwarded-request slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_denials_increment_the_bounded_abuse_counter() {
+async fn authenticated_denials_increment_the_bounded_abuse_counter_and_revoke_at_the_ceiling() {
     let limits = BrokerLimits {
         max_denied_requests: 2,
         ..DEFAULT_BROKER_LIMITS
     };
     let mut harness = Harness::with(FakeResponse::json("{\"ok\":true}"), limits, true).await;
     let capability = harness.capability.clone();
-    let body = serde_json::json!({"model": MODEL, "messages": [], "bogus": 1}).to_string();
-    for _ in 0..3 {
-        let resp = harness.post(Some(&capability), &[], body.as_bytes()).await;
+    let bad = serde_json::json!({"model": MODEL, "messages": [], "bogus": 1}).to_string();
+    for _ in 0..2 {
+        let resp = harness.post(Some(&capability), &[], bad.as_bytes()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    // The second denial reached the threshold and revoked the turn token: a following *valid*
+    // request cannot authenticate and never reaches upstream.
+    let revoked = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, false))
+        .await;
+    assert_eq!(
+        revoked.status(),
+        StatusCode::UNAUTHORIZED,
+        "reaching the denial threshold must revoke the capability"
+    );
     assert_eq!(
         harness.upstream.count(),
         0,
@@ -1215,6 +1226,209 @@ async fn retry_after_is_clamped_and_reflecting_headers_are_dropped() {
             .get("x-ratelimit-remaining-requests")
             .is_none(),
         "a header reflecting the key is dropped, not rewritten"
+    );
+    harness.shutdown().await;
+}
+
+/// §7.2: dropping the retained `TurnAccess` (turn-scoped revocation, the path for finalization and
+/// every non-session revocation) cancels a stalled stream promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_turn_access_cancels_a_stalled_stream() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let mut harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let mut resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    let started = std::time::Instant::now();
+    // Turn-scoped revocation: dropping the access revokes the grant (not the session).
+    drop(harness.access.take());
+    let next = resp.chunk().await;
+    assert!(
+        !matches!(next, Ok(Some(_))),
+        "a turn-access drop must end the downstream stream, got {next:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "turn revocation must not wait for the provider, took {:?}",
+        started.elapsed()
+    );
+    harness.shutdown().await;
+}
+
+/// §7.2: aborting the serving task (or an `accept()` error returning early) must cancel in-flight
+/// streams, not leave them until the provider sends the next byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_server_cancels_an_in_flight_stream() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let mut harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let mut resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    // Abort the serving task: the retained access stays live (so this is the shutdown path).
+    let server = harness.server.take().expect("server task");
+    let started = std::time::Instant::now();
+    server.abort();
+    let _ = server.await;
+    let next = resp.chunk().await;
+    assert!(
+        !matches!(next, Ok(Some(_))),
+        "an aborted server must end the downstream stream, got {next:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "an aborted server must not wait for the provider, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// §6.3/§7.1: a successful non-streaming response that is not valid JSON is a protocol error, not a
+/// 200 passed through to the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_non_streaming_json_body_is_refused() {
+    let harness = Harness::with(
+        FakeResponse::json("{not-json"),
+        default_limits(),
+        true,
+    )
+    .await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, false))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let text = String::from_utf8_lossy(&resp.bytes().await.expect("body")).to_string();
+    assert!(text.contains("upstream_protocol"), "pinned code: {text}");
+    assert_eq!(harness.upstream.count(), 1);
+    harness.shutdown().await;
+}
+
+/// §5.1: a request that merely *declares* a `Trailer:` is refused before the body is read, even
+/// without a trailer section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_trailer_header_is_refused_before_upstream_contact() {
+    let harness = Harness::with(FakeResponse::json("{\"ok\":true}"), default_limits(), true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let body = chat_body(MODEL, false);
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {capability}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTrailer: X-Smuggle\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let response = raw(port, &head, &body).await;
+    assert_eq!(response.status, 400);
+    assert_eq!(harness.upstream.count(), 0, "no upstream contact");
+    harness.shutdown().await;
+}
+
+/// §5.1/§5.2 + alice's review finding: a `Content-Length` sent ahead of `Transfer-Encoding: chunked`
+/// is a smuggling signal. hyper keeps the stale `Content-Length` in the header map while decoding
+/// the body as chunked, so charging the declared length would let a large chunked body be charged as
+/// a tiny fixed-length one and bypass the broker-wide request-memory budget. The combination is
+/// refused before the body is read, so it never reaches upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_length_before_chunked_transfer_encoding_is_refused() {
+    let harness = Harness::with(FakeResponse::json("{\"ok\":true}"), default_limits(), true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let body = chat_body(MODEL, false);
+    let chunked = format!(
+        "{:x}\r\n{}\r\n0\r\n\r\n",
+        body.len(),
+        String::from_utf8_lossy(&body)
+    );
+    // `Content-Length` appears *before* `Transfer-Encoding: chunked`, the ordering hyper preserves.
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {capability}\r\nContent-Type: application/json\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    let response = raw(port, &head, chunked.as_bytes()).await;
+    assert_eq!(
+        response.status, 400,
+        "a stale Content-Length before a chunked frame must be refused"
+    );
+    assert_eq!(harness.upstream.count(), 0, "no upstream contact");
+    harness.shutdown().await;
+}
+
+/// §7.1 + mutation "reserve the buffered budget after egress": a non-streaming request whose
+/// broker-wide buffered-response budget cannot be reserved is refused before any upstream contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exhausted_buffered_response_budget_refuses_before_egress() {
+    // Each buffered response charges 3 * 32 MiB + 2 MiB = 98 MiB; three exceed the 256 MiB budget.
+    let limits = BrokerLimits {
+        max_response_bytes: 32 * 1024 * 1024,
+        max_response_bytes_turn: 256 * 1024 * 1024,
+        max_forwarded_requests: 8,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    // Two chunks so the second (and therefore the response) is delayed while the budget is held.
+    let response = FakeResponse {
+        status: 200,
+        content_type: "application/json",
+        chunks: vec![br#"{"choices":[]"#.to_vec(), b"}".to_vec()],
+        chunk_delay: Duration::from_secs(2),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, limits, true).await;
+    let capability = harness.capability.clone();
+
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        let capability = capability.clone();
+        let url = harness.chat_url();
+        let body = chat_body(MODEL, false);
+        requests.push(tokio::spawn(async move {
+            Harness::client()
+                .post(url)
+                .bearer_auth(capability)
+                .body(body)
+                .send()
+                .await
+                .expect("request")
+                .status()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.expect("join"));
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::FORBIDDEN)
+            .count(),
+        1,
+        "exactly the over-budget request is refused, got {statuses:?}"
+    );
+    assert_eq!(
+        harness.upstream.count(),
+        2,
+        "an over-budget non-streaming request never reaches upstream"
     );
     harness.shutdown().await;
 }
