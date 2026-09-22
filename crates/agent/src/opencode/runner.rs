@@ -159,6 +159,7 @@ impl crate::Runner for Runner {
             &self.cfg.state_root,
             &self.cfg.auth_source,
             &issue.identifier,
+            &self.cfg.workspace_root,
         )?;
 
         // MCP injection is best-effort, exactly as it is for claude: on any failure the run
