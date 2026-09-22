@@ -31,14 +31,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider_credential::ProviderCredentialOwner;
 
-/// How long the listener waits for a freshly accepted connection's `Hello` frame before giving up
-/// on it and returning to `accept`. Only one connection is ever served at a time (see
-/// `accept_and_serve`'s doc), so without this bound a connection that never sends `Hello` — a
-/// same-user process that simply connects and does nothing, which the design's own threat model
-/// (`provider-auth-p0-findings.md` §8) assumes can happen — wedges every later connection,
-/// including the real daemon's own reconnect after a restart, forever. A legitimate handshake is a
-/// single local write immediately after `connect`, so this has ample margin without making a
-/// deliberately silent connection expensive to defend against.
+/// How long a freshly accepted connection's own task waits for its `Hello` frame before giving up
+/// on that connection specifically. Since B3 (jimmy's review of rhapsody#213), each connection's
+/// pre-`Hello` phase runs in its own task independently of every other connection's, so a same-user
+/// process that connects and never sends `Hello` — which the design's own threat model
+/// (`provider-auth-p0-findings.md` §8) assumes can happen — bounds only its OWN task's lifetime; it
+/// cannot wedge any other connection, including the real daemon's own reconnect after a restart
+/// (`five_silent_connections_cannot_starve_a_later_legitimate_client` pins exactly that). A
+/// legitimate handshake is a single local write immediately after `connect`, so this has ample
+/// margin without making a deliberately silent connection expensive to defend against.
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct BootstrapListener {
@@ -122,6 +123,13 @@ impl BootstrapListener {
                     accepted = self.listener.accept() => {
                         let (stream, _addr) = match accepted {
                             Ok(pair) => pair,
+                            // An accept() failure (EMFILE, ENFILE, ECONNABORTED, ...) must revoke
+                            // the channel exactly as thoroughly as an explicit `shutdown()` does —
+                            // see `graceful_shutdown`'s doc (jimmy's review of rhapsody#213, B7:
+                            // this exit used to `break` straight to the drain without flipping
+                            // `cancel` first, leaving `JoinSet::shutdown`'s cooperative abort as
+                            // the only defense against exactly the kind of in-flight synchronous
+                            // Keychain read this file's whole later history is about).
                             Err(_) => break,
                         };
                         let owner = owner.clone();
@@ -138,15 +146,33 @@ impl BootstrapListener {
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
-            // Graceful drain: every live connection task already saw `cancel` flip (either while
-            // idle between requests, or via the explicit post-read check in `serve_one`) and is
-            // returning on its own; `shutdown()` aborts any stragglers as a backstop and, critically,
-            // WAITS for every task to actually finish rather than merely asking it to — this is what
-            // makes the future's own completion mean "no in-flight read can answer any more".
-            connections.shutdown().await;
+            graceful_shutdown(&cancel, &mut connections).await;
         };
         (future, shutdown)
     }
+}
+
+/// The single shared teardown every `accept_and_serve` loop exit funnels through, whether the
+/// caller explicitly called [`ListenerShutdown::shutdown`] or the accept loop gave up on its own
+/// (an `accept()` error). Flips `cancel` UNCONDITIONALLY before draining — jimmy's review of
+/// rhapsody#213 (B7) found that the accept-error exit used to skip straight to
+/// `connections.shutdown()` without cancelling first, so a connection task parked inside the
+/// synchronous `owner.read_bound` Keychain call at that moment would still see `cancel.is_
+/// cancelled() == false` when it resumed and would answer anyway. There being exactly one call
+/// site for this function is what makes "every exit cancels before it drains" true by
+/// construction, not something a future new exit has to remember to repeat.
+///
+/// This does NOT itself guarantee no in-flight read answers after this returns — that guarantee
+/// comes from `serve_one`'s own explicit `cancel.is_cancelled()` check taken synchronously right
+/// after `owner.read_bound` returns (see that check's doc). What this function's ordering DOES
+/// guarantee: `cancel` is flipped before any live connection task is waited on, so a task that is
+/// merely idle (awaiting its next frame, its `Hello`, or the serving slot) is guaranteed to observe
+/// cancellation rather than being torn down by `JoinSet::shutdown`'s cooperative abort without
+/// ever having had the chance to check; `graceful_shutdown_cancels_before_it_drains` below pins
+/// this ordering directly.
+async fn graceful_shutdown(cancel: &CancellationToken, connections: &mut tokio::task::JoinSet<()>) {
+    cancel.cancel();
+    connections.shutdown().await;
 }
 
 /// A handle to request a graceful, waited-for shutdown of a listener returned by
@@ -668,6 +694,51 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Pins `graceful_shutdown`'s own ordering contract directly, independent of which
+    // `accept_and_serve` loop exit happens to call it (jimmy's review of rhapsody#213, B7: the
+    // accept-error exit used to reach `connections.shutdown()` without cancelling `cancel` first,
+    // so a task doing synchronous work concurrently with the drain could still observe stale
+    // (not-yet-cancelled) state once it finished). The spawned task mimics `serve_one`'s real
+    // shape: synchronous, non-yielding work (a real `std::thread::sleep`, which `JoinSet::
+    // shutdown`'s cooperative abort cannot interrupt) followed by a check of `cancel.is_cancelled()`
+    // taken only once that work completes. If `graceful_shutdown` cancelled AFTER draining instead
+    // of before, the drain would still wait out the same sleep (abort can't shorten it), but the
+    // task's check would read `false` — this test would catch that as a wrong result rather than a
+    // hang, because the timeout around the call fires only if the drain itself never returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_cancels_before_it_drains() {
+        let cancel = CancellationToken::new();
+        let mut connections = tokio::task::JoinSet::new();
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let task_result = result.clone();
+        let task_cancel = cancel.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        connections.spawn(async move {
+            let _ = entered_tx.send(());
+            std::thread::sleep(Duration::from_millis(50));
+            *task_result.lock().unwrap() = Some(task_cancel.is_cancelled());
+        });
+
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join")
+            .expect("task must signal it entered its synchronous phase");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            graceful_shutdown(&cancel, &mut connections),
+        )
+        .await
+        .expect("graceful_shutdown must not hang");
+
+        assert_eq!(
+            *result.lock().unwrap(),
+            Some(true),
+            "the task's post-sleep cancellation check must observe true — cancel must be flipped \
+             BEFORE graceful_shutdown starts draining, not after"
+        );
     }
 
     /// A `Keyring` double whose `get_password()` blocks — once armed via [`BlockingKeyring::arm`] —
