@@ -6,11 +6,13 @@
 //! the protocol state machine, not of the OS-level signing/ACL boundary (which is proven
 //! separately, against real signed binaries, for the ownership decision itself).
 
-/// A per-connection, single-use bootstrap token compared to what the desktop generated for this
-/// exact daemon launch. Never `Clone`/`Debug`; construct fresh per launch, never reused across a
-/// restart (design §2.5's "revision... changes on... availability transitions" is the daemon-side
-/// analogue — this is the transport-level guarantee that a stale launch's token cannot authenticate
-/// a new one).
+/// A bootstrap token minted fresh for one desktop-launched daemon's whole lifetime, not per
+/// connection: the listener accepts the same token on any number of connections for as long as it
+/// runs (e.g. the daemon reconnecting after its own restart). Only the per-connection `Hello` is
+/// one-shot (`ServerSession::accept_hello` below). Never `Clone`/`Debug`; construct fresh per
+/// launch, never reused across a restart (design §2.5's "revision... changes on... availability
+/// transitions" is the daemon-side analogue — this is the transport-level guarantee that a stale
+/// launch's token cannot authenticate a new one).
 pub struct Token(String);
 
 impl Token {

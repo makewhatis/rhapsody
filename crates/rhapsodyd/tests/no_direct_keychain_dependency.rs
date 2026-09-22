@@ -1,20 +1,24 @@
-//! Pins the structural half of the STUDIO-981/P0c confused-deputy defense: the `rhapsodyd` binary
-//! must not even be *capable* of a direct Keychain read, because it has no dependency that could
-//! perform one. `desktop/src-tauri` depends on `keyring` (for the Linear token and, on the desktop
-//! side, `provider_credential::ProviderCredentialOwner`); `rhapsodyd` and `rhapsody-credential-ipc`
-//! must not. This is a stronger, cheaper, always-current complement to a runtime confused-deputy
-//! test: a code review or a future PR cannot silently reintroduce a direct-Keychain code path
-//! without this failing, even before anyone writes the call site.
+//! Pins the structural half of the STUDIO-981/P0c confused-deputy defense: no source file under
+//! `crates/` (which is what actually builds `rhapsodyd`) calls a Keychain read API. `desktop/
+//! src-tauri` depends on `keyring` and calls it (for the Linear token and, on the desktop side,
+//! `provider_credential::ProviderCredentialOwner`); nothing under `crates/` may.
+//!
+//! `rhapsodyd_has_no_keychain_crate_dependency` alone is NOT sufficient evidence of that: absence
+//! of the `keyring` crate from `cargo tree -p rhapsodyd` does not mean the binary is *incapable* of
+//! a direct Keychain read — `security-framework` (whose macOS `passwords` module exports
+//! `get_generic_password`/`set_generic_password` un-gated) is already transitively present via
+//! `native-tls`'s TLS backend for `reqwest`. A future direct-Keychain read through
+//! `security_framework::passwords` would leave that test green. `no_crates_source_calls_a_keychain_
+//! read_api` pins the property that actually matters: no source file under `crates/` calls into
+//! one, checked directly against the text of every `.rs` file, so a future call site fails this
+//! test even before its crate happens to show up in `cargo tree`.
 
+use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn rhapsodyd_has_no_keychain_capable_dependency() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("resolve repo root");
+fn rhapsodyd_has_no_keychain_crate_dependency() {
+    let root = repo_root();
 
     let out = Command::new(env!("CARGO"))
         .args(["tree", "-p", "rhapsodyd", "--manifest-path"])
@@ -29,8 +33,71 @@ fn rhapsodyd_has_no_keychain_capable_dependency() {
     let tree = String::from_utf8_lossy(&out.stdout);
     assert!(
         !tree.to_lowercase().contains("keyring"),
-        "rhapsodyd must never depend on a Keychain-capable crate (P0c's direct-Keychain design \
+        "rhapsodyd must never depend on the `keyring` crate directly (P0c's direct-Keychain design \
          was rejected in favor of authenticated desktop-owned IPC — see \
          rhapsody_credential_ipc's crate doc for why); dependency tree:\n{tree}"
     );
+}
+
+/// The real property this ticket relies on: source-level absence of any Keychain read API call
+/// under `crates/`, independent of what the dependency graph happens to contain.
+#[test]
+fn no_crates_source_calls_a_keychain_read_api() {
+    let root = repo_root();
+    let crates_dir = root.join("crates");
+    const NEEDLES: &[&str] = &[
+        "security_framework::passwords",
+        "SecItemCopyMatching",
+        "keyring::",
+    ];
+
+    let mut offenders = Vec::new();
+    let mut stack = vec![crates_dir];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("file type");
+            if file_type.is_dir() {
+                // Skip build output; every crate's own `target/` would otherwise be walked too.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            // Skip this file itself: its own `NEEDLES` list necessarily contains the literal
+            // strings it searches for, which would otherwise always self-match.
+            if path.extension().is_some_and(|e| e == "rs")
+                && path
+                    .file_name()
+                    .is_some_and(|n| n != "no_direct_keychain_dependency.rs")
+            {
+                let contents =
+                    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+                for needle in NEEDLES {
+                    if contents.contains(needle) {
+                        offenders.push(format!("{}: contains {needle:?}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a crates/ source file calls a Keychain read API, defeating the P0c confused-deputy \
+         defense (rhapsodyd must reach a provider credential only through \
+         rhapsody_credential_ipc's authenticated channel):\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn repo_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("resolve repo root")
 }

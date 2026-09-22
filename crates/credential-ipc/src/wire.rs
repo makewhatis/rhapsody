@@ -161,9 +161,11 @@ impl std::fmt::Debug for LeasePayload {
     }
 }
 
-/// A frame the desktop (server) sends. `ReadBoundResult.seq` echoes the request it answers;
-/// `RevisionChanged` is unsolicited (pushed the moment a local Connect/Replace/Rebind/Remove
-/// commits) and carries the server's own independent, strictly increasing sequence.
+/// A frame the desktop (server) sends. `ReadBoundResult.seq` is stamped from the server's own
+/// independent, strictly increasing sequence — it does NOT echo the request's sequence; the client
+/// tracks the two sequences separately (see `session::ClientSession`). `RevisionChanged` is
+/// reserved for PB7, which will push it unsolicited the moment a local Connect/Replace/Rebind/
+/// Remove commits; nothing in this ticket's scope constructs one yet.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub enum ServerFrame {
     ReadBoundResult {
