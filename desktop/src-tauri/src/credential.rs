@@ -31,14 +31,18 @@ pub trait Store: Send + Sync {
 
 /// Outcome of a low-level keychain operation. `NoEntry` is the "absent" signal [`Keychain`] maps to an
 /// empty read / idempotent delete (Go's `keyring.ErrNotFound`); `Other` is any real failure.
-enum KeyringError {
+///
+/// `pub(crate)`: [`crate::provider_credential`] reuses this OS Keychain wrapper directly rather than
+/// duplicating the FFI boundary for a second secret namespace.
+#[derive(Debug)]
+pub(crate) enum KeyringError {
     NoEntry,
     Other(Error),
 }
 
 /// The macOS Keychain operations [`Keychain`] needs, behind a trait so tests inject an in-memory
 /// double instead of touching the real login keychain (the Go tests use `keyring.MockInit`).
-trait Keyring: Send + Sync {
+pub(crate) trait Keyring: Send + Sync {
     fn get_password(&self) -> Result<String, KeyringError>;
     fn set_password(&self, token: &str) -> Result<(), KeyringError>;
     fn delete_credential(&self) -> Result<(), KeyringError>;
@@ -47,9 +51,9 @@ trait Keyring: Send + Sync {
 /// The production [`Keyring`], backed by the OS Keychain via the `keyring` crate. Service/account
 /// namespace the item; a fresh `Entry` per call is cheap and points at the same login-keychain item,
 /// matching Go's repeated `keyring.Get/Set/Delete(service, account)`.
-struct OsKeyring {
-    service: String,
-    account: String,
+pub(crate) struct OsKeyring {
+    pub(crate) service: String,
+    pub(crate) account: String,
 }
 
 impl OsKeyring {
@@ -58,7 +62,7 @@ impl OsKeyring {
     }
 }
 
-fn map_keyring_err(e: keyring::Error) -> KeyringError {
+pub(crate) fn map_keyring_err(e: keyring::Error) -> KeyringError {
     match e {
         keyring::Error::NoEntry => KeyringError::NoEntry,
         other => KeyringError::Other(Box::new(other)),
