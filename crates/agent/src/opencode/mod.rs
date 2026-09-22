@@ -92,7 +92,15 @@ pub(crate) mod testdir {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!(
+            // Canonicalized: macOS's own `std::env::temp_dir()` is reached through a `/var` ->
+            // `/private/var` symlink, and `state::validate_root_is_safe` (STUDIO-980) now refuses
+            // any symlink component in a configured `state_root`. Resolving it here keeps paths
+            // built from `path()` free of that symlink, matching what `state::RunState::provision`
+            // does for its own empty-`state_root` default.
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            let dir = base.join(format!(
                 "rhapsody-opencode-test-{}-{nanos}-{seq}",
                 std::process::id()
             ));
