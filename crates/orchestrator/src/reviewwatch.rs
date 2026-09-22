@@ -1817,15 +1817,17 @@ impl Orchestrator {
     /// again while the pull request still stands at the same heads — which is the routine shape while
     /// the reviewers are queued, because a draft poke, a conflict route-back, a second reviewer's
     /// findings or a human `@symphony` comment can each summon the author with no review completing
-    /// in between — is the SAME unfinished exchange, not a second one. Recording it once is what
-    /// keeps a backlog of dispatches from each charging a round as the queue later drains.
+    /// in between — is the SAME unfinished exchange, not a second one. Recording it once keeps the
+    /// pending queue from growing a dispatch at a time while the queue drains.
     ///
     /// The dedup is by SET CONTAINMENT: a dispatch whose standing set introduces no head an
-    /// outstanding round had not already seen (a subset) is that same round. Equality alone is not
-    /// enough — a redundant dispatch against a stale sibling records a SUPERSET, and the following
-    /// dispatch against the reduced state records a subset of it; without containment the two would
-    /// both be charged by the two reviewers' verdicts at the SAME produced head, two rounds for one
-    /// exchange.
+    /// outstanding round had not already seen (a subset) is that same round and records nothing.
+    /// Equality alone cannot see that — a redundant dispatch against a stale sibling records a
+    /// SUPERSET, and a following dispatch against the reduced state records a subset of it.
+    /// [`Orchestrator::settle_author_round`] charges the verdicts that answer those entries ONCE, so
+    /// containment bounds the queue and is not the sole guard against a same-produced-head
+    /// over-charge; a truncated intermediate review can still leave a superset behind, which is why
+    /// the settle aggregation exists (sol round 5 on PR #216).
     ///
     /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
     /// run its review's findings bought is the loop's other half, so it costs the same as the review
@@ -1919,12 +1921,16 @@ impl Orchestrator {
     /// sibling's verdict at the already-answered head from charging a round nobody read (jimmy round
     /// 2 on PR #216).
     ///
-    /// FIFO over the pending rounds: one verdict answers one author round, and the oldest
-    /// outstanding round whose standing set does not contain `head` is the one it most plausibly
-    /// answers. The queue-time backlog does not reappear here as a charge per verdict because
-    /// [`Orchestrator::note_author_round`] records at most ONE pending round per standing head SET
-    /// (alice round 1 on PR #216): the siblings of an answering round leave nothing behind to charge
-    /// a second time.
+    /// **ONE verdict answers EVERY outstanding round it lands outside, and charges ONCE.** Every
+    /// pending standing set that does not contain `head` describes an author round this verdict read
+    /// past, so they are all retired together and the whole set costs a single round — one reviewer
+    /// verdict is one half of one exchange however many stale entries accumulated behind it.
+    /// Charging per verdict instead let a TRUNCATED intermediate review double-charge: a round that
+    /// wrote a new `requested_sha` and then died left a strict superset behind, and two reviewers'
+    /// verdicts at the eventual head consumed one entry each (sol round 5 on PR #216). The
+    /// queue-time backlog does not reappear here as a charge per verdict because
+    /// [`Orchestrator::note_author_round`] also records at most ONE pending round per standing head
+    /// SET by containment (alice round 1 on PR #216).
     ///
     /// Called only from a DECLARED review completion ([`Orchestrator::on_review_exit`]); a truncated
     /// or crashed round advances no `last_reviewed_sha`, and a STUDIO-960 carried verdict is
@@ -1943,20 +1949,27 @@ impl Orchestrator {
             self.author_rounds_pending.remove(&key);
             return;
         }
-        {
-            let Some(pending) = self.author_rounds_pending.get_mut(&key) else {
-                return;
-            };
-            let Some(idx) = pending
-                .iter()
-                .position(|base| !base.iter().any(|h| h == head))
-            else {
-                return;
-            };
-            pending.remove(idx);
-            if pending.is_empty() {
-                self.author_rounds_pending.remove(&key);
+        // Retire EVERY pending set this verdict answers at once — each entry whose standing set does
+        // not contain `head` describes a round the reviewer read past — and charge the answer once,
+        // not once per entry. A verdict INSIDE a set (the entry still contains `head`) read work a
+        // sibling of the same exchange was already reading, so it stays pending.
+        let answered = match self.author_rounds_pending.get_mut(&key) {
+            Some(pending) => {
+                let before = pending.len();
+                pending.retain(|base| base.iter().any(|h| h == head));
+                before - pending.len()
             }
+            None => return,
+        };
+        if answered == 0 {
+            return;
+        }
+        if self
+            .author_rounds_pending
+            .get(&key)
+            .is_some_and(|pending| pending.is_empty())
+        {
+            self.author_rounds_pending.remove(&key);
         }
         let round = self.reviewers_per_round();
         *self.review_rounds.entry(key.clone()).or_default() += round;
@@ -3074,8 +3087,9 @@ pub type ReviewRounds = HashMap<String, usize>;
 /// round disagree about `requested_sha` for a whole queue wait under review concurrency. A new
 /// dispatch recording a set CONTAINED IN an existing entry adds nothing (the same exchange seen with
 /// fewer heads), so a repeated dispatch against an unanswered state is one entry, not many. A
-/// reviewer's verdict at a head OUTSIDE a set settles the oldest such entry (FIFO) and charges it; a
-/// verdict INSIDE the set read work a sibling was already reading and answers nothing.
+/// reviewer's verdict at a head OUTSIDE a set settles EVERY such entry — the reviewer read past all
+/// of them — for a single charge; a verdict INSIDE the set read work a sibling was already reading
+/// and answers nothing.
 /// See [`Orchestrator::note_author_round`] and [`Orchestrator::settle_author_round`].
 pub type PendingAuthorRounds = HashMap<String, Vec<Vec<String>>>;
 
@@ -6944,6 +6958,72 @@ mod tests {
             o.review_rounds.get(&churn_key(&coord(12))),
             Some(&(3 * round)),
             "one spent round, the answered HEAD_B exchange, and exactly ONE answered HEAD_C exchange"
+        );
+    }
+
+    /// **sol round 5 on PR #216.** A TRUNCATED intermediate review must not let one answered
+    /// exchange charge twice. Containment only suppresses a new standing set that is a subset of an
+    /// existing entry; a review that writes a new `requested_sha` and then truncates without a
+    /// verdict EXPANDS the standing set, so a later dispatch records a strict SUPERSET as a second
+    /// pending entry. Two reviewers declaring a verdict at the eventual head then consume one entry
+    /// each — two author rounds charged for one conclusive exchange.
+    ///
+    /// This is the case neither the truncation test (one pending entry) nor the containment test
+    /// (a declared verdict at the intermediate head) covers.
+    ///
+    /// Mutation check: retire only the FIRST pending entry a verdict answers (the pre-fix
+    /// [`Orchestrator::settle_author_round`]) and this reds at `Some(6)`, not `Some(4)`.
+    #[test]
+    fn a_truncated_intermediate_review_does_not_double_charge_the_final_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        // Both reviewers read HEAD_A: one round is spent.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // Author dispatch #1 records the standing set {A}; the author pushes HEAD_B.
+        o.note_author_round(&iss);
+        // bob picks HEAD_B up and the round TRUNCATES — a max_turns backstop, no declared verdict.
+        // The row keeps its `requested_sha` (a truncated round is re-reviewed at the same head), so
+        // the live set is now {A, B}.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("bob dispatched at the pushed head");
+        o.store()
+            .mark_review_truncated(&key(12, "bob"))
+            .expect("truncate");
+
+        // A second dispatch (a human `@symphony`, say) sees the superset {A, B} and records it,
+        // because it is not contained in the outstanding {A}. Two pending entries now describe ONE
+        // unfinished exchange.
+        o.note_author_round(&iss);
+        assert_eq!(
+            o.author_rounds_pending
+                .get(&churn_key(&coord(12)))
+                .map(Vec::len),
+            Some(2),
+            "sanity: the truncated intermediate head leaves a second pending entry"
+        );
+
+        // The author pushes HEAD_C and BOTH reviewers declare a verdict there: one answered
+        // exchange, and it must charge exactly one round.
+        complete(&mut o, 12, "bob", HEAD_C);
+        complete(&mut o, 12, "carol", HEAD_C);
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus exactly ONE answered exchange; the truncated intermediate head \
+             must not let a sibling verdict charge a second round"
+        );
+        assert!(
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
+            "and the answered exchange leaves nothing pending behind"
         );
     }
 
