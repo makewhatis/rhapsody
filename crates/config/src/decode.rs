@@ -702,6 +702,58 @@ mod tests {
         decode(&def).expect("decode should succeed")
     }
 
+    /// Like [`decode_yaml`] but returns the error, for the provider-shape refusals.
+    fn try_decode_yaml(front: &str, prompt: &str) -> Result<Config, crate::decode::ConfigError> {
+        let config: YamlMap = if front.trim().is_empty() {
+            YamlMap::new()
+        } else {
+            serde_yaml_ng::from_str(front).expect("test front matter must parse")
+        };
+        decode(&Definition {
+            config,
+            prompt_template: prompt.to_string(),
+        })
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, sol): `credential.value` must be unrepresentable, not merely
+    // unvalidated. `.` is a permissive flaw: without `deny_unknown_fields` a provider carrying
+    // `credential: {source: keychain, value: sk-…}` decodes, and `effective_json::render` echoes the
+    // raw front matter, publishing the secret in `GET /api/v1/config`. The same holds for an unknown
+    // key on the provider block or the broker-limits block. All three must REFUSE at decode.
+    #[test]
+    fn provider_blocks_reject_unknown_secret_bearing_fields() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: tok\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: m\n",
+        );
+        let with_credential_value = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n      value: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_credential_value, "body").is_err(),
+            "a credential value must be refused, not silently ignored"
+        );
+        let with_provider_key = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    api_key: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_provider_key, "body").is_err(),
+            "an unknown secret-bearing provider key must be refused"
+        );
+        let with_limit_key = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    broker_limits:\n      api_key: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_limit_key, "body").is_err(),
+            "an unknown secret-bearing broker-limits key must be refused"
+        );
+        // The supported shape still decodes, so the refusal is not over-broad.
+        let good = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n"
+        );
+        assert!(try_decode_yaml(&good, "body").is_ok());
+    }
+
     // ---- config_test.go mirrors ----
 
     // Mirrors Go `TestDecodeAppliesDefaults`.

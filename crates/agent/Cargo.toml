@@ -80,6 +80,12 @@ harness-fixtures = { path = "../harness-fixtures" }
 # `src/harness.rs` that assert the two declarations cannot drift. Workspace-internal path dep — no
 # new external crate enters Cargo.lock.
 rhapsody-config = { path = "../config" }
+# rhapsody-provider-broker (test-only, STUDIO-984 review): the canonical credential-binding adapter
+# identity is ONE value across config, agent and broker registration, and the plan's carried limits
+# must match the broker's V1 default column. The broker crate cannot depend on this one (its
+# dependency guard), so the pin test lives here and compares all three. Workspace-internal path dep —
+# no new external crate enters Cargo.lock.
+rhapsody-provider-broker = { path = "../provider-broker" }
 
 [lints]
 workspace = true

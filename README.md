@@ -2545,12 +2545,18 @@ config goldens and an old-vs-new round-trip test.
   `protocol` (`openai-compatible` — Chat Completions with Bearer API-key auth only, never arbitrary
   headers), a `display_name`, a `base_url`, an `allow_insecure_http` policy, a `credential.source`
   storage *kind* (`keychain`), and validated broker limits. No value/token/key field exists anywhere
-  in the YAML-facing or pure resolved types, and none may be added.
+  in the YAML-facing or pure resolved types, and none may be added. The provider, credential and
+  broker-limits blocks also reject unknown keys outright, and the config view filters each provider
+  block to the schema's known keys — so a secret-shaped spelling such as `credential.value` can
+  neither decode into the typed config nor appear in `GET /api/v1/config`.
 - **`base_url` is the protocol root immediately above `chat/completions`.** Normalization strips a
   trailing `/` and appends `/v1` only when the path does not already end in `/v1`, so
   `https://api.fireworks.ai/inference/v1` and `https://api.openai.com/v1` are left alone and never
-  grow a second `/v1`. A URL carrying userinfo (`user:pass@`), a query string, or a fragment is
-  refused — those are the parts that could smuggle a reusable key into `WORKFLOW.md`.
+  grow a second `/v1`. The URL is parsed, not string-split: userinfo (`user:pass@`), a query string,
+  a fragment, whitespace/control characters, a missing host, a non-numeric port, an unclosed IPv6
+  literal, a percent-encoded path separator/dot segment, a literal `.`/`..` segment, and a base that
+  already ends in `chat/completions` are all refused — those are the parts that could smuggle a
+  reusable key into `WORKFLOW.md` or make the upstream route ambiguous.
 - **TLS policy is explicit.** `allow_insecure_http` defaults `false`, is required `true` for an
   `http` base URL, and is rejected `true` on `https`; an omitted or explicit `false` value on
   `https` round-trips identically. It is operator policy, never inferred from loopback/private
@@ -2563,7 +2569,9 @@ config goldens and an old-vs-new round-trip test.
 - **One credential binding, one cross-surface spelling.** Normalization derives
   `(provider_id, openai-chat-completions-bearer-v1, normalized_base_url)`, and the Keychain account
   is `v1:<provider_id>` — derived only from the canonical id, so a definition can never name an
-  arbitrary Keychain item.
+  arbitrary Keychain item. That adapter identity is the SAME string the broker crate hashes into its
+  own credential binding (`BrokerProtocol::canonical_id`), so storage, credential reads and broker
+  registration cannot disagree; a cross-crate pin test reds if any of the three spellings drifts.
 - **V1 materializes providers for OpenCode only.** An explicit provider with `agent.backend: claude`
   is a typed refusal; Claude keeps its native login path. The one harness registry in
   `rhapsody-agent` (`HARNESS_REGISTRY`) declares which provider protocols each adapter can consume;
@@ -2585,8 +2593,8 @@ config goldens and an old-vs-new round-trip test.
 - **The runtime type replaces the raw-key one.** `rhapsody_agent::Provider` /
   `ProviderAuth::ApiKey(String)` are gone; `HarnessSpec.provider` is now the non-secret
   `ResolvedProviderPlan` (stable id, protocol, normalized endpoint, policy, canonical binding,
-  credential source kind, model, origins). The move-only prepared provider that carries an opaque
-  broker session is a later slice (PB5).
+  credential source kind, validated broker limits, model, origins). The move-only prepared provider
+  that carries an opaque broker session is a later slice (PB5).
 
 Preserved-code surfaces are unchanged: `effective_json` emits the provider block and the
 `agent.provider`/`agent.model` keys only when configured, so the Go config goldens stay byte-exact;

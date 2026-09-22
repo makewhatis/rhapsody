@@ -1609,6 +1609,7 @@ dependencies = [
  "libc",
  "rhapsody-config",
  "rhapsody-core",
+ "rhapsody-provider-broker",
  "rhapsody-workspace",
  "serde",
  "serde_json",

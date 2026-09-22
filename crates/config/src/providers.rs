@@ -443,15 +443,46 @@ impl BaseUrlScheme {
 }
 
 /// Parses and checks the `base_url` TLS policy, returning the scheme
-/// (`provider-auth-design.md` §2.2):
+/// (`provider-auth-design.md` §2.2, `provider-broker-design.md` §6.1):
 ///
-/// * the URL must be absolute with an `http`/`https` scheme and a non-empty host;
+/// * the URL must be absolute with an `http`/`https` scheme, a well-formed authority (non-empty
+///   host, all-digit port), and no whitespace or control characters anywhere;
 /// * it must carry no userinfo, query string, or fragment — the parts that can smuggle a reusable
 ///   secret into `WORKFLOW.md` (see [`reject_secret_bearing_url_parts`]);
+/// * its path must not be ambiguous: no percent-encoded path separators/dot segments, no `.`/`..`
+///   segment, and no base already ending in `chat/completions` (see [`validate_base_path`]);
 /// * `allow_insecure_http` must be `true` for an `http` base URL;
 /// * `allow_insecure_http: true` is REJECTED on an `https` base URL (an explicit `false` or an
 ///   omitted value is fine there).
 pub fn base_url_scheme(base_url: &str, allow_insecure_http: bool) -> Result<BaseUrlScheme, String> {
+    let scheme = parse_base_url(base_url)?;
+    match scheme {
+        BaseUrlScheme::Http if !allow_insecure_http => Err(format!(
+            "base_url {base_url:?} is http but allow_insecure_http is not true"
+        )),
+        BaseUrlScheme::Https if allow_insecure_http => Err(format!(
+            "base_url {base_url:?} is https but allow_insecure_http is true"
+        )),
+        _ => Ok(scheme),
+    }
+}
+
+/// Parses `base_url`'s scheme, secret-bearing parts, authority, and path, returning the scheme when
+/// every shape rule holds (no TLS policy is applied here — [`base_url_scheme`] layers that on).
+fn parse_base_url(base_url: &str) -> Result<BaseUrlScheme, String> {
+    // A CR/LF surviving a quoted YAML scalar must never reach an upstream URL or a request header,
+    // and a space is not a legal URL character at all.
+    if let Some(c) = base_url
+        .chars()
+        .find(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "base_url {base_url:?} must not contain whitespace or control characters ({c:?})"
+        ));
+    }
+    if !base_url.is_ascii() {
+        return Err(format!("base_url {base_url:?} must be ASCII"));
+    }
     let (scheme, rest) = split_scheme(base_url)
         .ok_or_else(|| format!("base_url {base_url:?} must be an absolute http(s) URL"))?;
     let scheme = match scheme {
@@ -463,19 +494,118 @@ pub fn base_url_scheme(base_url: &str, allow_insecure_http: bool) -> Result<Base
             ));
         }
     };
-    if rest.is_empty() || rest.starts_with('/') {
+    reject_secret_bearing_url_parts(base_url, rest)?;
+    let (authority, path) = split_authority_and_path(rest);
+    validate_authority(base_url, authority)?;
+    validate_base_path(base_url, path)?;
+    Ok(scheme)
+}
+
+/// Splits everything after `scheme://` into its authority and its path (`""` when there is none).
+/// Callers have already refused a `?`/`#` everywhere in `rest`, so the path starts at the first `/`.
+fn split_authority_and_path(rest: &str) -> (&str, &str) {
+    match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    }
+}
+
+/// Validates the authority part of an absolute URL (`provider-broker-design.md` §6.1): a non-empty
+/// host, a well-formed bracketed IPv6 literal, and an all-digit optional port. A missing host, an
+/// unclosed `[`, an embedded space, or a non-numeric port each move the failure from load time
+/// (where it is typed) to dispatch in a later slice, so they are refused here.
+fn validate_authority(base_url: &str, authority: &str) -> Result<(), String> {
+    if authority.is_empty() {
         return Err(format!("base_url {base_url:?} has no host"));
     }
-    reject_secret_bearing_url_parts(base_url, rest)?;
-    match scheme {
-        BaseUrlScheme::Http if !allow_insecure_http => Err(format!(
-            "base_url {base_url:?} is http but allow_insecure_http is not true"
-        )),
-        BaseUrlScheme::Https if allow_insecure_http => Err(format!(
-            "base_url {base_url:?} is https but allow_insecure_http is true"
-        )),
-        _ => Ok(scheme),
+    if let Some(inner) = authority.strip_prefix('[') {
+        let close = inner
+            .find(']')
+            .ok_or_else(|| format!("base_url {base_url:?} has an unclosed IPv6 host literal"))?;
+        let host = &inner[..close];
+        if host.is_empty() {
+            return Err(format!("base_url {base_url:?} has no host"));
+        }
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return Err(format!("base_url {base_url:?} has an invalid IPv6 host"));
+        }
+        let after = &inner[close + 1..];
+        if !after.is_empty() {
+            let port = after
+                .strip_prefix(':')
+                .ok_or_else(|| format!("base_url {base_url:?} has an invalid authority"))?;
+            validate_port(base_url, port)?;
+        }
+        return Ok(());
     }
+    if authority.contains(['[', ']']) {
+        return Err(format!("base_url {base_url:?} has an invalid host"));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return Err(format!("base_url {base_url:?} has no host"));
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(format!(
+            "base_url {base_url:?} has an invalid host {host:?}"
+        ));
+    }
+    if let Some(port) = port {
+        validate_port(base_url, port)?;
+    }
+    Ok(())
+}
+
+/// A port is an optional, non-empty run of ASCII digits (`provider-broker-design.md` §6.1's
+/// "invalid port").
+fn validate_port(base_url: &str, port: &str) -> Result<(), String> {
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "base_url {base_url:?} has an invalid port {port:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses the `base_url` path forms `provider-broker-design.md` §6.1 makes unrepresentable: a
+/// percent-encoded path separator or dot segment (`%2f`, `%5c`, `%2e`), a literal `.`/`..` segment,
+/// and a base that already ends in the terminal `chat/completions` route (from which the adapter
+/// could not construct exactly one endpoint).
+fn validate_base_path(base_url: &str, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    let lower = path.to_ascii_lowercase();
+    for needle in ["%2f", "%5c", "%2e"] {
+        if lower.contains(needle) {
+            return Err(format!(
+                "base_url {base_url:?} must not percent-encode a path separator or dot segment"
+            ));
+        }
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "base_url {base_url:?} must not contain a dot segment"
+        ));
+    }
+    if path.trim_end_matches('/').ends_with("chat/completions") {
+        return Err(format!(
+            "base_url {base_url:?} must not already end in chat/completions"
+        ));
+    }
+    Ok(())
 }
 
 /// Splits `scheme://…` into its lowercase scheme and remainder, or `None` when malformed.
@@ -531,14 +661,9 @@ pub fn normalize_provider_base_url(base_url: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err(format!("base_url {base_url:?} must not be empty"));
     }
-    // Validate shape (scheme + host), but with no TLS assumption here — the caller applies
-    // `base_url_scheme` with the configured policy.
-    let (_, rest) = split_scheme(trimmed)
-        .ok_or_else(|| format!("base_url {base_url:?} must be an absolute http(s) URL"))?;
-    if rest.is_empty() || rest.starts_with('/') {
-        return Err(format!("base_url {base_url:?} has no host"));
-    }
-    reject_secret_bearing_url_parts(base_url, rest)?;
+    // Validate the whole shape (scheme, authority, path, secret parts), but with no TLS assumption
+    // here — the caller applies `base_url_scheme` with the configured policy.
+    parse_base_url(trimmed)?;
     if trimmed.ends_with("/v1") {
         return Ok(trimmed.to_string());
     }
@@ -793,6 +918,56 @@ mod tests {
             assert!(
                 normalize_provider_base_url(bad).is_err(),
                 "{bad:?} must be refused by normalization"
+            );
+        }
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, sol/alice): a URL shape that does not parse to exactly one
+    // unambiguous Chat Completions endpoint must be refused at the config boundary, not left for the
+    // broker to reject at dispatch. Each row below was reported by a reviewer as accepted at an
+    // earlier head; an implementation that only splits on `://` and tests a non-empty remainder
+    // accepts every one of them.
+    #[test]
+    fn base_url_refuses_malformed_authority_and_route_table() {
+        for bad in [
+            "https://:8080/v1",                        // empty host
+            "https://api.example:notaport/v1",         // non-numeric port
+            "https://api.example:/v1",                 // empty port
+            "https://[::1/v1",                         // unclosed IPv6 literal
+            "https://api.example /v1",                 // embedded space
+            "https://api.example/v1\r\nX-Evil: 1",     // CR/LF from a quoted YAML scalar
+            "https://api.example/a/%2f/b",             // percent-encoded path separator
+            "https://api.example/a/%5C/b",             // percent-encoded backslash
+            "https://api.example/a/%2e%2e/v1",         // encoded dot segment
+            "https://api.example/a/../v1",             // literal dot segment
+            "https://api.example/v1/chat/completions", // already-terminal route
+            "https://api.example/v1/chat/completions/",
+        ] {
+            assert!(
+                base_url_scheme(bad, false).is_err(),
+                "{bad:?} must be refused by the TLS-policy check"
+            );
+            assert!(
+                normalize_provider_base_url(bad).is_err(),
+                "{bad:?} must be refused by normalization"
+            );
+        }
+        // The well-formed shapes this check must NOT refuse: bracketed IPv6, an explicit port, and a
+        // path prefix other than `/v1`.
+        for good in [
+            "https://[::1]/v1",
+            "https://[::1]:8080/v1",
+            "https://api.example:8080/v1",
+            "https://api.example/inference/v1",
+        ] {
+            assert_eq!(
+                base_url_scheme(good, false),
+                Ok(BaseUrlScheme::Https),
+                "{good:?} must validate"
+            );
+            assert!(
+                normalize_provider_base_url(good).is_ok(),
+                "{good:?} must normalize"
             );
         }
     }

@@ -28,11 +28,11 @@ pub mod proctree;
 pub use harness::{
     BrokeredOpenCodeRefusal, CapabilityRefusal, CredentialTransport, Degradation, DispatchVerdict,
     EventFidelity, HARNESS_REGISTRY, Harness, HarnessCapabilities, HarnessId, HarnessKnobs,
-    HarnessRegistryEntry, HarnessSpec, McpSandboxCoupling, ProviderOrigins, ProviderProtocol,
-    ResolvedProviderPlan, Resume, SUPPORTED_OPENCODE_VERSIONS, Sandbox, StdinPolicy, Steering,
-    ToolEventGranularity, ToolNaming, UsageDetail, WorkRequirements, brokered_opencode_version_row,
-    check_brokered_opencode_controls, credential_transport, declared_capabilities,
-    harness_id_for_name, harness_supports_protocol, validate,
+    HarnessRegistryEntry, HarnessSpec, McpSandboxCoupling, ProviderLimits, ProviderOrigins,
+    ProviderProtocol, ResolvedProviderPlan, Resume, SUPPORTED_OPENCODE_VERSIONS, Sandbox,
+    StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail, WorkRequirements,
+    brokered_opencode_version_row, check_brokered_opencode_controls, credential_transport,
+    declared_capabilities, harness_id_for_name, harness_supports_protocol, validate,
 };
 pub use humanize::{LogEntry, humanize_stream_line};
 

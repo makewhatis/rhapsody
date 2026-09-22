@@ -49,7 +49,13 @@ use crate::workflow::{Definition, YamlMap};
 /// the front matter decodes — the typed `global` + `projects[]` view.
 pub fn render(def: &Definition) -> Value {
     let mut out = Map::new();
-    out.insert("config".to_string(), yaml_map_to_json(&def.config));
+    // The verbatim `config` echo is secret-safe by construction: the provider subtrees are filtered
+    // to the schema's known keys, so an unknown `credential.value`/`api_key` spelling can never be
+    // published by `GET /api/v1/config` even though `decode` already refuses it (STUDIO-984 review,
+    // sol). Every non-provider key is echoed unchanged, so provider-less configs stay byte-identical.
+    let mut config = yaml_map_to_json(&def.config);
+    sanitize_provider_blocks(&mut config);
+    out.insert("config".to_string(), config);
     out.insert(
         "prompt_body".to_string(),
         Value::String(def.prompt_template.clone()),
@@ -554,6 +560,86 @@ fn yaml_map_to_json(m: &YamlMap) -> Value {
     Value::Object(out)
 }
 
+/// The keys a `providers.<id>` block may legally carry (`RawProviderDefinition`). Anything else is
+/// dropped from the echoed `config` — in particular a secret-bearing `value`/`key`/`token` spelling.
+const ALLOWED_PROVIDER_KEYS: &[&str] = &[
+    "protocol",
+    "display_name",
+    "base_url",
+    "allow_insecure_http",
+    "credential",
+    "broker_limits",
+];
+const ALLOWED_CREDENTIAL_KEYS: &[&str] = &["source"];
+const ALLOWED_BROKER_LIMIT_KEYS: &[&str] = &[
+    "forwarded_requests_per_turn",
+    "denied_requests_before_revocation",
+    "concurrent_upstream_requests_per_turn",
+    "json_request_bytes",
+    "aggregate_request_bytes_per_turn",
+    "response_bytes_per_request",
+    "aggregate_response_bytes_per_turn",
+    "requested_output_tokens_per_request",
+    "reserved_token_units_per_turn",
+    "reserved_token_units_per_session",
+    "capability_lifetime_ms",
+    "max_reserved_token_units_per_utc_day",
+];
+
+/// Filters every `providers:` block in the echoed JSON `config` (global and per-project) down to the
+/// provider schema's known keys. Defense in depth: `decode` already refuses an unknown provider key
+/// (`deny_unknown_fields`), but the GET handler renders the parsed front matter WITHOUT decoding it
+/// first, so this is the boundary that keeps a secret-shaped key out of the response.
+fn sanitize_provider_blocks(root: &mut Value) {
+    let Value::Object(map) = root else {
+        return;
+    };
+    if let Some(Value::Object(providers)) = map.get_mut("providers") {
+        for def in providers.values_mut() {
+            sanitize_one_provider(def);
+        }
+    }
+    if let Some(Value::Array(projects)) = map.get_mut("projects") {
+        for project in projects.iter_mut() {
+            let Value::Object(pmap) = project else {
+                continue;
+            };
+            if let Some(Value::Object(providers)) = pmap.get_mut("providers") {
+                for def in providers.values_mut() {
+                    sanitize_one_provider(def);
+                }
+            }
+        }
+    }
+}
+
+/// Drops unknown keys from one provider object, its `credential` block and its `broker_limits` block.
+fn sanitize_one_provider(def: &mut Value) {
+    let Value::Object(obj) = def else {
+        return;
+    };
+    retain_keys(obj, ALLOWED_PROVIDER_KEYS);
+    if let Some(Value::Object(credential)) = obj.get_mut("credential") {
+        retain_keys(credential, ALLOWED_CREDENTIAL_KEYS);
+    }
+    if let Some(Value::Object(limits)) = obj.get_mut("broker_limits") {
+        retain_keys(limits, ALLOWED_BROKER_LIMIT_KEYS);
+    }
+}
+
+/// Removes every key of `obj` not named in `allowed` (serde_json's `Map::retain` is not guaranteed
+/// available on the pinned version, so this collects then removes).
+fn retain_keys(obj: &mut Map<String, Value>, allowed: &[&str]) {
+    let dropped: Vec<String> = obj
+        .keys()
+        .filter(|k| !allowed.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for k in dropped {
+        obj.remove(&k);
+    }
+}
+
 /// Convert one YAML value to its JSON equivalent, preserving integer-ness (Go's yaml.v3 →
 /// `map[string]any` → `encoding/json` keeps `int` as an integer, `bool` as a bool, etc.).
 fn yaml_value_to_json(v: &serde_yaml_ng::Value) -> Value {
@@ -712,7 +798,9 @@ mod tests {
             "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
             "agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
             "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
-            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            // A deliberately UN-normalized base (no `/v1`): the view must show the derived endpoint,
+            // so emitting the verbatim value reds this assertion.
+            "    base_url: https://api.fireworks.ai/inference\n",
             "    credential:\n      source: keychain\n",
         );
         let v = render_front(front, "body");
@@ -726,7 +814,7 @@ mod tests {
         assert_eq!(p["display_name"], "Fireworks");
         assert_eq!(
             p["base_url"], "https://api.fireworks.ai/inference/v1",
-            "the view carries the normalized endpoint"
+            "the view must carry the NORMALIZED endpoint, not the verbatim configured value"
         );
         assert_eq!(p["credential"]["source"], "keychain");
         assert_eq!(
@@ -746,5 +834,43 @@ mod tests {
                 "provider view leaked {forbidden:?}: {rendered}"
             );
         }
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, sol): a provider containing a secret-shaped unknown key must
+    // not appear in `GET /api/v1/config`. `decode` refuses it, but the GET handler renders the parsed
+    // front matter WITHOUT decoding it first, so `render` itself must drop it. Removing
+    // `sanitize_provider_blocks` from `render` reds this.
+    #[test]
+    fn rendered_config_never_publishes_a_provider_secret_key() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n",
+            "    credential:\n      source: keychain\n      value: sk-review-probe\n",
+        );
+        let v = render_front(front, "body");
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("sk-review-probe"),
+            "credential value leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"value\""),
+            "unknown credential key leaked: {rendered}"
+        );
+        assert_eq!(
+            v["config"]["providers"]["fireworks"]["credential"]["source"], "keychain",
+            "the known credential key must survive the filter"
+        );
+        // An unknown provider-level key and an unknown broker-limits key are dropped too.
+        let front2 = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n",
+            "    api_key: sk-review-probe\n    broker_limits:\n      token: sk-review-probe\n",
+        );
+        let rendered2 = render_front(front2, "body").to_string();
+        assert!(
+            !rendered2.contains("sk-review-probe"),
+            "secret leaked through an unknown provider/limits key: {rendered2}"
+        );
     }
 }

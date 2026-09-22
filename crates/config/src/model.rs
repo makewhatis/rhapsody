@@ -527,12 +527,18 @@ pub(crate) struct RawProviderBudget {
     pub daily_tokens: Option<i64>,
 }
 
+// The three provider raw structs below are the ONE exception to this file's "unknown keys are
+// ignored" convention. A provider block must be STRUCTURALLY unable to carry a reusable secret, and
+// `effective_json::render` echoes the parsed front matter verbatim, so an unknown key such as
+// `credential.value: sk-…` would otherwise decode, escape validation, and appear in the public
+// `GET /api/v1/config` response. They therefore reject unknown fields outright (`deny_unknown_fields`).
+
 /// Raw `providers.<id>` entry (STUDIO-984). Rhapsody-only, and deliberately secret-free: there is
 /// no value/token/key field, and none may be added. `allow_insecure_http` is `Option` so an absent
 /// value is distinguishable from an explicit `false` (both decode to `false`); `broker_limits` is
 /// `Option` so an absent block materializes the V1 default column.
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RawProviderDefinition {
     pub protocol: String,
     pub display_name: String,
@@ -543,18 +549,19 @@ pub(crate) struct RawProviderDefinition {
 }
 
 /// Raw `providers.<id>.credential` entry. `source` names a storage KIND; never an account, never a
-/// value.
+/// value. Unknown keys are refused so a `value`/`key`/`token` spelling cannot smuggle a secret into
+/// the config view.
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RawCredentialRef {
     pub source: String,
 }
 
 /// Raw `providers.<id>.broker_limits` entry. Every field is `Option` so `decode` can tell an absent
 /// value (materialize the default) from an explicit one (validate it, including explicit `0`, which
-/// must be refused).
+/// must be refused). Unknown keys are refused for the same reason as the two structs above.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RawBrokerLimits {
     pub forwarded_requests_per_turn: Option<u32>,
     pub denied_requests_before_revocation: Option<u32>,

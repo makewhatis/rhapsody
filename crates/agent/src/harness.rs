@@ -145,20 +145,63 @@ impl ProviderProtocol {
     }
 }
 
+/// The pure, non-secret validated broker limits carried by a [`ResolvedProviderPlan`]
+/// (`provider-broker-design.md` §3.1's `limits`).
+///
+/// The config-side `rhapsody_config::BrokerLimits` is the authoritative definition; this crate must
+/// not depend on `rhapsody-config` at runtime, so the fields are mirrored here and a cross-crate pin
+/// test asserts the defaults agree field-for-field. PB5 lowers a plan's `limits` into the broker's
+/// own `BrokerLimits`/`BrokerRegistrationPlan`; keeping the block on the plan means PB5 needs no
+/// second input and cannot re-derive (or drift from) the config defaults.
+///
+/// A raw reusable key is unrepresentable: every field is a number or `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderLimits {
+    pub forwarded_requests_per_turn: u32,
+    pub denied_requests_before_revocation: u32,
+    pub concurrent_upstream_requests_per_turn: u32,
+    pub json_request_bytes: u64,
+    pub aggregate_request_bytes_per_turn: u64,
+    pub response_bytes_per_request: u64,
+    pub aggregate_response_bytes_per_turn: u64,
+    pub requested_output_tokens_per_request: u64,
+    pub reserved_token_units_per_turn: u64,
+    pub reserved_token_units_per_session: u64,
+    pub capability_lifetime_ms: u64,
+    /// Optional durable UTC-day cap; `None` means no Rhapsody daily cap.
+    pub max_reserved_token_units_per_utc_day: Option<u64>,
+}
+
+impl Default for ProviderLimits {
+    /// The V1 default column (`provider-broker-design.md` §8.1) with no daily cap. Kept identical to
+    /// `rhapsody_config::BrokerLimits::default()` by `provider_limits_agree_with_the_config_crate`.
+    fn default() -> Self {
+        Self {
+            forwarded_requests_per_turn: 64,
+            denied_requests_before_revocation: 16,
+            concurrent_upstream_requests_per_turn: 4,
+            json_request_bytes: 8 * 1024 * 1024,
+            aggregate_request_bytes_per_turn: 32 * 1024 * 1024,
+            response_bytes_per_request: 16 * 1024 * 1024,
+            aggregate_response_bytes_per_turn: 64 * 1024 * 1024,
+            requested_output_tokens_per_request: 32_000,
+            reserved_token_units_per_turn: 1_000_000,
+            reserved_token_units_per_session: 20_000_000,
+            capability_lifetime_ms: 3_600_000,
+            max_reserved_token_units_per_utc_day: None,
+        }
+    }
+}
+
 /// The pure, non-secret result of selecting and normalizing a provider for one dispatch
 /// (`provider-auth-design.md` §3's `ResolvedProviderPlan`; STUDIO-984 owns this shape, PB5 owns
 /// `PreparedProvider`).
 ///
 /// **A raw reusable API key is unrepresentable here** — there is no value/token/key field, and none
 /// may be added. The plan carries only stable metadata, the normalized endpoint, the canonical
-/// credential *binding identity*, a credential *source kind*, and the model/provider/origin inputs
-/// P4/PB5 need. `credential_binding`/`credential_ref` are non-secret identifiers: the binding names
-/// WHICH credential to read, never the credential itself.
-///
-/// The design's §3.1 sketch also lists broker `limits`; those stay on the config-side
-/// `rhapsody_config::ProviderDefinition` and are lowered by PB5 into the broker's own
-/// `BrokerRegistrationPlan`, so this crate does not duplicate (and cannot drift from) the limit
-/// constants. §3.2 explicitly allows the Rust spelling to differ.
+/// credential *binding identity*, a credential *source kind*, the validated broker limits, and the
+/// model/provider/origin inputs P4/PB5 need. `credential_binding`/`credential_ref` are non-secret
+/// identifiers: the binding names WHICH credential to read, never the credential itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProviderPlan {
     /// The canonical operator-chosen provider id (the cross-surface identifier contract).
@@ -173,6 +216,8 @@ pub struct ResolvedProviderPlan {
     pub credential_binding: String,
     /// The credential *source kind* (e.g. `keychain`). Never an account and never a value.
     pub credential_ref: String,
+    /// The validated broker limits PB5 lowers into the broker's registration plan.
+    pub limits: ProviderLimits,
     /// The exact model selection, preserved for P4/PB5.
     pub model: String,
     /// Where each field came from, preserved for P4.
@@ -787,7 +832,14 @@ mod tests {
             "ResolvedProviderPlan { stable_id: \"fireworks\", protocol: OpenAiCompatible, \
              normalized_endpoint: \"https://api.example/v1\", allow_insecure_http: false, \
              credential_binding: \"fireworks\\u{1f}openai-chat-completions-bearer-v1\\u{1f}https://api.example/v1\", \
-             credential_ref: \"keychain\", model: \"m\", origins: ProviderOrigins { provider: \"global\", model: \"global\" } }",
+             credential_ref: \"keychain\", limits: ProviderLimits { forwarded_requests_per_turn: 64, \
+             denied_requests_before_revocation: 16, concurrent_upstream_requests_per_turn: 4, \
+             json_request_bytes: 8388608, aggregate_request_bytes_per_turn: 33554432, \
+             response_bytes_per_request: 16777216, aggregate_response_bytes_per_turn: 67108864, \
+             requested_output_tokens_per_request: 32000, reserved_token_units_per_turn: 1000000, \
+             reserved_token_units_per_session: 20000000, capability_lifetime_ms: 3600000, \
+             max_reserved_token_units_per_utc_day: None }, model: \"m\", \
+             origins: ProviderOrigins { provider: \"global\", model: \"global\" } }",
             "ResolvedProviderPlan's Debug shape changed; if a field was added, justify it and \
              confirm it cannot carry a reusable secret"
         );
@@ -804,6 +856,7 @@ mod tests {
                 "fireworks\u{1f}openai-chat-completions-bearer-v1\u{1f}https://api.example/v1"
                     .to_string(),
             credential_ref: "keychain".to_string(),
+            limits: ProviderLimits::default(),
             model: "m".to_string(),
             origins: ProviderOrigins {
                 provider: "global".to_string(),
@@ -1254,6 +1307,76 @@ mod tests {
         assert_eq!(
             ProviderProtocol::OpenAiCompatible.adapter_id(),
             rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1
+        );
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review, sol): the canonical credential-binding adapter identity
+    /// is ONE value used by config, agent AND broker registration. Comparing agent's literal to
+    /// config's constant was not enough — renaming the broker's `canonical_id` (which is actually
+    /// hashed into the binding fingerprint) left every test green. This compares all three crates.
+    #[test]
+    fn canonical_adapter_identity_agrees_across_config_agent_and_broker() {
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.adapter_id(),
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1
+        );
+        assert_eq!(
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1,
+            rhapsody_provider_broker::BrokerProtocol::OpenAiChatCompletions.canonical_id(),
+            "the broker hashes this id into its credential binding, so it must be the same value"
+        );
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review, sol): `ResolvedProviderPlan.limits` carries the validated
+    /// V1 default column, not a second, divergent copy. There is no shared type across the layering
+    /// (broker must not depend on config; agent must not depend on config at runtime), so this
+    /// asserts the agent mirror equals config's default field-for-field — changing a default in one
+    /// crate reds it.
+    #[test]
+    fn provider_limits_agree_with_the_config_crate() {
+        let ours = ProviderLimits::default();
+        let theirs = rhapsody_config::BrokerLimits::default();
+        assert_eq!(
+            ours.forwarded_requests_per_turn,
+            theirs.forwarded_requests_per_turn
+        );
+        assert_eq!(
+            ours.denied_requests_before_revocation,
+            theirs.denied_requests_before_revocation
+        );
+        assert_eq!(
+            ours.concurrent_upstream_requests_per_turn,
+            theirs.concurrent_upstream_requests_per_turn
+        );
+        assert_eq!(ours.json_request_bytes, theirs.json_request_bytes);
+        assert_eq!(
+            ours.aggregate_request_bytes_per_turn,
+            theirs.aggregate_request_bytes_per_turn
+        );
+        assert_eq!(
+            ours.response_bytes_per_request,
+            theirs.response_bytes_per_request
+        );
+        assert_eq!(
+            ours.aggregate_response_bytes_per_turn,
+            theirs.aggregate_response_bytes_per_turn
+        );
+        assert_eq!(
+            ours.requested_output_tokens_per_request,
+            theirs.requested_output_tokens_per_request
+        );
+        assert_eq!(
+            ours.reserved_token_units_per_turn,
+            theirs.reserved_token_units_per_turn
+        );
+        assert_eq!(
+            ours.reserved_token_units_per_session,
+            theirs.reserved_token_units_per_session
+        );
+        assert_eq!(ours.capability_lifetime_ms, theirs.capability_lifetime_ms);
+        assert_eq!(
+            ours.max_reserved_token_units_per_utc_day,
+            theirs.max_reserved_token_units_per_utc_day
         );
     }
 

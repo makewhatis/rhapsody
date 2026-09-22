@@ -18,10 +18,14 @@ pub enum BrokerProtocol {
 }
 
 impl BrokerProtocol {
-    /// The stable, non-secret canonical identifier hashed into a credential binding.
+    /// The stable, non-secret canonical identifier hashed into a credential binding. It is the
+    /// reviewed adapter identity (`provider-auth-design.md` §2.2 / `provider-broker-design.md`
+    /// §3.1), and must equal `rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1` and
+    /// `rhapsody_agent::ProviderProtocol::adapter_id()`: one binding is used identically by desktop
+    /// storage, credential reads, and broker registration.
     pub const fn canonical_id(self) -> &'static str {
         match self {
-            BrokerProtocol::OpenAiChatCompletions => "openai_chat_completions_v1",
+            BrokerProtocol::OpenAiChatCompletions => "openai-chat-completions-bearer-v1",
         }
     }
 }
@@ -278,7 +282,7 @@ mod tests {
     fn protocol_has_stable_canonical_id() {
         assert_eq!(
             BrokerProtocol::OpenAiChatCompletions.canonical_id(),
-            "openai_chat_completions_v1"
+            "openai-chat-completions-bearer-v1"
         );
     }
 }
