@@ -25,9 +25,17 @@ pub enum MutationOutcome {
     AlreadyAbsent(Revision),
 }
 
-/// One CAS mutation's failure. Every variant leaves the owner's state and revision untouched: a
-/// stale revision, a changed precondition, a denied/locked owner, and a value that violates the
-/// broker's bounds are all typed refusals, never a partial write.
+/// One CAS mutation's failure. No variant writes a partial secret: a stale revision, a changed
+/// precondition, a denied/locked owner, and a value that violates the broker's bounds are all typed
+/// refusals, never a partial write.
+///
+/// The owner's SECRET state is left untouched by every variant, but the opaque [`Revision`] is not
+/// universally frozen: an availability transition observed *during* the attempt advances it (design
+/// §2.5 — those transitions must change the revision so a refusal gate re-arms). [`StaleRevision`]
+/// carries whatever the current revision then is; a [`DeniedOrLocked`](MutationError::DeniedOrLocked)
+/// caller is not told the new value, so it must re-`read_bound` before retrying rather than reuse the
+/// revision it passed in — the unlock is itself a second transition, so a blind retry at the old
+/// revision is refused with `StaleRevision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationError {
     /// `expected_revision` did not match the owner's actual current revision — covers a stale

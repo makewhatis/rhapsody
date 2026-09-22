@@ -134,14 +134,10 @@ impl BoundCredentialLease {
         // `String`'s own `Zeroize` impl routes through `Vec<u8>`, whose impl zeroes the initialized
         // elements and then *clears* the vector (`zeroize-1.9.0` `Vec<Z>::zeroize`). That leaves an
         // empty string, so any `bytes().all(|b| b == 0)` assertion over it is vacuously true and a
-        // mutation that merely `clear()`s would pass. Zeroing the `Vec`'s SLICE directly keeps the
-        // length, so every original byte becomes a NUL and the wipe is observable at the value's real
-        // size.
-        //
-        // SAFETY: this only writes zero bytes, which are valid UTF-8, so the `String` invariant
-        // ("always valid UTF-8") is preserved. This mirrors `zeroize`'s own `String` impl, minus its
-        // length-clearing step.
-        unsafe { self.value.as_mut_vec() }.as_mut_slice().zeroize();
+        // mutation that merely `clear()`s would pass. `zeroize`'s `str` impl (safe) writes NULs into
+        // the fixed-length slice instead, so every original byte becomes a NUL and the wipe is
+        // observable at the value's real size — no `unsafe` needed (alice's review of rhapsody#221).
+        self.value.as_mut_str().zeroize();
     }
 
     /// Consume the lease and move its value into PB1's protocol-neutral, move-only

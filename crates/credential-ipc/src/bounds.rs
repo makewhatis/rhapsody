@@ -37,9 +37,11 @@ pub fn validate_envelope_size(raw: &str) -> Result<(), CredentialRejection> {
 mod tests {
     use super::*;
 
-    // The pre-storage bound and the broker's registration-time bound are the SAME rule: drive one
-    // table through both and assert identical verdicts. If PB1's validator is ever loosened or
-    // tightened, this test sees the change immediately rather than letting the owner drift.
+    // `BoundCredentialLease::new` delegates to PB1's `validate_api_key_value`, and the owner's
+    // pre-storage check re-exports that SAME function. This test cannot fail while both keep
+    // delegating to one validator — which is the point: it pins that there is exactly ONE rule
+    // (so a loosened or tightened bound reaches the owner and the broker together, never drifting
+    // apart), not that two independently-written rules happen to agree.
     #[test]
     fn the_owner_bound_is_pb1s_bound_for_every_shape() {
         let too_long = vec![b'a'; MAX_API_KEY_BYTES + 1];

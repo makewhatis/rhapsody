@@ -60,11 +60,6 @@ mod compile_guards {
     // compile if a future change adds `Clone`, `Serialize`, `Deserialize`, `Display`, `Deref`,
     // `AsRef<str>`, or `Borrow<str>` to the lease, or `Clone`/`Serialize`/`Deserialize`/`Copy` to
     // the state enum. `Debug` stays allowed (it redacts), and is pinned by `domain`'s canary test.
-    //
-    // This guards the *trait-based* ways a value could leak (an ordinary `&self` getter is not a
-    // trait impl and cannot be rejected by a negative impl — it is closed instead by construction:
-    // the lease exposes no `&self` value-returning method at all, only the consuming transfers
-    // `into_broker_lease`/`into_lease_payload`). Keep that property in review.
     assert_not_impl_any!(
         BoundCredentialLease:
             Clone,
@@ -76,6 +71,55 @@ mod compile_guards {
             std::fmt::Display
     );
     assert_not_impl_any!(CredentialState: Clone, serde::Serialize, serde::de::DeserializeOwned, Copy);
+
+    // The other half of that mutation discipline — "add a String getter on the lease; ... must
+    // fail" — cannot be expressed as a negative impl, because an INHERENT `&self` method is not a
+    // trait impl. It is instead pinned by method-resolution order: an inherent method always
+    // shadows a trait method of the same name. If someone adds, say,
+    // `pub fn get(&self) -> String { self.value.clone() }`, then `lease.get()` in the test below
+    // resolves to that inherent method and stops being `NotABorrowedString`, so THIS MODULE FAILS
+    // TO COMPILE. A build failure reddens the whole crate, which is the strongest form of the guard
+    // the ticket asks for. The names are deliberately ugly so the error is self-explanatory.
+    struct NotABorrowedString;
+
+    trait MustNotExposeABorrowedString {
+        fn get(&self) -> NotABorrowedString;
+        fn value(&self) -> NotABorrowedString;
+        fn secret(&self) -> NotABorrowedString;
+        fn as_str(&self) -> NotABorrowedString;
+    }
+
+    impl MustNotExposeABorrowedString for BoundCredentialLease {
+        fn get(&self) -> NotABorrowedString {
+            NotABorrowedString
+        }
+        fn value(&self) -> NotABorrowedString {
+            NotABorrowedString
+        }
+        fn secret(&self) -> NotABorrowedString {
+            NotABorrowedString
+        }
+        fn as_str(&self) -> NotABorrowedString {
+            NotABorrowedString
+        }
+    }
+
+    #[test]
+    fn the_lease_exposes_no_borrowing_string_getter() {
+        // Constructing a lease here is fine; the guard is the METHOD RESOLUTION of the calls below.
+        let lease = BoundCredentialLease::new(
+            crate::domain::Binding {
+                provider_id: "p".into(),
+                adapter: crate::domain::OPENAI_CHAT_COMPLETIONS_BEARER_V1.into(),
+                base_url: "https://x/v1".into(),
+            },
+            "sk-guard".to_owned(),
+        );
+        let _: NotABorrowedString = lease.get();
+        let _: NotABorrowedString = lease.value();
+        let _: NotABorrowedString = lease.secret();
+        let _: NotABorrowedString = lease.as_str();
+    }
 
     #[test]
     fn package_builds() {}

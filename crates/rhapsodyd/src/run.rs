@@ -112,8 +112,20 @@ where
     // Fully decoupled from the rest of boot (a detached task, not awaited here) — a slow/absent
     // bootstrap can never delay the observability server, the control loop, or shutdown, and this
     // crate's own hermetic tests (which never pass the flag) never touch stdin at all.
-    if flags.credential_bootstrap {
+    //
+    // The daemon's ONE credential boundary — a single `CredentialResolver` that owns the availability
+    // tracker (and, once the frame is learned, the channel) — is created HERE rather than inside the
+    // per-read call, and bound to this local so it is retained for the whole of `run` (the process
+    // lifetime). A tracker rebuilt per read could never observe an availability/authorization
+    // transition, which is exactly the defect sol's review of rhapsody#221 found. The detached task
+    // below performs the first read; PB7's prepared dispatch is expected to read through this same
+    // `Arc`. The binding is intentionally underscore-named: it is held, not otherwise consulted yet.
+    let _credential_owner_boundary: Option<
+        std::sync::Arc<crate::credential_client::CredentialResolver>,
+    > = if flags.credential_bootstrap {
         let probe = flags.credential_probe.clone();
+        let resolver = std::sync::Arc::new(crate::credential_client::CredentialResolver::new());
+        let task_resolver = std::sync::Arc::clone(&resolver);
         tokio::spawn(async move {
             match probe {
                 Some(CredentialProbe { account, binding }) => {
@@ -121,12 +133,9 @@ where
                     // `read_bound`. `connect` alone never proves authentication (the server gives
                     // unauthorized connections no response at all — see
                     // `credential_bootstrap::serve_one`), so only a completed `read_bound` can. Logs
-                    // only the resulting non-secret state tag + revision, never the credential. The
-                    // resolver tracks availability across calls (one here); a daemon that holds it
-                    // per-dispatch gets the transition-advancing revision PB7's refusal gate needs.
-                    let read = crate::credential_client::CredentialResolver::new()
-                        .resolve(tokio::io::stdin(), account, binding)
-                        .await;
+                    // only the resulting non-secret state tag + revision, never the credential.
+                    task_resolver.learn_bootstrap(tokio::io::stdin()).await;
+                    let read = task_resolver.read_bound(account, binding).await;
                     tracing::info!(
                         state = ?read.state.tag(),
                         revision = read.revision.0,
@@ -161,7 +170,10 @@ where
                 },
             }
         });
-    }
+        Some(resolver)
+    } else {
+        None
+    };
 
     // The fleet hub is HTTP-only; grpc paths 404. Warn once when grpc is selected + export is on.
     if otel_cfg.enabled && otel_cfg.protocol == "grpc" {

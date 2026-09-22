@@ -1016,6 +1016,48 @@ mod tests {
         );
     }
 
+    // §2.5 + `MutationError`'s contract: a mutation that observes an availability transition fails
+    // typed, writes nothing, and — because the ticket requires the transition to change the revision
+    // so a refusal gate re-arms — advances the revision even though the operation failed. The
+    // `DeniedOrLocked` error carries no revision, so a caller must re-read before retrying; a blind
+    // retry at the old revision is refused by the unlock transition's own bump. This pins the
+    // behaviour alice's review of rhapsody#221 found the old doc contradicting.
+    #[test]
+    fn a_mutation_denied_by_an_availability_transition_advances_the_revision() {
+        let kr = ToggleKeyring::new(MockKeyring::empty());
+        let owner = ProviderCredentialOwner::with_keyring(&test_ref(), kr.clone());
+        let b = binding("https://api.example/v1");
+        // Reachable and absent: the first classification, so `last_reachable` is `Some(true)` and
+        // r0 is Revision(0).
+        let r0 = owner.read_bound(&b).revision;
+        assert_eq!(r0, Revision::INITIAL);
+
+        kr.set_reachable(false);
+        let err = owner
+            .connect(r0, b.clone(), "sk-1".into())
+            .expect_err("a denied owner cannot mutate");
+        assert_eq!(err, MutationError::DeniedOrLocked);
+        let denied = owner.current_revision();
+        assert!(
+            denied > r0,
+            "the observed availability transition must advance the revision even on a failed mutation"
+        );
+
+        // The unlock is itself a further transition, observed on the NEXT owner access; a caller that
+        // blindly retries with `r0` is therefore refused, which is exactly why the doc tells it to
+        // re-read. Nothing was ever written.
+        kr.set_reachable(true);
+        let stale = owner
+            .connect(r0, b.clone(), "sk-1".into())
+            .expect_err("unlock moved the revision again");
+        let after = match stale {
+            MutationError::StaleRevision(r) => r,
+            other => panic!("expected StaleRevision, got {other:?}"),
+        };
+        assert!(after > denied, "unlock is itself a further transition");
+        assert_eq!(owner.read_bound(&b).state.tag(), CredentialStateTag::Absent);
+    }
+
     // --- Behavior across a simulated desktop/daemon restart ---------------------------------------
 
     // A "restart" is a fresh `ProviderCredentialOwner` over the SAME persisted Keychain backend
