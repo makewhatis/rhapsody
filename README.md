@@ -2572,9 +2572,11 @@ config goldens and an old-vs-new round-trip test.
   protocol to a registry row without teaching config reds that test rather than drifting silently.
 - **The defaulted broker-limits column is not pinned into the file.** A provider with no
   `broker_limits:` block is validated against the V1 defaults (with the capability lifetime bounded
-  by OpenCode's effective turn deadline, `min(1h, deadline)`) but `encode` omits the block, so a
-  console Save does not freeze today's defaults into an operator's `WORKFLOW.md`. An explicit block
-  round-trips verbatim.
+  by OpenCode's effective turn deadline, `min(1h, deadline)`) but `encode` emits only the fields that
+  differ from the values the decoder would derive from that same deadline — on any deadline, including
+  a sub-hour one — so a console Save never freezes today's defaults (or a derived lifetime) into an
+  operator's `WORKFLOW.md`. An explicit block round-trips verbatim; a partial block keeps only its
+  explicitly-set fields.
 - **Brokered OpenCode is version-gated and fail-closed.** The supported-version table is
   single-sourced from the PB0 probe (`1.18.30` / `@ai-sdk/openai-compatible` `2.0.41`), and the
   initial row accepts only an empty or `build` `opencode.agent`, an empty `variant`, an

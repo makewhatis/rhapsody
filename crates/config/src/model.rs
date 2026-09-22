@@ -553,7 +553,7 @@ pub(crate) struct RawCredentialRef {
 /// Raw `providers.<id>.broker_limits` entry. Every field is `Option` so `decode` can tell an absent
 /// value (materialize the default) from an explicit one (validate it, including explicit `0`, which
 /// must be refused).
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawBrokerLimits {
     pub forwarded_requests_per_turn: Option<u32>,

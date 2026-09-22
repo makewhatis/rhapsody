@@ -922,21 +922,14 @@ mod tests {
                 "{id:?} must be rejected by the credential owner too"
             );
         }
-        // The derived accounts and binding fields are identical across the two crates.
+        // The derived Keychain account is the ONLY value both crates compute independently, so it is
+        // the real cross-crate pin; `CredentialRef::account()` (the owner crate) must equal ours.
         let binding = provider("fireworks", "https://api.example/v1", false)
             .credential_binding()
             .unwrap();
         let ipc =
             rhapsody_credential_ipc::domain::CredentialRef::for_provider("fireworks").unwrap();
         assert_eq!(binding.keychain_account(), ipc.account());
-        let ipc_binding = rhapsody_credential_ipc::domain::Binding {
-            provider_id: binding.provider_id.clone(),
-            adapter: binding.adapter.clone(),
-            base_url: binding.base_url.clone(),
-        };
-        assert_eq!(ipc_binding.provider_id, binding.provider_id);
-        assert_eq!(ipc_binding.adapter, binding.adapter);
-        assert_eq!(ipc_binding.base_url, binding.base_url);
     }
 
     // Broker limits: the default column materializes exactly, and the daily cap has no implicit
