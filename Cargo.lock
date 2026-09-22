@@ -1647,6 +1647,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhapsody-credential-ipc"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "rhapsody-httpapi"
 version = "0.1.0"
 dependencies = [
