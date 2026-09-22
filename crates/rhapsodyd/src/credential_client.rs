@@ -381,7 +381,9 @@ mod tests {
             .expect("read_bound");
         assert_eq!(read.revision, Revision(3));
         match read.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-secret"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-secret")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
         server.await.unwrap();
@@ -613,7 +615,9 @@ mod tests {
         let read = resolve_credential(rx, "v1:spike-test-provider".into(), binding).await;
         assert_eq!(read.revision, Revision(9));
         match read.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-resolved"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-resolved")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
 

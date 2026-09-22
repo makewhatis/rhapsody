@@ -23,16 +23,24 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use rhapsody_credential_ipc::bounds;
 use rhapsody_credential_ipc::domain::{
     Binding, BoundCredentialLease, CredentialRead, CredentialRef, CredentialState, Revision,
 };
+use rhapsody_credential_ipc::owner::{CredentialOwner, CredentialStatus};
+
+// The typed mutation vocabulary now lives at the shared crate/process boundary (P1) so the daemon
+// and desktop agree on it; re-exported here for the callers that already name these paths.
+pub use rhapsody_credential_ipc::owner::{MutationError, MutationOutcome};
 
 use crate::credential::{Keyring, KeyringError, OsKeyring};
 
 /// The envelope actually persisted in the Keychain item (design §2.4). `version`/`kind` are pinned
 /// to the only currently-supported shape (`1`/`"api_key"`); anything else — or a value that fails
 /// to parse as this shape at all — decodes as [`CredentialState::Malformed`], not `Absent`.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+// No `Clone`: the `value` is a secret, and a derived clone would silently create a second, un-owned
+// copy of it beyond the one `BoundCredentialLease`/`Envelope` zeroizes.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Envelope {
     version: u32,
     kind: String,
@@ -59,31 +67,6 @@ enum Snapshot {
 /// could act on differently than simply continuing with the value as it stood.
 fn lock_revision(m: &Mutex<Revision>) -> MutexGuard<'_, Revision> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// One CAS mutation's success outcome (§2.5's table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationOutcome {
-    /// The mutation applied; the owner's revision is now this value.
-    Advanced(Revision),
-    /// Remove against an already-`Absent` credential: no state change, per §2.5's table — the
-    /// returned revision is the unchanged current one.
-    AlreadyAbsent(Revision),
-}
-
-/// One CAS mutation's failure. Every variant leaves the owner's state and revision untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationError {
-    /// `expected_revision` did not match the owner's actual current revision — covers a stale
-    /// read, a concurrent conflicting mutation, and a previously failed/rolled-back attempt alike.
-    /// Carries the real current revision so a caller can decide whether to retry.
-    StaleRevision(Revision),
-    /// The expected revision matched, but this operation's state precondition did not (e.g.
-    /// Connect against a `Present` item, Replace/Rebind against `Absent`, Replace against a
-    /// binding mismatch, or Replace/Rebind against `Malformed` data).
-    PreconditionFailed,
-    /// The Keychain itself refused the read/write right now (locked or access denied).
-    DeniedOrLocked,
 }
 
 /// Owns exactly one provider credential's Keychain item and in-memory revision. `keyring` is
@@ -185,9 +168,32 @@ impl ProviderCredentialOwner {
             Snapshot::Present(env) if env.binding == *expected_binding => {
                 CredentialState::Present(BoundCredentialLease::new(env.binding, env.value))
             }
-            Snapshot::Present(_) => CredentialState::BindingMismatch,
+            Snapshot::Present(env) => {
+                // The value was decoded while checking the binding; on a mismatch it must be
+                // zeroized before the mismatch leaves the boundary (§2.5). Routing it through the
+                // shared lease and dropping it immediately does exactly that, so the mismatch arm
+                // never leaves key bytes in a bare `String`.
+                drop(BoundCredentialLease::new(env.binding, env.value));
+                CredentialState::BindingMismatch
+            }
         };
         CredentialRead { revision, state }
+    }
+
+    /// The owner's configured/unconfigured status, without ever returning the value (§2.5). A
+    /// decoded value observed while classifying is zeroized on the way out, exactly as the
+    /// `BindingMismatch` arm of `read_bound` does.
+    pub fn status(&self) -> CredentialStatus {
+        let guard = lock_revision(&self.revision);
+        let (_revision, snapshot) = self.locked_snapshot(&guard);
+        match snapshot {
+            Snapshot::Present(env) => {
+                drop(BoundCredentialLease::new(env.binding, env.value));
+                CredentialStatus::Configured
+            }
+            Snapshot::Absent => CredentialStatus::Unconfigured,
+            Snapshot::Malformed | Snapshot::DeniedOrLocked => CredentialStatus::Unavailable,
+        }
     }
 
     /// Connect: requires `Absent` at `expected_revision`. Stores `value` under `binding`.
@@ -298,7 +304,14 @@ impl ProviderCredentialOwner {
         *lock_revision(&self.revision)
     }
 
+    /// Validate the candidate value and the serialized envelope against the broker's exact
+    /// size/syntax bounds BEFORE anything is written, then store it. A violation is a typed
+    /// [`MutationError::InvalidValue`] and the value is never trimmed, rewritten, or stored (§2.5 /
+    /// PB1 §3.2). The envelope-size check runs on the exact bytes about to be persisted, so a
+    /// value that fits the API-key cap can still be refused when its binding pushes the envelope
+    /// over the independent envelope cap.
     fn store_envelope(&self, binding: Binding, value: String) -> Result<(), MutationError> {
+        bounds::validate_api_key_value(value.as_bytes()).map_err(MutationError::InvalidValue)?;
         let envelope = Envelope {
             version: ENVELOPE_VERSION,
             kind: ENVELOPE_KIND.to_string(),
@@ -306,9 +319,54 @@ impl ProviderCredentialOwner {
             binding,
         };
         let raw = serde_json::to_string(&envelope).map_err(|_| MutationError::DeniedOrLocked)?;
+        bounds::validate_envelope_size(&raw).map_err(MutationError::InvalidValue)?;
         self.keyring
             .set_password(&raw)
             .map_err(|_| MutationError::DeniedOrLocked)
+    }
+}
+
+/// The owner implements the shared [`CredentialOwner`] abstraction (P1) — the crate/process
+/// boundary the daemon and desktop build units both program against. The inherent methods above are
+/// the implementation; this impl exposes them through the trait so a consumer can hold a
+/// `dyn CredentialOwner` without knowing about the Keychain.
+impl CredentialOwner for ProviderCredentialOwner {
+    fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
+        ProviderCredentialOwner::read_bound(self, expected_binding)
+    }
+
+    fn connect(
+        &self,
+        expected_revision: Revision,
+        binding: Binding,
+        value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::connect(self, expected_revision, binding, value)
+    }
+
+    fn replace(
+        &self,
+        expected_revision: Revision,
+        current_binding: &Binding,
+        new_value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::replace(self, expected_revision, current_binding, new_value)
+    }
+
+    fn rebind(
+        &self,
+        expected_revision: Revision,
+        new_binding: Binding,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::rebind(self, expected_revision, new_binding)
+    }
+
+    fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::remove(self, expected_revision)
+    }
+
+    fn status(&self) -> CredentialStatus {
+        ProviderCredentialOwner::status(self)
     }
 }
 
@@ -364,7 +422,9 @@ mod tests {
         let ok = owner.read_bound(&want);
         assert_eq!(ok.state.tag(), CredentialStateTag::Present);
         match ok.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-secret"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-secret")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
 
@@ -417,7 +477,11 @@ mod tests {
         );
         match owner.read_bound(&b).state {
             CredentialState::Present(lease) => {
-                assert_eq!(lease.expose_secret(), "sk-1", "value must be untouched")
+                assert_eq!(
+                    lease.expose_for_broker(str::to_owned),
+                    "sk-1",
+                    "value must be untouched"
+                )
             }
             other => panic!("expected Present, got {other:?}"),
         }
@@ -454,7 +518,9 @@ mod tests {
         };
         assert!(r2 > r1);
         match owner.read_bound(&b).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-2"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-2")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
     }
@@ -523,7 +589,9 @@ mod tests {
         owner.rebind(r1, target.clone()).expect("rebind");
 
         match owner.read_bound(&target).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
             other => panic!("expected Present under the new binding, got {other:?}"),
         }
     }
@@ -667,7 +735,9 @@ mod tests {
             "no failed CAS attempt may advance the revision"
         );
         match owner.read_bound(&b).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
             other => panic!("expected untouched Present, got {other:?}"),
         }
     }
@@ -789,7 +859,9 @@ mod tests {
         let removed = remove_handle.join().expect("remove thread");
 
         match &blocked_snapshot.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
             other => panic!(
                 "a read already in flight when Remove starts must still observe the pre-Remove \
                  value as a self-consistent snapshot, got {other:?}"
@@ -836,7 +908,9 @@ mod tests {
 
         // The persisted secret is still readable under its original binding...
         match after_restart.read_bound(&original).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
             other => panic!("expected Present to survive restart, got {other:?}"),
         }
         // ...but a changed canonical endpoint reports BindingMismatch, not a lease.
@@ -853,7 +927,9 @@ mod tests {
             .rebind(post_restart_revision, changed.clone())
             .expect("rebind after restart");
         match after_restart.read_bound(&changed).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
             other => panic!("expected Present under the new binding, got {other:?}"),
         }
     }
@@ -870,5 +946,168 @@ mod tests {
         let read = owner.read_bound(&b);
         let rendered = format!("{read:?}");
         assert!(!rendered.contains("sk-super-secret"), "leaked: {rendered}");
+    }
+
+    // --- Broker bounds enforced before storage (P1 acceptance / §2.5) ---------------------------
+
+    // Mutation discipline: if the bounds check is moved after the write (or dropped), this test
+    // fails because the refusals stop happening and/or a value lands in the Keychain.
+    #[test]
+    fn connect_refuses_an_out_of_bounds_value_before_storing_anything() {
+        let kr = MockKeyring::empty();
+        let owner = owner_over(kr.clone());
+        let b = binding("https://api.example/v1");
+        let cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("space", "sk key with a space".into()),
+            ("control", "sk\nkey".into()),
+            ("too long", "a".repeat(bounds::MAX_API_KEY_BYTES + 1)),
+        ];
+        for (name, bad) in cases {
+            let err = owner
+                .connect(Revision::INITIAL, b.clone(), bad)
+                .expect_err("an out-of-bounds value must be refused");
+            assert!(
+                matches!(err, MutationError::InvalidValue(_)),
+                "{name}: expected InvalidValue, got {err:?}"
+            );
+        }
+        assert_eq!(
+            owner.current_revision(),
+            Revision::INITIAL,
+            "no refused write may advance the revision"
+        );
+        assert_eq!(
+            owner.read_bound(&b).state.tag(),
+            CredentialStateTag::Absent,
+            "no refused write may store anything"
+        );
+    }
+
+    #[test]
+    fn connect_refuses_a_too_long_value_with_the_brokers_typed_reason() {
+        let owner = owner_over(MockKeyring::empty());
+        let too_long = "a".repeat(bounds::MAX_API_KEY_BYTES + 1);
+        let err = owner
+            .connect(
+                Revision::INITIAL,
+                binding("https://api.example/v1"),
+                too_long,
+            )
+            .expect_err("over the API-key cap");
+        assert_eq!(
+            err,
+            MutationError::InvalidValue(
+                rhapsody_credential_ipc::bounds::CredentialRejection::TooLong
+            )
+        );
+    }
+
+    // A value that fits the API-key cap can still push the serialized envelope past the
+    // independently-capped envelope size; the exact bytes about to be stored are checked, and the
+    // caller is refused rather than having anything trimmed.
+    #[test]
+    fn connect_refuses_an_envelope_over_the_cap_even_with_a_valid_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let huge = binding(&format!(
+            "https://api.example/v1/{}",
+            "x".repeat(bounds::MAX_CREDENTIAL_ENVELOPE_BYTES)
+        ));
+        let err = owner
+            .connect(Revision::INITIAL, huge, "sk-valid".into())
+            .expect_err("an oversized envelope must be refused");
+        assert!(matches!(err, MutationError::InvalidValue(_)), "got {err:?}");
+        assert_eq!(owner.current_revision(), Revision::INITIAL);
+    }
+
+    #[test]
+    fn replace_refuses_an_out_of_bounds_value_and_leaves_the_old_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let b = binding("https://api.example/v1");
+        let r1 = match owner
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .unwrap()
+        {
+            MutationOutcome::Advanced(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let err = owner
+            .replace(r1, &b, "sk has a space".into())
+            .expect_err("replace with an invalid value must be refused");
+        assert!(matches!(err, MutationError::InvalidValue(_)), "got {err:?}");
+        assert_eq!(owner.current_revision(), r1);
+        match owner.read_bound(&b).state {
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1")
+            }
+            other => panic!("expected untouched Present, got {other:?}"),
+        }
+    }
+
+    // A refusal must not echo the rejected value into its error string (secret canary across the
+    // error surface).
+    #[test]
+    fn a_bounds_refusal_never_echoes_the_rejected_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let err = owner
+            .connect(
+                Revision::INITIAL,
+                binding("https://api.example/v1"),
+                "sk-canary-secret with a space".into(),
+            )
+            .expect_err("refused");
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains("canary-secret"), "leaked: {rendered}");
+    }
+
+    // --- Configured/unconfigured status (shared abstraction, §2.5) -------------------------------
+
+    #[test]
+    fn status_reports_configured_unconfigured_and_unavailable() {
+        let empty = owner_over(MockKeyring::empty());
+        assert_eq!(empty.status(), CredentialStatus::Unconfigured);
+        let b = binding("https://api.example/v1");
+        empty
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .expect("connect");
+        assert_eq!(empty.status(), CredentialStatus::Configured);
+
+        assert_eq!(
+            owner_over(MockKeyring::erroring("locked")).status(),
+            CredentialStatus::Unavailable
+        );
+
+        let malformed = MockKeyring::empty();
+        malformed.set_password("not an envelope").expect("seed");
+        assert_eq!(
+            owner_over(malformed).status(),
+            CredentialStatus::Unavailable,
+            "present-but-unusable data must never read as configured"
+        );
+    }
+
+    // The desktop owner is usable through the shared abstraction the daemon programs against — this
+    // is the build-unit boundary P1 requires, exercised as a trait object.
+    #[test]
+    fn the_owner_is_usable_through_the_shared_credential_owner_abstraction() {
+        let owner: Box<dyn CredentialOwner> = Box::new(owner_over(MockKeyring::empty()));
+        let b = binding("https://api.example/v1");
+        assert_eq!(owner.status(), CredentialStatus::Unconfigured);
+        owner
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .expect("connect through the trait");
+        assert_eq!(owner.status(), CredentialStatus::Configured);
+        match owner.read_bound(&b).state {
+            CredentialState::Present(lease) => {
+                // The value only ever leaves through a closure-scoped borrow or a move into the
+                // broker — no ordinary string getter exists on the shared lease.
+                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-1");
+            }
+            other => panic!("expected Present, got {other:?}"),
+        }
+        assert_eq!(
+            owner.remove(Revision(1)),
+            Ok(MutationOutcome::Advanced(Revision(2)))
+        );
     }
 }

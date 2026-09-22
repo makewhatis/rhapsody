@@ -22,6 +22,11 @@
 //!
 //! - [`domain`] — the non-secret and secret-bearing types both sides share (`CredentialRef`,
 //!   `Binding`, `Revision`, `CredentialState`, `BoundCredentialLease`).
+//! - [`owner`] — the shared [`CredentialOwner`](owner::CredentialOwner) abstraction (P1): the one
+//!   testable seam the desktop owner implements and the daemon consumes, carrying the typed
+//!   mutation outcomes and configured/unconfigured status.
+//! - [`bounds`] — the broker's size/syntax bounds, re-used from PB1 so the owner refuses an
+//!   out-of-bounds credential before storage instead of duplicating the rule.
 //! - [`wire`] — length-prefixed JSON framing and the request/response/push message shapes.
 //! - [`session`] — the authentication + strictly-increasing-sequence state machine each connection
 //!   is driven through; transport-free so its unauthorized/replayed/out-of-order/oversized
@@ -37,13 +42,26 @@
 //! dependency, so pulling it into `desktop/` does not reintroduce the heavy-dependency coupling the
 //! root `Cargo.toml`'s workspace split exists to avoid.
 
+pub mod bounds;
 pub mod domain;
+pub mod owner;
 pub mod session;
 pub mod token;
 pub mod wire;
 
 #[cfg(test)]
-mod tests {
+mod compile_guards {
+    use static_assertions::assert_not_impl_any;
+
+    use crate::domain::{BoundCredentialLease, CredentialState};
+
+    // P1 mutation discipline: "Derive Debug/Serialize or add a String getter on the lease;
+    // compile-time/API-shape and canary tests must fail." These negative-impl assertions fail to
+    // compile if a future change adds `Clone`, `Serialize`, or `Display` to the lease or the state
+    // enum. `Debug` stays allowed (it redacts), and is pinned by `domain`'s canary test.
+    assert_not_impl_any!(BoundCredentialLease: Clone, serde::Serialize, serde::de::DeserializeOwned);
+    assert_not_impl_any!(CredentialState: Clone, serde::Serialize, serde::de::DeserializeOwned, Copy);
+
     #[test]
     fn package_builds() {}
 }

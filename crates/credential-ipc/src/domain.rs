@@ -92,6 +92,12 @@ impl Revision {
 /// The credential value plus its bound endpoint, held only long enough to build a broker session.
 /// Not `Clone`/`Copy` — it can be moved but never duplicated — and `Debug`/`Display` never print
 /// `value`. `Drop` zeroizes the value bytes.
+///
+/// There is deliberately **no** ordinary string accessor (`expose_secret`/`Deref`/`AsRef`/`Display`)
+/// and no `Serialize`: the value cannot be read out through a getter and cannot be written to a
+/// serialization surface. The two ways a value legitimately moves onward are
+/// [`expose_for_broker`](Self::expose_for_broker) (a closure-scoped borrow that cannot escape) and
+/// [`into_broker_lease`](Self::into_broker_lease) (a consuming move into PB1's move-only lease).
 pub struct BoundCredentialLease {
     pub binding: Binding,
     value: String,
@@ -102,16 +108,38 @@ impl BoundCredentialLease {
         BoundCredentialLease { binding, value }
     }
 
-    /// The raw secret. Named distinctly from a `Deref`/`AsRef` impl so a future `{:?}`/`{}` on the
-    /// lease itself can never reach it by accident — only an explicit call does.
-    pub fn expose_secret(&self) -> &str {
-        &self.value
+    /// Borrow the credential value for the duration of one closure — the shape PB7 uses while
+    /// constructing an upstream request. The borrow cannot escape the closure, so there is no way to
+    /// obtain an owned `String` or a `'static` reference to the secret from this method alone.
+    pub fn expose_for_broker<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        f(&self.value)
+    }
+
+    /// Zeroize the primary value buffer in place. `Drop` calls exactly this, so a test can call it
+    /// and observe the wipe without reading freed memory.
+    fn wipe(&mut self) {
+        self.value.zeroize();
+    }
+
+    /// Consume the lease and move its value into PB1's protocol-neutral, move-only
+    /// [`BoundCredentialLease`](rhapsody_provider_broker::BoundCredentialLease) — the "move into the
+    /// broker" path. The value is never exposed as a `String`: it is moved straight into the broker's
+    /// own zeroizing buffer, which validates the API-key shape on the way in. This lease's own buffer
+    /// is emptied before it drops, so the secret is never duplicated in two live allocations any
+    /// longer than the move itself.
+    pub fn into_broker_lease(
+        mut self,
+        binding: rhapsody_provider_broker::CredentialBinding,
+    ) -> Result<rhapsody_provider_broker::BoundCredentialLease, rhapsody_provider_broker::BrokerError>
+    {
+        let value = std::mem::take(&mut self.value);
+        rhapsody_provider_broker::BoundCredentialLease::new(binding, value)
     }
 }
 
 impl Drop for BoundCredentialLease {
     fn drop(&mut self) {
-        self.value.zeroize();
+        self.wipe();
     }
 }
 
@@ -249,7 +277,74 @@ mod tests {
             !display.contains("sk-super-secret-value"),
             "Display leaked: {display}"
         );
-        assert_eq!(lease.expose_secret(), "sk-super-secret-value");
+        // The only way to read the value is the closure-scoped borrow; the borrow cannot escape.
+        let seen = lease.expose_for_broker(str::to_owned);
+        assert_eq!(seen, "sk-super-secret-value");
+    }
+
+    // The "move into the broker" contract (P1 acceptance): the lease's value moves into PB1's
+    // move-only lease with no intermediate `String` and no ordinary accessor, and PB1 re-validates
+    // the shape on the way in.
+    #[test]
+    fn a_lease_moves_into_the_broker_lease_without_a_string_accessor() {
+        let lease = BoundCredentialLease::new(
+            Binding {
+                provider_id: "fireworks".into(),
+                adapter: "openai-chat-completions-bearer-v1".into(),
+                base_url: "https://api.fireworks.ai/inference/v1".into(),
+            },
+            "sk-fake-key".to_string(),
+        );
+        let broker_binding = rhapsody_provider_broker::CredentialBinding::new(
+            "fireworks",
+            rhapsody_provider_broker::BrokerProtocol::OpenAiChatCompletions,
+            "https://api.fireworks.ai/inference/v1",
+        )
+        .expect("binding");
+        let broker_lease = lease
+            .into_broker_lease(broker_binding)
+            .expect("move into broker");
+        // PB1's lease has no accessor at all, so the only observable here is that the move happened.
+        assert_eq!(broker_lease.binding().provider_id(), "fireworks");
+    }
+
+    // Pins the mechanism `Drop` uses: the primary buffer is wiped in place (the exact bytes go to
+    // zero), so routing a decoded value through a lease and dropping it — what the owner's
+    // `BindingMismatch` arm does — genuinely destroys the value rather than merely forgetting it.
+    #[test]
+    fn the_lease_wipes_its_primary_buffer() {
+        let mut lease = BoundCredentialLease::new(
+            Binding {
+                provider_id: "p".into(),
+                adapter: "a".into(),
+                base_url: "https://x/v1".into(),
+            },
+            "sk-super-secret".to_string(),
+        );
+        lease.wipe();
+        assert!(
+            lease.value.bytes().all(|b| b == 0),
+            "the primary buffer must be zeroed in place"
+        );
+    }
+
+    #[test]
+    fn moving_a_malformed_value_into_the_broker_is_refused() {
+        let lease = BoundCredentialLease::new(
+            Binding {
+                provider_id: "p".into(),
+                adapter: "a".into(),
+                base_url: "https://x/v1".into(),
+            },
+            "has a space".to_string(),
+        );
+        let broker_binding = rhapsody_provider_broker::CredentialBinding::new(
+            "p",
+            rhapsody_provider_broker::BrokerProtocol::OpenAiChatCompletions,
+            "https://x/v1",
+        )
+        .expect("binding");
+        assert!(lease.into_broker_lease(broker_binding).is_err());
     }
 
     #[test]

@@ -22,9 +22,19 @@ rand = "0.9"
 # zeroize: `BoundCredentialLease` and the raw bootstrap token must not linger in memory once
 # dropped. Already in Cargo.lock transitively (via `keyring`) — no new download.
 zeroize = "1"
+# rhapsody-provider-broker (PB1): the credential owner enforces the broker's exact API-key
+# size/syntax bound and independently-capped envelope size *before* storage (P1 acceptance), and the
+# owner's lease is convertible into PB1's move-only `BoundCredentialLease` without an intermediate
+# string accessor. Reusing the broker's validator/constants keeps the two call sites in lockstep
+# instead of duplicating the rule. PB1 carries no Tauri/desktop dependency, so this adds no coupling
+# to the desktop build. Path dependency; no new external crate enters Cargo.lock.
+rhapsody-provider-broker = { path = "../provider-broker" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+# static_assertions: the compile-guard module asserts the secret-bearing lease/state are not
+# `Clone`/`Serialize`/`Display` (P1 mutation discipline). Already in Cargo.lock (PB1's dev-dep).
+static_assertions = "1"
 
 [lints]
 workspace = true

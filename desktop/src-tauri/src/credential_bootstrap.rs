@@ -339,7 +339,7 @@ fn split_state(
     let lease = match state {
         S::Present(lease) => Some(rhapsody_credential_ipc::wire::LeasePayload {
             binding: lease.binding.clone(),
-            value: lease.expose_secret().to_string(),
+            value: lease.expose_for_broker(str::to_owned),
         }),
         _ => None,
     };
