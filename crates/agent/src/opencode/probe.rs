@@ -13,8 +13,9 @@
 //! * it passes only `--version`, which does not consult project or global config, sets `stdin` to
 //!   null, and runs outside the target worktree with project/plugin discovery disabled;
 //! * it drains stdout while it waits and enforces a process-tree timeout, killing the whole tree on
-//!   every exit path so a leftover descendant can neither hold the pipe nor outlive the probe;
-//! * unknown, unparseable, or unreachable versions refuse with
+//!   every exit path; a descendant that escaped the tree still holds the probe's stdout, and the
+//!   probe refuses that command rather than accepting a version from a wrapper it cannot contain;
+//! * unknown, unparseable, unsuccessful, or unreachable versions refuse with
 //!   [`UNSUPPORTED_HARNESS_VERSION`] / [`PROBE_FAILED`] rather than being treated as compatible.
 //!
 //! Wiring this probe into preparation is a later slice (PB5); PB0 only defines and tests it.
@@ -71,19 +72,27 @@ pub enum ProbeError {
     UnparseableOutput,
     /// The executable could not be spawned.
     Spawn { message: String },
+    /// The executable ran but exited unsuccessfully, so its output is not a version report.
+    NonZeroExit { status: String },
+    /// The executable left a descendant holding its stdout, so the probe could not contain it.
+    DescendantHeldStdout,
     /// The probe exceeded its process-tree timeout.
     TimedOut,
 }
 
 impl ProbeError {
     /// The bounded, actionable reason a caller records. Unknown/unparseable versions are
-    /// [`UNSUPPORTED_HARNESS_VERSION`]; a probe that could not run is [`PROBE_FAILED`].
+    /// [`UNSUPPORTED_HARNESS_VERSION`]; a probe that could not run under its conditions is
+    /// [`PROBE_FAILED`].
     pub fn reason(&self) -> &'static str {
         match self {
             ProbeError::UnsupportedVersion { .. } | ProbeError::UnparseableOutput => {
                 UNSUPPORTED_HARNESS_VERSION
             }
-            ProbeError::Spawn { .. } | ProbeError::TimedOut => PROBE_FAILED,
+            ProbeError::Spawn { .. }
+            | ProbeError::NonZeroExit { .. }
+            | ProbeError::DescendantHeldStdout
+            | ProbeError::TimedOut => PROBE_FAILED,
         }
     }
 
@@ -95,6 +104,12 @@ impl ProbeError {
             }
             ProbeError::UnparseableOutput => "unparseable opencode version output".to_string(),
             ProbeError::Spawn { message } => format!("could not run the opencode probe: {message}"),
+            ProbeError::NonZeroExit { status } => {
+                format!("opencode version probe exited unsuccessfully ({status})")
+            }
+            ProbeError::DescendantHeldStdout => {
+                "the opencode version probe left a descendant holding its stdout".to_string()
+            }
             ProbeError::TimedOut => "opencode version probe timed out".to_string(),
         }
     }
@@ -186,11 +201,15 @@ pub fn probe_with_timeout(
 ///
 /// The bound covers the WHOLE probe, not just `try_wait` on the direct child. stdout is drained
 /// while the child is waited on, so a `--version` larger than the pipe buffer cannot block the
-/// child into a false timeout, and a background descendant that keeps stdout open after the child
-/// exits cannot outlive the deadline: every exit path reaps the process tree, which closes the pipe
-/// the descendant was holding. (A descendant that escaped the tree before the sweep is the one gap
-/// [`crate::proctree`] documents; the drain is non-blocking, so even then the probe returns on
-/// time rather than blocking on the read.)
+/// child into a false timeout, and every exit path reaps the process tree, so a background
+/// descendant that stays in it can neither hold the pipe past the deadline nor outlive the probe.
+///
+/// A descendant that escaped the tree *before its own parent exited* (a wrapper that `set -m`s a
+/// background job, whose parent then exits) is the containment gap [`crate::proctree`] documents
+/// and defers to the spawn-side supervisor in harness slice 6: no parent- or group-walk can reach
+/// it once it is orphaned into a group of its own. It does still hold the probe's stdout, so the
+/// final drain cannot reach EOF, and [`ProbeError::DescendantHeldStdout`] refuses the command
+/// rather than accepting a version from a wrapper the probe could not contain (§9.1).
 fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
     let mut child = Command::new(command)
         .arg("--version")
@@ -211,42 +230,52 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
         })?;
 
     let pid = child.id();
-    let mut stdout = child.stdout.take().ok_or_else(|| ProbeError::Spawn {
-        message: "the probe child has no piped stdout".to_string(),
-    })?;
-    set_nonblocking(&stdout)?;
+    // Every return AFTER the spawn must contain the child; a failure to set up the read would
+    // otherwise leave a running, unreaped process behind.
+    let Some(mut stdout) = child.stdout.take() else {
+        contain(pid, &mut child);
+        return Err(ProbeError::Spawn {
+            message: "the probe child has no piped stdout".to_string(),
+        });
+    };
+    if let Err(e) = set_nonblocking(&stdout) {
+        contain(pid, &mut child);
+        return Err(e);
+    }
 
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut timed_out = false;
     loop {
-        if drain(&mut stdout, &mut buf, &mut chunk, deadline) {
+        if drain(&mut stdout, &mut buf, &mut chunk, deadline) == DrainOutcome::Deadline {
             timed_out = true;
             break;
         }
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
+        match child_exited(pid) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() >= deadline => {
                 timed_out = true;
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Ok(false) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
-                return Err(ProbeError::Spawn {
-                    message: e.to_string(),
-                });
+                contain(pid, &mut child);
+                return Err(e);
             }
         }
     }
 
-    // Reap the whole tree on EVERY exit path, success included: a descendant left holding stdout
-    // would otherwise keep the pipe open (blocking the final drain) and go on running.
+    // Sweep the whole tree on EVERY exit path, success included, BEFORE reaping: `pid` is still our
+    // live child or our unreaped zombie, so the OS cannot have recycled it, and `-pid`'s process
+    // group is still ours to signal. Reaping first (as `try_wait` would) frees the pid, and a
+    // recycled pid would aim the sweep's unconditional group kill at an unrelated process group.
     crate::proctree::kill_tree(pid);
-    let _ = child.wait();
-    // The child is dead and the tree reaped, so the pipe reaches EOF once its buffered bytes are
-    // read; the read is non-blocking, so an unreachable descendant cannot hang it.
-    drain(
+    let exit_status = child.wait().ok();
+    // The child is dead and the tree reaped, so a contained probe's pipe reaches EOF once its
+    // buffered bytes are read. The read is non-blocking, so even an unreachable descendant cannot
+    // hang it; it just leaves the pipe open, which the check below turns into a refusal.
+    let drained = drain(
         &mut stdout,
         &mut buf,
         &mut chunk,
@@ -256,7 +285,60 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
     if timed_out {
         return Err(ProbeError::TimedOut);
     }
+    match exit_status {
+        Some(status) if !status.success() => {
+            return Err(ProbeError::NonZeroExit {
+                status: describe_exit(status),
+            });
+        }
+        _ => {}
+    }
+    if drained != DrainOutcome::Eof {
+        return Err(ProbeError::DescendantHeldStdout);
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Reaps the probe child and sweeps its whole process tree. Used on the early error paths that
+/// follow [`Command::spawn`], so no path leaves a running or unreaped child behind.
+fn contain(pid: u32, child: &mut std::process::Child) {
+    crate::proctree::kill_tree(pid);
+    let _ = child.wait();
+}
+
+/// Whether the probe child has exited, WITHOUT reaping it. Reaping (`Child::try_wait`) frees the pid
+/// for the OS to hand to a new process; because the sweep signals the leader's process group as
+/// `-pid`, a recycled pid would aim that kill at an unrelated group. `waitid(WNOWAIT)` reports the
+/// exit but leaves the child a zombie — and its pid unrecyclable — until after the sweep, when
+/// [`Child::wait`] reaps it.
+fn child_exited(pid: u32) -> Result<bool, ProbeError> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, zeroed `siginfo_t`; `pid` is our own unreaped child; `WNOWAIT`
+    // reports the exit without consuming it, so the caller's later `wait` still reaps it.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(ProbeError::Spawn {
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    // SAFETY: a successful `waitid` initialized `info`; `si_pid` is zero when no child changed state.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Formats an [`std::process::ExitStatus`] for [`ProbeError::NonZeroExit`], never including
+/// environment values or credentials.
+fn describe_exit(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by a signal".to_string(),
+    }
 }
 
 /// Puts the child's stdout pipe in non-blocking mode so a read never blocks past the deadline.
@@ -277,30 +359,43 @@ fn set_nonblocking(stdout: &ChildStdout) -> Result<(), ProbeError> {
     Ok(())
 }
 
+/// Why one [`drain`] pass stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The pipe reached EOF: every write end of it is closed, so nothing can write again.
+    Eof,
+    /// No bytes are available right now, but the pipe is still open.
+    Pending,
+    /// The deadline passed with the pipe still open. Only an unending writer reaches this.
+    Deadline,
+}
+
 /// Reads everything currently available into `buf`, keeping at most [`MAX_PROBE_OUTPUT`] bytes but
-/// discarding the rest so a chatty `--version` cannot fill the pipe and block the child. Returns
-/// `true` once `deadline` has passed, which is how an unending output is bounded.
+/// discarding the rest so a chatty `--version` cannot fill the pipe and block the child. Reports
+/// whether the pipe reached EOF, is merely idle, or outlasted the deadline — the caller needs the
+/// EOF distinction to tell a contained probe from one whose stdout a descendant still holds.
 fn drain(
     stdout: &mut ChildStdout,
     buf: &mut Vec<u8>,
     chunk: &mut [u8; 8192],
     deadline: Instant,
-) -> bool {
+) -> DrainOutcome {
     loop {
         if Instant::now() >= deadline {
-            return true;
+            return DrainOutcome::Deadline;
         }
         match stdout.read(chunk) {
-            Ok(0) => return false, // EOF: every write end of the pipe is closed
+            Ok(0) => return DrainOutcome::Eof, // EOF: every write end of the pipe is closed
             Ok(n) => {
                 let room = MAX_PROBE_OUTPUT.saturating_sub(buf.len());
                 if room > 0 {
                     buf.extend_from_slice(&chunk[..n.min(room)]);
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return DrainOutcome::Pending,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            // An unexpected read error is not an EOF: fail closed rather than treating it as one.
+            Err(_) => return DrainOutcome::Pending,
         }
     }
 }
@@ -318,6 +413,34 @@ mod tests {
     fn process_alive(pid: i32) -> bool {
         // SAFETY: signal 0 delivers nothing, it only performs `kill(2)`'s error checking.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Reads the pid a fixture script recorded into `pidfile`.
+    fn read_pid(pidfile: &std::path::Path) -> i32 {
+        std::fs::read_to_string(pidfile)
+            .expect("the script recorded its descendant's pid")
+            .trim()
+            .parse()
+            .expect("descendant pid")
+    }
+
+    /// Polls until `pid` is gone, or `timeout` elapses. The signal may not have been reaped yet, so
+    /// a single check right after the probe would race.
+    fn wait_until_dead(pid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !process_alive(pid)
+    }
+
+    /// SIGKILLs a pid a fixture left behind, so a test never leaks a sleeper onto the runner.
+    fn reap(pid: i32) {
+        // SAFETY: SIGKILL on a pid the fixture itself recorded; an already-dead pid is an error the
+        // return deliberately ignores.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 
     fn script(body: &str) -> (crate::opencode::testdir::TempDir, String) {
@@ -433,6 +556,21 @@ mod tests {
         assert!(matches!(err, ProbeError::Spawn { .. }));
     }
 
+    /// B3 regression: a wrapper that prints the pinned string and then exits unsuccessfully is not
+    /// compatible. Its exit status is part of the report, so it must be preserved and refused
+    /// (§9.1) rather than discarded.
+    #[test]
+    fn probe_refuses_a_command_that_exits_unsuccessfully() {
+        let (_dir, command) = script("echo 1.18.30\nexit 42\n");
+        let err = probe(&command).unwrap_err();
+        assert_eq!(err.reason(), PROBE_FAILED);
+        assert!(
+            matches!(err, ProbeError::NonZeroExit { .. }),
+            "a failed version command was accepted: {err:?}"
+        );
+        assert!(err.message().contains("42"), "{}", err.message());
+    }
+
     #[test]
     fn probe_enforces_a_process_tree_timeout() {
         let (_dir, command) = script("sleep 5\n");
@@ -471,27 +609,27 @@ mod tests {
             "the probe waited for the descendant: {elapsed:?}"
         );
 
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("the script recorded its descendant's pid")
-            .trim()
-            .parse()
-            .expect("descendant pid");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while process_alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let pid = read_pid(&pidfile);
         assert!(
-            !process_alive(pid),
+            wait_until_dead(pid, Duration::from_secs(3)),
             "descendant {pid} survived the probe's process-tree kill"
         );
     }
 
-    /// B1 regression: a wrapper that prints one version line and exits while a background descendant
-    /// keeps stdout open. The probe must read the version and stay bounded, and it must not leak the
-    /// descendant — killing the tree closes the pipe the descendant held.
+    /// B1/B5 regression: a wrapper that prints one version line and exits while a same-group
+    /// background descendant keeps stdout open. The probe must read the version and stay bounded,
+    /// and it must not leak the descendant — the success path's tree kill closes the pipe the
+    /// descendant held. The `$!` pidfile is what pins that kill: without it this test stayed green
+    /// even when the post-loop `kill_tree` was gated on `timed_out`, leaving `sleep 30` orphaned.
     #[test]
-    fn probe_bounds_a_wrapper_whose_descendant_holds_stdout() {
-        let (_dir, command) = script("sleep 30 &\necho 1.18.30\n");
+    fn probe_bounds_a_wrapper_whose_descendant_holds_stdout_and_kills_it() {
+        let dir = crate::opencode::testdir::TempDir::new();
+        let pidfile = dir.path().join("descendant.pid");
+        let body = format!(
+            "sleep 30 &\necho $! > {pidfile}\necho 1.18.30\n",
+            pidfile = pidfile.display()
+        );
+        let (_script_dir, command) = script(&body);
         let start = Instant::now();
         let row = probe_with_timeout(&command, Duration::from_secs(3))
             .expect("the version line is still read from the bounded pipe");
@@ -501,6 +639,54 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
             "a descendant holding stdout outran the deadline: {elapsed:?}"
+        );
+        let pid = read_pid(&pidfile);
+        let dead = wait_until_dead(pid, Duration::from_secs(3));
+        if !dead {
+            reap(pid);
+        }
+        assert!(
+            dead,
+            "the success path leaked descendant {pid} instead of killing its tree"
+        );
+    }
+
+    /// B6 regression: a wrapper whose background descendant escapes into its OWN process group
+    /// (`set -m`) *before its own parent exits* is orphaned, and no parent- or group-walk can reach
+    /// it — the containment gap [`crate::proctree`] documents and defers to the spawn-side
+    /// supervisor in harness slice 6. The descendant still holds the probe's stdout, so the probe
+    /// must fail closed and refuse the wrapper (`harness_probe_failed`) rather than accept a version
+    /// from a command it could not contain (§9.1).
+    #[test]
+    fn probe_refuses_a_wrapper_whose_descendant_escaped_the_process_group() {
+        let dir = crate::opencode::testdir::TempDir::new();
+        let pidfile = dir.path().join("escaped.pid");
+        let body = format!(
+            "/bin/bash -c 'set -m; sleep 30 & echo $! > {pidfile}'\necho 1.18.30\n",
+            pidfile = pidfile.display()
+        );
+        let (_script_dir, command) = script(&body);
+
+        let start = Instant::now();
+        let result = probe_with_timeout(&command, Duration::from_secs(3));
+        let elapsed = start.elapsed();
+        // The survivor is the wrapper's leaked process, not something the probe can reach; reap it
+        // FIRST, so a failing assertion below cannot leave a sleeper behind.
+        if let Ok(pid) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            reap(pid);
+        }
+        let err = result.unwrap_err();
+        assert_eq!(err.reason(), PROBE_FAILED);
+        assert!(
+            matches!(err, ProbeError::DescendantHeldStdout),
+            "a wrapper it could not contain was accepted: {err:?}"
+        );
+        // The pipe is held, not blocked on: the non-blocking drain still returns on time.
+        assert!(
+            elapsed < Duration::from_secs(3) + TIMEOUT_SLACK,
+            "the probe waited on the escaped descendant: {elapsed:?}"
         );
     }
 

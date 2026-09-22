@@ -40,6 +40,29 @@ const COMPACTION_KEYS: &[&str] = &[
     "stream_options",
 ];
 
+/// The measured tool surface of the main `build` turn: the full built-in set, delegation and todo
+/// tools included.
+const MAIN_TOOLS: &[&str] = &[
+    "bash",
+    "edit",
+    "glob",
+    "grep",
+    "read",
+    "skill",
+    "task",
+    "todowrite",
+    "webfetch",
+    "write",
+];
+
+/// The measured tool surface of a NATIVE SUBAGENT turn: the main set minus `task` and `todowrite`,
+/// because a subagent cannot delegate again or own its parent's todo list. This asymmetry is the
+/// subagent request's distinguishing shape, so pinning it is what makes a fixture that replaced the
+/// subagent turn with another main-agent-shaped request turn red.
+const SUBAGENT_TOOLS: &[&str] = &[
+    "bash", "edit", "glob", "grep", "read", "skill", "webfetch", "write",
+];
+
 /// Substrings that must never appear in a committed fixture: a key-shaped seed, the fake
 /// capability seed, and machine-local absolute path roots.
 const FORBIDDEN_SUBSTRINGS: &[&str] = &[
@@ -76,6 +99,25 @@ fn requests(doc: &Value) -> &Vec<Value> {
     doc.pointer("/requests")
         .and_then(Value::as_array)
         .expect("requests array")
+}
+
+fn tool_names(request: &Value) -> Vec<&str> {
+    request
+        .pointer("/body/tool_names")
+        .and_then(Value::as_array)
+        .expect("tool names")
+        .iter()
+        .map(|v| v.as_str().expect("tool name"))
+        .collect()
+}
+
+/// Asserts a request's exact tool surface, as a set (the fixture lists them sorted already).
+fn assert_tool_set(request: &Value, expected: &[&str]) {
+    let mut got = tool_names(request);
+    got.sort();
+    let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "the request's tool surface drifted");
 }
 
 fn body_keys(request: &Value) -> Vec<String> {
@@ -251,24 +293,29 @@ fn subagent_requests_stay_on_the_generated_model_and_closed_schema() {
     assert_eq!(
         reqs.len(),
         3,
-        "main tool call, the subagent turn, then the resumed main turn"
+        "main tool call, the native subagent turn, then the resumed main turn"
     );
     for request in reqs {
         assert_common_request_shape(request);
         assert_closed_keys(request, CLOSED_KEYS);
     }
-    let first_tools: Vec<&str> = reqs[0]
-        .pointer("/body/tool_names")
-        .and_then(Value::as_array)
-        .expect("tool names")
-        .iter()
-        .map(|v| v.as_str().expect("tool name"))
-        .collect();
+    // Request 0 is the main turn that decided to delegate; it offers the delegation tool.
+    assert_tool_set(&reqs[0], MAIN_TOOLS);
     assert!(
-        first_tools.contains(&"task"),
+        tool_names(&reqs[0]).contains(&"task"),
         "the fixture must exercise the native subagent path"
     );
-    // The subagent turn carries the tool result plus the delegated prompt.
+    // Request 1 is the NATIVE SUBAGENT turn itself. Its measured distinguishing shape is the main
+    // tool set minus the main-only delegation and todo tools.
+    assert_tool_set(&reqs[1], SUBAGENT_TOOLS);
+    for main_only in ["task", "todowrite"] {
+        assert!(
+            !tool_names(&reqs[1]).contains(&main_only),
+            "the subagent turn offered the main-only {main_only} tool"
+        );
+    }
+    // Request 2 is the RESUMED MAIN turn: it carries the subagent's tool result.
+    assert_tool_set(&reqs[2], MAIN_TOOLS);
     let roles: Vec<&str> = reqs[2]
         .pointer("/body/message_roles")
         .and_then(Value::as_array)
