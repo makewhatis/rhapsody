@@ -38,10 +38,13 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// already unparseable, so the bound only prevents an unbounded read.
 const MAX_PROBE_OUTPUT: usize = 4096;
 
-/// The window the final drain gets after the child is reaped. The pipe is at EOF by then, so this
-/// only bounds a descendant that escaped the sweep and keeps streaming; a fresh window (rather than
-/// the probe deadline, which the tree kill may just have passed) is what lets the drain still read
-/// the bytes the child wrote before it exited.
+/// The window the final drain gets after the child is reaped. A contained probe's pipe reaches EOF
+/// once its buffered bytes are read, but a same-group descendant the sweep just SIGKILLed may still
+/// be closing its fds, so the window is polled rather than surrendered on the first `WouldBlock`.
+/// It also bounds a descendant that escaped the sweep and keeps the pipe open, which the caller's
+/// EOF check turns into a refusal. A fresh window (rather than the probe deadline, which the tree
+/// kill may just have passed) is what lets the drain still read the bytes the child wrote before
+/// exit.
 const FINAL_DRAIN_WINDOW: Duration = Duration::from_millis(250);
 
 /// One measured OpenCode compatibility row. `adapter_version` is the `@ai-sdk/openai-compatible`
@@ -271,27 +274,28 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
     // group is still ours to signal. Reaping first (as `try_wait` would) frees the pid, and a
     // recycled pid would aim the sweep's unconditional group kill at an unrelated process group.
     crate::proctree::kill_tree(pid);
-    let exit_status = child.wait().ok();
-    // The child is dead and the tree reaped, so a contained probe's pipe reaches EOF once its
-    // buffered bytes are read. The read is non-blocking, so even an unreachable descendant cannot
-    // hang it; it just leaves the pipe open, which the check below turns into a refusal.
-    let drained = drain(
-        &mut stdout,
-        &mut buf,
-        &mut chunk,
-        Instant::now() + FINAL_DRAIN_WINDOW,
-    );
+    // Reaping the child frees its pid, but it is already dead, so its stdout fd was closed at exit
+    // and the final drain below reaches EOF once those bytes are read. `waitid(WNOWAIT)` already
+    // reported the exit, so a `wait` error means the status is unknown: fail closed, never assume
+    // success.
+    let exit_status = child.wait();
+    let drained = final_drain(&mut stdout, &mut buf, &mut chunk);
 
     if timed_out {
         return Err(ProbeError::TimedOut);
     }
     match exit_status {
-        Some(status) if !status.success() => {
+        Ok(status) if !status.success() => {
             return Err(ProbeError::NonZeroExit {
                 status: describe_exit(status),
             });
         }
-        _ => {}
+        Err(e) => {
+            return Err(ProbeError::Spawn {
+                message: format!("could not reap the probe child: {e}"),
+            });
+        }
+        Ok(_) => {}
     }
     if drained != DrainOutcome::Eof {
         return Err(ProbeError::DescendantHeldStdout);
@@ -368,6 +372,31 @@ enum DrainOutcome {
     Pending,
     /// The deadline passed with the pipe still open. Only an unending writer reaches this.
     Deadline,
+}
+
+/// The final post-reap drain. Unlike the in-loop [`drain`], which reports idle (`Pending`) as soon
+/// as a read would block, this polls until the pipe reaches EOF or [`FINAL_DRAIN_WINDOW`] runs out:
+/// after the tree sweep a just-killed same-group descendant may still be closing its fds, and a
+/// single `Pending` must not turn a wrapper the probe DID contain into a refusal. The read stays
+/// non-blocking, so a descendant that keeps the pipe open for the whole window is still bounded, and
+/// the caller's EOF check refuses it.
+fn final_drain(
+    stdout: &mut ChildStdout,
+    buf: &mut Vec<u8>,
+    chunk: &mut [u8; 8192],
+) -> DrainOutcome {
+    let deadline = Instant::now() + FINAL_DRAIN_WINDOW;
+    loop {
+        match drain(stdout, buf, chunk, deadline) {
+            DrainOutcome::Pending => {
+                if Instant::now() >= deadline {
+                    return DrainOutcome::Deadline;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// Reads everything currently available into `buf`, keeping at most [`MAX_PROBE_OUTPUT`] bytes but
