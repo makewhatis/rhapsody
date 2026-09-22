@@ -526,21 +526,16 @@ where
             // already under human review — that the gate could never have held.
             target: move || {
                 let snap = triage_handle.reads_triage_target()?;
-                Some(rhapsody_orchestrator::TriageTarget {
-                    // Triage sweeps every project, so it takes the clients and drops the slug each
-                    // is bound to (STUDIO-677 keeps those beside them for the WRITERS — the quorum
-                    // picks exactly one project to create through). `facts` below stays
-                    // positionally aligned with the clients that survive this map.
-                    // Positionally aligned with `trackers` below, and taken from the SAME snapshot
-                    // in the SAME order — the manager's answer scope (STUDIO-731) is exactly the
-                    // set of projects this cycle swept, so it cannot drift from what triage saw.
-                    slugs: snap.trackers.iter().map(|p| p.slug.clone()).collect(),
-                    trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
-                    states: snap.states,
-                    facts: snap.facts,
-                    summon_token: snap.summon_token,
-                    reviewer_exclusions: snap.reviewer_exclusions,
-                })
+                // Triage sweeps every project, so it takes the clients and drops the slug each is
+                // bound to (STUDIO-677 keeps those beside them for the WRITERS — the quorum picks
+                // exactly one project to create through). `facts` stays positionally aligned with the
+                // clients that survive this map, and with `slugs` below, which is taken from the SAME
+                // snapshot in the SAME order: the manager's answer scope (STUDIO-731) is exactly the
+                // set of projects this cycle swept, so it cannot drift from what triage saw.
+                let slugs = snap.trackers.iter().map(|p| p.slug.clone()).collect();
+                Some(rhapsody_orchestrator::TriageTarget::from_snapshot(
+                    snap, slugs,
+                ))
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,
@@ -1745,6 +1740,26 @@ mod tests {
         assert_eq!(
             resolve_boot_logdir(&bad),
             PathBuf::from(format!("{home}/.rhapsody/logs")),
+        );
+    }
+
+    /// STUDIO-978 / jimmy's B5: `run.rs` is the ONLY production hop that hands the manager's room
+    /// reader the reviewer exclusions, and it had no test — setting it to `Default::default()` left
+    /// `cargo test -p rhapsodyd` green while restoring the stranded-review behaviour (B4). The
+    /// closure is built inline inside `run()`, so this pins the CALL rather than the value: it names
+    /// the shared conversion, which is what makes dropping a field impossible without breaking
+    /// `triage::from_snapshot_carries_every_field_including_reviewer_exclusions`.
+    ///
+    /// MUTATION GUARD: replace the call with `Some(TriageTarget::default())` (or a struct literal)
+    /// and the needle is absent → red. Assembled at run time so this test's own source is not an
+    /// occurrence of the string it forbids.
+    #[test]
+    fn the_triage_target_is_built_by_the_shared_snapshot_conversion() {
+        let src = include_str!("run.rs");
+        let needle: String = ["TriageTarget::", "from_snapshot("].concat();
+        assert!(
+            src.contains(&needle),
+            "run.rs must map the triage snapshot through the shared {needle} conversion, not a copy"
         );
     }
 

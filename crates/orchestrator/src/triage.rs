@@ -75,7 +75,7 @@ use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::dispatch::DispatchStates;
 use crate::preflight::{process_env, scrub_child_env};
-use crate::reads::ProjectFacts;
+use crate::reads::{ProjectFacts, TriageSnapshot};
 use crate::teams::IDENTITY_LABEL_PREFIX;
 
 /// The triage pass's own cadence — deliberately **not** the control loop's tick (§0.11.2).
@@ -534,6 +534,29 @@ pub struct TriageTarget {
     /// from here ([`crate::teamsears::EarsCycle`]) so `file_review` drops an impossible reviewer
     /// rather than filing a review ticket `spawn_worker` then refuses.
     pub reviewer_exclusions: crate::quorum::ReviewerExclusions,
+}
+
+impl TriageTarget {
+    /// The ONE `TriageSnapshot → TriageTarget` conversion (STUDIO-978), so the daemon's composition
+    /// root (`rhapsodyd/src/run.rs`) and every test harness map the fields the same way instead of
+    /// each hand-copying a struct literal. A field dropped from this mapping then breaks the test
+    /// that drives this function rather than hiding in a copy — the failure the reviewer-exclusion
+    /// wiring had when `run.rs`'s copy could be set to `Default::default()` with every test green.
+    ///
+    /// `slugs` is passed in rather than derived here: the daemon's manager room reader needs the
+    /// project slugs its answer scope is filtered by (STUDIO-731), while a triage-sweep test that
+    /// only exercises assignment passes `Vec::new()`. It is always positionally aligned with the
+    /// trackers taken from the same snapshot.
+    pub fn from_snapshot(snapshot: TriageSnapshot, slugs: Vec<String>) -> TriageTarget {
+        TriageTarget {
+            trackers: snapshot.trackers.into_iter().map(|p| p.tracker).collect(),
+            states: snapshot.states,
+            facts: snapshot.facts,
+            summon_token: snapshot.summon_token,
+            slugs,
+            reviewer_exclusions: snapshot.reviewer_exclusions,
+        }
+    }
 }
 
 /// What the manager reads an answer out of (STUDIO-731, slice 3).
@@ -4730,17 +4753,10 @@ mod tests {
             // a wiring that can hand triage trackers without the states they must filter by.
             target: move || {
                 let snap = control.reads_triage_target()?;
-                Some(TriageTarget {
-                    // Triage sweeps every project, so it takes the clients and drops the slugs each
-                    // is bound to (STUDIO-677 keeps those beside them for the writers, which pick
-                    // exactly one project). `facts` stays positionally aligned with what is left.
-                    trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
-                    states: snap.states,
-                    facts: snap.facts,
-                    summon_token: snap.summon_token,
-                    slugs: Vec::new(),
-                    reviewer_exclusions: snap.reviewer_exclusions,
-                })
+                // A triage sweep drops the slugs (STUDIO-677 keeps them for the writers). The
+                // conversion is the SAME one `run.rs` uses (STUDIO-978), so this test drives the
+                // production mapping rather than a hand-copied struct literal.
+                Some(TriageTarget::from_snapshot(snap, Vec::new()))
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
             agent_command: "claude".to_string(),
@@ -4785,6 +4801,66 @@ mod tests {
             0,
             "the account-level tracker is not a candidate source; it sees no project"
         );
+    }
+
+    /// STUDIO-978 / jimmy's B5: [`TriageTarget::from_snapshot`] is the ONE conversion from the
+    /// published snapshot to the daemon's triage target, so `run.rs` and every test hop map the
+    /// fields identically. A field dropped from it — `reviewer_exclusions` specifically, which
+    /// `run.rs`'s own struct-literal copy could lose with every test green — reds here.
+    ///
+    /// MUTATION GUARD: delete any one mapping line in `from_snapshot` (e.g.
+    /// `reviewer_exclusions: snapshot.reviewer_exclusions`) and the assertion for that field fails.
+    #[test]
+    fn from_snapshot_carries_every_field_including_reviewer_exclusions() {
+        let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
+        let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
+        let facts = vec![
+            ProjectFacts {
+                create_state: "Todo".to_string(),
+                pr_owner: "o".to_string(),
+                pr_repo: "r".to_string(),
+            },
+            ProjectFacts {
+                create_state: "In Progress".to_string(),
+                pr_owner: "o2".to_string(),
+                pr_repo: "r2".to_string(),
+            },
+        ];
+        let excl = crate::quorum::ReviewerExclusions {
+            unselectable: std::collections::HashSet::from(["sol".to_string()]),
+        };
+        let snap = crate::reads::TriageSnapshot {
+            trackers: vec![
+                project_tracker("alpha", Arc::clone(&a)),
+                project_tracker("beta", Arc::clone(&b)),
+            ],
+            states: states(),
+            facts: facts.clone(),
+            summon_token: "@symphony".to_string(),
+            reviewer_exclusions: excl,
+        };
+        let slugs = vec!["alpha".to_string(), "beta".to_string()];
+
+        let target = TriageTarget::from_snapshot(snap, slugs.clone());
+
+        assert_eq!(target.trackers.len(), 2, "every tracker is carried");
+        assert_eq!(
+            target.states,
+            states(),
+            "the dispatchable-state sets ride along"
+        );
+        assert_eq!(
+            target.facts, facts,
+            "facts stay positionally aligned with the trackers"
+        );
+        assert_eq!(target.summon_token, "@symphony");
+        assert_eq!(target.slugs, slugs);
+        assert!(
+            target.reviewer_exclusions.excludes("sol"),
+            "the excluded reviewer must survive the conversion; dropping this line is the B5 \
+             wiring bug"
+        );
+        assert!(!target.reviewer_exclusions.excludes("alice"));
     }
 
     /// The reads cell's own contract, which the closure above depends on: `None` until a config has

@@ -5779,6 +5779,44 @@ mod tests {
         );
     }
 
+    /// STUDIO-978 / alice's F2: an AUTHOR-LESS row can only ever be serviced by its INCUMBENT, so an
+    /// incumbent whose dispatch `spawn_worker` would REFUSE must defer the round rather than being
+    /// re-offered every tick. Without the unselectable check the row is dispatched, refused in the
+    /// worker, left `in_flight`, and crash recovery re-offers the same impossible incumbent — the
+    /// loop this branch is the only backstop for. The authored test above
+    /// (`an_unselectable_required_reviewer_does_not_break_continuity`) exercises the other branch and
+    /// cannot see this one.
+    ///
+    /// MUTATION GUARD: `(on_roster && !exclusions.unselectable.contains(incumbent))` →
+    /// `(on_roster)` and the refused incumbent is dispatched.
+    #[test]
+    fn an_authorless_row_defers_when_its_incumbent_cannot_run() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = ticketless(&["alice", "bob", "carol", "sol"]);
+        teams.roster[3].profile = "codexer".to_string();
+        let (mut o, dispatched) = orch(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        // `row(..)`'s author is alice; blanking it drives the author-less branch, which may only
+        // ever name the incumbent `sol`.
+        let mut r = row(12, "sol");
+        r.author = String::new();
+        introduce(&o, r);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "an incumbent whose dispatch is refused must not be dispatched"
+        );
+        assert_eq!(report.deferred, 1, "the round is deferred, not lost");
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
     /// STUDIO-951 / round 4: a persisted incumbent that is a TAIL pin beyond `review.reviewers`
     /// must not displace the declaration-order pin that actually survives the clamp. With
     /// `reviewers: 1` and `required: [carol, bob]`, `carol` is the one pin selection keeps and the

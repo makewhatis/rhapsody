@@ -3345,6 +3345,49 @@ mod tests {
         );
     }
 
+    /// STUDIO-978 / alice's F1 — the DISPATCH→PROVENANCE path, not a directly seeded row. A profile
+    /// naming a harness this build cannot run must record THAT harness (`codex`) with `profile` as
+    /// its origin on the run row. The pre-978 sibling resolved the name to `agent.backend` and wrote
+    /// `harness: claude` / `origin: agent.backend` — a harness that was never chosen, describing a
+    /// run that never happened — which the console then rendered as claude's event fidelity. The row
+    /// is written by the real `dispatch_issue` path, so reverting either `effective_harness`
+    /// (`teams.rs`) or the `harness_origin` rule (`retry.rs`) to the pre-978 fallback reds here; the
+    /// seeded-HTTP-row test could not see either.
+    ///
+    /// MUTATION GUARD: `effective_harness`'s `named.is_empty()` → `named.is_empty() ||
+    /// !harness_is_implemented(named)`, or `retry.rs`'s `harness_origin` rule → the same
+    /// `!harness_is_implemented(&re.harness)` guard.
+    #[test]
+    fn dispatch_records_the_refused_harness_the_profile_named_not_the_backend() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "codexer",
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "codexer".to_string();
+        let (mut o, store) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "claude".to_string();
+        }
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(
+            p.harness, "codex",
+            "the profile named codex; the row must not claim the configured backend ran"
+        );
+        assert_eq!(p.harness_origin, "profile");
+    }
+
     /// A profile that fails to resolve must not block work — and must not smuggle a half-resolved
     /// model onto the run either. The existing behaviour (no section, still routed) is unchanged.
     #[test]
