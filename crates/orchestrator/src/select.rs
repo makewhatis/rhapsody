@@ -303,12 +303,7 @@ impl Orchestrator {
             {
                 None
             } else {
-                let load = impl_load.get_or_insert_with(|| {
-                    crate::teams::LoadSnapshot::from_running_and_retries(
-                        &self.running,
-                        &self.retry_attempts,
-                    )
-                });
+                let load = impl_load.get_or_insert_with(|| self.teammate_load());
                 // Routed against the load THIS pass has already created, not the frozen
                 // start-of-pass load — the dispatch loop re-routes per issue with `running`
                 // advanced, so anything else answers a different question than the one that
@@ -671,12 +666,7 @@ impl Orchestrator {
             {
                 None
             } else {
-                let load = impl_load.get_or_insert_with(|| {
-                    crate::teams::LoadSnapshot::from_running_and_retries(
-                        &self.running,
-                        &self.retry_attempts,
-                    )
-                });
+                let load = impl_load.get_or_insert_with(|| self.teammate_load());
                 // Routed against the load THIS pass has already created, not the frozen
                 // start-of-pass load — the dispatch loop re-routes per issue with `running`
                 // advanced, so anything else answers a different question than the one that
@@ -2605,6 +2595,77 @@ mod tests {
         let (picked, _, held) =
             o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])]);
         assert!(picked.is_empty(), "alice's one seat is taken");
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// **A teammate's seat is spent by an in-flight PREPARATION, not only by a `RunningEntry`
+    /// (STUDIO-988 review round 7, sol #2).** A `preparing` reservation has no running entry yet, so
+    /// seeding the ladder's load from `running`/`retry_attempts` alone reads alice idle and admits a
+    /// second ticket past `max_concurrent` on a later tick. The reservation retains its planned
+    /// teammate, and the ladder's snapshot folds it in.
+    ///
+    /// MUTATION GUARD: drop `PreparingEntry::planned_identity` from `Orchestrator::teammate_load`
+    /// (seed the ladders from `from_running_and_retries` only) and the second ticket is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hanging_preparation_holds_its_teammates_seat_in_the_single_project_ladder() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let target = PreparedTarget::Ticket {
+            issue: teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        let (picked, _, held) =
+            o.select_dispatch_with_reopens(vec![teams_issue("2", "MT-2", &["rhapsody:@alice"])]);
+        assert!(
+            picked.is_empty(),
+            "alice's one seat is spent by the in-flight preparation"
+        );
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// The SAME protection on the ladder a `projects:` install actually runs (STUDIO-988 review
+    /// round 7, sol #2). MUTATION GUARD: drop the preparing fold from the multi ladder and the
+    /// second ticket is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hanging_preparation_holds_its_teammates_seat_in_the_multi_project_ladder() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let mut o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 10, HashMap::new())]);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let target = PreparedTarget::Ticket {
+            issue: teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            attempt: None,
+            route: o.route_for(Some(0)),
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: Some(0),
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![teams_issue("2", "MT-2", &["rhapsody:@alice"])],
+        ));
+        assert!(
+            picked.is_empty(),
+            "alice's one seat is spent by the in-flight preparation"
+        );
         assert_eq!(held.get("alice").copied(), Some(1));
     }
 

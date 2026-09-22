@@ -41,6 +41,22 @@ use crate::retry::{DispatchRoute, EvWorkerExit};
 /// from a ticket run anywhere one is held by id.
 pub const REVIEW_KEY_PREFIX: &str = "pr:";
 
+/// The watcher-side bookkeeping a ticketless review dispatch owns, applied once the dispatch is
+/// ACCEPTED. The synchronous path applies it in the sweep's `Dispatched` arm; an asynchronous
+/// preparation carries it on its reservation (`PreparedTarget::Review`) and applies it on acceptance,
+/// because `finish_review_dispatch` alone — the tail both paths share — writes the watch row but not
+/// the churn charge or the incumbent retirement. Without it a prepared review is free against the
+/// per-pull-request round budget and a reassigned round leaves its incumbent watch row live
+/// (STUDIO-988 review round 7, sol #1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewWatchCommit {
+    /// The incumbent watch row to retire when the round was reassigned to a substitute.
+    pub incumbent: ReviewWatchKey,
+    /// Whether the round moved to a substitute. Only then is the incumbent retired — retiring on a
+    /// non-reassigned round would drop the very row that owes this review.
+    pub reassigned: bool,
+}
+
 /// The dispatch-time coordinates of one ticketless review run: WHICH pull request, at WHICH head,
 /// for WHICH reviewer. Stamped onto the run's [`RunningEntry`](crate::orchestrator::RunningEntry)
 /// and threaded to the worker, which provisions the detached worktree from it.
@@ -336,6 +352,26 @@ impl Orchestrator {
     /// running/claimed half of the eligibility check is therefore reproduced here, where the review
     /// path cannot forget it.
     pub fn dispatch_review(&mut self, run: ReviewRun) -> ReviewDispatchOutcome {
+        self.dispatch_review_inner(run, None)
+    }
+
+    /// [`dispatch_review`](Self::dispatch_review) carrying the watcher bookkeeping a review must apply
+    /// once its dispatch is ACCEPTED. The ticketless sweep is the only caller that has this data; it
+    /// is what lets an asynchronous preparation charge the churn budget and retire a reassigned
+    /// incumbent exactly as the synchronous arm would (STUDIO-988 review round 7, sol #1).
+    pub(crate) fn dispatch_review_watch(
+        &mut self,
+        run: ReviewRun,
+        commit: ReviewWatchCommit,
+    ) -> ReviewDispatchOutcome {
+        self.dispatch_review_inner(run, Some(commit))
+    }
+
+    fn dispatch_review_inner(
+        &mut self,
+        run: ReviewRun,
+        commit: Option<ReviewWatchCommit>,
+    ) -> ReviewDispatchOutcome {
         // §16: gated on teams.enabled, structurally, before anything is observed or written.
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
             return ReviewDispatchOutcome::TeamsOff;
@@ -443,10 +479,17 @@ impl Orchestrator {
             issue: iss.clone(),
             run: Box::new(run.clone()),
             route: route.clone(),
+            commit: commit.clone(),
         };
         match self.begin_preparation(target, false) {
             crate::prepare::BeginPreparation::NoResolver => {
+                // The synchronous path applies the watcher commit inline, in the same order the
+                // watcher's own `Dispatched` arm used to: dispatch tail first, then retire/charge.
+                let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
                 self.finish_review_dispatch(run, route, iss);
+                if let Some(commit) = commit {
+                    self.commit_review_watch(&pr, &commit);
+                }
                 ReviewDispatchOutcome::Dispatched
             }
             crate::prepare::BeginPreparation::Started(_) => {

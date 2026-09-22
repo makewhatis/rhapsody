@@ -304,6 +304,10 @@ pub(crate) enum PreparedTarget {
         issue: Issue,
         run: Box<crate::review::ReviewRun>,
         route: DispatchRoute,
+        /// The watcher bookkeeping to apply on acceptance (STUDIO-988 review round 7, sol #1):
+        /// `None` on the direct/test dispatch paths, `Some` for the ticketless sweep, which owns the
+        /// churn charge and the reassigned-incumbent retirement.
+        commit: Option<crate::review::ReviewWatchCommit>,
     },
 }
 
@@ -427,6 +431,11 @@ pub(crate) struct PreparingEntry {
     /// When true, the identity's claim is held by THIS same piece of work (a retry/continuation),
     /// so the claim is not evidence of a competing dispatch.
     pub claim_already_held: bool,
+    /// The teammate this reservation would be worked by, retained so the load the selection ladders
+    /// seed includes preparations: without it a `preparing` ticket reads its teammate idle and a
+    /// later tick admits a second ticket past `max_concurrent` (STUDIO-988 review round 7, sol #2).
+    /// `None` for a review (the review pool is separate, D2) and for a ticket that routes to nobody.
+    pub planned_identity: Option<String>,
     /// When this reservation began, for bounded-age logging.
     pub started_at: DateTime<Utc>,
 }
@@ -435,6 +444,12 @@ impl PreparingEntry {
     /// The id of the issue/review this reservation is for.
     pub fn id(&self) -> &str {
         self.key.id()
+    }
+
+    /// The teammate this reservation would be worked by, for the implementation load the selection
+    /// ladders seed. `None` for a review and for a ticket that routes to nobody.
+    pub fn planned_identity(&self) -> Option<&str> {
+        self.planned_identity.as_deref()
     }
 
     /// The ticket's state when the reservation was made (empty for a review); used to fold
@@ -519,6 +534,15 @@ pub(crate) struct PreparingReservations {
     seq: u64,
 }
 
+/// The owned fields [`PreparingReservations::begin`] stores for one reservation, beyond the id/key
+/// it mints the token from. Grouped into one value so `begin` stays under clippy's argument ceiling.
+struct PreparingEntryInit {
+    target: PreparedTarget,
+    claim_already_held: bool,
+    planned_identity: Option<String>,
+    started_at: DateTime<Utc>,
+}
+
 impl PreparingReservations {
     /// Whether a reservation exists for `id`.
     pub fn contains(&self, id: &str) -> bool {
@@ -557,9 +581,7 @@ impl PreparingReservations {
         id: &str,
         key: PreparationKey,
         config_generation: u64,
-        target: PreparedTarget,
-        claim_already_held: bool,
-        started_at: DateTime<Utc>,
+        init: PreparingEntryInit,
     ) -> Result<PreparationToken, BeginPreparation> {
         if self.entries.contains_key(id) {
             return Err(BeginPreparation::AlreadyPreparing);
@@ -569,7 +591,7 @@ impl PreparingReservations {
             generation: config_generation,
             seq: self.seq,
         };
-        let fingerprint = RefusalGate::key(key.kind(), id, &target.selection());
+        let fingerprint = RefusalGate::key(key.kind(), id, &init.target.selection());
         self.entries.insert(
             id.to_string(),
             PreparingEntry {
@@ -578,9 +600,10 @@ impl PreparingReservations {
                 fingerprint,
                 config_generation,
                 cancel: CancelSignal::new(),
-                target,
-                claim_already_held,
-                started_at,
+                target: init.target,
+                claim_already_held: init.claim_already_held,
+                planned_identity: init.planned_identity,
+                started_at: init.started_at,
             },
         );
         Ok(token)
@@ -824,13 +847,27 @@ impl Orchestrator {
         if self.refusal_gate.suppressed(&fingerprint, now) {
             return BeginPreparation::Suppressed;
         }
+        // The teammate this reservation will be worked by, retained on the entry so the load the
+        // selection ladders seed counts it (STUDIO-988 review round 7, sol #2). Computed from the
+        // SAME running+retry+preparing load the ladders use, so a later tick's capacity answer
+        // matches this reservation. `None` for a review — the review pool is a separate counter (D2).
+        let planned_identity = match &target {
+            PreparedTarget::Ticket { issue, .. } => {
+                let load = self.teammate_load();
+                self.planned_identity(issue, &load)
+            }
+            PreparedTarget::Review { .. } => None,
+        };
         let token = match self.preparing.begin(
             &id,
             key.clone(),
             self.prepare_generation,
-            target,
-            claim_already_held,
-            now,
+            PreparingEntryInit {
+                target,
+                claim_already_held,
+                planned_identity,
+                started_at: now,
+            },
         ) {
             Ok(t) => t,
             Err(already) => return already,
@@ -1398,13 +1435,25 @@ impl Orchestrator {
                 );
                 self.dispatch_issue(issue, attempt, route, stack_context);
             }
-            PreparedTarget::Review { issue, run, route } => {
+            PreparedTarget::Review {
+                issue,
+                run,
+                route,
+                commit,
+            } => {
                 tracing::info!(
                     review = %run.key(),
                     harness = %prepared.harness,
                     "review preparation accepted; dispatching"
                 );
+                let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
                 self.finish_review_dispatch(*run, route, issue);
+                // The watcher bookkeeping the synchronous arm applies in `reviewwatch`: a prepared
+                // review must charge the same churn budget and retire the same reassigned incumbent
+                // once its dispatch is accepted (STUDIO-988 review round 7, sol #1).
+                if let Some(commit) = commit {
+                    self.commit_review_watch(&pr, &commit);
+                }
             }
         }
     }
@@ -2434,6 +2483,7 @@ mod tests {
             issue: run.synthetic_issue(),
             run: Box::new(run.clone()),
             route,
+            commit: None,
         };
         assert!(matches!(
             o.begin_preparation(target, false),
@@ -2461,6 +2511,7 @@ mod tests {
                         model: "opus".to_string(),
                         workspace_mode: String::new(),
                     },
+                    commit: None,
                 },
                 false
             ),
@@ -2611,6 +2662,7 @@ mod tests {
             issue: run.synthetic_issue(),
             run: Box::new(run.clone()),
             route: sample_route(),
+            commit: None,
         };
         assert!(matches!(
             o.begin_preparation(target, false),
@@ -3520,6 +3572,7 @@ mod tests {
             issue: run.synthetic_issue(),
             run: Box::new(run.clone()),
             route,
+            commit: None,
         };
         assert!(matches!(
             o.begin_preparation(target, false),
@@ -3573,6 +3626,7 @@ mod tests {
                 issue: run.synthetic_issue(),
                 run: Box::new(run.clone()),
                 route: sample_route(),
+                commit: None,
             };
             assert!(matches!(
                 o.begin_preparation(target, false),
@@ -3620,6 +3674,7 @@ mod tests {
             issue: run.synthetic_issue(),
             run: Box::new(run.clone()),
             route: sample_route(),
+            commit: None,
         };
         assert!(matches!(
             o.begin_preparation(target, false),

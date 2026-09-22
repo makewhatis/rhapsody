@@ -293,6 +293,16 @@ impl LoadSnapshot {
         }
     }
 
+    /// Seeds one extra live **implementation** run for `identity` into the partition. The seam the
+    /// selection ladders and `begin_preparation` share to fold loop-owned `preparing` reservations
+    /// into the teammate load (STUDIO-988 review round 7, sol #2): a reservation has no
+    /// `RunningEntry` yet, so without this its teammate reads idle and a later tick admits a second
+    /// ticket past `max_concurrent`. Never used for review runs — the review pool is a separate
+    /// counter (D2).
+    pub(crate) fn add_preparing_implementation(&mut self, identity: &str) {
+        self.add(identity, false);
+    }
+
     /// Live runs for `name`, review runs included; absent ⇒ 0.
     fn live(&self, name: &str) -> i64 {
         self.all.get(name).copied().unwrap_or(0)
@@ -955,6 +965,26 @@ impl Orchestrator {
         let routed = self.apply_pending_assignment(teams, iss, route(teams, iss, load));
         let name = routed.identity?;
         teams.roster.iter().any(|i| i.name == name).then_some(name)
+    }
+
+    /// The teammate-load snapshot the two implementation ladders seed from AND
+    /// [`begin_preparation`](Orchestrator::begin_preparation) recomputes a reservation's planned
+    /// identity against: the live runs plus the runs parked in retry, plus every loop-owned
+    /// `preparing` reservation's planned teammate. A preparation has no [`RunningEntry`] yet, so a
+    /// snapshot built from `running`/`retry_attempts` alone reads its teammate idle and a later tick
+    /// admits a second ticket past `max_concurrent` (STUDIO-988 review round 7, sol #2).
+    ///
+    /// Deliberately distinct from [`LoadSnapshot::from_running`]: that one stays `running`-only
+    /// because its counts feed the review ranking (STUDIO-721), and widening what the reviewer
+    /// rankers count is a review-side behaviour change this ticket does not make.
+    pub(crate) fn teammate_load(&self) -> LoadSnapshot {
+        let mut load = LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts);
+        for entry in self.preparing.values() {
+            if let Some(name) = entry.planned_identity() {
+                load.add_preparing_implementation(name);
+            }
+        }
+        load
     }
 
     /// Whether `name` has no implementation capacity left, given the pass-local `tally` of runs

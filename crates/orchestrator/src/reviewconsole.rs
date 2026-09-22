@@ -1545,6 +1545,7 @@ mod tests {
             issue: run.synthetic_issue(),
             run: Box::new(run.clone()),
             route,
+            commit: None,
         };
         assert!(matches!(
             o.begin_preparation(target, false),

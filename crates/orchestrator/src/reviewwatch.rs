@@ -1633,6 +1633,45 @@ impl Orchestrator {
         }
     }
 
+    /// Applies the watcher bookkeeping a ticketless review dispatch owns, at the moment its dispatch
+    /// is ACCEPTED. Called from `dispatch_review`'s synchronous path (via the `Dispatched` arm's
+    /// former home) and from `finish_prepared` once an asynchronous preparation is accepted, so a
+    /// prepared review is charged the same churn budget and retires the same reassigned incumbent
+    /// (STUDIO-988 review round 7, sol #1). A no-op on the reassignment half when the round was not
+    /// reassigned.
+    pub(crate) fn commit_review_watch(
+        &mut self,
+        pr: &PrCoord,
+        commit: &crate::review::ReviewWatchCommit,
+    ) {
+        if commit.reassigned {
+            tracing::info!(
+                pr = %pr, from = %commit.incumbent.reviewer,
+                "ticketless review: the round was reassigned — the incumbent was not eligible for it"
+            );
+            if let Err(e) = self.store().drop_review_watch(&commit.incumbent) {
+                tracing::warn!(
+                    pr = %pr, err = %e,
+                    "ticketless review: retiring the reassigned watch row failed"
+                );
+            }
+        }
+        let key = churn_key(pr);
+        let counter = self.review_rounds.entry(key.clone()).or_default();
+        *counter += 1;
+        let spent = *counter;
+        // Durable from the instant it is charged (STUDIO-956): a round the daemon spent and then
+        // forgot across a restart is how one pull request ran 46 of them.
+        self.persist_review_rounds(&key);
+        if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(self.reviewers_per_round()) {
+            tracing::warn!(
+                pr = %pr, rounds = spent,
+                "ticketless review: this pull request has now had its whole re-review budget; \
+                 further pushes will not be reviewed"
+            );
+        }
+    }
+
     /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
     /// request that has left the watch set or that an operator has deliberately cleared
     /// (STUDIO-956). The durability trap the ticket names: a bound that outlived its pull request
@@ -2601,48 +2640,23 @@ impl Orchestrator {
                 // (STUDIO-959). The watcher has no prior-round record to offer here.
                 prior_sha: String::new(),
             };
-            match self.dispatch_review(run) {
+            // The watcher bookkeeping travels WITH the dispatch, so an asynchronous preparation can
+            // apply it on acceptance exactly as the synchronous arm does here (STUDIO-988 review
+            // round 7, sol #1). `dispatch_review_watch` charges the churn budget and retires the
+            // reassigned incumbent for the no-resolver case; a prepared dispatch carries the same
+            // commit on its reservation and applies it in `finish_prepared`.
+            let commit = crate::review::ReviewWatchCommit {
+                incumbent: row.key.clone(),
+                reassigned,
+            };
+            match self.dispatch_review_watch(run, commit) {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
                     *slots -= 1;
                     assigned[idx] = picked;
-                    if reassigned {
-                        // The round moved to a substitute, so the incumbent's row leaves the watch
-                        // set rather than staying beside theirs: it is the SAME required review,
-                        // and two rows would make the pull request owe two of them forever —
-                        // `review_round_due` would go on answering true for the incumbent at every
-                        // head, for a reviewer nobody is waiting on.
-                        //
-                        // Retired only AFTER the dispatch succeeded. Doing it first would leave the
-                        // pull request with no row at all for this required review on any refusal,
-                        // and nothing would ever ask for it again.
-                        tracing::info!(
-                            pr = %pr, from = %row.key.reviewer,
-                            "ticketless review: the round was reassigned — the incumbent was not \
-                             eligible for it"
-                        );
-                        if let Err(e) = self.store().drop_review_watch(&row.key) {
-                            tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
-                        }
-                        // No capacity hold to drop here: this row's key was already removed at the
-                        // top of THIS call, and the only site that inserts a hold `continue`s before
-                        // reaching the reassignment, so the incumbent can never hold one by now
-                        // (STUDIO-950 round 11). The top-of-call removal is the guard for it.
-                    }
-                    let key = churn_key(pr);
-                    let counter = self.review_rounds.entry(key.clone()).or_default();
-                    *counter += 1;
-                    let spent = *counter;
-                    // Durable from the instant it is charged (STUDIO-956): a round the daemon spent
-                    // and then forgot across a restart is how one pull request ran 46 of them.
-                    self.persist_review_rounds(&key);
-                    if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
-                        tracing::warn!(
-                            pr = %pr, rounds = spent,
-                            "ticketless review: this pull request has now had its whole re-review \
-                             budget; further pushes will not be reviewed"
-                        );
-                    }
+                    // The churn charge and the reassigned-incumbent retirement ran inside
+                    // `dispatch_review_watch` / `commit_review_watch`, so they cover the prepared
+                    // path too and are deliberately not repeated here.
                 }
                 // Not a failure: something claimed the key between the check above and here, which
                 // is precisely what the guard exists for. Next tick.
@@ -2680,6 +2694,11 @@ impl Orchestrator {
                     if reserved {
                         *slots -= 1;
                     }
+                    // The reviewer chosen for this round is committed by the reservation, so the
+                    // later rows of THIS sweep must treat that teammate as assigned — the same
+                    // bookkeeping the synchronous arm does, kept here because it is sweep-local
+                    // state the reservation cannot carry.
+                    assigned[idx] = picked;
                     tracing::debug!(pr = %pr, reserved, "ticketless review: preparation in flight");
                 }
             }
@@ -9879,6 +9898,100 @@ mod tests {
         assert_eq!(
             report.deferred, 3,
             "the two over-budget rounds are deferred, not prepared"
+        );
+    }
+
+    /// **An ACCEPTED prepared review charges the churn budget (STUDIO-988 review round 7, sol #1).**
+    /// The synchronous `Dispatched` arm is the only place a round used to be charged; a sweep that
+    /// returns through `Preparing` and is accepted later must charge exactly the same one —
+    /// otherwise prepared reviews are free against `REVIEW_ROUNDS_PER_PR_CAP`.
+    ///
+    /// MUTATION GUARD: drop the `commit_review_watch` call from `finish_prepared` and the round
+    /// stays 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_prepared_review_charges_one_round() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let (mut o, _dispatched) = orch(ticketless(&["bob"]));
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        introduce(&o, row(31, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.dispatched, 0, "nothing dispatches until acceptance");
+        assert_eq!(o.preparing.len(), 1, "the round began a preparation");
+        assert_eq!(
+            o.review_rounds
+                .get(&churn_key(&coord(31)))
+                .copied()
+                .unwrap_or(0),
+            0,
+            "a reservation alone charges nothing"
+        );
+
+        let key = review_key(OWNER, REPO, 31, "bob");
+        let token = o
+            .preparing
+            .get(&key)
+            .map(|e| e.token)
+            .expect("review reservation");
+        o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+            .await;
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(31))).copied(),
+            Some(1),
+            "an accepted prepared review must charge one round against the per-PR churn budget"
+        );
+    }
+
+    /// **An ACCEPTED prepared reassignment retires the incumbent row (STUDIO-988 review round 7,
+    /// sol #1).** The synchronous arm drops the incumbent's row only after the dispatch succeeds; the
+    /// accepted prepared path must do the same, or a reassigned review leaves the pull request owing
+    /// the review of a reviewer who has left the roster forever.
+    ///
+    /// MUTATION GUARD: drop the `commit_review_watch` call from `finish_prepared` and bob's row
+    /// stands beside carol's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_prepared_reassignment_retires_the_incumbent() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "carol"]));
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        // `bob` has left the roster, so the round is reassigned — and PREPARED, not dispatched.
+        introduce(&o, row(12, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "the round is prepared, not dispatched"
+        );
+        let key = review_key(OWNER, REPO, 12, "carol");
+        assert_eq!(
+            o.preparing.values().map(|e| e.id()).collect::<Vec<_>>(),
+            vec![key.as_str()],
+            "the reservation is keyed by the substitute's identity"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the incumbent is retired only once the dispatch is accepted"
+        );
+
+        let token = o
+            .preparing
+            .get(&key)
+            .map(|e| e.token)
+            .expect("review reservation");
+        o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+            .await;
+
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_DROPPED,
+            "the accepted reassignment must retire the incumbent's row"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "carol").requested_sha,
+            HEAD_A,
+            "and the substitute's row carries the round"
         );
     }
 
