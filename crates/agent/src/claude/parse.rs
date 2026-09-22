@@ -49,6 +49,11 @@ struct RawLine {
     subtype: String,
     session_id: String,
     is_error: bool,
+    /// The HTTP status the API returned on an error result (`null` on a clean turn). Read for the
+    /// same reason as `is_error`: on the captured unrecognized-model failure the terminal `result`
+    /// carries `subtype: "success"` with `is_error: true` and `api_error_status: 404`, so the status
+    /// is the actionable detail and the subtype is a lie.
+    api_error_status: Option<i64>,
     result: String,
     /// top-level usage (present on `result` lines)
     usage: Option<RawUsage>,
@@ -142,16 +147,26 @@ pub fn classify(line: &[u8]) -> Classified {
             // Surface the final result text so the orchestrator can detect the agent's HANDOFF:
             // declaration. Keep the TAIL — the marker is the last line.
             let text = truncate_tail(&r.result, MAX_RESULT_TEXT);
+            // ⚠️ The verdict is `is_error`, NEVER `subtype` (design §5.2/§7.1): the captured
+            // unrecognized-model failure carries `subtype: "success"` on a failed turn, so a
+            // classifier keyed on the subtype string records a success for a run that produced
+            // nothing. When the API reported a status, the failure message names it — the subtype is
+            // unusable there — while an error result with no status keeps its subtype verbatim (so
+            // the `error_during_execution` golden is byte-identical).
             let (event_type, status) = if r.is_error {
                 (EVENT_TURN_FAILED, TURN_FAILED)
             } else {
                 (EVENT_TURN_COMPLETED, TURN_SUCCEEDED)
             };
+            let message = match (r.is_error, r.api_error_status) {
+                (true, Some(code)) if code != 0 => format!("http {code}"),
+                _ => r.subtype.clone(),
+            };
             Classified {
                 event: Event {
                     event_type: event_type.to_string(),
                     timestamp: now,
-                    message: r.subtype.clone(),
+                    message,
                     usage: Some(usage),
                     ..Default::default()
                 },
@@ -443,5 +458,51 @@ mod tests {
         );
         assert!(!classify(b"   ").ok, "blank line → no event");
         assert!(!classify(b"not json").ok, "non-json → no event");
+    }
+
+    /// MUTATION GUARD: the SUCCESS-LIE, against the real captured stream (STUDIO-869,
+    /// `harness/harness-spike/claude/failure-unrecognized-model.jsonl`). The terminal `result` line
+    /// carries `subtype: "success"` with `is_error: true` and `api_error_status: 404`, so a
+    /// classifier keyed on `subtype` records a SUCCESS for a run that produced nothing. Key on
+    /// `is_error` and this reds under that mutation instead.
+    ///
+    /// The fixture is committed in-tree, so the test is deterministic and needs no paid provider.
+    #[test]
+    fn classify_captured_unrecognized_model_failure_is_not_a_success() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/harness-spike/claude/failure-unrecognized-model.jsonl");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read capture {}: {e}", path.display()));
+
+        let mut terminal = None;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let c = classify(line.as_bytes());
+            if c.terminal {
+                terminal = Some(c);
+                break;
+            }
+        }
+        let c = terminal.expect("capture has a terminal result line");
+
+        // The lie the classifier must not believe:
+        let v: serde_json::Value =
+            serde_json::from_str(raw.lines().last().expect("last line")).expect("json");
+        assert_eq!(
+            v["subtype"], "success",
+            "fixture precondition: the captured failure's subtype says `success`"
+        );
+
+        assert_eq!(
+            c.event.event_type, EVENT_TURN_FAILED,
+            "a result with is_error:true must classify as a FAILED turn, not a completed one"
+        );
+        assert_eq!(c.result.status, TURN_FAILED);
+        assert_eq!(
+            c.event.message, "http 404",
+            "the failure must name the API status, since the subtype is unusable"
+        );
     }
 }

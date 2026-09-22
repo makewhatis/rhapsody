@@ -75,6 +75,7 @@ import {
   ticketUrl,
   type AttemptOption,
   type Baton,
+  harnessFidelity,
   type FailingStep,
   type RelayBatons,
   type RunVitals,
@@ -318,6 +319,11 @@ function RunTrace({
   // What this run ACTUALLY ran on (STUDIO-909). Written once at dispatch, so it never polls; the
   // header renders it with each value's origin, which is what makes an invisible override visible.
   const provenance = useRunProvenance(run.id);
+  // STUDIO-978: the observability this run's harness actually offers. Reduced event fidelity is
+  // stated where it shows (the Trace spine) and a harness that cannot be steered hides the message
+  // composer, rather than drawing an unexplained empty spine or a control that silently drops what
+  // it is given.
+  const fidelity = harnessFidelity(provenance.data);
   const live = liveRunRow(run, detail.data);
   const inFlight = live.outcome === OUTCOME_RUNNING;
   const transcript = useTranscript(run.id, inFlight);
@@ -484,6 +490,7 @@ function RunTrace({
             live={inFlight}
             batons={batons}
             jump={jump}
+            reducedEvents={fidelity.reducedEvents}
           />
           {/* Zone D (STUDIO-766): the rail is not step-scoped — the same five surfaces whichever
               step the spine has selected — so it is a full-width sibling of the Split, on the
@@ -510,6 +517,7 @@ function RunTrace({
               onComposerFocused={takeMessageFocus}
               onOpenMemory={onOpenMemory}
               onOpenRoom={onOpenRoom}
+              steeringAvailable={fidelity.steeringAvailable}
             />
           </WatchTabsRail>
           {/* §6's "Ask about this run": a room post refed to the run TODAY, which upgrades to the
@@ -1224,6 +1232,7 @@ function TraceSplit({
   live,
   batons,
   jump,
+  reducedEvents,
 }: {
   phases: readonly TracePhase[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -1234,6 +1243,9 @@ function TraceSplit({
   live: boolean;
   batons: RelayBatons;
   jump: { step: FailingStep; nonce: number } | null;
+  /** STUDIO-978: the run's harness emits only final text, so there is no per-step spine. Stated
+   *  here rather than drawn as a blank spine the operator cannot tell from a silent run. */
+  reducedEvents: boolean;
 }) {
   const [filter, setFilter] = useState<TraceFilter>("all");
   const [query, setQuery] = useState("");
@@ -1343,7 +1355,11 @@ function TraceSplit({
           {batons.outgoing === null ? null : <BatonRow baton={batons.outgoing} direction="out" />}
           {phases.length === 0 ? (
             <div className="empty">
-              {pending ? "Loading transcript…" : "No transcript recorded for this run."}
+              {pending
+                ? "Loading transcript…"
+                : reducedEvents
+                  ? "This run's harness emits only a final result, not per-step events, so there is no step spine to show."
+                  : "No transcript recorded for this run."}
             </div>
           ) : null}
           {phases.length > 0 && visible.length === 0 ? (
@@ -1840,6 +1856,7 @@ function WatchPanel({
   onComposerFocused,
   onOpenMemory,
   onOpenRoom,
+  steeringAvailable,
 }: {
   tab: WatchTabId;
   run: RunSummary;
@@ -1853,6 +1870,8 @@ function WatchPanel({
   onComposerFocused: () => void;
   onOpenMemory: () => void;
   onOpenRoom: () => void;
+  /** STUDIO-978: false when the run's harness cannot be steered, so the composer is hidden. */
+  steeringAvailable: boolean;
 }) {
   switch (tab) {
     case "diff":
@@ -1882,6 +1901,7 @@ function WatchPanel({
           onDraft={onDraft}
           focus={focusComposer}
           onFocused={onComposerFocused}
+          steeringAvailable={steeringAvailable}
         />
       );
     default:
@@ -2306,6 +2326,7 @@ function MessagesPanel({
   onDraft,
   focus,
   onFocused,
+  steeringAvailable,
 }: {
   runId: number;
   live: boolean;
@@ -2315,6 +2336,9 @@ function MessagesPanel({
   focus: boolean;
   /** Consumes that request, so a later plain tab click does not re-steal the focus. */
   onFocused: () => void;
+  /** STUDIO-978: false hides the composer (the harness cannot be steered — design D7). The
+   *  timeline still renders; only the dead control is removed. */
+  steeringAvailable: boolean;
 }) {
   const messages = useRunMessages(runId, live);
   const send = useSendRunMessage(runId);
@@ -2364,41 +2388,47 @@ function MessagesPanel({
           </div>
         ) : null}
       </div>
-      <div className="trmsg" id={MESSAGE_COMPOSER_ID}>
-        <textarea
-          ref={box}
-          aria-label="Message the running agent"
-          placeholder="The agent picks this up at its next step…"
-          maxLength={4000}
-          rows={2}
-          value={draft}
-          disabled={send.isPending}
-          onChange={(e) => onDraft(e.target.value)}
-          onKeyDown={(e) => {
-            // Enter sends, Shift+Enter breaks the line — and a composition (CJK and friends) is
-            // being CONFIRMED by that Enter, never sent by it.
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault();
-              submit();
-            }
-          }}
-        />
-        <div className="row">
-          {live ? null : (
-            <span className="acterr" role="status">
-              This run has ended — there is no agent left to deliver this to.
-            </span>
-          )}
-          {problem === "" ? null : (
-            <span className="acterr" role="status">
-              {problem}
-            </span>
-          )}
-          <Button onClick={submit} disabled={!live || send.isPending}>
-            Send
-          </Button>
+      {steeringAvailable ? (
+        <div className="trmsg" id={MESSAGE_COMPOSER_ID}>
+          <textarea
+            ref={box}
+            aria-label="Message the running agent"
+            placeholder="The agent picks this up at its next step…"
+            maxLength={4000}
+            rows={2}
+            value={draft}
+            disabled={send.isPending}
+            onChange={(e) => onDraft(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter sends, Shift+Enter breaks the line — and a composition (CJK and friends) is
+              // being CONFIRMED by that Enter, never sent by it.
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+          <div className="row">
+            {live ? null : (
+              <span className="acterr" role="status">
+                This run has ended — there is no agent left to deliver this to.
+              </span>
+            )}
+            {problem === "" ? null : (
+              <span className="acterr" role="status">
+                {problem}
+              </span>
+            )}
+            <Button onClick={submit} disabled={!live || send.isPending}>
+              Send
+            </Button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="trdep">
+          This run&apos;s harness cannot be steered, so there is no way to message its agent.
+        </div>
+      )}
     </>
   );
 }

@@ -647,8 +647,9 @@ mod tests {
             222_000,
             "an opencode-dispatched run must be governed by opencode's stall timeout"
         );
-        // A harness this build has no runner for runs on the default, so it keeps the default's
-        // liveness window rather than losing stall detection to a typo.
+        // A harness this build has no runner for never reaches a turn — `spawn_worker` REFUSES it
+        // (STUDIO-978) — so it keeps the default's liveness window here rather than losing stall
+        // detection to a typo.
         assert_eq!(resolved(&o, "", "goose"), 111_000);
 
         // And the per-project branch, which reads the project's own resolved config.
