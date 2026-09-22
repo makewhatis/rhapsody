@@ -187,6 +187,15 @@ impl Orchestrator {
             self.review_capacity_held.clear();
         }
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
+        // The roster identities a review dispatch would be refused for (STUDIO-978), resolved HERE
+        // on the control task — the live harness question needs `eff` (just set above) and the
+        // roster's profiles, neither of which the off-loop manager room reader holds. Published
+        // with the rest of the reload so `teamsears::file_review` can drop a reviewer `spawn_worker`
+        // would refuse instead of filing a review ticket the parent then waits on forever.
+        let reviewer_exclusions = match self.teams.as_ref() {
+            Some(teams) => self.reviewer_exclusions(teams),
+            None => crate::quorum::ReviewerExclusions::default(),
+        };
         // The project trackers and the same reload's dispatchable-state sets, published TOGETHER
         // under one write (STUDIO-672). Together because the off-loop triage task reads them as a
         // pair and acts on the pair; from this reload rather than re-derived there so triage and
@@ -196,6 +205,7 @@ impl Orchestrator {
             states,
             facts: project_facts,
             summon_token: cfg.tracker.summon_token.clone(),
+            reviewer_exclusions,
         });
         // Resolve configured project slugs against Linear + flag any missing repo-relative prompt_file,
         // best-effort and OFF the control task (a no-op on the direct-reload test path where `o.ctx` is
@@ -711,6 +721,55 @@ Do {{ issue.identifier }}.
                 .len(),
             3,
             "a reload must republish the live project set"
+        );
+    }
+
+    /// STUDIO-978: the control task resolves the roster identities a review dispatch would be
+    /// REFUSED for and publishes them with the rest of the triage snapshot, so the off-loop manager
+    /// room reader can drop a reviewer `spawn_worker` would refuse instead of filing a review ticket
+    /// the parent waits on forever. A profile naming `codex` (no runner in this build) is excluded;
+    /// an identity with no profile inherits `agent.backend` and is not.
+    #[test]
+    fn reload_publishes_reviewer_exclusions_for_an_unimplemented_harness_profile() {
+        use rhapsody_config::teams::{Identity, Teams};
+
+        let (path, dir) = write_workflow(CLAUDE_WF);
+        let profiles = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&profiles).expect("create profiles dir");
+        std::fs::write(
+            profiles.join("codexer.md"),
+            "---\nextends: swe\nharness: codex\n---\nCodex.\n",
+        )
+        .expect("write profile");
+
+        let mut o = Orchestrator::new(path);
+        let mut teams = Teams::disabled();
+        teams.enabled = true;
+        teams.roster = vec![
+            Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            },
+            Identity {
+                name: "sol".to_string(),
+                profile: "codexer".to_string(),
+                ..Identity::default()
+            },
+        ];
+        o.teams = Some(teams);
+        o.teams_profiles_dir = Some(profiles);
+        o.reload_from_disk().expect("reload");
+
+        let snap = o.control().reads_triage_target().expect("config loaded");
+        assert!(
+            snap.reviewer_exclusions.unselectable.contains("sol"),
+            "a codex profile must be excluded from review selection: {:?}",
+            snap.reviewer_exclusions
+        );
+        assert!(
+            !snap.reviewer_exclusions.unselectable.contains("alice"),
+            "no profile ⇒ runs on the backend, so not excluded: {:?}",
+            snap.reviewer_exclusions
         );
     }
 

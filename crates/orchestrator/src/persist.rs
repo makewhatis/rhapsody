@@ -271,7 +271,7 @@ impl Orchestrator {
         model_override: &rhapsody_agent::ModelOverride,
         project_slug: &str,
     ) -> (String, String) {
-        let harness = self.harness_actually_run(harness);
+        let harness = self.effective_harness(harness);
         let model = if model_override.model.is_empty() {
             self.configured_model_for(project_slug, &harness)
         } else {

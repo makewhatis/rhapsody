@@ -2307,6 +2307,49 @@ session instead of numbering per state directory: `concurrency-trials-isolated-x
 isolated turns with ten distinct ids. So isolation costs opencode nothing here, and slice 9 still
 owns the goose case where the trade is real.
 
+### Harness capabilities are declared and refused, not inferred (STUDIO-978)
+
+The frozen reference runs one backend, so "what can this harness do?" never has to be asked. Rhapsody
+ships a pluggable contract and must answer it before it spawns anything: a dispatch resolves to a
+harness, that harness **declares** its `HarnessCapabilities`, and a pure validator compares the
+declaration against what the work needs. Running a harness that cannot honour a requirement produces
+work that looks finished and is not, so the daemon refuses instead of guessing.
+
+Two lines are drawn (design §5.1):
+
+- **Correctness capabilities refuse.** A run that requires the daemon's MCP tools (`team_tools`) and
+  resolves to a harness that cannot reach them, or that requires a second turn (`multi_turn`) and
+  resolves to a harness that cannot resume, is **refused**. The refusal is typed
+  (`CapabilityRefusal`), recorded on the run, and terminal — never a silent downgrade, and it
+  schedules no retry, because a profile's harness name does not change between attempts.
+- **Observability capabilities degrade visibly.** A `FinalTextOnly` harness is still dispatchable: the
+  console states the reduced fidelity where the Trace spine would be, rather than rendering an empty
+  one, and hides the steering affordance where the harness declares `Steering::None`.
+
+Requirements that interact are modelled as a coupling, not as independent booleans:
+`HarnessCapabilities::mcp_sandbox` lets a harness declare that MCP and a sandbox are mutually
+exclusive (codex's measured shape), so a dispatch requiring both is refused rather than half-honoured.
+
+A named harness this build has no runner for — `codex`, or a typo — is a typed
+`HarnessNotImplemented` refusal, **never** a fall back to `agent.backend`. The run row records the
+harness the profile named (origin `profile`) rather than the backend it once silently ran on, so a
+refused run cannot render another harness's fidelity.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| Capability declaration | — (one backend) | `HarnessCapabilities`, read before spawn |
+| A profile naming a harness with no runner | — (no profiles) | **refused**, typed, no retry |
+| Run provenance for a named harness | — | the name the profile gave, origin `profile` |
+
+**One byte-level parity change falls out of this.** `crates/agent/src/claude/parse.rs` mirrors Go
+`parse.go`, and on a terminal `result` line its normalized `message` was the line's `subtype`
+verbatim. The STUDIO-869 capture shows why that is unusable: an unrecognized model returns
+`subtype: "success"` with `is_error: true` and `api_error_status: 404`, so the subtype reads as a
+success on a failed turn. On an error result carrying a non-zero `api_error_status` the message is now
+`http <status>`; an error result with no status keeps its subtype, so the committed goldens stay
+byte-identical. The verdict itself (`event_type`/`status`) already keyed on `is_error` before this
+change — only the message text diverges.
+
 ### Auto-promote names the backlog states it may act on — `promote_from_states` (STUDIO-948)
 
 The frozen reference's DAG auto-promote pass selects its input by Linear state **type** — a ticket in

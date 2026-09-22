@@ -514,6 +514,30 @@ pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) ->
                 obj.insert(key.to_string(), json!(value));
             }
         }
+        // OBSERVABILITY FIDELITY (STUDIO-978): what the console may honestly render for this run,
+        // derived from the harness the run ACTUALLY ran on — never from a guess. `harness_events`
+        // tells the Trace zone whether a per-step spine exists at all ("structured") or whether the
+        // run only has a final result ("final_text_only"), and `harness_steering` tells it whether
+        // the steering affordance is real. Omitted when the harness is unknown or unimplemented, so
+        // the console says "unknown" rather than assuming either shape.
+        if let Some(id) = rhapsody_agent::harness_id_for_name(&p.harness) {
+            let caps = rhapsody_agent::declared_capabilities(id);
+            obj.insert(
+                "harness_events".to_string(),
+                json!(match caps.events {
+                    rhapsody_agent::EventFidelity::FinalTextOnly => "final_text_only",
+                    rhapsody_agent::EventFidelity::Structured { .. } => "structured",
+                }),
+            );
+            obj.insert(
+                "harness_steering".to_string(),
+                json!(match caps.steering {
+                    rhapsody_agent::Steering::Live => "live",
+                    rhapsody_agent::Steering::BetweenTurns => "between_turns",
+                    rhapsody_agent::Steering::None => "none",
+                }),
+            );
+        }
     }
     Value::Object(obj)
 }

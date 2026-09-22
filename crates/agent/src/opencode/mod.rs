@@ -56,12 +56,14 @@
 pub mod args;
 pub mod mcpinject;
 pub mod parse;
+pub mod probe;
 pub mod runner;
 pub mod state;
 
 pub use args::{Config, auto_approve_enabled, build_args};
 pub use mcpinject::{INJECTED_CONFIG_NAME, SERVER_KEY, inject_daemon_mcp, rewrite_tool_names};
 pub use parse::{Classified, Failure, add_usage, classify};
+pub use probe::{CompatibilityRow, ProbeError, SUPPORTED, parse_probe_output, probe, resolve_row};
 pub use runner::Runner;
 pub use state::RunState;
 
@@ -90,7 +92,15 @@ pub(crate) mod testdir {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!(
+            // Canonicalized: macOS's own `std::env::temp_dir()` is reached through a `/var` ->
+            // `/private/var` symlink, and `state::validate_root_is_safe` (STUDIO-980) now refuses
+            // any symlink component in a configured `state_root`. Resolving it here keeps paths
+            // built from `path()` free of that symlink, matching what `state::RunState::provision`
+            // does for its own empty-`state_root` default.
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            let dir = base.join(format!(
                 "rhapsody-opencode-test-{}-{nanos}-{seq}",
                 std::process::id()
             ));
