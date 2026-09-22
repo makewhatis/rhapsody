@@ -33,7 +33,8 @@ rhapsody-provider-broker = { path = "../provider-broker" }
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 # static_assertions: the compile-guard module asserts the secret-bearing lease/state are not
-# `Clone`/`Serialize`/`Display` (P1 mutation discipline). Already in Cargo.lock (PB1's dev-dep).
+# `Clone`/`Serialize`/`Deserialize`/`Display`/`Deref`/`AsRef`/`Borrow` (P1 mutation discipline).
+# Already in Cargo.lock (PB1's dev-dep).
 static_assertions = "1"
 
 [lints]

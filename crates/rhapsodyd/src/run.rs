@@ -121,13 +121,12 @@ where
                     // `read_bound`. `connect` alone never proves authentication (the server gives
                     // unauthorized connections no response at all — see
                     // `credential_bootstrap::serve_one`), so only a completed `read_bound` can. Logs
-                    // only the resulting non-secret state tag + revision, never the credential.
-                    let read = crate::credential_client::resolve_credential(
-                        tokio::io::stdin(),
-                        account,
-                        binding,
-                    )
-                    .await;
+                    // only the resulting non-secret state tag + revision, never the credential. The
+                    // resolver tracks availability across calls (one here); a daemon that holds it
+                    // per-dispatch gets the transition-advancing revision PB7's refusal gate needs.
+                    let read = crate::credential_client::CredentialResolver::new()
+                        .resolve(tokio::io::stdin(), account, binding)
+                        .await;
                     tracing::info!(
                         state = ?read.state.tag(),
                         revision = read.revision.0,
@@ -1121,7 +1120,7 @@ struct Flags {
     /// freshly spawned real daemon binary which account/binding to run one real
     /// authenticate-then-`read_bound` round trip against, so the acceptance evidence is a genuine
     /// read over a real signed binary, not merely a successful `connect`. PB7 replaces this with
-    /// per-dispatch resolution through the same `resolve_credential` call.
+    /// per-dispatch resolution through the same `CredentialResolver` call.
     credential_probe: Option<CredentialProbe>,
     /// The positional WORKFLOW.md path (default `WORKFLOW.md`).
     path: PathBuf,

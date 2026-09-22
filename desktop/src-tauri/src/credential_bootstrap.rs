@@ -337,10 +337,7 @@ fn split_state(
     use rhapsody_credential_ipc::domain::CredentialState as S;
     let tag = state.tag();
     let lease = match state {
-        S::Present(lease) => Some(rhapsody_credential_ipc::wire::LeasePayload {
-            binding: lease.binding.clone(),
-            value: lease.expose_for_broker(str::to_owned),
-        }),
+        S::Present(lease) => Some(lease.into_lease_payload()),
         _ => None,
     };
     (tag, lease)
@@ -971,10 +968,11 @@ mod tests {
                 } => Ok(rhapsody_credential_ipc::domain::CredentialRead {
                     revision,
                     state: match (state, lease) {
-                        (CredentialStateTag::Present, Some(l)) => {
+                        (CredentialStateTag::Present, Some(mut l)) => {
                             rhapsody_credential_ipc::domain::CredentialState::Present(
                                 rhapsody_credential_ipc::domain::BoundCredentialLease::new(
-                                    l.binding, l.value,
+                                    l.binding.clone(),
+                                    std::mem::take(&mut l.value),
                                 ),
                             )
                         }

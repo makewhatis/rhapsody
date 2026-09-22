@@ -203,22 +203,105 @@ where
     }
 }
 
-/// Composes bootstrap + connect + one `read_bound` call into a single `CredentialRead`, filling in
+/// The daemon's observation of owner availability across successive resolutions (design §2.5). The
+/// owner's own revision is only visible when the owner answers, but the daemon-wide
+/// `OwnerUnavailable`/`OwnerUnauthorized` outcomes have no owner revision to carry — and the ticket
+/// makes it mandatory that EVERY daemon read carries a revision that ADVANCES on an availability/
+/// authorization transition, so a refusal gate keyed on `(key, fingerprint, credential revision)`
+/// re-arms the moment the owner goes away or comes back.
+///
+/// This tracker supplies exactly that: it holds its own monotonic generation, advances it whenever
+/// the reachability class changes, and adopts (never regresses past) the owner's revision when the
+/// owner answers. It is NOT the stateful preparation/refusal-gate machinery PB7 owns — it is the
+/// minimal revision source that machinery needs, and it lives here because only this daemon-side
+/// adapter can observe the channel's availability at all.
+#[derive(Debug, Default)]
+pub struct CredentialResolver {
+    state: std::sync::Mutex<AvailabilityState>,
+}
+
+/// How a single resolution reached (or failed to reach) the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reachability {
+    /// The owner answered, so its own revision is authoritative for this read.
+    Answered,
+    /// No channel to an owner at all (no bootstrap frame, connect failure, or a wedged owner).
+    Unavailable,
+    /// A connection authenticated an owner that then rejected us.
+    Unauthorized,
+}
+
+#[derive(Debug)]
+struct AvailabilityState {
+    revision: Revision,
+    last: Option<Reachability>,
+}
+
+impl Default for AvailabilityState {
+    fn default() -> AvailabilityState {
+        AvailabilityState {
+            revision: Revision::INITIAL,
+            last: None,
+        }
+    }
+}
+
+impl CredentialResolver {
+    pub fn new() -> CredentialResolver {
+        CredentialResolver::default()
+    }
+
+    /// Reads one credential through a one-shot bootstrap/connect/read, returning the read with its
+    /// daemon-visible revision folded through the availability tracker.
+    pub async fn resolve<R>(
+        &self,
+        stdin: R,
+        account: String,
+        expected_binding: Binding,
+    ) -> CredentialRead
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.observe(resolve_once(stdin, account, expected_binding).await)
+    }
+
+    /// Fold one raw read into the tracked generation. The tracked class and revision are read and
+    /// written under one lock, so a caller can never observe the revision of one transition paired
+    /// with the class of another.
+    fn observe(&self, read: CredentialRead) -> CredentialRead {
+        let class = match read.state {
+            CredentialState::OwnerUnavailable => Reachability::Unavailable,
+            CredentialState::OwnerUnauthorized => Reachability::Unauthorized,
+            _ => Reachability::Answered,
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(state.last, Some(prev) if prev != class) {
+            state.revision = state.revision.next();
+        }
+        state.last = Some(class);
+        // When the owner answers, its revision is the ground truth — but never move the tracked
+        // generation backwards (a restarted owner resets its own counter to zero).
+        if class == Reachability::Answered && read.revision > state.revision {
+            state.revision = read.revision;
+        }
+        CredentialRead {
+            revision: state.revision,
+            state: read.state,
+        }
+    }
+}
+
+/// Composes bootstrap + connect + one `read_bound` call into a single [`CredentialRead`], filling in
 /// the two states that only make sense at this daemon-wide level (design §2.5): `OwnerUnavailable`
 /// when there is no way to even reach an owner (no bootstrap frame ever arrived, or the socket
 /// connect itself failed) and `OwnerUnauthorized` when a connection WAS established and `Hello` was
 /// sent, but the owner closed it without ever answering — the server's deliberate no-oracle
 /// response to a wrong token (see `credential_bootstrap::serve_one` in the desktop crate).
 ///
-/// The `revision` on both of those synthesized states is a fixed placeholder, not a real tracked
-/// generation: making it a genuine, transition-observing counter needs the stateful
-/// preparation/refusal-gate machinery PB7 owns, which is explicitly out of P0c's scope. A caller
-/// must not treat two `OwnerUnavailable` reads from this function as comparable revisions.
-pub async fn resolve_credential<R>(
-    stdin: R,
-    account: String,
-    expected_binding: Binding,
-) -> CredentialRead
+/// The `revision` on the returned read is a placeholder here; [`CredentialResolver::resolve`] is the
+/// only production caller and replaces it with the tracked generation (this function alone cannot
+/// see a transition). Kept private so no caller can accidentally observe the raw placeholder.
+async fn resolve_once<R>(stdin: R, account: String, expected_binding: Binding) -> CredentialRead
 where
     R: AsyncRead + Unpin,
 {
@@ -262,9 +345,12 @@ fn to_domain_state(
 ) -> CredentialState {
     use rhapsody_credential_ipc::domain::CredentialStateTag as Tag;
     match (tag, lease) {
-        (Tag::Present, Some(l)) => CredentialState::Present(
-            rhapsody_credential_ipc::domain::BoundCredentialLease::new(l.binding, l.value),
-        ),
+        (Tag::Present, Some(mut l)) => {
+            CredentialState::Present(rhapsody_credential_ipc::domain::BoundCredentialLease::new(
+                l.binding.clone(),
+                std::mem::take(&mut l.value),
+            ))
+        }
         // A `Present` tag with no lease payload is a protocol violation from a well-behaved server
         // (it should never happen), not a value a caller could act on safely — fail closed to
         // `Malformed` rather than fabricating an empty credential.
@@ -382,7 +468,7 @@ mod tests {
         assert_eq!(read.revision, Revision(3));
         match read.state {
             CredentialState::Present(lease) => {
-                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-secret")
+                assert_eq!(lease.into_lease_payload().value, "sk-secret")
             }
             other => panic!("expected Present, got {other:?}"),
         }
@@ -456,7 +542,7 @@ mod tests {
         server.abort();
     }
 
-    // --- resolve_credential: the daemon-wide OwnerUnavailable/OwnerUnauthorized states ------------
+    // --- CredentialResolver: the daemon-wide OwnerUnavailable/OwnerUnauthorized states -------------
 
     fn unix_socket_path(name: &str) -> std::path::PathBuf {
         // Unix socket paths are capped at ~104 bytes (`sun_path`); `/tmp` directly with a short
@@ -467,7 +553,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_credential_reports_owner_unavailable_with_no_bootstrap_frame() {
         let empty: &[u8] = &[];
-        let read = resolve_credential(empty, "v1:x".into(), a_binding()).await;
+        let read = CredentialResolver::new()
+            .resolve(empty, "v1:x".into(), a_binding())
+            .await;
         assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
     }
 
@@ -484,7 +572,9 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        let read = CredentialResolver::new()
+            .resolve(rx, "v1:x".into(), a_binding())
+            .await;
         assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
     }
 
@@ -515,7 +605,9 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        let read = CredentialResolver::new()
+            .resolve(rx, "v1:x".into(), a_binding())
+            .await;
         assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnauthorized);
 
         accept.await.unwrap();
@@ -556,11 +648,13 @@ mod tests {
         drop(tx);
 
         let started = std::time::Instant::now();
-        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        let read = CredentialResolver::new()
+            .resolve(rx, "v1:x".into(), a_binding())
+            .await;
         assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
         assert!(
             started.elapsed() < RESPONSE_TIMEOUT * 2,
-            "resolve_credential must return once RESPONSE_TIMEOUT elapses, not wait for the owner"
+            "resolve must return once RESPONSE_TIMEOUT elapses, not wait for the owner"
         );
 
         accept.abort();
@@ -612,16 +706,104 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let read = resolve_credential(rx, "v1:spike-test-provider".into(), binding).await;
+        let read = CredentialResolver::new()
+            .resolve(rx, "v1:spike-test-provider".into(), binding)
+            .await;
         assert_eq!(read.revision, Revision(9));
         match read.state {
             CredentialState::Present(lease) => {
-                assert_eq!(lease.expose_for_broker(str::to_owned), "sk-resolved")
+                assert_eq!(lease.into_lease_payload().value, "sk-resolved")
             }
             other => panic!("expected Present, got {other:?}"),
         }
 
         accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    // §2.5 revision observation: the daemon-wide OwnerUnavailable/OwnerUnauthorized outcomes carry
+    // the tracked generation, and it ADVANCES on an availability/authorization transition — which is
+    // what re-arms a refusal gate keyed on it. A steady-state repeat must not manufacture a revision
+    // (that is the defect sol found at rhapsody#221: a constant placeholder for every such read).
+    #[tokio::test]
+    async fn availability_transitions_advance_the_resolver_revision() {
+        let path = unix_socket_path("avail");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+        let binding = a_binding();
+        let server_binding = binding.clone();
+
+        let resolver = CredentialResolver::new();
+        let empty: &[u8] = &[];
+
+        // Steady unavailable: first observation, then a repeat. No transition -> same revision.
+        let first = resolver.resolve(empty, "v1:x".into(), a_binding()).await;
+        assert_eq!(first.state.tag(), CredentialStateTag::OwnerUnavailable);
+        let repeat = resolver.resolve(empty, "v1:x".into(), a_binding()).await;
+        assert_eq!(
+            repeat.revision, first.revision,
+            "a repeated unavailable read must not manufacture a new revision"
+        );
+
+        // The owner comes up and answers at its own revision 9: the tracker adopts it.
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            let (mut r, mut w) = tokio::io::split(stream);
+            let mut session = ServerSession::new(Token::new("secret".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.unwrap();
+            session.accept_hello(&hello.token).expect("hello accepted");
+            let ClientFrame::ReadBound { seq, .. } = read_frame(&mut r).await.unwrap();
+            session.accept_client_seq(seq).unwrap();
+            let resp_seq = session.next_outgoing_seq();
+            write_frame(
+                &mut w,
+                &ServerFrame::ReadBoundResult {
+                    seq: resp_seq,
+                    revision: Revision(9),
+                    state: CredentialStateTag::Present,
+                    lease: Some(LeasePayload {
+                        binding: server_binding,
+                        value: "sk-avail".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "secret".into(),
+                socket_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let answered = resolver
+            .resolve(rx, "v1:spike-test-provider".into(), binding)
+            .await;
+        assert_eq!(
+            answered.revision,
+            Revision(9),
+            "an answered read adopts the owner's revision"
+        );
+        accept.await.unwrap();
+
+        // The owner goes away: an Answered -> Unavailable transition must advance past 9, so the
+        // refusal gate re-arms instead of staying asleep on a stale revision.
+        let gone = resolver.resolve(empty, "v1:x".into(), a_binding()).await;
+        assert_eq!(gone.state.tag(), CredentialStateTag::OwnerUnavailable);
+        assert!(
+            gone.revision > answered.revision,
+            "an availability transition must advance the revision ({:?} must exceed {:?})",
+            gone.revision,
+            answered.revision
+        );
+
         std::fs::remove_file(&path).ok();
     }
 }

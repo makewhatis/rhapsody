@@ -8,6 +8,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::domain::{Binding, CredentialStateTag, Revision};
 
@@ -47,12 +48,16 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Writes one length-prefixed JSON frame. Never partially writes a frame that later reads split.
+///
+/// The encoded body is held in a [`Zeroizing`] buffer: a lease frame carries the credential value, so
+/// the serialized bytes must be wiped when this function returns rather than left in a freed
+/// allocation. Non-secret frames are wiped too — the cost is a single pass over a tiny buffer.
 pub async fn write_frame<W, T>(w: &mut W, msg: &T) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = serde_json::to_vec(msg).map_err(FrameError::Decode)?;
+    let body = Zeroizing::new(serde_json::to_vec(msg).map_err(FrameError::Decode)?);
     let len = u32::try_from(body.len()).map_err(|_| FrameError::TooLarge {
         got: u32::MAX,
         max: MAX_FRAME_BYTES,
@@ -72,7 +77,8 @@ where
 }
 
 /// Reads one length-prefixed JSON frame, rejecting an oversized declared length before allocating
-/// or reading its body.
+/// or reading its body. The raw body buffer is zeroized on the way out (it may hold a credential
+/// value before deserialization moves it into the caller's type).
 pub async fn read_frame<R, T>(r: &mut R) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,
@@ -91,7 +97,7 @@ where
             max: MAX_FRAME_BYTES,
         });
     }
-    let mut body = vec![0u8; len as usize];
+    let mut body = Zeroizing::new(vec![0u8; len as usize]);
     r.read_exact(&mut body).await.map_err(FrameError::Io)?;
     serde_json::from_slice(&body).map_err(FrameError::Decode)
 }
@@ -145,11 +151,18 @@ pub enum ClientFrame {
 
 /// A non-secret lease payload as it travels on the wire. `Debug` redacts `value`; the receiving
 /// side converts this into a real [`crate::domain::BoundCredentialLease`] immediately, which
-/// zeroizes on drop.
+/// zeroizes on drop. `value` itself also zeroizes on drop, so the frame's own copy does not outlive
+/// the send as free heap.
 #[derive(Serialize, serde::Deserialize)]
 pub struct LeasePayload {
     pub binding: Binding,
     pub value: String,
+}
+
+impl Drop for LeasePayload {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
 }
 
 impl std::fmt::Debug for LeasePayload {

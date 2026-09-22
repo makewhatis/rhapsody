@@ -57,9 +57,24 @@ mod compile_guards {
 
     // P1 mutation discipline: "Derive Debug/Serialize or add a String getter on the lease;
     // compile-time/API-shape and canary tests must fail." These negative-impl assertions fail to
-    // compile if a future change adds `Clone`, `Serialize`, or `Display` to the lease or the state
-    // enum. `Debug` stays allowed (it redacts), and is pinned by `domain`'s canary test.
-    assert_not_impl_any!(BoundCredentialLease: Clone, serde::Serialize, serde::de::DeserializeOwned);
+    // compile if a future change adds `Clone`, `Serialize`, `Deserialize`, `Display`, `Deref`,
+    // `AsRef<str>`, or `Borrow<str>` to the lease, or `Clone`/`Serialize`/`Deserialize`/`Copy` to
+    // the state enum. `Debug` stays allowed (it redacts), and is pinned by `domain`'s canary test.
+    //
+    // This guards the *trait-based* ways a value could leak (an ordinary `&self` getter is not a
+    // trait impl and cannot be rejected by a negative impl — it is closed instead by construction:
+    // the lease exposes no `&self` value-returning method at all, only the consuming transfers
+    // `into_broker_lease`/`into_lease_payload`). Keep that property in review.
+    assert_not_impl_any!(
+        BoundCredentialLease:
+            Clone,
+            serde::Serialize,
+            serde::de::DeserializeOwned,
+            std::ops::Deref<Target = str>,
+            std::convert::AsRef<str>,
+            std::borrow::Borrow<str>,
+            std::fmt::Display
+    );
     assert_not_impl_any!(CredentialState: Clone, serde::Serialize, serde::de::DeserializeOwned, Copy);
 
     #[test]
