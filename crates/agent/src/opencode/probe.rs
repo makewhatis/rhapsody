@@ -37,6 +37,12 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// already unparseable, so the bound only prevents an unbounded read.
 const MAX_PROBE_OUTPUT: usize = 4096;
 
+/// The window the final drain gets after the child is reaped. The pipe is at EOF by then, so this
+/// only bounds a descendant that escaped the sweep and keeps streaming; a fresh window (rather than
+/// the probe deadline, which the tree kill may just have passed) is what lets the drain still read
+/// the bytes the child wrote before it exited.
+const FINAL_DRAIN_WINDOW: Duration = Duration::from_millis(250);
+
 /// One measured OpenCode compatibility row. `adapter_version` is the `@ai-sdk/openai-compatible`
 /// build bundled into `opencode_version`; both are pinned by the PB0 fixtures, and a row is only
 /// accepted when the executable reports exactly `opencode_version`.
@@ -240,7 +246,12 @@ fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
     let _ = child.wait();
     // The child is dead and the tree reaped, so the pipe reaches EOF once its buffered bytes are
     // read; the read is non-blocking, so an unreachable descendant cannot hang it.
-    drain(&mut stdout, &mut buf, &mut chunk, deadline);
+    drain(
+        &mut stdout,
+        &mut buf,
+        &mut chunk,
+        Instant::now() + FINAL_DRAIN_WINDOW,
+    );
 
     if timed_out {
         return Err(ProbeError::TimedOut);
