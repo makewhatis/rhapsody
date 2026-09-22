@@ -115,6 +115,22 @@ impl std::fmt::Debug for BootstrapMessage {
     }
 }
 
+/// The one required first frame on every connection — carries the bootstrap token to
+/// `session::ServerSession::accept_hello`. Framed separately from [`ClientFrame`] (not a variant of
+/// it) because it is exempt from the post-auth sequence check every other client frame is subject
+/// to, and because the server must be able to read/reject it before any `ClientFrame` decoding is
+/// even attempted.
+#[derive(Serialize, serde::Deserialize)]
+pub struct HelloFrame {
+    pub token: String,
+}
+
+impl std::fmt::Debug for HelloFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelloFrame").field("token", &"***").finish()
+    }
+}
+
 /// A frame the daemon (client) sends after authenticating. `Hello` itself is carried
 /// out-of-band of this enum (see `session::ServerSession::accept_hello`) because it is exempt
 /// from the post-auth sequence check every other client frame is subject to.
@@ -220,6 +236,29 @@ mod tests {
             "leaked: {rendered}"
         );
         assert!(rendered.contains("/tmp/rhapsody.sock"));
+    }
+
+    #[test]
+    fn hello_frame_debug_redacts_the_token() {
+        let hello = HelloFrame {
+            token: "super-secret-token".to_string(),
+        };
+        assert!(!format!("{hello:?}").contains("super-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn hello_frame_round_trips_over_a_real_frame() {
+        let (mut a, mut b) = duplex(4096);
+        write_frame(
+            &mut a,
+            &HelloFrame {
+                token: "t".to_string(),
+            },
+        )
+        .await
+        .expect("write hello");
+        let got: HelloFrame = read_frame(&mut b).await.expect("read hello");
+        assert_eq!(got.token, "t");
     }
 
     #[test]

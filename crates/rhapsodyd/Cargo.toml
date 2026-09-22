@@ -17,6 +17,8 @@ tokio = { version = "1", features = [
     "net",
     "time",
     "sync",
+    "io-std",
+    "io-util",
 ] }
 # libc: the single-instance run-lock is an advisory `flock(LOCK_EX|LOCK_NB)` on a per-config lock
 # file — the Rust mirror of Go `run.go`'s `syscall.Flock` (`$REF/cmd/symphony/run.go`). One FFI call;
@@ -55,6 +57,10 @@ rhapsody-orchestrator = { path = "../orchestrator" }
 rhapsody-httpapi = { path = "../httpapi" }
 rhapsody-telemetry = { path = "../telemetry" }
 rhapsody-mcp = { path = "../mcp" }
+# rhapsody-credential-ipc (STUDIO-981/P0c): the daemon-side half of the authenticated
+# desktop-to-daemon provider-credential channel — see that crate's doc comment for why direct
+# daemon Keychain access was rejected in favor of this. No Go parity (Rhapsody-only).
+rhapsody-credential-ipc = { path = "../credential-ipc" }
 
 [dev-dependencies]
 # tokio test extras: `#[tokio::test(flavor = "multi_thread")]` so a test's client request and the

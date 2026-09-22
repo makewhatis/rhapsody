@@ -19,6 +19,7 @@ pub mod apiproxy;
 pub mod app;
 pub(crate) mod atomicfile;
 pub mod credential;
+pub mod credential_bootstrap;
 pub mod drain;
 pub mod linearoauth;
 pub mod linearprojects;

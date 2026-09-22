@@ -22,6 +22,7 @@
 
 pub mod banner;
 pub mod bootcfg;
+pub mod credential_client;
 pub mod logsource;
 pub mod mcp;
 pub mod otel;

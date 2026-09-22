@@ -92,6 +92,16 @@ impl ProviderCredentialOwner {
         }
     }
 
+    /// A test-only constructor for other modules' tests (e.g. `credential_bootstrap`) that need a
+    /// real owner over an injected keychain double without reaching into this module's private
+    /// `with_keyring`. The credential ref is fixed to the same disposable test provider id every
+    /// owner-level test in this crate already uses.
+    #[cfg(test)]
+    pub(crate) fn for_test(keyring: Arc<dyn Keyring>) -> ProviderCredentialOwner {
+        let credential_ref = CredentialRef::for_provider("spike-test-provider").expect("valid id");
+        ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
+    }
+
     /// Reads the raw envelope, mapping every outcome to a `(decoded envelope option, revision)`
     /// pair under the single lock — the atomicity §2.5 requires between state and revision. Held
     /// only internally; callers get a [`CredentialRead`] from [`Self::read_bound`].

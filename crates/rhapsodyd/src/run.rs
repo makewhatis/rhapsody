@@ -107,6 +107,37 @@ where
     // lines are written to `stderr` directly, not through `tracing`.
     let _ = tracing::dispatcher::set_global_default(tel.subscriber());
 
+    // STUDIO-981/P0c (Rhapsody-only, no Go parity): only when the real desktop supervisor passed
+    // `--credential-bootstrap` does the daemon even attempt to read a bootstrap frame from stdin.
+    // Fully decoupled from the rest of boot (a detached task, not awaited here) — a slow/absent
+    // bootstrap can never delay the observability server, the control loop, or shutdown, and this
+    // crate's own hermetic tests (which never pass the flag) never touch stdin at all.
+    if flags.credential_bootstrap {
+        tokio::spawn(async {
+            match crate::credential_client::read_bootstrap(tokio::io::stdin()).await {
+                Some(msg) => {
+                    match crate::credential_client::CredentialClient::connect(&msg).await {
+                        Ok(_client) => {
+                            tracing::info!(
+                                "provider-credential owner connected over authenticated IPC"
+                            );
+                            // PB7 wires this connection into dispatch's prepared-credential seam; P0c's
+                            // job is to prove the channel authenticates and connects, not to consume it.
+                        }
+                        Err(e) => {
+                            tracing::warn!(err = %e, "provider-credential owner bootstrap connect failed");
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        "no provider-credential bootstrap frame received; running with no credential owner"
+                    );
+                }
+            }
+        });
+    }
+
     // The fleet hub is HTTP-only; grpc paths 404. Warn once when grpc is selected + export is on.
     if otel_cfg.enabled && otel_cfg.protocol == "grpc" {
         tracing::warn!(
@@ -1053,6 +1084,13 @@ struct Flags {
     no_store: bool,
     /// `--no-color`: disable the banner's ANSI color.
     no_color: bool,
+    /// `--credential-bootstrap` (STUDIO-981/P0c, Rhapsody-only, no Go parity): only the real
+    /// desktop supervisor ever passes this. It tells the daemon to read the one bootstrap frame
+    /// from stdin and, if one arrives, connect to the authenticated provider-credential channel.
+    /// Every existing/hermetic daemon test omits it, so their boot is byte-for-byte unchanged; a
+    /// bare CLI invocation (or a confused-deputy process launching this same binary directly) also
+    /// omits it and gets no credential owner, by construction.
+    credential_bootstrap: bool,
     /// The positional WORKFLOW.md path (default `WORKFLOW.md`).
     path: PathBuf,
 }
@@ -1068,6 +1106,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         db: String::new(),
         no_store: false,
         no_color: false,
+        credential_bootstrap: false,
         path: PathBuf::from("WORKFLOW.md"),
     };
     let mut i = 0;
@@ -1099,6 +1138,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         match name {
             "no-store" => f.no_store = parse_bool_flag(inline, "no-store")?,
             "no-color" => f.no_color = parse_bool_flag(inline, "no-color")?,
+            "credential-bootstrap" => {
+                f.credential_bootstrap = parse_bool_flag(inline, "credential-bootstrap")?
+            }
             "port" => {
                 let v = take_value(inline, args, &mut i, "port")?;
                 f.port = v
@@ -2030,6 +2072,7 @@ mod tests {
             db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
@@ -2157,6 +2200,7 @@ mod tests {
             db: String::new(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
             port: 0,
             path: PathBuf::from("WORKFLOW.md"),
         };
@@ -2216,6 +2260,7 @@ mod tests {
             db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));

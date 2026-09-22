@@ -1790,6 +1790,7 @@ dependencies = [
  "rhapsody-agent",
  "rhapsody-config",
  "rhapsody-core",
+ "rhapsody-credential-ipc",
  "rhapsody-httpapi",
  "rhapsody-mcp",
  "rhapsody-orchestrator",
