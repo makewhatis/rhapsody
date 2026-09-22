@@ -25,7 +25,7 @@
 //! only on `POST`, the one mutating method, and on `OPTIONS`, a preflight for that `POST`. Every
 //! other method reaches the handler unchanged: reads keep their wire contract, and a wrong method
 //! still gets the handler's own 405. Every denial is the same bounded 403 envelope. The specific
-//! reason is logged, but no client-supplied value is echoed back or logged.
+//! reason is logged with the method and route path, but no header value is echoed back or logged.
 
 use std::net::SocketAddr;
 
