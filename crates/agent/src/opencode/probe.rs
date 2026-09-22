@@ -337,4 +337,27 @@ mod tests {
         assert_eq!(err.reason(), PROBE_FAILED);
         assert_eq!(err, ProbeError::TimedOut);
     }
+
+    /// `env_clear()` is the guard, not the allow-list: an ambient credential must not reach the
+    /// probed child even though the test process holds it.
+    #[tokio::test]
+    async fn probe_child_cannot_see_an_ambient_credential() {
+        let _env = crate::ENV_GUARD.write().await; // exclusive: mutates the process environment
+        // SAFETY: the write lock excludes every reader, and the var is removed before the lock is
+        // released.
+        unsafe {
+            std::env::set_var("PB0_AMBIENT_CREDENTIAL", "rhp-fake-ambient");
+        }
+        let (_dir, command) = script(
+            "if [ -n \"${PB0_AMBIENT_CREDENTIAL:-}\" ]; then echo leaked; else echo 1.18.30; fi\n",
+        );
+        let result = probe(&command);
+        unsafe {
+            std::env::remove_var("PB0_AMBIENT_CREDENTIAL");
+        }
+        // A child that saw the credential prints `leaked`, which is not a version, so the probe
+        // refuses and this unwrap fails.
+        let row = result.expect("the probe child must not inherit ambient credentials");
+        assert_eq!(row.opencode_version, "1.18.30");
+    }
 }
