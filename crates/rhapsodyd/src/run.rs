@@ -1230,6 +1230,18 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             );
         }
     };
+    // A probe with no `--credential-bootstrap` is unreachable dead configuration, not a silently
+    // ignored no-op: the boot task that would ever read `credential_probe` only spawns when
+    // `credential_bootstrap` is set (see `run`'s `if flags.credential_bootstrap` block). Refusing
+    // this combination outright follows the same "refuse unsupported/unmeasured combinations with
+    // a typed, actionable reason" rule the rest of this ticket's design follows, rather than
+    // accepting flags that quietly do nothing (jimmy's review of rhapsody#213, N5).
+    if f.credential_probe.is_some() && !f.credential_bootstrap {
+        return Err(
+            "-credential-probe-account/-credential-probe-binding require -credential-bootstrap"
+                .to_string(),
+        );
+    }
     Ok(f)
 }
 
@@ -2808,6 +2820,77 @@ mod tests {
         assert!(
             parse_flags(&["--port".into(), "abc".into()]).is_err(),
             "non-numeric port must error"
+        );
+    }
+
+    // N5 (jimmy's review of rhapsody#213): the new `--credential-probe-*` flags' error paths had no
+    // test coverage.
+    #[test]
+    fn credential_probe_flag_semantics() {
+        let valid_binding = r#"{"provider_id":"p","adapter":"a","base_url":"https://example"}"#;
+
+        // Neither flag: fine, no probe configured.
+        let f = parse_flags(&["--credential-bootstrap".into()]).expect("neither flag");
+        assert!(f.credential_probe.is_none());
+
+        // Both flags, well-formed: parses into a probe.
+        let f = parse_flags(&[
+            "--credential-bootstrap".into(),
+            "--credential-probe-account".into(),
+            "v1:p".into(),
+            "--credential-probe-binding".into(),
+            valid_binding.into(),
+        ])
+        .expect("both flags well-formed");
+        let probe = f.credential_probe.expect("probe present");
+        assert_eq!(probe.account, "v1:p");
+        assert_eq!(probe.binding.provider_id, "p");
+
+        // Only one of the pair: must error, not silently configure a partial/default probe.
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+            ])
+            .is_err(),
+            "account without binding must error"
+        );
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-binding".into(),
+                valid_binding.into(),
+            ])
+            .is_err(),
+            "binding without account must error"
+        );
+
+        // Malformed binding JSON: must error, not silently produce a default/empty Binding.
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+                "--credential-probe-binding".into(),
+                "not json".into(),
+            ])
+            .is_err(),
+            "malformed binding JSON must error"
+        );
+
+        // Both flags well-formed but WITHOUT --credential-bootstrap: refused outright rather than
+        // silently accepted and ignored (the flags would be dead configuration otherwise — see
+        // `parse_flags`'s validation).
+        assert!(
+            parse_flags(&[
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+                "--credential-probe-binding".into(),
+                valid_binding.into(),
+            ])
+            .is_err(),
+            "a probe without --credential-bootstrap must error"
         );
     }
 
