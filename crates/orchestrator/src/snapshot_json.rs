@@ -127,6 +127,31 @@ pub fn render(s: &Snapshot) -> Value {
                                 json!({ "attempts": attempts }),
                             );
                         }
+                        // STUDIO-1005: a SUPERSEDED escalation, and ONLY a superseded one. The
+                        // adjudication `reason` is written once and never revalidated, so an
+                        // operator reading it has no way to know the branch moved on. When the
+                        // watcher has OBSERVED a different current head the row must say so, and it
+                        // must carry the manager's own words beside the notice so the operator sees
+                        // exactly which present-tense claim is now a snapshot.
+                        //
+                        // CONDITIONAL on purpose, and load-bearing (the ticket's last acceptance):
+                        // an escalation whose head has NOT moved adds NOTHING, so it renders
+                        // byte-identically to before this ticket. The head fields and the reason are
+                        // absent rather than empty there — the same rule the key, the row and the
+                        // capacity annotations all follow on this Go-pinned surface.
+                        if d.superseded()
+                            && let Some(obj) = row.as_object_mut()
+                        {
+                            obj.insert("adjudicated_head".to_string(), json!(d.adjudicated_head));
+                            obj.insert("current_head".to_string(), json!(d.current_head));
+                            obj.insert("superseded".to_string(), json!(true));
+                            obj.insert("reason".to_string(), json!(d.reason));
+                            obj.insert("findings".to_string(), json!(d.findings));
+                            obj.insert(
+                                "supersession".to_string(),
+                                json!(d.supersession().unwrap_or_default()),
+                            );
+                        }
                         row
                     })
                     .collect::<Vec<_>>(),
@@ -414,6 +439,7 @@ mod tests {
             capacity_held: None,
             capacity_unreadable: None,
             adjudicated_head: String::new(),
+            current_head: String::new(),
             rounds: 0,
             findings: Vec::new(),
             reason: String::new(),
@@ -474,6 +500,7 @@ mod tests {
             }),
             capacity_unreadable: None,
             adjudicated_head: String::new(),
+            current_head: String::new(),
             rounds: 0,
             findings: Vec::new(),
             reason: String::new(),
@@ -514,6 +541,7 @@ mod tests {
             capacity_held: None,
             capacity_unreadable: Some(3),
             adjudicated_head: String::new(),
+            current_head: String::new(),
             rounds: 0,
             findings: Vec::new(),
             reason: String::new(),
