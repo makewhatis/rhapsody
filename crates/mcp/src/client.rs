@@ -15,6 +15,16 @@ use std::time::Duration;
 /// The HTTP timeout Go applies in `NewClientForPort` (`$REF/internal/mcpfacade/client.go`: 15s).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The header the daemon's operator-write guard requires, exactly once, on every mutating request
+/// (STUDIO-982; httpapi's `operator_guard`). Rhapsody-only: Go's facade sends no such header.
+pub(crate) const OPERATOR_HEADER: &str = "X-Rhapsody-Operator";
+
+/// The one value of [`OPERATOR_HEADER`] the guard accepts.
+pub(crate) const OPERATOR_HEADER_VALUE: &str = "1";
+
+/// The closed empty JSON object a mutation with no body of its own sends (STUDIO-982).
+const EMPTY_JSON_BODY: &[u8] = b"{}";
+
 /// A tool-surfaced error — parity port of client.go's `FacadeError`. `code` mirrors the daemon's
 /// `errorEnvelope` code (httpapi `handlers.go`) when the failure came from the HTTP layer, or
 /// `daemon_unreachable` when the daemon could not be contacted at all. `status` is the HTTP status
@@ -116,6 +126,10 @@ impl Client {
     /// [`FacadeError`] otherwise (client.go's `do`). `body` is `None` for GET. A refused/timed-out
     /// dial is `daemon_unreachable`; a ≥400 response with a decodable envelope carries the daemon's
     /// own code, else `http_error`.
+    ///
+    /// Every non-GET request is a mutation. It carries exactly one [`OPERATOR_HEADER`], and it
+    /// always has a JSON body: `{}` when the caller has none (STUDIO-982). The `Host` is the one
+    /// reqwest derives from `base`, i.e. `127.0.0.1:<port>`, which is what the guard requires.
     pub(crate) async fn do_request(
         &self,
         method: reqwest::Method,
@@ -136,6 +150,12 @@ impl Client {
 
         let url = format!("{base}{path}");
         let mut req = http.request(method.clone(), &url);
+        let body = if method == reqwest::Method::GET {
+            body
+        } else {
+            req = req.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
+            Some(body.unwrap_or_else(|| EMPTY_JSON_BODY.to_vec()))
+        };
         if let Some(b) = body {
             req = req.header("Content-Type", "application/json").body(b);
         }
@@ -245,7 +265,8 @@ impl Client {
         .await
     }
 
-    /// POST `/api/v1/runs/{id}/{action}` (stop|resume) with no body, returning the raw 2xx body —
+    /// POST `/api/v1/runs/{id}/{action}` (stop|resume) with no body of its own (`do_request` sends
+    /// `{}`), returning the raw 2xx body —
     /// the HTTP half of writes.go's `runAction`. (Go folds the empty-id guard and result-shaping
     /// into that one `*Client` method; here they live in [`crate::server::Facade::run_action`] so
     /// the client stays rmcp-free, matching M1's layering.) The id is path-escaped; `action` is a
@@ -465,5 +486,92 @@ mod tests {
         let c = Client::for_port(port as i64);
         let err = c.get_state().await.expect_err("want error");
         assert_eq!(err.code, "daemon_unreachable");
+    }
+
+    /// What one request carried, as the daemon would see it.
+    #[derive(Clone, Default, Debug)]
+    struct Seen {
+        method: String,
+        host: Vec<String>,
+        operator: Vec<String>,
+        content_type: Vec<String>,
+        origin: usize,
+        cookie: usize,
+        body: String,
+    }
+
+    /// A stub that records every request's guard-relevant headers and body, answering `{}`.
+    async fn recording_stub() -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let sink = seen.clone();
+        let router = Router::new().fallback(any(
+            move |method: axum::http::Method, headers: axum::http::HeaderMap, body: String| {
+                let sink = sink.clone();
+                async move {
+                    let all = |name: &str| -> Vec<String> {
+                        headers
+                            .get_all(name)
+                            .iter()
+                            .map(|v| v.to_str().unwrap_or_default().to_string())
+                            .collect()
+                    };
+                    sink.lock().unwrap().push(Seen {
+                        method: method.to_string(),
+                        host: all("host"),
+                        operator: all("x-rhapsody-operator"),
+                        content_type: all("content-type"),
+                        origin: headers.get_all("origin").iter().count(),
+                        cookie: headers.get_all("cookie").iter().count(),
+                        body,
+                    });
+                    "{}"
+                }
+            },
+        ));
+        (spawn_router(router).await, seen)
+    }
+
+    // STUDIO-982: every mutation carries exactly one `X-Rhapsody-Operator: 1`, the bound loopback
+    // Host, a JSON content type, and no Origin or Cookie. A no-body action sends the closed `{}`
+    // body, and a body-bearing one sends its own body unchanged.
+    #[tokio::test]
+    async fn mutations_carry_the_operator_guard_contract() {
+        let (port, seen) = recording_stub().await;
+        let c = client_for_port(port);
+        c.post_action("stop", "7").await.expect("stop");
+        c.post_action("handoff", "7").await.expect("handoff");
+        c.post_message("7", "hi").await.expect("message");
+        c.post_json("/api/v1/runs/7/retain", br#"{"content":"x"}"#.to_vec())
+            .await
+            .expect("retain");
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<&str> = seen.iter().map(|s| s.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            ["{}", "{}", r#"{"text":"hi"}"#, r#"{"content":"x"}"#]
+        );
+        for s in &seen {
+            assert_eq!(s.method, "POST", "{s:?}");
+            assert_eq!(s.host, [format!("127.0.0.1:{port}")], "{s:?}");
+            assert_eq!(s.operator, ["1"], "exactly one operator header: {s:?}");
+            assert_eq!(s.content_type, ["application/json"], "{s:?}");
+            assert_eq!((s.origin, s.cookie), (0, 0), "{s:?}");
+        }
+    }
+
+    // Reads keep their wire shape: no operator header and no body.
+    #[tokio::test]
+    async fn reads_carry_no_operator_header() {
+        let (port, seen) = recording_stub().await;
+        client_for_port(port)
+            .get("/api/v1/state")
+            .await
+            .expect("get");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "GET");
+        assert!(seen[0].operator.is_empty(), "{:?}", seen[0]);
+        assert!(seen[0].content_type.is_empty(), "{:?}", seen[0]);
+        assert_eq!(seen[0].body, "");
     }
 }
