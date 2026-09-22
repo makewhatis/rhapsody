@@ -2249,11 +2249,7 @@ mod store_tests {
     };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
-    const HEAD: &str = "c0a54eb0000000000000000000000000000000000";
-    /// A head one commit past [`HEAD`] — the SAME length and prefix, differing only in the character
-    /// that encodes the commit — so the single-commit test proves the supersession rule is a plain
-    /// string inequality and not an artifact of a prefix or abbreviation mismatch.
-    const HEAD_ONE_COMMIT_LATER: &str = "c0a54eb1000000000000000000000000000000000";
+    const HEAD: &str = "c0a54eb000000000000000000000000000000000";
     /// A head well past [`HEAD`] — the incident's current head, full-length like every head the
     /// watcher records, so the fixtures cannot pass by comparing two DIFFERENT abbreviation lengths
     /// (which would render every escalation permanently superseded).
@@ -3525,6 +3521,49 @@ mod store_tests {
             note.contains(HEAD) && note.contains(HEAD_PUSHED),
             "the notice must name both heads so the operator can see the snapshot moved, got: {note}"
         );
+
+        // MINIMUM move: the incident's head jump is large, but the sweep compares two SHA strings
+        // and has no commit count — it cannot obtain one without the `gh` call
+        // `the_reconciliation_sweep_makes_no_network_call` forbids — so "moved by more than one
+        // commit" is not a rule this code can express. The smallest difference a local comparison
+        // can see is a single character, and it must mark supersession exactly the same. (The two
+        // heads are equal-length SHA-1 strings, syntactic fixtures only: no commit-graph distance is
+        // claimed, which a fabricated hash could not carry.)
+        let one_char_later = {
+            let mut h = HEAD.to_string();
+            h.replace_range(7..8, "1");
+            h
+        };
+        assert_eq!(one_char_later.len(), HEAD.len());
+        assert_eq!(
+            HEAD.chars()
+                .zip(one_char_later.chars())
+                .filter(|(a, b)| a != b)
+                .count(),
+            1,
+            "this case is the minimal one: equal length, one differing character"
+        );
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            one_char_later.clone(),
+        );
+        o.reconcile_review_divergence();
+        let minimal = o.review_divergences();
+        assert_eq!(
+            minimal.len(),
+            1,
+            "a one-character move must not drop it either"
+        );
+        assert!(
+            minimal[0].superseded(),
+            "a one-character head move must still mark the escalation superseded"
+        );
+        assert_eq!(minimal[0].current_head, one_char_later);
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["superseded"], true,
+            "the minimal move must reach the wire, not only the struct"
+        );
     }
 
     /// A supersession APPEARING is its own log transition: the sweep that learns the head moved
@@ -3554,49 +3593,6 @@ mod store_tests {
                 .iter()
                 .any(|e| e.level == "WARN" && e.message.contains("SUPERSEDED")),
             "the sweep that learns the head moved must log it, got: {events:?}"
-        );
-    }
-
-    /// The ticket's single-commit mutation: the supersession marker must fire on ANY head move, not
-    /// only a move of more than one commit. The sweep compares two SHA strings and cannot count
-    /// commits locally, so a one-commit difference is simply a difference. The two heads share a
-    /// length and differ in one character, and the test asserts both the struct flag and the wire
-    /// marker.
-    ///
-    /// MUTATION (the ticket's ⚠️): require the head to differ by more than one commit — a rule the
-    /// sweep could only satisfy by acquiring a commit count, which needs the network call
-    /// [`the_reconciliation_sweep_makes_no_network_call`] forbids. The comparison is deliberately
-    /// plain string inequality so that rule cannot be expressed; this test pins the inequality.
-    #[test]
-    fn a_single_commit_head_move_still_marks_the_escalation_superseded() {
-        let o = &mut orch(false, "2026-09-22T16:14:00Z");
-        reviewed_row(o, "alice", "STUDIO-1005");
-        escalated_at(o, HEAD);
-        o.review_observed_head.insert(
-            PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD_ONE_COMMIT_LATER.to_string(), // one commit past HEAD
-        );
-
-        o.reconcile_review_divergence();
-        let found = o.review_divergences();
-        assert_eq!(found.len(), 1);
-        assert!(found[0].superseded(), "one commit is still a moved head");
-        // The fixture really is a ONE-commit move: same length, one differing character. Without
-        // this the test could pass on a prefix/length mismatch instead.
-        assert_eq!(HEAD.len(), HEAD_ONE_COMMIT_LATER.len());
-        assert_eq!(
-            HEAD.chars()
-                .zip(HEAD_ONE_COMMIT_LATER.chars())
-                .filter(|(a, b)| a != b)
-                .count(),
-            1,
-            "the two heads must differ in exactly one character"
-        );
-        // And the marker reaches the wire for that minimal move, not only in the struct.
-        let rendered = crate::snapshot_json::render(&o.build_snapshot());
-        assert_eq!(
-            rendered["review_divergence"][0]["superseded"], true,
-            "a one-commit head move must mark the escalation superseded on the wire"
         );
     }
 

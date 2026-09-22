@@ -3783,8 +3783,14 @@ mod tests {
             "a later observation updates the memo"
         );
 
-        // A pull request that leaves the watch set forgets its head, so the map does not grow.
-        o.handle_review_sweep(&[observed(12, PrLookup::Gone)]);
+        // A pull request that leaves the watch set forgets its head, so the map does not grow. It is
+        // retired through a MERGED `Found` deliberately: the pre-read loop records the merged head
+        // FIRST (the memo rule is unconditional on the answer), and `retire_review_pr` is the only
+        // thing that clears it again — the commonest way a pull request leaves the watch set is a
+        // merge, and without that one removal every merged pull request would leak a memo entry for
+        // the daemon's whole life. Retiring through `Gone` would clear the memo in the pre-read loop
+        // instead, pinning nothing about `retire_review_pr`.
+        o.handle_review_sweep(&[observed(12, merged_at(HEAD_B))]);
         assert!(
             !o.review_observed_head.contains_key(&coord(12)),
             "a retired pull request carries no current head"
@@ -3825,6 +3831,16 @@ mod tests {
             o.review_observed_head.get(&coord(12)).map(String::as_str),
             Some(HEAD_A),
             "a reverse move must not leave a stale head standing"
+        );
+
+        // An observation that names NO head (here `Gone`) must clear the memo: a lingering head
+        // would falsely supersede a current escalation. The store read above still fails, so the
+        // early return means `retire_review_pr` never runs — only the pre-read `_` arm can clear it,
+        // which is what this asserts.
+        o.handle_review_sweep(&[observed(12, PrLookup::Gone)]);
+        assert!(
+            !o.review_observed_head.contains_key(&coord(12)),
+            "an observation carrying no head clears the memo"
         );
     }
 
