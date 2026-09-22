@@ -240,6 +240,14 @@ pub(crate) enum PreparedTarget {
         attempt: Option<i64>,
         route: Option<DispatchRoute>,
         stack_context: String,
+        /// Whether this is a POOL-MODE pick. A pool pick is prepared BEFORE its cross-daemon claim
+        /// election, so the election is deferred to `finish_prepared`. Detection cannot be
+        /// `pool_proj.is_some()`: the legacy single-project pool ladder carries `proj == None` too,
+        /// so the two are kept apart.
+        pool: bool,
+        /// The owning project INDEX for a pool pick (`None` on the legacy single-project pool
+        /// ladder), used at completion to resolve the slug-bound tracker for the election.
+        pool_proj: Option<usize>,
     },
     /// A review dispatch, resuming the ticketless review's watch-set writes then dispatch.
     Review {
@@ -250,29 +258,20 @@ pub(crate) enum PreparedTarget {
 }
 
 impl PreparedTarget {
-    /// The stable, secret-free selection input folded into the refusal fingerprint.
+    /// The stable, secret-free selection input folded into the refusal fingerprint. Deliberately
+    /// WITHOUT the retry `attempt`: the credential requirement of a fresh dispatch and a retry of
+    /// the same ticket are identical, so a refusal on a retry must suppress the fresh re-probe that
+    /// follows the claim's release rather than reading as a different selection.
     fn selection(&self) -> String {
         match self {
-            PreparedTarget::Ticket {
-                issue,
-                attempt,
-                route,
-                ..
-            } => {
+            PreparedTarget::Ticket { issue, route, .. } => {
                 let labels = issue.labels.as_ref().map_or_else(String::new, |ls| {
                     let mut v: Vec<&str> = ls.iter().map(String::as_str).collect();
                     v.sort_unstable();
                     v.join(",")
                 });
                 let slug = route.as_ref().map_or("", |r| r.slug.as_str());
-                format!(
-                    "ticket|{}|{}|{}|{}|{}",
-                    issue.id,
-                    issue.state,
-                    labels,
-                    slug,
-                    attempt.unwrap_or(0)
-                )
+                format!("ticket|{}|{}|{}|{}", issue.id, issue.state, labels, slug)
             }
             PreparedTarget::Review { run, route, .. } => format!(
                 "review|{}|{}|{}|{}",
@@ -344,6 +343,34 @@ impl PreparingEntry {
             PreparedTarget::Review { route, .. } => route.slug.as_str(),
         }
     }
+
+    /// The owning project GROUP for this reservation — the key the per-project concurrency cap
+    /// counts by, with the same slug fallback a [`RunningEntry`](crate::orchestrator::RunningEntry)
+    /// uses when a project carries no group.
+    pub fn project_group(&self) -> &str {
+        match &self.target {
+            PreparedTarget::Ticket { route, .. } => route.as_ref().map_or("", |r| {
+                if r.group.is_empty() {
+                    r.slug.as_str()
+                } else {
+                    r.group.as_str()
+                }
+            }),
+            PreparedTarget::Review { route, .. } => {
+                if route.group.is_empty() {
+                    route.slug.as_str()
+                } else {
+                    route.group.as_str()
+                }
+            }
+        }
+    }
+
+    /// Whether this reservation is for a ticketless REVIEW (which draws the separate review pool)
+    /// rather than a ticket implementation.
+    pub fn is_review(&self) -> bool {
+        matches!(self.target, PreparedTarget::Review { .. })
+    }
 }
 
 impl std::fmt::Debug for PreparingEntry {
@@ -403,8 +430,7 @@ impl PreparingReservations {
         self.entries.values()
     }
 
-    /// How many reservations are held. Used by tests (and PB7's diagnostics).
-    #[cfg(test)]
+    /// How many reservations are held. The concurrency accounting reads it, as do tests.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -433,7 +459,7 @@ impl PreparingReservations {
             generation: config_generation,
             seq: self.seq,
         };
-        let fingerprint = RefusalGate::fingerprint(key.kind(), id, &target.selection(), "");
+        let fingerprint = RefusalGate::key(key.kind(), id, &target.selection());
         self.entries.insert(
             id.to_string(),
             PreparingEntry {
@@ -457,33 +483,40 @@ impl PreparingReservations {
         self.entries.remove(id)
     }
 
-    /// Cancels one reservation explicitly (Stop / issue disappearance), firing its cancel signal.
-    pub fn cancel(&mut self, id: &str) -> bool {
-        match self.entries.remove(id) {
-            Some(entry) => {
-                entry.cancel.cancel();
-                true
-            }
-            None => false,
-        }
+    /// Cancels one reservation explicitly (Stop / issue disappearance), firing its cancel signal and
+    /// returning the released entry so the caller can give back any claim it was holding.
+    pub fn cancel(&mut self, id: &str) -> Option<PreparingEntry> {
+        let entry = self.entries.remove(id)?;
+        entry.cancel.cancel();
+        Some(entry)
     }
 
-    /// Cancels every reservation (reload / shutdown), firing each cancel signal. Returns the cancelled
-    /// entries so the caller can drop any payloads they were carrying.
+    /// Cancels every reservation (reload / shutdown), firing each cancel signal. Returns the
+    /// cancelled entries so the caller can drop any payloads they were carrying AND give back any
+    /// claims they held (the reload path) — an earlier bug cleared the vector before returning it,
+    /// so the `count = cancelled.len()` logs and every claim-return were silently dead.
     pub fn cancel_all(&mut self) -> Vec<PreparingEntry> {
-        let mut out: Vec<PreparingEntry> = self.entries.drain().map(|(_, e)| e).collect();
+        let out: Vec<PreparingEntry> = self.entries.drain().map(|(_, e)| e).collect();
         for e in &out {
             e.cancel.cancel();
         }
-        out.clear();
         out
     }
 }
 
-/// The bounded refusal gate: it suppresses the SAME `(identity, selection, credential revision)`
-/// refusal until an input changes or its scheduled next-probe time arrives. An input change re-arms
-/// immediately (a changed fingerprint is simply a new key); repeating the identical refusal advances
-/// bounded backoff but appends no second history row.
+/// The bounded refusal gate: it suppresses the SAME `(identity, selection)` refusal until an input
+/// changes or its scheduled next-probe time arrives. Repeated identical refusals advance bounded
+/// backoff without appending a second history row.
+///
+/// **The credential revision is stored ON the entry, never in its key.** The design names the gate
+/// key as `(identity, selection fingerprint, credential revision)`, but a revision the resolver has
+/// yet to observe cannot be part of the key `begin_preparation` checks *before* spawning that
+/// resolver — a key that included it matched only when the revision was empty, so the moment PB7
+/// supplied a real revision every refusal was re-probed on every tick. Keying on identity+selection
+/// and remembering the observed revision keeps both properties: the pre-spawn check suppresses, and
+/// a revision CHANGE is a new episode (fresh base backoff and a new history row) because the gate
+/// compares the stored revision. A workflow reload, an explicit refresh and a provider credential
+/// mutation all re-arm the gate directly.
 #[derive(Default)]
 pub struct RefusalGate {
     entries: HashMap<String, RefusalGateEntry>,
@@ -492,35 +525,45 @@ pub struct RefusalGate {
 #[derive(Debug, Clone)]
 struct RefusalGateEntry {
     reason_code: String,
+    /// The opaque credential revision observed at the refusal that armed this entry (empty in P6).
+    revision: String,
     next_probe_at: DateTime<Utc>,
     backoff_ms: i64,
 }
 
 impl RefusalGate {
-    /// The gate fingerprint: identity + selection + credential revision, exactly as the design names
-    /// it. Secret-free by construction (the revision is opaque).
-    pub fn fingerprint(kind: &str, id: &str, selection: &str, revision: &str) -> String {
-        format!("{kind}|{id}|{selection}|{revision}")
+    /// The gate key: identity + selection, deliberately WITHOUT the credential revision (see the
+    /// type docs). Secret-free by construction.
+    pub fn key(kind: &str, id: &str, selection: &str) -> String {
+        format!("{kind}|{id}|{selection}")
     }
 
     /// Whether an identical refusal is still suppressing re-work at `now`.
-    pub fn suppressed(&self, fingerprint: &str, now: DateTime<Utc>) -> bool {
-        self.entries
-            .get(fingerprint)
-            .is_some_and(|e| now < e.next_probe_at)
+    pub fn suppressed(&self, key: &str, now: DateTime<Utc>) -> bool {
+        self.entries.get(key).is_some_and(|e| now < e.next_probe_at)
     }
 
-    /// Records a refusal (or its repeat) and returns the new bounded backoff. A first refusal arms
-    /// the base backoff; each repeat doubles it up to [`REFUSAL_BACKOFF_MAX_MS`].
-    pub fn record(&mut self, fingerprint: &str, reason_code: &str, now: DateTime<Utc>) -> i64 {
-        let backoff = match self.entries.get(fingerprint) {
-            Some(prev) => (prev.backoff_ms.saturating_mul(2)).min(REFUSAL_BACKOFF_MAX_MS),
-            None => REFUSAL_BACKOFF_BASE_MS,
+    /// Records a refusal (or its repeat) and returns the new bounded backoff. The first refusal — or
+    /// one at a CHANGED credential revision — arms the base backoff; each repeat of the identical
+    /// refusal doubles it up to [`REFUSAL_BACKOFF_MAX_MS`].
+    pub fn record(
+        &mut self,
+        key: &str,
+        reason_code: &str,
+        revision: &str,
+        now: DateTime<Utc>,
+    ) -> i64 {
+        let backoff = match self.entries.get(key) {
+            Some(prev) if prev.revision == revision => {
+                (prev.backoff_ms.saturating_mul(2)).min(REFUSAL_BACKOFF_MAX_MS)
+            }
+            _ => REFUSAL_BACKOFF_BASE_MS,
         };
         self.entries.insert(
-            fingerprint.to_string(),
+            key.to_string(),
             RefusalGateEntry {
                 reason_code: reason_code.to_string(),
+                revision: revision.to_string(),
                 next_probe_at: now + chrono::Duration::milliseconds(backoff),
                 backoff_ms: backoff,
             },
@@ -528,18 +571,18 @@ impl RefusalGate {
         backoff
     }
 
-    /// Re-arms one fingerprint (a changed credential revision / explicit refresh).
-    pub fn rearm(&mut self, fingerprint: &str) {
-        self.entries.remove(fingerprint);
+    /// Re-arms one key (a changed credential revision / explicit refresh).
+    pub fn rearm(&mut self, key: &str) {
+        self.entries.remove(key);
     }
 
     /// Re-arms every gate (workflow reload / explicit refresh): a reload can change what a refusal
-    /// meant, so every suppressed fingerprint is released exactly once.
+    /// meant, so every suppressed key is released exactly once.
     pub fn rearm_all(&mut self) {
         self.entries.clear();
     }
 
-    /// How many fingerprints are currently gated (0 when nothing is refusing).
+    /// How many keys are currently gated (0 when nothing is refusing).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -549,11 +592,16 @@ impl RefusalGate {
         self.entries.is_empty()
     }
 
-    /// The closed reason code recorded for a fingerprint, if any (for the API surface).
-    pub fn reason_code(&self, fingerprint: &str) -> Option<&str> {
-        self.entries
-            .get(fingerprint)
-            .map(|e| e.reason_code.as_str())
+    /// The closed reason code recorded for a key, if any (for the API surface).
+    pub fn reason_code(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(|e| e.reason_code.as_str())
+    }
+
+    /// The credential revision the refusal at `key` last observed, if any. The completion path
+    /// compares it against the revision a new completion carries: the same revision is a REPEAT (no
+    /// second history row); a different one (or no entry at all) is a fresh episode.
+    pub fn observed_revision(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(|e| e.revision.as_str())
     }
 }
 
@@ -612,7 +660,7 @@ impl Orchestrator {
             return BeginPreparation::AlreadyPreparing;
         }
         let selection = target.selection();
-        let fingerprint = RefusalGate::fingerprint(key.kind(), &id, &selection, "");
+        let fingerprint = RefusalGate::key(key.kind(), &id, &selection);
         let now = (self.now)();
         if self.refusal_gate.suppressed(&fingerprint, now) {
             return BeginPreparation::Suppressed;
@@ -674,7 +722,7 @@ impl Orchestrator {
     /// Handles a resolver completion on the control task. Accepts only the CURRENT token and config
     /// generation, revalidates drain/eligibility, then either dispatches or writes the zero-turn
     /// refusal. Any stale completion drops its move-only payload and changes no state.
-    pub(crate) fn handle_dispatch_prepared(
+    pub(crate) async fn handle_dispatch_prepared(
         &mut self,
         id: String,
         token: PreparationToken,
@@ -690,13 +738,17 @@ impl Orchestrator {
         }
         // A completion minted under an older config generation is stale by definition.
         if token.generation != self.prepare_generation {
-            let _ = self.preparing.take(&id);
+            if let Some(entry) = self.preparing.take(&id) {
+                self.abandon_prepared(entry, AbandonCause::Superseded);
+            }
             return;
         }
         // Revalidate current eligibility: an armed drain defers without refusing (the work may be
         // re-offered after the drain), and a live run/claim means this completion is moot.
         if self.drain.is_draining() {
-            let _ = self.preparing.take(&id);
+            if let Some(entry) = self.preparing.take(&id) {
+                self.abandon_prepared(entry, AbandonCause::Drained);
+            }
             return;
         }
         let target = {
@@ -718,15 +770,35 @@ impl Orchestrator {
             PreparationOutcome::Ready(prepared) => {
                 // Ready to run the ordinary side effects. A successful preparation clears any stale
                 // gate for this fingerprint.
-                let gate_fp = gate_fingerprint(&entry, &completion.observed_revision);
-                self.refusal_gate.rearm(&gate_fp);
-                self.finish_prepared(id, target, prepared);
+                self.refusal_gate.rearm(&entry.fingerprint);
+                self.finish_prepared(id, target, prepared).await;
             }
             PreparationOutcome::Refused(reason) => {
                 let now = (self.now)();
-                let gate_fp = gate_fingerprint(&entry, &completion.observed_revision);
-                self.refusal_gate.record(&gate_fp, reason.code(), now);
-                self.persist_refusal(&entry, &reason);
+                // The key holds identity+selection; the revision is the entry's own data. A changed
+                // revision (or no prior entry) is a fresh episode and gets its own history row; a
+                // repeat of the identical refusal only advances the backoff.
+                let new_episode = self.refusal_gate.observed_revision(&entry.fingerprint)
+                    != Some(completion.observed_revision.as_str());
+                self.refusal_gate.record(
+                    &entry.fingerprint,
+                    reason.code(),
+                    &completion.observed_revision,
+                    now,
+                );
+                // A refusal is not agent work: give back the claim a retry/continuation held, so
+                // the ticket is not stranded. The gate — not a retry timer — drives its re-probe, and
+                // the released ticket is re-selected fresh only once the gate's probe time arrives.
+                self.release_retry_claim(&entry);
+                if new_episode {
+                    self.persist_refusal(&entry, &reason);
+                } else {
+                    tracing::debug!(
+                        id = %id,
+                        code = reason.code(),
+                        "repeat refusal; backoff advanced without a second history row"
+                    );
+                }
             }
         }
     }
@@ -747,6 +819,8 @@ impl Orchestrator {
             attempt,
             route: route.clone(),
             stack_context: stack_context.clone(),
+            pool: false,
+            pool_proj: None,
         };
         match self.begin_preparation(target, claim_already_held) {
             BeginPreparation::NoResolver => {
@@ -774,15 +848,84 @@ impl Orchestrator {
         }
     }
 
-    /// Runs the ordinary dispatch side effects for an accepted successful preparation.
-    fn finish_prepared(&mut self, _id: String, target: PreparedTarget, prepared: PreparedDispatch) {
+    /// Begins preparation for ONE pool-mode pick. Preparation runs BEFORE the cross-daemon claim
+    /// election (STUDIO-988): a refused or abandoned preparation must leave the ticket unassigned,
+    /// so the election — which is what a refusal would otherwise strand — moves to
+    /// [`finish_prepared`], after acceptance. With no resolver installed this is today's
+    /// claim-then-dispatch, byte-identical.
+    pub(crate) async fn dispatch_or_prepare_pool(&mut self, pick: crate::select::TaggedIssue) {
+        let route = self.route_for(pick.proj);
+        let target = PreparedTarget::Ticket {
+            issue: pick.iss.clone(),
+            attempt: None,
+            route: route.clone(),
+            stack_context: String::new(),
+            pool: true,
+            pool_proj: pick.proj,
+        };
+        match self.begin_preparation(target, false) {
+            BeginPreparation::NoResolver => {
+                for winner in self.claim_winners(vec![pick]).await {
+                    let winner_route = self.route_for(winner.proj);
+                    self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                }
+            }
+            BeginPreparation::Started(_) => {}
+            BeginPreparation::AlreadyPreparing => {
+                tracing::debug!(
+                    issue = %pick.iss.identifier,
+                    "pool preparation already in flight; not claiming or dispatching again"
+                );
+            }
+            BeginPreparation::AlreadyInFlight => {
+                tracing::debug!(
+                    issue = %pick.iss.identifier,
+                    "pool preparation skipped: a run or competing claim is already in flight"
+                );
+            }
+            BeginPreparation::Suppressed => {
+                tracing::debug!(
+                    issue = %pick.iss.identifier,
+                    "pool preparation suppressed by the refusal gate until its next probe"
+                );
+            }
+        }
+    }
+
+    /// Runs the ordinary dispatch side effects for an accepted successful preparation. A pool pick
+    /// runs its cross-daemon claim election HERE — after preparation, so a refusal never claims — and
+    /// dispatches only if it won.
+    async fn finish_prepared(
+        &mut self,
+        _id: String,
+        target: PreparedTarget,
+        prepared: PreparedDispatch,
+    ) {
         match target {
             PreparedTarget::Ticket {
                 issue,
                 attempt,
                 route,
                 stack_context,
+                pool,
+                pool_proj,
             } => {
+                if pool {
+                    tracing::info!(
+                        issue = %issue.identifier,
+                        harness = %prepared.harness,
+                        "preparation accepted; running the pool claim election"
+                    );
+                    let pick = crate::select::TaggedIssue {
+                        iss: issue,
+                        proj: pool_proj,
+                    };
+                    for winner in self.claim_winners(vec![pick]).await {
+                        let winner_route = self.route_for(winner.proj);
+                        self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                    }
+                    return;
+                }
                 tracing::info!(
                     issue = %issue.identifier,
                     harness = %prepared.harness,
@@ -799,6 +942,80 @@ impl Orchestrator {
                     "review preparation accepted; dispatching"
                 );
                 self.finish_review_dispatch(*run, route, issue);
+            }
+        }
+    }
+
+    /// Gives back the claim a retry/continuation held when its preparation ended in a REFUSAL. The
+    /// design forbids a claim on a refusal and, more practically, the released ticket is re-selected
+    /// fresh and suppressed by the refusal gate until its probe time — without this, `on_retry` has
+    /// already removed the retry entry, leaving `claimed` set with nothing to fire it again.
+    fn release_retry_claim(&mut self, entry: &PreparingEntry) {
+        let PreparedTarget::Ticket { issue, .. } = &entry.target else {
+            return;
+        };
+        if !entry.claim_already_held {
+            return;
+        }
+        self.claimed.remove(&issue.id);
+        self.completed.remove(&issue.id);
+        self.persist_release(&issue.identifier);
+        tracing::info!(
+            issue = %issue.identifier,
+            "refused preparation released the retry claim so the ticket can re-probe"
+        );
+    }
+
+    /// Releases or re-parks the claim of a claim-held preparation that ended WITHOUT dispatching for
+    /// a reason that is not a refusal. `Drained` parks the retry (keeping its claim and attempt) exactly
+    /// as [`on_retry`](Orchestrator::on_retry)'s own drain gate does; `Superseded` (reload, stale
+    /// generation, issue disappearance) gives the claim back so the ticket re-selects under the new
+    /// state. A fresh dispatch holds no claim and this is a no-op.
+    fn abandon_prepared(&mut self, entry: PreparingEntry, cause: AbandonCause) {
+        let PreparedTarget::Ticket {
+            issue,
+            attempt,
+            route,
+            ..
+        } = &entry.target
+        else {
+            return;
+        };
+        if !entry.claim_already_held {
+            return;
+        }
+        match cause {
+            AbandonCause::Drained => {
+                let attempt = attempt.unwrap_or(0);
+                let (slug, repo) = route
+                    .as_ref()
+                    .map_or(("", ""), |r| (r.slug.as_str(), r.repo.as_str()));
+                self.schedule_retry_for(
+                    crate::retry::RetryTarget {
+                        id: &issue.id,
+                        identifier: &issue.identifier,
+                        project_slug: slug,
+                        project_repo: repo,
+                    },
+                    attempt,
+                    crate::drain::DRAIN_REQUEUE_DELAY_MS,
+                    "drain: preparation deferred",
+                    issue.clone(),
+                    String::new(),
+                );
+                tracing::debug!(
+                    issue = %issue.identifier,
+                    "drain: re-parked a preparation-terminated retry; claim and attempt kept"
+                );
+            }
+            AbandonCause::Superseded => {
+                self.claimed.remove(&issue.id);
+                self.completed.remove(&issue.id);
+                self.persist_release(&issue.identifier);
+                tracing::info!(
+                    issue = %issue.identifier,
+                    "superseded preparation released the retry claim so the ticket re-selects"
+                );
             }
         }
     }
@@ -878,20 +1095,22 @@ impl Orchestrator {
         }
     }
 
-    /// Cancels one preparation reservation explicitly (Stop / issue disappearance / ineligibility).
-    /// Returns whether a reservation was held and released.
+    /// Cancels one preparation reservation explicitly (Stop / issue disappearance / ineligibility),
+    /// giving back any claim it held. Returns whether a reservation was held and released.
     pub(crate) fn cancel_preparation(&mut self, id: &str) -> bool {
-        let cancelled = self.preparing.cancel(id);
-        if cancelled {
-            tracing::debug!(id = %id, "preparation cancelled");
-        }
-        cancelled
+        let Some(entry) = self.preparing.cancel(id) else {
+            return false;
+        };
+        tracing::debug!(id = %id, "preparation cancelled");
+        self.abandon_prepared(entry, AbandonCause::Superseded);
+        true
     }
 
     /// Cancels every ticket preparation whose issue is NOT in `present` — the current candidate set.
     /// An issue that disappeared from the board (terminal, reassigned, filtered out) must not keep a
     /// reservation, a resolver task, or a concurrency slot. Review keys are untouched: they are never
-    /// in the candidate set by construction.
+    /// in the candidate set by construction. A claim-held retry is released (mirrors `on_retry`'s
+    /// release-on-gone) rather than stranded.
     pub(crate) fn cancel_dropped_preparations(
         &mut self,
         present: &std::collections::HashSet<String>,
@@ -911,7 +1130,9 @@ impl Orchestrator {
     }
 
     /// Cancels every preparation reservation and re-arms the refusal gate — the reload path: a new
-    /// config changes what a preparation would resolve and what a refusal meant.
+    /// config changes what a preparation would resolve and what a refusal meant. A claim-held retry
+    /// is RELEASED so the ticket re-selects under the new config, instead of keeping a claim nothing
+    /// in `retry_attempts` will ever give back.
     pub(crate) fn reload_preparations(&mut self) {
         self.prepare_generation = self.prepare_generation.wrapping_add(1);
         let cancelled = self.preparing.cancel_all();
@@ -922,10 +1143,16 @@ impl Orchestrator {
                 "reload cancelled in-flight preparations and re-armed the refusal gate"
             );
         }
+        for entry in cancelled {
+            self.abandon_prepared(entry, AbandonCause::Superseded);
+        }
         self.refusal_gate.rearm_all();
     }
 
-    /// Cancels every preparation reservation without re-arming the gate — the shutdown path.
+    /// Cancels every preparation reservation without re-arming the gate — the shutdown path. The
+    /// claims are deliberately LEFT in place and persisted: the retry rows were written when the
+    /// retry was scheduled, so boot recovery re-arms them; releasing here would DELETE them and lose
+    /// the recovery. Only the in-memory reservations and their resolver tasks are torn down.
     pub(crate) fn cancel_all_preparations(&mut self) {
         let cancelled = self.preparing.cancel_all();
         if !cancelled.is_empty() {
@@ -943,16 +1170,14 @@ impl Orchestrator {
     }
 }
 
-/// The gate fingerprint with the observed credential revision appended (P6 supplies an empty
-/// revision; PB7 supplies the opaque one). Recomputed from the entry's key and target so it is
-/// byte-identical to the fingerprint [`Orchestrator::begin_preparation`] checks before spawning.
-fn gate_fingerprint(entry: &PreparingEntry, revision: &str) -> String {
-    RefusalGate::fingerprint(
-        entry.key.kind(),
-        entry.key.id(),
-        &entry.target.selection(),
-        revision,
-    )
+/// Why a claim-held preparation ended without dispatching. The two causes differ in what happens to
+/// the claim the retry was holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbandonCause {
+    /// An armed drain deferred the work: PARK the retry (keep the claim and attempt, re-arm).
+    Drained,
+    /// A reload, a stale generation or the issue leaving the board: GIVE the claim back.
+    Superseded,
 }
 
 #[cfg(test)]
@@ -1065,6 +1290,8 @@ mod tests {
             attempt: None,
             route: None,
             stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
         }
     }
 
@@ -1146,7 +1373,8 @@ mod tests {
         let Some(token) = token else {
             panic!("a reservation should exist");
         };
-        o.handle_dispatch_prepared("1".to_string(), token, completion);
+        o.handle_dispatch_prepared("1".to_string(), token, completion)
+            .await;
         assert_eq!(
             sink.lock().expect("dispatch sink").len(),
             1,
@@ -1180,7 +1408,8 @@ mod tests {
             outcome: PreparationOutcome::Refused(RefusalReason::CredentialDeniedOrLocked),
             observed_revision: String::new(),
         };
-        o.handle_dispatch_prepared("1".to_string(), token, completion);
+        o.handle_dispatch_prepared("1".to_string(), token, completion)
+            .await;
 
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
@@ -1246,7 +1475,8 @@ mod tests {
             )),
             observed_revision: "rev-1".to_string(),
         };
-        o.handle_dispatch_prepared("1".to_string(), stale, completion);
+        o.handle_dispatch_prepared("1".to_string(), stale, completion)
+            .await;
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
             "a stale token must not dispatch"
@@ -1277,7 +1507,8 @@ mod tests {
             )),
             observed_revision: "rev-1".to_string(),
         };
-        o.handle_dispatch_prepared("1".to_string(), token, completion);
+        o.handle_dispatch_prepared("1".to_string(), token, completion)
+            .await;
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
             "a completion minted under an older config generation must not dispatch"
@@ -1311,7 +1542,8 @@ mod tests {
             )),
             observed_revision: "rev-1".to_string(),
         };
-        o.handle_dispatch_prepared("1".to_string(), token, completion);
+        o.handle_dispatch_prepared("1".to_string(), token, completion)
+            .await;
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
             "a completion delivered after cancellation is stale and must not dispatch"
@@ -1323,25 +1555,33 @@ mod tests {
     #[test]
     fn refusal_gate_suppresses_identical_and_rearms_on_change() {
         let now = fixed_now();
-        let fp = RefusalGate::fingerprint("ticket", "1", "sel", "");
+        let key = RefusalGate::key("ticket", "1", "sel");
         let mut gate = RefusalGate::default();
-        assert!(!gate.suppressed(&fp, now));
-        let backoff = gate.record(&fp, "credential_absent", now);
+        assert!(!gate.suppressed(&key, now));
+        let backoff = gate.record(&key, "credential_absent", "", now);
         assert_eq!(backoff, REFUSAL_BACKOFF_BASE_MS);
-        assert!(gate.suppressed(&fp, now));
-        assert!(gate.suppressed(&fp, now + chrono::Duration::seconds(1)));
-        // A repeat advances bounded backoff.
-        let next = gate.record(&fp, "credential_absent", now);
+        assert!(gate.suppressed(&key, now));
+        assert!(gate.suppressed(&key, now + chrono::Duration::seconds(1)));
+        // A repeat at the SAME revision advances bounded backoff and is not a new episode.
+        assert_eq!(gate.observed_revision(&key), Some(""));
+        let next = gate.record(&key, "credential_absent", "", now);
         assert_eq!(next, REFUSAL_BACKOFF_BASE_MS * 2);
         // Past the probe time the gate no longer suppresses.
         let far = now + chrono::Duration::milliseconds(next + 1);
-        assert!(!gate.suppressed(&fp, far));
-        // A changed fingerprint (a new credential revision) is a different key and never suppressed.
-        let changed = RefusalGate::fingerprint("ticket", "1", "sel", "rev-2");
-        assert!(!gate.suppressed(&changed, now));
-        // An explicit re-arm releases the fingerprint.
-        gate.rearm(&fp);
-        assert!(!gate.suppressed(&fp, now));
+        assert!(!gate.suppressed(&key, far));
+        // A CHANGED credential revision is a fresh episode at the same key: base backoff again.
+        let fresh = gate.record(&key, "credential_absent", "rev-2", now);
+        assert_eq!(fresh, REFUSAL_BACKOFF_BASE_MS);
+        assert_eq!(gate.observed_revision(&key), Some("rev-2"));
+        // The key deliberately excludes the revision, so the pre-spawn check suppresses even after a
+        // revision was observed — PB7 re-arms on a credential mutation instead.
+        assert!(gate.suppressed(&key, now));
+        // A different identity is a different key and never suppressed.
+        let other = RefusalGate::key("ticket", "2", "sel");
+        assert!(!gate.suppressed(&other, now));
+        // An explicit re-arm releases the key.
+        gate.rearm(&key);
+        assert!(!gate.suppressed(&key, now));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1361,7 +1601,8 @@ mod tests {
                 outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
                 observed_revision: String::new(),
             },
-        );
+        )
+        .await;
         // Let the first resolver task actually run before sampling its call count.
         std::thread::sleep(Duration::from_millis(30));
         let calls_after_first = calls.load(Ordering::SeqCst);
@@ -1429,7 +1670,7 @@ mod tests {
                     PreparationOutcome::Refused(RefusalReason::ResolverTimedOut) => {}
                     other => panic!("expected a typed timeout refusal, got {other:?}"),
                 }
-                o.handle_dispatch_prepared(id, token, completion);
+                o.handle_dispatch_prepared(id, token, completion).await;
             }
             _ => panic!("expected DispatchPrepared"),
         }
@@ -1448,6 +1689,8 @@ mod tests {
             attempt: None,
             route: None,
             stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
         }
     }
 
@@ -1475,7 +1718,8 @@ mod tests {
                 )),
                 observed_revision: "rev-1".to_string(),
             },
-        );
+        )
+        .await;
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
             "an armed drain must defer an otherwise-accepted completion"
@@ -1534,7 +1778,8 @@ mod tests {
                 )),
                 observed_revision: "rev-1".to_string(),
             },
-        );
+        )
+        .await;
         assert!(sink.lock().expect("dispatch sink").is_empty());
     }
 
@@ -1640,7 +1885,8 @@ mod tests {
                 outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
                 observed_revision: String::new(),
             },
-        );
+        )
+        .await;
         assert_eq!(
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Suppressed
@@ -1656,5 +1902,462 @@ mod tests {
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Started(_)
         ));
+    }
+
+    // --- STUDIO-988 review round: caps, claim hand-back, gate dedup, pool ordering ---------------
+
+    fn ticket_target_at(
+        id: &str,
+        ident: &str,
+        state: &str,
+        route: Option<DispatchRoute>,
+    ) -> PreparedTarget {
+        PreparedTarget::Ticket {
+            issue: issue(id, ident, state),
+            attempt: None,
+            route,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+        }
+    }
+
+    fn sample_route() -> DispatchRoute {
+        DispatchRoute {
+            slug: "alpha".to_string(),
+            group: "alpha".to_string(),
+            repo: "https://example.test/o/r".to_string(),
+            model: "opus".to_string(),
+            workspace_mode: String::new(),
+        }
+    }
+
+    // MUTATION GUARD: drop `preparing` from `implementation_pool_holders` /
+    // `running_in_project_group` / `review_pool_holders` and a hung preparation spends no slot —
+    // this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preparing_counts_against_the_global_project_and_review_caps() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Hang);
+        let target = ticket_target_at("1", "MT-1", "Todo", Some(sample_route()));
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        assert_eq!(
+            o.implementation_pool_holders(),
+            1,
+            "a ticket preparation spends the global implementation pool"
+        );
+        assert_eq!(
+            o.running_in_project_group("alpha"),
+            1,
+            "a ticket preparation spends its project group's slot"
+        );
+        assert_eq!(
+            o.review_pool_holders(),
+            1,
+            "with no separate review pool a preparation spends the shared pool the watcher draws"
+        );
+
+        // A review preparation draws the REVIEW pool, not the implementation pool (STUDIO-950).
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.max_concurrent_reviews = Some(2);
+        o.eff = Some(eff);
+        let calls = Arc::new(AtomicUsize::new(0));
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls,
+            outcome: Mutex::new(Scripted::Hang),
+        }));
+        let run = crate::review::ReviewRun {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            reviewer: "alice".to_string(),
+            head_sha: "abc".to_string(),
+            ..Default::default()
+        };
+        let target = PreparedTarget::Review {
+            issue: run.synthetic_issue(),
+            run: Box::new(run.clone()),
+            route: sample_route(),
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        assert_eq!(
+            o.ticketless_review_holders(),
+            1,
+            "a review preparation holds a review-pool slot"
+        );
+        assert_eq!(
+            o.review_pool_holders(),
+            1,
+            "a review preparation spends the separate review pool"
+        );
+        assert_eq!(
+            o.implementation_pool_holders(),
+            0,
+            "a review preparation must not spend the implementation pool"
+        );
+    }
+
+    // Alice's round-1 repro, at the tick boundary: with one global slot and candidates in two
+    // different states, two ticks must admit exactly ONE preparation. MUTATION GUARD: exclude
+    // `preparing` from the global pool draw and the second tick over-reserves — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_ticks_do_not_over_reserve_a_single_global_slot() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![
+            issue("1", "MT-1", "Todo"),
+            issue("2", "MT-2", "In Progress"),
+        ];
+        let mut eff = empty_effective(Arc::new(tr));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 1;
+        eff.poll_interval = Duration::from_secs(3600);
+        eff.max_retry_backoff_ms = 300_000;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.prepare_timeout = Duration::from_secs(3600);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Hang),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+
+        o.on_tick().await;
+        o.on_tick().await;
+        assert_eq!(
+            o.preparing.len(),
+            1,
+            "a single global slot admits exactly one preparation across two ticks"
+        );
+    }
+
+    // MUTATION GUARD: `PreparingReservations::cancel_all` used to clear the vector before returning
+    // it (always empty), so the reload path released no claims and its count log never fired — this
+    // test reds if `cancel_all` stops returning its entries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_releases_a_claim_held_retry_preparation() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Hang);
+        o.claimed.insert("1".to_string());
+        o.dispatch_or_prepare(issue("1", "MT-1", "Todo"), Some(3), None, String::new());
+        assert!(o.preparing.contains("1"));
+        o.reload_preparations();
+        assert!(o.preparing.is_empty(), "reload cancels the reservation");
+        assert!(
+            !o.claimed.contains("1"),
+            "reload gives back the retry claim so the ticket re-selects"
+        );
+        assert!(o.refusal_gate.is_empty(), "reload re-arms the gate");
+    }
+
+    // MUTATION GUARD: keep the claim on a refusal and the retry is stranded (nothing in
+    // `retry_attempts` will ever fire it again) — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_retry_releases_its_claim_instead_of_stranding() {
+        let (mut o, sink, _calls) =
+            orch_with_resolver(Scripted::Refused(RefusalReason::CredentialAbsent));
+        o.claimed.insert("1".to_string()); // on_retry kept the claim for this retry
+        o.dispatch_or_prepare(issue("1", "MT-1", "Todo"), Some(1), None, String::new());
+        assert!(o.preparing.contains("1"), "the retry began preparing");
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: String::new(),
+            },
+        )
+        .await;
+        assert!(
+            !o.claimed.contains("1"),
+            "a refusal must release the retry's claim so the ticket re-probes"
+        );
+        assert!(
+            o.retry_attempts.is_empty(),
+            "a refusal does not enter agent retry"
+        );
+        assert!(o.completed.is_empty());
+        assert!(sink.lock().expect("dispatch sink").is_empty());
+    }
+
+    // MUTATION GUARD: drop a retry's preparation on a drain and on_retry's own parking promise
+    // ("keeps its claim, its due time and its attempt") is broken — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_defers_a_retry_by_re_parking_it_not_dropping_it() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.claimed.insert("1".to_string());
+        o.dispatch_or_prepare(issue("1", "MT-1", "Todo"), Some(2), None, String::new());
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.drain
+            .arm(fixed_now(), crate::drain::DrainReason::Operator);
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-1",
+                )),
+                observed_revision: "rev-1".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a drain must not dispatch"
+        );
+        assert!(
+            o.claimed.contains("1"),
+            "a drain parks the retry, keeping its claim"
+        );
+        let re = o
+            .retry_attempts
+            .get("1")
+            .expect("the deferred retry is re-parked");
+        assert_eq!(
+            re.attempt, 2,
+            "the attempt number is preserved across the drain"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    // MUTATION GUARD: append a row on every accepted refusal and a locked credential writes one row
+    // per backoff step forever — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_identical_refusal_appends_no_second_history_row() {
+        let (mut o, _sink, _calls) =
+            orch_with_resolver(Scripted::Refused(RefusalReason::CredentialAbsent));
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        o.set_store(Arc::clone(&store));
+        let cell = Arc::new(Mutex::new(fixed_now()));
+        let clock = Arc::clone(&cell);
+        o.now = Box::new(move || *clock.lock().unwrap_or_else(|e| e.into_inner()));
+
+        let refuse = |o: &mut Orchestrator| {
+            assert!(matches!(
+                o.begin_preparation(ticket_target("Todo"), false),
+                BeginPreparation::Started(_)
+            ));
+        };
+        refuse(&mut o);
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: String::new(),
+            },
+        )
+        .await;
+        let rows = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert_eq!(rows.len(), 1, "the first refusal writes exactly one row");
+
+        // Advance past the base backoff so the gate re-probes, then refuse identically again.
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) =
+            fixed_now() + chrono::Duration::milliseconds(REFUSAL_BACKOFF_BASE_MS + 1);
+        refuse(&mut o);
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: String::new(),
+            },
+        )
+        .await;
+        let rows = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a repeat of the identical refusal advances the backoff but writes no second row"
+        );
+        assert_eq!(o.refusal_gate.len(), 1, "one gated fingerprint");
+    }
+
+    // MUTATION GUARD: key the gate by the credential revision and begin_preparation (which cannot
+    // know a revision a resolver has yet to observe) never suppresses once PB7 supplies one — this
+    // test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gate_suppresses_a_refusal_that_observed_a_credential_revision() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Hang);
+        o.now = Box::new(fixed_now);
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: "rev-7".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Suppressed,
+            "the pre-spawn check must suppress even after a non-empty revision was observed"
+        );
+    }
+
+    // MUTATION GUARD: the stale-generation branch is unreachable through the reload path (which
+    // cancels first), so nothing else protects it — this test pins it directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bumped_generation_without_cancellation_drops_the_completion() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        // A generation bump that did NOT cancel the reservation (the shape a future PB7 path could
+        // produce): the generation guard, not the missing entry, must drop the completion.
+        o.prepare_generation = token.generation + 1;
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-1",
+                )),
+                observed_revision: "rev-1".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a completion minted under an older generation must not dispatch"
+        );
+        assert!(o.preparing.is_empty(), "the stale reservation is released");
+    }
+
+    fn pool_orch(scripted: Scripted) -> (Orchestrator, Arc<Fake>, DispatchedEntries) {
+        let mut tr = Fake::new();
+        tr.viewer = rhapsody_core::Viewer {
+            id: "me".to_string(),
+            ..Default::default()
+        };
+        tr.candidates = vec![issue("1", "MT-1", "Todo")];
+        let tr = Arc::new(tr);
+        let mut eff = empty_effective(Arc::clone(&tr) as Arc<dyn rhapsody_tracker::Tracker>);
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        eff.claim_ttl = Duration::from_secs(60);
+        eff.claim_settle_delay = Duration::from_millis(1);
+        eff.review_promote_state = String::new();
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(scripted),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        (o, tr, sink)
+    }
+
+    // MUTATION GUARD: claim the pool pick before preparation (the pre-fix order) and a refused pick
+    // is left assigned and moved with no run — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_pick_is_prepared_before_its_claim_election() {
+        let (mut o, tr, sink) = pool_orch(Scripted::Hang);
+        let pick = crate::select::TaggedIssue {
+            iss: issue("1", "MT-1", "Todo"),
+            proj: None,
+        };
+        o.dispatch_or_prepare_pool(pick).await;
+        assert_eq!(
+            tr.create_comment_calls().len(),
+            0,
+            "no claim comment may be posted before preparation completes"
+        );
+        assert_eq!(
+            tr.assign_calls().len(),
+            0,
+            "no assignment may be made before preparation completes"
+        );
+        assert!(sink.lock().expect("dispatch sink").is_empty());
+
+        // A refusal leaves the ticket UNCLAIMED — the whole point of preparing first.
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: String::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            tr.create_comment_calls().len(),
+            0,
+            "a refused pool pick is never claimed"
+        );
+        assert_eq!(
+            tr.assign_calls().len(),
+            0,
+            "a refused pool pick is never assigned"
+        );
+        assert!(sink.lock().expect("dispatch sink").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_pick_claims_and_dispatches_only_after_preparation_succeeds() {
+        let (mut o, tr, sink) = pool_orch(Scripted::Ready);
+        let pick = crate::select::TaggedIssue {
+            iss: issue("1", "MT-1", "Todo"),
+            proj: None,
+        };
+        o.dispatch_or_prepare_pool(pick).await;
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-1",
+                )),
+                observed_revision: "rev-1".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            tr.assign_calls().len(),
+            1,
+            "an accepted pool preparation claims the ticket"
+        );
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "an accepted pool preparation dispatches the winner"
+        );
     }
 }

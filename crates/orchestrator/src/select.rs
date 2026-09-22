@@ -344,10 +344,19 @@ impl Orchestrator {
     /// a multi-slug project admits at most its cap of concurrent agents in total. `group == slug` for
     /// single-slug / legacy modes. Mirrors Go `runningInProjectGroup`.
     pub(crate) fn running_in_project_group(&self, group: &str) -> i64 {
-        self.running
+        let running = self
+            .running
             .values()
             .filter(|re| re.project_group == group)
-            .count() as i64
+            .count();
+        // STUDIO-988: a `preparing` reservation spends its project's slot before a `RunningEntry`
+        // exists, or a preparation could over-admit a project.
+        let preparing = self
+            .preparing
+            .values()
+            .filter(|e| e.project_group() == group)
+            .count();
+        i64::try_from(running + preparing).unwrap_or(i64::MAX)
     }
 
     /// How many running entries currently spend the IMPLEMENTATION global pool (STUDIO-950). With
@@ -361,6 +370,10 @@ impl Orchestrator {
     /// subtracted: only [`running_ticketless_reviews`](Orchestrator::running_ticketless_reviews)
     /// (the entries carrying `review` coordinates) belong to the separate pool.
     ///
+    /// STUDIO-988: the count also includes the `preparing` reservations — ticket preparations add to
+    /// the implementation total, review preparations subtract from it — so a preparation spends the
+    /// pool before its `RunningEntry` exists.
+    ///
     /// `pub(crate)` because the RETRY ladder
     /// ([`on_retry`](Orchestrator::on_retry)) is a third implementation draw that dispatches straight
     /// from itself, bypassing both ladders above — it must ask the same question or a due retry is
@@ -372,9 +385,11 @@ impl Orchestrator {
     /// inherits `max_concurrent_agents` the project gate can bind first — see the README's
     /// STUDIO-950 entry, which says so.
     pub(crate) fn implementation_pool_holders(&self) -> i64 {
-        let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
+        // STUDIO-988: the `preparing` reservations are in-flight work too — a preparation must count
+        // against the global pool before its `RunningEntry` exists, or two concurrent paths over-admit.
+        let total = i64::try_from(self.running.len() + self.preparing.len()).unwrap_or(i64::MAX);
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
-            Some(_) => (total - self.running_ticketless_reviews()).max(0),
+            Some(_) => (total - self.ticketless_review_holders()).max(0),
             None => total,
         }
     }

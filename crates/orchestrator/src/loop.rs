@@ -652,7 +652,7 @@ impl Orchestrator {
                 id,
                 token,
                 completion,
-            } => self.handle_dispatch_prepared(id, token, completion),
+            } => self.handle_dispatch_prepared(id, token, completion).await,
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
             }
@@ -982,9 +982,10 @@ impl Orchestrator {
             for (iss, route) in direct {
                 self.dispatch_or_prepare(iss, None, route, String::new());
             }
-            for ti in self.claim_winners(pool_picks).await {
-                let route = self.route_for(ti.proj);
-                self.dispatch_or_prepare(ti.iss, None, route, String::new());
+            // Pool picks are PREPARED first (STUDIO-988): the cross-daemon claim election runs on
+            // acceptance, so a refusal leaves the ticket unassigned rather than claimed-and-moved.
+            for ti in pool_picks {
+                self.dispatch_or_prepare_pool(ti).await;
             }
             // Review-reopens: promote (Linear WRITE) THEN dispatch.
             for ti in reopen {
@@ -1070,8 +1071,9 @@ impl Orchestrator {
                 .into_iter()
                 .map(|iss| TaggedIssue { iss, proj: None })
                 .collect();
-            for ti in self.claim_winners(pool_picks).await {
-                self.dispatch_or_prepare(ti.iss, None, None, String::new());
+            // Prepared first, claimed on acceptance (STUDIO-988): see the multi-project ladder.
+            for ti in pool_picks {
+                self.dispatch_or_prepare_pool(ti).await;
             }
         } else {
             for iss in active {
@@ -1096,7 +1098,9 @@ impl Orchestrator {
     }
 
     /// Builds the dispatch routing snapshot for a tagged pick's owning project (`None` proj ⇒ legacy).
-    fn route_for(&self, proj: Option<usize>) -> Option<DispatchRoute> {
+    /// `pub(crate)` because the pool preparation path (`prepare.rs`) re-derives the winning pick's
+    /// route at completion.
+    pub(crate) fn route_for(&self, proj: Option<usize>) -> Option<DispatchRoute> {
         let idx = proj?;
         let p = self.eff.as_ref()?.projects.get(idx)?;
         Some(DispatchRoute {

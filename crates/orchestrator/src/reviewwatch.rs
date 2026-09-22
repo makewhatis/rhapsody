@@ -1044,6 +1044,15 @@ impl Orchestrator {
         .unwrap_or(i64::MAX)
     }
 
+    /// Running ticketless reviews PLUS the `preparing` reservations for one (STUDIO-988). A review
+    /// preparation draws the same pool a running review does, so it must be subtracted from the
+    /// implementation draw and counted against the review budget before its `RunningEntry` exists.
+    pub(crate) fn ticketless_review_holders(&self) -> i64 {
+        let preparing = i64::try_from(self.preparing.values().filter(|e| e.is_review()).count())
+            .unwrap_or(i64::MAX);
+        self.running_ticketless_reviews().saturating_add(preparing)
+    }
+
     /// How many running entries currently SPEND the global pool the review watcher draws against
     /// (STUDIO-950). When `agent.max_concurrent_reviews` gives reviews their own pool that is the
     /// ticketless review runs alone; unset, it is EVERY running run on the shared
@@ -1053,10 +1062,12 @@ impl Orchestrator {
     /// what actually spent the pool instead of always the reviews — in shared mode the pool is held
     /// by implementations too, and `holding=0` while four implementations spend it is a lie the
     /// operator tuning the key cannot act on.
-    fn review_pool_holders(&self) -> i64 {
+    pub(crate) fn review_pool_holders(&self) -> i64 {
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
-            Some(_) => self.running_ticketless_reviews(),
-            None => i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+            // STUDIO-988: a review `preparing` reservation holds a review-pool slot before its run.
+            Some(_) => self.ticketless_review_holders(),
+            // Shared pool: every running entry AND every preparation spends it.
+            None => i64::try_from(self.running.len() + self.preparing.len()).unwrap_or(i64::MAX),
         }
     }
 

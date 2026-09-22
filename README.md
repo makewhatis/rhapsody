@@ -1649,11 +1649,21 @@ loop-side timeout, so retries cannot accumulate unbounded resolver work.
 A typed preparation failure is a **refusal**, not a failed agent attempt: it writes exactly one
 zero-turn run row with the new Rhapsody-only outcome `refused` (distinct from `failed` and from
 queued work; the console renders it `blocked`, like a token-ceiling stop) and arms a bounded refusal
-gate keyed by `(identity, selection fingerprint, opaque credential revision)`. The gate re-probes on
-a bounded backoff or immediately when an input changes — a workflow reload, an explicit
-`POST /api/v1/refresh`, or a credential mutation — and repeating an identical refusal advances the
-backoff without appending a second history row. No claim, workspace, mailbox, or review-watch row is
-created for a refusal.
+gate. The gate is keyed by `(identity, selection fingerprint)` and REMEMBERS the opaque credential
+revision observed at the refusal: the pre-spawn check suppresses without knowing a revision a
+resolver has yet to observe, and a revision change is a fresh episode (base backoff, a new history
+row). It re-probes on a bounded backoff or immediately when an input changes — a workflow reload, an
+explicit `POST /api/v1/refresh`, or a credential mutation — and repeating an identical refusal at the
+same revision advances the backoff without appending a second history row. No claim, workspace,
+mailbox, or review-watch row is created for a refusal; a refused retry hands its claim back so the
+ticket is re-probed rather than stranded. A preparation that is deferred by an armed drain (or
+superseded by a reload or a departed issue) parks or releases that claim exactly as `on_retry` does,
+never leaving it with nothing to fire it again.
+
+Pool-mode picks are prepared **before** the cross-daemon claim election: `claim_pool` assigns the
+ticket and may move its state, which is the very mutation a refusal must not leave behind, so the
+election runs only after an accepted preparation. The shared classification bullet still holds for
+the in-memory claim, workspace, active-run, mailbox, and review-watch rows.
 
 No credential value or bound lease appears in `Debug`/`Display`, telemetry, provenance, API JSON, or
 error strings: the completion carries the opaque revision only, and `PreparedDispatch` is move-only
