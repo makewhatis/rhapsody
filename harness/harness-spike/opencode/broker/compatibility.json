@@ -1,0 +1,9 @@
+{
+  "opencode_version": "1.18.30",
+  "adapter_package": "@ai-sdk/openai-compatible",
+  "adapter_version": "2.0.41",
+  "probe_command": ["--version"],
+  "source_tag": "v1.18.30",
+  "source_commit": "3104c1428ec91f809e5ab86631300de41eb6952e",
+  "source_repo": "https://github.com/anomalyco/opencode"
+}
