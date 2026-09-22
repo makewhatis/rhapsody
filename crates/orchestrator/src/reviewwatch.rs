@@ -1895,11 +1895,7 @@ impl Orchestrator {
             }
         }
         let round = self.reviewers_per_round();
-        if let Some(spent) = self.review_rounds.get_mut(&key) {
-            *spent += round;
-        } else {
-            self.review_rounds.insert(key.clone(), round);
-        }
+        *self.review_rounds.entry(key.clone()).or_default() += round;
         self.persist_review_rounds(&key);
     }
 
