@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use rhapsody_credential_ipc::domain::{Binding, CredentialRead, CredentialState};
+use rhapsody_credential_ipc::domain::{Binding, CredentialRead, CredentialState, Revision};
 use rhapsody_credential_ipc::session::{ClientSession, SessionError, Token};
 use rhapsody_credential_ipc::wire::{
     BootstrapMessage, ClientFrame, FrameError, HelloFrame, LeasePayload, ServerFrame, read_frame,
@@ -148,6 +148,50 @@ where
                 }
             }
         }
+    }
+}
+
+/// Composes bootstrap + connect + one `read_bound` call into a single `CredentialRead`, filling in
+/// the two states that only make sense at this daemon-wide level (design §2.5): `OwnerUnavailable`
+/// when there is no way to even reach an owner (no bootstrap frame ever arrived, or the socket
+/// connect itself failed) and `OwnerUnauthorized` when a connection WAS established and `Hello` was
+/// sent, but the owner closed it without ever answering — the server's deliberate no-oracle
+/// response to a wrong token (see `credential_bootstrap::serve_one` in the desktop crate).
+///
+/// The `revision` on both of those synthesized states is a fixed placeholder, not a real tracked
+/// generation: making it a genuine, transition-observing counter needs the stateful
+/// preparation/refusal-gate machinery PB7 owns, which is explicitly out of P0c's scope. A caller
+/// must not treat two `OwnerUnavailable` reads from this function as comparable revisions.
+pub async fn resolve_credential<R>(
+    stdin: R,
+    account: String,
+    expected_binding: Binding,
+) -> CredentialRead
+where
+    R: AsyncRead + Unpin,
+{
+    let unavailable = || CredentialRead {
+        revision: Revision::INITIAL,
+        state: CredentialState::OwnerUnavailable,
+    };
+
+    let Some(msg) = read_bootstrap(stdin).await else {
+        return unavailable();
+    };
+    let mut client = match CredentialClient::connect(&msg).await {
+        Ok(c) => c,
+        Err(_) => return unavailable(),
+    };
+    match client.read_bound(account, expected_binding).await {
+        Ok(read) => read,
+        // A connection that dies with no bytes ever received back, right after we sent Hello, is
+        // exactly the shape of a rejected authentication attempt (not a generic transport failure
+        // partway through an otherwise-successful exchange).
+        Err(ClientError::Frame(FrameError::Eof)) => CredentialRead {
+            revision: Revision::INITIAL,
+            state: CredentialState::OwnerUnauthorized,
+        },
+        Err(_) => unavailable(),
     }
 }
 
@@ -309,5 +353,127 @@ mod tests {
             .expect_err("no response ever arrives for an unauthorized connection");
         assert!(matches!(err, ClientError::Frame(_)));
         server.await.unwrap();
+    }
+
+    // --- resolve_credential: the daemon-wide OwnerUnavailable/OwnerUnauthorized states ------------
+
+    fn unix_socket_path(name: &str) -> std::path::PathBuf {
+        // Unix socket paths are capped at ~104 bytes (`sun_path`); `/tmp` directly with a short
+        // name keeps well under that regardless of the ambient `$TMPDIR`.
+        std::path::PathBuf::from("/tmp").join(format!("rd-cc-{name}-{}.sock", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_reports_owner_unavailable_with_no_bootstrap_frame() {
+        let empty: &[u8] = &[];
+        let read = resolve_credential(empty, "v1:x".into(), a_binding()).await;
+        assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_reports_owner_unavailable_when_the_socket_connect_fails() {
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "tok".into(),
+                socket_path: "/tmp/rd-cc-definitely-does-not-exist.sock".into(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_reports_owner_unauthorized_when_the_real_owner_rejects_the_token() {
+        let path = unix_socket_path("unauth");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            let (mut r, _w) = tokio::io::split(stream);
+            let mut session = ServerSession::new(Token::new("expected-token".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.expect("read hello");
+            // Wrong token: reject and close, exactly as the real desktop server does.
+            assert!(session.accept_hello(&hello.token).is_err());
+        });
+
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "wrong-token".into(),
+                socket_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnauthorized);
+
+        accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_passes_through_a_real_present_read() {
+        let path = unix_socket_path("present");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+        let binding = a_binding();
+        let server_binding = binding.clone();
+
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            let (mut r, mut w) = tokio::io::split(stream);
+            let mut session = ServerSession::new(Token::new("secret".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.unwrap();
+            session.accept_hello(&hello.token).expect("hello accepted");
+            let ClientFrame::ReadBound { seq, .. } = read_frame(&mut r).await.unwrap();
+            session.accept_client_seq(seq).unwrap();
+            let resp_seq = session.next_outgoing_seq();
+            write_frame(
+                &mut w,
+                &ServerFrame::ReadBoundResult {
+                    seq: resp_seq,
+                    revision: Revision(9),
+                    state: CredentialStateTag::Present,
+                    lease: Some(LeasePayload {
+                        binding: server_binding,
+                        value: "sk-resolved".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "secret".into(),
+                socket_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let read = resolve_credential(rx, "v1:spike-test-provider".into(), binding).await;
+        assert_eq!(read.revision, Revision(9));
+        match read.state {
+            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-resolved"),
+            other => panic!("expected Present, got {other:?}"),
+        }
+
+        accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
     }
 }
