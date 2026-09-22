@@ -3921,7 +3921,7 @@ mod tests {
         let mut iss = issue("1", "MT-1", "In Review");
         iss.team_id = "team-1".to_string();
         iss.latest_summon_at = Some(
-            chrono::TimeZone::with_ymd_and_hms(&Utc, 2030, 1, 1, 0, 0, 0)
+            Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
                 .single()
                 .expect("summon instant"),
         );
