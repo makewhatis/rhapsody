@@ -19,7 +19,9 @@ use crate::error::BrokerError;
 use crate::ledger::{ReservationCounters, TurnLedger, TurnOutcome};
 use crate::policy::SessionPolicy;
 use crate::random::RandomSource;
-use crate::reservations::{Reservations, SessionReservations};
+use crate::reservations::{
+    ConcurrencyPermit, ReservationSnapshot, Reservations, ReserveRequest, SessionReservations,
+};
 
 /// Recover a poisoned lock instead of propagating: no broker method panics while holding one.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -324,7 +326,9 @@ impl TurnInner {
     }
 
     pub(crate) fn is_expired(&self, now: MonotonicTime) -> bool {
-        now > self.not_after
+        // Inclusive: a capability is dead *at* its absolute expiry, never a nanosecond later
+        // (design §2 "expires no later than the turn deadline"; §4.2 `not_after <= deadline`).
+        now >= self.not_after
     }
 
     pub(crate) fn is_revoked(&self) -> bool {
@@ -335,14 +339,50 @@ impl TurnInner {
         lock(&self.finalized).is_some()
     }
 
-    /// Finalize exactly once, publishing the ledger into the capacity-one slot.
+    /// Whether this grant may still admit work: neither it nor its session is revoked, and the
+    /// capability has not expired. Called by the reservation primitives *inside* the admission
+    /// lock, so a revocation cannot publish a ledger between this check and the reservation it
+    /// commits.
+    pub(crate) fn check_live(&self) -> Result<(), BrokerError> {
+        if self.is_revoked() || self.session.is_revoked() {
+            return Err(BrokerError::Unauthorized);
+        }
+        if self.is_expired(self.session.broker.clock.now()) {
+            return Err(BrokerError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Atomically reserve one forwarded request against the turn and session limits.
+    pub(crate) fn reserve_request(&self, request: ReserveRequest) -> Result<(), BrokerError> {
+        self.reservations
+            .try_reserve(&self.session.session_reservations, request, || {
+                self.check_live()
+            })
+    }
+
+    /// Acquire one concurrency permit for this turn.
+    pub(crate) fn acquire_concurrency(&self) -> Result<ConcurrencyPermit, BrokerError> {
+        self.reservations
+            .try_acquire_concurrency(|| self.check_live())
+    }
+
+    /// Count one locally denied request against this turn.
+    pub(crate) fn record_denied(&self) -> Result<(), BrokerError> {
+        self.reservations.record_denied(|| self.check_live())
+    }
+
+    /// Finalize exactly once, publishing the ledger into the capacity-one slot. `close_and_snapshot`
+    /// sets the reservation gate closed and returns the committed counters in one critical section,
+    /// so no admission can commit after the ledger is built.
     pub(crate) fn finalize(&self, outcome: TurnOutcome) -> Option<TurnLedger> {
         let mut finalized = lock(&self.finalized);
         if finalized.is_some() {
             return None;
         }
         *finalized = Some(outcome);
-        let ledger = self.build_ledger(outcome);
+        let counters = self.reservations.close_and_snapshot();
+        let ledger = self.build_ledger(outcome, counters);
         self.slot.finalize(ledger.clone());
         Some(ledger)
     }
@@ -374,15 +414,20 @@ impl TurnInner {
     }
 
     /// Set the revoked flag and drop the grant from the registry if one was issued.
+    ///
+    /// The flag and the digest lookup happen under the registry lock that mint reserves the digest
+    /// under, so mint and revocation cannot interleave: mint either inserts (and a concurrent
+    /// revocation then finds the digest and removes the grant), or mint observes `revoked` and
+    /// refuses before inserting. No revoked grant can be left registered by a racing mint.
     fn revoke_grant(&self) {
+        let mut registry = lock(&self.session.broker.registry);
         self.revoked.store(true, Ordering::Release);
         if let Some(digest) = self.digest() {
-            lock(&self.session.broker.registry).remove_grant(&digest);
+            registry.remove_grant(&digest);
         }
     }
 
-    fn build_ledger(&self, outcome: TurnOutcome) -> TurnLedger {
-        let snapshot = self.reservations.snapshot();
+    fn build_ledger(&self, outcome: TurnOutcome, snapshot: ReservationSnapshot) -> TurnLedger {
         let counters = ReservationCounters {
             forwarded_requests: snapshot.forwarded_requests,
             denied_requests: snapshot.denied_requests,

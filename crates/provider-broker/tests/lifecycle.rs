@@ -4,6 +4,10 @@
 //! expiry/drop/finish, and indistinguishable auth failures.
 
 use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use rhapsody_provider_broker::{
     BoundCredentialLease, Broker, BrokerError, BrokerProtocol, BrokerRegistration,
@@ -697,6 +701,111 @@ fn reservations_via_a_grant_are_bounded() {
     // A request larger than the turn's per-request byte cap is refused.
     let over = DEFAULT_BROKER_LIMITS.max_request_bytes + 1;
     assert!(grant.reserve_request(over, 0, 0).is_err());
+}
+
+#[test]
+fn a_capability_is_dead_at_its_exact_expiry() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt, receipt) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm");
+    let access = attempt.mint_access().expect("mint");
+    let token = access.api_key.expose_for_child(str::to_owned);
+    let not_after = access.not_after();
+
+    // Advance to *exactly* the absolute expiry: the boundary is inclusive, so the capability is
+    // already dead and must not admit anything (design §2 "expires no later than the turn
+    // deadline", §4.2 `not_after <= outer turn deadline`).
+    clock.advance(Duration::from_secs(60 * 60));
+    assert_eq!(
+        clock.now(),
+        not_after,
+        "the clock is exactly at the boundary"
+    );
+    assert_eq!(
+        broker.lookup_capability(&token).unwrap_err(),
+        BrokerError::Unauthorized
+    );
+
+    drop(access);
+    assert_eq!(
+        receipt.take().expect("finalized ledger").outcome(),
+        TurnOutcome::Expired
+    );
+}
+
+#[test]
+fn minting_at_the_exact_expiry_is_refused() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut registration = register(&broker, "provider-a");
+
+    let (attempt, receipt) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm");
+
+    clock.advance(Duration::from_secs(60 * 60));
+    assert_eq!(
+        attempt.mint_access().unwrap_err(),
+        BrokerError::TurnExpired,
+        "a capability is not minted at or after its absolute expiry"
+    );
+    let ledger = receipt.take().expect("finalized ledger");
+    assert_eq!(ledger.outcome(), TurnOutcome::NoCapability);
+    assert!(!ledger.capability_issued());
+}
+
+#[test]
+fn a_committed_reservation_always_reaches_the_finalized_ledger() {
+    // A `CapabilityGrant` can outlive its `TurnAccess` (the forwarder holds it), so a reservation
+    // can race the access drop that finalizes the ledger. The binding invariant: every reservation
+    // that returned `Ok` is counted in the finalized ledger — cancellation cannot lose admitted
+    // spend (PB1 acceptance; design §4.3).
+    for _ in 0..256 {
+        let clock = Arc::new(ManualClock::new());
+        let rng = Arc::new(ScriptedRandom::new());
+        let broker = broker_with(clock, rng);
+        let mut registration = register(&broker, "provider-a");
+
+        let (attempt, receipt) = registration
+            .ledgers
+            .arm_turn(TurnMeta::without_deadline())
+            .expect("arm");
+        let access = attempt.mint_access().expect("mint");
+        let token = access.api_key.expose_for_child(str::to_owned);
+        let grant = broker.lookup_capability(&token).expect("live grant");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let successes = Arc::new(AtomicU64::new(0));
+        let reserving = {
+            let grant = grant.clone();
+            let barrier = Arc::clone(&barrier);
+            let successes = Arc::clone(&successes);
+            thread::spawn(move || {
+                barrier.wait();
+                while grant.reserve_request(1, 0, 0).is_ok() {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        };
+        barrier.wait();
+        drop(access);
+        reserving.join().expect("reserving thread");
+
+        let ledger = receipt.take().expect("finalized ledger");
+        assert_eq!(
+            successes.load(Ordering::Acquire),
+            ledger.forwarded_requests(),
+            "every admitted reservation must appear in the finalized ledger"
+        );
+    }
 }
 
 #[test]

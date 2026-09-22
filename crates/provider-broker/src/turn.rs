@@ -54,8 +54,10 @@ impl BrokerTurnAttempt {
     ///
     /// All failure paths finalize the armed receipt with `no_capability` and release the session's
     /// capacity-one turn gate, so a refused or failed turn never leaves custody dangling. A turn
-    /// whose receipt was already dropped (revoked) fails closed with [`BrokerError::TurnRevoked`]
-    /// rather than hand back a dead handle.
+    /// already revoked or finalized when the capability is reserved fails closed with
+    /// [`BrokerError::TurnRevoked`]. A receipt dropped concurrently with a successful mint still
+    /// revokes the grant, so a handle returned by such a race is dead from that instant; the child
+    /// can never spend through it.
     pub fn mint_access(mut self) -> Result<TurnAccess, BrokerError> {
         let inner = self.inner.take().ok_or(BrokerError::AttemptConsumed)?;
         let gate = self.gate.take();
@@ -111,9 +113,15 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
         let encoded = encode_token(&raw);
         let digest = TokenDigest::of(&encoded);
         {
+            // The liveness re-check, the registry insert, and `mark_issued` (which records the
+            // digest) all happen under the registry lock that `revoke_grant` also takes. A
+            // concurrent revocation therefore either sets `revoked` before this re-check and the
+            // mint refuses, or acquires the lock afterwards, sees the recorded digest, and removes
+            // the grant — it can never skip removal because the digest was not yet visible.
             let mut registry = lock(&session.broker.registry);
-            // Re-check under the registry lock (which a concurrent `revoke_grant` also takes)
-            // so a released receipt cannot race into a live grant.
+            if session.is_revoked() {
+                return Err(BrokerError::SessionRevoked);
+            }
             if inner.is_revoked() || inner.is_finalized() {
                 return Err(BrokerError::TurnRevoked);
             }
@@ -121,9 +129,9 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
                 continue;
             }
             registry.grants.insert(digest, Arc::clone(inner));
+            inner.mark_issued(digest);
         }
         let token = CapabilityToken::from_encoded(encoded);
-        inner.mark_issued(digest);
         inner.slot.set_access_live();
         return Ok((token, digest));
     }
@@ -285,52 +293,38 @@ impl CapabilityGrant {
 
     /// Whether the grant or its parent session has been revoked.
     pub fn is_revoked(&self) -> bool {
-        self.inner
-            .revoked
-            .load(std::sync::atomic::Ordering::Acquire)
-            || self.inner.session.is_revoked()
+        self.inner.is_revoked() || self.inner.session.is_revoked()
     }
 
     /// Atomically reserve one forwarded request against the turn and session limits. Reserves
-    /// nothing if any limit would be exceeded.
+    /// nothing if any limit would be exceeded, the capability has expired, or the turn has been
+    /// revoked or finalized. Liveness and the reservation commit share one critical section with
+    /// finalization, so revocation can never publish a ledger that omits an admitted request.
     pub fn reserve_request(
         &self,
         request_bytes: u64,
         response_bytes: u64,
         output_tokens: u64,
     ) -> Result<(), BrokerError> {
-        self.check_live()?;
-        self.inner.reservations.try_reserve(
-            &self.inner.session.session_reservations,
-            ReserveRequest {
-                request_bytes,
-                response_bytes,
-                output_tokens,
-            },
-        )
+        self.inner.reserve_request(ReserveRequest {
+            request_bytes,
+            response_bytes,
+            output_tokens,
+        })
     }
 
     /// Acquire one of the turn's concurrent-request permits; the permit releases the slot on drop.
+    /// Refused if the capability has expired or the turn has been revoked or finalized.
     pub fn acquire_concurrency(&self) -> Result<ConcurrencyPermit, BrokerError> {
-        self.check_live()?;
-        self.inner.reservations.try_acquire_concurrency()
+        self.inner.acquire_concurrency()
     }
 
-    /// Count one locally denied authenticated request. Reaching the configured threshold refuses
-    /// further denials so the caller can revoke the turn.
+    /// Count one locally denied authenticated request. The denial that *reaches* the configured
+    /// threshold is counted and refused so the caller can revoke the turn; further denials keep
+    /// returning the same refusal without incrementing past the cap. Refused if the capability has
+    /// expired or the turn has been revoked or finalized.
     pub fn record_denied(&self) -> Result<(), BrokerError> {
-        self.check_live()?;
-        self.inner.reservations.record_denied()
-    }
-
-    fn check_live(&self) -> Result<(), BrokerError> {
-        if self.is_revoked() {
-            return Err(BrokerError::Unauthorized);
-        }
-        if self.inner.is_expired(self.inner.session.broker.clock.now()) {
-            return Err(BrokerError::Unauthorized);
-        }
-        Ok(())
+        self.inner.record_denied()
     }
 }
 
