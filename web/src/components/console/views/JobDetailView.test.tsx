@@ -558,6 +558,49 @@ describe("zone A — the sticky header (§3A)", () => {
     );
   });
 
+  // STUDIO-1020 — each round's chip is painted from its OWN verdict, and the tooltip names it. A
+  // running review and a round with no verdict both read their own state, so the strip tells the
+  // three apart without opening each run.
+  it("paints each review round's chip from its own verdict and names it in the tooltip", async () => {
+    const writing = run({
+      id: 803,
+      issue_identifier: "pr:makewhatis/rhapsody#223@sol",
+      started_at: "2026-09-01T18:00:00Z",
+      ended_at: "",
+      outcome: "running",
+      verdict: "approved", // a stale verdict must not colour a round that is still running
+    });
+    const changes = run({
+      id: 802,
+      issue_identifier: "pr:makewhatis/rhapsody#223@sol",
+      started_at: "2026-09-01T17:30:00Z",
+      verdict: "changes_requested",
+    });
+    const approved = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      verdict: "approved",
+    });
+    mountDetail([run({ id: 522 })], vi.fn(), [writing, changes, approved]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(3));
+    expect(
+      [...document.querySelectorAll(".trrev")].map((b) => b.getAttribute("data-verdict")),
+    ).toEqual(["reviewing", "changes_requested", "approved"]);
+    // The verdict is ADDED to what the tooltip already showed, not instead of it.
+    const titles = [...document.querySelectorAll(".trrev")].map((b) => b.getAttribute("title"));
+    expect(titles[0]).toMatch(/^review · sol · reviewing · run 803 · started /);
+    expect(titles[1]).toMatch(/^review · sol · changes requested · run 802 · started /);
+    expect(titles[2]).toMatch(/^review · alice · approved · run 801 · started /);
+    // The button's text is unchanged: the state rides in the chip's form (a `::before` glyph) and
+    // its colour, so a screen reader and the existing strip assertions both still read the label.
+    expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
+      "review · sol",
+      "review · sol",
+      "review · alice",
+    ]);
+  });
+
   // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
   // so selecting it drives the same detail fetch and the same header pill as an attempt.
   it("opens a review run's own trace from the review strip", async () => {

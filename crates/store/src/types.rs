@@ -388,6 +388,17 @@ pub const REVIEW_STATUS_DROPPED: &str = "dropped";
 /// absent — review ships as if it had happened.
 pub const REVIEW_STATUS_TRUNCATED: &str = "truncated";
 
+// --- per-run review verdicts (STUDIO-1020) ----------------------------------------------------
+// Values for rhapsody_review_verdicts.verdict. NOT a Go port: the frozen reference has no review
+// feature. Unlike ReviewWatchRow.status, which holds the LATEST state per (PR, reviewer) and so
+// cannot describe an older round, one of these is recorded against each review RUN id and never
+// changes — the run detail's strip colours each round by its own outcome.
+
+/// The reviewer finished and declared `HANDOFF: approved` — nothing to fix.
+pub const REVIEW_VERDICT_APPROVED: &str = "approved";
+/// The reviewer finished and declared findings (`HANDOFF: findings` / `not approved`).
+pub const REVIEW_VERDICT_CHANGES_REQUESTED: &str = "changes_requested";
+
 /// ReviewWatchKey identifies one watch-set row: a pull request and the ONE reviewer watching it.
 ///
 /// Granularity is per-(PR, reviewer) on purpose. A single `last_reviewed_sha` per PR lets the first

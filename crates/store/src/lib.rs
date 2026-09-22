@@ -425,6 +425,26 @@ pub trait Store {
     /// adjudication ledger are rehydrated from.
     fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError>;
 
+    // --- per-run review verdicts (STUDIO-1020; no Go counterpart) -------------------------------
+    // A review run's own verdict, keyed by `runs.id` and written ONCE at the run's exit. The watch
+    // set's `status` cannot answer this: it holds only the LATEST state per (PR, reviewer), so a
+    // ticket with three rounds whose last review approved reads approved all the way back. Backed by
+    // the `rhapsody_review_verdicts` table (see the README "Divergences" entry); a run with no row —
+    // still running, ended without declaring a verdict, or predating this feature — is "no verdict".
+
+    /// Records `run_id`'s verdict, upserting on the run id. Callers pass one of
+    /// [`REVIEW_VERDICT_APPROVED`] / [`REVIEW_VERDICT_CHANGES_REQUESTED`]; a value the console
+    /// cannot colour is refused by the caller, not stored.
+    fn set_review_verdict(&self, run_id: i64, verdict: &str) -> Result<(), StoreError>;
+
+    /// One run's verdict, or `Ok(None)` when it recorded none.
+    fn review_verdict(&self, run_id: i64) -> Result<Option<String>, StoreError>;
+
+    /// The verdicts of a SET of runs in one query, keyed by run id. Missing ids are absent — the
+    /// same "no verdict" [`Store::review_verdict`] returns, batched so the run detail's review strip
+    /// never pays a query per round.
+    fn load_review_verdicts(&self, run_ids: &[i64]) -> Result<HashMap<i64, String>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;
