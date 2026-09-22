@@ -95,17 +95,20 @@ impl BootstrapListener {
     /// first's connection to end.
     ///
     /// Every per-connection task is tracked in a [`tokio::task::JoinSet`] owned by the returned
-    /// future's own stack frame. Simply dropping or `abort()`-ing that future (sol's first review
-    /// of rhapsody#213) is not enough on its own: `JoinSet::drop` and `JoinSet::abort_all` only set
-    /// each child's cooperative-cancellation flag, which a task already mid-poll through a
-    /// synchronous `owner.read_bound` Keychain call and a ready (non-blocking) socket write does
-    /// not observe until its NEXT poll — by which point it may already have sent the response
-    /// (sol's second review of rhapsody#213). The returned [`ListenerShutdown::shutdown`] instead
-    /// flips a shared [`CancellationToken`] that `serve_one` checks explicitly, synchronously,
-    /// after the owner read returns and before the response is written, so the check itself can
-    /// never be skipped by a poll boundary; the caller then awaits the driving future (e.g. the
-    /// `tokio::spawn` `JoinHandle`) to know every connection has actually finished, not merely been
-    /// asked to.
+    /// future's own stack frame. `JoinSet::drop` and `JoinSet::abort_all` only set each child's
+    /// cooperative-cancellation flag, which a task already mid-poll through a synchronous
+    /// `owner.read_bound` Keychain call and a ready (non-blocking) socket write does not observe
+    /// until its NEXT poll — by which point it may already have sent the response (sol's first and
+    /// second reviews of rhapsody#213). So revocation instead rests on a shared
+    /// [`CancellationToken`] that `serve_one` checks explicitly, synchronously, after the owner
+    /// read returns and before the response is written, so the check itself can never be skipped
+    /// by a poll boundary. That token is flipped on EVERY way the returned future can end:
+    /// [`ListenerShutdown::shutdown`], an `accept()` error, and — through a drop guard held by the
+    /// future itself — being dropped or `abort()`-ed mid-poll, or panicking (jimmy's review of
+    /// rhapsody#213, B8). Dropping or aborting the future therefore never lets an in-flight read
+    /// answer, but it also does not WAIT for the connection tasks to finish: only calling
+    /// `shutdown()` and then awaiting the driving future (e.g. the `tokio::spawn` `JoinHandle`)
+    /// tells the caller every connection has actually finished, not merely been asked to.
     pub fn accept_and_serve(
         self,
         owner: Arc<ProviderCredentialOwner>,
@@ -115,6 +118,10 @@ impl BootstrapListener {
             cancel: cancel.clone(),
         };
         let future = async move {
+            // Flips `cancel` if this future ends by any route other than the two loop exits below
+            // (drop, `abort()`, panic, a future early `return`), none of which reach
+            // `graceful_shutdown` — see this method's doc (jimmy's review of rhapsody#213, B8).
+            let _cancel_on_exit = cancel.clone().drop_guard();
             let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -176,10 +183,11 @@ async fn graceful_shutdown(cancel: &CancellationToken, connections: &mut tokio::
 }
 
 /// A handle to request a graceful, waited-for shutdown of a listener returned by
-/// [`BootstrapListener::accept_and_serve`]. See that method's doc for why calling
-/// [`shutdown`](ListenerShutdown::shutdown) and then awaiting the listener's driving future is the
-/// only combination that is actually safe to treat as "this channel is fully revoked" — aborting
-/// or dropping the driving future on its own is not.
+/// [`BootstrapListener::accept_and_serve`]. Aborting or dropping the listener's driving future
+/// also revokes the channel — no in-flight read answers afterward — but does not wait for the
+/// connection tasks to finish; calling [`shutdown`](ListenerShutdown::shutdown) and then awaiting
+/// the driving future is the only combination that tells the caller the channel is fully revoked
+/// AND every connection has ended. See that method's doc.
 #[derive(Clone)]
 pub struct ListenerShutdown {
     cancel: CancellationToken,
@@ -691,6 +699,87 @@ mod tests {
         assert!(
             outcome.is_err(),
             "a read already in flight when shutdown was requested must never deliver its response"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // jimmy's review of rhapsody#213 (B8): aborting (or dropping) the listener's driving future
+    // WITHOUT ever calling `ListenerShutdown::shutdown` bypasses both of the accept loop's
+    // `break`s, so `graceful_shutdown` never runs and nothing flips `cancel` — while `JoinSet`'s
+    // drop only sets each child's cooperative flag, which a task parked inside the synchronous
+    // Keychain call cannot observe before it writes its reply. The `ListenerShutdown` handle is
+    // kept alive and never called, exactly as a supervisor that `select!`s the future against the
+    // child process (or `abort()`s it on restart) would leave it. A read in flight at that moment
+    // must still never deliver its response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborting_the_listener_during_a_blocked_owner_read_discards_the_in_flight_response() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+
+        let backing = MockKeyring::empty();
+        let (blocking_kr, entered_rx, release_tx) = BlockingKeyring::new(backing);
+        let arm = blocking_kr.clone();
+        let owner = ProviderCredentialOwner::for_test(blocking_kr);
+        owner
+            .connect(
+                Revision::INITIAL,
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+                "sk-real-socket-secret".into(),
+            )
+            .expect("connect (unblocked: not yet armed)");
+        arm.arm();
+        let owner = Arc::new(owner);
+
+        let (fut, _shutdown_never_called) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+
+        let read_task = tokio::spawn(async move {
+            let outcome = client
+                .read_bound(
+                    "v1:spike-test-provider".into(),
+                    Binding {
+                        provider_id: "spike-test-provider".into(),
+                        adapter: "openai-chat-completions-bearer-v1".into(),
+                        base_url: "https://api.example/v1".into(),
+                    },
+                )
+                .await;
+            drop(client);
+            outcome
+        });
+
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join")
+            .expect("read must signal it entered the blocking Keychain call");
+
+        // Abort the listener task WHILE the read is parked inside the Keychain call, and wait for
+        // the abort to land, before the blocked call is released.
+        serve.abort();
+        let _ = serve.await;
+
+        release_tx
+            .send(())
+            .expect("release the paused read so the connection task can finish");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), read_task)
+            .await
+            .expect("the client task must not hang waiting for a response that will never come")
+            .expect("read task must not panic");
+        assert!(
+            outcome.is_err(),
+            "a read in flight when the listener task was aborted must never deliver its response"
         );
 
         std::fs::remove_dir_all(&dir).ok();
