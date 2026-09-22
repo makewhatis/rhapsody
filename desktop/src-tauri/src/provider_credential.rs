@@ -12,7 +12,10 @@
 //! Every mutation is a linearizable compare-and-swap against one `Mutex`-guarded revision, matching
 //! §2.5's "every operation is compare-and-swap against one owner snapshot" — the same lock that
 //! guards a read also guards every mutation, so a blocked read and a racing mutation cannot
-//! interleave into an inconsistent snapshot (see the `race_*` test below).
+//! interleave into an inconsistent snapshot (see `a_blocked_read_forces_a_concurrent_remove_to_
+//! wait_and_keeps_its_old_revision` below). `probe_access` and `locked_read` both take the guard as
+//! an explicit parameter specifically so a caller cannot drop and re-acquire a fresh one between
+//! them without that showing up at the call site.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -150,8 +153,15 @@ impl ProviderCredentialOwner {
 
     /// Distinguishes "denied/locked" from "malformed"/"absent" without yet deciding which one a
     /// caller needs — both `locked_read`'s `Err`-on-decode-failure and `Err`-on-Keychain-failure
-    /// collapse to the same `Result<_, ()>`, so mutation/read paths call this first.
-    fn probe_access(&self) -> Result<(), MutationError> {
+    /// collapse to the same `Result<_, ()>`, so mutation/read paths call this first. Takes `guard`
+    /// for the same reason `locked_read` does: every caller must already hold the revision lock
+    /// across BOTH this call and the `locked_read` call that follows it, in the SAME critical
+    /// section — never releasing and re-acquiring in between, which would let a concurrent mutation
+    /// interleave a torn (state, revision) pair. This parameter makes that requirement visible at
+    /// every call site instead of relying on each caller to remember it (see the `a_blocked_read_*`
+    /// race test, and sol's review of rhapsody#213, which found and reproduced exactly that defect).
+    fn probe_access(&self, guard: &MutexGuard<'_, Revision>) -> Result<(), MutationError> {
+        let _ = guard;
         match self.keyring.get_password() {
             Ok(_) => Ok(()),
             Err(KeyringError::NoEntry) => Ok(()),
@@ -164,7 +174,7 @@ impl ProviderCredentialOwner {
     /// `BindingMismatch`, never a partial/raw disclosure of the stored endpoint or key.
     pub fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
         let guard = lock_revision(&self.revision);
-        if self.probe_access().is_err() {
+        if self.probe_access(&guard).is_err() {
             return CredentialRead {
                 revision: *guard,
                 state: CredentialState::DeniedOrLocked,
@@ -192,7 +202,7 @@ impl ProviderCredentialOwner {
         value: String,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        self.probe_access()?;
+        self.probe_access(&guard)?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
         }
@@ -215,7 +225,7 @@ impl ProviderCredentialOwner {
         new_value: String,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        self.probe_access()?;
+        self.probe_access(&guard)?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
         }
@@ -238,7 +248,7 @@ impl ProviderCredentialOwner {
         new_binding: Binding,
     ) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        self.probe_access()?;
+        self.probe_access(&guard)?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
         }
@@ -258,7 +268,7 @@ impl ProviderCredentialOwner {
     /// the Keychain item, so it stays observable after the secret bytes are gone.
     pub fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
         let mut guard = lock_revision(&self.revision);
-        self.probe_access()?;
+        self.probe_access(&guard)?;
         if *guard != expected_revision {
             return Err(MutationError::StaleRevision(*guard));
         }
@@ -304,7 +314,6 @@ mod tests {
     use super::*;
     use crate::credential::mock::MockKeyring;
     use rhapsody_credential_ipc::domain::CredentialStateTag;
-    use std::sync::Barrier;
     use std::thread;
 
     fn test_ref() -> CredentialRef {
@@ -662,50 +671,119 @@ mod tests {
 
     // --- The race PB7 depends on: a blocked read must retain its OLD revision, never a torn one ---
 
+    /// A `Keyring` double whose very first `get_password()` call sleeps for
+    /// [`BLOCKING_KEYRING_PAUSE`] before returning; every later call passes straight through to
+    /// `inner`. `read_bound` calls `get_password` while still holding the revision lock, so this
+    /// pause holds that lock open for a large, real wall-clock window — long enough that if a
+    /// regression ever drops the lock before the read completes, a concurrently spawned mutation
+    /// contending for the SAME lock (already parked waiting, not merely scheduled to run later) has
+    /// every practical opportunity to win the race and finish inside that window, rather than this
+    /// test's outcome depending on which of two fast, uncontended operations the OS scheduler
+    /// happens to run first.
+    struct BlockingKeyring {
+        inner: Arc<MockKeyring>,
+        paused: Mutex<bool>,
+    }
+
+    const BLOCKING_KEYRING_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    impl BlockingKeyring {
+        fn new(inner: Arc<MockKeyring>) -> Arc<BlockingKeyring> {
+            Arc::new(BlockingKeyring {
+                inner,
+                paused: Mutex::new(true),
+            })
+        }
+    }
+
+    impl crate::credential::Keyring for BlockingKeyring {
+        fn get_password(&self) -> Result<String, crate::credential::KeyringError> {
+            let mut paused = self.paused.lock().unwrap();
+            if *paused {
+                *paused = false;
+                drop(paused);
+                thread::sleep(BLOCKING_KEYRING_PAUSE);
+            }
+            self.inner.get_password()
+        }
+        fn set_password(&self, token: &str) -> Result<(), crate::credential::KeyringError> {
+            self.inner.set_password(token)
+        }
+        fn delete_credential(&self) -> Result<(), crate::credential::KeyringError> {
+            self.inner.delete_credential()
+        }
+    }
+
     // Mutation discipline: "Delete revision state with the credential; a blocked old Present read
-    // after Remove must incorrectly win and fail the race test." This test pins the opposite: the
-    // snapshot a blocked reader captured BEFORE a concurrent Remove must keep its pre-Remove
-    // revision, so a caller comparing it against the post-Remove revision correctly sees it as
-    // stale and rejects it — exactly what a defect deleting revision alongside the secret breaks.
+    // after Remove must incorrectly win and fail the race test." This test pins the opposite: a
+    // read genuinely paused INSIDE the locked critical section still returns a self-consistent
+    // pre-Remove snapshot (Present paired with its own old revision, never Absent paired with a
+    // stale revision or vice versa), and Remove cannot advance the revision until that read
+    // releases the lock. sol's review of an earlier revision of this test (rhapsody#213) found it
+    // used a `Barrier` that only ran the read and the remove sequentially on one thread each,
+    // proving no actual mutual exclusion; this version verifies the specific defect sol
+    // reintroduced to confirm the gap (`read_bound` capturing the revision, releasing the lock, and
+    // only then reading storage) — with that defect reintroduced locally, Remove wins the 300 ms
+    // window and this test's `Present`/revision assertions fail, because the read observes the
+    // post-Remove `Absent` state instead.
     #[test]
-    fn a_read_snapshot_taken_before_a_concurrent_remove_keeps_its_old_revision() {
-        let owner = Arc::new(owner_over(MockKeyring::empty()));
+    fn a_blocked_read_forces_a_concurrent_remove_to_wait_and_keeps_its_old_revision() {
+        let backing = MockKeyring::empty();
         let b = binding("https://api.example/v1");
-        let r1 = match owner
-            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
-            .unwrap()
-        {
-            MutationOutcome::Advanced(r) => r,
+        let envelope = Envelope {
+            version: ENVELOPE_VERSION,
+            kind: ENVELOPE_KIND.to_string(),
+            value: "sk-1".into(),
+            binding: b.clone(),
+        };
+        backing
+            .set_password(&serde_json::to_string(&envelope).unwrap())
+            .expect("seed the backing keychain directly, bypassing the owner under test");
+
+        let blocking_kr = BlockingKeyring::new(backing);
+        let owner = Arc::new(ProviderCredentialOwner::with_keyring(
+            &test_ref(),
+            blocking_kr,
+        ));
+
+        let read_owner = owner.clone();
+        let read_binding = b.clone();
+        let read_handle = thread::spawn(move || read_owner.read_bound(&read_binding));
+
+        // Give the read time to acquire the revision lock and enter its pause before the mutation
+        // even attempts to acquire the same lock — otherwise Remove could win the initial
+        // acquisition race before the read starts, which would prove nothing about what happens
+        // while a read is genuinely in flight.
+        thread::sleep(std::time::Duration::from_millis(30));
+
+        let remove_owner = owner.clone();
+        let remove_handle = thread::spawn(move || remove_owner.remove(Revision::INITIAL));
+
+        let blocked_snapshot = read_handle.join().expect("read thread");
+        let removed = remove_handle.join().expect("remove thread");
+
+        match &blocked_snapshot.state {
+            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            other => panic!(
+                "a read already in flight when Remove starts must still observe the pre-Remove \
+                 value as a self-consistent snapshot, got {other:?} — this fails if the revision \
+                 lock is ever released before the read's storage access completes, letting Remove \
+                 win the race and this read observe the post-Remove Absent state instead"
+            ),
+        }
+        assert_eq!(blocked_snapshot.revision, Revision::INITIAL);
+
+        let removed_revision = match removed {
+            Ok(MutationOutcome::Advanced(r)) => r,
             other => panic!("{other:?}"),
         };
-
-        // `read_bound` and every mutation take the SAME mutex, so a "blocked owner read" racing a
-        // mutation can never observe a torn state — one completes fully before the other starts.
-        // We pin exactly that ordering property here: a snapshot taken before Remove keeps its
-        // pre-Remove revision even once Remove has run on another thread, so a caller (PB7) that
-        // compares a cached revision against the current one correctly rejects the stale snapshot
-        // rather than treating it as still current.
-        let barrier = Arc::new(Barrier::new(2));
-        let blocked_snapshot = owner.read_bound(&b);
-        assert_eq!(blocked_snapshot.revision, r1);
-
-        let owner2 = owner.clone();
-        let barrier2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            barrier2.wait();
-            owner2.remove(r1)
-        });
-        barrier.wait();
-        let removed = handle.join().expect("remove thread");
-        assert!(matches!(removed, Ok(MutationOutcome::Advanced(_))));
-
-        let current = owner.current_revision();
         assert!(
-            current > blocked_snapshot.revision,
+            removed_revision > blocked_snapshot.revision,
             "post-remove revision must have moved past the pre-remove snapshot"
         );
         // PB7's rejection rule falls straight out of this: `blocked_snapshot.revision != current`.
-        assert_ne!(blocked_snapshot.revision, current);
+        assert_eq!(owner.current_revision(), removed_revision);
+        assert_ne!(blocked_snapshot.revision, owner.current_revision());
     }
 
     // --- Behavior across a simulated desktop/daemon restart ---------------------------------------
