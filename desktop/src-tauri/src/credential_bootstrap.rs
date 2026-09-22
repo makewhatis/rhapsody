@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rhapsody_credential_ipc::domain::CredentialRef;
 use rhapsody_credential_ipc::session::{ServerSession, Token};
@@ -28,6 +29,16 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::provider_credential::ProviderCredentialOwner;
 
+/// How long the listener waits for a freshly accepted connection's `Hello` frame before giving up
+/// on it and returning to `accept`. Only one connection is ever served at a time (see
+/// `accept_and_serve`'s doc), so without this bound a connection that never sends `Hello` — a
+/// same-user process that simply connects and does nothing, which the design's own threat model
+/// (`provider-auth-p0-findings.md` §8) assumes can happen — wedges every later connection,
+/// including the real daemon's own reconnect after a restart, forever. A legitimate handshake is a
+/// single local write immediately after `connect`, so this has ample margin without making a
+/// deliberately silent connection expensive to defend against.
+const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+
 pub struct BootstrapListener {
     token: String,
     socket_path: PathBuf,
@@ -37,7 +48,12 @@ pub struct BootstrapListener {
 impl BootstrapListener {
     /// Binds a fresh Unix socket at a private per-process path under `dir` (the real supervisor
     /// uses a directory under `~/.rhapsody/run`; tests use a `TempDir`) and mints a fresh bootstrap
-    /// token. Never reuses a path or a token across calls — each daemon launch gets its own of both.
+    /// token — each daemon launch gets its own token, never reused across a restart. The socket
+    /// path itself is deterministic per desktop process id (`cred-<pid>.sock`), so a second `bind`
+    /// call from the SAME process reuses that same path, unconditionally removing whatever socket
+    /// file is already there (including one still served by an earlier listener in this process, if
+    /// any); in production the supervisor calls this exactly once per daemon launch, so that never
+    /// happens.
     pub fn bind(dir: &std::path::Path) -> std::io::Result<BootstrapListener> {
         std::fs::create_dir_all(dir)?;
         // Short name: Unix socket paths are capped at ~104 bytes total (`sun_path`), and `dir` may
@@ -64,8 +80,9 @@ impl BootstrapListener {
 
     /// Accepts connections and serves `read_bound` requests against `owner` until `owner`'s
     /// underlying process/task is dropped or the listener errors. Only one connection is served at a
-    /// time (the daemon holds exactly one); a prior connection is superseded by a new one (the
-    /// daemon reconnecting after its own restart), never held open against it.
+    /// time (the daemon holds exactly one). A connection that never completes its `Hello` handshake
+    /// within [`HELLO_TIMEOUT`] is dropped so it cannot hold this slot against a later connection —
+    /// including the real daemon reconnecting after its own restart — forever.
     pub async fn accept_and_serve(self, owner: Arc<ProviderCredentialOwner>) {
         loop {
             let (stream, _addr) = match self.listener.accept().await {
@@ -86,9 +103,12 @@ impl BootstrapListener {
 async fn serve_one(mut stream: UnixStream, token: String, owner: Arc<ProviderCredentialOwner>) {
     let mut session = ServerSession::new(Token::new(token));
 
-    let hello: HelloFrame = match read_frame(&mut stream).await {
-        Ok(h) => h,
-        Err(_) => return,
+    let hello: HelloFrame = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut stream)).await
+    {
+        Ok(Ok(h)) => h,
+        // A timed-out or errored/EOF'd Hello read are the same outcome here: give up on this
+        // connection and let `accept_and_serve` move on to the next one rather than blocking it.
+        Ok(Err(_)) | Err(_) => return,
     };
     // An unauthorized connection gets no response at all — closing the stream, not answering with
     // an explicit rejection frame, so a probing caller learns nothing beyond "this didn't work".
@@ -301,6 +321,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // A same-user process that connects and sends nothing (never a `Hello`) must not be able to
+    // wedge the shared accept loop against a later, legitimate connection — including the real
+    // daemon reconnecting after its own restart. Without `HELLO_TIMEOUT` bounding the first read in
+    // `serve_one`, this test hangs forever instead of completing.
+    #[tokio::test]
+    async fn a_silent_connection_cannot_wedge_a_later_legitimate_client() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+        let owner = owner_with_secret();
+        let serve = tokio::spawn(listener.accept_and_serve(owner));
+
+        // Connect but never write anything, and hold the stream open for the whole test — a
+        // dropped stream would EOF immediately and prove nothing about the timeout.
+        let silent = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect silent");
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect legit");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+        let read = client
+            .read_bound(
+                "v1:spike-test-provider".into(),
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+            )
+            .await
+            .expect("a legitimate client must still be served after the silent one times out");
+        assert_eq!(read.state.tag(), CredentialStateTag::Present);
+
+        drop(silent);
+        drop(client);
+        serve.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // A minimal client double built directly on the wire/session primitives (rather than importing
     // the daemon crate, which this crate does not and should not depend on) — exercises the exact
     // same `ClientSession`/framing the real `rhapsodyd` client uses.
@@ -340,8 +401,11 @@ mod tests {
             )
             .await
             .map_err(|_| ())?;
+            // Comfortably above `HELLO_TIMEOUT` so a test that first parks a silent connection (to
+            // prove it cannot wedge a later legitimate one) never races its own client-side wait
+            // against the server-side timeout that frees the slot this client needs.
             let frame: ServerFrame = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(3),
                 read_frame(&mut self.stream),
             )
             .await

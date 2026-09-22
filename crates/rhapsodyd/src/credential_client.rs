@@ -27,11 +27,19 @@ use tokio::net::UnixStream;
 /// receives it within milliseconds of process creation.
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `read_bound` waits for the owner's response before giving up. Without this bound, an
+/// owner that accepted `Hello` but is itself wedged (e.g. blocked inside its own credential-owner
+/// mutation lock) hangs the calling daemon task forever instead of producing `OwnerUnavailable` —
+/// design §2.5 requires "blocking reads are concurrency/timeout bounded".
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug)]
 pub enum ClientError {
     Frame(FrameError),
     Session(SessionError),
     Io(std::io::Error),
+    /// The owner accepted `Hello` but never answered a request within [`RESPONSE_TIMEOUT`].
+    Timeout,
 }
 
 impl std::fmt::Display for ClientError {
@@ -40,6 +48,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Frame(e) => write!(f, "{e}"),
             ClientError::Session(e) => write!(f, "{e}"),
             ClientError::Io(e) => write!(f, "{e}"),
+            ClientError::Timeout => write!(f, "timed out waiting for the owner's response"),
         }
     }
 }
@@ -120,9 +129,11 @@ where
         .map_err(ClientError::Frame)?;
 
         loop {
-            let frame: ServerFrame = read_frame(&mut self.stream)
-                .await
-                .map_err(ClientError::Frame)?;
+            let frame: ServerFrame =
+                match tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(&mut self.stream)).await {
+                    Ok(r) => r.map_err(ClientError::Frame)?,
+                    Err(_) => return Err(ClientError::Timeout),
+                };
             match frame {
                 ServerFrame::ReadBoundResult {
                     seq: resp_seq,
@@ -197,6 +208,9 @@ where
             revision: Revision::INITIAL,
             state: CredentialState::OwnerUnauthorized,
         },
+        // A `Hello`-accepted owner that never answers within `RESPONSE_TIMEOUT` (wedged, or simply
+        // too slow) is unavailable, not unauthorized — the connection itself was never rejected.
+        // Every other connect/frame failure is unavailable too.
         Err(_) => unavailable(),
     }
 }
@@ -424,6 +438,51 @@ mod tests {
         assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnauthorized);
 
         accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A wedged owner (accepted `Hello`, then never answers) must not hang the calling daemon task
+    // forever — it must time out and report `OwnerUnavailable` within a bounded wait. Without
+    // `RESPONSE_TIMEOUT` bounding `read_bound`'s response read, this test never completes.
+    #[tokio::test]
+    async fn resolve_credential_reports_owner_unavailable_when_the_owner_never_answers() {
+        let path = unix_socket_path("wedged");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            let (mut r, _w) = tokio::io::split(stream);
+            let mut session = ServerSession::new(Token::new("secret".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.unwrap();
+            session.accept_hello(&hello.token).expect("hello accepted");
+            // Authenticated, then deliberately never reads or answers the follow-up ReadBound —
+            // simulating an owner wedged after a successful handshake. Hold `_w` for the test's
+            // whole run so the connection stays open rather than EOFing.
+            tokio::time::sleep(RESPONSE_TIMEOUT * 3).await;
+        });
+
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "secret".into(),
+                socket_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let started = std::time::Instant::now();
+        let read = resolve_credential(rx, "v1:x".into(), a_binding()).await;
+        assert_eq!(read.state.tag(), CredentialStateTag::OwnerUnavailable);
+        assert!(
+            started.elapsed() < RESPONSE_TIMEOUT * 2,
+            "resolve_credential must return once RESPONSE_TIMEOUT elapses, not wait for the owner"
+        );
+
+        accept.abort();
         std::fs::remove_file(&path).ok();
     }
 
