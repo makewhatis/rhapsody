@@ -33,7 +33,7 @@ use chrono::{DateTime, Utc};
 use rhapsody_core::Issue;
 
 use crate::control_loop::{CancelSignal, Event};
-use crate::orchestrator::{Orchestrator, RunningEntry};
+use crate::orchestrator::Orchestrator;
 use crate::retry::DispatchRoute;
 
 /// The default per-preparation timeout. Well under the poll interval; a resolver that does not answer
@@ -835,9 +835,6 @@ impl Orchestrator {
     /// claim would greet boot recovery as live work.
     fn write_refusal_run(&self, issue: &Issue, project_slug: &str, reason: &str) {
         let now = (self.now)();
-        let mut re = RunningEntry::empty(issue.clone());
-        re.project_slug = project_slug.to_string();
-        re.started_at = now;
         let run_id = match self.store.start_run(rhapsody_store::RunStart {
             issue_id: issue.id.clone(),
             issue_identifier: issue.identifier.clone(),
@@ -1507,6 +1504,38 @@ mod tests {
         assert_eq!(o.preparing.len(), 1);
         assert!(o.preparing.contains("1"));
         assert!(!o.preparing.contains("2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cancels_every_preparation_and_a_late_completion_is_inert() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        for (id, ident) in [("1", "MT-1"), ("2", "MT-2")] {
+            assert!(matches!(
+                o.begin_preparation(ticket_target_id(id, ident, "Todo"), false),
+                BeginPreparation::Started(_)
+            ));
+        }
+        let token = o.preparing.get("2").map(|e| e.token).expect("reservation");
+        o.cancel_all_preparations();
+        assert!(
+            o.preparing.is_empty(),
+            "shutdown releases every reservation"
+        );
+        // A completion delivered after shutdown is stale and must not dispatch.
+        o.handle_dispatch_prepared(
+            "2".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-1",
+                )),
+                observed_revision: "rev-1".to_string(),
+            },
+        );
+        assert!(sink.lock().expect("dispatch sink").is_empty());
     }
 
     // The review path shares the same machinery: the same reservation map, token and gates.
