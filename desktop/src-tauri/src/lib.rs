@@ -26,6 +26,7 @@ pub mod logbridge;
 pub mod menu;
 pub mod onboarding;
 pub mod prefs;
+pub mod provider_credential;
 pub mod supervisor;
 pub mod toolcheck;
 pub mod tooldirs;

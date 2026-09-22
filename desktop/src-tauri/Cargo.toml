@@ -33,6 +33,13 @@ tauri-plugin-process = "2"
 # pinned to the same major as `tauri`; the `dialog:allow-open` permission is granted in
 # capabilities/default.json (a Tauri v2 gotcha — without it the dialog IPC is silently denied).
 tauri-plugin-dialog = "2"
+# rhapsody-credential-ipc (STUDIO-981/P0c): the shared wire types + bootstrap-token/session state
+# machine for the authenticated desktop-to-daemon provider-credential channel. A path dependency
+# reaching into the root workspace's `crates/` tree (this crate's own workspace deliberately
+# excludes `desktop/` in the other direction, to keep Tauri's heavy tree out of the daemon build —
+# see root `Cargo.toml`); the reverse pull adds no Tauri/tauri-adjacent dependency to `crates/*`, so
+# it does not reintroduce that coupling. No Go parity: this whole feature is Rhapsody-only.
+rhapsody-credential-ipc = { path = "../../crates/credential-ipc" }
 # semver (TRA-266): parse the Makefile-stamped RHAPSODY_VERSION so the updater compares latest.json
 # against the REAL release version, not tauri.conf.json's static 0.1.0 (see update.rs). This is the
 # SAME semver crate `tauri-plugin-updater` already uses for `RemoteRelease.version`, so its
