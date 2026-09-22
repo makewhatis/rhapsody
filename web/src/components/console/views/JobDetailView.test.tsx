@@ -601,6 +601,24 @@ describe("zone A — the sticky header (§3A)", () => {
     ]);
   });
 
+  // A review whose `pr:` key carries no reviewer falls back to "review <id>" as its label, which
+  // IS the run id — so the verdict the tooltip adds must not also repeat it (STUDIO-1020).
+  it("does not repeat the run id in an unnamed review's tooltip", async () => {
+    const orphan = run({
+      id: 804,
+      issue_identifier: "pr:makewhatis/rhapsody#223",
+      started_at: "2026-09-01T16:00:00Z",
+      verdict: "changes_requested",
+    });
+    mountDetail([run({ id: 522 })], vi.fn(), [orphan]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    const chip = document.querySelector(".trrev") as HTMLElement;
+    expect(chip.textContent).toBe("review 804");
+    const title = chip.getAttribute("title") ?? "";
+    expect(title).toMatch(/^changes requested · run 804 · started /);
+    expect(title).not.toMatch(/run 804.*run 804/);
+  });
+
   // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
   // so selecting it drives the same detail fetch and the same header pill as an attempt.
   it("opens a review run's own trace from the review strip", async () => {

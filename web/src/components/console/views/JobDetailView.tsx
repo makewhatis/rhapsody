@@ -436,6 +436,9 @@ function RunTrace({
             // The verdict phrase the tooltip adds (STUDIO-1020), or "" for a round with no verdict.
             const verdict = REVIEW_STATE_LABELS[r.state];
             const id = `run ${r.id}`;
+            // A NAMED entry's label already carries "review · <who>", so the run id follows it; the
+            // unnamed fallback's label IS the run id, so the tooltip must not repeat it.
+            const head = r.named ? [r.label, verdict] : [verdict];
             return (
               <button
                 key={r.id}
@@ -446,7 +449,7 @@ function RunTrace({
                 // stylesheet draws — the model names the state, the stylesheet encodes it.
                 data-verdict={r.state}
                 aria-pressed={r.id === run.id}
-                title={[r.named ? r.label : id, verdict, id, `started ${formatDateTime(r.startedAt)}`]
+                title={[...head, id, `started ${formatDateTime(r.startedAt)}`]
                   .filter((part) => part !== "")
                   .join(" · ")}
                 onClick={() => selectRun(r.id)}
