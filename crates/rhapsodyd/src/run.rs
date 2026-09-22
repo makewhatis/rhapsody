@@ -107,6 +107,63 @@ where
     // lines are written to `stderr` directly, not through `tracing`.
     let _ = tracing::dispatcher::set_global_default(tel.subscriber());
 
+    // STUDIO-981/P0c (Rhapsody-only, no Go parity): only when the real desktop supervisor passed
+    // `--credential-bootstrap` does the daemon even attempt to read a bootstrap frame from stdin.
+    // Fully decoupled from the rest of boot (a detached task, not awaited here) — a slow/absent
+    // bootstrap can never delay the observability server, the control loop, or shutdown, and this
+    // crate's own hermetic tests (which never pass the flag) never touch stdin at all.
+    if flags.credential_bootstrap {
+        let probe = flags.credential_probe.clone();
+        tokio::spawn(async move {
+            match probe {
+                Some(CredentialProbe { account, binding }) => {
+                    // The real round trip: read the bootstrap frame, connect, authenticate, and
+                    // `read_bound`. `connect` alone never proves authentication (the server gives
+                    // unauthorized connections no response at all — see
+                    // `credential_bootstrap::serve_one`), so only a completed `read_bound` can. Logs
+                    // only the resulting non-secret state tag + revision, never the credential.
+                    let read = crate::credential_client::resolve_credential(
+                        tokio::io::stdin(),
+                        account,
+                        binding,
+                    )
+                    .await;
+                    tracing::info!(
+                        state = ?read.state.tag(),
+                        revision = read.revision.0,
+                        "provider-credential owner bootstrap resolved"
+                    );
+                }
+                None => match crate::credential_client::read_bootstrap(tokio::io::stdin()).await {
+                    Some(msg) => {
+                        match crate::credential_client::CredentialClient::connect(&msg).await {
+                            Ok(_client) => {
+                                // `connect` only establishes the stream and sends `Hello` — the
+                                // server never acknowledges a successful handshake, so this does
+                                // NOT by itself prove authentication succeeded. Without a
+                                // `--credential-probe-*` pair (see `Flags::credential_probe`) there
+                                // is nothing configured to `read_bound` against yet, so this is
+                                // deliberately the weakest claim the daemon can honestly make.
+                                tracing::info!(
+                                    "provider-credential owner bootstrap stream established (no \
+                                     probe configured; authentication unconfirmed)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "provider-credential owner bootstrap connect failed");
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::info!(
+                            "no provider-credential bootstrap frame received; running with no credential owner"
+                        );
+                    }
+                },
+            }
+        });
+    }
+
     // The fleet hub is HTTP-only; grpc paths 404. Warn once when grpc is selected + export is on.
     if otel_cfg.enabled && otel_cfg.protocol == "grpc" {
         tracing::warn!(
@@ -1049,8 +1106,33 @@ struct Flags {
     no_store: bool,
     /// `--no-color`: disable the banner's ANSI color.
     no_color: bool,
+    /// `--credential-bootstrap` (STUDIO-981/P0c, Rhapsody-only, no Go parity): only the real
+    /// desktop supervisor ever passes this. It tells the daemon to read the one bootstrap frame
+    /// from stdin and, if one arrives, connect to the authenticated provider-credential channel.
+    /// Every existing/hermetic daemon test omits it, so their boot is byte-for-byte unchanged; a
+    /// bare CLI invocation (or a confused-deputy process launching this same binary directly) also
+    /// omits it and gets no credential owner, by construction.
+    credential_bootstrap: bool,
+    /// `--credential-probe-account` / `--credential-probe-binding` (STUDIO-981/P0c, Rhapsody-only):
+    /// only meaningful alongside `--credential-bootstrap`. The real desktop supervisor does not
+    /// wire the actual socket-server spawn call yet (see README's "Wiring the socket server into
+    /// the real supervisor spawn call" note), so there is no config-driven provider account for the
+    /// daemon to resolve at boot today — these two flags let `credential_bootstrap_e2e.rs` tell the
+    /// freshly spawned real daemon binary which account/binding to run one real
+    /// authenticate-then-`read_bound` round trip against, so the acceptance evidence is a genuine
+    /// read over a real signed binary, not merely a successful `connect`. PB7 replaces this with
+    /// per-dispatch resolution through the same `resolve_credential` call.
+    credential_probe: Option<CredentialProbe>,
     /// The positional WORKFLOW.md path (default `WORKFLOW.md`).
     path: PathBuf,
+}
+
+/// The account + expected binding `--credential-probe-account`/`--credential-probe-binding` parse
+/// into; see [`Flags::credential_probe`].
+#[derive(Clone)]
+struct CredentialProbe {
+    account: String,
+    binding: rhapsody_credential_ipc::domain::Binding,
 }
 
 /// Parses the daemon flags, mirroring Go's `flag.FlagSet` (`--port` / `--db` take a value, either
@@ -1064,8 +1146,12 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         db: String::new(),
         no_store: false,
         no_color: false,
+        credential_bootstrap: false,
+        credential_probe: None,
         path: PathBuf::from("WORKFLOW.md"),
     };
+    let mut probe_account: Option<String> = None;
+    let mut probe_binding_json: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -1095,6 +1181,25 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         match name {
             "no-store" => f.no_store = parse_bool_flag(inline, "no-store")?,
             "no-color" => f.no_color = parse_bool_flag(inline, "no-color")?,
+            "credential-bootstrap" => {
+                f.credential_bootstrap = parse_bool_flag(inline, "credential-bootstrap")?
+            }
+            "credential-probe-account" => {
+                probe_account = Some(take_value(
+                    inline,
+                    args,
+                    &mut i,
+                    "credential-probe-account",
+                )?)
+            }
+            "credential-probe-binding" => {
+                probe_binding_json = Some(take_value(
+                    inline,
+                    args,
+                    &mut i,
+                    "credential-probe-binding",
+                )?)
+            }
             "port" => {
                 let v = take_value(inline, args, &mut i, "port")?;
                 f.port = v
@@ -1105,6 +1210,33 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             other => return Err(format!("flag provided but not defined: -{other}")),
         }
         i += 1;
+    }
+    f.credential_probe = match (probe_account, probe_binding_json) {
+        (Some(account), Some(binding_json)) => {
+            let binding = serde_json::from_str(&binding_json).map_err(|e| {
+                format!("invalid value {binding_json:?} for flag -credential-probe-binding: {e}")
+            })?;
+            Some(CredentialProbe { account, binding })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                "-credential-probe-account and -credential-probe-binding must be given together"
+                    .to_string(),
+            );
+        }
+    };
+    // A probe with no `--credential-bootstrap` is unreachable dead configuration, not a silently
+    // ignored no-op: the boot task that would ever read `credential_probe` only spawns when
+    // `credential_bootstrap` is set (see `run`'s `if flags.credential_bootstrap` block). Refusing
+    // this combination outright follows the same "refuse unsupported/unmeasured combinations with
+    // a typed, actionable reason" rule the rest of this ticket's design follows, rather than
+    // accepting flags that quietly do nothing (jimmy's review of rhapsody#213, N5).
+    if f.credential_probe.is_some() && !f.credential_bootstrap {
+        return Err(
+            "-credential-probe-account/-credential-probe-binding require -credential-bootstrap"
+                .to_string(),
+        );
     }
     Ok(f)
 }
@@ -2046,6 +2178,8 @@ mod tests {
             db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
+            credential_probe: None,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
@@ -2173,6 +2307,8 @@ mod tests {
             db: String::new(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
+            credential_probe: None,
             port: 0,
             path: PathBuf::from("WORKFLOW.md"),
         };
@@ -2232,6 +2368,8 @@ mod tests {
             db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
             no_store: false,
             no_color: false,
+            credential_bootstrap: false,
+            credential_probe: None,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
@@ -2698,6 +2836,77 @@ mod tests {
         assert!(
             parse_flags(&["--port".into(), "abc".into()]).is_err(),
             "non-numeric port must error"
+        );
+    }
+
+    // N5 (jimmy's review of rhapsody#213): the new `--credential-probe-*` flags' error paths had no
+    // test coverage.
+    #[test]
+    fn credential_probe_flag_semantics() {
+        let valid_binding = r#"{"provider_id":"p","adapter":"a","base_url":"https://example"}"#;
+
+        // Neither flag: fine, no probe configured.
+        let f = parse_flags(&["--credential-bootstrap".into()]).expect("neither flag");
+        assert!(f.credential_probe.is_none());
+
+        // Both flags, well-formed: parses into a probe.
+        let f = parse_flags(&[
+            "--credential-bootstrap".into(),
+            "--credential-probe-account".into(),
+            "v1:p".into(),
+            "--credential-probe-binding".into(),
+            valid_binding.into(),
+        ])
+        .expect("both flags well-formed");
+        let probe = f.credential_probe.expect("probe present");
+        assert_eq!(probe.account, "v1:p");
+        assert_eq!(probe.binding.provider_id, "p");
+
+        // Only one of the pair: must error, not silently configure a partial/default probe.
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+            ])
+            .is_err(),
+            "account without binding must error"
+        );
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-binding".into(),
+                valid_binding.into(),
+            ])
+            .is_err(),
+            "binding without account must error"
+        );
+
+        // Malformed binding JSON: must error, not silently produce a default/empty Binding.
+        assert!(
+            parse_flags(&[
+                "--credential-bootstrap".into(),
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+                "--credential-probe-binding".into(),
+                "not json".into(),
+            ])
+            .is_err(),
+            "malformed binding JSON must error"
+        );
+
+        // Both flags well-formed but WITHOUT --credential-bootstrap: refused outright rather than
+        // silently accepted and ignored (the flags would be dead configuration otherwise — see
+        // `parse_flags`'s validation).
+        assert!(
+            parse_flags(&[
+                "--credential-probe-account".into(),
+                "v1:p".into(),
+                "--credential-probe-binding".into(),
+                valid_binding.into(),
+            ])
+            .is_err(),
+            "a probe without --credential-bootstrap must error"
         );
     }
 
