@@ -264,9 +264,10 @@ pub(crate) const IMPLEMENTED_BACKENDS: &[&str] = &["claude", "opencode"];
 /// Whether THIS build can actually run `name` — the membership test `spawn_worker` makes against
 /// a resolved project's runner pool (built from [`IMPLEMENTED_BACKENDS`]) when a teammate profile
 /// names a harness (STUDIO-902). Exposed so `rhapsodyd teams show` can report a harness the
-/// dispatcher would silently fall back from, rather than printing it as though it would run
-/// (STUDIO-903). `""` is not implemented on purpose: an empty harness means "inherit
-/// `agent.backend`", which dispatch resolves before it ever asks this question.
+/// dispatcher would REFUSE, rather than printing it as though it would run (STUDIO-903; the refusal
+/// replaced the old silent fall back in STUDIO-978). `""` is not implemented on purpose: an empty
+/// harness means "inherit `agent.backend`", which dispatch resolves before it ever asks this
+/// question.
 pub fn harness_is_implemented(name: &str) -> bool {
     IMPLEMENTED_BACKENDS.contains(&name)
 }
@@ -488,10 +489,11 @@ fn stall_timeout_ms_for(cfg: &Config, backend: &str) -> Option<i64> {
 /// 300000, so this changes nothing until an operator tunes one — which is exactly the operator who
 /// would be misled.
 ///
-/// An unrecognized harness name yields `None`, the same skip-don't-refuse posture
-/// `Loop::spawn_worker` takes when a profile names a harness this build has no runner for: the run
-/// is still perfectly runnable on the default, so it keeps the default's liveness window rather than
-/// losing stall detection to a typo.
+/// An unrecognized harness name yields `None`, which leaves the config's own timeout in force. That
+/// is now moot for such a run: `spawn_worker` REFUSES a profile naming a harness this build cannot
+/// run (STUDIO-978), so it never reaches a turn and never stalls. The `None` is kept as the honest
+/// "this build has no timeout knob for that name" answer rather than reinstating the old
+/// skip-don't-refuse assumption that the run would proceed on the default.
 pub(crate) fn stall_timeout_for_harness(cfg: &Config, harness: &str) -> Option<Duration> {
     if harness.is_empty() || harness == cfg.agent.backend {
         return None;

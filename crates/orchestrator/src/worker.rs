@@ -359,9 +359,10 @@ pub async fn run_agent_attempt(
     }
     let needs = WorkRequirements {
         team_tools: deps.mcp_enabled,
-        // A run whose turn budget is exactly one can never reach turn 2, so it does not need
-        // continuation. Every default installation runs many turns.
-        multi_turn: deps.max_turns != 1,
+        // A run whose turn budget cannot reach turn 2 does not need continuation. The turn loop
+        // starts at 1 and ends when `turn >= max_turns`, so a budget of 0 or a negative one also
+        // ends on the FIRST turn — `> 1` is the honest test, and the default budget is 20.
+        multi_turn: deps.max_turns > 1,
         // Sandbox enforcement is not a daemon-side requirement today; the coupled mcp+sandbox rule
         // is exercised by the validator's own tests and by any future adapter that couples them.
         sandbox: false,
@@ -1100,11 +1101,11 @@ mod tests {
     }
 
     /// STUDIO-978: a profile naming a harness this build has no runner for is a TYPED REFUSAL, not a
-    /// fall back. `harness_refusal` is what `spawn_worker` stamps; the worker must turn it into the
-    /// run's failure without starting a session, and the reason must name the harness.
-    ///
-    /// MUTATION GUARD: restore the STUDIO-902 fall back (warn and dispatch on the default) and the
-    /// `start_calls() == 0` assertion reds.
+    /// fall back. This is the WORKER-level unit test: it drives the flag `spawn_worker` stamps by
+    /// hand to prove `run_agent_attempt` turns it into the run's failure without starting a session.
+    /// The end-to-end guard that `spawn_worker` ITSELF stamps it lives in
+    /// `teams.rs::spawn_worker_refuses_an_unimplemented_harness_without_starting_a_session`, which
+    /// clears the recorder seam and launches the real worker.
     #[tokio::test]
     async fn an_unimplemented_harness_is_refused_not_fallen_back_from() {
         let ag = fake_agent(vec![succeeded_turn()]);

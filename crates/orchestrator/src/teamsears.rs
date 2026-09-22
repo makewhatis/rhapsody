@@ -1370,10 +1370,11 @@ async fn file_review(
         .or_else(|| {
             // The off-loop triage task holds no `Orchestrator`, so it cannot ask the live harness
             // question `reviewer_exclusions` answers; a required reviewer is pinned here as long as
-            // it is a roster member and not the author. That is safe rather than lossy: a pin whose
-            // profile names a harness this build cannot run falls back to `agent.backend` and still
-            // reviews, and the one reason a reviewer is removed from selection entirely — the
-            // ticketless `review.model` refusal — cannot arise here, because `review_model_for`
+            // it is a roster member and not the author. ⚠️ STUDIO-978 removed the old safety
+            // argument for this: a pin whose profile names a harness this build cannot run is now
+            // REFUSED at dispatch rather than falling back to `agent.backend`, and this path cannot
+            // see that. The one reason a reviewer is removed from selection entirely that CANNOT
+            // arise here is the ticketless `review.model` refusal, because `review_model_for`
             // self-gates on `review_ticketless` and `validate` makes `quorum.enabled` and
             // `mode: ticketless` mutually exclusive, so this path never runs on a config where
             // that refusal exists.

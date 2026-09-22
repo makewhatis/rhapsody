@@ -2669,17 +2669,21 @@ impl Orchestrator {
         load: &LoadSnapshot,
     ) -> Option<String> {
         let teams = self.teams.as_ref()?;
+        // `rank_reviewers` only ever names roster members, so `peers` is the whole filter — a
+        // teammate at their `max_concurrent` is a candidate like any other (D2).
+        let exclusions = self.reviewer_exclusions(teams);
         let incumbent = row.key.reviewer.as_str();
         if row.author.trim().is_empty() {
             // Roster membership, and deliberately NOT capacity (D2): a reviewer who has left the
             // roster since the row was written has no identity left to dispatch under, which is a
-            // reason to defer that survives. Being at their implementation cap is not.
+            // reason to defer that survives. Being at their implementation cap is not. An identity
+            // whose dispatch would be REFUSED is deferred for the same reason a refuse cannot
+            // become a review (STUDIO-978): handing it the round would only dispatch a run that
+            // records failed and never completes.
             let on_roster = teams.roster.iter().any(|i| i.name == incumbent);
-            return on_roster.then(|| incumbent.to_string());
+            return (on_roster && !exclusions.unselectable.contains(incumbent))
+                .then(|| incumbent.to_string());
         }
-        // `rank_reviewers` only ever names roster members, so `peers` is the whole filter — a
-        // teammate at their `max_concurrent` is a candidate like any other (D2).
-        let exclusions = self.reviewer_exclusions(teams);
         let candidates: Vec<String> =
             crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts(), &exclusions)
                 .into_iter()
@@ -2701,10 +2705,10 @@ impl Orchestrator {
         // is byte-identical to before the feature).
         //
         // "Required" here is the EFFECTIVE pin set, not the configured list: a required name the
-        // ranking never promoted — off the roster, the author, `unpinnable` — is not a reviewer this
-        // round yields to, so it must not evict the incumbent either. Reading the raw list made an
-        // unpinnable pin break continuity for a teammate the ranking never selected, handing the
-        // round to whoever merely led on load (round 3).
+        // ranking never promoted — off the roster, the author, `unselectable` — is not a reviewer
+        // this round yields to, so it must not evict the incumbent either. Reading the raw list made
+        // an unselectable pin break continuity for a teammate the ranking never selected, handing
+        // the round to whoever merely led on load (round 3).
         if !row.last_reviewed_sha.is_empty() && candidates.iter().any(|name| name == incumbent) {
             let pinned =
                 crate::quorum::pinned_required_reviewers(teams, row.author.trim(), &exclusions);
@@ -5731,9 +5735,9 @@ mod tests {
 
     /// STUDIO-951 / round 3: continuity yields only to a required reviewer who is **actually
     /// pinned**. `sol` is required but its profile names a harness this build cannot run, so
-    /// `rank_reviewers` drops it from the pinned prefix and keeps it a plain ranked candidate — a
-    /// name the guard must not treat as a pin. Reading the raw config list instead evicts the
-    /// incumbent for a teammate the ranking never promoted, and the round goes to whoever merely
+    /// `rank_reviewers` drops it from the pinned prefix (and, since STUDIO-978, from the ranked fill
+    /// too) — a name the guard must not treat as a pin. Reading the raw config list instead evicts
+    /// the incumbent for a teammate the ranking never promoted, and the round goes to whoever merely
     /// leads on load: neither the incumbent nor the pin.
     ///
     /// `bob` is loaded and `carol` is idle, so with continuity broken the load leader `carol` wins;
@@ -5742,7 +5746,7 @@ mod tests {
     /// Mutation check: read `teams.review_required()` instead of the effective pinned set and this
     /// goes red with `carol`.
     #[test]
-    fn an_unpinnable_required_reviewer_does_not_break_continuity() {
+    fn an_unselectable_required_reviewer_does_not_break_continuity() {
         let dir = crate::testsupport::TempDir::new();
         write_profile(
             &dir,
@@ -5771,7 +5775,7 @@ mod tests {
         assert_eq!(
             reviewers_of(&dispatched),
             vec!["bob".to_string()],
-            "an unpinnable required reviewer must not evict the incumbent"
+            "an unselectable required reviewer must not evict the incumbent"
         );
     }
 

@@ -59,7 +59,7 @@ use crate::retry::{DispatchRoute, EvRetry, EvWorkerExit};
 use crate::select::TaggedIssue;
 use crate::snapshot::{RefreshResult, Snapshot};
 use crate::stop::{ControlHandle, ResumePlan, StopPlan};
-use crate::worker::{WorkerDeps, run_agent_attempt};
+use crate::worker::{WorkerDeps, WorkerError, run_agent_attempt};
 use crate::workspace_gc::WorkspaceGcPlan;
 
 /// A set-once cancellation trigger — the Rust stand-in for a cancelable `context.Context`'s
@@ -1627,6 +1627,10 @@ impl Orchestrator {
                 res = run => res,
                 _ = cancel.cancelled() => (iss.state.clone(), false, None),
             };
+            // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
+            // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
+            // succeed, and the failure backoff would loop forever.
+            let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
             let exit = EvWorkerExit {
                 issue_id,
                 failed: err.is_some(),
@@ -1634,6 +1638,7 @@ impl Orchestrator {
                 err_msg: err.map(|e| e.to_string()).unwrap_or_default(),
                 last_state: final_state,
                 declared_handoff: declared,
+                refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
@@ -1920,6 +1925,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: String::new(),
                 declared_handoff: false,
+                refused: false,
             }));
         }));
         (o, spawned)
