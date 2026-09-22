@@ -443,6 +443,12 @@ impl Orchestrator {
             // divergence for one grace period while `gh` still refuses the coordinate — a delay of
             // the same page, which is why this is the smaller harm, not a harm-free choice.
             self.review_watch_unreadable.remove(&dismissed);
+            // ...and the observed-head memo (STUDIO-1005 review round 1), keyed by coordinate for
+            // the same reason: left behind it would leak one entry per dismissed pull request, and a
+            // later reintroduction of the same coordinate would transiently inherit the previous
+            // watch lifecycle's head — which the reconciliation sweep would read as a supersession
+            // of a fresh escalation until the rotating watcher reached it.
+            self.review_observed_head.remove(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
@@ -1397,6 +1403,44 @@ mod tests {
         assert!(
             !o.review_watch_unreadable.contains_key(&pr()),
             "so must the unreadability record, whatever casing the operator typed"
+        );
+    }
+
+    /// STUDIO-1005 (round 1, sol's blocking 2): a dismissal forgets the observed-head memo too,
+    /// keyed by the MATCHED ROW's coordinate for the unreadability record's reason above. Left
+    /// behind it would leak one entry per dismissed pull request, and a later reintroduction of the
+    /// same coordinate would transiently inherit the previous watch lifecycle's head — which the
+    /// reconciliation sweep would read as a supersession of a fresh escalation until the rotating
+    /// watcher reached it.
+    ///
+    /// Mutation check: drop the `review_observed_head.remove(&dismissed)` in
+    /// `handle_review_dismiss` and this reds.
+    #[test]
+    fn a_dismissal_forgets_the_observed_head() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        // Keyed by the store row's coordinate, casing and all; the operator's own spelling is
+        // unnormalized, so the removal must use the matched row's coordinate, not the request's.
+        o.review_observed_head.insert(
+            pr(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
+        assert!(
+            o.review_observed_head.contains_key(&pr()),
+            "precondition: the watcher recorded the head it observed"
+        );
+
+        let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
+        assert_eq!(
+            o.handle_review_dismiss(&typed),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            !o.review_observed_head.contains_key(&pr()),
+            "a dismissed pull request must not keep the head memo a reintroduction could inherit"
         );
     }
 

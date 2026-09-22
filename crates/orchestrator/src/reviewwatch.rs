@@ -1148,24 +1148,45 @@ impl Orchestrator {
         // Keeping the clear below the read left a recovering pull request's failure count standing
         // on the tick it answered, so a later single failure would deny a hold GitHub had just
         // confirmed.
+        //
+        // STUDIO-1005 (review round 1): the observed-head memo follows the same rule, and for a
+        // sharper reason. The memo is the reconciliation sweep's only local record that an
+        // escalation's recorded head is no longer the branch's head. Recording it BELOW the store
+        // read left it stale whenever that read failed: a real advance went unrecorded, so the sweep
+        // kept presenting a superseded escalation as current; and a stale memo could outlive its
+        // head, so a reverse move (a force-push back) falsely marked a current escalation
+        // superseded. The head GitHub just reported is a fact about the PULL REQUEST, not about the
+        // local read, so it is recorded here from the answer itself.
         for obs in observed {
             self.review_watch_unreadable.remove(&obs.pr);
-            // STUDIO-988: remember the last observed head/open state so a REVIEW preparation
-            // completion can be revalidated before it reviews a commit the sweep has since seen
-            // move (or a pull request it has since seen close).
-            self.review_observed_heads.insert(
-                obs.pr.to_string(),
-                match &obs.lookup {
-                    PrLookup::Found(snap) => crate::prepare::ReviewHeadObservation {
-                        open: snap.status == PrStatus::Open,
-                        head: snap.head_sha.clone(),
-                    },
-                    PrLookup::Gone | PrLookup::Untrusted => crate::prepare::ReviewHeadObservation {
-                        open: false,
-                        head: String::new(),
-                    },
-                },
-            );
+            // STUDIO-1005 (review round 1): the observed-head memo is written from the answer itself,
+            // "answered ⇒ memo reflects the answer". STUDIO-988 extends the recorded value with the
+            // open flag so a REVIEW preparation completion can be revalidated against the last
+            // observed head/open state before it reviews a commit the sweep has since seen move (or a
+            // pull request it has since seen close).
+            match &obs.lookup {
+                // An OPEN or merged/closed `Found` with a head: the current head to compare an
+                // escalation against (STUDIO-1005) and, for STUDIO-988, whether it is still open.
+                // (A retired pull request's entry is removed by `retire_review_pr` below; recording
+                // it here first is harmless and keeps the "answered ⇒ memo reflects the answer" rule
+                // unconditional.)
+                PrLookup::Found(snap) if !snap.head_sha.is_empty() => {
+                    self.review_observed_head.insert(
+                        obs.pr.clone(),
+                        crate::prepare::ReviewHeadObservation {
+                            open: snap.status == PrStatus::Open,
+                            head: snap.head_sha.clone(),
+                        },
+                    );
+                }
+                // A `Found` naming no head, `Gone`, or `Untrusted`: the coordinate has no current
+                // head the sweep may compare against. Clear rather than keep an older head — an
+                // empty `current_head` is "unknown" and renders exactly as before the feature, while
+                // a lingering head could falsely supersede a current escalation.
+                _ => {
+                    self.review_observed_head.remove(&obs.pr);
+                }
+            }
         }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
@@ -1253,6 +1274,10 @@ impl Orchestrator {
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
+                    // The observed-head memo for this coordinate was already updated above the store
+                    // read (STUDIO-1005), so a failed local read cannot leave the reconciliation
+                    // sweep comparing against a stale head.
+                    //
                     // STUDIO-962: a finished run's pull request left in draft gets its author
                     // poked, once per head, before the review dispatch below — the two are
                     // independent and a draft may still owe a round.
@@ -1935,6 +1960,10 @@ impl Orchestrator {
         // still an ANSWER); relying on that caller's ordering would make this function silently
         // incomplete if the loop were ever reordered.
         self.review_watch_unreadable.remove(pr);
+        // And the observed-head memo (STUDIO-1005): a coordinate that left the watch set has no
+        // current head to compare an escalation against, and leaving the entry would grow this map
+        // for the daemon's whole life.
+        self.review_observed_head.remove(pr);
         for id in retired_ids {
             self.review_unassignable.remove(&id);
             // A round cannot be held for capacity once its pull request has left the watch set
@@ -3107,6 +3136,7 @@ mod tests {
 
     use rhapsody_config::teams::{Identity, Review, ReviewMode};
     use rhapsody_core::LinkedPRRef;
+    use rhapsody_store as rs;
     use rhapsody_store::{
         REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_TRUNCATED, ReviewWatchKey,
         Sqlite, StorePath,
@@ -3322,6 +3352,233 @@ mod tests {
         (o, dispatched)
     }
 
+    /// A store that ANSWERS every read except `load_live_review_watch`, which fails — the local
+    /// read failure STUDIO-1005's ordering fix is about. Delegates everything else to [`rs::Noop`].
+    ///
+    /// The watcher's whole decision wedges on this read, so a test can reach the observation-side
+    /// work that must happen regardless of it (the observed-head memo) and nothing else.
+    struct FailingLiveWatchStore(rs::Noop);
+
+    impl rs::Store for FailingLiveWatchStore {
+        fn load_live_review_watch(&self) -> Result<Vec<rs::ReviewWatchRow>, rs::StoreError> {
+            Err(rs::StoreError::Disabled)
+        }
+        fn start_run(&self, r: rs::RunStart) -> Result<i64, rs::StoreError> {
+            self.0.start_run(r)
+        }
+        fn end_run(&self, run_id: i64, e: rs::RunEnd) -> Result<(), rs::StoreError> {
+            self.0.end_run(run_id, e)
+        }
+        fn update_run_progress(
+            &self,
+            run_id: i64,
+            p: rs::RunProgress,
+        ) -> Result<(), rs::StoreError> {
+            self.0.update_run_progress(run_id, p)
+        }
+        fn append_events(&self, run_id: i64, ev: &[rs::EventRow]) -> Result<(), rs::StoreError> {
+            self.0.append_events(run_id, ev)
+        }
+        fn save_retry(&self, r: rs::RetryRow) -> Result<(), rs::StoreError> {
+            self.0.save_retry(r)
+        }
+        fn delete_retry(&self, issue_id: &str) -> Result<(), rs::StoreError> {
+            self.0.delete_retry(issue_id)
+        }
+        fn save_claim(
+            &self,
+            issue_id: &str,
+            state: &str,
+            project_slug: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.save_claim(issue_id, state, project_slug)
+        }
+        fn delete_claim(&self, issue_id: &str) -> Result<(), rs::StoreError> {
+            self.0.delete_claim(issue_id)
+        }
+        fn load_recovery(&self) -> Result<rs::Recovery, rs::StoreError> {
+            self.0.load_recovery()
+        }
+        fn mark_running_interrupted(&self) -> Result<i64, rs::StoreError> {
+            self.0.mark_running_interrupted()
+        }
+        fn save_totals(&self, t: rs::Totals) -> Result<(), rs::StoreError> {
+            self.0.save_totals(t)
+        }
+        fn load_totals(&self) -> Result<rs::Totals, rs::StoreError> {
+            self.0.load_totals()
+        }
+        fn list_runs(&self, f: rs::RunFilter) -> Result<Vec<rs::RunSummary>, rs::StoreError> {
+            self.0.list_runs(f)
+        }
+        fn list_issue_runs(&self, f: rs::RunFilter) -> Result<Vec<rs::RunSummary>, rs::StoreError> {
+            self.0.list_issue_runs(f)
+        }
+        fn day_totals(&self, since: &str, now: &str) -> Result<rs::DayTotals, rs::StoreError> {
+            self.0.day_totals(since, now)
+        }
+        fn issue_history(
+            &self,
+            identifier: &str,
+            project: &str,
+            limit: i64,
+        ) -> Result<Vec<rs::RunSummary>, rs::StoreError> {
+            self.0.issue_history(identifier, project, limit)
+        }
+        fn runs_for_issues(
+            &self,
+            identifiers: &[String],
+            limit: i64,
+        ) -> Result<Vec<rs::RunSummary>, rs::StoreError> {
+            self.0.runs_for_issues(identifiers, limit)
+        }
+        fn get_run(&self, run_id: i64) -> Result<Option<rs::RunSummary>, rs::StoreError> {
+            self.0.get_run(run_id)
+        }
+        fn run_events(&self, run_id: i64) -> Result<Vec<rs::EventRow>, rs::StoreError> {
+            self.0.run_events(run_id)
+        }
+        fn search_events(&self, q: rs::EventQuery) -> Result<Vec<rs::EventHit>, rs::StoreError> {
+            self.0.search_events(q)
+        }
+        fn earliest_run_start(&self) -> Result<Option<String>, rs::StoreError> {
+            self.0.earliest_run_start()
+        }
+        fn metrics(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rs::DayRollup>, rs::StoreError> {
+            self.0.metrics(since_days, project)
+        }
+        fn metrics_by_provider(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rs::DayProviderRollup>, rs::StoreError> {
+            self.0.metrics_by_provider(since_days, project)
+        }
+        fn set_run_provenance(
+            &self,
+            run_id: i64,
+            p: &rs::RunProvenance,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_run_provenance(run_id, p)
+        }
+        fn run_provenance(&self, run_id: i64) -> Result<Option<rs::RunProvenance>, rs::StoreError> {
+            self.0.run_provenance(run_id)
+        }
+        fn load_run_provenances(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, rs::RunProvenance>, rs::StoreError> {
+            self.0.load_run_provenances(run_ids)
+        }
+        fn tokens_by_provider(
+            &self,
+            since: &str,
+        ) -> Result<Vec<rs::ProviderTokens>, rs::StoreError> {
+            self.0.tokens_by_provider(since)
+        }
+        fn run_costs(&self) -> Result<Vec<rs::RunCostBucket>, rs::StoreError> {
+            self.0.run_costs()
+        }
+        fn insert_run_message(
+            &self,
+            run_id: i64,
+            body: &str,
+            created_at_ms: i64,
+        ) -> Result<i64, rs::StoreError> {
+            self.0.insert_run_message(run_id, body, created_at_ms)
+        }
+        fn mark_oldest_run_message_delivered(
+            &self,
+            run_id: i64,
+            turn: i64,
+        ) -> Result<(), rs::StoreError> {
+            self.0.mark_oldest_run_message_delivered(run_id, turn)
+        }
+        fn expire_run_messages(&self, run_id: i64) -> Result<(), rs::StoreError> {
+            self.0.expire_run_messages(run_id)
+        }
+        fn list_run_messages(&self, run_id: i64) -> Result<Vec<rs::RunMessage>, rs::StoreError> {
+            self.0.list_run_messages(run_id)
+        }
+        fn save_review_watch(&self, w: rs::ReviewWatchRow) -> Result<(), rs::StoreError> {
+            self.0.save_review_watch(w)
+        }
+        fn mark_review_requested(
+            &self,
+            key: &rs::ReviewWatchKey,
+            sha: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.mark_review_requested(key, sha)
+        }
+        fn mark_review_completed(
+            &self,
+            key: &rs::ReviewWatchKey,
+            sha: &str,
+            status: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.mark_review_completed(key, sha, status)
+        }
+        fn mark_review_truncated(&self, key: &rs::ReviewWatchKey) -> Result<(), rs::StoreError> {
+            self.0.mark_review_truncated(key)
+        }
+        fn drop_review_watch(&self, key: &rs::ReviewWatchKey) -> Result<(), rs::StoreError> {
+            self.0.drop_review_watch(key)
+        }
+        fn get_review_watch(
+            &self,
+            key: &rs::ReviewWatchKey,
+        ) -> Result<Option<rs::ReviewWatchRow>, rs::StoreError> {
+            self.0.get_review_watch(key)
+        }
+        fn find_review_watch(
+            &self,
+            key: &rs::ReviewWatchKey,
+        ) -> Result<Option<rs::ReviewWatchRow>, rs::StoreError> {
+            self.0.find_review_watch(key)
+        }
+        fn load_review_watch(&self) -> Result<Vec<rs::ReviewWatchRow>, rs::StoreError> {
+            self.0.load_review_watch()
+        }
+        fn record_summon_watermark(&self, w: rs::SummonWatermark) -> Result<(), rs::StoreError> {
+            self.0.record_summon_watermark(w)
+        }
+        fn summon_watermark(
+            &self,
+            identifier: &str,
+        ) -> Result<Option<rs::SummonWatermark>, rs::StoreError> {
+            self.0.summon_watermark(identifier)
+        }
+        fn set_review_rounds(&self, pr: &str, dispatches: i64) -> Result<(), rs::StoreError> {
+            self.0.set_review_rounds(pr, dispatches)
+        }
+        fn record_review_adjudication(
+            &self,
+            pr: &str,
+            adjudication: &rs::ReviewAdjudication,
+        ) -> Result<(), rs::StoreError> {
+            self.0.record_review_adjudication(pr, adjudication)
+        }
+        fn clear_review_adjudication(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.clear_review_adjudication(pr)
+        }
+        fn clear_review_bound(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.clear_review_bound(pr)
+        }
+        fn load_review_bounds(&self) -> Result<Vec<rs::ReviewBoundRow>, rs::StoreError> {
+            self.0.load_review_bounds()
+        }
+        fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
+            self.0.prune(retention_days)
+        }
+        fn close(&self) -> Result<(), rs::StoreError> {
+            self.0.close()
+        }
+    }
+
     fn key(number: i64, reviewer: &str) -> ReviewWatchKey {
         ReviewWatchKey {
             owner: OWNER.to_string(),
@@ -3528,6 +3785,112 @@ mod tests {
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// STUDIO-1005: the watcher remembers the head it OBSERVED, not merely the one it dispatched
+    /// against. This is the escalation surface's only local record that the branch has moved — an
+    /// escalation deliberately stops arming rounds, so a push past it never advances `requested_sha`
+    /// or `last_reviewed_sha`, and without this memo the reconciliation sweep could not tell the
+    /// operator their reason had become a snapshot.
+    #[test]
+    fn the_watcher_records_the_head_it_observes() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
+            Some(HEAD_A),
+            "the observed head is recorded"
+        );
+
+        // The author pushes: the memo follows the branch even though the loop may be stopped.
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
+            Some(HEAD_B),
+            "a later observation updates the memo"
+        );
+
+        // A pull request that leaves the watch set forgets its head, so the map does not grow. It is
+        // retired through a MERGED `Found` deliberately: the pre-read loop records the merged head
+        // FIRST (the memo rule is unconditional on the answer), and `retire_review_pr` is the only
+        // thing that clears it again — the commonest way a pull request leaves the watch set is a
+        // merge, and without that one removal every merged pull request would leak a memo entry for
+        // the daemon's whole life. Retiring through `Gone` would clear the memo in the pre-read loop
+        // instead, pinning nothing about `retire_review_pr`.
+        o.handle_review_sweep(&[observed(12, merged_at(HEAD_B))]);
+        assert!(
+            !o.review_observed_head.contains_key(&coord(12)),
+            "a retired pull request carries no current head"
+        );
+    }
+
+    /// STUDIO-1005 (round 1, sol's blocking 1): the observed-head memo follows the ANSWER, not the
+    /// store. `handle_review_sweep_slots` reads the watch set once and a failed local read hands
+    /// back without deciding anything — but the head GitHub just reported is a fact about the pull
+    /// request, not about the read, so it must be recorded anyway. Before the fix the memo was
+    /// updated BELOW the read: a failed read left the previous head standing, so a real advance went
+    /// unrecorded (the sweep kept presenting a superseded escalation as current) and a stale memo
+    /// could falsely mark a current escalation superseded after a reverse move.
+    ///
+    /// Mutation: move the memo update back below the `load_live_review_watch` read and BOTH
+    /// directions red.
+    #[test]
+    fn an_answered_observation_updates_the_head_memo_despite_a_failed_watch_read() {
+        let (mut o, _) = orch_on(
+            ticketless(&["alice", "bob"]),
+            Arc::new(FailingLiveWatchStore(rs::Noop)),
+        );
+
+        // Direction A -> B: the advance must be recorded even though the watch read fails.
+        o.review_observed_head.insert(
+            coord(12),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
+            Some(HEAD_B),
+            "an answered observation must update the memo without the store read succeeding"
+        );
+
+        // Direction B -> A: the reverse move must be recorded too, or a fresh escalation is judged
+        // against the stale head and can be falsely marked superseded.
+        o.review_observed_head.insert(
+            coord(12),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_B.to_string(),
+            },
+        );
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
+            Some(HEAD_A),
+            "a reverse move must not leave a stale head standing"
+        );
+
+        // An observation that names NO head (here `Gone`) must clear the memo: a lingering head
+        // would falsely supersede a current escalation. The store read above still fails, so the
+        // early return means `retire_review_pr` never runs — only the pre-read `_` arm can clear it,
+        // which is what this asserts.
+        o.handle_review_sweep(&[observed(12, PrLookup::Gone)]);
+        assert!(
+            !o.review_observed_head.contains_key(&coord(12)),
+            "an observation carrying no head clears the memo"
+        );
     }
 
     // --- STUDIO-960: a head move that carried no new work -------------------------------------

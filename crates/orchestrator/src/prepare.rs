@@ -1026,17 +1026,19 @@ impl Orchestrator {
                 PreparedValidity::Current
             }
             PreparedTarget::Review { run, .. } => {
-                let coord = format!("{}/{}#{}", run.owner, run.repo, run.number);
-                match self.review_observed_heads.get(&coord) {
+                let coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+                match self.review_observed_head.get(&coord) {
                     // The last observation agrees: the pull request is open at the same head.
                     Some(observed) if observed.open && observed.head == run.head_sha => {
                         PreparedValidity::Current
                     }
-                    // Observed closed/gone or at a different head: the review is stale.
+                    // Observed closed or at a different head: the review is stale.
                     Some(_) => PreparedValidity::Stale,
-                    // Never observed since boot: cannot disprove it, and the watcher re-offers every
-                    // sweep, so allow it rather than deadlock a legitimate first review.
-                    None => PreparedValidity::Current,
+                    // No observation: the sweep removed the entry (gone, untrusted, no head, or a
+                    // dismissed/retired pull request), so there is nothing current to review. A
+                    // preparation only begins after its own sweep observed the pull request, so an
+                    // absent entry here means the answer was withdrawn, not merely unseen.
+                    None => PreparedValidity::Stale,
                 }
             }
         }
@@ -3221,8 +3223,8 @@ mod tests {
         };
         let route = sample_route();
         // The sweep observed the pull request at a DIFFERENT head after the reservation began.
-        o.review_observed_heads.insert(
-            format!("{}/{}#{}", run.owner, run.repo, run.number),
+        o.review_observed_head.insert(
+            crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number),
             ReviewHeadObservation {
                 open: true,
                 head: "def".to_string(),
@@ -3247,6 +3249,44 @@ mod tests {
         assert!(
             sink.lock().expect("dispatch sink").is_empty(),
             "a review whose head moved must not run against the stale commit"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    // MUTATION GUARD: fail OPEN when the sweep has withdrawn its observation (the pull request was
+    // dismissed, retired, or reported with no head) and a review runs against work that no longer
+    // exists — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_review_with_no_current_observation_drops_the_completion() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        let run = crate::review::ReviewRun {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            reviewer: "alice".to_string(),
+            head_sha: "abc".to_string(),
+            ..Default::default()
+        };
+        // No entry for the coordinate: the sweep removed it (gone / dismissed / no head).
+        let target = PreparedTarget::Review {
+            issue: run.synthetic_issue(),
+            run: Box::new(run.clone()),
+            route: sample_route(),
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o
+            .preparing
+            .get(&run.key())
+            .map(|e| e.token)
+            .expect("review reservation");
+        o.handle_dispatch_prepared(run.key(), token, ready_completion())
+            .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a review with no current observation must not dispatch"
         );
         assert!(o.preparing.is_empty());
     }

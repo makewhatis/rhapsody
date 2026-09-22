@@ -347,8 +347,16 @@ pub struct Divergence {
     pub capacity_unreadable: Option<u32>,
     /// The head the manager stopped at — only meaningful for [`DivergenceKind::ReviewEscalated`],
     /// `""` otherwise. Read by [`Orchestrator::set_review_divergences`] to name where the loop
-    /// stopped, never rendered onto `/api/v1/state`.
+    /// stopped. Rendered onto `/api/v1/state` ONLY when the escalation is SUPERSEDED, so a
+    /// still-current escalation keeps the row shape it had before STUDIO-1005.
     pub adjudicated_head: String,
+    /// The head the review watcher most recently OBSERVED for this pull request, or `""` when no
+    /// observation is available (STUDIO-1005). Filled in from
+    /// [`Orchestrator::review_observed_head`] for a [`DivergenceKind::ReviewEscalated`] row; `""`
+    /// for every other kind. When it differs from [`Divergence::adjudicated_head`] the escalation is
+    /// SUPERSEDED — its reason was computed against a head the branch no longer carries — and the
+    /// operator must be told so. See [`Divergence::superseded`] and [`Divergence::supersession`].
+    pub current_head: String,
     /// How many review↔author rounds the loop ran before the escalation — `0` for every kind but
     /// [`DivergenceKind::ReviewEscalated`]. Rendered onto the escalation log line, not the wire.
     pub rounds: usize,
@@ -357,9 +365,47 @@ pub struct Divergence {
     pub findings: Vec<String>,
     /// The manager's OWN words for an escalation — empty for every kind but
     /// [`DivergenceKind::ReviewEscalated`]. Read by [`Orchestrator::set_review_divergences`] so the
-    /// WARN carries the reason rather than only the room post and the pull-request comment; like
-    /// [`Divergence::adjudicated_head`] it is not rendered onto `/api/v1/state`.
+    /// WARN carries the reason rather than only the room post and the pull-request comment. Rendered
+    /// onto `/api/v1/state` only when the escalation is SUPERSEDED (STUDIO-1005): a superseded row
+    /// shows the manager's reason beside the supersession notice, so the operator can see the text
+    /// they must not act on as current fact.
     pub reason: String,
+}
+
+impl Divergence {
+    /// Whether this escalation's reason is no longer known to describe the current head
+    /// (STUDIO-1005).
+    ///
+    /// True only for a [`DivergenceKind::ReviewEscalated`] whose recorded
+    /// [`Divergence::adjudicated_head`] is non-empty and differs from an OBSERVED
+    /// [`Divergence::current_head`]. A missing observation (`current_head` empty) is "unknown", not
+    /// "stale": the ticket forbids claiming staleness the daemon cannot stand behind, and this is the
+    /// direction that renders exactly as before the feature existed. A moved head is a signal that
+    /// the text MAY be stale, never a verdict that the findings were addressed — a merge, a
+    /// CHANGELOG bump or a force-push all move the head without touching a finding.
+    pub fn superseded(&self) -> bool {
+        self.kind == DivergenceKind::ReviewEscalated
+            && !self.adjudicated_head.is_empty()
+            && !self.current_head.is_empty()
+            && self.current_head != self.adjudicated_head
+    }
+
+    /// The operator-facing supersession sentence, or `None` when the escalation is not superseded.
+    ///
+    /// Deliberately states only what the daemon knows: the head the reason was computed at and the
+    /// head the branch now carries. It does NOT claim the findings were fixed — the signal is "this
+    /// text may be stale", not "this text is wrong" — and it does not count commits, because a local
+    /// string comparison cannot honestly answer that without a `git`/`gh` call the sweep may not make.
+    pub fn supersession(&self) -> Option<String> {
+        self.superseded().then(|| {
+            format!(
+                "This escalation was computed at head `{}`; the branch has since moved to `{}`, so \
+                 these findings may already be addressed — treat the manager's reason as evidence, \
+                 not a verdict.",
+                self.adjudicated_head, self.current_head
+            )
+        })
+    }
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -500,6 +546,7 @@ pub(crate) fn reconcile_pr(
                 // (which has the per-coordinate count [`reconcile_pr`] deliberately does not).
                 capacity_unreadable: None,
                 adjudicated_head: String::new(),
+                current_head: String::new(),
                 rounds: 0,
                 findings: Vec::new(),
                 reason: String::new(),
@@ -536,6 +583,7 @@ fn row_divergence(
         capacity_held: row.capacity_held,
         capacity_unreadable: row.capacity_unreadable,
         adjudicated_head: String::new(),
+        current_head: String::new(),
         rounds: 0,
         findings: Vec::new(),
         reason: String::new(),
@@ -881,6 +929,13 @@ impl Orchestrator {
                         capacity_held: None,
                         capacity_unreadable: None,
                         adjudicated_head: head,
+                        // STUDIO-1005: the head the watcher last observed. `""` until it has
+                        // observed this pull request, which renders exactly as before this ticket.
+                        current_head: self
+                            .review_observed_head
+                            .get(pr)
+                            .map(|o| o.head.clone())
+                            .unwrap_or_default(),
                         rounds,
                         findings,
                         reason,
@@ -915,6 +970,9 @@ impl Orchestrator {
                             capacity_held: None,
                             capacity_unreadable: None,
                             adjudicated_head: head,
+                            // A ship is not an escalation's reason, so it carries no observed head
+                            // (STUDIO-1005): the supersession notice is the escalation surface's.
+                            current_head: String::new(),
                             rounds,
                             findings: Vec::new(),
                             reason: String::new(),
@@ -950,6 +1008,7 @@ impl Orchestrator {
                             capacity_held: None,
                             capacity_unreadable: None,
                             adjudicated_head: String::new(),
+                            current_head: String::new(),
                             rounds: 0,
                             findings: Vec::new(),
                             reason: String::new(),
@@ -1102,13 +1161,17 @@ impl Orchestrator {
         // the same false page on the second sweep. The count is deliberately NOT compared, only its
         // presence: it climbs on every failed lookup, so comparing the number would make every
         // outage sweep a transition and defeat the rate limit.
-        let previous: HashMap<&str, (Option<CapacityHold>, bool)> = self
+        let previous: HashMap<&str, (Option<CapacityHold>, bool, bool)> = self
             .review_divergence
             .iter()
             .map(|d| {
                 (
                     d.pr.as_str(),
-                    (d.capacity_held, d.capacity_unreadable.is_some()),
+                    (
+                        d.capacity_held,
+                        d.capacity_unreadable.is_some(),
+                        d.superseded(),
+                    ),
                 )
             })
             .collect();
@@ -1126,12 +1189,19 @@ impl Orchestrator {
             // re-stamped when the rotating cursor next evaluates the pull request, not every sweep,
             // so comparing it would log a rotation as a transition and defeat the rate limit; the
             // unreadable count is likewise reduced to presence for the same reason.
-            let (prev_hold, prev_unreadable) = previous
+            let (prev_hold, prev_unreadable, prev_superseded) = previous
                 .get(d.pr.as_str())
                 .copied()
-                .unwrap_or((None, false));
+                .unwrap_or((None, false, false));
+            // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
+            // annotations' reason one paragraph up: the head move is the news, and waiting out the
+            // steady-state rate limit would leave the log repeating "still unaddressed" for a full
+            // `RECONCILE_LOG_EVERY` window after the branch moved. Presence only — `current_head`
+            // can change again without the superseded FACT changing, and comparing the SHA would
+            // make every push a logged transition.
             let annotation_changed = !same_capacity(prev_hold, d.capacity_held)
-                || prev_unreadable != d.capacity_unreadable.is_some();
+                || prev_unreadable != d.capacity_unreadable.is_some()
+                || prev_superseded != d.superseded();
             // The crossing sweep, an annotation transition, and the rate-limited repeats in ONE
             // condition: at the crossing the count is 1, and `1 - 1` is a multiple of everything.
             if annotation_changed || (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
@@ -1186,6 +1256,20 @@ impl Orchestrator {
                             d.findings.join("; ")
                         }
                     );
+                    // STUDIO-1005: when the watcher has seen the branch move past the head the
+                    // escalation was computed at, say so ON THE LINE THAT CARRIES THE REASON — the
+                    // same defect one surface over. The operator reading "still unaddressed" must not
+                    // have to infer that the text is a snapshot; the log is the third place this
+                    // reason reaches a human after the room post and the pull-request comment.
+                    if let Some(note) = d.supersession() {
+                        tracing::warn!(
+                            pr = %d.pr,
+                            adjudicated_head = %d.adjudicated_head,
+                            current_head = %d.current_head,
+                            "review reconciliation: the escalation above is SUPERSEDED — {}",
+                            note
+                        );
+                    }
                     continue;
                 }
                 // STUDIO-956's decider: the manager SHIPPED the loop and the merge gate still holds
@@ -2165,7 +2249,11 @@ mod store_tests {
     };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
-    const HEAD: &str = "c0a54eb0000000000000000000000000000000000";
+    const HEAD: &str = "c0a54eb000000000000000000000000000000000";
+    /// A head well past [`HEAD`] — the incident's current head, full-length like every head the
+    /// watcher records, so the fixtures cannot pass by comparing two DIFFERENT abbreviation lengths
+    /// (which would render every escalation permanently superseded).
+    const HEAD_PUSHED: &str = "b02fc72000000000000000000000000000000000";
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -3354,6 +3442,328 @@ mod store_tests {
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
+    }
+
+    /// Records an ESCALATE at `head` for PR #164 with the incident's own reason text, so a test can
+    /// seed the watcher's observed-head memo beside it and watch the supersession follow.
+    fn escalated_at(o: &mut Orchestrator, head: &str) {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Escalate {
+                head: head.to_string(),
+                rounds: 3,
+                findings: vec!["alice asked for changes at 0052489".to_string()],
+                reason: "sol's REQUEST CHANGES at 0052489 is still unaddressed".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+    }
+
+    /// **STUDIO-1005 acceptance: the #210 replay.** An escalation's reason is a snapshot written
+    /// once and never revalidated; when the author pushes past the head it was computed at, the
+    /// sweep must say so — and must compare against the head the WATCHER OBSERVED, not the
+    /// reviewer's `last_reviewed_sha`. In this fixture the escalation's head IS the reviewed head
+    /// (the author pushed since, and the loop is stopped so nothing advanced `last_reviewed_sha`),
+    /// so comparing against `last_reviewed_sha` would read as still-current and the operator would
+    /// act on findings the author already addressed.
+    ///
+    /// MUTATION (the ticket's ⚠️): compare `adjudicated_head` against the watch row's
+    /// `last_reviewed_sha` instead of `review_observed_head`, and the `superseded` assertion reds.
+    #[test]
+    fn a_superseded_escalation_is_reported_with_both_heads() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005"); // last_reviewed_sha == HEAD, and stays there
+        escalated_at(o, HEAD);
+        // The watcher observed a head that is NOT the escalation's: the author pushed after it.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "a superseded escalation must NOT be dropped — the push may be unrelated: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ReviewEscalated);
+        assert!(
+            found[0].superseded(),
+            "a head move past the escalation's head marks it stale"
+        );
+        assert_eq!(found[0].adjudicated_head, HEAD);
+        assert_eq!(found[0].current_head, HEAD_PUSHED);
+        assert_eq!(
+            found[0].reason, "sol's REQUEST CHANGES at 0052489 is still unaddressed",
+            "the manager's own reason is still reported — as evidence, not silently deleted"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = &rendered["review_divergence"][0];
+        assert_eq!(row["superseded"], true);
+        assert_eq!(row["adjudicated_head"], HEAD);
+        assert_eq!(row["current_head"], HEAD_PUSHED);
+        assert_eq!(
+            row["reason"],
+            "sol's REQUEST CHANGES at 0052489 is still unaddressed"
+        );
+        assert_eq!(
+            row["findings"][0], "alice asked for changes at 0052489",
+            "the stale findings travel with the reason"
+        );
+        let note = row["supersession"].as_str().unwrap_or_default();
+        assert!(
+            note.contains(HEAD) && note.contains(HEAD_PUSHED),
+            "the notice must name both heads so the operator can see the snapshot moved, got: {note}"
+        );
+
+        // MINIMUM move: the incident's head jump is large, but the sweep compares two SHA strings
+        // and has no commit count — it cannot obtain one without the `gh` call
+        // `the_reconciliation_sweep_makes_no_network_call` forbids — so "moved by more than one
+        // commit" is not a rule this code can express. The smallest difference a local comparison
+        // can see is a single character, and it must mark supersession exactly the same. (The two
+        // heads are equal-length SHA-1 strings, syntactic fixtures only: no commit-graph distance is
+        // claimed, which a fabricated hash could not carry.)
+        let one_char_later = {
+            let mut h = HEAD.to_string();
+            h.replace_range(7..8, "1");
+            h
+        };
+        assert_eq!(one_char_later.len(), HEAD.len());
+        assert_eq!(
+            HEAD.chars()
+                .zip(one_char_later.chars())
+                .filter(|(a, b)| a != b)
+                .count(),
+            1,
+            "this case is the minimal one: equal length, one differing character"
+        );
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: one_char_later.clone(),
+            },
+        );
+        o.reconcile_review_divergence();
+        let minimal = o.review_divergences();
+        assert_eq!(
+            minimal.len(),
+            1,
+            "a one-character move must not drop it either"
+        );
+        assert!(
+            minimal[0].superseded(),
+            "a one-character head move must still mark the escalation superseded"
+        );
+        assert_eq!(minimal[0].current_head, one_char_later);
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            rendered["review_divergence"][0]["superseded"], true,
+            "the minimal move must reach the wire, not only the struct"
+        );
+    }
+
+    /// A supersession APPEARING is its own log transition: the sweep that learns the head moved
+    /// says so at once rather than waiting out `RECONCILE_LOG_EVERY` (~30 min), which would leave the
+    /// log repeating "still unaddressed" long after the branch moved.
+    ///
+    /// MUTATION: drop `prev_superseded != d.superseded()` from `annotation_changed` and the second
+    /// sweep logs nothing, so this reds.
+    #[test]
+    fn a_newly_superseded_escalation_logs_on_the_sweep_that_learns_it() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        o.review_observed_head.insert(
+            pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD.to_string(),
+            },
+        );
+
+        // First sweep: the escalation is current.
+        o.reconcile_review_divergence();
+        assert!(!o.review_divergences()[0].superseded());
+
+        // The author pushes. The very NEXT sweep must log the supersession, not wait for the
+        // steady-state rate limit.
+        o.review_observed_head.insert(
+            pr,
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
+        );
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "WARN" && e.message.contains("SUPERSEDED")),
+            "the sweep that learns the head moved must log it, got: {events:?}"
+        );
+    }
+
+    /// **STUDIO-1005 acceptance: an escalation whose head has NOT moved adds NOTHING to the wire
+    /// row.** This is the ticket's last acceptance and it is deliberately a test that passes against
+    /// BOTH the old and the new code: it asserts the row's exact key set, referencing none of the
+    /// supersession fields, so the pre-ticket implementation produces the same object.
+    #[test]
+    fn an_escalation_at_the_current_head_renders_byte_identically_to_today() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        // The watcher observed exactly the head the escalation was computed at: no supersession.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD.to_string(),
+            },
+        );
+
+        o.reconcile_review_divergence();
+        assert!(
+            !o.review_divergences()[0].superseded(),
+            "the head has not moved, so the escalation is current"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = rendered["review_divergence"][0]
+            .as_object()
+            .expect("a review_divergence row is an object");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["detail", "kind", "pr", "reviewer", "stale_secs", "ticket",],
+            "a still-current escalation must carry today's fields and no supersession annotation, \
+             got: {row:?}"
+        );
+        assert_eq!(row["kind"], "review_escalated");
+    }
+
+    /// **STUDIO-1005 acceptance: a MISSING observation is "unknown", not "stale".** The memo is empty
+    /// on every daemon restart until the rotating watcher reaches the pull request (it visits only
+    /// `MAX_PR_STATE_CALLS_PER_TICK` coordinates a tick), and immediately after the pre-read `_` arm
+    /// clears it for a `Gone`, `Untrusted` or headless `Found`. In that window `superseded()` must
+    /// stay false: an absent `current_head` is the daemon not knowing, never a claim that a current
+    /// escalation went stale — the safety promise carried by the `!self.current_head.is_empty()`
+    /// guard (see the `review_observed_head` doc in `orchestrator.rs`).
+    ///
+    /// MUTATION: delete that guard and this reds — an unobserved escalation becomes `superseded`
+    /// with an empty `current_head` on the console and in the WARN.
+    #[test]
+    fn an_unobserved_escalation_is_unknown_not_superseded() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, HEAD);
+        // No `review_observed_head` entry: the watcher has not reached this coordinate yet.
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "the live escalation is still reported");
+        assert!(
+            !found[0].superseded(),
+            "a missing observation is unknown, not stale"
+        );
+        assert_eq!(
+            found[0].current_head, "",
+            "no observation ⇒ no current head"
+        );
+
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        let row = rendered["review_divergence"][0]
+            .as_object()
+            .expect("a review_divergence row is an object");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["detail", "kind", "pr", "reviewer", "stale_secs", "ticket",],
+            "an unobserved escalation must carry today's fields and no supersession annotation, \
+             got: {row:?}"
+        );
+        assert_eq!(row["kind"], "review_escalated");
+    }
+
+    /// The companion guard: an escalation whose recorded head is EMPTY is not "superseded" either.
+    /// `head` is written together with `decision` in `rhapsody_review_bound`, so this is defensive —
+    /// but an empty `adjudicated_head` gives the comparison nothing to have moved FROM, and must
+    /// read as unknown rather than as a move to whatever the watcher happened to observe.
+    ///
+    /// MUTATION: delete `!self.adjudicated_head.is_empty()` and this reds.
+    #[test]
+    fn an_escalation_with_no_recorded_head_is_not_superseded() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        reviewed_row(o, "alice", "STUDIO-1005");
+        escalated_at(o, "");
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
+        );
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "the live escalation is still reported");
+        assert!(
+            !found[0].superseded(),
+            "an escalation with no recorded head cannot be called stale"
+        );
+        assert_eq!(found[0].adjudicated_head, "");
+    }
+
+    /// **STUDIO-1005 acceptance: the sweep stays local-only.** The reconciliation sweep runs on
+    /// `on_tick`, above the validate/drain/credential gates, and must never make a `gh`, tracker or
+    /// model call. This asserts it directly on the source, so a future edit that reaches for a
+    /// lookup to "refresh" the escalation's text reds here instead of shipping an agent run per tick.
+    ///
+    /// MUTATION (the ticket's ⚠️): introduce any of these calls into the sweep and this reds.
+    #[test]
+    fn the_reconciliation_sweep_makes_no_network_call() {
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/reviewreconcile.rs"
+        ))
+        .expect("read the sweep's own source");
+        // Scan only the module's production half. `read_to_string` would otherwise fold in this
+        // file's own `#[cfg(test)]` module, where a future test may legitimately need one of these
+        // tokens (e.g. a `Command::new` fixture) and would red here pointing at a test rather than
+        // the sweep. The `#[cfg(test)]` marker is where the production text ends.
+        let src = full
+            .split_once("#[cfg(test)]")
+            .map(|(prod, _)| prod)
+            .unwrap_or(&full);
+        // Assembled rather than written literally so the tokens do not appear in THIS test's own
+        // source and match themselves.
+        let tokens = [
+            format!(".pr_state{}", "("),
+            format!(".pr_state_unconditional{}", "("),
+            format!("sweep_pr_states{}", "("),
+            format!("Command::{}", "new"),
+            format!("req{}", "west"),
+            format!("run{}", "_turn"),
+            format!("post_pr{}", "_comment"),
+        ];
+        for token in tokens {
+            assert!(
+                !src.contains(token.as_str()),
+                "the reconciliation sweep must stay local-only; found `{token}`"
+            );
+        }
     }
 
     /// **A shipped pull request the merge gate cannot clear is REPORTED, not hidden.** A `ship`
