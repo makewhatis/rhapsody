@@ -1783,12 +1783,19 @@ impl Orchestrator {
     /// different head — i.e. once somebody has actually read what the author produced. Until then
     /// the exchange is incomplete and charges nothing.
     ///
-    /// **At most ONE pending round per standing head SET.** An author dispatched again while the
-    /// pull request still stands at the same heads — which is the routine shape while the reviewers
-    /// are queued, because a draft poke, a conflict route-back, a second reviewer's findings or a
-    /// human `@symphony` comment can each summon the author with no review completing in between —
-    /// is the SAME unfinished exchange, not a second one. Recording it once is what keeps a backlog
-    /// of dispatches from each charging a round as the queue later drains.
+    /// **At most ONE pending round per standing head SET, by containment.** An author dispatched
+    /// again while the pull request still stands at the same heads — which is the routine shape while
+    /// the reviewers are queued, because a draft poke, a conflict route-back, a second reviewer's
+    /// findings or a human `@symphony` comment can each summon the author with no review completing
+    /// in between — is the SAME unfinished exchange, not a second one. Recording it once is what
+    /// keeps a backlog of dispatches from each charging a round as the queue later drains.
+    ///
+    /// The dedup is by SET CONTAINMENT: a dispatch whose standing set introduces no head an
+    /// outstanding round had not already seen (a subset) is that same round. Equality alone is not
+    /// enough — a redundant dispatch against a stale sibling records a SUPERSET, and the following
+    /// dispatch against the reduced state records a subset of it; without containment the two would
+    /// both be charged by the two reviewers' verdicts at the SAME produced head, two rounds for one
+    /// exchange.
     ///
     /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
     /// run its review's findings bought is the loop's other half, so it costs the same as the review
@@ -1805,8 +1812,8 @@ impl Orchestrator {
     /// completion that answers the pending round and charges it. So an author amending in a loop is
     /// bounded exactly as before: one round per ANSWERED amendment, stopped by the threshold.
     ///
-    /// The writers that can summon the author with no review completing are NOT all one-shot, and a
-    /// maintainer reading an earlier draft of this comment would have believed they were:
+    /// The writers that can summon the author with no review completing are NOT all one-shot, and
+    /// the wording must say so rather than wave them away:
     /// - the draft poke fires again on each new head, but is independently capped by its own
     ///   [`crate::draftpoke::MAX_DRAFT_POKES`] ceiling;
     /// - a human `@symphony` comment is an external, human-driven event;
@@ -1849,13 +1856,19 @@ impl Orchestrator {
             if standing.is_empty() {
                 continue;
             }
-            // Deduplicated against the same standing head set: a second dispatch against an
-            // unanswered state is the SAME exchange (see the doc above).
+            // Deduplicated by SET CONTAINMENT, not equality: a dispatch that saw only heads an
+            // outstanding exchange had already seen (a SUBset) introduced nothing new, so it is that
+            // same exchange. Equality also collapses, since a set is contained in itself. Recording
+            // a subset as a second entry would let two reviewers' verdicts at the same produced head
+            // charge two rounds for one exchange.
             let pending = self
                 .author_rounds_pending
                 .entry(churn_key(&pr))
                 .or_default();
-            if !pending.iter().any(|base| base == &standing) {
+            if !pending
+                .iter()
+                .any(|base| standing.iter().all(|h| base.contains(h)))
+            {
                 pending.push(standing);
             }
         }
@@ -3022,10 +3035,11 @@ pub type ReviewRounds = HashMap<String, usize>;
 /// (STUDIO-1004), keyed by [`churn_key`] as [`ReviewRounds`] is. Each entry is the SET of heads the
 /// pull request STOOD AT when that round was recorded — every `requested_sha` and
 /// `last_reviewed_sha` its live rows carried, deduplicated and sorted — because the rows of one
-/// round disagree about `requested_sha` for a whole queue wait under review concurrency. At most one
-/// entry per distinct head set exists, so a repeated dispatch against an unanswered state adds
-/// nothing. A reviewer's verdict at a head OUTSIDE a set settles the oldest such entry (FIFO) and
-/// charges it; a verdict INSIDE the set read work a sibling was already reading and answers nothing.
+/// round disagree about `requested_sha` for a whole queue wait under review concurrency. A new
+/// dispatch recording a set CONTAINED IN an existing entry adds nothing (the same exchange seen with
+/// fewer heads), so a repeated dispatch against an unanswered state is one entry, not many. A
+/// reviewer's verdict at a head OUTSIDE a set settles the oldest such entry (FIFO) and charges it; a
+/// verdict INSIDE the set read work a sibling was already reading and answers nothing.
 /// See [`Orchestrator::note_author_round`] and [`Orchestrator::settle_author_round`].
 pub type PendingAuthorRounds = HashMap<String, Vec<Vec<String>>>;
 
@@ -6524,6 +6538,62 @@ mod tests {
         assert!(
             !o.author_round_budget_spent(&iss),
             "and must not escalate the pull request as if the author and reviewers disagreed"
+        );
+    }
+
+    /// **Round 3, the dedup must be by SET CONTAINMENT, not equality.** A dispatch recorded while a
+    /// stale sibling head is still in play sees a SUPERSET of every head an outstanding exchange
+    /// already saw; recording it as a second entry would then let two reviewers' verdicts at the
+    /// SAME produced head charge TWO rounds for ONE exchange — an over-escalation, the failure class
+    /// this ticket exists to end. A state that introduces no head the outstanding exchange had not
+    /// already seen is the SAME exchange, so a set contained in an existing one is not recorded.
+    ///
+    /// Mutation check: compare the sets for EQUALITY only, and this reds at `Some(4 * round)` —
+    /// bob's and carol's HEAD_C verdicts each charge one, for one exchange.
+    #[test]
+    fn a_redundant_dispatch_does_not_double_charge_the_next_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 8);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // Author dispatch #1 against HEAD_A.
+        o.note_author_round(&iss);
+        // The author pushes HEAD_B and bob picks it up; carol is still queued at HEAD_A, so a
+        // second, redundant dispatch (a human `@symphony`, say) records the superset {A, B}.
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("bob dispatched at the pushed head");
+        o.note_author_round(&iss);
+
+        // carol now reads HEAD_B too. Both reviewers at HEAD_B are ONE exchange, charged once.
+        o.store()
+            .mark_review_requested(&key(12, "carol"), HEAD_B)
+            .expect("carol dispatched at the pushed head");
+        complete(&mut o, 12, "bob", HEAD_B);
+        complete(&mut o, 12, "carol", HEAD_B);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus ONE answered HEAD_B exchange"
+        );
+
+        // The findings summon the author against HEAD_B. Both rows now stand at {B}, a subset of the
+        // outstanding {A, B}: the SAME exchange, so it must not be recorded a second time.
+        o.note_author_round(&iss);
+
+        // Both reviewers read HEAD_C, the head the author produced. ONE exchange, ONE round.
+        complete(&mut o, 12, "bob", HEAD_C);
+        complete(&mut o, 12, "carol", HEAD_C);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(3 * round)),
+            "one spent round, the answered HEAD_B exchange, and exactly ONE answered HEAD_C exchange"
         );
     }
 
