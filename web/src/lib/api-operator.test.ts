@@ -91,6 +91,17 @@ describe("operator-write guard contract (STUDIO-982)", () => {
     expect(OPERATOR_HEADER).toBe("X-Rhapsody-Operator");
   });
 
+  it("surfaces the daemon's refusal instead of swallowing it", async () => {
+    const refusal = { error: { code: "operator_write_forbidden", message: "refused by the guard" } };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(refusal), { status: 403 })),
+    );
+    await expect(postTeamsRoom("hello")).rejects.toThrow("refused by the guard");
+    await expect(stopRun(7)).rejects.toThrow("refused by the guard");
+    await expect(postRefresh()).rejects.toThrow("refresh failed: 403");
+  });
+
   // The inventory: no dashboard source sends a mutating method except through operatorPost, so a
   // new write cannot skip the header by calling fetch directly.
   it("operatorPost is the only place the dashboard sends a mutating method", () => {

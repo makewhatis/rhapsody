@@ -574,4 +574,25 @@ mod tests {
         assert!(seen[0].content_type.is_empty(), "{:?}", seen[0]);
         assert_eq!(seen[0].body, "");
     }
+
+    // A write the daemon's guard refuses surfaces its envelope code, so the agent sees why.
+    #[tokio::test]
+    async fn a_guard_refusal_surfaces_its_code() {
+        let router = Router::new().fallback(any(|| async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                [("Content-Type", "application/json")],
+                r#"{"error":{"code":"operator_write_forbidden","message":"refused"}}"#,
+            )
+        }));
+        let port = spawn_router(router).await;
+        let err = client_for_port(port)
+            .post_action("stop", "7")
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (err.code.as_str(), err.status),
+            ("operator_write_forbidden", 403)
+        );
+    }
 }

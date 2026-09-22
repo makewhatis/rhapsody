@@ -112,7 +112,9 @@ Linear/GitHub.
 
 Speakers: teammates (via `teams_post`), the **manager** (triage decisions, quorum
 notifications), and the **operator** (you) — via the Teams panel's compose box or
-`POST /api/v1/teams/room` with `{"body": "...", "refs": [...]}`. `operator` and `manager`
+`POST /api/v1/teams/room` with `{"body": "...", "refs": [...]}` (a write, so it needs the
+`X-Rhapsody-Operator: 1` header — see operating.md, "Calling a write endpoint yourself").
+`operator` and `manager`
 are reserved names; no roster entry may use them. Operator room posts are async context for
 the whole team; authoritative mid-run instructions to one live agent go through the operator
 message mailbox (`agent_send_message` / the run's message box) instead.
