@@ -235,7 +235,7 @@ mod tests {
     }
 
     async fn post(url: &str, body: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())

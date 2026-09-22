@@ -259,7 +259,7 @@ mod tests {
     }
 
     async fn do_action(url: &str, method: reqwest::Method) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .request(method, url)
             .send()
             .await

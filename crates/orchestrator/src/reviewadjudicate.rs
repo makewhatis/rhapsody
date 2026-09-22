@@ -117,6 +117,21 @@ pub struct ReviewAdjudicationPlan {
     /// findings or an approval. The manager names these on an escalation, so an operator gets the
     /// specific findings rather than "needs a human".
     pub findings: Vec<String>,
+    /// Whether a `ship` is AVAILABLE for this plan (STUDIO-977, C): true only when every required
+    /// reviewer has READ the change `head` carries — an `approved` verdict or a `reviewed` one
+    /// (findings) at `head` or at a head proven by patch-id to carry the same change. Decided on the
+    /// control task from the watch rows ([`crate::automerge::ship_available`]) — a manager must not
+    /// be able to ship a change nobody read, and making that structural rather than a turn-by-turn
+    /// judgement is the point: when this is false, [`perform_adjudication`] records an escalation
+    /// whatever the model answered. A `reviewed` row is READ, so it does NOT make `ship` unavailable
+    /// — adjudicating findings is the manager's job (STUDIO-956); whether a shipped pull request may
+    /// MERGE is the merge gate's, a separate question.
+    pub ship_available: bool,
+    /// Why `ship` was unavailable, when it was — the specific gate that failed, computed on the
+    /// control task ([`crate::automerge::AutoMergeRefusal::why`]). Empty when `ship_available` is
+    /// true. Carried so the escalation names the real reason ("a review round is still owed at this
+    /// head") rather than a false "nobody read it".
+    pub ship_unavailable_reason: String,
 }
 
 /// What the manager is asked, and the bounds it is asked under. The turn parameters mirror
@@ -215,8 +230,9 @@ impl Adjudication {
     /// stopped only while the branch still is, or is again, that head. A later head carrying new
     /// work is a head the manager never adjudicated: the code the verdict describes no longer
     /// exists on the branch, so the loop must resume. `unchanged_from` is STUDIO-960's proof that a
-    /// head move carried no new work — the diff against the base is byte-identical to the one the
-    /// verdict was made against — and a move that changed nothing does not re-open the decision.
+    /// head move carried no new work — the change against the base is the same (a patch-id
+    /// comparison, STUDIO-977) as the one the verdict was made against — and a move that changed
+    /// nothing does not re-open the decision.
     ///
     /// **The proof must cover the ADJUDICATED head, not merely any head.** `unchanged_from` lists
     /// individual historical reviewed SHAs whose patch matches the new head; it is not a PR-wide
@@ -572,6 +588,34 @@ pub async fn perform_adjudication(
         }
     };
 
+    // STUDIO-977 C, the structural half: `ship` is not available when not every required reviewer
+    // has READ the change at `head` (a still-owed round, no watch row at all, a status this daemon
+    // cannot read, or a verdict whose head was never proven the same). A manager that answers SHIP
+    // over a change nobody read would stop the loop on a head nobody has looked at — the deadlock
+    // `#209`/`#203` reached — so the answer is upgraded to an escalation here, where the two audit
+    // writes and the ledger cannot disagree about it. A `reviewed` row is READ and does NOT block a
+    // ship: the manager adjudicates findings, and the merge gate separately decides mergeability
+    // (STUDIO-956 preserved). This is deliberately NOT a judgement re-derived inside the prompt each
+    // turn, and the reason names the gate that actually failed rather than claiming nobody read it.
+    let verdict = match verdict {
+        Verdict::Ship if !plan.ship_available => {
+            let reason = if plan.ship_unavailable_reason.trim().is_empty() {
+                ship_unavailable_reason(&plan.head)
+            } else {
+                plan.ship_unavailable_reason.clone()
+            };
+            tracing::info!(
+                pr = %plan.pr,
+                head = %plan.head,
+                reason = %reason,
+                "review adjudication: the manager shipped, but approval-at-head does not hold for \
+                 this change; escalating to a human instead"
+            );
+            Verdict::Escalate { reason }
+        }
+        v => v,
+    };
+
     let body = decision_body(plan, &verdict);
     let adjudication = match verdict {
         Verdict::Ship => Adjudication::Ship {
@@ -830,6 +874,17 @@ fn snippet(s: &str) -> String {
     one.chars().take(160).collect()
 }
 
+/// Why a manager's `ship` became an escalation, used only when the plan carried no more specific
+/// reason: not every required reviewer has READ the change at `head`, so there is nothing a ship
+/// could stand in for (STUDIO-977, C).
+pub fn ship_unavailable_reason(head: &str) -> String {
+    format!(
+        "the manager shipped, but not every required reviewer has read the change at `{}`; a human \
+         must decide",
+        head.trim()
+    )
+}
+
 /// The human-readable decision, posted to the room and the pull request: which way it went, and why.
 ///
 /// The escalation names the head, the round count and every open finding — the ticket's third ⚠️.
@@ -931,6 +986,8 @@ mod tests {
         assert_eq!(adjudication_model(&teams, "claude"), "");
     }
 
+    /// A plan whose change every required reviewer has READ (`ship_available`), which is the
+    /// ordinary case this module's tests exercise. The unavailable case has its own plan and test.
     fn plan() -> ReviewAdjudicationPlan {
         ReviewAdjudicationPlan {
             pr: PrCoord::new("makewhatis", "rhapsody", 192),
@@ -940,6 +997,8 @@ mod tests {
                 "alice asked for changes at a324d2d".to_string(),
                 "bob asked for changes at c366a61".to_string(),
             ],
+            ship_available: true,
+            ship_unavailable_reason: String::new(),
         }
     }
 
@@ -1515,6 +1574,52 @@ mod tests {
                 rounds: 3,
             })
         );
+    }
+
+    /// **Acceptance (STUDIO-977, C).** `ship` is NOT available when the change is unread — the model
+    /// may answer SHIP, but the daemon records an ESCALATE, so a stopped loop over a head nobody has
+    /// read can never masquerade as a decision. The escalation goes through the same two audit writes
+    /// as any other, and names the gate that actually failed.
+    ///
+    /// MUTATION: drop the `ship_available` upgrade and this reds — the ledger holds a `Ship`.
+    #[tokio::test]
+    async fn a_ship_over_an_unread_change_escalates_instead() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = ReviewAdjudicationPlan {
+            ship_available: false,
+            ship_unavailable_reason: "the manager shipped, but not every required reviewer has \
+                                      read the change at `be260a6` (a review round is still owed \
+                                      at this head); a human must decide"
+                .to_string(),
+            ..plan()
+        };
+        let deps = deps(
+            Arc::new(FixedVerdict(Verdict::Ship)),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+
+        assert!(
+            room.0.lock().unwrap()[0].body.contains("escalate"),
+            "the room post says it went that way"
+        );
+        assert!(comments.0.lock().unwrap()[0].3.contains("escalate"));
+        match ledger.peek(&plan.pr) {
+            Some(Adjudication::Escalate { head, reason, .. }) => {
+                assert_eq!(head, plan.head);
+                assert!(
+                    reason.contains("not every required reviewer has read")
+                        && reason.contains("a review round is still owed"),
+                    "the reason names the gate that failed, not a blanket 'unread': {reason}"
+                );
+            }
+            other => panic!("expected a settled escalation, got {other:?}"),
+        }
     }
 
     /// **A turn that can never succeed escalates through the SAME audit path as a real decision.**
