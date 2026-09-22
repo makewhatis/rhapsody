@@ -1051,6 +1051,63 @@ mod tests {
         );
     }
 
+    // STUDIO-988 review round 5 (alice A): a zero-turn `refused` row must not count as "the last run
+    // a summons has to beat", or the refusal hides the very summons that should re-offer the reopen
+    // (the STUDIO-649 loss). The reopen fixtures cannot see this: their summons is dated 2030 while
+    // the refusal row is dated now, so the row never post-dates it. Here the refusal lands AFTER the
+    // summons, in the production ordering.
+    //
+    // MUTATION GUARD: drop the `OUTCOME_REFUSED` skip in `last_run_started_at` and this reds.
+    #[test]
+    fn a_refused_row_does_not_hide_a_newer_summons_from_a_reopen() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        let store = o.store();
+        // An ordinary run that ended BEFORE the summons.
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "A-1".to_string(),
+                started_at: "2029-01-01T00:00:00Z".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        store
+            .end_run(run, rhapsody_store::RunEnd::default())
+            .expect("end run");
+        // A zero-turn refusal recorded AFTER the summons.
+        let refused = store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "A-1".to_string(),
+                started_at: "2029-06-15T00:00:00Z".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start refused run");
+        store
+            .end_run(
+                refused,
+                rhapsody_store::RunEnd {
+                    outcome: rhapsody_store::OUTCOME_REFUSED.to_string(),
+                    ..rhapsody_store::RunEnd::default()
+                },
+            )
+            .expect("end refused run");
+
+        let iss = Issue {
+            id: "1".into(),
+            identifier: "A-1".into(),
+            team_id: "team-1".into(),
+            state: "In Review".into(),
+            latest_summon_at: Some(Utc.with_ymd_and_hms(2029, 6, 1, 0, 0, 0).unwrap()),
+            ..Default::default()
+        };
+        assert!(
+            o.review_reopen_eligible(&iss, &HashSet::new()),
+            "a refusal row must not hide the newer summons that re-offers the reopen"
+        );
+    }
+
     // STUDIO-949 acceptance: a ticket WITHOUT the label behaves identically to today. Written
     // against `eligible()`'s bool ONLY — the exact call the pre-STUDIO-949 code answered — so it
     // compiles and passes against both the old and the new implementation.

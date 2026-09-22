@@ -198,6 +198,18 @@ impl Orchestrator {
                     );
                     continue;
                 }
+                // STUDIO-988 review round 5 (alice #1): a REFUSED reopen stays in its review state
+                // (the promote is deferred to acceptance), so `review_reopen_eligible` keeps this
+                // branch live every tick. It must skip a gate-suppressed candidate BEFORE reserving
+                // the slot, exactly as the active branch below does — otherwise one refused reopen
+                // holds the only slot and starves the queue behind it for the whole gate window.
+                if self.preparation_suppressed(&iss, None) {
+                    tracing::debug!(
+                        issue_identifier = %iss.identifier,
+                        "skipping reopen: suppressed by the refusal gate until its next probe"
+                    );
+                    continue;
+                }
                 let pst = normalize_state(&eff.review_promote_state);
                 if count(&state_counts, &pst)
                     >= state_limit(
@@ -551,6 +563,24 @@ impl Orchestrator {
                     tracing::info!(
                         issue_identifier = %ti.iss.identifier,
                         "skipping dispatch: the pull request's shared review↔author round budget is spent"
+                    );
+                    continue;
+                }
+                // STUDIO-988 review round 5 (alice #1): see the single-project ladder. The reopen
+                // path spends the global, per-project and promote-state budgets below, so a
+                // suppressed reopen must be skipped FIRST — with the SAME route `promote_and_dispatch`
+                // will resolve from the project index, or the gate keys would not agree.
+                let reopen_route = DispatchRoute {
+                    slug: p.slug.clone(),
+                    group: p.group.clone(),
+                    repo: p.repo.clone(),
+                    model: p.model.clone(),
+                    workspace_mode: p.workspace_mode.clone(),
+                };
+                if self.preparation_suppressed(&ti.iss, Some(&reopen_route)) {
+                    tracing::debug!(
+                        issue_identifier = %ti.iss.identifier,
+                        "skipping reopen: suppressed by the refusal gate until its next probe"
                     );
                     continue;
                 }
@@ -1439,6 +1469,88 @@ mod tests {
         let held = o.human_holds.held();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-988 review round 5 (alice #1): a REFUSED reopen stays in its review state (the promote
+    // is deferred to acceptance), so this ladder re-enters the reopen branch every tick. Before the
+    // fix the branch reserved the only slot BEFORE `begin_preparation` could report `Suppressed`, so
+    // one refused reopen starved an eligible lower-priority Todo behind it for the whole gate window.
+    //
+    // MUTATION GUARD: drop the `preparation_suppressed` skip from the single-project reopen branch
+    // and this reds with `active=[] reopen=["A-1"]`.
+    #[test]
+    fn a_refused_reopen_does_not_spend_the_only_slot() {
+        use crate::prepare::ticket_gate_key;
+        use crate::testsupport::HangResolver;
+        let mut o = orch_for_reopen("A-1");
+        o.eff.as_mut().expect("eff").max_concurrent = 1;
+        o.now = Box::new(|| Utc.with_ymd_and_hms(2030, 6, 1, 0, 0, 0).unwrap());
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        // The higher-priority review ticket, and a gate entry for exactly its (identity, selection).
+        let mut review = summoned_review_issue(false);
+        review.priority = Some(1);
+        o.refusal_gate.record(
+            &ticket_gate_key(&review, None),
+            "credential_absent",
+            "",
+            (o.now)(),
+        );
+        let mut low = issue("2", "A-2", "Todo");
+        low.priority = Some(3);
+
+        let (active, reopen, _) = o.select_dispatch_with_reopens(vec![review, low]);
+        assert!(
+            reopen.is_empty(),
+            "a gate-suppressed reopen must not reserve the only slot"
+        );
+        assert_eq!(active.len(), 1, "the slot frees for the next candidate");
+        assert_eq!(active[0].identifier, "A-2");
+    }
+
+    // The SAME starvation on the ladder a `projects:` install actually runs (STUDIO-988 review round
+    // 5, alice #1). MUTATION GUARD: drop the multi-project reopen branch's skip and this reds while
+    // the single-project test above still passes.
+    #[test]
+    fn a_refused_reopen_does_not_spend_the_only_slot_in_the_multi_project_ladder() {
+        use crate::prepare::ticket_gate_key;
+        use crate::testsupport::HangResolver;
+        let mut projects = vec![proj("a", 10, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let mut o = orch_for_multi(1, projects, None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+        o.now = Box::new(|| Utc.with_ymd_and_hms(2030, 6, 1, 0, 0, 0).unwrap());
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+
+        let mut review = summoned_review_issue(false);
+        review.priority = Some(1);
+        let route = o.route_for(Some(0));
+        o.refusal_gate.record(
+            &ticket_gate_key(&review, route.as_ref()),
+            "credential_absent",
+            "",
+            (o.now)(),
+        );
+        let mut low = issue("2", "A-2", "Todo");
+        low.priority = Some(3);
+
+        let (picked, reopen, _) =
+            o.select_dispatch_multi_with_reopens(tag_for(0, vec![review, low]));
+        assert!(
+            reopen.is_empty(),
+            "the multi-project ladder must skip a gate-suppressed reopen before reserving the only slot"
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].iss.identifier, "A-2");
     }
 
     // STUDIO-949 round 4: the review-state branch is the THIRD site of the class round 3 fixed at the

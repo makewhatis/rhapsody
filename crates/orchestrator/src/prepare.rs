@@ -931,22 +931,39 @@ impl Orchestrator {
             }
             return;
         }
-        // A completion whose credential revision is not the one the loop currently expects is
-        // stale: a credential mutation advanced the loop's revision while this resolver read the
-        // old one, so its result must not become a session (STUDIO-988 review round 4, sol #3). The
-        // check is inert in P6 (no provider subsystem ⇒ `None`), and PB7 advances the field on a
-        // mutation which `abandon_prepared` re-parks/releases exactly as any supersession.
-        if let Some(expected) = self.prepare_expected_revision.clone()
-            && completion.observed_revision != expected
-        {
-            tracing::info!(
-                id = %id,
-                "prepared completion carries a stale credential revision; dropping it"
-            );
-            if let Some(entry) = self.preparing.take(&id) {
-                self.abandon_prepared(entry, AbandonCause::Superseded);
+        // A completion whose credential revision is not the one the loop currently expects is stale:
+        // a credential mutation advanced the loop's revision while this resolver read the old one, so
+        // its result must not become a session (STUDIO-988 review round 4, sol #3). The check is inert
+        // in P6 (no provider subsystem ⇒ `None`), and PB7 advances the field on a mutation which
+        // `abandon_prepared` re-parks/releases exactly as any supersession.
+        //
+        // Two refinements from STUDIO-988 review round 5 (sol #1 / alice C): a typed timeout/failure
+        // that never reached a credential carries an EMPTY observed revision, so it must NOT be read
+        // as a mismatch — otherwise a hung resolver would never arm its gate and the same locked
+        // credential would be re-probed every tick. And a READY completion's move-only payload must
+        // carry the expected revision AND agree with the envelope that delivered it, so a stale
+        // payload cannot ride a fresh-looking envelope (or vice versa) into a session.
+        if let Some(expected) = self.prepare_expected_revision.as_deref() {
+            let stale = match &completion.outcome {
+                PreparationOutcome::Ready(prepared) => {
+                    prepared.credential_revision != expected
+                        || completion.observed_revision != prepared.credential_revision
+                }
+                PreparationOutcome::Refused(_) => {
+                    !completion.observed_revision.is_empty()
+                        && completion.observed_revision != expected
+                }
+            };
+            if stale {
+                tracing::info!(
+                    id = %id,
+                    "prepared completion carries a stale credential revision; dropping it"
+                );
+                if let Some(entry) = self.preparing.take(&id) {
+                    self.abandon_prepared(entry, AbandonCause::Superseded);
+                }
+                return;
             }
-            return;
         }
         // Revalidate current eligibility: an armed drain defers without refusing (the work may be
         // re-offered after the drain), and a live run/claim means this completion is moot.
@@ -3515,6 +3532,68 @@ mod tests {
         assert!(o.preparing.is_empty());
     }
 
+    // STUDIO-988 review round 5 (sol #2): the review guard's real contract is EVENT ORDER — a
+    // watcher observation that lands BETWEEN begin and completion must drop the completion. The two
+    // tests above seed the memo before `begin_preparation`, so neither exercises that ordering.
+    //
+    // MUTATION GUARD: accept a review completion without re-reading the memo, or read it only at
+    // begin, and this reds for both the external-close and external-push observations.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_review_observation_landing_after_begin_drops_the_completion() {
+        for (open, head, why) in [
+            (false, "abc", "an external close"),
+            (true, "def", "an external push"),
+        ] {
+            let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+            let run = crate::review::ReviewRun {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                number: 7,
+                reviewer: "alice".to_string(),
+                head_sha: "abc".to_string(),
+                ..Default::default()
+            };
+            let coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+            // The sweep observed the pull request open at this head BEFORE the reservation.
+            o.review_observed_head.insert(
+                coord.clone(),
+                ReviewHeadObservation {
+                    open: true,
+                    head: "abc".to_string(),
+                },
+            );
+            let target = PreparedTarget::Review {
+                issue: run.synthetic_issue(),
+                run: Box::new(run.clone()),
+                route: sample_route(),
+            };
+            assert!(matches!(
+                o.begin_preparation(target, false),
+                BeginPreparation::Started(_)
+            ));
+            // The next watcher hand-back lands while the preparation is in flight.
+            o.review_observed_head.insert(
+                coord,
+                ReviewHeadObservation {
+                    open,
+                    head: head.to_string(),
+                },
+            );
+            let token = o
+                .preparing
+                .get(&run.key())
+                .map(|e| e.token)
+                .expect("review reservation");
+            o.handle_dispatch_prepared(run.key(), token, ready_completion())
+                .await;
+            assert!(
+                sink.lock().expect("dispatch sink").is_empty(),
+                "a review whose state changed after begin must not dispatch ({why})"
+            );
+            assert!(o.preparing.is_empty());
+        }
+    }
+
     // MUTATION GUARD: fail OPEN when the sweep has withdrawn its observation (the pull request was
     // dismissed, retired, or reported with no head) and a review runs against work that no longer
     // exists — this test reds.
@@ -3751,6 +3830,194 @@ mod tests {
             sink.lock().expect("dispatch sink").len(),
             1,
             "a completion at the expected revision still dispatches"
+        );
+    }
+
+    // MUTATION GUARD (STUDIO-988 review round 5, sol #1): compare only the ENVELOPE revision and a
+    // Ready payload carrying a different revision than the envelope is accepted — the move-only
+    // payload must agree with the envelope that delivered it, not merely be wrapped by it. This test
+    // reds when the agreement half is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ready_payload_must_agree_with_its_envelope_revision() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.set_prepare_expected_revision(Some("rev-2".to_string()));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                // The payload claims the expected revision while the envelope names another: one of
+                // the two is stale, so the session must not start.
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-2",
+                )),
+                observed_revision: "rev-1".to_string(),
+                resolved: fake_selection(),
+            },
+        )
+        .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a Ready payload whose revision disagrees with its envelope must be dropped"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    // MUTATION GUARD (STUDIO-988 review round 5, sol #1 / alice C): compare the observed revision
+    // unconditionally and a typed TIMEOUT that never reached a credential (empty observed revision)
+    // is dropped as stale — no refusal row, no armed gate, so a locked credential is re-probed every
+    // tick. This test reds when typed failures are compared as if they carried a revision.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_typed_timeout_with_an_expected_revision_still_records_a_refusal() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Ready);
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        o.set_prepare_expected_revision(Some("rev-1".to_string()));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, PreparationCompletion::timed_out())
+            .await;
+
+        assert_eq!(
+            o.refusal_gate.len(),
+            1,
+            "a typed timeout that never reached a credential must still arm the refusal gate"
+        );
+        let runs = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert_eq!(
+            runs.len(),
+            1,
+            "a typed timeout must still record its zero-turn refusal row"
+        );
+        assert_eq!(runs[0].outcome, rhapsody_store::OUTCOME_REFUSED);
+    }
+
+    // STUDIO-988 review round 5 (alice B): the reopen arm's author-round budget check in
+    // `prepared_target_still_current` is its own gate — a shared review↔author budget spent between
+    // begin and acceptance must drop the completion rather than let the deferred promote move the
+    // ticket out of review for a run the ladder declined to authorize.
+    //
+    // MUTATION GUARD: remove the `author_round_budget_spent` check from the reopen arm (or let it
+    // fall through to the ordinary ticket eligibility path) and the positive control dispatches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopen_completion_is_dropped_when_the_author_round_budget_is_spent() {
+        use crate::reviewwatch::churn_key;
+        let mut tr = Fake::new();
+        let mut iss = issue("1", "MT-1", "In Review");
+        iss.team_id = "team-1".to_string();
+        iss.latest_summon_at = Some(
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2030, 1, 1, 0, 0, 0)
+                .single()
+                .expect("summon instant"),
+        );
+        iss.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            merged: false,
+        }]);
+        tr.by_id.insert("1".to_string(), iss.clone());
+        let tracker = Arc::new(tr);
+        let mut eff = empty_effective(Arc::clone(&tracker) as Arc<dyn rhapsody_tracker::Tracker>);
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.review_states = set_of(&["in review"]);
+        eff.review_promote_state = "In Progress".to_string();
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        crate::testsupport::seed_run(
+            store.as_ref(),
+            "1",
+            "MT-1",
+            Utc.with_ymd_and_hms(2029, 1, 1, 0, 0, 0)
+                .single()
+                .expect("prior run instant"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        // The opt-in adjudication threshold, with the pull request's budget already charged.
+        let mut teams = rhapsody_config::teams::Teams::disabled();
+        teams.enabled = true;
+        teams.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+        teams.review.adjudicate_after_rounds = 1;
+        o.teams = Some(teams);
+        let coord = crate::prstate::PrCoord::new("o", "r", 7);
+        o.review_rounds.insert(churn_key(&coord), 1);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Ready),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+
+        let reopen_target = |iss: Issue| PreparedTarget::Ticket {
+            issue: iss,
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: Some(ReopenPromote {
+                state: "In Progress".to_string(),
+                summon: None,
+            }),
+        };
+        assert!(matches!(
+            o.begin_preparation(reopen_target(iss.clone()), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a reopen whose shared budget is spent must not dispatch"
+        );
+        assert!(
+            tracker.move_calls().is_empty(),
+            "the deferred promote must not run for a budget-spent reopen"
+        );
+        assert!(o.preparing.is_empty());
+
+        // Positive control: with the budget cleared the SAME completion promotes and dispatches,
+        // so the drop above is the budget check's work and not an unrelated gate.
+        o.review_rounds.clear();
+        assert!(matches!(
+            o.begin_preparation(reopen_target(iss), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            tracker.move_calls().len(),
+            1,
+            "the reopen promotes once the budget is free"
+        );
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "the reopen dispatches once the budget is free"
         );
     }
 
