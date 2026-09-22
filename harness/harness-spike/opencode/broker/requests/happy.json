@@ -1,0 +1,76 @@
+{
+  "argv": [
+    "run",
+    "--format",
+    "json",
+    "--pure",
+    "--auto",
+    "--dir",
+    "<WORK>",
+    "--agent",
+    "build",
+    "-m",
+    "<PROVIDER>/probe-model",
+    "<PROMPT>"
+  ],
+  "compatibility": {
+    "adapter_package": "@ai-sdk/openai-compatible",
+    "adapter_version": "2.0.41",
+    "opencode_version": "1.18.30",
+    "probe_command": [
+      "--version"
+    ],
+    "source_commit": "3104c1428ec91f809e5ab86631300de41eb6952e",
+    "source_repo": "https://github.com/anomalyco/opencode",
+    "source_tag": "v1.18.30"
+  },
+  "exit_code": 0,
+  "requests": [
+    {
+      "body": {
+        "keys": [
+          "max_tokens",
+          "messages",
+          "model",
+          "stream",
+          "stream_options",
+          "tool_choice",
+          "tools"
+        ],
+        "max_tokens": 32000,
+        "message_roles": [
+          "system",
+          "user"
+        ],
+        "model": "probe-model",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tool_choice": "auto",
+        "tool_names": [
+          "bash",
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "skill",
+          "task",
+          "todowrite",
+          "webfetch",
+          "write"
+        ]
+      },
+      "headers": {
+        "accept": "*/*",
+        "authorization": "Bearer <CAPABILITY>",
+        "content-type": "application/json",
+        "user-agent": "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "response_status": 200
+    }
+  ],
+  "scenario": "happy"
+}
