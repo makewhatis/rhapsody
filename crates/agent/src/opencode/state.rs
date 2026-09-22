@@ -96,7 +96,18 @@ impl RunState {
         }
 
         let root = if state_root.is_empty() {
-            std::env::temp_dir()
+            // Canonicalized up front, unlike the operator-configured case below: macOS's own
+            // `/tmp`/`/var/folders` are themselves reached through a `/var` -> `/private/var`
+            // symlink, and `validate_root_is_safe` refuses any OTHER symlink in a configured path
+            // outright. Resolving our own default here means it never gets flagged as if an
+            // operator had configured a suspicious symlink (STUDIO-980 review).
+            let tmp = std::env::temp_dir();
+            tmp.canonicalize().map_err(|e| {
+                AgentError::Other(format!(
+                    "opencode_state_unsafe: could not resolve the system temp dir {}: {e}",
+                    tmp.display()
+                ))
+            })?
         } else {
             PathBuf::from(state_root)
         };
@@ -182,56 +193,95 @@ pub fn default_auth_source() -> PathBuf {
 }
 
 /// Refuses `root` (the resolved `state_root`) before anything is written under it (STUDIO-980):
-/// inside the daemon's own worktree root, inside any git worktree/repository, reached only through
-/// a symlink into either, or sitting under unsafe ownership.
+/// inside the daemon's own worktree root, inside any git worktree/repository, reached through a
+/// symlink at all, or sitting under unsafe ownership anywhere in its ancestor chain.
 ///
 /// It is enough to validate `root` alone, never the per-session directory `provision` creates under
 /// it: containment is downward-closed (nothing else writes into `root` between this check and the
 /// `mkdir`), so a safe `root` makes every fresh child of it safe too.
 fn validate_root_is_safe(root: &Path, workspace_root: &str) -> Result<(), AgentError> {
-    // `ancestors()` on an absolute path always reaches "/", which always exists, so this is only
-    // `None` for a relative path with no existing prefix at all — treated as unsafe rather than
-    // guessed at.
-    let ancestor = root.ancestors().find(|p| p.exists()).ok_or_else(|| {
-        AgentError::Other(format!(
-            "opencode_state_unsafe: no existing ancestor of {} to validate",
-            root.display()
-        ))
+    // Lexical, not real: `std::path::absolute` prepends the cwd for a relative path WITHOUT
+    // touching the filesystem or resolving symlinks — crucially, it does NOT collapse `..`
+    // components either (that would require knowing what a symlink points to). A `..` therefore
+    // survives into `absolute_root` verbatim, which is exactly what makes it dangerous: a
+    // nonexistent leading component followed by `..` (e.g. `<root>/nonexistent/../workspaces/x`)
+    // would find no existing ancestor short of a real one far above the intended target, compare
+    // as outside every containment check below, and then have the `..` actually resolved by
+    // `create_dir_all` once `nonexistent` is created — landing the real directory right back
+    // inside what containment was refusing (STUDIO-980 review, finding B3). So `..` is refused
+    // outright, the same as a symlink component.
+    let absolute_root = std::path::absolute(root).map_err(|e| {
+        AgentError::Other(format!("opencode_state_unsafe: {}: {e}", root.display()))
     })?;
-
-    // `stat`, not `lstat`: ownership of the REAL directory content will land in, following any
-    // symlink `ancestor` itself might be.
-    let meta = std::fs::metadata(ancestor).map_err(|e| {
-        AgentError::Other(format!(
-            "opencode_state_unsafe: {}: {e}",
-            ancestor.display()
-        ))
-    })?;
-    // SAFETY: geteuid() takes no arguments and has no preconditions; unsafe only as an FFI import.
-    let our_uid = unsafe { libc::geteuid() };
-    if !ownership_is_safe(meta.uid(), meta.mode(), our_uid) {
+    if absolute_root
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(AgentError::Other(format!(
-            "opencode_state_unsafe: {} is owned by uid {} and writable by other users; refusing \
-             to provision opencode state under it",
-            ancestor.display(),
-            meta.uid()
+            "opencode_state_unsafe: {} contains a '..' component; opencode state_root must be a \
+             direct path with no parent-directory traversal",
+            absolute_root.display()
         )));
     }
 
+    // `ancestors()` on an absolute path always reaches "/", which always exists, so this is only
+    // `None` for a path whose absolutized form still has no existing prefix — treated as unsafe
+    // rather than guessed at.
+    let ancestor = absolute_root
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            AgentError::Other(format!(
+                "opencode_state_unsafe: no existing ancestor of {} to validate",
+                absolute_root.display()
+            ))
+        })?;
+
     // Resolve every symlink up to (and including) `ancestor`, then re-attach whatever suffix of
     // `root` doesn't exist yet lexically — it cannot itself be a symlink, since nothing has created
-    // it. Comparing against this CANONICAL form (rather than the raw configured string) is what
-    // makes a symlink pointing into a worktree/repository refused instead of silently followed.
+    // it. A configured `state_root` reached through ANY symlink component is refused outright
+    // (design §2.7: "symlink components refused"), not merely followed-and-checked-for-containment:
+    // if the canonical form disagrees with the lexical absolute form, some component resolved
+    // somewhere other than where it lexically appears. `provision` exempts its own empty-`state_root`
+    // default by canonicalizing `std::env::temp_dir()` itself before calling here.
     let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
         AgentError::Other(format!(
             "opencode_state_unsafe: {}: {e}",
             ancestor.display()
         ))
     })?;
-    let suffix = root
+    let suffix = absolute_root
         .strip_prefix(ancestor)
         .unwrap_or_else(|_| Path::new(""));
     let canonical = canonical_ancestor.join(suffix);
+
+    if canonical != absolute_root {
+        return Err(AgentError::Other(format!(
+            "opencode_state_unsafe: {} is reached through a symlink (resolves to {}); opencode \
+             state must be configured with a path free of symlink components",
+            absolute_root.display(),
+            canonical.display()
+        )));
+    }
+
+    // SAFETY: geteuid() takes no arguments and has no preconditions; unsafe only as an FFI import.
+    let our_uid = unsafe { libc::geteuid() };
+    // Walk EVERY existing ancestor, not just the nearest one: an attacker who controls a directory
+    // higher up the chain can rename a safe leaf away and plant their own in its place, the same
+    // hazard a symlink swap would create. This is the same shape sshd's `StrictModes` checks.
+    for a in ancestor.ancestors() {
+        let meta = std::fs::metadata(a).map_err(|e| {
+            AgentError::Other(format!("opencode_state_unsafe: {}: {e}", a.display()))
+        })?;
+        if !ownership_is_safe(meta.uid(), meta.mode(), our_uid) {
+            return Err(AgentError::Other(format!(
+                "opencode_state_unsafe: {} is owned by uid {} and is writable by other users \
+                 without the sticky bit set; refusing to provision opencode state under it",
+                a.display(),
+                meta.uid()
+            )));
+        }
+    }
 
     if !workspace_root.is_empty() {
         let canonical_ws = Path::new(workspace_root)
@@ -259,14 +309,24 @@ fn validate_root_is_safe(root: &Path, workspace_root: &str) -> Result<(), AgentE
     Ok(())
 }
 
-/// Whether a directory owned by `owner_uid` is safe to create opencode state under, from the
-/// current process's effective uid `our_uid`. Owning it ourselves is always safe. Otherwise it is
-/// safe only the way a shared system temp dir is: not writable by group/other at all, or writable
-/// but with the sticky bit set (so only the owner or root can rename/unlink an entry another user
-/// created there — the same property that makes `/tmp` mode `1777` safe to share).
+/// Whether a directory owned by `owner_uid` is safe to create (or walk through to) opencode state
+/// under, from the current process's effective uid `our_uid`.
+///
+/// The owner must be trusted first: ourselves, or root (uid 0, the owner of a system-managed shared
+/// dir like `/tmp`). A directory owned by any OTHER user is under that user's sole control — they
+/// can `chmod` it at any moment regardless of its mode right now — so it is never safe, whatever its
+/// current permissions read.
+///
+/// A trusted owner is not automatically enough, though: owning a directory ourselves at a permissive
+/// mode is exactly as exploitable as a foreign owner, because directory write permission (not
+/// ownership of the entries inside it) is what controls renaming or unlinking a sibling. So even a
+/// self-owned or root-owned directory must be either not writable by group/other at all, or writable
+/// with the sticky bit set (so only the owner or root can rename/unlink an entry another user created
+/// there — the same property that makes `/tmp` mode `1777` safe to share).
 fn ownership_is_safe(owner_uid: u32, mode: u32, our_uid: u32) -> bool {
-    if owner_uid == our_uid {
-        return true;
+    let owner_trusted = owner_uid == our_uid || owner_uid == 0;
+    if !owner_trusted {
+        return false;
     }
     let sticky = mode & 0o1000 != 0;
     let writable_by_others = mode & 0o022 != 0;
@@ -472,8 +532,77 @@ mod tests {
         );
     }
 
-    // The same refusal, reached through a symlink rather than a literal path — the check must
-    // compare CANONICAL forms, not the raw configured string.
+    // ⚠️ Mutation target for B3: a NONEXISTENT leading component followed by `..` must not let
+    // `create_dir_all` land the real directory inside the workspace root behind the containment
+    // check's back. `<tmp>/nonexistent/../workspaces/opencode-state` has no existing ancestor short
+    // of `<tmp>` itself, so a check that only compares the unresolved lexical suffix against
+    // `workspace_root` would see `nonexistent/../workspaces/opencode-state` and never match — while
+    // `create_dir_all` resolves the `..` for real once `nonexistent` exists, writing straight into
+    // the workspace it was told to avoid.
+    #[test]
+    fn a_state_root_through_a_nonexistent_component_and_parent_dir_is_refused() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let workspace_root = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&workspace_root).expect("mkdir workspace root");
+        let bad_state_root = tmp
+            .path()
+            .join("nonexistent")
+            .join("..")
+            .join("workspaces")
+            .join("opencode-state");
+
+        let err = RunState::provision(
+            &bad_state_root.to_string_lossy(),
+            &auth,
+            "STUDIO-980",
+            &workspace_root.to_string_lossy(),
+        )
+        .expect_err("a '..' traversal that lands inside the workspace root must be refused");
+        assert!(
+            err.to_string().starts_with("opencode_state_unsafe:"),
+            "{err}"
+        );
+        assert!(
+            !tmp.path().join("nonexistent").exists(),
+            "the traversal component must never even be created"
+        );
+        assert_eq!(
+            std::fs::read_dir(&workspace_root)
+                .expect("read workspace root")
+                .count(),
+            0,
+            "nothing must be written inside the workspace root via the traversal"
+        );
+    }
+
+    // The same shape, but bypassing the git-repository guard rather than the workspace-root one —
+    // the two containment checks are independent and both must be closed against this trick.
+    #[test]
+    fn a_state_root_through_a_nonexistent_component_and_parent_dir_into_a_repo_is_refused() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        let bad_state_root = tmp
+            .path()
+            .join("nonexistent")
+            .join("..")
+            .join("repo")
+            .join("opencode-state");
+
+        let err = RunState::provision(&bad_state_root.to_string_lossy(), &auth, "STUDIO-980", "")
+            .expect_err("a '..' traversal that lands inside a git repository must be refused");
+        assert!(
+            err.to_string().starts_with("opencode_state_unsafe:"),
+            "{err}"
+        );
+        assert!(!repo.join("opencode-state").exists());
+    }
+
+    // The same destination, reached through a symlink rather than a literal path — refused because
+    // ANY symlink component in a configured `state_root` is refused outright (not merely followed
+    // and then checked for containment).
     #[test]
     fn a_state_root_reached_through_a_symlink_into_the_workspace_root_is_refused() {
         let tmp = TempDir::new();
@@ -524,6 +653,76 @@ mod tests {
         assert!(!bad_state_root.exists());
     }
 
+    // A symlink that lands OUTSIDE every workspace root and repository must still be refused: the
+    // rule is "no symlink components", not "no symlink components that happen to be dangerous".
+    #[test]
+    fn a_state_root_reached_through_a_symlink_outside_every_repo_is_still_refused() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let err = RunState::provision(&link.to_string_lossy(), &auth, "STUDIO-980", "")
+            .expect_err("any symlink component in a configured state_root must be refused");
+        assert!(
+            err.to_string().starts_with("opencode_state_unsafe:"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&real).expect("read real").count(),
+            0,
+            "nothing must be written through the symlink"
+        );
+    }
+
+    // The empty-`state_root` default must NOT trip the symlink refusal above: `provision`
+    // canonicalizes `std::env::temp_dir()` itself first, which is exactly what exempts macOS's own
+    // `/var` -> `/private/var` symlink from a rule aimed at operator-configured paths.
+    #[test]
+    fn the_default_state_root_is_not_refused_for_its_own_symlinked_temp_dir() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+
+        let st =
+            RunState::provision("", &auth, "STUDIO-980", "").expect("the default root must work");
+        assert!(
+            st.xdg_data_home()
+                .join("opencode")
+                .join("auth.json")
+                .is_file()
+        );
+    }
+
+    // ⚠️ Mutation target for B2: a directory WE OWN but at a permissive mode is exactly as
+    // exploitable as a foreign-owned one, because directory write permission — not ownership of the
+    // entries inside it — is what lets another local user rename our fresh 0700 session directory
+    // away and plant their own before `auth.json` is copied in. Constructible without root, unlike
+    // the foreign-owner cases below.
+    #[test]
+    fn a_state_root_we_own_but_world_writable_without_the_sticky_bit_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let err = RunState::provision(&root.to_string_lossy(), &auth, "STUDIO-980", "")
+            .expect_err("a self-owned, world-writable, non-sticky root must be refused");
+        assert!(
+            err.to_string().starts_with("opencode_state_unsafe:"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).expect("read root").count(),
+            0,
+            "a refused provision must write nothing under an unsafe root"
+        );
+    }
+
     // Pure-logic coverage for the ownership guard: constructing an actual foreign-owned directory
     // needs root (chown to another uid is not permitted otherwise), so this is the deterministic
     // substitute — it exercises exactly the branch `validate_root_is_safe` calls, and turns red if
@@ -532,7 +731,12 @@ mod tests {
     fn ownership_is_safe_matches_the_shared_tmp_dir_convention() {
         assert!(
             ownership_is_safe(501, 0o755, 501),
-            "owning it yourself is always safe, regardless of mode"
+            "owning it yourself at a non-writable-by-others mode is safe"
+        );
+        assert!(
+            !ownership_is_safe(501, 0o777, 501),
+            "owning it yourself does NOT excuse a world-writable, non-sticky mode: directory \
+             write permission, not entry ownership, is what lets another user rename our entry away"
         );
         assert!(
             ownership_is_safe(0, 0o1777, 501),
@@ -544,7 +748,12 @@ mod tests {
         );
         assert!(
             ownership_is_safe(0, 0o755, 501),
-            "owned by someone else but not writable by us at all is not a containment risk"
+            "root is a trusted owner even when the caller is a different uid"
+        );
+        assert!(
+            !ownership_is_safe(502, 0o755, 501),
+            "a directory owned by a DIFFERENT non-root user is never safe, however tight its mode \
+             reads right now — that owner can chmod it at any time"
         );
     }
 }
