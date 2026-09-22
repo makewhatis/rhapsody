@@ -1781,12 +1781,29 @@ impl Orchestrator {
     /// recorded as PENDING against the head the pull request STOOD AT when it was dispatched, and
     /// [`Orchestrator::settle_author_round`] charges it the moment a reviewer's verdict lands at a
     /// different head — i.e. once somebody has actually read what the author produced. Until then
-    /// the exchange is incomplete and the existing "a round cannot start while one is in flight"
-    /// rate limit is the only bound needed.
+    /// the exchange is incomplete and charges nothing.
+    ///
+    /// **At most ONE pending round per standing head.** An author dispatched again while the pull
+    /// request still stands at the same head — which is the routine shape while the reviewers are
+    /// queued, because a draft poke, a conflict route-back, a second reviewer's findings or a human
+    /// `@symphony` comment can each summon the author with no review completing in between — is the
+    /// SAME unfinished exchange, not a second one. Recording it once is what keeps a backlog of
+    /// dispatches from each charging a round as the queue later drains.
     ///
     /// A ROUND rather than a dispatch, matching [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit: the author's
     /// run its review's findings bought is the loop's other half, so it costs the same as the review
     /// round did at any reviewer count.
+    ///
+    /// **The runaway bound survives.** A fresh author dispatch is never the daemon's own idea: both
+    /// ladders in [`crate::select`] require a summons, and the only summoner a push loop can sustain
+    /// is a COMPLETED review — the very completion that answers the pending round and charges it.
+    /// The other writers (the draft poke, the conflict route-back, a human `@symphony`) are one-shot
+    /// external events, not loops the author's own amending drives, so they cannot buy an unbounded
+    /// run stream; each merely records a pending round that charges only if some reviewer later
+    /// reads the head it produced, and is dropped with the pull request otherwise. An author
+    /// amending in a loop is therefore bounded exactly as before — one round per answered amendment,
+    /// stopped by the threshold — while an amendment nobody reads cannot be re-summoned by the
+    /// author's own push.
     ///
     /// A store read that fails records NO pending round, which fails toward "not charged": the whole
     /// point is to stop advancing a pull request nobody has read, and a monitoring read that cannot
@@ -1819,10 +1836,15 @@ impl Orchestrator {
             if standing.is_empty() {
                 continue;
             }
-            self.author_rounds_pending
+            // Deduplicated against the same standing head: a second dispatch against an unanswered
+            // head is the SAME exchange (see the doc above).
+            let pending = self
+                .author_rounds_pending
                 .entry(churn_key(&pr))
-                .or_default()
-                .push(standing);
+                .or_default();
+            if !pending.iter().any(|base| base == &standing) {
+                pending.push(standing);
+            }
         }
     }
 
@@ -1834,14 +1856,19 @@ impl Orchestrator {
     /// was recorded against the head the pull request stood at when the author was dispatched, and
     /// a reviewer reaching the head that round produced reports a different SHA. A completion at
     /// the SAME head read the work the author was RESPONDING to — an in-flight sibling review of the
-    /// previous round, completing after the author's push — and answers nothing, so it is skipped.
+    /// previous round, completing after the author's push — and answers nothing, so its entry is
+    /// left pending.
     ///
     /// FIFO over the pending rounds: one verdict answers one author round, and the oldest
-    /// outstanding round is the one it most plausibly answers. Called only from a DECLARED review
-    /// completion ([`Orchestrator::on_review_exit`]); a truncated or crashed round advances no
-    /// `last_reviewed_sha`, and a STUDIO-960 carried verdict is deliberately not an answer either —
-    /// no reviewer read new work, and charging a no-op rebase would undo the very saving that ticket
-    /// bought.
+    /// outstanding round is the one it most plausibly answers. The queue-time backlog does not
+    /// reappear here as a charge per verdict because [`Orchestrator::note_author_round`] records at
+    /// most ONE pending round per standing head (alice round 1 on PR #216): the siblings of an
+    /// answering round leave nothing behind to charge a second time.
+    ///
+    /// Called only from a DECLARED review completion ([`Orchestrator::on_review_exit`]); a truncated
+    /// or crashed round advances no `last_reviewed_sha`, and a STUDIO-960 carried verdict is
+    /// deliberately not an answer either — no reviewer read new work, and charging a no-op rebase
+    /// would undo the very saving that ticket bought.
     pub(crate) fn settle_author_round(&mut self, pr: &PrCoord, head: &str) {
         if head.is_empty() {
             return;
@@ -2969,9 +2996,10 @@ pub type ReviewRounds = HashMap<String, usize>;
 
 /// The AUTHOR rounds each pull request has dispatched but that no reviewer has answered yet
 /// (STUDIO-1004), keyed by [`churn_key`] as [`ReviewRounds`] is. Each entry is the head the pull
-/// request STOOD AT when that round was recorded — the work it was a response to — oldest first, so
-/// a reviewer's verdict at a different head settles the oldest outstanding round. See
-/// [`Orchestrator::note_author_round`] and [`Orchestrator::settle_author_round`].
+/// request STOOD AT when that round was recorded — the work it was a response to — and at most one
+/// entry per distinct head exists, so a repeated dispatch against an unanswered head adds nothing.
+/// A reviewer's verdict at a different head (FIFO) settles the oldest outstanding entry and charges
+/// it. See [`Orchestrator::note_author_round`] and [`Orchestrator::settle_author_round`].
 pub type PendingAuthorRounds = HashMap<String, Vec<String>>;
 
 /// The auto-merge plan each watched pull request has already been ANNOUNCED for: its head and the
@@ -6332,8 +6360,9 @@ mod tests {
     /// **Acceptance 3.** An author that pushes N times while every reviewer is queued advances the
     /// counter by zero, and the pull request does not escalate on that basis.
     ///
-    /// Mutation check: count a dispatch as an answer (settle from `dispatch_review` instead of the
-    /// completion) and the counter climbs with the pushes.
+    /// Mutation check (STUDIO-1004 ⚠️): restore the unconditional `*entry += round` in
+    /// [`Orchestrator::note_author_round`] and the counter climbs with the pushes, so the first
+    /// assert reds.
     #[test]
     fn an_author_pushing_while_reviewers_are_queued_advances_nothing() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
@@ -6353,6 +6382,13 @@ mod tests {
             Some(&spent),
             "five author pushes nobody reviewed must charge exactly nothing"
         );
+        assert_eq!(
+            o.author_rounds_pending
+                .get(&churn_key(&coord(12)))
+                .map(Vec::len),
+            Some(1),
+            "and the five pushes against one unanswered head are ONE pending exchange, not five"
+        );
         assert!(
             !o.author_round_budget_spent(&iss),
             "and must not escalate the pull request as if the author and reviewers disagreed"
@@ -6360,6 +6396,48 @@ mod tests {
         assert!(
             dispatched.lock().expect("lock").is_empty(),
             "no review was dispatched, so nothing can have answered"
+        );
+    }
+
+    /// **alice round 1 on PR #216, finding 1.** The backlog a queued author builds must not
+    /// resurface as a charge per verdict when the queue finally drains: five unanswered pushes at
+    /// two reviewers, answered by BOTH reviewers reading the head the author produced, is **one**
+    /// exchange and charges exactly one round — not one per sibling verdict.
+    ///
+    /// Mutation check: drop the per-standing-head dedup from [`Orchestrator::note_author_round`] so
+    /// the five pushes record five pending entries, and bob's verdict and carol's verdict each
+    /// charge one — the counter then overshoots to three rounds and the assert reds.
+    #[test]
+    fn a_queued_backlog_drains_as_one_exchange() {
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 3);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        // Two reviewers, both having read HEAD_A: one round is spent.
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        introduce(&o, reviewed_row(12, "carol", HEAD_A));
+        let round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), round);
+        let iss = author_issue("STUDIO-1", 12);
+
+        // The author keeps pushing while the queue is stuck.
+        for _ in 0..5 {
+            o.note_author_round(&iss);
+        }
+
+        // The queue drains: BOTH reviewers read HEAD_B, the head the author produced. That is ONE
+        // exchange, so it costs ONE round however many reviewers answered it.
+        complete(&mut o, 12, "bob", HEAD_B);
+        complete(&mut o, 12, "carol", HEAD_B);
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(2 * round)),
+            "one spent round plus ONE answered exchange; the queued backlog must not charge again"
+        );
+        assert!(
+            !o.author_rounds_pending.contains_key(&churn_key(&coord(12))),
+            "and the answered exchange leaves nothing pending behind"
         );
     }
 
@@ -6401,9 +6479,10 @@ mod tests {
         );
     }
 
-    /// is still bounded: each amendment a reviewer READS charges a round, and the threshold stops
-    /// the loop. This is the author half in isolation, so the bound is the adjudication threshold
-    /// and not the review cap.
+    /// **The runaway bound still holds after the move.** An author amending in a loop — a rebase
+    /// chain, a CI-driven force-push — is still bounded: each amendment a reviewer READS charges a
+    /// round, and the threshold stops the loop. This is the author half in isolation, so the bound
+    /// is the adjudication threshold and not the review cap.
     ///
     /// Mutation check: make [`Orchestrator::settle_author_round`] charge nothing (remove the
     /// runaway bound's only source of author rounds) and this runs all eleven rounds and reds.
