@@ -588,11 +588,13 @@ pub struct Orchestrator {
     /// [`review_rounds`](Orchestrator::review_rounds) is and dropped with it when the pull request
     /// leaves the watch set.
     ///
-    /// Each entry is the head the pull request STOOD AT when that author round was recorded, so
-    /// [`Orchestrator::settle_author_round`] can charge the round only once a reviewer's verdict
-    /// lands at a different head — an author dispatch no reviewer ever read must not advance the
-    /// adjudication counter. In memory only: it records dispatches that have not been charged, and a
-    /// restart losing one can only DELAY a charge, never invent one.
+    /// Each entry is the SET of heads the pull request STOOD AT when that author round was recorded,
+    /// so [`Orchestrator::settle_author_round`] can charge the round only once a reviewer's verdict
+    /// lands at a head outside that set — an author dispatch no reviewer ever read must not advance
+    /// the adjudication counter. The set, not one head, because the rows of a round are dispatched at
+    /// different times under review concurrency and disagree about their requested head for a whole
+    /// queue wait. In memory only: it records dispatches that have not been charged, and a restart
+    /// losing one can only DELAY a charge, never invent one.
     pub(crate) author_rounds_pending: crate::reviewwatch::PendingAuthorRounds,
     /// What the watcher has already ANNOUNCED about each watched pull request's auto-merge plan,
     /// keyed by [`churn_key`](crate::reviewwatch::churn_key) exactly as
