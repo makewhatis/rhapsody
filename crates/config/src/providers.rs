@@ -554,20 +554,24 @@ impl ProviderReload {
                 },
             };
             hash = fnv1a(hash, binding.identity().as_bytes());
-            // The limits are part of what P9's status shows, so a limits change is a change too.
-            hash = fnv1a(
-                hash,
-                &def.broker_limits
-                    .reserved_token_units_per_session
-                    .to_le_bytes(),
-            );
-            hash = fnv1a(
-                hash,
-                &def.broker_limits
-                    .max_reserved_token_units_per_utc_day
-                    .unwrap_or(0)
-                    .to_le_bytes(),
-            );
+            // The limits are part of what P9's status shows, so ANY limits change is a change too.
+            let l = &def.broker_limits;
+            for value in [
+                u64::from(l.forwarded_requests_per_turn),
+                u64::from(l.denied_requests_before_revocation),
+                u64::from(l.concurrent_upstream_requests_per_turn),
+                l.json_request_bytes,
+                l.aggregate_request_bytes_per_turn,
+                l.response_bytes_per_request,
+                l.aggregate_response_bytes_per_turn,
+                l.requested_output_tokens_per_request,
+                l.reserved_token_units_per_turn,
+                l.reserved_token_units_per_session,
+                l.capability_lifetime_ms,
+                l.max_reserved_token_units_per_utc_day.unwrap_or(0),
+            ] {
+                hash = fnv1a(hash, &value.to_le_bytes());
+            }
             bindings.push(binding);
         }
         Self {

@@ -227,6 +227,14 @@ fn validate_providers(config: &Resolved) -> Result<(), ValidationError> {
         validate_provider_map(&format!("project {i}"), &merged, turn_timeout)?;
     }
 
+    // A normalized model selection is always transport-validated when written, provider or not, so a
+    // set-but-invalid `agent.model` is never silently ignored.
+    if !config.agent.model.is_empty() {
+        crate::providers::validate_model_id(&config.agent.model).map_err(|reason| {
+            ValidationError::InvalidProviderModel(format!("agent.model: {reason}"))
+        })?;
+    }
+
     if config.agent.provider.is_empty() {
         return Ok(());
     }
@@ -252,9 +260,10 @@ fn validate_providers(config: &Resolved) -> Result<(), ValidationError> {
             def.id, def.protocol, PROTOCOL_OPENAI_COMPATIBLE
         )));
     }
+    // An explicit provider requires an exact model for the brokered adapter.
     crate::providers::validate_model_id(&config.agent.model).map_err(|reason| {
         ValidationError::InvalidProviderModel(format!(
-            "agent.provider {:?}: {reason}",
+            "agent.provider {:?} requires an exact model: {reason}",
             config.agent.provider
         ))
     })?;
@@ -1459,6 +1468,15 @@ mod tests {
 
         let mut padded = provider_cfg(ONE_PROVIDER, "opencode", "fireworks", " padded ");
         let err = validate(&mut padded).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProviderModel(_)),
+            "{err:?}"
+        );
+
+        // A set model is transport-validated even with no explicit provider, so an invalid one is
+        // never silently ignored.
+        let mut no_provider = provider_cfg(ONE_PROVIDER, "claude", "", " padded ");
+        let err = validate(&mut no_provider).unwrap_err();
         assert!(
             matches!(err, ValidationError::InvalidProviderModel(_)),
             "{err:?}"
