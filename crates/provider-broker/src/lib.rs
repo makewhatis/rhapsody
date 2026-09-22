@@ -35,11 +35,11 @@ pub mod error;
 pub mod ledger;
 pub mod policy;
 pub mod random;
-pub mod reservations;
 pub mod secret;
 pub mod session;
 pub mod turn;
 
+mod reservations;
 mod state;
 
 pub use binding::{
