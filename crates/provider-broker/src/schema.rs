@@ -940,17 +940,14 @@ mod tests {
             assert!(number_round_trips(text), "{text} is representable");
         }
         // ...but an integer too wide for i64/u64, or a float that overflows f64, is refused.
-        for text in [
-            "123456789012345678901234567890",
-            "1e400",
-            "-1e400",
-        ] {
+        for text in ["123456789012345678901234567890", "1e400", "-1e400"] {
             assert!(!number_round_trips(text), "{text} is not representable");
         }
     }
 
     #[test]
-    fn parses_scalars_and_nesting() {        assert_eq!(parse("null"), Json::Null);
+    fn parses_scalars_and_nesting() {
+        assert_eq!(parse("null"), Json::Null);
         assert_eq!(parse("true"), Json::Bool(true));
         assert_eq!(parse("[]"), Json::Array(vec![]));
         assert_eq!(parse("{}"), Json::Object(vec![]));

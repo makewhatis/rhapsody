@@ -1311,12 +1311,7 @@ async fn aborting_the_server_cancels_an_in_flight_stream() {
 /// 200 passed through to the child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_non_streaming_json_body_is_refused() {
-    let harness = Harness::with(
-        FakeResponse::json("{not-json"),
-        default_limits(),
-        true,
-    )
-    .await;
+    let harness = Harness::with(FakeResponse::json("{not-json"), default_limits(), true).await;
     let capability = harness.capability.clone();
     let resp = harness
         .post(Some(&capability), &[], &chat_body(MODEL, false))

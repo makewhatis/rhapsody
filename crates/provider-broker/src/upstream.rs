@@ -533,19 +533,24 @@ mod tests {
     #[test]
     fn round_trip_accepts_normalization_equivalent_endpoints() {
         // An expanded IPv6 literal normalizes to the same address the URL library uses.
-        let expanded =
-            NormalizedEndpoint::parse("https://[0:0:0:0:0:0:0:1]/v1", false).expect("expanded ipv6");
+        let expanded = NormalizedEndpoint::parse("https://[0:0:0:0:0:0:0:1]/v1", false)
+            .expect("expanded ipv6");
         assert_eq!(
             expanded.chat_completions_url(),
             "https://[0:0:0:0:0:0:0:1]/v1/chat/completions"
         );
         // An IDNA/Unicode host normalizes to the same punycode destination.
-        let idna = NormalizedEndpoint::parse("https://bücher.example/v1", false).expect("idna host");
+        let idna =
+            NormalizedEndpoint::parse("https://bücher.example/v1", false).expect("idna host");
         assert_eq!(idna.canonical(), "https://bücher.example/v1");
         // A raw Unicode path is encoded identically on both sides of the comparison.
         let unicode_path =
             NormalizedEndpoint::parse("https://api.example.com/v1/ünïcode", false).expect("path");
-        assert!(unicode_path.chat_completions_url().contains("/v1/ünïcode/chat/completions"));
+        assert!(
+            unicode_path
+                .chat_completions_url()
+                .contains("/v1/ünïcode/chat/completions")
+        );
     }
 
     #[test]
