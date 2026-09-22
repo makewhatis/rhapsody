@@ -861,7 +861,7 @@ impl Orchestrator {
                 issue_identifier = %re.issue.identifier,
                 reason = %reason,
                 "dispatch refused: the resolved harness cannot honor this run; recording failed \
-                 once and scheduling no retry"
+                 once and scheduling no retry (fix the profile and restart to re-offer it)"
             );
             self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
             self.persist_complete(&re.issue.identifier);

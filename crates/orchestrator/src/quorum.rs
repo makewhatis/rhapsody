@@ -1166,9 +1166,16 @@ pub(crate) fn select_reviewers(
 /// This was once two sets (`unpinnable` vs `unselectable`) because an unimplemented harness still
 /// ran on the backend and so stayed a ranked candidate. With the fallback removed the two conditions
 /// have the same consequence — the dispatch is refused — so one set says it.
-#[derive(Debug, Default)]
-pub(crate) struct ReviewerExclusions {
+#[derive(Debug, Clone, Default)]
+pub struct ReviewerExclusions {
     pub(crate) unselectable: HashSet<String>,
+}
+
+impl ReviewerExclusions {
+    /// Whether `name` may never be offered as a reviewer.
+    pub(crate) fn excludes(&self, name: &str) -> bool {
+        self.unselectable.contains(name)
+    }
 }
 
 /// The required reviewers [`rank_reviewers`] promotes into its pinned prefix **and** the caller's

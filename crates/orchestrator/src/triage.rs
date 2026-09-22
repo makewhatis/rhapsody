@@ -529,6 +529,11 @@ pub struct TriageTarget {
     /// [`TeamScope`](crate::teamsknow::TeamScope) admits it as a value rather than treating it as
     /// "no filter", which is precisely the distinction the store's own `project` filter cannot make.
     pub slugs: Vec<String>,
+    /// The roster identities a review dispatch would be refused for (STUDIO-978), resolved on the
+    /// control task and published with the rest of the reload. The manager's room reader takes it
+    /// from here ([`crate::teamsears::EarsCycle`]) so `file_review` drops an impossible reviewer
+    /// rather than filing a review ticket `spawn_worker` then refuses.
+    pub reviewer_exclusions: crate::quorum::ReviewerExclusions,
 }
 
 /// What the manager reads an answer out of (STUDIO-731, slice 3).
@@ -1134,6 +1139,7 @@ where
             billing_guard: deps.billing_guard,
             tracker_api_key: &deps.tracker_api_key,
             knowledge: knowledge.as_ref(),
+            reviewer_exclusions: &target.reviewer_exclusions,
         };
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
@@ -2665,6 +2671,7 @@ mod tests {
                     }],
                     summon_token: "@symphony".to_string(),
                     slugs: Vec::new(),
+                    reviewer_exclusions: Default::default(),
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -2807,6 +2814,7 @@ mod tests {
                     }],
                     summon_token: "@symphony".to_string(),
                     slugs: vec!["proj".to_string()],
+                    reviewer_exclusions: Default::default(),
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -4731,6 +4739,7 @@ mod tests {
                     facts: snap.facts,
                     summon_token: snap.summon_token,
                     slugs: Vec::new(),
+                    reviewer_exclusions: snap.reviewer_exclusions,
                 })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,

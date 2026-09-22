@@ -539,6 +539,7 @@ where
                     states: snap.states,
                     facts: snap.facts,
                     summon_token: snap.summon_token,
+                    reviewer_exclusions: snap.reviewer_exclusions,
                 })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
