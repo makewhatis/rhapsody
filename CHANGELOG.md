@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.6](https://github.com/makewhatis/rhapsody/compare/v0.3.5...v0.3.6) (2026-09-21)
+
+
+### Features
+
+* **config,orchestrator:** meter spend by provider and stop at a daily budget (STUDIO-957) ([#199](https://github.com/makewhatis/rhapsody/issues/199)) ([3a5bcad](https://github.com/makewhatis/rhapsody/commit/3a5bcad73caffb6ff7c0c205ee45c6f9637bbfe7))
+* **config,orchestrator:** pin required reviewers on every pull request (STUDIO-951) ([#190](https://github.com/makewhatis/rhapsody/issues/190)) ([763838e](https://github.com/makewhatis/rhapsody/commit/763838ebcafc6f9da01f3325e0c393ebb4876b8c))
+* **config,orchestrator:** scope review.auto_merge per project (STUDIO-927) ([#179](https://github.com/makewhatis/rhapsody/issues/179)) ([81f4732](https://github.com/makewhatis/rhapsody/commit/81f4732ea89ef67b507865b4fd8233d2f7c2f234))
+* **orchestrator:** carry a review verdict across an unchanged head move (STUDIO-960) ([#194](https://github.com/makewhatis/rhapsody/issues/194)) ([0b6cf09](https://github.com/makewhatis/rhapsody/commit/0b6cf09f763971fd98644364bd926728deea2eff))
+* **orchestrator:** gate auto-promote to named backlog states (STUDIO-948) ([#185](https://github.com/makewhatis/rhapsody/issues/185)) ([aa6eb60](https://github.com/makewhatis/rhapsody/commit/aa6eb60e1fa6581a5e6f6611a897cd440698c5ae))
+* **orchestrator:** give reviews their own global concurrency budget (STUDIO-950) ([#187](https://github.com/makewhatis/rhapsody/issues/187)) ([f00b6ce](https://github.com/makewhatis/rhapsody/commit/f00b6ce70b24959532980e04069e2a2961856c42))
+* **orchestrator:** make PR-state polling free with conditional requests (STUDIO-974) ([#204](https://github.com/makewhatis/rhapsody/issues/204)) ([a1e0a00](https://github.com/makewhatis/rhapsody/commit/a1e0a00b3b0c5ce2b08a83200fecf4273075c949))
+* **orchestrator:** make review rounds 2+ read the delta and their prior findings (STUDIO-959) ([#193](https://github.com/makewhatis/rhapsody/issues/193)) ([0cbe20e](https://github.com/makewhatis/rhapsody/commit/0cbe20e3fa4395bf2a329748fe5a9ecf14bb3dcd))
+* **orchestrator:** poke the author of a finished run's still-draft pull request (STUDIO-962) ([#195](https://github.com/makewhatis/rhapsody/issues/195)) ([a476c2d](https://github.com/makewhatis/rhapsody/commit/a476c2d51b2f93a9682749f58885e182512f2b33))
+* **orchestrator:** refuse rhapsody:human tickets at dispatch (STUDIO-949) ([#186](https://github.com/makewhatis/rhapsody/issues/186)) ([d3a8251](https://github.com/makewhatis/rhapsody/commit/d3a8251f2c35a8f9aa8d664aa98e0bf0e0477e3d))
+* **orchestrator:** stop a run at its per-run token ceiling (STUDIO-967) ([#208](https://github.com/makewhatis/rhapsody/issues/208)) ([3a8ab00](https://github.com/makewhatis/rhapsody/commit/3a8ab0002d5038477c9e3cd7e730e525559a872b))
+* **web:** add a board view where a card is a ticket (STUDIO-925) ([#178](https://github.com/makewhatis/rhapsody/issues/178)) ([2fc26f7](https://github.com/makewhatis/rhapsody/commit/2fc26f7de003ec8f286056f3afa90fb3319e4797))
+* **web:** fix the board's lane axis, pin four fixed-width lanes, add a lane-width control (STUDIO-930) ([#180](https://github.com/makewhatis/rhapsody/issues/180)) ([19ed6e8](https://github.com/makewhatis/rhapsody/commit/19ed6e89e47cec99cbc47e7245c8cd9565b1464f))
+* **web:** move display options into a header popover and drop the status filter on the board (STUDIO-932) ([#181](https://github.com/makewhatis/rhapsody/issues/181)) ([080b610](https://github.com/makewhatis/rhapsody/commit/080b610dbad1f44a6b066777b63befd6d7bc8207))
+* **web:** show a ticket's reviews in the run detail strip (STUDIO-976) ([#209](https://github.com/makewhatis/rhapsody/issues/209)) ([cdb90d1](https://github.com/makewhatis/rhapsody/commit/cdb90d1caceb03b45b66ef21e221e4bb4e239da1))
+* **web:** show a ticket's token cost by provider and live-run activity (STUDIO-926) ([#177](https://github.com/makewhatis/rhapsody/issues/177)) ([71087e9](https://github.com/makewhatis/rhapsody/commit/71087e95bef614a95a7a6a6c9d03ad7c942e5053))
+* **web:** show a ticket's whole-store token total on its run detail (STUDIO-975) ([#206](https://github.com/makewhatis/rhapsody/issues/206)) ([c89c2e9](https://github.com/makewhatis/rhapsody/commit/c89c2e9db18f56932e46037d731ac4b40f3d4368))
+* **web:** surface a budget-held ticket on the console (STUDIO-970) ([#205](https://github.com/makewhatis/rhapsody/issues/205)) ([4b20307](https://github.com/makewhatis/rhapsody/commit/4b20307c258449f829d19e69a271d6e702975465))
+
+
+### Bug Fixes
+
+* **desktop:** poll notarytool instead of --wait so a crash stops discarding an accepted submission (STUDIO-877) ([#184](https://github.com/makewhatis/rhapsody/issues/184)) ([b46b048](https://github.com/makewhatis/rhapsody/commit/b46b048df894e3868a368f6c2bb05fc78edb164d))
+* **httpapi:** fold review runs into their ticket in the board counts (STUDIO-965) ([#202](https://github.com/makewhatis/rhapsody/issues/202)) ([e376c2e](https://github.com/makewhatis/rhapsody/commit/e376c2ec3b684ed78be2a7debd0fe6f85c7252aa))
+* **orchestrator:** let the manager decide ship-or-escalate at the review round threshold (STUDIO-956) ([#192](https://github.com/makewhatis/rhapsody/issues/192)) ([a552f68](https://github.com/makewhatis/rhapsody/commit/a552f68a3efdac4ebc6ec683d7d84cc8fec88dcd))
+* **orchestrator:** name auto-merge's decline reason in the reconciliation sweep ([#175](https://github.com/makewhatis/rhapsody/issues/175)) ([9c530d2](https://github.com/makewhatis/rhapsody/commit/9c530d286105331af2ac5595406845a4aa0d08f7))
+* **orchestrator:** re-read a watched head before dispatching its review (STUDIO-953) ([#189](https://github.com/makewhatis/rhapsody/issues/189)) ([59f311f](https://github.com/makewhatis/rhapsody/commit/59f311ff4d1e8abe398b3efb4fb20fced292ce61))
+* **orchestrator:** resume the review loop when a shipped pull request gets another commit (STUDIO-971) ([#203](https://github.com/makewhatis/rhapsody/issues/203)) ([58b754c](https://github.com/makewhatis/rhapsody/commit/58b754c3e907f7a7cca60fa761aa7503f8af6b67))
+* **orchestrator:** route a conflicted pull request back to its author (STUDIO-961) ([#196](https://github.com/makewhatis/rhapsody/issues/196)) ([e2c3be3](https://github.com/makewhatis/rhapsody/commit/e2c3be39fd36cd08581022523fede8ebedf020ed))
+* **store,httpapi,web:** filter the board's active feed to each issue's latest run outcome (STUDIO-931) ([#182](https://github.com/makewhatis/rhapsody/issues/182)) ([8598156](https://github.com/makewhatis/rhapsody/commit/85981564d98bf439d7022de9408a15a43d82d869))
+* **web:** open a reviewer chip's own run and count runs in the Running lane (STUDIO-955) ([#191](https://github.com/makewhatis/rhapsody/issues/191)) ([0222cdc](https://github.com/makewhatis/rhapsody/commit/0222cdcd2ee3d8032e39beab2c69db6ab84e3a09))
+* **web:** read a parked ticket as parked, not queued (STUDIO-966) ([#201](https://github.com/makewhatis/rhapsody/issues/201)) ([1883c1d](https://github.com/makewhatis/rhapsody/commit/1883c1dbc34b520351d11fab566ea9ce4e334f69))
+* **web:** say alice is reviewing STUDIO-957 in the review row, not just to a screen reader (STUDIO-968) ([#200](https://github.com/makewhatis/rhapsody/issues/200)) ([6e2741e](https://github.com/makewhatis/rhapsody/commit/6e2741ef4e92b800bef99c529aed778b4d0d354d))
+* **web:** show each review's own provider on the board card (STUDIO-952) ([#188](https://github.com/makewhatis/rhapsody/issues/188)) ([debe199](https://github.com/makewhatis/rhapsody/commit/debe19920b5035469be595c0c5dbbfae4809abc4))
+
 ## [0.3.5](https://github.com/makewhatis/rhapsody/compare/v0.3.4...v0.3.5) (2026-09-16)
 
 
