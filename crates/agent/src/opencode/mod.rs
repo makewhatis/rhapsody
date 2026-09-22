@@ -56,12 +56,14 @@
 pub mod args;
 pub mod mcpinject;
 pub mod parse;
+pub mod probe;
 pub mod runner;
 pub mod state;
 
 pub use args::{Config, auto_approve_enabled, build_args};
 pub use mcpinject::{INJECTED_CONFIG_NAME, SERVER_KEY, inject_daemon_mcp, rewrite_tool_names};
 pub use parse::{Classified, Failure, add_usage, classify};
+pub use probe::{CompatibilityRow, ProbeError, SUPPORTED, parse_probe_output, probe, resolve_row};
 pub use runner::Runner;
 pub use state::RunState;
 

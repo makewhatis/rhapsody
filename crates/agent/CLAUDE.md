@@ -20,8 +20,9 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/claude/mcpinject.rs` | `mcpinject.go` | per-workspace `.symphony-mcp.json` merge + "me" identity env |
 | `src/claude/parse.rs` | `parse.go` | one stream-json line → normalized `Event`/`TurnResult` |
 | `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above; also implements `harness::Harness` for `Runner` (STUDIO-900) — its declared `HarnessCapabilities` live next to the behavior they describe |
-| `src/opencode/*` | — | the SECOND backend (STUDIO-902); no Go counterpart. The same module split as `claude/` (`args`/`parse`/`mcpinject`/`runner`) plus `state` (the per-run `XDG_DATA_HOME`), built against the committed captures in `harness/harness-spike/opencode/`. Read its `mod.rs` first: it tabulates every spike finding against the module that implements it |
+| `src/opencode/*` | — | the SECOND backend (STUDIO-902); no Go counterpart. The same module split as `claude/` (`args`/`parse`/`mcpinject`/`runner`) plus `state` (the per-run `XDG_DATA_HOME`) and `probe` (the STUDIO-995 managed-version probe against the committed broker fixtures), built against the committed captures in `harness/harness-spike/opencode/`. Read its `mod.rs` first: it tabulates every spike finding against the module that implements it |
 | `tests/fake_claude_gate.rs` | — | P4 phase gate: runs the real Claude `Runner` against the committed `harness/stubs/fake-claude*` and diffs the humanized output against `harness/fixtures/runs/*.jsonl` |
+| `tests/opencode_broker_fixture.rs` | — | PB0 phase gate (STUDIO-995): pins the committed managed-OpenCode broker request fixtures under `harness/harness-spike/opencode/broker/requests/` — request counts, route/auth/model/`max_tokens`/SSE shape, the closed schema, and a secret/machine-path sanitization scan |
 
 ## Architecture — reading order
 
