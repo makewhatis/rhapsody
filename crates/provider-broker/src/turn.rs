@@ -284,6 +284,37 @@ impl CapabilityGrant {
         self.inner.session.policy.limits()
     }
 
+    /// Whether plaintext HTTP to the upstream is explicitly allowed for this grant.
+    pub fn allow_insecure_http(&self) -> bool {
+        self.inner.session.plan.allow_insecure_http()
+    }
+
+    /// Whether this grant may still admit work right now: neither it nor its session is revoked and
+    /// the capability has not expired. The streaming adapter polls this to cancel a live response
+    /// when the turn is revoked or expires (design §7.2).
+    pub fn is_live(&self) -> bool {
+        self.inner.check_live().is_ok()
+    }
+
+    /// The monotonic time remaining before the capability's absolute expiry, saturating at zero.
+    pub fn remaining_lifetime(&self) -> std::time::Duration {
+        let now = self.inner.session.broker.clock.now();
+        std::time::Duration::from_nanos(
+            self.inner
+                .not_after
+                .as_nanos()
+                .saturating_sub(now.as_nanos()),
+        )
+    }
+
+    /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that
+    /// constructs the upstream `Authorization` header and its redactor. There is no key accessor on
+    /// any public type. `None` once custody has been released (session revoked).
+    pub(crate) fn with_credential<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let guard = crate::state::lock(&self.inner.session.credential);
+        guard.as_ref().map(|lease| lease.expose_for_upstream(f))
+    }
+
     /// The monotonic ordinal of this turn within its session.
     pub fn turn_ordinal(&self) -> u64 {
         self.inner.ordinal
