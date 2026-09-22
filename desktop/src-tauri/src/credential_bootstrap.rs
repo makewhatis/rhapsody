@@ -111,13 +111,16 @@ async fn serve_one(mut stream: UnixStream, token: String, owner: Arc<ProviderCre
             // its place must reconnect (and re-authenticate) rather than being silently forgiven.
             return;
         }
-        // `account` is the wire form of a `CredentialRef`; re-validate it here too, rather than
-        // trusting whatever the peer sent, even though only an already-authenticated peer reaches
-        // this line.
-        let Ok(credential_ref) = CredentialRef::for_provider(strip_v1(&account)) else {
+        // Re-validate `account` (the wire form of a `CredentialRef`) rather than trusting whatever
+        // the peer sent, even though only an already-authenticated peer reaches this line — AND
+        // require it to name exactly the one credential `owner` is bound to. `owner` is
+        // single-credential-scoped (see module doc), so without this check a syntactically valid
+        // but WRONG account (e.g. a typo, or a future multi-provider client asking for a different
+        // provider than this owner holds) would silently receive this owner's data instead of a
+        // refusal.
+        if CredentialRef::for_provider(strip_v1(&account)).is_err() || account != owner.account() {
             return;
-        };
-        let _ = &credential_ref; // `owner` is already scoped to its one credential; see module doc.
+        }
         let read = owner.read_bound(&expected_binding);
         let (state, lease) = split_state(read.state);
         let resp_seq = session.next_outgoing_seq();
@@ -258,6 +261,40 @@ mod tests {
         assert!(
             err.is_err(),
             "an unauthorized connection must never get a real response"
+        );
+
+        serve.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `owner` is bound to exactly one credential; a syntactically valid but WRONG account must be
+    // refused, not silently answered with this owner's data.
+    #[tokio::test]
+    async fn a_request_for_a_different_account_gets_no_response() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+        let owner = owner_with_secret();
+        let serve = tokio::spawn(listener.accept_and_serve(owner));
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+
+        let err = client
+            .read_bound(
+                "v1:some-other-provider".into(),
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "a request for a different account must never get a real response"
         );
 
         serve.abort();

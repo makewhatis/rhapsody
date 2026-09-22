@@ -65,6 +65,7 @@ pub enum MutationError {
 /// injectable so tests never touch the real OS Keychain (mirrors `credential::Keychain`'s own
 /// `mock` seam).
 pub struct ProviderCredentialOwner {
+    account: String,
     keyring: Arc<dyn Keyring>,
     revision: Mutex<Revision>,
 }
@@ -83,13 +84,22 @@ impl ProviderCredentialOwner {
     }
 
     fn with_keyring(
-        _credential_ref: &CredentialRef,
+        credential_ref: &CredentialRef,
         keyring: Arc<dyn Keyring>,
     ) -> ProviderCredentialOwner {
         ProviderCredentialOwner {
+            account: credential_ref.account().to_string(),
             keyring,
             revision: Mutex::new(Revision::INITIAL),
         }
+    }
+
+    /// The derived account this owner is bound to (e.g. `v1:anthropic`) — not a secret, safe to
+    /// compare against a wire request. A caller (e.g. the IPC server) must reject any request whose
+    /// account does not match this exactly, rather than answering for whatever the sole configured
+    /// owner happens to be regardless of which credential was actually asked for.
+    pub fn account(&self) -> &str {
+        &self.account
     }
 
     /// A test-only constructor for other modules' tests (e.g. `credential_bootstrap`) that need a
