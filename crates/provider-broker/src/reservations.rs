@@ -481,4 +481,111 @@ mod tests {
         );
         assert_eq!(reservations.snapshot().forwarded_requests, 1);
     }
+
+    #[test]
+    fn finalization_cannot_snapshot_between_a_concurrency_acquisitions_check_and_its_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let reservations = Arc::new(Reservations::new(limits()));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // A permit acquisition whose liveness check blocks after it passes, while still holding the
+        // lock.
+        let acquiring = {
+            let reservations = Arc::clone(&reservations);
+            thread::spawn(move || {
+                reservations.try_acquire_concurrency(|| {
+                    checked_tx.send(()).expect("signal the check");
+                    release_rx.recv().expect("wait for finalization attempt");
+                    Ok(())
+                })
+            })
+        };
+        checked_rx.recv().expect("the acquisition passed its check");
+
+        // A concurrent finalization must not observe the ledger until the admission commits.
+        let finalizing = {
+            let reservations = Arc::clone(&reservations);
+            thread::spawn(move || reservations.close_and_snapshot())
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finalizing.is_finished(),
+            "finalization must not snapshot while an acquisition holds the gate"
+        );
+
+        release_tx.send(()).expect("release the acquisition");
+        let permit = acquiring
+            .join()
+            .expect("acquisition thread")
+            .expect("the permit commits");
+        let snapshot = finalizing.join().expect("finalization thread");
+        assert_eq!(
+            snapshot.concurrent_requests, 1,
+            "the committed permit is in the finalized ledger"
+        );
+
+        // Once closed, no further acquisition commits even with a passing liveness check.
+        assert_eq!(
+            reservations.try_acquire_concurrency(|| Ok(())).unwrap_err(),
+            BrokerError::Unauthorized
+        );
+        assert_eq!(reservations.snapshot().concurrent_requests, 1);
+        drop(permit);
+        assert_eq!(reservations.snapshot().concurrent_requests, 0);
+    }
+
+    #[test]
+    fn finalization_cannot_snapshot_between_a_denials_check_and_its_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let reservations = Arc::new(Reservations::new(limits()));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // A denial whose liveness check blocks after it passes, while still holding the lock.
+        let recording = {
+            let reservations = Arc::clone(&reservations);
+            thread::spawn(move || {
+                reservations.record_denied(|| {
+                    checked_tx.send(()).expect("signal the check");
+                    release_rx.recv().expect("wait for finalization attempt");
+                    Ok(())
+                })
+            })
+        };
+        checked_rx.recv().expect("the denial passed its check");
+
+        // A concurrent finalization must not observe the ledger until the denial commits.
+        let finalizing = {
+            let reservations = Arc::clone(&reservations);
+            thread::spawn(move || reservations.close_and_snapshot())
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finalizing.is_finished(),
+            "finalization must not snapshot while a denial holds the gate"
+        );
+
+        release_tx.send(()).expect("release the denial");
+        recording
+            .join()
+            .expect("denial thread")
+            .expect("the denial commits");
+        let snapshot = finalizing.join().expect("finalization thread");
+        assert_eq!(
+            snapshot.denied_requests, 1,
+            "the committed denial is in the finalized ledger"
+        );
+
+        // Once closed, no further denial commits even with a passing liveness check.
+        assert_eq!(
+            reservations.record_denied(|| Ok(())).unwrap_err(),
+            BrokerError::Unauthorized
+        );
+        assert_eq!(reservations.snapshot().denied_requests, 1);
+    }
 }

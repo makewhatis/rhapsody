@@ -131,6 +131,10 @@ fn mint_token(inner: &Arc<TurnInner>) -> Result<(CapabilityToken, TokenDigest), 
             registry.grants.insert(digest, Arc::clone(inner));
             inner.mark_issued(digest);
         }
+        // Test-only: pause once the grant is published so a race test can interleave a receipt drop
+        // after the registry lock is released. Compiled out of production builds.
+        #[cfg(test)]
+        session.broker.mint_race.pause_after_insert();
         let token = CapabilityToken::from_encoded(encoded);
         inner.slot.set_access_live();
         return Ok((token, digest));
@@ -340,12 +344,106 @@ impl fmt::Debug for CapabilityGrant {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+
     use super::*;
+    use crate::binding::{BoundCredentialLease, CredentialBinding};
+    use crate::broker::{Broker, BrokerRegistrationPlan};
+    use crate::clock::ManualClock;
+    use crate::policy::{DEFAULT_BROKER_LIMITS, SessionPolicy};
+    use crate::random::ScriptedRandom;
+
+    const BASE_URL: &str = "http://127.0.0.1:41234/v1";
+    const ENDPOINT: &str = "https://api.example.com/v1";
 
     #[test]
     fn turn_meta_carries_an_optional_deadline() {
         assert_eq!(TurnMeta::without_deadline().deadline(), None);
         let at = MonotonicTime::from_nanos(5);
         assert_eq!(TurnMeta::new(Some(at)).deadline(), Some(at));
+    }
+
+    #[test]
+    fn a_mint_racing_a_receipt_drop_leaves_no_registered_dead_grant() {
+        let clock = Arc::new(ManualClock::new());
+        let rng = Arc::new(ScriptedRandom::new());
+        let broker = Broker::new(BASE_URL, clock, rng).expect("broker");
+        let plan = BrokerRegistrationPlan::new(
+            "provider-a",
+            BrokerProtocol::OpenAiChatCompletions,
+            ENDPOINT,
+            false,
+            "model-x",
+            DEFAULT_BROKER_LIMITS,
+        )
+        .expect("plan");
+        let binding = CredentialBinding::new(
+            "provider-a",
+            BrokerProtocol::OpenAiChatCompletions,
+            ENDPOINT,
+        )
+        .expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let mut registration = broker
+            .register_session(plan, lease, SessionPolicy::default())
+            .expect("registration");
+
+        let (attempt, receipt) = registration
+            .ledgers
+            .arm_turn(TurnMeta::without_deadline())
+            .expect("arm");
+
+        // Arm the rendezvous so the mint pauses *after* it has published (and digest-recorded) its
+        // grant and released the registry lock. A receipt drop can then be interleaved
+        // deterministically: `revoke_grant` must find the digest and remove the grant. If the digest
+        // is published outside that critical section, the drop sees no digest and leaves the grant
+        // registered.
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        registration
+            .session
+            .inner
+            .broker
+            .mint_race
+            .arm(reached_tx, resume_rx);
+
+        let minting = thread::spawn(move || attempt.mint_access());
+        reached_rx.recv().expect("the mint published its grant");
+
+        // A concurrent receipt drop revokes the turn. It is synchronous, so by the time it returns
+        // revocation is complete and the grant must be gone.
+        drop(receipt);
+        assert!(
+            lock(&registration.session.inner.broker.registry)
+                .grants
+                .is_empty(),
+            "a receipt drop must remove the minted grant, leaving no registered dead mintage"
+        );
+        resume_tx.send(()).expect("resume the mint");
+
+        let result = minting.join().expect("mint thread");
+        match result {
+            Ok(access) => {
+                // The mint won the race; its handle must be dead from the drop onward.
+                let token = access.api_key.expose_for_child(str::to_owned);
+                assert_eq!(
+                    broker.lookup_capability(&token).unwrap_err(),
+                    BrokerError::Unauthorized,
+                    "a handle returned by the race must be dead"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error, BrokerError::TurnRevoked, "a lost race fails closed");
+            }
+        }
+        assert!(
+            lock(&registration.session.inner.broker.registry)
+                .grants
+                .is_empty(),
+            "no grant may remain registered after the race settles"
+        );
     }
 }

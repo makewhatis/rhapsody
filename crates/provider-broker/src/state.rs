@@ -445,12 +445,51 @@ impl TurnInner {
     }
 }
 
+/// Test-only rendezvous that pauses a mint *after* it has inserted its grant and released the
+/// registry lock, so a race test can interleave a concurrent receipt drop deterministically. The
+/// pause is the last thing that happens before the mint returns its handle. Compiled out of
+/// production builds; a no-op unless a test arms it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MintRaceGate {
+    rendezvous: Mutex<Option<MintRaceRendezvous>>,
+}
+
+#[cfg(test)]
+struct MintRaceRendezvous {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl MintRaceGate {
+    pub(crate) fn arm(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *lock(&self.rendezvous) = Some(MintRaceRendezvous { reached, resume });
+    }
+
+    /// Called by a mint that has already published (and digest-recorded) its grant. Signals the test
+    /// that the grant is live and blocks until the test lets the mint continue.
+    pub(crate) fn pause_after_insert(&self) {
+        let rendezvous = lock(&self.rendezvous).take();
+        if let Some(rendezvous) = rendezvous {
+            let _ = rendezvous.reached.send(());
+            let _ = rendezvous.resume.recv();
+        }
+    }
+}
+
 /// The shared broker internals: listener-independent registry plus the injected clock/RNG.
 pub(crate) struct BrokerInner {
     pub(crate) base_url: String,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) rng: Arc<dyn RandomSource>,
     pub(crate) registry: Mutex<Registry>,
+    #[cfg(test)]
+    pub(crate) mint_race: MintRaceGate,
 }
 
 /// The capability registry. Sessions are held weakly (the [`crate::BrokerSession`] handle and live

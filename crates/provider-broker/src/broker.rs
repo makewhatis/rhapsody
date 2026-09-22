@@ -161,6 +161,8 @@ impl Broker {
                 clock,
                 rng,
                 registry: Mutex::new(Registry::default()),
+                #[cfg(test)]
+                mint_race: crate::state::MintRaceGate::default(),
             }),
         })
     }
