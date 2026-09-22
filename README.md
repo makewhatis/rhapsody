@@ -1642,10 +1642,13 @@ review identity) before spawning resolver work, so a preparation counts against 
 concurrency gate exactly as a live run does — and the selection ladder skips a gate-suppressed
 candidate *before* spending a slot, so one refused ticket cannot starve the queue behind it. The
 resolver reports back over the control channel; a completion is accepted only for the current token
-**and** config generation, after re-checking drain and revalidating the CURRENT board — the ticket's
-tracker state, labels, existence and selection fingerprint, or the review's last observed head/open
-state — so a state flap, a label change, a disappearance or a dismissed review cannot launch stale
-work. A stale completion drops its move-only payload without touching loop state. A cancellation
+**and** config generation and the loop's expected credential revision, after re-checking drain and
+revalidating the CURRENT board — the ticket's tracker state, labels, existence and selection
+fingerprint, or the review's last observed head/open state — so a state flap, a label change, a
+disappearance or a dismissed review cannot launch stale work. The SAME revalidation runs before a
+refusal is recorded, so a ticket that left the board while resolution was in flight gets neither a
+run nor a zero-turn row. A stale completion drops its move-only payload without touching loop state.
+A cancellation
 (reload/shutdown/a departed issue) re-parks a claim-held reservation exactly once, and the
 concurrency permit is owned by the resolver's own blocking work until it really exits — the loop
 hands the permit to the resolver rather than holding it, so a loop-side timeout that drops the
@@ -1690,9 +1693,14 @@ error strings: the completion carries the opaque revision only, and `PreparedDis
 
 The ticketless review path shares the same machinery: its watch-set writes move behind the
 preparation gate, and a review preparation or suppression returns `Preparing` without writing a row.
-The review-REOPEN path (a summoned review-state ticket) shares it too: the promote write runs first,
-the summons is captured, and the dispatch — including the run's mailbox seed — happens only after an
-accepted preparation, so no dispatch path bypasses the gate.
+A reservation STARTED by one sweep also spends that sweep's review budget, so a single sweep cannot
+prepare more rounds than `agent.max_concurrent_reviews` allows. The review-REOPEN path (a summoned
+review-state ticket) shares it too: the promote write (a Linear state move) and the summons are BOTH
+deferred until an accepted preparation, exactly as the pool claim election is — a refused, suppressed
+or stale reopen therefore leaves the ticket in its review state with its summons intact, so the
+reopen ladder re-offers it, and the dispatch (including the run's mailbox seed) happens only after
+acceptance. A dismissal cancels any in-flight preparation for its coordinate. No dispatch path
+bypasses the gate.
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)

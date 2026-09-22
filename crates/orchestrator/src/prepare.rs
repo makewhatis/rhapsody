@@ -1117,6 +1117,12 @@ impl Orchestrator {
                     if !self.review_reopen_eligible(&cur, &running) {
                         return PreparedValidity::Stale;
                     }
+                    // The reopen ladder's OTHER gate: a shared review↔author round budget spent
+                    // between begin and acceptance must still refuse, or the deferred promote would
+                    // move the ticket out of review for a run the ladder declined to authorize.
+                    if self.author_round_budget_spent(&cur) {
+                        return PreparedValidity::Stale;
+                    }
                     return PreparedValidity::Current;
                 }
                 let mut claimed = self.claimed.clone();
