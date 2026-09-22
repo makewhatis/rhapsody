@@ -288,20 +288,30 @@ fn raw_provider_from_definition(
         credential: Some(RawCredentialRef {
             source: def.credential.source.clone(),
         }),
-        broker_limits: Some(RawBrokerLimits {
-            forwarded_requests_per_turn: Some(l.forwarded_requests_per_turn),
-            denied_requests_before_revocation: Some(l.denied_requests_before_revocation),
-            concurrent_upstream_requests_per_turn: Some(l.concurrent_upstream_requests_per_turn),
-            json_request_bytes: Some(l.json_request_bytes),
-            aggregate_request_bytes_per_turn: Some(l.aggregate_request_bytes_per_turn),
-            response_bytes_per_request: Some(l.response_bytes_per_request),
-            aggregate_response_bytes_per_turn: Some(l.aggregate_response_bytes_per_turn),
-            requested_output_tokens_per_request: Some(l.requested_output_tokens_per_request),
-            reserved_token_units_per_turn: Some(l.reserved_token_units_per_turn),
-            reserved_token_units_per_session: Some(l.reserved_token_units_per_session),
-            capability_lifetime_ms: Some(l.capability_lifetime_ms),
-            max_reserved_token_units_per_utc_day: l.max_reserved_token_units_per_utc_day,
-        }),
+        // Emit the limits block ONLY when it differs from the V1 default column. Writing all eleven
+        // defaulted values on every Save would pin today's V1 defaults forever in an operator's file
+        // for a provider that never had a `broker_limits:` block at all; an absent block decodes to
+        // exactly the same values, so this still round-trips (the `allow_insecure_http` pattern).
+        broker_limits: if def.broker_limits == crate::providers::BrokerLimits::default() {
+            None
+        } else {
+            Some(RawBrokerLimits {
+                forwarded_requests_per_turn: Some(l.forwarded_requests_per_turn),
+                denied_requests_before_revocation: Some(l.denied_requests_before_revocation),
+                concurrent_upstream_requests_per_turn: Some(
+                    l.concurrent_upstream_requests_per_turn,
+                ),
+                json_request_bytes: Some(l.json_request_bytes),
+                aggregate_request_bytes_per_turn: Some(l.aggregate_request_bytes_per_turn),
+                response_bytes_per_request: Some(l.response_bytes_per_request),
+                aggregate_response_bytes_per_turn: Some(l.aggregate_response_bytes_per_turn),
+                requested_output_tokens_per_request: Some(l.requested_output_tokens_per_request),
+                reserved_token_units_per_turn: Some(l.reserved_token_units_per_turn),
+                reserved_token_units_per_session: Some(l.reserved_token_units_per_session),
+                capability_lifetime_ms: Some(l.capability_lifetime_ms),
+                max_reserved_token_units_per_utc_day: l.max_reserved_token_units_per_utc_day,
+            })
+        },
     }
 }
 
@@ -1220,6 +1230,35 @@ mod tests {
         assert!(re_encode_decode(&absent).providers.is_empty());
     }
 
+    // A provider with no `broker_limits:` block must emit NO broker_limits key on encode — the
+    // defaulted V1 column is not pinned into the operator's file — yet still decode back identically.
+    #[test]
+    fn encoded_provider_omits_the_default_broker_limits_block() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        let def = encode(&c).expect("encode");
+        let entry = def
+            .config
+            .get("providers")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get("fireworks"))
+            .and_then(Value::as_mapping)
+            .expect("provider entry present");
+        assert!(
+            !entry.contains_key("broker_limits"),
+            "a defaulted broker_limits block must not be written into the file: {entry:?}"
+        );
+        assert_eq!(
+            re_encode_decode(&c).providers,
+            c.providers,
+            "omitting the defaulted block must still round-trip"
+        );
+    }
+
     // MUTATION GUARD (secret hygiene / serialization shape): the serialized provider entry carries
     // EXACTLY the non-secret keys the design allows. Adding a secret-bearing field that reaches the
     // front matter changes this key set and reds the test.
@@ -1247,14 +1286,9 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec![
-                "base_url",
-                "broker_limits",
-                "credential",
-                "display_name",
-                "protocol",
-            ],
-            "the serialized provider entry must carry no secret-bearing key"
+            vec!["base_url", "credential", "display_name", "protocol"],
+            "the serialized provider entry must carry no secret-bearing key; the defaulted \
+             broker_limits block is omitted rather than pinned into the file"
         );
         let credential = entry
             .get("credential")

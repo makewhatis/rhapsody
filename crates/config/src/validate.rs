@@ -28,8 +28,8 @@ use crate::model::{
 };
 use crate::projects::{EffectiveConfig, effective_for};
 use crate::providers::{
-    CREDENTIAL_SOURCE_KEYCHAIN, MAX_PROVIDERS, PROTOCOL_OPENAI_COMPATIBLE, base_url_scheme,
-    canonical_provider_id,
+    CREDENTIAL_SOURCE_KEYCHAIN, MAX_PROVIDERS, PROTOCOL_OPENAI_COMPATIBLE,
+    PROVIDER_HARNESS_BACKENDS, base_url_scheme, canonical_provider_id,
 };
 use crate::resolve::Resolved;
 
@@ -196,15 +196,13 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// The harness's own turn deadline in milliseconds, used to bound a provider's capability lifetime
-/// (`provider-broker-design.md` §8.1). Mirrors the backend→timeout mapping the runners use.
-fn turn_timeout_ms(config: &Resolved) -> u64 {
-    let ms = match config.agent.backend.as_str() {
-        "opencode" => config.opencode.turn_timeout_ms,
-        "codex" => config.codex.turn_timeout_ms,
-        _ => config.claude.turn_timeout_ms,
-    };
-    ms.max(0) as u64
+/// The effective turn deadline (milliseconds) that bounds a provider's capability lifetime
+/// (`provider-broker-design.md` §8.1). V1 materializes providers for OpenCode only, so this is
+/// OpenCode's deadline with an absent/explicit-`0` value materialized to one hour exactly as the
+/// runner does — never the SELECTED backend's deadline, so a `providers:` block on a Claude install
+/// is not failed by a provider that Claude will never consume.
+fn provider_turn_deadline_ms(config: &Resolved) -> u64 {
+    crate::providers::provider_turn_deadline_ms(config.opencode.turn_timeout_ms)
 }
 
 /// Validates the provider configuration (STUDIO-984; Rhapsody-only). Every scope's EFFECTIVE set is
@@ -217,7 +215,7 @@ fn turn_timeout_ms(config: &Resolved) -> u64 {
 /// `allow_insecure_http` policy honored; a supported credential source kind; validated broker limits;
 /// and — for an explicit selection — OpenCode only in v1 with an exact, transport-valid model.
 fn validate_providers(config: &Resolved) -> Result<(), ValidationError> {
-    let turn_timeout = turn_timeout_ms(config);
+    let turn_timeout = provider_turn_deadline_ms(config);
     validate_provider_map("global", &config.providers, turn_timeout)?;
     for (i, p) in config.projects.iter().enumerate() {
         let mut merged = config.providers.clone();
@@ -240,7 +238,7 @@ fn validate_providers(config: &Resolved) -> Result<(), ValidationError> {
     }
     // V1 scopes provider materialization to OpenCode (`provider-auth-design.md` §3). Claude keeps its
     // native login path; selecting an explicit provider with it is refused.
-    if config.agent.backend != "opencode" {
+    if !PROVIDER_HARNESS_BACKENDS.contains(&config.agent.backend.as_str()) {
         return Err(ValidationError::UnsupportedProviderHarness(format!(
             "agent.backend {:?} has no provider adapter in v1; only opencode can consume a provider \
              (got agent.provider {:?})",
@@ -1319,6 +1317,49 @@ mod tests {
         assert!(err.to_string().contains("max 256"), "{err}");
     }
 
+    // MUTATION GUARD: the per-project overlay is validated against the EFFECTIVE merged set, not the
+    // project's own map. Seeding `merged` with an empty map instead of the global providers leaves
+    // every other test green while accepting a 250-global + 10-project = 260-provider registry.
+    #[test]
+    fn project_overlay_counts_against_the_effective_ceiling() {
+        let mut front = String::from(
+            "tracker:\n  kind: linear\n  api_key: tok\nrepo: git@github.com:o/x.git\nproviders:\n",
+        );
+        for i in 0..250 {
+            front.push_str(&format!(
+                "  g{i}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            ));
+        }
+        front.push_str("projects:\n  - name: P\n    slugs: [a-1]\n    providers:\n");
+        for i in 0..10 {
+            front.push_str(&format!(
+                "      p{i}:\n        protocol: openai-compatible\n        base_url: https://example/v1\n        credential:\n          source: keychain\n"
+            ));
+        }
+        let mut c = cfg_from(&front, "body");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::TooManyProviders(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("project 0"), "{err}");
+
+        // A project entry that OVERLAYS an existing id does not add to the effective count.
+        let mut front = String::from(
+            "tracker:\n  kind: linear\n  api_key: tok\nrepo: git@github.com:o/x.git\nproviders:\n",
+        );
+        for i in 0..250 {
+            front.push_str(&format!(
+                "  g{i}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            ));
+        }
+        front.push_str(
+            "projects:\n  - name: P\n    slugs: [a-1]\n    providers:\n      g0:\n        protocol: openai-compatible\n        base_url: https://overlay.example/v1\n        credential:\n          source: keychain\n",
+        );
+        let mut c = cfg_from(&front, "body");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+    }
+
     // MUTATION GUARD: non-canonical ids (uppercase, leading digit, dot) are rejected, never
     // case-folded. A parser that lowercases first reds the uppercase row.
     #[test]
@@ -1420,6 +1461,47 @@ mod tests {
             validate(&mut c),
             Err(ValidationError::InvalidProvider(_))
         ));
+    }
+
+    // MUTATION GUARD (capability lifetime vs the effective turn deadline): the defaulted lifetime is
+    // min(1h, OpenCode's deadline, 0 ⇒ 1h), so a sub-hour deadline TIGHTENS it instead of failing, and
+    // a `providers:` block on a Claude install (a provider Claude never consumes) is not failed by
+    // Claude's deadline. Refusing on the raw configured deadline reds the first two rows.
+    #[test]
+    fn provider_capability_lifetime_uses_the_effective_turn_deadline() {
+        // Explicit turn_timeout_ms: 0 means one hour, exactly as the runner materializes it.
+        let zero = format!("{}opencode:\n  turn_timeout_ms: 0\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&zero, "opencode", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+
+        // A lowered deadline: the defaulted lifetime becomes min(1h, deadline) rather than a refusal.
+        let sub_hour = format!("{}opencode:\n  turn_timeout_ms: 1800000\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&sub_hour, "opencode", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            1_800_000
+        );
+
+        // A provider merely DEFINED on a Claude install is inert and must not fail preflight.
+        let claude = format!("{}claude:\n  turn_timeout_ms: 1800000\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&claude, "claude", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+
+        // An EXPLICIT lifetime longer than the effective deadline is still refused.
+        let explicit_over = format!(
+            "{}opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n    broker_limits:\n      capability_lifetime_ms: 3600000\n"
+        );
+        let mut c = provider_cfg(&explicit_over, "opencode", "", "");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProvider(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("capability_lifetime_ms"), "{err}");
     }
 
     // MUTATION GUARD: an explicit provider with a non-OpenCode harness is refused in v1.

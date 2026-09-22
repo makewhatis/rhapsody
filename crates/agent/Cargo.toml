@@ -74,6 +74,12 @@ tokio = { version = "1", features = ["macros", "rt", "time", "io-util", "process
 # used to build the `/api/v1/runs/{id}/events`-shaped objects the gate compares, is already a
 # non-test dependency above and needs no dev re-declaration.)
 harness-fixtures = { path = "../harness-fixtures" }
+# rhapsody-config (test-only, STUDIO-984 review): the harness registry's provider-protocol
+# compatibility must AGREE with config's provider-selection policy, and config cannot depend on this
+# crate (layering). This dev-dependency exists solely for the cross-crate pin tests in
+# `src/harness.rs` that assert the two declarations cannot drift. Workspace-internal path dep — no
+# new external crate enters Cargo.lock.
+rhapsody-config = { path = "../config" }
 
 [lints]
 workspace = true

@@ -12,7 +12,9 @@
 //! none may be added: `provider-auth-design.md` §2.2 says `WORKFLOW.md` "never stores an API key,
 //! refresh token, OAuth secret, generated OpenCode `auth.json`, or provider response". The runtime
 //! types that DO touch a credential live in later slices (`ResolvedProviderPlan` here, then PB5's
-//! move-only `PreparedProvider`), and even they never carry a reusable key.
+//! move-only `PreparedProvider`), and even they never carry a reusable key. The one string field that
+//! could smuggle a secret — `base_url` — is checked for exactly that: userinfo, a query string, and a
+//! fragment are refused ([`reject_secret_bearing_url_parts`]).
 //!
 //! # The cross-surface identifier and binding contracts
 //!
@@ -64,6 +66,13 @@ pub const ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1: &str = "openai-chat-complet
 
 /// The only credential source kind v1 accepts. A *kind*, never an account name and never a value.
 pub const CREDENTIAL_SOURCE_KEYCHAIN: &str = "keychain";
+
+/// The `agent.backend` values v1 permits an explicit Rhapsody provider on (`provider-auth-design.md`
+/// §3: "V1 deliberately enables only the measured OpenCode row"). The ONE compatibility switch lives
+/// in `rhapsody-agent`'s `HARNESS_REGISTRY`; config cannot depend on that crate (layering), so this
+/// constant is config's declaration of the same subset and a cross-crate pin test in `rhapsody-agent`
+/// asserts the two agree — adding a protocol to a registry row without teaching config reds it.
+pub const PROVIDER_HARNESS_BACKENDS: &[&str] = &["opencode"];
 
 // ---------------------------------------------------------------------------
 // Broker limits: V1 defaults and daemon hard ceilings (`provider-broker-design.md` §8.1)
@@ -124,6 +133,28 @@ pub struct BrokerLimits {
     /// key — means no Rhapsody daily cap. When present it is a checked positive `u64`, may be lower
     /// than one run cap, and needs durable budget storage available at runtime.
     pub max_reserved_token_units_per_utc_day: Option<u64>,
+}
+
+/// The effective turn deadline (milliseconds) of the harness that consumes providers in v1 —
+/// OpenCode, the one harness `provider-auth-design.md` §3 materializes providers for. An absent,
+/// explicit-`0`, or negative configured timeout means one hour, exactly as the runners materialize
+/// it (`opencode/runner.rs`, `claude/runner.rs`), so a defaulted config is never invalid merely
+/// because the operator wrote `turn_timeout_ms: 0` to mean "no limit".
+pub fn provider_turn_deadline_ms(configured_ms: i64) -> u64 {
+    let ms = configured_ms.max(0) as u64;
+    if ms == 0 {
+        DEFAULT_CAPABILITY_LIFETIME_MS
+    } else {
+        ms
+    }
+}
+
+/// The V1 default capability lifetime for an effective turn deadline: `min(1 hour, deadline)`
+/// (`provider-broker-design.md` §8.1's "current turn deadline, at most 1 hour"). A harness deadline
+/// shorter than an hour TIGHTENS the defaulted lifetime rather than making the default config
+/// invalid — refusing instead would make any `providers:` block unusable on a sub-hour install.
+pub fn default_capability_lifetime_ms(turn_deadline_ms: u64) -> u64 {
+    DEFAULT_CAPABILITY_LIFETIME_MS.min(turn_deadline_ms)
 }
 
 impl Default for BrokerLimits {
@@ -275,11 +306,11 @@ impl BrokerLimits {
 /// adding a `value`/`token`/`key` field would make a reusable secret representable in YAML, which
 /// the acceptance contract forbids.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CredentialRef {
+pub struct CredentialSource {
     pub source: String,
 }
 
-impl CredentialRef {
+impl CredentialSource {
     /// Reports whether this names the one credential source v1 accepts.
     pub fn is_supported(&self) -> bool {
         self.source == CREDENTIAL_SOURCE_KEYCHAIN
@@ -309,7 +340,7 @@ pub struct ProviderDefinition {
     /// `true` on `https`. Never inferred from addressing or child input.
     pub allow_insecure_http: bool,
     /// Where the credential lives; a storage kind, never a value.
-    pub credential: CredentialRef,
+    pub credential: CredentialSource,
     /// Validated broker limits; the V1 default column when the workflow omits the block.
     pub broker_limits: BrokerLimits,
 }
@@ -387,7 +418,7 @@ pub fn validate_model_id(model: &str) -> Result<(), String> {
     if model.trim() != model {
         return Err("model id must not have surrounding whitespace".to_string());
     }
-    if model.chars().any(|c| c.is_control() || c == '\0') {
+    if model.chars().any(char::is_control) {
         return Err("model id must not contain control or NUL bytes".to_string());
     }
     Ok(())
@@ -415,6 +446,8 @@ impl BaseUrlScheme {
 /// (`provider-auth-design.md` §2.2):
 ///
 /// * the URL must be absolute with an `http`/`https` scheme and a non-empty host;
+/// * it must carry no userinfo, query string, or fragment — the parts that can smuggle a reusable
+///   secret into `WORKFLOW.md` (see [`reject_secret_bearing_url_parts`]);
 /// * `allow_insecure_http` must be `true` for an `http` base URL;
 /// * `allow_insecure_http: true` is REJECTED on an `https` base URL (an explicit `false` or an
 ///   omitted value is fine there).
@@ -433,6 +466,7 @@ pub fn base_url_scheme(base_url: &str, allow_insecure_http: bool) -> Result<Base
     if rest.is_empty() || rest.starts_with('/') {
         return Err(format!("base_url {base_url:?} has no host"));
     }
+    reject_secret_bearing_url_parts(base_url, rest)?;
     match scheme {
         BaseUrlScheme::Http if !allow_insecure_http => Err(format!(
             "base_url {base_url:?} is http but allow_insecure_http is not true"
@@ -453,12 +487,45 @@ fn split_scheme(url: &str) -> Option<(&str, &str)> {
     Some((scheme, rest))
 }
 
+/// Refuses the `base_url` parts that could carry a reusable secret, or that cannot be part of a
+/// protocol root: userinfo (`user:password@` — an `@` in the authority), a query string (`?…`), and a
+/// fragment (`#…`). `rest` is everything after `scheme://`.
+///
+/// Without this, `https://sk-live-SECRET@api.example/v1` and
+/// `https://api.example/v1?api_key=sk-SECRET` both validate and then flow into the credential binding
+/// identity and the operator-facing config view — contradicting the module's "secrets are
+/// structurally unrepresentable" guarantee, since a reusable key would round-trip through YAML.
+fn reject_secret_bearing_url_parts(base_url: &str, rest: &str) -> Result<(), String> {
+    let authority = match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    if authority.contains('@') {
+        return Err(format!(
+            "base_url {base_url:?} must not contain userinfo (an `@` in the authority)"
+        ));
+    }
+    if rest.contains('?') {
+        return Err(format!(
+            "base_url {base_url:?} must not contain a query string"
+        ));
+    }
+    if rest.contains('#') {
+        return Err(format!(
+            "base_url {base_url:?} must not contain a URL fragment"
+        ));
+    }
+    Ok(())
+}
+
 /// Normalizes a `base_url` to the OpenAI client protocol base immediately above
 /// `chat/completions` (`provider-auth-design.md` §2.2 / the ticket's "Ways to get this wrong").
 ///
 /// The rule is exactly: strip a trailing `/`; then append `/v1` ONLY when the path does not already
 /// end in `/v1`. A base ending in `/v1` or `/inference/v1` is therefore unchanged, so a subsequent
-/// [`chat_completions_url`] never grows a second `/v1`.
+/// [`chat_completions_url`] never grows a second `/v1`. Like [`base_url_scheme`], it refuses a URL
+/// carrying userinfo, a query, or a fragment ([`reject_secret_bearing_url_parts`]) so no caller can
+/// derive a binding or a view from a secret-bearing endpoint.
 pub fn normalize_provider_base_url(base_url: &str) -> Result<String, String> {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -471,6 +538,7 @@ pub fn normalize_provider_base_url(base_url: &str) -> Result<String, String> {
     if rest.is_empty() || rest.starts_with('/') {
         return Err(format!("base_url {base_url:?} has no host"));
     }
+    reject_secret_bearing_url_parts(base_url, rest)?;
     if trimmed.ends_with("/v1") {
         return Ok(trimmed.to_string());
     }
@@ -528,9 +596,10 @@ impl CredentialBinding {
 /// is safe to compute in a control task or a GET handler's snapshot — the actual credential read is
 /// P9's off-loop job.
 ///
-/// [`Self::revision`] is a stable digest over the canonical bindings and their limits: two provider
-/// sets with the same bindings and limits share a revision, and any change to a binding, a limit, or
-/// the set itself moves it. [`Self::bindings`] names exactly which non-secret status P9 must refresh.
+/// [`Self::revision`] is a stable digest over the canonical bindings, the non-secret metadata
+/// (protocol, TLS policy, credential source), and their limits: two provider sets with the same
+/// values share a revision, and any change to a binding, a metadata field, a limit, or the set
+/// itself moves it. [`Self::bindings`] names exactly which non-secret status P9 must refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderReload {
     revision: u64,
@@ -554,6 +623,16 @@ impl ProviderReload {
                 },
             };
             hash = fnv1a(hash, binding.identity().as_bytes());
+            // Every non-secret field P9's status shows is part of the revision, so a protocol, TLS
+            // policy, or credential-source change moves it even when the endpoint does not.
+            for part in [
+                def.protocol.as_str(),
+                def.credential.source.as_str(),
+                if def.allow_insecure_http { "1" } else { "0" },
+            ] {
+                hash = fnv1a(hash, part.as_bytes());
+                hash = fnv1a(hash, &[0x1f]);
+            }
             // The limits are part of what P9's status shows, so ANY limits change is a change too.
             let l = &def.broker_limits;
             for value in [
@@ -623,7 +702,7 @@ mod tests {
             display_name: String::new(),
             base_url: base_url.to_string(),
             allow_insecure_http,
-            credential: CredentialRef {
+            credential: CredentialSource {
                 source: CREDENTIAL_SOURCE_KEYCHAIN.to_string(),
             },
             broker_limits: BrokerLimits::default(),
@@ -641,6 +720,7 @@ mod tests {
             "a_b_c",
             "z9",
             "a-very-long-id",
+            "trailing-", // a trailing '-' IS allowed; '-' is legal after the first char
         ] {
             assert!(
                 canonical_provider_id(ok).is_ok(),
@@ -655,12 +735,8 @@ mod tests {
             "_lead",     // must start with a letter
             "has space",
             "has.dot",
-            "café",      // non-ASCII
-            "trailing-", // trailing '-' is actually allowed; kept out of `bad` below
+            "café", // non-ASCII
         ] {
-            if bad == "trailing-" {
-                continue;
-            }
             assert!(
                 canonical_provider_id(bad).is_err(),
                 "{bad:?} should be rejected"
@@ -696,6 +772,29 @@ mod tests {
         assert!(base_url_scheme("ftp://api.example/v1", false).is_err());
         assert!(base_url_scheme("api.example/v1", false).is_err());
         assert!(base_url_scheme("https:///v1", false).is_err());
+    }
+
+    // MUTATION GUARD (a secret must never be representable in `base_url`): userinfo, a query string,
+    // and a fragment are each refused by BOTH the TLS-policy check and normalization. An
+    // implementation that only checks scheme+host accepts `https://sk-live-SECRET@api.example/v1` and
+    // `https://api.example/v1?api_key=sk-SECRET` (the latter even normalizes to
+    // `…/v1?api_key=sk-SECRET/v1`), letting a reusable key round-trip through WORKFLOW.md — reds the
+    // first three rows below.
+    #[test]
+    fn base_url_refuses_secret_bearing_parts_table() {
+        let userinfo = "https://sk-live-SECRET@api.fireworks.ai/inference/v1";
+        let query = "https://api.fireworks.ai/inference/v1?api_key=sk-SECRET";
+        let fragment = "https://api.fireworks.ai/inference/v1#sk-SECRET";
+        for bad in [userinfo, query, fragment] {
+            assert!(
+                base_url_scheme(bad, false).is_err(),
+                "{bad:?} must be refused by the TLS-policy check"
+            );
+            assert!(
+                normalize_provider_base_url(bad).is_err(),
+                "{bad:?} must be refused by normalization"
+            );
+        }
     }
 
     // MUTATION GUARD (`/v1` must not be appended unconditionally): a base that already ends in
@@ -772,6 +871,72 @@ mod tests {
         // The identity is stable and contains no secret-looking value.
         assert_eq!(binding.identity(), binding.identity());
         assert!(!binding.identity().contains("Fireworks"));
+    }
+
+    // CROSS-CRATE PIN (STUDIO-984 review): `canonical_provider_id` must accept EXACTLY what the
+    // credential-owner crate's `CredentialRef::for_provider` accepts, and the derived `v1:<id>`
+    // Keychain account must be identical. Two parsers that drift would let YAML accept an id the
+    // credential owner refuses (or vice versa) — the disagreement the "one parser" rule forbids.
+    // `rhapsody-config` cannot depend on the owner crate at runtime (layering), so this test is the
+    // pin rather than a shared call.
+    #[test]
+    fn canonical_provider_id_agrees_with_the_credential_ipc_parser() {
+        let mut ok: Vec<String> = vec![
+            "a".into(),
+            "fireworks".into(),
+            "fireworks-ai".into(),
+            "a_b_c".into(),
+            "z9".into(),
+            "a-very-long-id".into(),
+            "trailing-".into(),
+        ];
+        ok.push("a".repeat(PROVIDER_ID_MAX_LEN));
+        for id in &ok {
+            assert!(
+                canonical_provider_id(id).is_ok(),
+                "{id:?} must be canonical"
+            );
+            assert!(
+                rhapsody_credential_ipc::domain::CredentialRef::for_provider(id).is_ok(),
+                "{id:?} must be accepted by the credential owner too"
+            );
+        }
+        let mut bad: Vec<String> = vec![
+            String::new(),
+            "Fireworks".into(),
+            "9lives".into(),
+            "-lead".into(),
+            "_lead".into(),
+            "has space".into(),
+            "has.dot".into(),
+            "café".into(),
+        ];
+        bad.push("a".repeat(PROVIDER_ID_MAX_LEN + 1));
+        for id in &bad {
+            assert!(
+                canonical_provider_id(id).is_err(),
+                "{id:?} must be rejected"
+            );
+            assert!(
+                rhapsody_credential_ipc::domain::CredentialRef::for_provider(id).is_err(),
+                "{id:?} must be rejected by the credential owner too"
+            );
+        }
+        // The derived accounts and binding fields are identical across the two crates.
+        let binding = provider("fireworks", "https://api.example/v1", false)
+            .credential_binding()
+            .unwrap();
+        let ipc =
+            rhapsody_credential_ipc::domain::CredentialRef::for_provider("fireworks").unwrap();
+        assert_eq!(binding.keychain_account(), ipc.account());
+        let ipc_binding = rhapsody_credential_ipc::domain::Binding {
+            provider_id: binding.provider_id.clone(),
+            adapter: binding.adapter.clone(),
+            base_url: binding.base_url.clone(),
+        };
+        assert_eq!(ipc_binding.provider_id, binding.provider_id);
+        assert_eq!(ipc_binding.adapter, binding.adapter);
+        assert_eq!(ipc_binding.base_url, binding.base_url);
     }
 
     // Broker limits: the default column materializes exactly, and the daily cap has no implicit
@@ -911,6 +1076,17 @@ mod tests {
             .broker_limits
             .reserved_token_units_per_session = 1;
         assert!(ProviderReload::from_providers(&d).changed_from(Some(r1.revision())));
+
+        // A metadata-only change (TLS policy, protocol, credential source) is a change too.
+        let mut e = a.clone();
+        e.get_mut("fireworks").unwrap().allow_insecure_http = true;
+        assert!(ProviderReload::from_providers(&e).changed_from(Some(r1.revision())));
+        let mut f = a.clone();
+        f.get_mut("fireworks").unwrap().protocol = "anthropic-messages".to_string();
+        assert!(ProviderReload::from_providers(&f).changed_from(Some(r1.revision())));
+        let mut g = a.clone();
+        g.get_mut("fireworks").unwrap().credential.source = "env-file".to_string();
+        assert!(ProviderReload::from_providers(&g).changed_from(Some(r1.revision())));
     }
 
     // A malformed base URL must not panic the pure signal; it contributes an empty endpoint.

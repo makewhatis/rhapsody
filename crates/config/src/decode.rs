@@ -22,7 +22,7 @@ use crate::model::{
     ProviderBudget, Raw, RawBrokerLimits, RawClaudeOverride, RawProject, RawProviderDefinition,
     Server, Storage, Tracker, Workspace,
 };
-use crate::providers::{BrokerLimits, CredentialRef, ProviderDefinition};
+use crate::providers::{BrokerLimits, CredentialSource, ProviderDefinition};
 use crate::workflow::Definition;
 
 /// Errors from [`decode`]. `Parse` Displays with Go's `workflow_parse_error` sentinel token
@@ -238,7 +238,15 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 
     // multi-project routing — overrides mapped verbatim (nil preserved) so ResolveProjects can
     // tell inherit from set; a workflow without `projects:` decodes to repo == "" and no projects.
-    let projects = r.projects.into_iter().map(decode_project).collect();
+    // Providers are consumed only by OpenCode in v1, so their defaulted capability lifetime is
+    // bounded by OpenCode's effective turn deadline (an absent/0 timeout means one hour).
+    let provider_deadline_ms =
+        crate::providers::provider_turn_deadline_ms(opencode.turn_timeout_ms);
+    let projects = r
+        .projects
+        .into_iter()
+        .map(|p| decode_project(p, provider_deadline_ms))
+        .collect();
 
     // Per-provider daily token budgets (STUDIO-957). Rhapsody-only, and deliberately absent from
     // `effective_json`/`encode` parity surfaces (the `allow_handoff` pattern): an absent value is
@@ -264,7 +272,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         .providers
         .into_iter()
         .map(|(id, rp)| {
-            let def = decode_provider(rp);
+            let def = decode_provider(rp, provider_deadline_ms);
             (id.clone(), ProviderDefinition { id, ..def })
         })
         .collect();
@@ -305,7 +313,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 /// Maps one raw project entry to a typed [`Project`] (Go `decodeProject`). Override fields are
 /// preserved verbatim (nil/None ⇒ inherit) with no defaults applied, except per-project hook
 /// timeout which defaults like the top level.
-fn decode_project(rp: RawProject) -> Project {
+fn decode_project(rp: RawProject, provider_deadline_ms: u64) -> Project {
     // An all-empty `claude: {}` block decodes to a non-nil zero override; Go normalizes it to
     // absent so the first Encode is already canonical and the on-disk shape is save-stable
     // (INF-224). `Option::filter` drops the empty override to None, mirroring that.
@@ -368,7 +376,7 @@ fn decode_project(rp: RawProject) -> Project {
             .providers
             .into_iter()
             .map(|(id, rp)| {
-                let def = decode_provider(rp);
+                let def = decode_provider(rp, provider_deadline_ms);
                 (id.clone(), ProviderDefinition { id, ..def })
             })
             .collect(),
@@ -378,8 +386,9 @@ fn decode_project(rp: RawProject) -> Project {
 /// Maps one raw provider definition to its typed form (STUDIO-984). All defaults are materialized
 /// here — `allow_insecure_http` false, the credential source verbatim (validated later), and the V1
 /// broker-limits default column — so the typed definition is complete without a second defaulting
-/// stage. The `id` is stamped by the caller from the map key.
-fn decode_provider(rp: RawProviderDefinition) -> ProviderDefinition {
+/// stage. `provider_deadline_ms` is the effective turn deadline (OpenCode's) the defaulted capability
+/// lifetime is bounded by. The `id` is stamped by the caller from the map key.
+fn decode_provider(rp: RawProviderDefinition, provider_deadline_ms: u64) -> ProviderDefinition {
     ProviderDefinition {
         id: String::new(),
         protocol: rp.protocol,
@@ -388,19 +397,24 @@ fn decode_provider(rp: RawProviderDefinition) -> ProviderDefinition {
         allow_insecure_http: or_bool(rp.allow_insecure_http, false),
         credential: rp
             .credential
-            .map(|c| CredentialRef { source: c.source })
+            .map(|c| CredentialSource { source: c.source })
             .unwrap_or_default(),
-        broker_limits: decode_broker_limits(rp.broker_limits),
+        broker_limits: decode_broker_limits(rp.broker_limits, provider_deadline_ms),
     }
 }
 
 /// Materializes the V1 broker-limits default column (`provider-broker-design.md` §8.1) over an
 /// optional raw block. An explicit value — including an explicit `0` — is carried verbatim and
-/// validated later, so a zero is refused rather than silently defaulted away.
-fn decode_broker_limits(raw: Option<RawBrokerLimits>) -> BrokerLimits {
+/// validated later, so a zero is refused rather than silently defaulted away. The defaulted
+/// `capability_lifetime_ms` is `min(1h, provider_deadline_ms)`.
+fn decode_broker_limits(raw: Option<RawBrokerLimits>, provider_deadline_ms: u64) -> BrokerLimits {
     let d = BrokerLimits::default();
+    let lifetime_default = crate::providers::default_capability_lifetime_ms(provider_deadline_ms);
     let Some(r) = raw else {
-        return d;
+        return BrokerLimits {
+            capability_lifetime_ms: lifetime_default,
+            ..d
+        };
     };
     BrokerLimits {
         forwarded_requests_per_turn: r
@@ -431,7 +445,7 @@ fn decode_broker_limits(raw: Option<RawBrokerLimits>) -> BrokerLimits {
         reserved_token_units_per_session: r
             .reserved_token_units_per_session
             .unwrap_or(d.reserved_token_units_per_session),
-        capability_lifetime_ms: r.capability_lifetime_ms.unwrap_or(d.capability_lifetime_ms),
+        capability_lifetime_ms: r.capability_lifetime_ms.unwrap_or(lifetime_default),
         max_reserved_token_units_per_utc_day: r.max_reserved_token_units_per_utc_day,
     }
 }

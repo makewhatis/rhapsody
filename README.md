@@ -2549,7 +2549,8 @@ config goldens and an old-vs-new round-trip test.
 - **`base_url` is the protocol root immediately above `chat/completions`.** Normalization strips a
   trailing `/` and appends `/v1` only when the path does not already end in `/v1`, so
   `https://api.fireworks.ai/inference/v1` and `https://api.openai.com/v1` are left alone and never
-  grow a second `/v1`.
+  grow a second `/v1`. A URL carrying userinfo (`user:pass@`), a query string, or a fragment is
+  refused — those are the parts that could smuggle a reusable key into `WORKFLOW.md`.
 - **TLS policy is explicit.** `allow_insecure_http` defaults `false`, is required `true` for an
   `http` base URL, and is rejected `true` on `https`; an omitted or explicit `false` value on
   `https` round-trips identically. It is operator policy, never inferred from loopback/private
@@ -2565,8 +2566,15 @@ config goldens and an old-vs-new round-trip test.
   arbitrary Keychain item.
 - **V1 materializes providers for OpenCode only.** An explicit provider with `agent.backend: claude`
   is a typed refusal; Claude keeps its native login path. The one harness registry in
-  `rhapsody-agent` declares which provider protocols each adapter can consume, so there is no second
-  compatibility switch in config.
+  `rhapsody-agent` (`HARNESS_REGISTRY`) declares which provider protocols each adapter can consume;
+  config does not depend on that crate (layering), so it declares the same accepted-backend subset in
+  `PROVIDER_HARNESS_BACKENDS` and a cross-crate pin test asserts the two declarations agree — adding a
+  protocol to a registry row without teaching config reds that test rather than drifting silently.
+- **The defaulted broker-limits column is not pinned into the file.** A provider with no
+  `broker_limits:` block is validated against the V1 defaults (with the capability lifetime bounded
+  by OpenCode's effective turn deadline, `min(1h, deadline)`) but `encode` omits the block, so a
+  console Save does not freeze today's defaults into an operator's `WORKFLOW.md`. An explicit block
+  round-trips verbatim.
 - **Brokered OpenCode is version-gated and fail-closed.** The supported-version table is
   single-sourced from the PB0 probe (`1.18.30` / `@ai-sdk/openai-compatible` `2.0.41`), and the
   initial row accepts only an empty or `build` `opencode.agent`, an empty `variant`, an

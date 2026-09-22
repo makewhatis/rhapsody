@@ -656,6 +656,42 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    promote_from_stat
         );
     }
 
+    // STUDIO-984 (Rhapsody-only, DATA-LOSS class): per-project provider definitions are NOT surfaced
+    // in the typed view either, so `project_from_json` carries them forward from the base project like
+    // `promote_from_states`. Before the fix a Settings save rebuilt each project from
+    // `Project::default()` and silently deleted its whole `providers:` block. Observed on the file
+    // itself, since the typed view never echoes per-project providers back.
+    #[tokio::test]
+    async fn config_post_typed_preserves_per_project_providers() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n\
+repo: git@github.com:o/infra.git\n\
+agent:\n  backend: claude\n\
+providers:\n  globalp:\n    protocol: openai-compatible\n    base_url: https://global.example/v1\n    credential:\n      source: keychain\n\
+projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    providers:\n      projp:\n        protocol: openai-compatible\n        base_url: https://project.example/v1\n        credential:\n          source: keychain\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let got1 = get_config_ok(&base).await;
+        let before = fs::read_to_string(wf.path()).expect("read WORKFLOW.md");
+        assert!(
+            before.contains("projp") && before.contains("https://project.example/v1"),
+            "precondition: the fixture must define a per-project provider:\n{before}"
+        );
+        let resp = post_config(&base, &got1).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+        let after = fs::read_to_string(wf.path()).expect("read WORKFLOW.md");
+        assert!(
+            after.contains("projp") && after.contains("https://project.example/v1"),
+            "per-project provider dropped by Settings save (STUDIO-984):\n{after}"
+        );
+        // The global provider must survive too.
+        assert!(
+            after.contains("globalp") && after.contains("https://global.example/v1"),
+            "global provider dropped by Settings save (STUDIO-984):\n{after}"
+        );
+    }
+
     // Mirrors Go `TestConfigTypedClaudeOverridesRoundTrip` (the INF-239 acceptance): the four
     // newly-surfaced per-project claude knobs (turn/stall timeouts, billing_guard, command) round-trip
     // as overrides on the overriding project and stay ABSENT (inherited) on the inheriting one.

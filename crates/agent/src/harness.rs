@@ -112,8 +112,10 @@ pub enum HarnessId {
 /// value `openai-compatible`, NOT arbitrary auth headers or fields.
 ///
 /// The `as_str`/`adapter_id` pair is a cross-surface contract: `as_str` matches the YAML protocol
-/// name config validates, and `adapter_id` is the identity half of every credential binding. Both
-/// are pinned by a test so a rename cannot silently drift the config crate and the broker apart.
+/// name config validates, and `adapter_id` is the identity half of every credential binding. The
+/// agreement with `rhapsody-config`'s constants is pinned by
+/// [`tests::protocol_and_adapter_names_are_pinned_to_the_config_crate`], so a rename on either side
+/// reds a test rather than silently drifting the two crates apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     /// `openai-compatible`: Chat Completions + Bearer API-key auth.
@@ -578,9 +580,11 @@ pub enum CredentialTransport {
 }
 
 /// One harness's declared provider compatibility: which protocols its adapter can consume and how it
-/// materializes credentials. This is the ONE compatibility switch — there must not be a second one
-/// in config (`provider-auth-design.md` §3: "It is not acceptable to add a second provider
-/// compatibility switch in config").
+/// materializes credentials. This is the source of truth for provider compatibility
+/// (`provider-auth-design.md` §3: "It is not acceptable to add a second provider compatibility switch
+/// in config"). `rhapsody-config` cannot depend on this crate (layering), so it declares the same
+/// accepted-backend subset in its `PROVIDER_HARNESS_BACKENDS` constant and the cross-crate pin test
+/// [`config_provider_policy_agrees_with_the_harness_registry`] asserts the two cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HarnessRegistryEntry {
     pub id: HarnessId,
@@ -1217,8 +1221,9 @@ mod tests {
     }
 
     /// The protocol names are a cross-surface contract: `as_str` matches the YAML protocol config
-    /// validates, and `adapter_id` is the binding identity. Both are literals here so a rename in
-    /// either crate reds the other's test.
+    /// validates, and `adapter_id` is the binding identity. These literals pin THIS crate's spelling;
+    /// the cross-crate agreement is pinned separately by
+    /// [`protocol_and_adapter_names_are_pinned_to_the_config_crate`].
     #[test]
     fn protocol_names_are_the_cross_surface_contract() {
         assert_eq!(
@@ -1234,6 +1239,45 @@ mod tests {
             Some(ProviderProtocol::OpenAiCompatible)
         );
         assert_eq!(ProviderProtocol::from_name("anthropic-messages"), None);
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review): the agent's protocol name and adapter id must equal the
+    /// config crate's constants, so a rename on EITHER side reds this test. The literals in
+    /// [`protocol_names_are_the_cross_surface_contract`] cannot catch drift — they compare this
+    /// crate's own spelling to itself.
+    #[test]
+    fn protocol_and_adapter_names_are_pinned_to_the_config_crate() {
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.as_str(),
+            rhapsody_config::PROTOCOL_OPENAI_COMPATIBLE
+        );
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.adapter_id(),
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1
+        );
+    }
+
+    /// CROSS-CRATE PIN: config's provider-selection policy agrees with the ONE harness registry. For
+    /// every registered harness, config permits an explicit provider on exactly the backends whose
+    /// registry row can consume `openai-compatible`. Giving Claude a protocol in [`HARNESS_REGISTRY`]
+    /// without teaching `rhapsody-config` reds this test — the drift the design forbids when it says
+    /// there must not be a second compatibility switch in config.
+    #[test]
+    fn config_provider_policy_agrees_with_the_harness_registry() {
+        for entry in HARNESS_REGISTRY {
+            let name = match entry.id {
+                HarnessId::Claude => "claude",
+                HarnessId::Opencode => "opencode",
+            };
+            let config_allows = rhapsody_config::PROVIDER_HARNESS_BACKENDS.contains(&name);
+            let registry_supports = entry
+                .protocols
+                .contains(&ProviderProtocol::OpenAiCompatible);
+            assert_eq!(
+                config_allows, registry_supports,
+                "config's provider policy and HARNESS_REGISTRY disagree for harness {name:?}"
+            );
+        }
     }
 
     /// MUTATION GUARD: the supported-version table is fail-closed and single-sourced from the PB0

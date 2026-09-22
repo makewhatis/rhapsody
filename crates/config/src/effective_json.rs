@@ -269,21 +269,22 @@ fn provider_json(def: &crate::providers::ProviderDefinition) -> Value {
     );
     limits.insert(
         "max_reserved_token_units_per_utc_day".into(),
+        // The daily cap is an unbounded checked `u64` (it has no hard ceiling), so emit it as a u64
+        // rather than a lossy `as i64` cast that would show a huge-but-valid value as negative.
         l.max_reserved_token_units_per_utc_day
-            .map(|v| num(v as i64))
+            .map(|v| Value::Number(serde_json::Number::from(v)))
             .unwrap_or(Value::Null),
     );
     obj(vec![
         ("id", s(&def.id)),
         ("protocol", s(&def.protocol)),
         ("display_name", s(&def.display_name)),
-        // The normalized endpoint when derivable, else the verbatim value (a malformed URL fails
-        // validation, so a produced view is always normalized).
+        // The normalized endpoint when derivable, else an EMPTY string (never the verbatim value —
+        // echoing a malformed URL could publish a smuggled secret to an operator-facing surface; a
+        // config with a secret-bearing base_url is refused by `validate` before this view is built).
         (
             "base_url",
-            s(&def
-                .normalized_base_url()
-                .unwrap_or_else(|_| def.base_url.clone())),
+            s(&def.normalized_base_url().unwrap_or_default()),
         ),
         ("allow_insecure_http", Value::Bool(def.allow_insecure_http)),
         (

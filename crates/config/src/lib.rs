@@ -40,9 +40,10 @@ pub use model::{
 };
 pub use projects::{EffectiveConfig, ResolvedProject, effective_for, resolve_projects};
 pub use providers::{
-    ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1, BrokerLimits, CredentialBinding, CredentialRef,
-    MAX_PROVIDERS, MODEL_ID_MAX_BYTES, PROTOCOL_OPENAI_COMPATIBLE, ProviderDefinition,
-    ProviderReload, canonical_provider_id, normalize_provider_base_url, validate_model_id,
+    ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1, BrokerLimits, CredentialBinding, CredentialSource,
+    MAX_PROVIDERS, MODEL_ID_MAX_BYTES, PROTOCOL_OPENAI_COMPATIBLE, PROVIDER_HARNESS_BACKENDS,
+    ProviderDefinition, ProviderReload, canonical_provider_id, normalize_provider_base_url,
+    validate_model_id,
 };
 pub use resolve::{Resolved, resolve};
 pub use validate::{ValidationError, validate};
