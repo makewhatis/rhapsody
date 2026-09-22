@@ -4,20 +4,27 @@
 //! `real_rhapsodyd_smoke.rs` gates on `RHAPSODY_SMOKE_RHAPSODYD`: a second `cargo build` from the
 //! required `desktop` CI job would contend with the root `test` job's shared target dir.
 //!
-//! Two scenarios:
+//! Three scenarios, each launching the real daemon binary with `--credential-probe-account`/
+//! `--credential-probe-binding` so it runs an actual authenticate-then-`read_bound` round trip (not
+//! merely a `connect`, which the server never acknowledges either way — see
+//! `credential_bootstrap::serve_one`'s no-oracle rejection, and jimmy's review of an earlier
+//! revision of this test at rhapsody#213, which is exactly why these flags exist):
 //!   - `legitimate_launch_authenticates_and_reads_a_real_credential`: exactly what the real desktop
 //!     supervisor must do — bind a `BootstrapListener`, spawn the real `rhapsodyd` with
 //!     `--credential-bootstrap` and a piped stdin, write the one bootstrap frame, close the pipe.
 //!     The real daemon binary connects over a REAL Unix socket, authenticates, and round-trips a
 //!     `read_bound` against a real `ProviderCredentialOwner` — proving the full chain the unit tests
-//!     each proved in isolation actually composes.
+//!     each proved in isolation actually composes. Asserts the daemon logs `state=Present`.
+//!   - `wrong_token_launch_reports_owner_unauthorized`: the SAME real binary and the SAME real
+//!     socket/owner, but the bootstrap frame carries a token nobody issued. The daemon must report
+//!     `OwnerUnauthorized`, never `Present`, and never claim it authenticated.
 //!   - `direct_launch_with_no_bootstrap_gets_no_credential_owner`: the confused-deputy shape — the
 //!     SAME real binary, launched directly with `--credential-bootstrap` and closed stdin (exactly
 //!     what a coding-harness child capable of executing an arbitrary binary on disk would do,
 //!     bypassing the real supervisor entirely). It must still boot and serve `/healthz` normally,
 //!     with nowhere to obtain a credential from — there is no socket path it was ever told about,
-//!     and (per `no_direct_keychain_dependency.rs`, in the `rhapsodyd` crate) no Keychain-capable
-//!     dependency for it to fall back to even if it wanted to.
+//!     and (per `no_direct_keychain_dependency.rs`, in the `rhapsodyd` crate) no Keychain read API
+//!     called anywhere under `crates/` for it to fall back to even if it wanted to.
 //!
 //! Run: `RHAPSODY_CREDENTIAL_BOOTSTRAP_E2E=1 cargo test --test credential_bootstrap_e2e -- --nocapture`.
 
@@ -161,7 +168,20 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
 
     let port = pick_free_port();
     let mut child = Command::new(&bin)
-        .args(["--credential-bootstrap", "--port", &port.to_string()])
+        .args([
+            "--credential-bootstrap",
+            "--credential-probe-account",
+            "v1:spike-test-provider",
+            "--credential-probe-binding",
+            &serde_json::to_string(&Binding {
+                provider_id: "spike-test-provider".into(),
+                adapter: "openai-chat-completions-bearer-v1".into(),
+                base_url: "https://api.example/v1".into(),
+            })
+            .unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
         .arg(dir.join("WORKFLOW.md"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -186,19 +206,117 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
         "real rhapsodyd must answer /healthz"
     );
     // Give the credential-bootstrap task (spawned independently of the HTTP server) a moment to
-    // complete its connect + one request/response cycle.
+    // complete its connect + authenticate + `read_bound` round trip.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("wait for daemon");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The daemon must have actually READ the credential, not merely connected — `state=Present`
+    // only appears once a real `read_bound` round trip against the real owner succeeds.
+    assert!(
+        stderr.contains("provider-credential owner bootstrap resolved")
+            && stderr.contains("Present"),
+        "daemon stderr must report a resolved Present read, not merely a connect; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panic"),
+        "daemon must not panic while bootstrapping the credential channel; stderr:\n{stderr}"
+    );
+
+    serve.abort();
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&socket_dir).ok();
+}
+
+#[tokio::test]
+async fn wrong_token_launch_reports_owner_unauthorized() {
+    if skip_unless_enabled() {
+        return;
+    }
+    let bin = build_release_rhapsodyd();
+    let dir = temp_workflow_dir("wrongtoken");
+
+    let credential_ref = CredentialRef::for_provider("spike-test-provider").expect("valid id");
+    let owner = Arc::new(ProviderCredentialOwner::new(&credential_ref));
+    let binding = Binding {
+        provider_id: "spike-test-provider".into(),
+        adapter: "openai-chat-completions-bearer-v1".into(),
+        base_url: "https://api.example/v1".into(),
+    };
+    let connected_revision = match owner
+        .connect(
+            Revision::INITIAL,
+            binding.clone(),
+            "sk-e2e-wrong-token-secret".into(),
+        )
+        .expect("seed a real Keychain credential")
+    {
+        rhapsody_desktop::provider_credential::MutationOutcome::Advanced(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let _cleanup = CleanupGuard {
+        owner: owner.clone(),
+        revision: std::sync::Mutex::new(connected_revision),
+    };
+
+    let socket_dir = std::env::temp_dir().join(format!("rd-cbe2e-sock-wt-{}", std::process::id()));
+    let listener = BootstrapListener::bind(&socket_dir).expect("bind real unix socket");
+    let mut bootstrap_msg = listener.bootstrap_message();
+    // The token nobody issued: the real owner never generated this value, so the daemon's Hello
+    // must be rejected exactly as it would be for an unrelated same-user process.
+    bootstrap_msg.token = "a-token-nobody-issued".to_string();
+    let serve = tokio::spawn(listener.accept_and_serve(owner));
+
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .args([
+            "--credential-bootstrap",
+            "--credential-probe-account",
+            "v1:spike-test-provider",
+            "--credential-probe-binding",
+            &serde_json::to_string(&binding).unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .arg(dir.join("WORKFLOW.md"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real rhapsodyd");
+
+    {
+        use std::io::Write;
+        let bytes = serde_json::to_vec(&bootstrap_msg).unwrap();
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .expect("write length prefix");
+        stdin.write_all(&bytes).expect("write bootstrap frame");
+    }
+
+    assert!(
+        wait_healthy(port).await,
+        "real rhapsodyd must answer /healthz even with a rejected credential handshake"
+    );
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let _ = child.kill();
     let output = child.wait_with_output().expect("wait for daemon");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("provider-credential owner connected"),
-        "daemon stderr must report a successful bootstrap connect; stderr:\n{stderr}"
+        stderr.contains("provider-credential owner bootstrap resolved")
+            && stderr.contains("OwnerUnauthorized"),
+        "a wrong-token launch must report OwnerUnauthorized; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Present"),
+        "a wrong-token launch must never report a Present read; stderr:\n{stderr}"
     );
     assert!(
         !stderr.contains("panic"),
-        "daemon must not panic while bootstrapping the credential channel; stderr:\n{stderr}"
+        "daemon must not panic on a rejected credential handshake; stderr:\n{stderr}"
     );
 
     serve.abort();

@@ -1797,6 +1797,7 @@ dependencies = [
  "rhapsody-store",
  "rhapsody-telemetry",
  "rhapsody-tracker",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

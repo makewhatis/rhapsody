@@ -113,27 +113,53 @@ where
     // bootstrap can never delay the observability server, the control loop, or shutdown, and this
     // crate's own hermetic tests (which never pass the flag) never touch stdin at all.
     if flags.credential_bootstrap {
-        tokio::spawn(async {
-            match crate::credential_client::read_bootstrap(tokio::io::stdin()).await {
-                Some(msg) => {
-                    match crate::credential_client::CredentialClient::connect(&msg).await {
-                        Ok(_client) => {
-                            tracing::info!(
-                                "provider-credential owner connected over authenticated IPC"
-                            );
-                            // PB7 wires this connection into dispatch's prepared-credential seam; P0c's
-                            // job is to prove the channel authenticates and connects, not to consume it.
-                        }
-                        Err(e) => {
-                            tracing::warn!(err = %e, "provider-credential owner bootstrap connect failed");
-                        }
-                    }
-                }
-                None => {
+        let probe = flags.credential_probe.clone();
+        tokio::spawn(async move {
+            match probe {
+                Some(CredentialProbe { account, binding }) => {
+                    // The real round trip: read the bootstrap frame, connect, authenticate, and
+                    // `read_bound`. `connect` alone never proves authentication (the server gives
+                    // unauthorized connections no response at all — see
+                    // `credential_bootstrap::serve_one`), so only a completed `read_bound` can. Logs
+                    // only the resulting non-secret state tag + revision, never the credential.
+                    let read = crate::credential_client::resolve_credential(
+                        tokio::io::stdin(),
+                        account,
+                        binding,
+                    )
+                    .await;
                     tracing::info!(
-                        "no provider-credential bootstrap frame received; running with no credential owner"
+                        state = ?read.state.tag(),
+                        revision = read.revision.0,
+                        "provider-credential owner bootstrap resolved"
                     );
                 }
+                None => match crate::credential_client::read_bootstrap(tokio::io::stdin()).await {
+                    Some(msg) => {
+                        match crate::credential_client::CredentialClient::connect(&msg).await {
+                            Ok(_client) => {
+                                // `connect` only establishes the stream and sends `Hello` — the
+                                // server never acknowledges a successful handshake, so this does
+                                // NOT by itself prove authentication succeeded. Without a
+                                // `--credential-probe-*` pair (see `Flags::credential_probe`) there
+                                // is nothing configured to `read_bound` against yet, so this is
+                                // deliberately the weakest claim the daemon can honestly make.
+                                tracing::info!(
+                                    "provider-credential owner bootstrap stream established (no \
+                                     probe configured; authentication unconfirmed)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "provider-credential owner bootstrap connect failed");
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::info!(
+                            "no provider-credential bootstrap frame received; running with no credential owner"
+                        );
+                    }
+                },
             }
         });
     }
@@ -1091,8 +1117,26 @@ struct Flags {
     /// bare CLI invocation (or a confused-deputy process launching this same binary directly) also
     /// omits it and gets no credential owner, by construction.
     credential_bootstrap: bool,
+    /// `--credential-probe-account` / `--credential-probe-binding` (STUDIO-981/P0c, Rhapsody-only):
+    /// only meaningful alongside `--credential-bootstrap`. The real desktop supervisor does not
+    /// wire the actual socket-server spawn call yet (see README's "Wiring the socket server into
+    /// the real supervisor spawn call" note), so there is no config-driven provider account for the
+    /// daemon to resolve at boot today — these two flags let `credential_bootstrap_e2e.rs` tell the
+    /// freshly spawned real daemon binary which account/binding to run one real
+    /// authenticate-then-`read_bound` round trip against, so the acceptance evidence is a genuine
+    /// read over a real signed binary, not merely a successful `connect`. PB7 replaces this with
+    /// per-dispatch resolution through the same `resolve_credential` call.
+    credential_probe: Option<CredentialProbe>,
     /// The positional WORKFLOW.md path (default `WORKFLOW.md`).
     path: PathBuf,
+}
+
+/// The account + expected binding `--credential-probe-account`/`--credential-probe-binding` parse
+/// into; see [`Flags::credential_probe`].
+#[derive(Clone)]
+struct CredentialProbe {
+    account: String,
+    binding: rhapsody_credential_ipc::domain::Binding,
 }
 
 /// Parses the daemon flags, mirroring Go's `flag.FlagSet` (`--port` / `--db` take a value, either
@@ -1107,8 +1151,11 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         no_store: false,
         no_color: false,
         credential_bootstrap: false,
+        credential_probe: None,
         path: PathBuf::from("WORKFLOW.md"),
     };
+    let mut probe_account: Option<String> = None;
+    let mut probe_binding_json: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -1141,6 +1188,22 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "credential-bootstrap" => {
                 f.credential_bootstrap = parse_bool_flag(inline, "credential-bootstrap")?
             }
+            "credential-probe-account" => {
+                probe_account = Some(take_value(
+                    inline,
+                    args,
+                    &mut i,
+                    "credential-probe-account",
+                )?)
+            }
+            "credential-probe-binding" => {
+                probe_binding_json = Some(take_value(
+                    inline,
+                    args,
+                    &mut i,
+                    "credential-probe-binding",
+                )?)
+            }
             "port" => {
                 let v = take_value(inline, args, &mut i, "port")?;
                 f.port = v
@@ -1152,6 +1215,21 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         }
         i += 1;
     }
+    f.credential_probe = match (probe_account, probe_binding_json) {
+        (Some(account), Some(binding_json)) => {
+            let binding = serde_json::from_str(&binding_json).map_err(|e| {
+                format!("invalid value {binding_json:?} for flag -credential-probe-binding: {e}")
+            })?;
+            Some(CredentialProbe { account, binding })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                "-credential-probe-account and -credential-probe-binding must be given together"
+                    .to_string(),
+            );
+        }
+    };
     Ok(f)
 }
 
@@ -2073,6 +2151,7 @@ mod tests {
             no_store: false,
             no_color: false,
             credential_bootstrap: false,
+            credential_probe: None,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
@@ -2201,6 +2280,7 @@ mod tests {
             no_store: false,
             no_color: false,
             credential_bootstrap: false,
+            credential_probe: None,
             port: 0,
             path: PathBuf::from("WORKFLOW.md"),
         };
@@ -2261,6 +2341,7 @@ mod tests {
             no_store: false,
             no_color: false,
             credential_bootstrap: false,
+            credential_probe: None,
             path: PathBuf::from("WORKFLOW.md"),
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));

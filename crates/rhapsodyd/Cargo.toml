@@ -61,6 +61,9 @@ rhapsody-mcp = { path = "../mcp" }
 # desktop-to-daemon provider-credential channel — see that crate's doc comment for why direct
 # daemon Keychain access was rejected in favor of this. No Go parity (Rhapsody-only).
 rhapsody-credential-ipc = { path = "../credential-ipc" }
+# serde_json (STUDIO-981/P0c): decodes `--credential-probe-binding`'s JSON `Binding` value. Already
+# in Cargo.lock at this exact version (rhapsody-credential-ipc and others already depend on it).
+serde_json = "1"
 
 [dev-dependencies]
 # tokio test extras: `#[tokio::test(flavor = "multi_thread")]` so a test's client request and the
