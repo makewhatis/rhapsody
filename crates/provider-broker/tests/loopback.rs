@@ -1049,6 +1049,106 @@ async fn capability_expiry_cancels_a_stalled_stream() {
     harness.shutdown().await;
 }
 
+/// §7.2: dropping the downstream body releases the concurrency permit (client disconnect).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_disconnect_releases_the_concurrency_permit() {
+    let limits = BrokerLimits {
+        max_concurrent_requests: 1,
+        max_forwarded_requests: 2,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, limits, true).await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let mut resp = resp;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+    drop(resp);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(
+        second.status(),
+        200,
+        "a client disconnect must release the permit"
+    );
+    harness.shutdown().await;
+}
+
+/// §7.2: a client that disconnects while a buffered response is still buffering releases the
+/// concurrency permit rather than pinning it for the whole upstream delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_disconnect_during_buffering_releases_the_permit() {
+    let limits = BrokerLimits {
+        max_concurrent_requests: 1,
+        max_forwarded_requests: 2,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let response = FakeResponse {
+        status: 200,
+        content_type: "application/json",
+        chunks: vec![
+            br#"{"choices":[]"#.to_vec(),
+            br#","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec(),
+        ],
+        chunk_delay: Duration::from_millis(1_500),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, limits, true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let body = chat_body(MODEL, false);
+    let first = tokio::spawn({
+        let capability = capability.clone();
+        let url = url.clone();
+        async move {
+            let client = Harness::client();
+            let _ = client
+                .post(url)
+                .bearer_auth(capability)
+                .body(body)
+                .send()
+                .await;
+        }
+    });
+
+    // The first request reaches the upstream (so it held the single concurrency slot) and is then
+    // buffering; aborting the client drops its connection.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        harness.upstream.count(),
+        1,
+        "the first request was forwarded"
+    );
+    first.abort();
+    let _ = first.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let second = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, false))
+        .await;
+    assert_eq!(
+        second.status(),
+        200,
+        "a buffered client disconnect must release the permit"
+    );
+    harness.shutdown().await;
+}
+
 /// §5.2/§8.2: authenticated denials increment the turn's bounded abuse counter, capped at
 /// `max_denied_requests`, without consuming a forwarded-request slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
