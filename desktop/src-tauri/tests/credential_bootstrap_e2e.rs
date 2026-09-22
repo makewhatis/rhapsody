@@ -164,7 +164,8 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
     let socket_dir = std::env::temp_dir().join(format!("rd-cbe2e-sock-{}", std::process::id()));
     let listener = BootstrapListener::bind(&socket_dir).expect("bind real unix socket");
     let bootstrap_msg = listener.bootstrap_message();
-    let serve = tokio::spawn(listener.accept_and_serve(owner));
+    let (serve_fut, shutdown) = listener.accept_and_serve(owner);
+    let serve = tokio::spawn(serve_fut);
 
     let port = pick_free_port();
     let mut child = Command::new(&bin)
@@ -224,7 +225,8 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
         "daemon must not panic while bootstrapping the credential channel; stderr:\n{stderr}"
     );
 
-    serve.abort();
+    shutdown.shutdown();
+    let _ = serve.await;
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&socket_dir).ok();
 }
@@ -266,7 +268,8 @@ async fn wrong_token_launch_reports_owner_unauthorized() {
     // The token nobody issued: the real owner never generated this value, so the daemon's Hello
     // must be rejected exactly as it would be for an unrelated same-user process.
     bootstrap_msg.token = "a-token-nobody-issued".to_string();
-    let serve = tokio::spawn(listener.accept_and_serve(owner));
+    let (serve_fut, shutdown) = listener.accept_and_serve(owner);
+    let serve = tokio::spawn(serve_fut);
 
     let port = pick_free_port();
     let mut child = Command::new(&bin)
@@ -319,7 +322,8 @@ async fn wrong_token_launch_reports_owner_unauthorized() {
         "daemon must not panic on a rejected credential handshake; stderr:\n{stderr}"
     );
 
-    serve.abort();
+    shutdown.shutdown();
+    let _ = serve.await;
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&socket_dir).ok();
 }

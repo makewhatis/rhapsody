@@ -16,6 +16,7 @@
 //! for a ticket whose job is to prove and specify the mechanism (P0c), not to finish wiring it into
 //! every call site (P1's "production boundary").
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use rhapsody_credential_ipc::wire::{
     BootstrapMessage, ClientFrame, HelloFrame, ServerFrame, read_frame, write_frame,
 };
 use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::provider_credential::ProviderCredentialOwner;
 
@@ -78,50 +80,92 @@ impl BootstrapListener {
         }
     }
 
-    /// Accepts connections and serves `read_bound` requests against `owner` until `owner`'s
-    /// underlying process/task is dropped or the listener errors. Each accepted connection's
-    /// pre-`Hello` phase runs in its own task, bounded by [`HELLO_TIMEOUT`] independently of every
-    /// other connection — so any number of same-user processes that connect and never send `Hello`
-    /// cannot serialize-starve a later, legitimate connection's own `Hello` read behind
-    /// `HELLO_TIMEOUT` multiplied by however many came before it (jimmy's review of rhapsody#213,
-    /// B3: five silent connections cost the real daemon `5 × HELLO_TIMEOUT` before its own `Hello`
-    /// was even read, exceeding the daemon-side `RESPONSE_TIMEOUT`). Only an AUTHENTICATED
-    /// connection ever contends for `serving_slot`, the single slot that actually answers
-    /// `read_bound` requests — matching "only one connection is served at a time (the daemon holds
-    /// exactly one)"; a second authenticated connection (e.g. the daemon reconnecting after its own
-    /// restart) waits for the first's connection to end.
+    /// Accepts connections and serves `read_bound` requests against `owner` until told to shut
+    /// down via the returned [`ListenerShutdown`]. Each accepted connection's pre-`Hello` phase
+    /// runs in its own task, bounded by [`HELLO_TIMEOUT`] independently of every other connection —
+    /// so any number of same-user processes that connect and never send `Hello` cannot
+    /// serialize-starve a later, legitimate connection's own `Hello` read behind `HELLO_TIMEOUT`
+    /// multiplied by however many came before it (jimmy's review of rhapsody#213, B3: five silent
+    /// connections cost the real daemon `5 × HELLO_TIMEOUT` before its own `Hello` was even read,
+    /// exceeding the daemon-side `RESPONSE_TIMEOUT`). Only an AUTHENTICATED connection ever
+    /// contends for `serving_slot`, the single slot that actually answers `read_bound` requests —
+    /// matching "only one connection is served at a time (the daemon holds exactly one)"; a second
+    /// authenticated connection (e.g. the daemon reconnecting after its own restart) waits for the
+    /// first's connection to end.
     ///
-    /// Every per-connection task is tracked in a [`tokio::task::JoinSet`] owned by this call's own
-    /// stack frame rather than fire-and-forgotten via a bare `tokio::spawn` (sol's review of
-    /// rhapsody#213: an already-authenticated child task used to outlive this method being
-    /// cancelled/dropped, keeping its `Arc<ProviderCredentialOwner>` and the launch token alive and
-    /// still answering `read_bound` after the listener itself had shut down). Dropping a `JoinSet`
-    /// aborts every task it still holds, so cancelling or dropping this future — the same thing the
-    /// supervisor does to revoke a channel on stop/restart — now also tears down every connection
-    /// spawned from it.
-    pub async fn accept_and_serve(self, owner: Arc<ProviderCredentialOwner>) {
-        let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
-        let mut connections = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                accepted = self.listener.accept() => {
-                    let (stream, _addr) = match accepted {
-                        Ok(pair) => pair,
-                        Err(_) => return,
-                    };
-                    let owner = owner.clone();
-                    let token = self.token.clone();
-                    let serving_slot = serving_slot.clone();
-                    connections.spawn(async move {
-                        serve_one(stream, token, owner, serving_slot).await;
-                    });
+    /// Every per-connection task is tracked in a [`tokio::task::JoinSet`] owned by the returned
+    /// future's own stack frame. Simply dropping or `abort()`-ing that future (sol's first review
+    /// of rhapsody#213) is not enough on its own: `JoinSet::drop` and `JoinSet::abort_all` only set
+    /// each child's cooperative-cancellation flag, which a task already mid-poll through a
+    /// synchronous `owner.read_bound` Keychain call and a ready (non-blocking) socket write does
+    /// not observe until its NEXT poll — by which point it may already have sent the response
+    /// (sol's second review of rhapsody#213). The returned [`ListenerShutdown::shutdown`] instead
+    /// flips a shared [`CancellationToken`] that `serve_one` checks explicitly, synchronously,
+    /// after the owner read returns and before the response is written, so the check itself can
+    /// never be skipped by a poll boundary; the caller then awaits the driving future (e.g. the
+    /// `tokio::spawn` `JoinHandle`) to know every connection has actually finished, not merely been
+    /// asked to.
+    pub fn accept_and_serve(
+        self,
+        owner: Arc<ProviderCredentialOwner>,
+    ) -> (impl Future<Output = ()> + Send + 'static, ListenerShutdown) {
+        let cancel = CancellationToken::new();
+        let shutdown = ListenerShutdown {
+            cancel: cancel.clone(),
+        };
+        let future = async move {
+            let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    accepted = self.listener.accept() => {
+                        let (stream, _addr) = match accepted {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        };
+                        let owner = owner.clone();
+                        let token = self.token.clone();
+                        let serving_slot = serving_slot.clone();
+                        let cancel = cancel.clone();
+                        connections.spawn(async move {
+                            serve_one(stream, token, owner, serving_slot, cancel).await;
+                        });
+                    }
+                    // Reap finished connections so `connections` doesn't grow without bound; the
+                    // `if` guard keeps this branch out of the poll set entirely while empty, rather
+                    // than resolving to `None` every iteration and busy-looping.
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                 }
-                // Reap finished connections so `connections` doesn't grow without bound; the `if`
-                // guard keeps this branch out of the poll set entirely while empty, rather than
-                // resolving to `None` every iteration and busy-looping.
-                _ = connections.join_next(), if !connections.is_empty() => {}
             }
-        }
+            // Graceful drain: every live connection task already saw `cancel` flip (either while
+            // idle between requests, or via the explicit post-read check in `serve_one`) and is
+            // returning on its own; `shutdown()` aborts any stragglers as a backstop and, critically,
+            // WAITS for every task to actually finish rather than merely asking it to — this is what
+            // makes the future's own completion mean "no in-flight read can answer any more".
+            connections.shutdown().await;
+        };
+        (future, shutdown)
+    }
+}
+
+/// A handle to request a graceful, waited-for shutdown of a listener returned by
+/// [`BootstrapListener::accept_and_serve`]. See that method's doc for why calling
+/// [`shutdown`](ListenerShutdown::shutdown) and then awaiting the listener's driving future is the
+/// only combination that is actually safe to treat as "this channel is fully revoked" — aborting
+/// or dropping the driving future on its own is not.
+#[derive(Clone)]
+pub struct ListenerShutdown {
+    cancel: CancellationToken,
+}
+
+impl ListenerShutdown {
+    /// Signals the listener to stop accepting new connections and every existing connection to
+    /// stop answering further `read_bound` requests. Does not itself wait for anything — await the
+    /// listener's driving future (returned alongside this handle) afterward to know shutdown has
+    /// actually completed.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
     }
 }
 
@@ -130,16 +174,19 @@ async fn serve_one(
     token: String,
     owner: Arc<ProviderCredentialOwner>,
     serving_slot: Arc<tokio::sync::Semaphore>,
+    cancel: CancellationToken,
 ) {
     let mut session = ServerSession::new(Token::new(token));
 
-    let hello: HelloFrame = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut stream)).await
-    {
-        Ok(Ok(h)) => h,
-        // A timed-out or errored/EOF'd Hello read are the same outcome here: give up on this
-        // connection — its own task simply ends, never blocking any other connection's Hello phase
-        // or the single serving slot.
-        Ok(Err(_)) | Err(_) => return,
+    let hello: HelloFrame = tokio::select! {
+        () = cancel.cancelled() => return,
+        result = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut stream)) => match result {
+            Ok(Ok(h)) => h,
+            // A timed-out or errored/EOF'd Hello read are the same outcome here: give up on this
+            // connection — its own task simply ends, never blocking any other connection's Hello
+            // phase or the single serving slot.
+            Ok(Err(_)) | Err(_) => return,
+        },
     };
     // An unauthorized connection gets no response at all — closing the stream, not answering with
     // an explicit rejection frame, so a probing caller learns nothing beyond "this didn't work".
@@ -150,14 +197,20 @@ async fn serve_one(
     // Only an authenticated connection reaches here, and only one at a time ever serves
     // `read_bound` requests. `acquire` only errors if the semaphore itself was closed, which never
     // happens here.
-    let Ok(_permit) = serving_slot.acquire().await else {
+    let Ok(_permit) = (tokio::select! {
+        () = cancel.cancelled() => return,
+        permit = serving_slot.acquire() => permit,
+    }) else {
         return;
     };
 
     loop {
-        let frame: ClientFrame = match read_frame(&mut stream).await {
-            Ok(f) => f,
-            Err(_) => return,
+        let frame: ClientFrame = tokio::select! {
+            () = cancel.cancelled() => return,
+            result = read_frame(&mut stream) => match result {
+                Ok(f) => f,
+                Err(_) => return,
+            },
         };
         let ClientFrame::ReadBound {
             seq,
@@ -180,6 +233,17 @@ async fn serve_one(
             return;
         }
         let read = owner.read_bound(&expected_binding);
+        // `owner.read_bound` is fully synchronous (a Keychain call, possibly blocking on macOS
+        // Keychain locking), so it runs to completion within this task's current poll no matter
+        // what `cancel` does concurrently on another thread — a task abort or a `JoinSet` drop
+        // cannot interrupt it. This check, taken synchronously right after that call returns and
+        // before the response is built or written, is what actually closes the window: if shutdown
+        // was requested at any point up to and including while the Keychain call was in flight,
+        // this connection now discards the result instead of sending it (sol's review of
+        // rhapsody#213, second round).
+        if cancel.is_cancelled() {
+            return;
+        }
         let (state, lease) = split_state(read.state);
         let resp_seq = session.next_outgoing_seq();
         if write_frame(
@@ -269,7 +333,8 @@ mod tests {
         let msg = listener.bootstrap_message();
         let owner = owner_with_secret();
 
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         let stream = UnixStream::connect(&msg.socket_path)
             .await
@@ -291,7 +356,8 @@ mod tests {
         assert_eq!(read.state.tag(), CredentialStateTag::Present);
 
         drop(client);
-        serve.abort();
+        shutdown.shutdown();
+        let _ = serve.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -301,7 +367,8 @@ mod tests {
         let listener = BootstrapListener::bind(&dir).expect("bind");
         let socket_path = listener.bootstrap_message().socket_path;
         let owner = owner_with_secret();
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         let stream = UnixStream::connect(&socket_path).await.expect("connect");
         let mut client = rhapsodyd_test_client(stream, "totally-wrong-token".into()).await;
@@ -321,7 +388,8 @@ mod tests {
             "an unauthorized connection must never get a real response"
         );
 
-        serve.abort();
+        shutdown.shutdown();
+        let _ = serve.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -333,7 +401,8 @@ mod tests {
         let listener = BootstrapListener::bind(&dir).expect("bind");
         let msg = listener.bootstrap_message();
         let owner = owner_with_secret();
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         let stream = UnixStream::connect(&msg.socket_path)
             .await
@@ -355,7 +424,8 @@ mod tests {
             "a request for a different account must never get a real response"
         );
 
-        serve.abort();
+        shutdown.shutdown();
+        let _ = serve.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -369,7 +439,8 @@ mod tests {
         let listener = BootstrapListener::bind(&dir).expect("bind");
         let msg = listener.bootstrap_message();
         let owner = owner_with_secret();
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         // Connect but never write anything, and hold the stream open for the whole test — a
         // dropped stream would EOF immediately and prove nothing about the timeout.
@@ -396,7 +467,8 @@ mod tests {
 
         drop(silent);
         drop(client);
-        serve.abort();
+        shutdown.shutdown();
+        let _ = serve.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -414,7 +486,8 @@ mod tests {
         let listener = BootstrapListener::bind(&dir).expect("bind");
         let msg = listener.bootstrap_message();
         let owner = owner_with_secret();
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         let mut silent = Vec::new();
         for _ in 0..5 {
@@ -447,23 +520,25 @@ mod tests {
 
         drop(silent);
         drop(client);
-        serve.abort();
+        shutdown.shutdown();
+        let _ = serve.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // sol's review of rhapsody#213: dropping/aborting the outer `accept_and_serve` task used to
-    // leave an already-authenticated connection's own spawned task running, still holding the
+    // sol's first review of rhapsody#213: dropping/aborting the outer `accept_and_serve` task used
+    // to leave an already-authenticated connection's own spawned task running, still holding the
     // owner and still answering `read_bound`. A second read over the SAME already-authenticated
-    // client, issued only after the outer serve task has been awaited to completion following
-    // `abort()`, must now fail instead of succeeding.
+    // client, issued only after `shutdown()` and awaiting the listener task to completion, must now
+    // fail instead of succeeding.
     #[tokio::test]
-    async fn aborting_the_listener_task_drops_authenticated_child_connections() {
+    async fn shutdown_drops_authenticated_child_connections() {
         let dir = temp_dir();
         let listener = BootstrapListener::bind(&dir).expect("bind");
         let msg = listener.bootstrap_message();
         let owner = owner_with_secret();
 
-        let serve = tokio::spawn(listener.accept_and_serve(owner));
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
 
         let stream = UnixStream::connect(&msg.socket_path)
             .await
@@ -483,7 +558,7 @@ mod tests {
             .expect("first read succeeds while the listener task is alive");
         assert_eq!(read.state.tag(), CredentialStateTag::Present);
 
-        serve.abort();
+        shutdown.shutdown();
         let _ = serve.await;
 
         let second = client
@@ -502,6 +577,154 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // sol's second review of rhapsody#213: `JoinSet::shutdown`/`abort` only sets each child's
+    // cooperative-cancellation flag, which a connection task already mid-poll through a
+    // synchronous, blocking `owner.read_bound` Keychain call cannot observe until its NEXT poll —
+    // by which point it may already have written its response, even though `shutdown()` was called
+    // (and, in this test, `serve.await` had already completed) before the Keychain call returned.
+    // Proves the fix: a read genuinely blocked inside the Keychain call when `shutdown()` fires
+    // must never deliver its response, no matter when the blocking call happens to unblock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_during_a_blocked_owner_read_discards_the_in_flight_response() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+
+        let backing = MockKeyring::empty();
+        let (blocking_kr, entered_rx, release_tx) = BlockingKeyring::new(backing);
+        let arm = blocking_kr.clone();
+        let owner = ProviderCredentialOwner::for_test(blocking_kr);
+        owner
+            .connect(
+                Revision::INITIAL,
+                Binding {
+                    provider_id: "spike-test-provider".into(),
+                    adapter: "openai-chat-completions-bearer-v1".into(),
+                    base_url: "https://api.example/v1".into(),
+                },
+                "sk-real-socket-secret".into(),
+            )
+            .expect("connect (unblocked: not yet armed)");
+        // Arm the pause only now, so it catches `read_bound`'s `get_password` call and not the one
+        // `connect` above already made to check the owner was `Absent`.
+        arm.arm();
+        let owner = Arc::new(owner);
+
+        let (fut, shutdown) = listener.accept_and_serve(owner);
+        let serve = tokio::spawn(fut);
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+
+        let read_task = tokio::spawn(async move {
+            let outcome = client
+                .read_bound(
+                    "v1:spike-test-provider".into(),
+                    Binding {
+                        provider_id: "spike-test-provider".into(),
+                        adapter: "openai-chat-completions-bearer-v1".into(),
+                        base_url: "https://api.example/v1".into(),
+                    },
+                )
+                .await;
+            // Keep `client` (and so its socket) alive until the read settles, so the server
+            // observes shutdown rather than an early client-side EOF.
+            drop(client);
+            outcome
+        });
+
+        // Block on a real OS thread (via `spawn_blocking`) rather than in this async task, so the
+        // wait itself doesn't tie up the only worker thread the server's genuinely-blocking
+        // `owner.read_bound` call needs in order to make progress concurrently.
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join")
+            .expect("read must signal it entered the blocking Keychain call");
+
+        // Shut the listener down WHILE the read is still parked inside the Keychain call — the
+        // exact window a bare task abort/`JoinSet` drop cannot close.
+        shutdown.shutdown();
+
+        // Only now release the blocked call, letting `serve_one` resume past it.
+        release_tx
+            .send(())
+            .expect("release the paused read so the server task can finish");
+
+        serve
+            .await
+            .expect("the listener task must complete cleanly, waiting for the freed connection");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), read_task)
+            .await
+            .expect("the client task must not hang waiting for a response that will never come")
+            .expect("read task must not panic");
+        assert!(
+            outcome.is_err(),
+            "a read already in flight when shutdown was requested must never deliver its response"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `Keyring` double whose `get_password()` blocks — once armed via [`BlockingKeyring::arm`] —
+    /// until the test explicitly releases it, signaling the test the instant it is entered. Armed
+    /// lazily (rather than pausing the very first call unconditionally, as `provider_credential`'s
+    /// own double does) because seeding this owner's state goes through the real `connect`, which
+    /// makes its own `get_password` call first to check the owner is `Absent`; arming only after
+    /// that succeeds lets the pause catch exactly the later `read_bound` call under test.
+    struct BlockingKeyring {
+        inner: Arc<MockKeyring>,
+        armed: std::sync::atomic::AtomicBool,
+        entered_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl BlockingKeyring {
+        fn new(
+            inner: Arc<MockKeyring>,
+        ) -> (
+            Arc<BlockingKeyring>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let kr = Arc::new(BlockingKeyring {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                entered_tx: std::sync::Mutex::new(Some(entered_tx)),
+                release_rx: std::sync::Mutex::new(Some(release_rx)),
+            });
+            (kr, entered_rx, release_tx)
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::credential::Keyring for BlockingKeyring {
+        fn get_password(&self) -> Result<String, crate::credential::KeyringError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.release_rx.lock().unwrap().take() {
+                    let _ = rx.recv();
+                }
+            }
+            self.inner.get_password()
+        }
+        fn set_password(&self, token: &str) -> Result<(), crate::credential::KeyringError> {
+            self.inner.set_password(token)
+        }
+        fn delete_credential(&self) -> Result<(), crate::credential::KeyringError> {
+            self.inner.delete_credential()
+        }
     }
 
     // A minimal client double built directly on the wire/session primitives (rather than importing
