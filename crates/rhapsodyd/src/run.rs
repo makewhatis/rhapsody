@@ -137,8 +137,9 @@ where
                     task_resolver.learn_bootstrap(tokio::io::stdin()).await;
                     let read = task_resolver.read_bound(account, binding).await;
                     tracing::info!(
-                        state = ?read.state.tag(),
-                        revision = read.revision.0,
+                        state = ?read.read.state.tag(),
+                        revision = read.read.revision.0,
+                        availability_generation = read.availability_generation.0,
                         "provider-credential owner bootstrap resolved"
                     );
                 }

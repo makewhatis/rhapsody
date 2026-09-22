@@ -80,6 +80,11 @@ mod compile_guards {
     // resolves to that inherent method and stops being `NotABorrowedString`, so THIS MODULE FAILS
     // TO COMPILE. A build failure reddens the whole crate, which is the strongest form of the guard
     // the ticket asks for. The names are deliberately ugly so the error is self-explanatory.
+    //
+    // Scope: this guard covers exactly the four names below (`get`/`value`/`secret`/`as_str`). A
+    // value-returning accessor under any OTHER name (`reveal`, `bytes`, ...) cannot be rejected by
+    // this mechanism and is a review matter, not a mechanically enforced property (alice's round-3
+    // review of rhapsody#221).
     struct NotABorrowedString;
 
     trait MustNotExposeABorrowedString {
