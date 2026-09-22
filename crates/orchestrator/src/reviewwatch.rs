@@ -6544,6 +6544,61 @@ mod tests {
         );
     }
 
+    /// **The wiring, positively.** The truncated test above pins which exits must NOT settle; this
+    /// pins that the exit that MUST — a declared verdict from a live run — really does, through the
+    /// production path (`on_review_exit`), not only through the test helper. A refactor that drops
+    /// the `settle_author_round` call from `on_review_exit`, or places it below the truncated
+    /// branch, reds one of the two.
+    #[test]
+    fn a_declared_review_exit_answers_the_author_round() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_A);
+        let charged = o.reviewers_per_round();
+
+        let iss = author_issue("STUDIO-1", 12);
+        o.note_author_round(&iss);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+
+        let run = ReviewRun {
+            owner: OWNER.to_string(),
+            repo: REPO.to_string(),
+            number: 12,
+            reviewer: "bob".to_string(),
+            head_sha: HEAD_B.to_string(),
+            ..ReviewRun::default()
+        };
+        let id = run.key();
+        let re = o
+            .running
+            .get(&id)
+            .cloned()
+            .expect("the review is running after its dispatch");
+        o.on_review_exit(
+            &re,
+            &run,
+            &crate::EvWorkerExit {
+                issue_id: id.clone(),
+                failed: false,
+                started_at: re.started_at,
+                err_msg: String::new(),
+                last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
+                declared_handoff: true,
+                refused: false,
+            },
+        );
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))),
+            Some(&(charged * 3)),
+            "a declared verdict at the pushed head answers the author round: the review half of \
+             round one, the review half of round two, and the answered author round"
+        );
+        assert_eq!(watch_row(&o, 12, "bob").last_reviewed_sha, HEAD_B);
+    }
+
     /// **alice round 1 on PR #199, finding 1.** `note_author_round` is placed AFTER the provider
     /// budget gate, so a budget-REFUSED fresh dispatch charges nothing. A ticket held every tick
     /// would otherwise spend its pull request's shared review↔author budget on each poll and reach
