@@ -130,7 +130,7 @@ where
                     }
                 }
                 None => {
-                    tracing::debug!(
+                    tracing::info!(
                         "no provider-credential bootstrap frame received; running with no credential owner"
                     );
                 }
