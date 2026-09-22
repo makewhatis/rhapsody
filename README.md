@@ -1368,9 +1368,14 @@ silently inherit that mode. It is gated by this key alone, runs through the daem
 path with `manager.model` / `manager.timeout_ms`, and needs no `gh` on the control task: the control
 task decides and hands a plan to the watcher, which performs the turn and the writes off-loop.
 
-**Both halves are bounded, and a failed turn is bounded too.** Author re-dispatches charge the same
-counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
-the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
+**Both halves are bounded, and a failed turn is bounded too.** The threshold bounds ANSWERED
+exchanges: an author re-dispatch RECORDS a pending round (one ROUND each, whatever the reviewer
+count) and charges it only once a reviewer's verdict lands at a head outside the set the dispatch
+stood at — one round per answered amendment, which is what bounds the STUDIO-170 shape at the
+threshold. An unreviewed author loop charges ZERO BY DESIGN, so the writers that can summon an author
+with no review completing — the conflict route-back per still-dirty head, the draft poke under its
+own cap, a human `@symphony` comment — go uncharged. A turn that fails clears its in-flight marker so
+a later sweep re-asks, but only
 `MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
 turn per sweep forever — through the same room post and pull-request comment every other decision
 gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —

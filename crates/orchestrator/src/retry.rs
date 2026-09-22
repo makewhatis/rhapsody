@@ -591,14 +591,17 @@ impl Orchestrator {
                 // the console. Best-effort and idempotent.
                 self.release_budget_hold(&iss.identifier);
             }
-            // STUDIO-956: a FRESH dispatch of a ticket whose pull request is under review charges one
-            // AUTHOR round to that pull request's shared review↔author budget. Charged here rather
-            // than in `select` because this is the one funnel every dispatch path shares, so no path
-            // can dispatch an author round the budget never saw. Retries and continuations
-            // (`attempt` is `Some`) are the SAME round and must not charge twice; a ticket whose
-            // pull request has never been reviewed carries no budget entry, so an ordinary first
-            // dispatch pays nothing. Placed after the provider-budget gate so a REFUSED dispatch
-            // does not charge a round that never ran.
+            // STUDIO-956 / STUDIO-1004: a FRESH dispatch of a ticket whose pull request is under
+            // review RECORDS a PENDING author round against that pull request's shared
+            // review↔author budget; the round is charged only in `settle_author_round`, once a
+            // reviewer's verdict lands at a head outside the set this dispatch stood at — so an
+            // unreviewed author loop charges zero. Recorded here rather than in `select` because
+            // this is the one funnel every dispatch path shares, so no path can dispatch an author
+            // round the budget never saw. Retries and continuations (`attempt` is `Some`) are the
+            // SAME round and must not record twice; a ticket whose pull request has never been
+            // reviewed carries no budget entry, so an ordinary first dispatch records nothing.
+            // Placed after the provider-budget gate so a REFUSED dispatch does not record a round
+            // that never ran.
             self.note_author_round(&iss);
         }
         // Arm the worker's cancellation before the spawn observes it (Go `wctx, cancel :=
