@@ -103,9 +103,10 @@ impl BootstrapListener {
     /// [`CancellationToken`] that `serve_one` checks explicitly, synchronously, after the owner
     /// read returns and before the response is written, so the check itself can never be skipped
     /// by a poll boundary. That token is flipped on EVERY way the returned future can end:
-    /// [`ListenerShutdown::shutdown`], an `accept()` error, and — through a drop guard held by the
-    /// future itself — being dropped or `abort()`-ed mid-poll, or panicking (jimmy's review of
-    /// rhapsody#213, B8). Dropping or aborting the future therefore never lets an in-flight read
+    /// [`ListenerShutdown::shutdown`], an `accept()` error, and — through the `Drop` of the
+    /// `CancelOnDropConnections` that owns the connection tasks, which flips it before those tasks
+    /// are torn down — being dropped or `abort()`-ed mid-poll, or panicking (jimmy's and sol's
+    /// reviews of rhapsody#213, B8). Dropping or aborting the future therefore never lets an in-flight read
     /// answer, but it also does not WAIT for the connection tasks to finish: only calling
     /// `shutdown()` and then awaiting the driving future (e.g. the `tokio::spawn` `JoinHandle`)
     /// tells the caller every connection has actually finished, not merely been asked to.
@@ -119,13 +120,14 @@ impl BootstrapListener {
         };
         let future = async move {
             let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
-            let mut connections = tokio::task::JoinSet::new();
             // Flips `cancel` if this future ends by any route other than the two loop exits below
             // (drop, `abort()`, panic, a future early `return`), none of which reach
-            // `graceful_shutdown` — see this method's doc (jimmy's and sol's reviews of
-            // rhapsody#213, B8). Declared after `connections` so it drops first, flipping the token
-            // before the `JoinSet` is dropped.
-            let _cancel_on_exit = cancel.clone().drop_guard();
+            // `graceful_shutdown` — see `CancelOnDropConnections` and this method's doc (jimmy's
+            // and sol's reviews of rhapsody#213, B8).
+            let mut connections = CancelOnDropConnections {
+                cancel: cancel.clone(),
+                tasks: tokio::task::JoinSet::new(),
+            };
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
@@ -145,19 +147,40 @@ impl BootstrapListener {
                         let token = self.token.clone();
                         let serving_slot = serving_slot.clone();
                         let cancel = cancel.clone();
-                        connections.spawn(async move {
+                        connections.tasks.spawn(async move {
                             serve_one(stream, token, owner, serving_slot, cancel).await;
                         });
                     }
                     // Reap finished connections so `connections` doesn't grow without bound; the
                     // `if` guard keeps this branch out of the poll set entirely while empty, rather
                     // than resolving to `None` every iteration and busy-looping.
-                    _ = connections.join_next(), if !connections.is_empty() => {}
+                    _ = connections.tasks.join_next(), if !connections.tasks.is_empty() => {}
                 }
             }
-            graceful_shutdown(&cancel, &mut connections).await;
+            graceful_shutdown(&cancel, &mut connections.tasks).await;
         };
         (future, shutdown)
+    }
+}
+
+/// The listener's per-connection tasks, owned together with the token that revokes them. Its
+/// `Drop` flips `cancel` on every way the listener future can end without reaching
+/// `graceful_shutdown` — being dropped or `abort()`-ed mid-poll, a panic, an early `return` —
+/// because `JoinSet`'s own drop only sets each child's cooperative flag, which a child parked in
+/// the synchronous `owner.read_bound` Keychain call cannot observe before it writes its reply
+/// (jimmy's review of rhapsody#213, B8). Holding the `JoinSet` as a field rather than as a sibling
+/// local next to a separate drop guard makes the order a language guarantee instead of a
+/// declaration-order convention (sol's review of rhapsody#213): a value's `Drop::drop` always runs
+/// before any of its fields are dropped, so the token is flipped before the `JoinSet` starts
+/// tearing its children down, however this frame is later rearranged.
+struct CancelOnDropConnections {
+    cancel: CancellationToken,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl Drop for CancelOnDropConnections {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
