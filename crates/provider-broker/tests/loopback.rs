@@ -762,6 +762,39 @@ async fn revoking_the_session_cancels_a_live_stream() {
     harness.shutdown().await;
 }
 
+/// §5.2/§8.2: authenticated denials increment the turn's bounded abuse counter, capped at
+/// `max_denied_requests`, without consuming a forwarded-request slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_denials_increment_the_bounded_abuse_counter() {
+    let limits = BrokerLimits {
+        max_denied_requests: 2,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let mut harness = Harness::with(FakeResponse::json("{\"ok\":true}"), limits, true).await;
+    let capability = harness.capability.clone();
+    let body = serde_json::json!({"model": MODEL, "messages": [], "bogus": 1}).to_string();
+    for _ in 0..3 {
+        let resp = harness.post(Some(&capability), &[], body.as_bytes()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        harness.upstream.count(),
+        0,
+        "denied requests never reach upstream"
+    );
+
+    // Finalize the turn to read the ledger the abuses were counted into.
+    drop(harness.access.take());
+    let ledger = harness.receipt.take().expect("finalized ledger");
+    assert_eq!(
+        ledger.denied_requests(),
+        2,
+        "the abuse counter is counted up to and bounded by max_denied_requests"
+    );
+    assert_eq!(ledger.forwarded_requests(), 0);
+    harness.shutdown().await;
+}
+
 /// §6.3: `Retry-After` is parsed and clamped, and a header reflecting the key is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_is_clamped_and_reflecting_headers_are_dropped() {
@@ -797,6 +830,104 @@ async fn retry_after_is_clamped_and_reflecting_headers_are_dropped() {
         "a header reflecting the key is dropped, not rewritten"
     );
     harness.shutdown().await;
+}
+
+/// The closed schema is fixture-backed: every top-level key and message role the committed PB0
+/// OpenCode captures exercise must be inside the allow-list, and a minimal request shaped from each
+/// fixture must validate.
+#[test]
+fn pinned_opencode_fixtures_are_within_the_closed_schema() {
+    use rhapsody_provider_broker::{
+        ChatRequestPolicy, top_level_field_allowed, validate_chat_request,
+    };
+
+    let fixtures: [(&str, &str); 5] = [
+        (
+            "happy",
+            include_str!("../../../harness/harness-spike/opencode/broker/requests/happy.json"),
+        ),
+        (
+            "compaction",
+            include_str!("../../../harness/harness-spike/opencode/broker/requests/compaction.json"),
+        ),
+        (
+            "subagent",
+            include_str!("../../../harness/harness-spike/opencode/broker/requests/subagent.json"),
+        ),
+        (
+            "retry",
+            include_str!("../../../harness/harness-spike/opencode/broker/requests/retry.json"),
+        ),
+        (
+            "auth",
+            include_str!("../../../harness/harness-spike/opencode/broker/requests/auth.json"),
+        ),
+    ];
+    for (name, raw) in fixtures {
+        let fixture: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        let requests = fixture["requests"].as_array().expect("requests array");
+        assert!(!requests.is_empty(), "{name} has at least one request");
+        for request in requests {
+            let body = &request["body"];
+            for key in body["keys"].as_array().expect("keys") {
+                let key = key.as_str().expect("key");
+                assert!(
+                    top_level_field_allowed(key),
+                    "{name}: fixture key `{key}` is outside the closed top-level schema"
+                );
+            }
+            for role in body["message_roles"].as_array().expect("roles") {
+                let role = role.as_str().expect("role");
+                assert!(
+                    rhapsody_provider_broker::schema::ALLOWED_MESSAGE_ROLES.contains(&role),
+                    "{name}: fixture role `{role}` is outside the closed role set"
+                );
+            }
+
+            // Reconstruct a minimal request shaped from the recorded fixture and validate it.
+            let model = body["model"].as_str().expect("model");
+            let messages: Vec<serde_json::Value> = body["message_roles"]
+                .as_array()
+                .expect("roles")
+                .iter()
+                .map(|role| serde_json::json!({"role": role, "content": "x"}))
+                .collect();
+            let mut normalized = serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "max_tokens": body["max_tokens"].clone(),
+                "stream": body["stream"].clone(),
+            });
+            if let Some(stream_options) = body.get("stream_options") {
+                normalized["stream_options"] = stream_options.clone();
+            }
+            let tool_names = body["tool_names"].as_array().cloned().unwrap_or_default();
+            if !tool_names.is_empty() {
+                normalized["tools"] = serde_json::Value::Array(
+                    tool_names
+                        .iter()
+                        .map(|tool| {
+                            serde_json::json!({
+                                "type": "function",
+                                "function": {"name": tool}
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(choice) = body["tool_choice"].as_str() {
+                normalized["tool_choice"] = serde_json::json!(choice);
+            }
+            let policy = ChatRequestPolicy {
+                model,
+                max_output_tokens: 32_000,
+            };
+            assert!(
+                validate_chat_request(normalized.to_string().as_bytes(), policy).is_ok(),
+                "{name}: a request shaped from the pinned fixture must validate"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

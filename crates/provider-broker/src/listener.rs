@@ -306,26 +306,26 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     // The grant concurrency permit is acquired before the body is read or allocated.
     let _permit = match grant.acquire_concurrency() {
         Ok(permit) => permit,
-        Err(_) => return refusal_response(PolicyRefusal::BudgetExhausted),
+        Err(_) => return deny(&grant, PolicyRefusal::BudgetExhausted),
     };
 
     // Weighted request-memory budget: charged before the body is allocated.
     let max_request_bytes = grant.limits().max_request_bytes;
     let declared = declared_content_length(&parts.headers);
     if declared.is_some_and(|length| length > max_request_bytes) {
-        return refusal_response(PolicyRefusal::RequestTooLarge);
+        return deny(&grant, PolicyRefusal::RequestTooLarge);
     }
     let Some(weight) = request_weight(declared, max_request_bytes) else {
-        return refusal_response(PolicyRefusal::RequestTooLarge);
+        return deny(&grant, PolicyRefusal::RequestTooLarge);
     };
     let Some(_memory) = state.request_budget.try_acquire(weight) else {
-        return refusal_response(PolicyRefusal::BudgetExhausted);
+        return deny(&grant, PolicyRefusal::BudgetExhausted);
     };
 
     // Read the body under the request byte ceiling.
     let buffer = match read_bounded_body(body, max_request_bytes).await {
         Ok(buffer) => buffer,
-        Err(refusal) => return refusal_response(refusal),
+        Err(refusal) => return deny(&grant, refusal),
     };
 
     // Closed-schema validation.
@@ -337,20 +337,20 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         },
     ) {
         Ok(request) => request,
-        Err(rejection) => return refusal_response(map_rejection(rejection)),
+        Err(rejection) => return deny(&grant, map_rejection(rejection)),
     };
 
     // The fixed, normalized upstream endpoint (parsed once for this turn).
     let endpoint =
         match NormalizedEndpoint::parse(grant.normalized_endpoint(), grant.allow_insecure_http()) {
             Ok(endpoint) => endpoint,
-            Err(_) => return refusal_response(PolicyRefusal::ProviderMisconfigured),
+            Err(_) => return deny(&grant, PolicyRefusal::ProviderMisconfigured),
         };
 
     // Re-serialize the validated object and apply the outbound body-size limit again.
     let outbound = request.to_json_bytes();
     if outbound.len() as u64 > max_request_bytes {
-        return refusal_response(PolicyRefusal::RequestTooLarge);
+        return deny(&grant, PolicyRefusal::RequestTooLarge);
     }
 
     // Outbound admission: consume the forwarded-request slot immediately before construction.
@@ -362,7 +362,7 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         )
         .is_err()
     {
-        return refusal_response(PolicyRefusal::BudgetExhausted);
+        return deny(&grant, PolicyRefusal::BudgetExhausted);
     }
 
     // The credential is borrowed for exactly this request and its redactor; the capability never
@@ -673,6 +673,15 @@ async fn read_bounded_body(body: Body, max_bytes: u64) -> Result<Vec<u8>, Policy
         }
     }
     Ok(buffer)
+}
+
+/// Map a schema rejection to its pinned policy refusal.
+/// Refuse an authenticated request and count the local denial against the turn's bounded abuse
+/// counter (design §5.2, §8.2). Reaching the configured threshold is counted and refused here; the
+/// turn's owner (the worker retaining the receipt) performs the revocation.
+fn deny(grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
+    let _ = grant.record_denied();
+    refusal_response(refusal)
 }
 
 /// Map a schema rejection to its pinned policy refusal.

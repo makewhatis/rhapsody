@@ -40,6 +40,15 @@ const ALLOWED_TOP_LEVEL: &[&str] = &[
     "tool_choice",
 ];
 
+/// Whether `name` is one of the closed top-level fields. The pinned PB0 fixtures are asserted against
+/// this in `tests/loopback.rs`, so the allow-list cannot silently drift from the measured shapes.
+pub fn top_level_field_allowed(name: &str) -> bool {
+    ALLOWED_TOP_LEVEL.contains(&name)
+}
+
+/// The message roles the pinned fixtures exercise.
+pub const ALLOWED_MESSAGE_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
+
 /// Generation/token-limit aliases that must never be forwarded even though they are not in the
 /// allow-list, so the refusal names the exact control (design §5.3.6). Kept separate from the
 /// generic unknown-field refusal purely for a precise diagnostic.

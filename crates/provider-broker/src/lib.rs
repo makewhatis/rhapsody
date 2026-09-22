@@ -77,7 +77,8 @@ pub use redact::{REDACTION_MARKER, StreamingRedactor};
 pub use refusal::PolicyRefusal;
 pub use reservations::ConcurrencyPermit;
 pub use schema::{
-    ChatRequest, ChatRequestPolicy, RequestRejection, SchemaError, validate_chat_request,
+    ChatRequest, ChatRequestPolicy, RequestRejection, SchemaError, top_level_field_allowed,
+    validate_chat_request,
 };
 pub use secret::{CapabilityToken, ZeroizingBytes};
 pub use session::{BrokerLedgerReceiver, BrokerSession};
