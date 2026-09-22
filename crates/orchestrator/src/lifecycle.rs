@@ -2820,6 +2820,20 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ReviewBoundRow>, rhapsody_store::StoreError> {
             self.0.load_review_bounds()
         }
+        fn save_review_done(
+            &self,
+            row: rhapsody_store::ReviewDoneRow,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_review_done(row)
+        }
+        fn clear_review_done(&self, identifier: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.clear_review_done(identifier)
+        }
+        fn load_review_done(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ReviewDoneRow>, rhapsody_store::StoreError> {
+            self.0.load_review_done()
+        }
         fn prune(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
             self.0.prune(a0)
         }

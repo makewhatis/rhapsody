@@ -425,6 +425,28 @@ pub trait Store {
     /// adjudication ledger are rehydrated from.
     fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError>;
 
+    // --- durable terminal-move ledger (STUDIO-1007; no Go counterpart — see [`ReviewDoneRow`]) ---
+
+    /// Records `row` as a terminal-state move owed to `row.identifier`'s merged pull request, or
+    /// replaces the existing row for that ticket with it.
+    ///
+    /// A last-write-wins upsert of the WHOLE row, attempts and `next_at` included, because there is
+    /// exactly one writer — the off-loop auto-done half on the review watcher's task — so the row it
+    /// last wrote is authoritative and no column needs protecting from a second writer. It is
+    /// written BEFORE the first move attempt (which is what lets the handoff guard and the
+    /// reconciliation sweep see the merge even while the move is still being tried) and rewritten by
+    /// each retry with its new attempt count and next due time.
+    fn save_review_done(&self, row: ReviewDoneRow) -> Result<(), StoreError>;
+
+    /// Forgets the owed move for one ticket — the move LANDED. Idempotent, and a no-op when the row
+    /// is absent: the normal case is that a daemon never had anything to move.
+    fn clear_review_done(&self, identifier: &str) -> Result<(), StoreError>;
+
+    /// Every owed terminal move, in `identifier` order — what the bounded retry walks each tick and
+    /// what the reconciliation sweep reads to report a merged pull request whose ticket is not
+    /// terminal.
+    fn load_review_done(&self) -> Result<Vec<ReviewDoneRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

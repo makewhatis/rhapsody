@@ -234,6 +234,18 @@ pub enum DivergenceKind {
     /// rows are all approved is not reported here, since auto-merge either merges it or
     /// [`DivergenceKind::ApprovedStillOpen`] reports the stuck gate after the staleness threshold.
     ReviewShipped,
+    /// A pull request MERGED and its implementation ticket is still not in its terminal state
+    /// (STUDIO-1007). The auto-Done move (`crate::reviewdone`) is still owed — it is being retried,
+    /// or its bounded retry was exhausted — so the ticket sits in review and silently blocks every
+    /// dependent of it.
+    ///
+    /// It is a `Divergence` and not merely a log line because this is exactly the incident the
+    /// ticket filed: four merged tickets sat In Review and eighteen others were `blockedBy` them,
+    /// and nothing on any operator surface said so. The merged fact is NOT re-derived here — the
+    /// sweep is local-only and asks GitHub and the tracker nothing — it comes straight from the
+    /// durable owed-move row the merge itself wrote, which is why this report appears on the first
+    /// sweep after the merge and survives a restart.
+    MergedTicketNotTerminal,
 }
 
 impl DivergenceKind {
@@ -249,6 +261,7 @@ impl DivergenceKind {
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
             DivergenceKind::ReviewEscalated => "review_escalated",
             DivergenceKind::ReviewShipped => "review_shipped",
+            DivergenceKind::MergedTicketNotTerminal => "merged_ticket_not_terminal",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -284,6 +297,10 @@ impl DivergenceKind {
             DivergenceKind::ReviewShipped => {
                 "the manager shipped the review loop and no further review or author round will be \
                  dispatched; the merge gate still holds the pull request"
+            }
+            DivergenceKind::MergedTicketNotTerminal => {
+                "the pull request merged but the ticket is still not in its terminal state, so the \
+                 auto-Done move is still owed and every dependent of the ticket is blocked by it"
             }
         }
     }
@@ -781,6 +798,14 @@ impl Orchestrator {
             self.set_review_divergences(Vec::new());
             return;
         }
+        // The merged-but-not-terminal divergences (STUDIO-1007). Read HERE, above the human-hold
+        // gate below, because that gate's reasoning does not apply to them: it exists to stop the
+        // watch-set rules reporting a ticket a PERSON took over as stalled, and this report is about
+        // a FINISHED pull request whose terminal move the daemon already owes — a hold makes that no
+        // less true. Reading it first also means this report goes out on a daemon whose hold ledger
+        // is un-primed, which is exactly the "shows on the operator feed within one sweep" the
+        // ticket asks for.
+        let done = self.review_done_divergences();
         // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
         // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
         // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
@@ -801,7 +826,9 @@ impl Orchestrator {
         // `an_unprimed_hold_ledger_reports_no_divergence` reds (the held row is reported).
         let (labelled, ledger_primed) = self.human_holds.labelled_and_primed();
         if !ledger_primed {
-            self.set_review_divergences(Vec::new());
+            // The watch-set rules report nothing (above), but the owed-move report does not depend
+            // on the label set, so it still goes out.
+            self.set_review_divergences(done);
             return;
         }
         let rows = match self.store().load_live_review_watch() {
@@ -1054,7 +1081,69 @@ impl Orchestrator {
                 Some(d)
             })
             .collect();
+        let mut found = found;
+        // The merged-but-not-terminal divergences read above (STUDIO-1007) come from a DIFFERENT
+        // source than every rule in the loop: a merged pull request's watch rows are retired, so it
+        // is not in the live set the loop walked and nothing there could derive it. The durable
+        // owed-move row the merge wrote is the fact, read — not invented — exactly as this module's
+        // contract requires: no `gh`, no tracker, local only.
+        found.extend(done);
         self.set_review_divergences(found);
+    }
+
+    /// The divergences owed to a merged pull request whose ticket is not yet terminal (STUDIO-1007):
+    /// one per durable owed-move row that has a FAILED attempt behind it.
+    ///
+    /// A row with `attempts == 0` is a move that is about to be attempted RIGHT NOW — auto-done
+    /// writes the row and makes the first attempt in the same breath, on the watcher's task — so
+    /// reporting it would race a move that lands a moment later, logging a divergence and its
+    /// recovery for one sub-second window. `attempts >= 1` is "the tracker considered this and did
+    /// not take it", which is the fact an operator can act on and needs no time to prove it is
+    /// stuck.
+    ///
+    /// Deliberately NOT filtered by the `rhapsody:human` hold the rules above honour. That hold
+    /// exempts a ticket a PERSON has taken over from the stall rules, which are about an obligation
+    /// nobody is progressing; this divergence is about a FINISHED pull request whose ticket the
+    /// daemon already committed to moving, and a merged pull request is not something a hold makes
+    /// untrue. It is reported from the first failed attempt and stays reported after the retry is
+    /// exhausted, with no staleness threshold — a merge that has not landed needs no time to prove
+    /// it is stuck.
+    ///
+    /// A store that cannot be read warns and reports nothing, exactly as the watch-set read above
+    /// does: a failed read is not evidence that a divergence resolved.
+    fn review_done_divergences(&self) -> Vec<Divergence> {
+        let rows = match self.store().load_review_done() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "review reconciliation: the owed terminal moves could not be read; this sweep \
+                     reports nothing about them"
+                );
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .filter(|row| row.attempts >= 1)
+            .map(|row| Divergence {
+                pr: row.pr,
+                kind: DivergenceKind::MergedTicketNotTerminal,
+                ticket: row.identifier,
+                reviewer: String::new(),
+                // No threshold and no datable anchor on the row: `next_at` is the NEXT attempt, not
+                // the merge, so this is the `RoundBudgetExhausted` shape — reported as soon as the
+                // fact is known.
+                stale_secs: 0,
+                auto_merge_reason: None,
+                capacity_held: None,
+                capacity_unreadable: None,
+                adjudicated_head: String::new(),
+                current_head: String::new(),
+                rounds: 0,
+                findings: Vec::new(),
+                reason: String::new(),
+            })
+            .collect()
     }
 
     /// The capacity hold recorded for one review key, or `None` when there is none or the record is
@@ -1331,6 +1420,24 @@ impl Orchestrator {
                          `agent.max_run_tokens`; raise the ceiling, then restart the daemon to \
                          re-offer this head (the stopped round's key stays held this session so it \
                          cannot re-burn the ceiling). This sweep only reports, so it needs a human.",
+                        d.pr,
+                        d.kind.detail()
+                    );
+                    continue;
+                }
+                // STUDIO-1007: a merged pull request whose ticket is not terminal. The generic copy
+                // below would be false here — something HAS reported it blocked (the merge retired
+                // the pull request and the auto-Done move is still owed) — so name the merge, the
+                // ticket and the move the operator is waiting on.
+                if d.kind == DivergenceKind::MergedTicketNotTerminal {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        sweeps,
+                        "review reconciliation: {} — {}. The auto-Done move was either refused or is \
+                         still being retried; a ticket in review blocks every dependent of it. This \
+                         sweep only reports, so it needs a human.",
                         d.pr,
                         d.kind.detail()
                     );
@@ -3733,6 +3840,14 @@ mod store_tests {
             format!("req{}", "west"),
             format!("run{}", "_turn"),
             format!("post_pr{}", "_comment"),
+            // STUDIO-1007: the sweep REPORTS a merged pull request whose ticket is not terminal; it
+            // must never be the thing that MOVES it. The retry and the move live on the watcher's
+            // off-loop half (`reviewdone`), fed by this sweep's own report — reaching for either
+            // from here is the mutation the ticket's ⚠️ names.
+            format!("self.tracker{}", "."),
+            format!("move_issue{}", "_state"),
+            format!("finish_review{}", "_ticket"),
+            format!("retry_pending{}", "_review_done"),
         ];
         for token in tokens {
             assert!(
@@ -4455,6 +4570,85 @@ mod store_tests {
         assert_eq!(
             rendered["review_divergence"][0]["capacity_unreadable"]["attempts"],
             UNREADABLE_ATTEMPTS_TO_DROP_HOLD
+        );
+    }
+
+    // --- STUDIO-1007: a merged pull request whose ticket is not terminal -----------------------
+
+    /// The durable owed-move row auto-done writes before its first attempt, for `identifier`.
+    fn owed_move(o: &Orchestrator, identifier: &str, pr: &str) {
+        o.store()
+            .save_review_done(rhapsody_store::ReviewDoneRow {
+                identifier: identifier.to_string(),
+                pr: pr.to_string(),
+                issue_id: format!("ID-{identifier}"),
+                team_id: "TEAM-1".to_string(),
+                state: "Done".to_string(),
+                attempts: 2,
+                next_at: String::new(),
+                gave_up: false,
+            })
+            .expect("record the owed move");
+    }
+
+    /// **STUDIO-1007 acceptance: a merged pull request whose ticket is not terminal shows on the
+    /// operator feed within one sweep.** The owed-move row is the ONLY input — the sweep asks `gh`
+    /// and the tracker nothing — and both surfaces carry it: the divergence on `/api/v1/state` and
+    /// the project advisory.
+    ///
+    /// MUTATION (the ticket's ⚠️): let the sweep perform the move (clear the row itself) and the
+    /// source-level `the_reconciliation_sweep_makes_no_network_call` reds; drop this report and the
+    /// assertions here red.
+    #[test]
+    fn a_merged_pull_requests_unmoved_ticket_is_reported() {
+        let mut o = orch(false, "2026-09-22T22:00:00Z");
+        owed_move(&o, "STUDIO-1004", "makewhatis/rhapsody#216");
+
+        o.reconcile_review_divergence();
+        let ds = o.review_divergences();
+        assert_eq!(
+            ds.len(),
+            1,
+            "one divergence for the one unmoved ticket: {ds:?}"
+        );
+        assert_eq!(ds[0].kind, DivergenceKind::MergedTicketNotTerminal);
+        assert_eq!(ds[0].ticket, "STUDIO-1004");
+        assert_eq!(ds[0].pr, "makewhatis/rhapsody#216");
+
+        assert!(
+            o.project_statuses()
+                .iter()
+                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+            "the project advisory points at the divergence surface"
+        );
+
+        // The move landing forgets the row, and the report with it.
+        o.store()
+            .clear_review_done("STUDIO-1004")
+            .expect("the move landed");
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences().is_empty(),
+            "recovered once the terminal move lands"
+        );
+    }
+
+    /// The report does NOT depend on the human-hold ledger being primed: the owed-move row is a
+    /// finished pull request, not a stalled obligation a held ticket could be excused from, so it
+    /// goes out on a daemon whose selection half has never read the board.
+    #[test]
+    fn an_unprimed_daemon_still_reports_an_owed_terminal_move() {
+        let mut o = orch_before_first_pass(false, "2026-09-22T22:00:00Z");
+        owed_move(&o, "STUDIO-1004", "makewhatis/rhapsody#216");
+
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences()
+                .iter()
+                .map(|d| d.kind)
+                .collect::<Vec<_>>(),
+            vec![DivergenceKind::MergedTicketNotTerminal]
         );
     }
 }
