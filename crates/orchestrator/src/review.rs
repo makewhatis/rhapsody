@@ -311,7 +311,12 @@ pub enum ReviewDispatchOutcome {
     /// identical refusal. Nothing observable was written: the watch-set writes happen only once
     /// preparation is accepted, so the sweep can re-offer this head — a re-offer hits the same
     /// reservation (or the gate) rather than spawning a second review.
-    Preparing,
+    ///
+    /// `reserved` is true only when THIS call STARTED a new reservation, which spends one unit of
+    /// the caller's dispatch budget for the rest of the sweep. A re-offer that JOINED an existing
+    /// reservation, or a gate suppression, started nothing and must not double-count (STUDIO-988
+    /// review round 4, jimmy #1).
+    Preparing { reserved: bool },
 }
 
 impl Orchestrator {
@@ -444,9 +449,13 @@ impl Orchestrator {
                 self.finish_review_dispatch(run, route, iss);
                 ReviewDispatchOutcome::Dispatched
             }
-            crate::prepare::BeginPreparation::Started(_)
-            | crate::prepare::BeginPreparation::AlreadyPreparing
-            | crate::prepare::BeginPreparation::Suppressed => ReviewDispatchOutcome::Preparing,
+            crate::prepare::BeginPreparation::Started(_) => {
+                ReviewDispatchOutcome::Preparing { reserved: true }
+            }
+            crate::prepare::BeginPreparation::AlreadyPreparing
+            | crate::prepare::BeginPreparation::Suppressed => {
+                ReviewDispatchOutcome::Preparing { reserved: false }
+            }
             crate::prepare::BeginPreparation::AlreadyInFlight => {
                 ReviewDispatchOutcome::AlreadyInFlight
             }

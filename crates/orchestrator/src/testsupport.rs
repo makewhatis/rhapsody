@@ -28,6 +28,10 @@ use rhapsody_tracker::fake::Fake;
 use crate::dispatch::EligibilityGate;
 use crate::effective::{DEFAULT_CLAIM_SETTLE_DELAY, DEFAULT_CLAIM_TTL, Effective, ResolvedProject};
 
+use crate::liveness::{self, Sampler};
+use crate::obslog::Store as TranscriptStore;
+use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
+
 /// A preparation resolver that never answers, for tests that only need asynchronous preparation to
 /// ENGAGE (STUDIO-988) and never to complete. The permit is dropped when the future is dropped;
 /// tests that care about permit ownership live in `prepare.rs` beside `BlockingResolver`.
@@ -43,9 +47,6 @@ impl crate::prepare::PreparationResolver for HangResolver {
         std::future::pending::<crate::prepare::PreparationCompletion>().await
     }
 }
-use crate::liveness::{self, Sampler};
-use crate::obslog::Store as TranscriptStore;
-use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
 
 // --- issue / blocker / set builders (Go dispatch_test / select_test helpers) -----------------
 

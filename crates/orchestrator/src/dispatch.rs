@@ -747,7 +747,13 @@ impl Orchestrator {
     pub(crate) fn last_run_started_at(&self, identifier: &str) -> Option<DateTime<Utc>> {
         let runs = self.store().issue_history(identifier, "", 10).ok()?;
         for r in runs {
-            if r.started_at.is_empty() || r.outcome == OUTCOME_INTERRUPTED {
+            // `refused` rows are skipped for the same reason `interrupted` ones are: a zero-turn
+            // refusal is not a run a summons had to beat, and counting its start would hide the
+            // triggering summons from a later reopen (STUDIO-988 review round 4, jimmy #3).
+            if r.started_at.is_empty()
+                || r.outcome == OUTCOME_INTERRUPTED
+                || r.outcome == rhapsody_store::OUTCOME_REFUSED
+            {
                 continue;
             }
             if let Ok(t) = DateTime::parse_from_rfc3339(&r.started_at) {

@@ -948,6 +948,10 @@ pub struct Orchestrator {
     /// The bounded refusal gate: suppresses the identical `(identity, selection, credential
     /// revision)` refusal until an input changes or its next-probe time arrives.
     pub(crate) refusal_gate: crate::prepare::RefusalGate,
+    /// The credential revision the loop currently expects, or `None` when it has no opinion (the P6
+    /// default — no provider subsystem). A completion whose observed revision differs is stale and
+    /// its move-only payload is dropped; PB7 advances this on a credential mutation.
+    pub(crate) prepare_expected_revision: Option<String>,
     /// A reopening ticket's captured summons, held from `promote_and_dispatch` until
     /// `dispatch_issue` makes the run live and seeds it (STUDIO-988). Needed because the run does not
     /// exist until an asynchronous preparation is accepted, which can be several events later. Empty
@@ -1093,6 +1097,7 @@ impl Orchestrator {
                 crate::prepare::MAX_PREPARATION_CONCURRENCY,
             )),
             refusal_gate: crate::prepare::RefusalGate::default(),
+            prepare_expected_revision: None,
             pending_reopen_summons: HashMap::new(),
         }
     }

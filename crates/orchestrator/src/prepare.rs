@@ -24,13 +24,13 @@
 //! With no resolver installed, every dispatch path is byte-identical to a daemon built before this
 //! feature: `begin_preparation` is never reached and `dispatch_issue` runs inline as it always did.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rhapsody_core::Issue;
+use rhapsody_core::{Issue, normalize_state};
 
 use crate::control_loop::{CancelSignal, Event};
 use crate::orchestrator::Orchestrator;
@@ -265,6 +265,20 @@ pub struct PreparationRequest {
     pub expected_revision: String,
 }
 
+/// The deferred promote a REVIEW-REOPEN dispatch carries (STUDIO-988 review round 4, jimmy #3 /
+/// alice #4). The Linear state write and the captured reopening summons are held on the target and
+/// applied only once a preparation is ACCEPTED (`finish_prepared`), exactly as the pool claim
+/// election was moved there: a refused, suppressed or stale reopen must leave the ticket in its
+/// review state with its summons intact, so `review_reopen_eligible` can re-offer it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReopenPromote {
+    /// The active state the ticket is moved to before the run (the configured promote state).
+    pub state: String,
+    /// The summons that triggered the reopen `(at, body)`, seeded into the run's mailbox once the
+    /// run is live.
+    pub summon: Option<(DateTime<Utc>, String)>,
+}
+
 /// What a completion resumes: the dispatch context captured when the reservation was inserted.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedTarget {
@@ -282,6 +296,8 @@ pub(crate) enum PreparedTarget {
         /// The owning project INDEX for a pool pick (`None` on the legacy single-project pool
         /// ladder), used at completion to resolve the slug-bound tracker for the election.
         pool_proj: Option<usize>,
+        /// A deferred review-reopen promote (`None` on every ordinary dispatch).
+        reopen: Option<ReopenPromote>,
     },
     /// A review dispatch, resuming the ticketless review's watch-set writes then dispatch.
     Review {
@@ -304,7 +320,27 @@ pub(crate) fn ticket_selection(issue: &Issue, route: Option<&DispatchRoute>) -> 
         v.join(",")
     });
     let slug = route.map_or("", |r| r.slug.as_str());
-    format!("ticket|{}|{}|{}|{}", issue.id, issue.state, labels, slug)
+    // The state is NORMALIZED (STUDIO-988 review round 4, alice #5): a `review_promote_state`
+    // config is accepted after `normalize_state` and `move_issue_state` resolves it
+    // case-insensitively, but the tracker re-read returns its own casing. Folding the raw strings
+    // into the fingerprint made a reopen with a case-variant promote state always stale. Both sides
+    // of the comparison normalize, so the gate keys still agree with each other.
+    format!(
+        "ticket|{}|{}|{}|{}",
+        issue.id,
+        normalize_state(&issue.state),
+        labels,
+        slug
+    )
+}
+
+/// The required-label set for a REVALIDATION that must not apply the proactive-pickup label gate.
+/// A claim-held retry/continuation is admitted by `on_retry` with no required labels (a label
+/// stripped mid-run must not abandon in-flight work), so completion revalidation asks the same
+/// question (STUDIO-988 review round 4, jimmy #2 / alice #1).
+fn no_required_labels() -> &'static HashSet<String> {
+    static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
 }
 
 /// The refusal-gate key for a ticket identity + selection. Shared by every place that must agree on
@@ -711,6 +747,13 @@ impl Orchestrator {
         self.prepare_resolver = Some(resolver);
     }
 
+    /// Installs the credential revision the loop currently expects (STUDIO-988, the PB7 credential
+    /// mutation hook). `None` means "no opinion" — the P6 default — and a completion whose observed
+    /// revision differs from a `Some` value is dropped as stale before it can mutate state.
+    pub fn set_prepare_expected_revision(&mut self, revision: Option<String>) {
+        self.prepare_expected_revision = revision;
+    }
+
     /// Whether asynchronous preparation is active for this daemon.
     pub fn preparation_enabled(&self) -> bool {
         self.prepare_resolver.is_some()
@@ -807,26 +850,47 @@ impl Orchestrator {
             key,
             selection,
             config_generation: token.generation,
-            expected_revision: String::new(),
+            // The revision the loop currently expects; empty in P6 (PB7 supplies it).
+            expected_revision: self.prepare_expected_revision.clone().unwrap_or_default(),
         };
         tokio::spawn(async move {
             let _guard = wg;
+            // ONE deadline bounds the whole preparation — waiting for a permit AND the resolver
+            // work — so a saturated resolver pool cannot park a reservation forever with no typed
+            // outcome (STUDIO-988 review round 4, sol #1 / alice #3). A queued preparation used to
+            // await the permit outside any bound.
+            let deadline = tokio::time::Instant::now() + timeout;
             // The permit is acquired here and HANDED TO the resolver, which owns it for the whole
             // lifetime of the underlying work — including after the loop-side timeout drops the
             // `prepare` future. A `spawn_blocking` closure keeps running when its join future is
             // cancelled, so if the permit were dropped with the future, repeated timeouts would
             // accumulate unbounded blocking tasks.
-            let permit = match semaphore.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return, // the semaphore was closed: the daemon is shutting down
-            };
             let mut cancel_wait = cancel.wait();
-            let completion = tokio::select! {
+            let acquired = tokio::select! {
                 _ = cancel_wait.cancelled() => None,
-                r = tokio::time::timeout(timeout, resolver.prepare(&req, permit)) => match r {
-                    Ok(c) => Some(c),
-                    Err(_) => Some(PreparationCompletion::timed_out()),
+                r = tokio::time::timeout_at(deadline, semaphore.acquire_owned()) => match r {
+                    Ok(Ok(p)) => Some(p),
+                    Ok(Err(_)) => return, // the semaphore was closed: the daemon is shutting down
+                    // The deadline passed without a permit. Fall through to a typed completion so
+                    // the loop releases the reservation and arms the refusal gate.
+                    Err(_) => None,
                 },
+            };
+            let completion = match acquired {
+                // Cancelled, or the permit never arrived before the deadline. On cancellation the
+                // reservation is already gone and the completion is dropped by the loop; on the
+                // deadline the loop records a `resolver_timed_out` refusal.
+                None => (!cancel_wait.is_cancelled()).then(PreparationCompletion::timed_out),
+                Some(permit) => {
+                    let mut resolve_wait = cancel.wait();
+                    tokio::select! {
+                        _ = resolve_wait.cancelled() => None,
+                        r = tokio::time::timeout_at(deadline, resolver.prepare(&req, permit)) => match r {
+                            Ok(c) => Some(c),
+                            Err(_) => Some(PreparationCompletion::timed_out()),
+                        },
+                    }
+                }
             };
             // A closed receiver (the loop is gone) or a stale token drops the payload here without
             // touching loop state.
@@ -867,6 +931,23 @@ impl Orchestrator {
             }
             return;
         }
+        // A completion whose credential revision is not the one the loop currently expects is
+        // stale: a credential mutation advanced the loop's revision while this resolver read the
+        // old one, so its result must not become a session (STUDIO-988 review round 4, sol #3). The
+        // check is inert in P6 (no provider subsystem ⇒ `None`), and PB7 advances the field on a
+        // mutation which `abandon_prepared` re-parks/releases exactly as any supersession.
+        if let Some(expected) = self.prepare_expected_revision.clone()
+            && completion.observed_revision != expected
+        {
+            tracing::info!(
+                id = %id,
+                "prepared completion carries a stale credential revision; dropping it"
+            );
+            if let Some(entry) = self.preparing.take(&id) {
+                self.abandon_prepared(entry, AbandonCause::Superseded);
+            }
+            return;
+        }
         // Revalidate current eligibility: an armed drain defers without refusing (the work may be
         // re-offered after the drain), and a live run/claim means this completion is moot.
         if self.drain.is_draining() {
@@ -890,22 +971,21 @@ impl Orchestrator {
         let Some(entry) = self.preparing.take(&id) else {
             return;
         };
+        // Revalidate the CURRENT board BEFORE branching on the outcome (STUDIO-988 review round 4,
+        // sol #2). A refused completion must not arm a gate or write a zero-turn row for a ticket
+        // that has since gone terminal, disappeared, changed selection or gained `rhapsody:human`,
+        // exactly as a success must not dispatch it. A stale completion is dropped either way.
+        if self.prepared_target_still_current(&entry).await == PreparedValidity::Stale {
+            tracing::info!(
+                id = %id,
+                "prepared completion is stale: the target changed since preparation began; \
+                 dropping it without dispatching or refusing"
+            );
+            self.abandon_prepared(entry, AbandonCause::Superseded);
+            return;
+        }
         match completion.outcome {
             PreparationOutcome::Ready(prepared) => {
-                // Revalidate the CURRENT board before launching anything: a ticket whose state,
-                // labels or selection moved between the reservation and this completion must not
-                // dispatch stale work, and a review whose head or open state moved must not review
-                // a commit it never selected. A stale completion is dropped exactly as a
-                // cancellation-dropped one is.
-                if self.prepared_target_still_current(&entry).await == PreparedValidity::Stale {
-                    tracing::info!(
-                        id = %id,
-                        "prepared completion is stale: the target changed since preparation began; \
-                         dropping it without dispatching"
-                    );
-                    self.abandon_prepared(entry, AbandonCause::Superseded);
-                    return;
-                }
                 // Ready to run the ordinary side effects. A successful preparation clears any stale
                 // gate for this fingerprint.
                 self.refusal_gate.rearm(&entry.fingerprint);
@@ -964,7 +1044,12 @@ impl Orchestrator {
     /// re-offered on the next tick.
     async fn prepared_target_still_current(&self, entry: &PreparingEntry) -> PreparedValidity {
         match &entry.target {
-            PreparedTarget::Ticket { issue, route, .. } => {
+            PreparedTarget::Ticket {
+                issue,
+                route,
+                reopen,
+                ..
+            } => {
                 let Some(eff) = self.eff.as_ref() else {
                     // No config: nothing to revalidate against. Dispatch would not resolve a route
                     // either; allow it so a config-less unit test behaves as before.
@@ -991,12 +1076,15 @@ impl Orchestrator {
                 let Some(cur_state) = states.into_iter().find(|i| i.id == issue.id) else {
                     return PreparedValidity::Stale; // the issue is gone
                 };
+                // The label read falls back on the issue being ABSENT from the answer, not on its
+                // label list being empty (STUDIO-988 review round 4, jimmy #4): Linear
+                // normalizes a ticket with no labels to `labels: None`, so `.and_then(labels)`
+                // made "every label was removed" indistinguishable from "unchanged".
                 let labels = match tracker.fetch_issue_labels_by_ids(&ids).await {
-                    Ok(v) => v
-                        .into_iter()
-                        .find(|i| i.id == issue.id)
-                        .and_then(|i| i.labels)
-                        .or_else(|| issue.labels.clone()),
+                    Ok(v) => match v.into_iter().find(|i| i.id == issue.id) {
+                        Some(i) => i.labels,
+                        None => issue.labels.clone(),
+                    },
                     Err(e) => {
                         tracing::warn!(
                             issue_identifier = %issue.identifier,
@@ -1017,9 +1105,29 @@ impl Orchestrator {
                 // Current eligibility, excluding this identity's own claim/reservation.
                 let mut running = self.running_id_set();
                 running.remove(&issue.id);
+                if reopen.is_some() {
+                    // A review-reopen target is still in its REVIEW state (the promote is deferred
+                    // until acceptance), so the board question is the reopen ladder's — still a
+                    // review-state ticket with a fresh summons — not active-state eligibility, which
+                    // would reject it outright (STUDIO-988 review round 4, jimmy #3).
+                    let st = normalize_state(&cur.state);
+                    if !eff.review_states.contains(&st) || eff.active_states.contains(&st) {
+                        return PreparedValidity::Stale;
+                    }
+                    if !self.review_reopen_eligible(&cur, &running) {
+                        return PreparedValidity::Stale;
+                    }
+                    return PreparedValidity::Current;
+                }
                 let mut claimed = self.claimed.clone();
                 claimed.remove(&issue.id);
-                let gate = eligibility_gate_for(eff, route.as_ref());
+                let mut gate = eligibility_gate_for(eff, route.as_ref());
+                if entry.claim_already_held {
+                    // A claim-held retry is admitted by `on_retry` with NO required-label gate, so
+                    // revalidation must ask the same question or a label stripped mid-run livelocks
+                    // the retry (STUDIO-988 review round 4, jimmy #2 / alice #1).
+                    gate.required_labels = no_required_labels();
+                }
                 if !crate::dispatch::eligibility(&cur, &running, &claimed, &gate).ok {
                     return PreparedValidity::Stale;
                 }
@@ -1062,6 +1170,7 @@ impl Orchestrator {
             stack_context: stack_context.clone(),
             pool: false,
             pool_proj: None,
+            reopen: None,
         };
         match self.begin_preparation(target, claim_already_held) {
             BeginPreparation::NoResolver => {
@@ -1137,6 +1246,7 @@ impl Orchestrator {
             stack_context: String::new(),
             pool: true,
             pool_proj: pick.proj,
+            reopen: None,
         };
         match self.begin_preparation(target, false) {
             BeginPreparation::NoResolver => {
@@ -1184,7 +1294,55 @@ impl Orchestrator {
                 stack_context,
                 pool,
                 pool_proj,
+                reopen,
             } => {
+                // A review-reopen promotes (a Linear state write) and seeds its summons HERE, once
+                // the preparation is accepted — never before — so a refused/suppressed/stale reopen
+                // leaves the ticket in its review state with the summons intact and
+                // `review_reopen_eligible` can re-offer it (STUDIO-988 review round 4, jimmy #3 /
+                // alice #4).
+                if let Some(promote) = reopen {
+                    let tracker = {
+                        let Some(eff) = self.eff.as_ref() else {
+                            return;
+                        };
+                        match &route {
+                            Some(r) => eff.project_by_slug(&r.slug).map_or_else(
+                                || Arc::clone(&eff.tracker),
+                                |p| Arc::clone(&p.tracker),
+                            ),
+                            None => Arc::clone(&eff.tracker),
+                        }
+                    };
+                    if let Err(e) = tracker
+                        .move_issue_state(&issue.id, &issue.team_id, &promote.state)
+                        .await
+                    {
+                        tracing::error!(
+                            issue_id = %issue.id,
+                            issue_identifier = %issue.identifier,
+                            promote_state = %promote.state,
+                            err = %e,
+                            "review-reopen promote failed; skipping (not dispatching un-promoted \
+                             review issue)"
+                        );
+                        return;
+                    }
+                    let mut iss = issue;
+                    iss.state = promote.state.clone();
+                    if let Some((at, body)) = promote.summon {
+                        self.pending_reopen_summons
+                            .insert(iss.id.clone(), (at, body));
+                    }
+                    tracing::info!(
+                        issue_id = %iss.id,
+                        issue_identifier = %iss.identifier,
+                        promote_state = %promote.state,
+                        "review-reopen: summoned ticket promoted and dispatched"
+                    );
+                    self.dispatch_issue(iss, attempt, route, stack_context);
+                    return;
+                }
                 if pool {
                     tracing::info!(
                         issue = %issue.identifier,
@@ -1280,10 +1438,11 @@ impl Orchestrator {
         if !entry.claim_already_held {
             return;
         }
-        let delay = match cause {
-            AbandonCause::Drained => crate::drain::DRAIN_REQUEUE_DELAY_MS,
-            AbandonCause::Superseded => crate::drain::DRAIN_REQUEUE_DELAY_MS,
-        };
+        // Both causes re-park at the same short delay: a drain, a reload, a stale generation, a
+        // cancellation and a departed issue are all "re-examine this promptly under the new state",
+        // where `on_retry` can release a ticket that is genuinely gone. The cause only decides the
+        // reason string.
+        let delay = crate::drain::DRAIN_REQUEUE_DELAY_MS;
         let reason = match cause {
             AbandonCause::Drained => "drain: preparation deferred",
             AbandonCause::Superseded => "preparation superseded; re-examining promptly",
@@ -1471,6 +1630,38 @@ impl Orchestrator {
         for id in dropped {
             tracing::info!(issue_id = %id, "issue left the candidate set; cancelling its preparation");
             self.cancel_preparation(&id);
+        }
+    }
+
+    /// Cancels every REVIEW preparation reservation for one pull-request coordinate — the operator
+    /// dismissal path (STUDIO-988 review round 4, alice #2). A dismissal drops the watch rows, so
+    /// the sweep will never observe the coordinate again; the last observation would otherwise keep
+    /// judging an in-flight completion `Current`, letting it dispatch a review of work the operator
+    /// has explicitly taken out of the watch set and re-upserting a live watch row.
+    pub(crate) fn cancel_review_preparations_for(&mut self, coord: &crate::prstate::PrCoord) {
+        let ids: Vec<String> = self
+            .preparing
+            .values()
+            .filter(|e| match &e.target {
+                PreparedTarget::Review { run, .. } => {
+                    run.owner.eq_ignore_ascii_case(&coord.owner)
+                        && run.repo.eq_ignore_ascii_case(&coord.repo)
+                        && run.number == coord.number
+                }
+                PreparedTarget::Ticket { .. } => false,
+            })
+            .map(|e| e.id().to_string())
+            .collect();
+        for id in ids {
+            tracing::info!(
+                id = %id,
+                "review dismissed; cancelling its in-flight preparation so no stale review dispatches"
+            );
+            // A review reservation holds no claim, so `abandon_prepared` only clears its (absent)
+            // summons; the cancel signal drops the resolver's payload at the event boundary.
+            if let Some(entry) = self.preparing.cancel(&id) {
+                self.abandon_prepared(entry, AbandonCause::Superseded);
+            }
         }
     }
 
@@ -1676,6 +1867,7 @@ mod tests {
             stack_context: String::new(),
             pool: false,
             pool_proj: None,
+            reopen: None,
         }
     }
 
@@ -2094,6 +2286,7 @@ mod tests {
             stack_context: String::new(),
             pool: false,
             pool_proj: None,
+            reopen: None,
         }
     }
 
@@ -2325,6 +2518,7 @@ mod tests {
             stack_context: String::new(),
             pool: false,
             pool_proj: None,
+            reopen: None,
         }
     }
 
@@ -2876,14 +3070,18 @@ mod tests {
         // Let the timeouts fire; if the permit were released with the cancelled future, the waiters
         // would acquire it and the blocking closures would exceed the bound.
         std::thread::sleep(Duration::from_millis(150));
+        // Release BEFORE asserting (STUDIO-988 review round 4, jimmy #6): on a regression the
+        // `assert_eq!` panics, and a `released` set only afterwards would leave the detached
+        // closures spinning forever, hanging runtime shutdown instead of failing the assertion.
+        // `peak` is a maximum recorded while the closures were blocked, so releasing now cannot
+        // change the verdict.
+        released.store(true, Ordering::SeqCst);
         assert_eq!(
             peak.load(Ordering::SeqCst),
             MAX_PREPARATION_CONCURRENCY,
             "a timed-out resolver's blocking closure must retain its permit; \
              releasing it on timeout would start more than the daemon-wide bound"
         );
-        // Release the closures so the test runtime can shut down cleanly.
-        released.store(true, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -2897,6 +3095,11 @@ mod tests {
         let mut low = issue("2", "MT-2", "Todo");
         low.priority = Some(3);
         tr.candidates = vec![high, low];
+        // Completion revalidation re-reads the target by id before either dispatching OR recording a
+        // refusal (STUDIO-988 review round 4, sol #2), so the Fake must answer that read.
+        for iss in &tr.candidates {
+            tr.by_id.insert(iss.id.clone(), iss.clone());
+        }
         let mut eff = empty_effective(Arc::new(tr));
         eff.active_states = set_of(&["todo", "in progress"]);
         eff.terminal_states = set_of(&["done"]);
@@ -2945,6 +3148,59 @@ mod tests {
             !o.preparing.contains("1"),
             "the suppressed ticket is not re-reserved"
         );
+    }
+
+    // The SAME suppression filter, on the ladder a `projects:` install actually uses (STUDIO-988
+    // review round 4, jimmy #5 / alice #6). MUTATION GUARD: the legacy ladder's test does not reach
+    // this branch, so disabling the multi-project filter left the whole suite green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suppressed_candidate_does_not_spend_the_slot_in_the_multi_project_ladder() {
+        let mut tr = Fake::new();
+        let mut high = issue("1", "MT-1", "Todo");
+        high.priority = Some(1);
+        let mut low = issue("2", "MT-2", "Todo");
+        low.priority = Some(3);
+        tr.candidates = vec![high, low];
+        for iss in &tr.candidates {
+            tr.by_id.insert(iss.id.clone(), iss.clone());
+        }
+        let (mut o, _sink) = crate::testsupport::orch_for_retry_multi(
+            vec![crate::testsupport::proj_with_tracker(
+                "a",
+                Arc::new(tr),
+                "promptA",
+            )],
+            1,
+        );
+        o.now = Box::new(fixed_now);
+        o.prepare_timeout = Duration::from_secs(3600);
+        o.prepare_resolver = Some(Arc::new(RefuseOne {
+            refuse_id: "1".to_string(),
+        }));
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        assert!(o.preparing.contains("1"), "the first pick begins preparing");
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            refused_completion(RefusalReason::CredentialAbsent),
+        )
+        .await;
+
+        // The suppressed high-priority ticket must not spend the multi-project ladder's only slot.
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        assert!(
+            o.preparing.contains("2"),
+            "the multi-project ladder must skip a gate-suppressed candidate before reserving the slot"
+        );
+        assert!(!o.preparing.contains("1"));
     }
 
     // Alice's delta repro: in POOL mode the candidate query returns only UNASSIGNED tickets, so a
@@ -3356,6 +3612,255 @@ mod tests {
         assert!(
             o.pending_reopen_summons.is_empty(),
             "the consumed summons is not left for a later run"
+        );
+    }
+
+    // --- STUDIO-988 round 4: the remaining review blockers --------------------------------------
+
+    fn refused_completion(reason: RefusalReason) -> PreparationCompletion {
+        PreparationCompletion {
+            outcome: PreparationOutcome::Refused(reason),
+            observed_revision: String::new(),
+            resolved: fake_selection(),
+        }
+    }
+
+    // MUTATION GUARD: apply the proactive required-label gate to a claim-held retry's completion
+    // revalidation and `on_retry`'s "a required label stripped mid-run does not abandon in-flight
+    // work" admission livelocks the retry — it is never dispatched and never released
+    // (STUDIO-988 review round 4, jimmy #2 / alice #1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_held_retry_revalidates_without_the_required_label_gate() {
+        let (mut o, _shared, sink) = orch_with_mutable_state();
+        o.eff.as_mut().expect("eff").labels = set_of(&["agent"]);
+        o.claimed.insert("1".to_string());
+        o.dispatch_or_prepare(issue("1", "MT-1", "Todo"), Some(1), None, String::new());
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a claim-held retry must revalidate with no required labels, exactly as on_retry admits it"
+        );
+    }
+
+    // The positive control: the label gate is NOT dropped for a FRESH dispatch, only for a
+    // claim-held retry. Without this, "revalidate with no labels" could be applied everywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_dispatch_missing_a_required_label_is_still_dropped() {
+        let (mut o, _shared, sink) = orch_with_mutable_state();
+        o.eff.as_mut().expect("eff").labels = set_of(&["agent"]);
+        o.dispatch_or_prepare(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a fresh dispatch whose required routing label is missing must not dispatch"
+        );
+    }
+
+    // MUTATION GUARD: revalidate only the READY outcome and a stale REFUSAL still writes a run row
+    // and arms an obsolete gate (STUDIO-988 review round 4, sol #2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_completion_is_revalidated_before_it_records_a_refusal() {
+        let (mut o, shared, _sink) = orch_with_mutable_state();
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        // The ticket goes terminal between begin and completion.
+        {
+            let mut s = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.0 = "Done".to_string();
+        }
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            refused_completion(RefusalReason::CredentialAbsent),
+        )
+        .await;
+        let runs = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert!(
+            runs.is_empty(),
+            "a stale refusal must not record a zero-turn run for a ticket that left the board"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    // MUTATION GUARD: never compare the credential revision and a completion minted against a
+    // superseded revision still mutates state (STUDIO-988 review round 4, sol #3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completion_with_a_stale_credential_revision_is_dropped() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.set_prepare_expected_revision(Some("rev-1".to_string()));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        // The resolver read a NEWER revision than the loop now expects: the mutation landed
+        // mid-flight, so this result must not become a session.
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-2",
+                )),
+                observed_revision: "rev-2".to_string(),
+                resolved: fake_selection(),
+            },
+        )
+        .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a completion at a superseded credential revision must be dropped"
+        );
+        assert!(o.preparing.is_empty());
+
+        // Positive control: the SAME expected revision accepts.
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a completion at the expected revision still dispatches"
+        );
+    }
+
+    // MUTATION GUARD: await the resolver permit OUTSIDE the deadline/cancel select and a saturated
+    // pool parks the reservation forever with no typed outcome — this test never receives a
+    // completion (STUDIO-988 review round 4, sol #1 / alice #3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saturated_resolver_pool_still_answers_with_a_typed_timeout() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.prepare_timeout = Duration::from_millis(25);
+        // Zero permits: the acquire can never succeed.
+        o.prepare_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        o.prepare_resolver = Some(Arc::new(RefuseOne {
+            refuse_id: "never".to_string(),
+        }));
+        let mut rx = o.take_events_rx().expect("control-event receiver");
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a saturated pool must still emit a typed completion, not park forever")
+            .expect("the event channel is open");
+        match ev {
+            Event::DispatchPrepared { completion, .. } => assert!(
+                matches!(
+                    completion.outcome,
+                    PreparationOutcome::Refused(RefusalReason::ResolverTimedOut)
+                ),
+                "a permit-acquire timeout is a typed resolver_timed_out refusal"
+            ),
+            _ => panic!("expected a DispatchPrepared completion"),
+        }
+    }
+
+    // MUTATION GUARD: fall back on the label list being empty instead of the issue being ABSENT and
+    // removing a ticket's LAST label is invisible to revalidation (STUDIO-988 review round 4,
+    // jimmy #4). Linear normalizes a ticket with no labels to `labels: None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_tickets_last_label_between_begin_and_completion_drops_the_completion() {
+        let mut tr = Fake::new();
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.labels = Some(vec!["agent".to_string()]);
+        tr.candidates = vec![iss.clone()];
+        tr.by_id.insert("1".to_string(), iss.clone());
+        // The by-id LABEL read answers "found, but with no labels" — the exact shape Linear returns.
+        tr.labels_by_ids_func = Some(Box::new(|ids: &[String]| {
+            Ok(ids
+                .iter()
+                .map(|id| Issue {
+                    id: id.clone(),
+                    labels: None,
+                    ..Issue::default()
+                })
+                .collect())
+        }));
+        let mut eff = empty_effective(Arc::new(tr) as Arc<dyn rhapsody_tracker::Tracker>);
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Ready),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        let target = PreparedTarget::Ticket {
+            issue: iss,
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a ticket whose last label was removed must not dispatch stale work"
+        );
+    }
+
+    // MUTATION GUARD: compare the RAW state strings and a target whose state differs only in case
+    // from the tracker's answer is always judged stale (STUDIO-988 review round 4, alice #5).
+    // `validate` accepts `review_promote_state` after `normalize_state`, so a case variant is real
+    // config.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_case_variant_state_still_revalidates() {
+        let (mut o, shared, sink) = orch_with_mutable_state();
+        {
+            let mut s = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.0 = "In Progress".to_string();
+        }
+        assert!(matches!(
+            o.begin_preparation(ticket_target("in progress"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a state that differs only in case must not make a completion stale"
         );
     }
 }

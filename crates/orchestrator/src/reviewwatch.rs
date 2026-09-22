@@ -2436,9 +2436,18 @@ impl Orchestrator {
                 // STUDIO-988: preparation began (or the refusal gate suppressed an identical
                 // refusal). The watch row was NOT written, so this head is re-offered next sweep —
                 // a re-offer joins the existing reservation rather than spawning a second review.
-                ReviewDispatchOutcome::Preparing => {
+                //
+                // A reservation STARTED here draws the same review pool a running review does, so it
+                // spends this sweep's budget: without the decrement every due round in one sweep
+                // begins a preparation against a cap of one (STUDIO-988 review round 4, jimmy #1). A
+                // re-offer that joined an existing reservation, or a gate suppression, started
+                // nothing and must not decrement — `review_pool_holders` already counted it.
+                ReviewDispatchOutcome::Preparing { reserved } => {
                     report.deferred += 1;
-                    tracing::debug!(pr = %pr, "ticketless review: preparation in flight");
+                    if reserved {
+                        *slots -= 1;
+                    }
+                    tracing::debug!(pr = %pr, reserved, "ticketless review: preparation in flight");
                 }
             }
         }
@@ -8548,6 +8557,46 @@ mod tests {
             o.running_ticketless_reviews(),
             2,
             "running review runs must never exceed agent.max_concurrent_reviews"
+        );
+    }
+
+    /// STUDIO-988 review round 4 (jimmy #1): a `Preparing` reservation that STARTED in this sweep
+    /// spends the sweep's budget. Without the decrement every due round in ONE sweep begins a
+    /// preparation, over-reserving `max_concurrent_reviews`; `review_pool_holders` only protects the
+    /// NEXT sweep. Mutation check: drop the `if reserved { *slots -= 1; }` and this reds
+    /// (`preparing.len() == 3`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_review_sweep_reserves_at_most_the_review_pool() {
+        use crate::testsupport::HangResolver;
+        let (mut o, _dispatched) = orch(ticketless(&["bob"]));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.max_concurrent = 10;
+            eff.max_concurrent_reviews = Some(1);
+        }
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        for n in 31..34 {
+            introduce(&o, row(n, "bob"));
+        }
+
+        let report = o.handle_review_sweep(&[
+            open_at(31, HEAD_A),
+            open_at(32, HEAD_A),
+            open_at(33, HEAD_A),
+        ]);
+
+        assert_eq!(
+            o.preparing.len(),
+            1,
+            "one sweep must not start more review preparations than the review pool holds"
+        );
+        assert_eq!(
+            report.dispatched, 0,
+            "nothing dispatches until a preparation is accepted"
+        );
+        assert_eq!(
+            report.deferred, 3,
+            "the two over-budget rounds are deferred, not prepared"
         );
     }
 
