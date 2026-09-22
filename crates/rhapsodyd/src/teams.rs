@@ -506,57 +506,59 @@ fn field(value: &str, o: Origin) -> String {
 /// is the resolved `agent.backend` from the same workflow the daemon would boot, and naming it is
 /// what turns the line from a restatement into an answer.
 ///
-/// A harness this build cannot run is MARKED, because the dispatcher silently falls back to
-/// `agent.backend` for it (`spawn_worker`, STUDIO-902): plain `harness: codex [overlay]` would
-/// claim a CLI that never runs, which is the misleading report decision 2 of this ticket exists to
-/// avoid. The mark is only ever appended — `<value> [origin]` stays byte-identical for the
-/// implemented harnesses that are the overwhelmingly common case, so a mark means something.
+/// A harness this build cannot run is MARKED, because the dispatcher REFUSES a profile that names
+/// one (`spawn_worker`, STUDIO-978; it used to silently fall back to `agent.backend`): plain
+/// `harness: codex [overlay]` would claim a CLI that never runs, which is the misleading report
+/// decision 2 of this ticket exists to avoid. The mark is only ever appended — `<value> [origin]`
+/// stays byte-identical for the implemented harnesses that are the overwhelmingly common case, so a
+/// mark means something.
 ///
 /// The empty-`harness` branch is deliberately UNMARKED, including when `agent.backend` itself
-/// names a harness this build cannot run: the mark's justification is `spawn_worker`'s silent
-/// fallback,
-/// and there is none here — `runner_for_backend` rejecting the backend makes `build_effective`
-/// fail and the daemon refuses to boot, and `validate` rejects an unknown name outright, so both
-/// are loud and a second report would only be noisier.
+/// names a harness this build cannot run: `runner_for_backend` rejecting the backend makes
+/// `build_effective` fail and the daemon refuses to boot, and `validate` rejects an unknown name
+/// outright, so both are loud and a second report would only be noisier.
 fn harness_field(profile_value: &str, origin: Origin, backend: &str) -> String {
     if profile_value.is_empty() {
         return format!("{backend} [unset — inherits agent.backend]");
     }
-    match harness_note(profile_value, backend) {
+    match harness_note(profile_value) {
         Some(note) => format!("{profile_value} {} ({note})", origin_tag(origin)),
         None => format!("{profile_value} {}", origin_tag(origin)),
     }
 }
 
 /// The parenthetical [`harness_field`] appends when the resolved harness is not one this build can
-/// run, or `None` when it is. `backend` is what dispatch falls back to.
+/// run, or `None` when it is.
 ///
 /// Recognized-but-unimplemented (`codex`) and a name no registry knows are told apart: the first
-/// is a build limitation, the second a typo, and the operator's next move differs.
-fn harness_note(harness: &str, backend: &str) -> Option<String> {
+/// is a build limitation, the second a typo, and the operator's next move differs. Neither says it
+/// "runs on" anything any more (STUDIO-978): `spawn_worker` REFUSES such a dispatch rather than
+/// falling back to `agent.backend`, so the note names the refusal.
+fn harness_note(harness: &str) -> Option<String> {
     if rhapsody_orchestrator::effective::harness_is_implemented(harness) {
         return None;
     }
     if rhapsody_config::HARNESS_NAMES.contains(&harness) {
-        Some(format!(
-            "recognized harness, but this build has no runner for it; runs on {backend}"
-        ))
+        Some(
+            "recognized harness, but this build has no runner for it; a dispatch is refused"
+                .to_string(),
+        )
     } else {
-        Some(format!("not a recognized harness; runs on {backend}"))
+        Some("not a recognized harness; a dispatch is refused".to_string())
     }
 }
 
 /// The harness an identity's runs actually use, for [`harness_field`]'s reason and by the same
-/// rule: the profile's resolved `harness` when this build implements it, else the configured
-/// `agent.backend` (the value dispatch falls back to). Shared with the review-scoped lines so
-/// `show` explains the review model against the harness the run really is on (STUDIO-908).
+/// rule: the profile's resolved `harness` when it names one, else the configured `agent.backend`
+/// (STUDIO-978 — a named harness this build cannot run is kept verbatim because the dispatch is
+/// REFUSED, not run on the backend; see `Orchestrator::effective_harness`). Shared with the
+/// review-scoped lines so `show` explains the review model against the harness the run resolves to
+/// (STUDIO-908).
 fn resolved_harness(profile_value: &str, backend: &str) -> String {
-    if !profile_value.is_empty()
-        && rhapsody_orchestrator::effective::harness_is_implemented(profile_value)
-    {
-        profile_value.to_string()
-    } else {
+    if profile_value.is_empty() {
         backend.to_string()
+    } else {
+        profile_value.to_string()
     }
 }
 
@@ -961,9 +963,9 @@ mod tests {
     }
 
     /// **Decision 2, mutation-checked by the assertion below.** The registry recognizes names this
-    /// build cannot run (`codex`), and `spawn_worker` silently falls back to `agent.backend` for
-    /// them — so plain `harness: codex [overlay]` would claim a CLI that never runs. It is marked,
-    /// and the mark names what dispatch falls back to.
+    /// build cannot run (`codex`), and `spawn_worker` REFUSES a profile naming one (STUDIO-978) —
+    /// so plain `harness: codex [overlay]` would claim a CLI that never runs. It is marked, and the
+    /// mark names the refusal.
     #[test]
     fn show_marks_a_recognized_harness_this_build_cannot_run() {
         let dir = TempDir::new();
@@ -981,14 +983,14 @@ mod tests {
             .unwrap_or_else(|| panic!("no harness line in {out}"));
         assert_eq!(
             line,
-            "harness:       codex [overlay] (recognized harness, but this build has no runner for it; runs on claude)",
+            "harness:       codex [overlay] (recognized harness, but this build has no runner for it; a dispatch is refused)",
             "out = {out}"
         );
     }
 
     /// A name no registry knows — the mistyped `harness:` the ticket opens with — is marked
     /// differently from a recognized-but-unimplemented one, because the operator's fix differs,
-    /// and it too names the backend it silently falls back to.
+    /// and it too names the refusal.
     #[test]
     fn show_marks_a_harness_no_registry_knows() {
         let dir = TempDir::new();
@@ -1005,7 +1007,8 @@ mod tests {
             .find(|l| l.starts_with("harness:"))
             .unwrap_or_else(|| panic!("no harness line in {out}"));
         assert_eq!(
-            line, "harness:       openai [overlay] (not a recognized harness; runs on claude)",
+            line,
+            "harness:       openai [overlay] (not a recognized harness; a dispatch is refused)",
             "out = {out}"
         );
     }

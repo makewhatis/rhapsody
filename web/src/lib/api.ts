@@ -208,6 +208,13 @@ export interface RunProvenance {
   model?: string;
   model_origin?: string;
   provider?: string;
+  /** OBSERVABILITY FIDELITY (STUDIO-978): whether this run's harness emits per-step events at all
+   *  ("structured") or only a final result ("final_text_only"). Absent means the harness is unknown
+   *  or unimplemented, so the console must say "unknown" rather than assume a shape. */
+  harness_events?: "structured" | "final_text_only";
+  /** Whether the harness can be steered at all ("live", "between_turns", "none"). Where it is
+   *  "none" the console HIDES the message field rather than offering a control that cannot work. */
+  harness_steering?: "live" | "between_turns" | "none";
 }
 
 // ProviderTokens is one bucket of the DaySummary's per-provider token split (STUDIO-909).

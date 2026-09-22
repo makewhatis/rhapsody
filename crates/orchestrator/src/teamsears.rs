@@ -381,6 +381,12 @@ pub(crate) struct EarsCycle<'a> {
     /// bounded by, so without one the manager stays exactly the router it was. That is what keeps
     /// the teams-off and `labels`-only prompts byte-identical.
     pub(crate) knowledge: Option<&'a crate::teamsknow::Knowledge<'a>>,
+    /// The roster identities a review dispatch would be REFUSED for (STUDIO-978), resolved on the
+    /// control task and carried in from [`TriageTarget`](crate::triage::TriageTarget). The manager
+    /// room reader runs off-loop and cannot ask the live harness question itself, so this is what
+    /// keeps [`file_review`] from filing a review ticket `spawn_worker` would refuse — the parent
+    /// would otherwise read "already under review" forever with no round ever run.
+    pub(crate) reviewer_exclusions: &'a crate::quorum::ReviewerExclusions,
 }
 
 /// What THIS pass has already written to the tracker, by issue id.
@@ -1363,36 +1369,48 @@ async fn file_review(
         .map(str::to_string)
         .or_else(|| identity_label_holder(teams, iss))
         .unwrap_or_default();
-    let reviewer = match target
-        .assignee
-        .clone()
-        .filter(|a| a != &author)
-        .or_else(|| {
-            // The off-loop triage task holds no `Orchestrator`, so it cannot ask the live harness
-            // question `reviewer_exclusions` answers; a required reviewer is pinned here as long as
-            // it is a roster member and not the author. That is safe rather than lossy: a pin whose
-            // profile names a harness this build cannot run falls back to `agent.backend` and still
-            // reviews, and the one reason a reviewer is removed from selection entirely — the
-            // ticketless `review.model` refusal — cannot arise here, because `review_model_for`
-            // self-gates on `review_ticketless` and `validate` makes `quorum.enabled` and
-            // `mode: ticketless` mutually exclusive, so this path never runs on a config where
-            // that refusal exists.
-            crate::quorum::select_reviewers(
-                teams,
-                &author,
-                cycle.load,
-                &crate::quorum::ReviewerExclusions::default(),
-            )
+    // The review dispatch is refused (STUDIO-978) for a profile naming a harness this build has no
+    // runner for, so filing a review ticket for such a reviewer would park the parent "under
+    // review" forever with no round ever run. The exclusions are resolved on the control task from
+    // the live harness answer and carried in `cycle`; the operator's named reviewer is a PREFERENCE,
+    // dropped with a note rather than a mandate, exactly as the quorum path drops a refused pin.
+    let mut refused_name: Option<String> = None;
+    let pinned = target.assignee.clone().filter(|a| {
+        if a == &author {
+            return false;
+        }
+        if cycle.reviewer_exclusions.excludes(a) {
+            refused_name = Some(a.clone());
+            return false;
+        }
+        true
+    });
+    let reviewer = match pinned.or_else(|| {
+        // The off-loop triage task holds no `Orchestrator`, so it reads the exclusions the control
+        // task already resolved — the same answer `rank_reviewers`, `quorum` and `reviewwatch` use.
+        // The one reason a reviewer is removed from selection entirely that CANNOT arise here is the
+        // ticketless `review.model` refusal, because `review_model_for` self-gates on
+        // `review_ticketless` and `validate` makes `quorum.enabled` and `mode: ticketless` mutually
+        // exclusive, so this path never runs on a config where that refusal exists.
+        crate::quorum::select_reviewers(teams, &author, cycle.load, cycle.reviewer_exclusions)
             .into_iter()
             .next()
-        }) {
+    }) {
         Some(r) => r,
         None => {
-            return Done::say(format!(
-                "{}: the roster holds nobody but {author} to review it, so I asked no one. Add a \
-                 teammate to `teams.yaml`.",
-                iss.identifier
-            ));
+            return Done::say(match refused_name.as_deref() {
+                Some(named) => format!(
+                    "{}: {named} cannot run on this build and the roster holds nobody else to \
+                     review it, so I asked no one. Add a teammate to `teams.yaml`, or fix {named}'s \
+                     profile.",
+                    iss.identifier
+                ),
+                None => format!(
+                    "{}: the roster holds nobody but {author} to review it, so I asked no one. Add \
+                     a teammate to `teams.yaml`.",
+                    iss.identifier
+                ),
+            });
         }
     };
     // §0.12's claim rule: an UNASSIGNED review ticket is never picked up, so a fan-out that cannot
@@ -1455,6 +1473,13 @@ async fn file_review(
         "{reviewer} — filed {filed} to review {}'s PR ({pr_url}).",
         iss.identifier
     );
+    if let Some(named) = &refused_name {
+        // The operator named this reviewer and we did not use them: say so, so the substitution is
+        // visible rather than looking like the name was ignored.
+        line.push_str(&format!(
+            " ({named} cannot run on this build, so I asked {reviewer} instead.)"
+        ));
+    }
     if let Err(e) = tracker
         .add_issue_label(&iss.id, &iss.team_id, QUORUM_REQUESTED_LABEL)
         .await
@@ -2492,7 +2517,17 @@ mod tests {
             billing_guard: false,
             tracker_api_key: String::new().leak(),
             knowledge: None,
+            reviewer_exclusions: no_exclusions(),
         }
+    }
+
+    /// The empty exclusion set every test cycle shares by default — a `&'static` so [`cycle`] can
+    /// hand one out without a named local per call. A test that needs exclusions writes
+    /// `EarsCycle { reviewer_exclusions: &x, ..cycle(..) }`.
+    fn no_exclusions() -> &'static crate::quorum::ReviewerExclusions {
+        static D: std::sync::OnceLock<crate::quorum::ReviewerExclusions> =
+            std::sync::OnceLock::new();
+        D.get_or_init(crate::quorum::ReviewerExclusions::default)
     }
 
     fn owner_of(issues: &[Issue]) -> HashMap<String, usize> {
@@ -2841,6 +2876,163 @@ mod tests {
         assert_eq!(report.answered, 1, "silence is a bug: it still replies");
         assert!(
             fx.reply_bodies()[0].contains("already under review"),
+            "{:?}",
+            fx.reply_bodies()
+        );
+    }
+
+    /// STUDIO-978: `file_review` honours the reviewer exclusions the control task resolved. The
+    /// load leader would win the ranked fill, but its profile names a harness `spawn_worker`
+    /// REFUSES, so the round goes to the next candidate instead of filing a review ticket that can
+    /// never run and leaving the parent "under review" forever.
+    ///
+    /// MUTATION GUARD: pass `&ReviewerExclusions::default()` — the pre-978 call — and `bob`, the
+    /// load leader, is chosen, so the label assertion goes red.
+    #[tokio::test]
+    async fn an_excluded_load_leader_does_not_get_the_review_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("someone review STUDIO-654");
+        let t = teams(&["alice", "bob", "jimmy"], ManagerMode::Labels);
+        let issues = vec![in_review("STUDIO-654")]; // the author is alice (identity label)
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f) = (states(), facts());
+        // bob leads on load (0), so the ranked fill would name him first if he were selectable.
+        let load = HashMap::from([("bob".to_string(), 0i64), ("jimmy".to_string(), 5i64)]);
+        let excl = crate::quorum::ReviewerExclusions {
+            unselectable: HashSet::from(["bob".to_string()]),
+        };
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+            }))),
+        );
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &EarsCycle {
+                reviewer_exclusions: &excl,
+                ..cycle(&issues, &owner, &trackers, &st, &f, &load, false)
+            },
+        )
+        .await;
+
+        assert_eq!(report.filed, 1);
+        let created = fx.tracker.create_issue_calls();
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(
+            created[0].spec.labels,
+            vec![format!("{IDENTITY_LABEL_PREFIX}jimmy")],
+            "the excluded load leader must not be chosen"
+        );
+    }
+
+    /// The operator's named reviewer is a PREFERENCE, not a mandate: when that identity cannot be
+    /// dispatched, the ranked fill decides and the reply says the substitution happened.
+    #[tokio::test]
+    async fn a_named_reviewer_who_cannot_run_is_replaced_by_the_fill() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("bob, review STUDIO-654 please");
+        let t = teams(&["alice", "bob", "jimmy"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")]; // the author is alice
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // The model names bob, whose profile resolves to a harness this build cannot run.
+        let ears = fx
+            .ears(FakeArbiter::answering(|| {
+                Ok(vec![Target {
+                    key: "STUDIO-654".to_string(),
+                    intent: Intent::Review,
+                    assignee: Some("bob".to_string()),
+                    answer: String::new(),
+                }])
+            }))
+            .with_github(
+                Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+                Arc::new(FakeOpenPr(Box::new(|| {
+                    Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+                }))),
+            );
+        let excl = crate::quorum::ReviewerExclusions {
+            unselectable: HashSet::from(["bob".to_string()]),
+        };
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &EarsCycle {
+                reviewer_exclusions: &excl,
+                ..cycle(&issues, &owner, &trackers, &st, &f, &load, true)
+            },
+        )
+        .await;
+
+        assert_eq!(report.filed, 1);
+        let created = fx.tracker.create_issue_calls();
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(
+            created[0].spec.labels,
+            vec![format!("{IDENTITY_LABEL_PREFIX}jimmy")],
+            "the fill reviews when the named identity cannot run"
+        );
+        let replies = fx.reply_bodies();
+        assert!(
+            replies[0].contains("bob cannot run on this build"),
+            "the substitution must be visible: {replies:?}"
+        );
+    }
+
+    /// With the only viable reviewer excluded, the room files NOTHING rather than creating work the
+    /// worker would refuse — and says why, so the operator can fix the profile.
+    #[tokio::test]
+    async fn a_roster_with_only_a_refused_reviewer_files_no_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("bob, review STUDIO-654 please");
+        let t = teams(&["alice", "bob"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")]; // the author is alice
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let ears = fx
+            .ears(FakeArbiter::answering(|| {
+                Ok(vec![Target {
+                    key: "STUDIO-654".to_string(),
+                    intent: Intent::Review,
+                    assignee: Some("bob".to_string()),
+                    answer: String::new(),
+                }])
+            }))
+            .with_github(
+                Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+                Arc::new(FakeOpenPr(Box::new(|| {
+                    Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+                }))),
+            );
+        let excl = crate::quorum::ReviewerExclusions {
+            unselectable: HashSet::from(["bob".to_string()]),
+        };
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &EarsCycle {
+                reviewer_exclusions: &excl,
+                ..cycle(&issues, &owner, &trackers, &st, &f, &load, true)
+            },
+        )
+        .await;
+
+        assert_eq!(report.filed, 0);
+        assert!(fx.tracker.create_issue_calls().is_empty());
+        assert!(fx.tracker.add_label_calls().is_empty());
+        assert!(
+            fx.reply_bodies()[0].contains("bob cannot run on this build"),
             "{:?}",
             fx.reply_bodies()
         );

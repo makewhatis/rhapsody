@@ -1147,28 +1147,35 @@ pub(crate) fn select_reviewers(
     picked
 }
 
-/// The two DIFFERENT reasons a pinned required reviewer can fail to become the pinned specialist
-/// (STUDIO-951), kept apart because they call for opposite treatment of the ranked fill.
+/// The roster identities a review cannot be dispatched to, so [`rank_reviewers`] removes them from
+/// BOTH the pinned prefix and the ranked fill. The orchestrator resolves this
+/// ([`Orchestrator::reviewer_exclusions`]) because it is a question about the LIVE harness each
+/// profile resolves to, which the pure selector cannot answer for itself.
 ///
-/// Both are questions the pure selector cannot answer for itself — one is about the live harness a
-/// profile resolves to, the other about what `dispatch_review` will accept — so the orchestrator
-/// resolves them ([`Orchestrator::reviewer_exclusions`]) and hands the answer in.
+/// Today two conditions put an identity here, both of which make the review impossible to complete —
+/// the ticketless `review.model` refusal fires in `dispatch_review` before any watch write, and an
+/// unimplemented harness fires in `spawn_worker` after it — leaving the row either re-offered every
+/// tick or marked in-flight against a run that can never finish. Either way the merge-stalling loop
+/// the exclusion exists to prevent.
 ///
-/// * `unselectable` — the identity cannot be dispatched **at all**, so it is removed from both the
-///   pinned prefix and the ranked fill. Today this is exactly the ticketless `review.model`
-///   refusal: `dispatch_review` refuses the run before any watch write, so leaving the name in the
-///   ranked fill would re-offer the same refused review every tick and never complete — the
-///   merge-stalling loop the exclusion exists to prevent.
-/// * `unpinnable` — the identity still runs (on `agent.backend`), just not as the specialist its
-///   profile names, so it is dropped from the **pinned prefix only** and remains a ranked
-///   candidate. This is an unimplemented harness. Excluding these from the ranked fill too — as
-///   one shared set once did — made writing `review.required` strictly *reduce* a teammate's
-///   participation: an operator who pinned a specialist whose harness this build cannot run got
-///   that specialist as the ranked fill only until the pin removed them from it.
-#[derive(Debug, Default)]
-pub(crate) struct ReviewerExclusions {
+/// * the identity's profile names a harness this build cannot run, which `spawn_worker` REFUSES
+///   rather than falling back to `agent.backend` (STUDIO-978); or
+/// * on the ticketless path, the identity's harness cannot serve the operator's `review.model`, so
+///   `dispatch_review` refuses it.
+///
+/// This was once two sets (`unpinnable` vs `unselectable`) because an unimplemented harness still
+/// ran on the backend and so stayed a ranked candidate. With the fallback removed the two conditions
+/// have the same consequence — the dispatch is refused — so one set says it.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewerExclusions {
     pub(crate) unselectable: HashSet<String>,
-    pub(crate) unpinnable: HashSet<String>,
+}
+
+impl ReviewerExclusions {
+    /// Whether `name` may never be offered as a reviewer.
+    pub(crate) fn excludes(&self, name: &str) -> bool {
+        self.unselectable.contains(name)
+    }
 }
 
 /// The required reviewers [`rank_reviewers`] promotes into its pinned prefix **and** the caller's
@@ -1179,7 +1186,7 @@ pub(crate) struct ReviewerExclusions {
 ///
 /// [`reviewwatch`](crate::reviewwatch)'s continuity guard is the caller: it must yield to a
 /// required reviewer only when one is genuinely going to jump the queue. Reading the raw config
-/// list there counted an `unpinnable` or off-roster name as a pin the ranking never made, which
+/// list there counted an `unselectable` or off-roster name as a pin the ranking never made, which
 /// broke continuity to make way for a teammate who was not selected — and handed the round to
 /// whoever merely led on load (STUDIO-951, round 3). Reading the promoted-but-untruncated prefix
 /// counted a tail pin beyond the clamp, which let a persisted incumbent hold the round against the
@@ -1214,9 +1221,6 @@ struct RequiredPinPlan<'a> {
     pinned: Vec<&'a str>,
     /// Not a roster member; the selector only ever names roster members.
     unknown: Vec<&'a str>,
-    /// On the roster but its profile names a harness this build cannot run, so the pin is dropped
-    /// while the teammate stays a ranked candidate.
-    unpinnable: Vec<&'a str>,
     /// On the roster but cannot be dispatched at all; removed from the ranked fill too.
     unselectable: Vec<&'a str>,
 }
@@ -1237,7 +1241,6 @@ fn plan_required_pins<'a>(
     let mut plan = RequiredPinPlan {
         pinned: Vec::new(),
         unknown: Vec::new(),
-        unpinnable: Vec::new(),
         unselectable: Vec::new(),
     };
     for name in teams.review_required() {
@@ -1256,10 +1259,6 @@ fn plan_required_pins<'a>(
         }
         if exclusions.unselectable.contains(name) {
             plan.unselectable.push(name);
-            continue;
-        }
-        if exclusions.unpinnable.contains(name) {
-            plan.unpinnable.push(name);
             continue;
         }
         plan.pinned.push(name);
@@ -1289,22 +1288,21 @@ fn plan_required_pins<'a>(
 /// * is not a roster member (`rank_reviewers` only ever names roster members), or
 /// * is the author (the existing non-author filter outranks the pin: nobody reviews their own pull
 ///   request), or
-/// * appears in [`ReviewerExclusions`] — the orchestrator's live answer for pins whose harness
-///   cannot serve the operator's `review.model` or whose profile names a harness this build cannot
-///   run ([`Orchestrator::reviewer_exclusions`]). A pin that cannot be dispatched must not empty
-///   or block a round; a hard pin that stalls a merge forever is strictly worse than the
+/// * appears in [`ReviewerExclusions`] — the orchestrator's live answer for pins whose profile
+///   names a harness this build cannot run, or whose harness cannot serve the operator's
+///   `review.model` ([`Orchestrator::reviewer_exclusions`]). A pin that cannot be dispatched must
+///   not empty or block a round; a hard pin that stalls a merge forever is strictly worse than the
 ///   load-ranked behaviour it replaces. An `unselectable` name is excluded from BOTH halves below,
 ///   not just from `pinned`: otherwise it would be emitted again as the ranked fill the moment its
 ///   load or roster position made it early enough, which is the same permanent dispatch-refusal
-///   the exclusion exists to prevent. An `unpinnable` name is dropped from `pinned` only and
-///   stays in the ranked fill.
+///   the exclusion exists to prevent.
 ///
 /// A dropped pin is named in one warning per selection, never one per reviewer, so a degraded
-/// round is visible rather than silent. The three reasons get distinct messages so the operator is
+/// round is visible rather than silent. The reasons get distinct messages so the operator is
 /// not told to fix a config that is correct: the **author** case is the normal state (a pinned
 /// teammate who opened the pull request) and is skipped without a warning at all; an **off-roster**
-/// name is also reported once at boot by the daemon; the two live harness answers cannot be, so
-/// they are visible here, at the moment the round is actually built.
+/// name is also reported once at boot by the daemon; the live harness answer cannot be, so it is
+/// visible here, at the moment the round is actually built.
 pub(crate) fn rank_reviewers(
     teams: &Teams,
     author: &str,
@@ -1314,7 +1312,6 @@ pub(crate) fn rank_reviewers(
     let RequiredPinPlan {
         pinned,
         unknown,
-        unpinnable,
         unselectable,
     } = plan_required_pins(teams, author, exclusions);
     if !unselectable.is_empty() {
@@ -1322,21 +1319,12 @@ pub(crate) fn rank_reviewers(
             required = %unselectable.join(", "),
             author = %author,
             "teams review: a required reviewer cannot be dispatched for this configuration and \
-             was dropped from the round entirely — its harness cannot serve the configured \
-             `review.model` and a dispatch would be refused before any review row is written, so \
-             leaving it as a candidate would re-offer the same refused review forever. The round \
-             proceeds with the remaining reviewers; fix `review.model` in teams.yaml to silence \
-             this."
-        );
-    }
-    if !unpinnable.is_empty() {
-        tracing::warn!(
-            required = %unpinnable.join(", "),
-            author = %author,
-            "teams review: a required reviewer's profile names a harness this build cannot run, so \
-             it cannot review as the pinned specialist — the pin was skipped and it stays in the \
-             ranked fill, running on `agent.backend`. The round proceeds; fix the profile's harness \
-             in teams.yaml to silence this."
+             was dropped from the round entirely — either its profile names a harness this build \
+             cannot run (a dispatch would be refused rather than fallen back from) or its harness \
+             cannot serve the configured `review.model`, so a dispatch would be refused before any \
+             review row is written. Leaving it as a candidate would re-offer the same refused review \
+             forever. The round proceeds with the remaining reviewers; fix the profile's `harness` \
+             or `review.model` in teams.yaml to silence this."
         );
     }
     if !unknown.is_empty() {
@@ -2137,32 +2125,11 @@ mod tests {
         let teams = teams_quorum_pinning(&["alice", "sol", "bob", "carol"], 2, &["sol"]);
         let exclusions = ReviewerExclusions {
             unselectable: HashSet::from(["sol".to_string()]),
-            ..ReviewerExclusions::default()
         };
         assert_eq!(
             select_reviewers(&teams, "alice", &HashMap::new(), &exclusions),
             vec!["bob".to_string(), "carol".to_string()],
             "a refused reviewer is dropped from both halves and the round is filled by ranking"
-        );
-    }
-
-    // Edge 3, `unpinnable` half: a pin whose harness this build cannot run is dropped from the
-    // pinned prefix but KEEPS its place in the ranked fill, because `spawn_worker` falls back to
-    // `agent.backend` and the teammate really does review. Writing the pin must not make the
-    // teammate review LESS than not writing it, which is what sharing one exclusion set with the
-    // refusal above did. Mutation check: put `sol` in `unselectable` instead and this goes red
-    // with the pin deleted from a pool it would otherwise lead.
-    #[test]
-    fn an_unpinnable_required_reviewer_stays_in_the_ranked_fill() {
-        let teams = teams_quorum_pinning(&["alice", "sol", "bob", "carol"], 2, &["sol"]);
-        let exclusions = ReviewerExclusions {
-            unpinnable: HashSet::from(["sol".to_string()]),
-            ..ReviewerExclusions::default()
-        };
-        assert_eq!(
-            select_reviewers(&teams, "alice", &HashMap::new(), &exclusions),
-            vec!["sol".to_string(), "bob".to_string()],
-            "the pin is dropped but `sol` still leads the ranked fill, exactly as if unpinned"
         );
     }
 

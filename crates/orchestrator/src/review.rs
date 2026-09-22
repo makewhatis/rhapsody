@@ -2148,6 +2148,7 @@ mod tests {
             // empty — the exact input that made every clean review exit an OUTCOME_CONTINUED.
             last_state: last_state.to_string(),
             declared_handoff,
+            refused: false,
         });
         run_id
     }
@@ -2814,6 +2815,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: true,
+            refused: false,
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
@@ -2981,6 +2983,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            refused: false,
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())

@@ -39,8 +39,8 @@ use crate::claude::{
     split_command,
 };
 use crate::harness::{
-    EventFidelity, Harness, HarnessCapabilities, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
-    ToolEventGranularity, ToolNaming, UsageDetail,
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
+    StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
 };
 use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
@@ -155,7 +155,7 @@ impl crate::Runner for Runner {
 /// belongs to slice 7/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
 /// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
 /// the mailbox.
-const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     events: EventFidelity::Structured {
         tool_level: ToolEventGranularity::FileLevel,
     },
@@ -163,6 +163,7 @@ const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     resume: Resume::Flags,
     mcp: true,
     sandbox: Sandbox::ToolAllowlist,
+    mcp_sandbox: McpSandboxCoupling::Independent,
     usage: UsageDetail::TokensAndCost,
     budgets: false,
     tool_naming: ToolNaming::McpDoubleUnderscore,
@@ -2390,6 +2391,80 @@ mod tests {
             "the daemon's turn deadline is not a CLI budget"
         );
         assert_eq!(caps.tool_naming, ToolNaming::McpDoubleUnderscore);
+        assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
+    }
+
+    /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline: "flip an adapter declaration
+    /// to claim resume or MCP support without fixture evidence; a capability-honesty test must
+    /// fail"). Every declared capability that the committed STUDIO-869 capture can witness is
+    /// crossed against it, so a declaration claiming something the measured CLI does not do reds
+    /// HERE rather than silently breaking the refusal logic it exists to drive.
+    ///
+    /// The fixture is committed in-tree, so this needs no paid provider and no CLI installed.
+    #[test]
+    fn declared_capabilities_match_the_committed_capture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/harness-spike/claude");
+        let read = |name: &str| {
+            let p = root.join(name);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let happy = read("happy.jsonl");
+        let resume = read("resume.jsonl");
+        let caps = *Runner::new(Config::default()).capabilities();
+        assert_eq!(
+            crate::harness::declared_capabilities(HarnessId::Claude),
+            caps,
+            "the by-name reader must return the SAME constant this adapter declares"
+        );
+
+        // events: FileLevel — the happy capture carries a typed tool_use block, which a
+        // command-only harness cannot emit.
+        assert_eq!(
+            caps.events,
+            EventFidelity::Structured {
+                tool_level: ToolEventGranularity::FileLevel
+            }
+        );
+        assert!(
+            happy.contains("\"type\":\"tool_use\""),
+            "FileLevel evidence: happy.jsonl must carry a tool_use block"
+        );
+
+        // mcp: true + tool_naming: McpDoubleUnderscore — the capture calls the daemon's own tool and
+        // spells it `mcp__<server>__<tool>`.
+        assert!(
+            caps.mcp,
+            "the capture proves Claude reaches the daemon's tools"
+        );
+        assert!(
+            happy.contains("mcp__symphony__symphony_state"),
+            "McpDoubleUnderscore evidence: happy.jsonl must name the daemon's tool that way"
+        );
+        assert_eq!(caps.tool_naming, ToolNaming::McpDoubleUnderscore);
+
+        // resume: Flags — the resume capture continues the SAME session the happy capture opened, so
+        // `--resume <id>` is exercised, not merely declared.
+        assert_eq!(caps.resume, Resume::Flags);
+        let session_id = |text: &str| {
+            text.split("\"session_id\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_string)
+        };
+        let happy_sid = session_id(&happy).expect("happy capture carries a session_id");
+        let resume_sid = session_id(&resume).expect("resume capture carries a session_id");
+        assert_eq!(
+            happy_sid, resume_sid,
+            "resume evidence: the resume capture must continue the happy capture's session"
+        );
+
+        // The coupled pair is independent for Claude, and the sandbox is the tool allowlist.
+        assert_eq!(caps.sandbox, Sandbox::ToolAllowlist);
+        assert_eq!(caps.mcp_sandbox, McpSandboxCoupling::Independent);
+
+        // stdin: HeldOpen is the INF-250 mailbox; claude's own runner tests pin the held-open write
+        // path, so the declaration is asserted here and exercised there.
         assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
     }
 }
