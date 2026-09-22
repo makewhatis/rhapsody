@@ -10,9 +10,10 @@
 //! already transitively present via `native-tls`'s TLS backend for `reqwest`. A future direct-
 //! Keychain read through any of those modules would leave that test green.
 //! `no_crates_source_calls_a_keychain_read_api` pins the property that actually matters: no source
-//! file under `crates/` references `security_framework::` (any path into that crate) or calls a
-//! `SecItem*`/`SecKeychain*` C API by name, checked directly against the text of every `.rs` file,
-//! so a future call site fails this test even before its crate happens to show up in `cargo tree`.
+//! file under `crates/` references `security_framework` (any path into that crate, including an
+//! aliased `use`) or calls a `SecItem*`/`SecKeychain*`/`keyring::` API, checked directly against the
+//! text of every `.rs` file, so a future call site fails this test even before its crate happens to
+//! show up in `cargo tree`.
 
 use std::path::Path;
 use std::process::Command;
@@ -46,18 +47,18 @@ fn rhapsodyd_has_no_keychain_crate_dependency() {
 fn no_crates_source_calls_a_keychain_read_api() {
     let root = repo_root();
     let crates_dir = root.join("crates");
-    // Broad on purpose: `security_framework::` alone catches ANY path into that crate (its
-    // Keychain-capable modules are `passwords` and `os::macos::{keychain,passwords}`, and jimmy's
-    // review of rhapsody#213 (N4) found that a needle naming only the top-level `passwords` module
-    // missed the `os::macos` ones), and `SecItem`/`SecKeychain` catch the C API family by prefix
+    // Broad on purpose: the bare crate name `security_framework` (no trailing `::`) catches a
+    // `use security_framework as kc;` alias too, not just a fully-qualified path — jimmy's review
+    // of rhapsody#213 (N4 nit) found `security_framework::` alone misses that form.
+    // `security_framework`'s Keychain-capable modules are `passwords` and
+    // `os::macos::{keychain,passwords}` (an earlier needle naming only the top-level `passwords`
+    // module missed the `os::macos` ones). `SecItem`/`SecKeychain` catch the C API family by prefix
     // rather than naming one function (the prior needle matched only `SecItemCopyMatching`, missing
-    // e.g. `SecItemAdd`/`SecKeychainFindGenericPassword`).
-    const NEEDLES: &[&str] = &[
-        "security_framework::",
-        "SecItem",
-        "SecKeychain",
-        "keyring::",
-    ];
+    // e.g. `SecItemAdd`/`SecKeychainFindGenericPassword`). `keyring::` stays colon-qualified,
+    // unlike `security_framework`: the bare word "keyring" already appears in unrelated prose
+    // comments elsewhere under `crates/` (e.g. `orchestrator/src/prconditional.rs`, describing a
+    // `gh auth` credential rotation), so broadening it the same way would false-positive on those.
+    const NEEDLES: &[&str] = &["security_framework", "SecItem", "SecKeychain", "keyring::"];
 
     let mut offenders = Vec::new();
     let mut stack = vec![crates_dir];

@@ -2455,8 +2455,9 @@ execute an arbitrary on-disk binary as the same OS user.
 
 - **The desktop app remains the sole Keychain owner for provider credentials.** `rhapsodyd` never
   reads the OS Keychain for a provider secret: no source file under `crates/` references
-  `security_framework::` (any path into that crate) or calls a `SecItem*`/`SecKeychain*`/`keyring::`
-  API, pinned by `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`. That is a property of
+  `security_framework` (any path into that crate, including an aliased `use`) or calls a
+  `SecItem*`/`SecKeychain*`/`keyring::` API, pinned by
+  `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`. That is a property of
   the source, not of the dependency graph — `cargo tree -p rhapsodyd` contains zero `keyring`
   entries, but it does transitively pull in `security-framework` (via `native-tls`'s TLS backend for
   `reqwest`), which exposes un-gated Keychain read/write functions on macOS in both its `passwords`
