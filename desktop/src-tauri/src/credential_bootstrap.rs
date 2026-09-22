@@ -118,12 +118,14 @@ impl BootstrapListener {
             cancel: cancel.clone(),
         };
         let future = async move {
-            // Flips `cancel` if this future ends by any route other than the two loop exits below
-            // (drop, `abort()`, panic, a future early `return`), none of which reach
-            // `graceful_shutdown` — see this method's doc (jimmy's review of rhapsody#213, B8).
-            let _cancel_on_exit = cancel.clone().drop_guard();
             let serving_slot = Arc::new(tokio::sync::Semaphore::new(1));
             let mut connections = tokio::task::JoinSet::new();
+            // Flips `cancel` if this future ends by any route other than the two loop exits below
+            // (drop, `abort()`, panic, a future early `return`), none of which reach
+            // `graceful_shutdown` — see this method's doc (jimmy's and sol's reviews of
+            // rhapsody#213, B8). Declared after `connections` so it drops first, flipping the token
+            // before the `JoinSet` is dropped.
+            let _cancel_on_exit = cancel.clone().drop_guard();
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
