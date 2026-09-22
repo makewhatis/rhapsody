@@ -1243,6 +1243,24 @@ opencode:
         );
     }
 
+    /// STUDIO-978: the console derives a run's event fidelity and steering from
+    /// `rhapsody_agent::harness_id_for_name`, which is a SECOND string→harness map living in the
+    /// agent crate. It must cover every harness this crate's dispatch pool builds, or a newly
+    /// added backend would silently render as "unknown" (no fidelity, composer shown) while
+    /// actually running. Pin the two together at the pool's own edge so adding a backend to
+    /// `IMPLEMENTED_BACKENDS` without the name map reds here rather than drifting in production.
+    #[test]
+    fn the_name_map_covers_every_implemented_backend() {
+        for name in IMPLEMENTED_BACKENDS {
+            assert!(
+                rhapsody_agent::harness_id_for_name(name).is_some(),
+                "{name:?} is in the dispatch pool but the console's name map cannot address it"
+            );
+        }
+        assert_eq!(rhapsody_agent::harness_id_for_name("codex"), None);
+        assert_eq!(rhapsody_agent::harness_id_for_name(""), None);
+    }
+
     /// `validate`'s `UnsupportedAgentBackend` check used to hardcode its own notion of "which
     /// backend names exist" (design record §1.3); STUDIO-893 makes it read
     /// `rhapsody_config::HARNESS_NAMES` instead. This is a SOURCE pin, not a behavioural one: a
