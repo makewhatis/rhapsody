@@ -40,6 +40,9 @@ pub enum ClientError {
     Io(std::io::Error),
     /// The owner accepted `Hello` but never answered a request within [`RESPONSE_TIMEOUT`].
     Timeout,
+    /// A prior `read_bound` call on this client already failed; see the `poisoned` field's doc on
+    /// [`CredentialClient`]. The caller must open a new connection instead of retrying this one.
+    Poisoned,
 }
 
 impl std::fmt::Display for ClientError {
@@ -49,6 +52,12 @@ impl std::fmt::Display for ClientError {
             ClientError::Session(e) => write!(f, "{e}"),
             ClientError::Io(e) => write!(f, "{e}"),
             ClientError::Timeout => write!(f, "timed out waiting for the owner's response"),
+            ClientError::Poisoned => {
+                write!(
+                    f,
+                    "client is poisoned by a prior failure; open a new connection"
+                )
+            }
         }
     }
 }
@@ -76,6 +85,14 @@ where
 pub struct CredentialClient<S> {
     stream: S,
     session: ClientSession,
+    /// Set on any `read_bound` failure, including [`ClientError::Timeout`]. `ReadBoundResult`
+    /// carries no request-identifying data beyond the server's own independent sequence, so a
+    /// client that gave up waiting and was then reused for a new request could have a late reply to
+    /// the abandoned request arrive and be accepted as the answer to the new one — `accept_server_
+    /// seq` only checks strict ordering, not which logical request a reply belongs to. `resolve_
+    /// credential` never reuses a client across calls today, so this cannot happen yet, but
+    /// `CredentialClient` is `pub` and PB7 is expected to hold one open across many requests.
+    poisoned: bool,
 }
 
 impl CredentialClient<UnixStream> {
@@ -107,11 +124,35 @@ where
         )
         .await
         .map_err(ClientError::Frame)?;
-        Ok(CredentialClient { stream, session })
+        Ok(CredentialClient {
+            stream,
+            session,
+            poisoned: false,
+        })
     }
 
-    /// Requests `read_bound` for `account` against `expected_binding` and awaits the reply.
+    /// Requests `read_bound` for `account` against `expected_binding` and awaits the reply. Once
+    /// any call to this method fails, this client is permanently poisoned (see the `poisoned`
+    /// field's doc) and every subsequent call fails fast with [`ClientError::Poisoned`] without
+    /// touching the stream — the caller must open a new connection rather than retry this one.
     pub async fn read_bound(
+        &mut self,
+        account: String,
+        expected_binding: Binding,
+    ) -> Result<CredentialRead, ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Poisoned);
+        }
+        match self.read_bound_inner(account, expected_binding).await {
+            Ok(read) => Ok(read),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    async fn read_bound_inner(
         &mut self,
         account: String,
         expected_binding: Binding,
@@ -373,6 +414,44 @@ mod tests {
             .expect_err("no response ever arrives for an unauthorized connection");
         assert!(matches!(err, ClientError::Frame(_)));
         server.await.unwrap();
+    }
+
+    // N3 (jimmy's review of rhapsody#213): a `CredentialClient` that gave up waiting for a response
+    // must not be reusable — a late reply to the abandoned request could otherwise be accepted as
+    // the answer to a NEW request on the same client, since `ReadBoundResult` carries only the
+    // server's own independent sequence, not any per-request identifier `accept_server_seq` could
+    // use to reject a stale match. Once `read_bound` fails for any reason, every subsequent call
+    // must fail fast with `Poisoned` instead of touching the stream.
+    #[tokio::test]
+    async fn a_client_is_poisoned_after_any_read_bound_failure_and_refuses_reuse() {
+        let (client_io, server_io) = duplex(8192);
+        // The server accepts Hello and then never answers anything, ever — simulating exactly the
+        // "wedged after auth" scenario RESPONSE_TIMEOUT exists to bound.
+        let server = tokio::spawn(async move {
+            let (mut r, _w) = tokio::io::split(server_io);
+            let mut session = ServerSession::new(Token::new("secret".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.unwrap();
+            session.accept_hello(&hello.token).expect("hello accepted");
+            // Never read or answer the follow-up ReadBound; hold the connection open.
+            tokio::time::sleep(RESPONSE_TIMEOUT * 3).await;
+        });
+
+        let mut client = CredentialClient::handshake(client_io, "secret".into())
+            .await
+            .expect("handshake");
+
+        let first = client.read_bound("v1:x".into(), a_binding()).await;
+        assert!(matches!(first, Err(ClientError::Timeout)));
+
+        // A second call on the SAME client must refuse outright, not attempt another write/read
+        // that could race the first request's still-possibly-arriving late reply.
+        let second = client.read_bound("v1:y".into(), a_binding()).await;
+        assert!(
+            matches!(second, Err(ClientError::Poisoned)),
+            "a client must refuse reuse after any read_bound failure, got {second:?}"
+        );
+
+        server.abort();
     }
 
     // --- resolve_credential: the daemon-wide OwnerUnavailable/OwnerUnauthorized states ------------
