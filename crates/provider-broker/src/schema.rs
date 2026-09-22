@@ -16,6 +16,8 @@
 //! `max_tokens`, `stream`, `stream_options`, `tools`, `tool_choice`; the measured message roles are
 //! `system`, `user`, `assistant`, `tool`; and the measured tool set is the ten function tools.
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 /// Parser/validation limits (design §5.3.8). These are compile-time, not operator-tunable.
@@ -313,6 +315,9 @@ impl Parser<'_> {
         self.count_value()?;
         self.pos += 1; // consume `{`
         let mut entries: Vec<(String, Json)> = Vec::new();
+        // A per-object hash set keeps duplicate detection O(n) instead of comparing every new key
+        // against every earlier one (design §5.3.8).
+        let mut seen: HashSet<String> = HashSet::new();
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -324,7 +329,7 @@ impl Parser<'_> {
                 return Err(SchemaError::UnexpectedToken);
             }
             let key = self.parse_string()?;
-            if entries.iter().any(|(existing, _)| existing == &key) {
+            if !seen.insert(key.clone()) {
                 return Err(SchemaError::DuplicateKey);
             }
             self.skip_whitespace();
@@ -417,6 +422,12 @@ impl Parser<'_> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| SchemaError::InvalidNumber)?;
+        // Refuse a number that `serde_json` cannot represent without changing it: a huge integer
+        // would otherwise re-serialize as a float and a huge exponent as `null`, so the forwarded
+        // body would silently differ from the validated one (design §5.3.9).
+        if !number_round_trips(text) {
+            return Err(SchemaError::InvalidNumber);
+        }
         Ok(Number(text.to_owned()))
     }
 
@@ -513,6 +524,15 @@ impl Parser<'_> {
         }
         self.pos += 4;
         Ok(value)
+    }
+}
+
+/// Whether a JSON number literal survives a `serde_json` parse/serialize round-trip unchanged, so
+/// the re-serialized outbound body is exactly the validated value.
+fn number_round_trips(text: &str) -> bool {
+    match text.parse::<serde_json::Number>() {
+        Ok(number) => number.to_string() == text,
+        Err(_) => false,
     }
 }
 
@@ -925,6 +945,57 @@ mod tests {
         assert_eq!(
             parse_bounded(br#"{"a":1,"a":2}"#),
             Err(SchemaError::DuplicateKey)
+        );
+    }
+
+    #[test]
+    fn many_distinct_keys_parse_in_linear_time() {
+        // Duplicate detection must be a hash set, not a comparison against every earlier key. A
+        // quadratic implementation is visibly slower here (minutes in a debug build).
+        let count = 50_000usize;
+        let mut body = String::from("{");
+        for index in 0..count {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("\"k{index}\":0"));
+        }
+        body.push('}');
+        let started = std::time::Instant::now();
+        let parsed = parse_bounded(body.as_bytes()).expect("distinct keys parse");
+        assert!(matches!(parsed, Json::Object(entries) if entries.len() == count));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "duplicate detection must be linear, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn non_representable_numbers_are_refused_not_silently_rewritten() {
+        // A huge integer would re-serialize as a float and a huge exponent as `null`.
+        assert_eq!(
+            parse_bounded(b"123456789012345678901234567890"),
+            Err(SchemaError::InvalidNumber)
+        );
+        assert_eq!(parse_bounded(b"1e400"), Err(SchemaError::InvalidNumber));
+        // Representable numbers still parse exactly.
+        assert_eq!(
+            parse_bounded(b"32000"),
+            Ok(Json::Number(Number("32000".to_owned())))
+        );
+        assert_eq!(
+            parse_bounded(b"1.5"),
+            Ok(Json::Number(Number("1.5".to_owned())))
+        );
+    }
+
+    #[test]
+    fn a_non_representable_parameters_number_is_refused() {
+        let body = br#"{"messages":[],"model":"probe-model","tools":[{"type":"function","function":{"name":"f","parameters":{"a":1e400}}}]}"#;
+        assert_eq!(
+            validate_chat_request(body, policy()),
+            Err(RequestRejection::Malformed(SchemaError::InvalidNumber))
         );
     }
 

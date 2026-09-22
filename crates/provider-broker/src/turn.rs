@@ -307,6 +307,40 @@ impl CapabilityGrant {
         )
     }
 
+    /// Await cancellation of one admitted request (design §7.2): turn revocation, session
+    /// revocation, absolute capability expiry, or daemon shutdown (the caller's `shutdown` watch).
+    ///
+    /// The future completes only when the request must stop; the caller drops the outbound
+    /// request/response future rather than waiting for upstream progress. Revocation is signalled
+    /// synchronously through `Notify`, so a revocation during a stalled upstream read wakes this
+    /// immediately; expiry is bounded by a sleep over the remaining monotonic lifetime, so a
+    /// trickling provider cannot hold the request open past its deadline.
+    pub(crate) async fn wait_cancelled(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+        loop {
+            if !self.is_live() || *shutdown.borrow_and_update() {
+                return;
+            }
+            let turn = self.inner.cancellation.notified();
+            let session = self.inner.session.cancellation.notified();
+            tokio::pin!(turn, session);
+            // Register before the second liveness check so a revocation between the check and the
+            // wait cannot be missed (the `Notify` lost-wakeup race).
+            turn.as_mut().enable();
+            session.as_mut().enable();
+            if !self.is_live() {
+                return;
+            }
+            let remaining = self.remaining_lifetime();
+            tokio::select! {
+                biased;
+                _ = &mut turn => {}
+                _ = &mut session => {}
+                _ = shutdown.changed() => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        }
+    }
+
     /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that
     /// constructs the upstream `Authorization` header and its redactor. There is no key accessor on
     /// any public type. `None` once custody has been released (session revoked).

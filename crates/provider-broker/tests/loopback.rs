@@ -22,8 +22,8 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use rhapsody_provider_broker::{
     BoundCredentialLease, BrokerLedgerReceiver, BrokerLimits, BrokerListener, BrokerProtocol,
-    BrokerRegistrationPlan, BrokerSession, CredentialBinding, DEFAULT_BROKER_LIMITS, ManualClock,
-    ScriptedRandom, SessionPolicy, TurnAccess, TurnMeta, TurnReceipt,
+    BrokerRegistrationPlan, BrokerSession, Clock, CredentialBinding, DEFAULT_BROKER_LIMITS,
+    ManualClock, ScriptedRandom, SessionPolicy, SystemClock, TurnAccess, TurnMeta, TurnReceipt,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -187,7 +187,7 @@ struct Harness {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
-    clock: Arc<ManualClock>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Harness {
@@ -196,12 +196,42 @@ impl Harness {
         Self::against(upstream, limits, allow_insecure_http).await
     }
 
+    /// A harness on the production clock, so absolute capability expiry is driven by real time.
+    async fn with_system_clock(
+        response: FakeResponse,
+        limits: BrokerLimits,
+        allow_insecure_http: bool,
+    ) -> Self {
+        let upstream = FakeUpstream::spawn(response).await;
+        Self::against_clock(
+            upstream,
+            limits,
+            allow_insecure_http,
+            Arc::new(SystemClock::new()),
+        )
+        .await
+    }
+
     async fn against(
         upstream: FakeUpstream,
         limits: BrokerLimits,
         allow_insecure_http: bool,
     ) -> Self {
-        let clock = Arc::new(ManualClock::new());
+        Self::against_clock(
+            upstream,
+            limits,
+            allow_insecure_http,
+            Arc::new(ManualClock::new()),
+        )
+        .await
+    }
+
+    async fn against_clock(
+        upstream: FakeUpstream,
+        limits: BrokerLimits,
+        allow_insecure_http: bool,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let rng = Arc::new(ScriptedRandom::new());
         let (listener, broker) = BrokerListener::bind_with(clock.clone(), rng).expect("listener");
         let api_port = listener.local_addr().port();
@@ -758,6 +788,263 @@ async fn revoking_the_session_cancels_a_live_stream() {
     assert!(
         !matches!(next, Ok(Some(_))),
         "revocation must terminate the downstream stream, got {next:?}"
+    );
+    harness.shutdown().await;
+}
+
+/// §5.1 + §7.1: the grant concurrency permit is held from authentication through downstream body
+/// completion, so a live stream still occupies its slot against the next request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_concurrency_permit_is_held_through_a_live_stream() {
+    let limits = BrokerLimits {
+        max_concurrent_requests: 1,
+        max_forwarded_requests: 2,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(3),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, limits, true).await;
+    let capability = harness.capability.clone();
+
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let mut resp = resp;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    // The first stream still holds the single concurrency slot: a second request is refused before
+    // any upstream contact.
+    let second = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&second.bytes().await.expect("body")).to_string();
+    assert!(text.contains("budget_exhausted"), "pinned code: {text}");
+    assert_eq!(
+        harness.upstream.count(),
+        1,
+        "a request over the concurrency limit never reaches upstream"
+    );
+
+    harness.shutdown().await;
+}
+
+/// §7.2 + mutation "poll liveness only between chunks": revoking a turn ends a stalled stream
+/// promptly instead of waiting for the provider's next byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_cancels_a_stalled_stream_without_waiting_for_the_next_chunk() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let mut resp = resp;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    let started = std::time::Instant::now();
+    harness.session.revoke();
+    let next = resp.chunk().await;
+    assert!(
+        !matches!(next, Ok(Some(_))),
+        "revocation must end the downstream stream, got {next:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a stalled provider must not delay revocation, took {:?}",
+        started.elapsed()
+    );
+    harness.shutdown().await;
+}
+
+/// §7.2 + mutation "buffered path never checks liveness": revoking a turn cuts off a non-streaming
+/// response that is still waiting for provider bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_the_session_cancels_a_buffered_response() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "application/json",
+        chunks: vec![
+            br#"{"choices":[]"#.to_vec(),
+            br#","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec(),
+        ],
+        chunk_delay: Duration::from_millis(1_500),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let started = std::time::Instant::now();
+    let body = chat_body(MODEL, false);
+    let post = harness.post(Some(&capability), &[], &body);
+    let revoke = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        harness.session.revoke();
+    };
+    let (resp, ()) = tokio::join!(post, revoke);
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a revoked buffered response must not deliver a full 200"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_200),
+        "revocation must cancel the buffered read, took {:?}",
+        started.elapsed()
+    );
+    harness.shutdown().await;
+}
+
+/// §5.1: an authenticated body read is bounded by the remaining turn lifetime, so a stalled client
+/// cannot hold the concurrency permit and request-memory charge open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_authenticated_body_read_is_bounded() {
+    let limits = BrokerLimits {
+        max_capability_lifetime: Duration::from_secs(3),
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let harness = Harness::with(FakeResponse::json("{\"ok\":true}"), limits, true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {capability}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+    );
+    let started = std::time::Instant::now();
+    // Only 9 of the declared 100 bytes are sent, then the client stalls.
+    let response = raw(port, &head, b"{\"model\"").await;
+    assert_eq!(
+        response.status, 400,
+        "a stalled body read must fail closed with a bounded refusal"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(4_500),
+        "the body read must be bounded, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(harness.upstream.count(), 0);
+    harness.shutdown().await;
+}
+
+/// §5.1 + mutation "accept trailers": a request carrying a trailer section is refused before any
+/// upstream contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_trailers_are_refused_before_upstream_contact() {
+    let harness = Harness::with(FakeResponse::json("{\"ok\":true}"), default_limits(), true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let body = chat_body(MODEL, false);
+    let chunked = format!(
+        "{:x}\r\n{}\r\n0\r\nX-Smuggle: 1\r\n\r\n",
+        body.len(),
+        String::from_utf8_lossy(&body)
+    );
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {capability}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Smuggle\r\nConnection: close\r\n\r\n"
+    );
+    let response = raw(port, &head, chunked.as_bytes()).await;
+    assert_eq!(response.status, 400);
+    assert_eq!(harness.upstream.count(), 0, "no upstream contact");
+    harness.shutdown().await;
+}
+
+/// §7.2: daemon shutdown cancels an in-flight stream rather than letting a detached connection task
+/// outlive the listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_an_in_flight_stream() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let mut harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let mut resp = resp;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    // Trigger shutdown *without* consuming the harness: its retained `TurnAccess` must stay live so
+    // this test exercises the shutdown path, not turn revocation.
+    let shutdown_tx = harness.shutdown.take().expect("shutdown sender");
+    let server = harness.server.take().expect("server task");
+    let started = std::time::Instant::now();
+    shutdown_tx.send(()).expect("send shutdown");
+    server.await.expect("server joins");
+    let next = resp.chunk().await;
+    assert!(
+        !matches!(next, Ok(Some(_))),
+        "shutdown must end the downstream stream, got {next:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown must not wait for the provider, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// §7.2 + mutation "expiry has no timer": an absolute capability expiry cancels a stalled stream
+/// without waiting for the provider's next byte. Uses the production clock so the deadline is real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_expiry_cancels_a_stalled_stream() {
+    let limits = BrokerLimits {
+        max_capability_lifetime: Duration::from_millis(800),
+        ..DEFAULT_BROKER_LIMITS
+    };
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n".to_vec(),
+        ],
+        chunk_delay: Duration::from_secs(8),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with_system_clock(response, limits, true).await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    let mut resp = resp;
+    let first = resp.chunk().await.expect("first").expect("first ok");
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+
+    let started = std::time::Instant::now();
+    let next = resp.chunk().await;
+    assert!(
+        !matches!(next, Ok(Some(_))),
+        "expiry must end the downstream stream, got {next:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "absolute expiry must not wait for the provider, took {:?}",
+        started.elapsed()
     );
     harness.shutdown().await;
 }

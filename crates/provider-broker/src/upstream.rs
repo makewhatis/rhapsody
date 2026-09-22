@@ -55,6 +55,9 @@ pub enum EndpointError {
     InsecureFlagOnHttps,
     /// The final URL could not be parsed by the URL library.
     InvalidUrl,
+    /// The hand-rolled authority/path split disagreed with the URL library's parse, so an encoded
+    /// form could silently change the authority or path.
+    RoundTripRefused,
 }
 
 impl std::fmt::Display for EndpointError {
@@ -78,6 +81,7 @@ impl std::fmt::Display for EndpointError {
                 "allow_insecure_http is invalid on an https base url"
             }
             EndpointError::InvalidUrl => "base url could not be parsed",
+            EndpointError::RoundTripRefused => "base url changes authority or path when parsed",
         };
         f.write_str(text)
     }
@@ -135,7 +139,7 @@ impl NormalizedEndpoint {
         if authority.is_empty() {
             return Err(EndpointError::MissingHost);
         }
-        validate_authority(authority)?;
+        let (host, port) = parse_authority(authority)?;
 
         let path = remainder;
         if path.contains('%') {
@@ -147,21 +151,37 @@ impl NormalizedEndpoint {
         {
             return Err(EndpointError::DotSegmentRefused);
         }
-        let lowered = path.to_ascii_lowercase();
+        // Canonical storage removes redundant trailing slashes and preserves the operator's prefix.
+        let trimmed = path.trim_end_matches('/');
+        // The already-`chat/completions` check runs on the canonical (trailing-slash-trimmed) path,
+        // so `.../chat/completions/` is refused too (design §6.1).
+        let lowered = trimmed.to_ascii_lowercase();
         if lowered == "chat/completions" || lowered.ends_with("/chat/completions") {
             return Err(EndpointError::AlreadyChatCompletions);
         }
-
-        // Canonical storage removes redundant trailing slashes and preserves the operator's prefix.
-        let trimmed = path.trim_end_matches('/');
         let canonical = if trimmed.is_empty() {
             format!("{scheme}://{authority}")
         } else {
             format!("{scheme}://{authority}{trimmed}")
         };
+
+        // Round-trip: the hand-rolled authority/path split must agree with the URL library, or an
+        // encoded form (a backslash or control byte in the authority) would silently move the
+        // destination (design §6.1).
+        let parsed = url::Url::parse(&canonical).map_err(|_| EndpointError::InvalidUrl)?;
+        let expected_path = if trimmed.is_empty() { "/" } else { trimmed };
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let effective_port = port.unwrap_or(default_port);
+        let host_matches = parsed
+            .host_str()
+            .is_some_and(|parsed_host| trim_ipv6_brackets(parsed_host).eq_ignore_ascii_case(&host));
+        let port_matches = parsed.port_or_known_default() == Some(effective_port);
+        if !host_matches || !port_matches || parsed.path() != expected_path {
+            return Err(EndpointError::RoundTripRefused);
+        }
+
         // One internal trailing slash then the fixed relative path; never another `/v1`.
         let chat_completions = format!("{canonical}/chat/completions");
-
         if url::Url::parse(&chat_completions).is_err() {
             return Err(EndpointError::InvalidUrl);
         }
@@ -188,7 +208,15 @@ impl NormalizedEndpoint {
     }
 }
 
-fn validate_authority(authority: &str) -> Result<(), EndpointError> {
+/// Strip the brackets `Url::host_str` may include around an IPv6 literal.
+fn trim_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Split an authority into its host (IPv6 brackets removed) and an optional `u16` port.
+fn parse_authority(authority: &str) -> Result<(String, Option<u16>), EndpointError> {
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal.
         let close = rest.find(']').ok_or(EndpointError::MissingHost)?;
@@ -208,12 +236,14 @@ fn validate_authority(authority: &str) -> Result<(), EndpointError> {
     if host.is_empty() {
         return Err(EndpointError::MissingHost);
     }
-    if let Some(port) = port
-        && (port.is_empty() || port.parse::<u16>().is_err())
-    {
-        return Err(EndpointError::InvalidPort);
-    }
-    Ok(())
+    let port = match port {
+        Some(port) => Some(
+            port.parse::<u16>()
+                .map_err(|_| EndpointError::InvalidPort)?,
+        ),
+        None => None,
+    };
+    Ok((host.to_owned(), port))
 }
 
 /// Why an outbound request failed. A transport failure after admission is conservatively charged by
@@ -444,6 +474,45 @@ mod tests {
         assert_eq!(
             NormalizedEndpoint::parse("https://api.example.com/v1/chat/completions", false),
             Err(EndpointError::AlreadyChatCompletions)
+        );
+        // A trailing slash must not sneak the base past the check.
+        assert_eq!(
+            NormalizedEndpoint::parse("https://api.example.com/v1/chat/completions/", false),
+            Err(EndpointError::AlreadyChatCompletions)
+        );
+    }
+
+    #[test]
+    fn an_encoded_authority_that_changes_on_parse_is_refused() {
+        // A backslash in the authority moves the path under WHATWG parsing.
+        assert_eq!(
+            NormalizedEndpoint::parse("https://good.example\\evil.example/v1", false),
+            Err(EndpointError::RoundTripRefused)
+        );
+        // A raw tab inside the host is stripped by WHATWG parsing.
+        assert_eq!(
+            NormalizedEndpoint::parse("https://api.exa\tmple.com/v1", false),
+            Err(EndpointError::RoundTripRefused)
+        );
+    }
+
+    #[test]
+    fn round_trip_accepts_default_ports_and_case_insensitive_hosts() {
+        let upper = NormalizedEndpoint::parse("https://API.Example.COM/v1", false).expect("upper");
+        assert_eq!(
+            upper.chat_completions_url(),
+            "https://API.Example.COM/v1/chat/completions"
+        );
+        let default_port =
+            NormalizedEndpoint::parse("https://api.example.com:443/v1", false).expect(":443");
+        assert_eq!(
+            default_port.chat_completions_url(),
+            "https://api.example.com:443/v1/chat/completions"
+        );
+        let ipv6 = NormalizedEndpoint::parse("https://[::1]:9000/v1", false).expect("ipv6");
+        assert_eq!(
+            ipv6.chat_completions_url(),
+            "https://[::1]:9000/v1/chat/completions"
         );
     }
 

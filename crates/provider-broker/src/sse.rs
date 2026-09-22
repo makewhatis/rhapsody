@@ -1,11 +1,18 @@
-//! The bounded SSE usage observer (design §7.1, §7.3).
+//! The bounded usage observer (design §7.1, §7.3).
 //!
-//! The adapter forwards the provider's SSE bytes unchanged (after redaction); this observer watches
-//! them on the way past and extracts the final `usage` object the child requested through
-//! `stream_options.include_usage`. Its line buffer is bounded: an oversized or malformed event makes
-//! usage *unknown* rather than allocating without limit, and the broker may then terminate the
-//! stream as a protocol error when forwarding it would violate the response-size or redaction
-//! contract.
+//! For a streaming response the adapter forwards the provider's SSE bytes unchanged (after
+//! redaction); this observer watches them on the way past and extracts the final `usage` object the
+//! child requested through `stream_options.include_usage`. Its line buffer is bounded: an oversized
+//! or malformed event makes usage *unknown* rather than allocating without limit, and the broker may
+//! then terminate the stream as a protocol error when forwarding it would violate the response-size
+//! or redaction contract.
+//!
+//! For a non-streaming response, [`SseUsageObserver::observe_json`] reads the top-level `usage`
+//! object directly (design §7.3).
+//!
+//! Usage values must be finite non-negative integers; a present-but-invalid value makes the whole
+//! observation unknown (design §7.3). The last `usage` object in the stream is judged as a whole —
+//! fields from an earlier object never mix into a later one.
 //!
 //! This observer only *measures*. The ledger/budget slice (PB3) owns settlement; §7.3's rule that a
 //! syntactically valid provider report can never re-open admission is why nothing here releases a
@@ -120,6 +127,33 @@ impl SseUsageObserver {
         self.overflowed
     }
 
+    /// Read the top-level `usage` object of a non-streaming JSON response body (design §7.3).
+    pub fn observe_json(&mut self, body: &[u8]) {
+        let value: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => {
+                self.mark_malformed();
+                return;
+            }
+        };
+        let Some(usage) = value.get("usage") else {
+            return;
+        };
+        // A provider that sends `"usage": null` on every chunk/response reports no usage; that is
+        // not malformed.
+        if usage.is_null() {
+            return;
+        }
+        match usage.as_object() {
+            Some(usage) => self.apply_usage(usage),
+            None => self.mark_malformed(),
+        }
+    }
+
+    fn mark_malformed(&mut self) {
+        self.observation.malformed_events = self.observation.malformed_events.saturating_add(1);
+    }
+
     fn observe_line(&mut self, line: &[u8]) {
         let line = strip_carriage_return(line);
         let Some(payload) = line.strip_prefix(b"data:") else {
@@ -133,57 +167,111 @@ impl SseUsageObserver {
         let value: serde_json::Value = match serde_json::from_slice(payload) {
             Ok(value) => value,
             Err(_) => {
-                self.observation.malformed_events =
-                    self.observation.malformed_events.saturating_add(1);
+                self.mark_malformed();
                 return;
             }
         };
-        let Some(usage) = value.get("usage").and_then(|usage| usage.as_object()) else {
+        let Some(usage) = value.get("usage") else {
             return;
         };
-        self.apply_usage(usage);
+        if usage.is_null() {
+            return;
+        }
+        match usage.as_object() {
+            Some(usage) => self.apply_usage(usage),
+            None => self.mark_malformed(),
+        }
     }
 
     fn apply_usage(&mut self, usage: &serde_json::Map<String, serde_json::Value>) {
         let input = field_u64(usage, "prompt_tokens");
         let output = field_u64(usage, "completion_tokens");
         let total = field_u64(usage, "total_tokens");
-        let cached = usage
-            .get("prompt_tokens_details")
-            .and_then(|details| details.as_object())
-            .and_then(|details| field_u64(details, "cached_tokens"));
+        let cached = match usage.get("prompt_tokens_details") {
+            None => Parsed::Absent,
+            Some(details) => match details.as_object() {
+                Some(details) => field_u64(details, "cached_tokens"),
+                None => Parsed::Invalid,
+            },
+        };
 
-        if input.is_some() {
-            self.observation.input_tokens = input;
+        // A present-but-invalid value makes the whole observation unknown and keeps the full
+        // reservation (design §7.3).
+        if let Parsed::Invalid = input {
+            self.invalidate_usage();
+            return;
         }
-        if output.is_some() {
-            self.observation.output_tokens = output;
+        if let Parsed::Invalid = output {
+            self.invalidate_usage();
+            return;
         }
-        if cached.is_some() {
-            self.observation.cached_tokens = cached;
+        if let Parsed::Invalid = total {
+            self.invalidate_usage();
+            return;
         }
-        if total.is_some() {
-            self.observation.total_tokens = total;
+        if let Parsed::Invalid = cached {
+            self.invalidate_usage();
+            return;
         }
-        let complete = input.is_some() && output.is_some() && total.is_some();
-        if complete {
-            self.observation.complete = true;
-        }
-        if let (Some(total), Some(input), Some(output)) = (total, input, output) {
-            if let Some(sum) = input.checked_add(output) {
-                if total != sum {
-                    self.observation.inconsistent = true;
+
+        // The last usage object is judged as a whole: replace every field rather than merging
+        // stale values from an earlier object.
+        self.observation.input_tokens = input.value();
+        self.observation.output_tokens = output.value();
+        self.observation.total_tokens = total.value();
+        self.observation.cached_tokens = cached.value();
+        self.observation.complete = input.is_valid() && output.is_valid() && total.is_valid();
+        self.observation.inconsistent = match (total, input, output) {
+            (Parsed::Valid(total), Parsed::Valid(input), Parsed::Valid(output)) => {
+                match input.checked_add(output) {
+                    Some(sum) => total != sum,
+                    None => true,
                 }
-            } else {
-                self.observation.inconsistent = true;
             }
+            _ => false,
+        };
+    }
+
+    /// Mark the current usage observation as unknown and clear its values.
+    fn invalidate_usage(&mut self) {
+        let malformed_events = self.observation.malformed_events.saturating_add(1);
+        self.observation = UsageObservation {
+            malformed_events,
+            ..UsageObservation::default()
+        };
+    }
+}
+
+/// A usage field's parse outcome: absent, a valid non-negative integer, or present but invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parsed {
+    Absent,
+    Valid(u64),
+    Invalid,
+}
+
+impl Parsed {
+    fn is_valid(self) -> bool {
+        matches!(self, Parsed::Valid(_))
+    }
+
+    fn value(self) -> Option<u64> {
+        match self {
+            Parsed::Valid(value) => Some(value),
+            _ => None,
         }
     }
 }
 
-/// A non-negative integer field, or `None` when absent or not a valid non-negative integer.
-fn field_u64(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u64> {
-    map.get(key)?.as_u64()
+/// A usage field: absent, a valid non-negative integer, or present-but-invalid (design §7.3).
+fn field_u64(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Parsed {
+    match map.get(key) {
+        None => Parsed::Absent,
+        Some(value) => match value.as_u64() {
+            Some(value) => Parsed::Valid(value),
+            None => Parsed::Invalid,
+        },
+    }
 }
 
 fn strip_carriage_return(line: &[u8]) -> &[u8] {
@@ -261,6 +349,69 @@ mod tests {
         let observation = observer.observation();
         assert!(!observation.complete);
         assert!(observation.is_unknown());
+    }
+
+    #[test]
+    fn invalid_values_in_a_later_usage_object_make_the_whole_observation_unknown() {
+        let mut observer = SseUsageObserver::new();
+        observer.observe(
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n",
+        );
+        observer.observe(
+            b"data: {\"usage\":{\"prompt_tokens\":-10,\"completion_tokens\":18446744073709551616,\"total_tokens\":1e30}}\n\n",
+        );
+        observer.finish();
+        let observation = observer.observation();
+        assert!(
+            observation.is_unknown(),
+            "negative/overflowing usage must be unknown, got {observation:?}"
+        );
+        assert!(!observation.complete);
+        assert_eq!(observation.input_tokens, None);
+        assert_eq!(observation.output_tokens, None);
+        assert_eq!(observation.total_tokens, None);
+        assert_eq!(observation.conservative_total(), None);
+        assert!(observation.malformed_events >= 1);
+    }
+
+    #[test]
+    fn the_last_usage_object_is_judged_as_a_whole() {
+        let mut observer = SseUsageObserver::new();
+        observer.observe(
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n",
+        );
+        observer.observe(b"data: {\"usage\":{\"prompt_tokens\":4,\"total_tokens\":4}}\n\n");
+        observer.finish();
+        let observation = observer.observation();
+        // The earlier completion count must not survive next to the later input/total.
+        assert_eq!(observation.input_tokens, Some(4));
+        assert_eq!(observation.output_tokens, None);
+        assert_eq!(observation.total_tokens, Some(4));
+        assert!(!observation.complete);
+    }
+
+    #[test]
+    fn reads_json_usage_from_a_non_streaming_body() {
+        let mut observer = SseUsageObserver::new();
+        observer.observe_json(
+            br#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#,
+        );
+        let observation = observer.observation();
+        assert!(observation.complete);
+        assert_eq!(observation.conservative_total(), Some(10));
+        assert!(!observation.is_unknown());
+
+        // A null usage object means "no usage", not malformed (usage is still unknown, but no
+        // malformed event is recorded).
+        let mut observer = SseUsageObserver::new();
+        observer.observe_json(br#"{"choices":[],"usage":null}"#);
+        assert_eq!(observer.observation().malformed_events, 0);
+        assert!(!observer.observation().complete);
+
+        // A usage value that is not an object is malformed.
+        let mut observer = SseUsageObserver::new();
+        observer.observe_json(br#"{"choices":[],"usage":5}"#);
+        assert!(observer.observation().malformed_events >= 1);
     }
 
     #[test]

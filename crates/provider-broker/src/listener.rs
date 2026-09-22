@@ -35,6 +35,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower::Service;
 
 use crate::broker::Broker;
@@ -44,6 +45,7 @@ use crate::budget::{
 };
 use crate::redact::StreamingRedactor;
 use crate::refusal::{PolicyRefusal, refusal_response};
+use crate::reservations::ConcurrencyPermit;
 use crate::schema::{ChatRequestPolicy, RequestRejection, validate_chat_request};
 use crate::secret::ZeroizingBytes;
 use crate::sse::SseUsageObserver;
@@ -63,6 +65,9 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_HEADER_BLOCK_BYTES: usize = 64 * 1024;
 /// Maximum count of headers hyper will parse on one request.
 pub const MAX_HEADER_COUNT: usize = 64;
+/// Maximum duration of one authenticated request-body read, or the remaining turn lifetime,
+/// whichever is shorter (design §5.1).
+pub const AUTHENTICATED_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Diagnostic response headers the broker may forward, each bounded and never reflecting the key
 /// (design §6.3).
@@ -87,6 +92,9 @@ struct BrokerState {
     request_budget: Arc<WeightedBudget>,
     response_budget: Arc<WeightedBudget>,
     expected_host: Arc<str>,
+    /// Daemon shutdown broadcast: every in-flight request selects on this and drops its upstream
+    /// I/O when it flips (design §7.2).
+    shutdown: watch::Receiver<bool>,
 }
 
 /// The private loopback listener. Binding is the only public construction; the actual address is
@@ -97,6 +105,8 @@ pub struct BrokerListener {
     expected_host: Arc<str>,
     connections: Arc<tokio::sync::Semaphore>,
     addr: SocketAddr,
+    /// Signal that flips to `true` when serving stops, cancelling in-flight connection handlers.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl BrokerListener {
@@ -130,12 +140,14 @@ impl BrokerListener {
         let client = Arc::new(
             UpstreamClient::new().map_err(|error| std::io::Error::other(error.to_string()))?,
         );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let state = BrokerState {
             broker,
             client,
             request_budget: WeightedBudget::new(REQUEST_MEMORY_BUDGET),
             response_budget: WeightedBudget::new(BUFFERED_RESPONSE_BUDGET),
             expected_host: Arc::clone(&expected_host),
+            shutdown: shutdown_rx,
         };
         let router = Router::new()
             .route("/v1/chat/completions", any(handle_chat))
@@ -147,6 +159,7 @@ impl BrokerListener {
             expected_host,
             connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
             addr,
+            shutdown_tx,
         })
     }
 
@@ -171,9 +184,13 @@ impl BrokerListener {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        let listener = self.listener;
-        let router = self.router;
-        let connections = self.connections;
+        let Self {
+            listener,
+            router,
+            connections,
+            shutdown_tx,
+            ..
+        } = self;
         tokio::pin!(shutdown);
         loop {
             let permit = tokio::select! {
@@ -192,6 +209,9 @@ impl BrokerListener {
                 serve_connection(stream, router).await;
             });
         }
+        // Cancel every in-flight connection handler: a detached streaming response must not survive
+        // daemon shutdown (design §7.2).
+        let _ = shutdown_tx.send(true);
         Ok(())
     }
 }
@@ -303,8 +323,9 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         Err(_) => return refusal_response(PolicyRefusal::Unauthorized),
     };
 
-    // The grant concurrency permit is acquired before the body is read or allocated.
-    let _permit = match grant.acquire_concurrency() {
+    // The grant concurrency permit is acquired before the body is read or allocated, and is held
+    // through the whole downstream response (see `forward_response`), not just the response head.
+    let permit = match grant.acquire_concurrency() {
         Ok(permit) => permit,
         Err(_) => return deny(&grant, PolicyRefusal::BudgetExhausted),
     };
@@ -322,10 +343,23 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         return deny(&grant, PolicyRefusal::BudgetExhausted);
     };
 
-    // Read the body under the request byte ceiling.
-    let buffer = match read_bounded_body(body, max_request_bytes).await {
-        Ok(buffer) => buffer,
-        Err(refusal) => return deny(&grant, refusal),
+    // Every admission after authentication selects over revocation/expiry/shutdown as well as its
+    // own progress (design §7.2).
+    let mut shutdown = state.shutdown.clone();
+
+    // Read the body under the request byte ceiling and the body-read deadline, cancelled by
+    // revocation/expiry/shutdown rather than waiting for a stalled client.
+    let body_deadline = AUTHENTICATED_BODY_READ_TIMEOUT.min(grant.remaining_lifetime());
+    let buffer = {
+        let read = read_bounded_body(body, max_request_bytes, body_deadline);
+        tokio::select! {
+            biased;
+            _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
+            result = read => match result {
+                Ok(buffer) => buffer,
+                Err(refusal) => return deny(&grant, refusal),
+            },
+        }
     };
 
     // Closed-schema validation.
@@ -383,17 +417,43 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         return refusal_response(PolicyRefusal::Unauthorized);
     };
 
-    let upstream = match state
-        .client
-        .forward_chat_completions(&endpoint, authorization, &outbound)
-        .await
-    {
-        Ok(upstream) => upstream,
-        // A transport failure after admission is conservatively charged (the reservation above).
-        Err(_) => return refusal_response(PolicyRefusal::UpstreamUnavailable),
+    // Outbound connect/headers also select over cancellation, so a revoked turn closed while the
+    // provider is still connecting drops the request future immediately.
+    let upstream = {
+        let forward = state
+            .client
+            .forward_chat_completions(&endpoint, authorization, &outbound);
+        tokio::select! {
+            biased;
+            _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
+            result = forward => match result {
+                Ok(upstream) => upstream,
+                // A transport failure after admission is conservatively charged (reservation above).
+                Err(_) => return refusal_response(PolicyRefusal::UpstreamUnavailable),
+            },
+        }
     };
 
-    forward_response(&state, grant, request.stream, upstream, secret).await
+    forward_response(
+        &state,
+        grant,
+        request.stream,
+        upstream,
+        secret,
+        permit,
+        shutdown,
+    )
+    .await
+}
+
+/// The response for a request cancelled during admission: `Unauthorized` once the capability is no
+/// longer live (revoked/expired), and an upstream-unavailable refusal for a daemon shutdown.
+fn cancelled_response(grant: &CapabilityGrant) -> Response {
+    if grant.is_live() {
+        refusal_response(PolicyRefusal::UpstreamUnavailable)
+    } else {
+        refusal_response(PolicyRefusal::Unauthorized)
+    }
 }
 
 /// Build the downstream response from a received upstream response: fresh headers, media-type
@@ -404,6 +464,8 @@ async fn forward_response(
     streaming: bool,
     upstream: crate::upstream::UpstreamResponse,
     secret: ZeroizingBytes,
+    permit: ConcurrencyPermit,
+    shutdown: watch::Receiver<bool>,
 ) -> Response {
     if upstream.has_non_identity_encoding() {
         return refusal_response(PolicyRefusal::UpstreamProtocol);
@@ -434,8 +496,19 @@ async fn forward_response(
     let max_response_bytes = grant.limits().max_response_bytes;
     let body = if success_streaming {
         let stream = upstream.into_byte_stream();
-        Body::from_stream(streaming_body(grant, stream, secret, max_response_bytes))
+        // The concurrency permit moves into the stream state: it is released only when the
+        // downstream body is dropped or completes (design §7.1).
+        Body::from_stream(streaming_body(
+            grant,
+            stream,
+            secret,
+            max_response_bytes,
+            permit,
+            shutdown,
+        ))
     } else {
+        // The permit is held across buffering, redaction and usage parsing.
+        let _permit = permit;
         // Buffered non-streaming response: reserve the broker-wide weighted budget.
         let Some(weight) = buffered_response_weight(max_response_bytes) else {
             return refusal_response(PolicyRefusal::BudgetExhausted);
@@ -444,7 +517,15 @@ async fn forward_response(
             return refusal_response(PolicyRefusal::BudgetExhausted);
         };
         let stream = upstream.into_byte_stream();
-        match buffer_body(stream, StreamingRedactor::new(secret), max_response_bytes).await {
+        let buffered = {
+            let mut shutdown = shutdown;
+            tokio::select! {
+                biased;
+                _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
+                result = buffer_body(stream, StreamingRedactor::new(secret), max_response_bytes) => result,
+            }
+        };
+        match buffered {
             Ok(bytes) => Body::from(bytes),
             Err(refusal) => return refusal_response(refusal),
         }
@@ -463,6 +544,8 @@ fn streaming_body<S>(
     stream: S,
     secret: ZeroizingBytes,
     max_bytes: u64,
+    permit: ConcurrencyPermit,
+    shutdown: watch::Receiver<bool>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
@@ -476,6 +559,10 @@ where
         emitted: u64,
         max_bytes: u64,
         finished: bool,
+        /// Held until the downstream body is dropped or completes (design §7.1).
+        _permit: ConcurrencyPermit,
+        /// Daemon-shutdown broadcast (design §7.2).
+        shutdown: watch::Receiver<bool>,
     }
 
     let state = StreamState {
@@ -487,14 +574,29 @@ where
         emitted: 0,
         max_bytes,
         finished: false,
+        _permit: permit,
+        shutdown,
     };
     unfold(state, |mut state| async move {
         loop {
-            // Cancellation: turn/session revocation and absolute expiry drop the upstream stream.
-            if state.finished || !state.grant.is_live() {
+            // Cancellation: turn/session revocation, absolute expiry and daemon shutdown drop the
+            // upstream stream (design §7.2).
+            if state.finished || !state.grant.is_live() || *state.shutdown.borrow() {
                 return None;
             }
-            match state.stream.next().await {
+            // Select over upstream progress and cancellation, so a stalled provider still ends the
+            // request when the turn is revoked or the capability expires.
+            let item = {
+                let grant = &state.grant;
+                let shutdown = &mut state.shutdown;
+                let stream = &mut state.stream;
+                tokio::select! {
+                    biased;
+                    _ = grant.wait_cancelled(shutdown) => return None,
+                    item = stream.next() => item,
+                }
+            };
+            match item {
                 None => {
                     // Re-check after the await: a revocation during the final upstream read must not
                     // let a last byte through.
@@ -546,6 +648,9 @@ where
 }
 
 /// Buffer a non-streaming body under the response byte ceiling, redacting and observing it.
+///
+/// A non-streaming response is a JSON document: its top-level `usage` object is read directly
+/// (design §7.3), not by scanning it for SSE `data:` lines.
 async fn buffer_body<S>(
     stream: S,
     mut redactor: StreamingRedactor,
@@ -566,7 +671,6 @@ where
         }
         let emitted = redactor.push(&chunk).unwrap_or_default();
         if !emitted.is_empty() {
-            observer.observe(&emitted);
             out.extend_from_slice(&emitted);
         }
         if out.len() as u64 > max_bytes {
@@ -575,13 +679,12 @@ where
     }
     let tail = redactor.finish();
     if !tail.is_empty() {
-        observer.observe(&tail);
         out.extend_from_slice(&tail);
     }
-    observer.finish();
     if out.len() as u64 > max_bytes {
         return Err(PolicyRefusal::UpstreamProtocol);
     }
+    observer.observe_json(&out);
     Ok(Bytes::from(out))
 }
 
@@ -659,12 +762,30 @@ fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-/// Read the request body under `max_bytes`, never allocating past the ceiling.
-async fn read_bounded_body(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyRefusal> {
+/// Read the request body under `max_bytes` and a deadline (design §5.1: 30 seconds or the remaining
+/// turn lifetime, whichever is shorter), never allocating past the ceiling. A request trailer is
+/// refused rather than silently skipped (design §5.1).
+async fn read_bounded_body(
+    body: Body,
+    max_bytes: u64,
+    deadline: Duration,
+) -> Result<Vec<u8>, PolicyRefusal> {
+    match tokio::time::timeout(deadline, read_body_frames(body, max_bytes)).await {
+        Ok(result) => result,
+        // A stalled authenticated read fails closed with a bounded refusal, so it cannot hold the
+        // concurrency permit and request-memory charge indefinitely.
+        Err(_) => Err(PolicyRefusal::InvalidRequest),
+    }
+}
+
+async fn read_body_frames(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyRefusal> {
     let mut body = body;
     let mut buffer = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| PolicyRefusal::InvalidRequest)?;
+        if frame.is_trailers() {
+            return Err(PolicyRefusal::InvalidRequest);
+        }
         if let Some(data) = frame.data_ref() {
             if buffer.len() as u64 + data.len() as u64 > max_bytes {
                 return Err(PolicyRefusal::RequestTooLarge);
@@ -744,5 +865,28 @@ mod tests {
             )),
             PolicyRefusal::InvalidRequest
         );
+    }
+
+    #[tokio::test]
+    async fn a_complete_body_is_read_under_the_ceiling() {
+        let body = Body::from(Bytes::from_static(b"hello"));
+        let read = read_bounded_body(body, 1024, Duration::from_secs(1)).await;
+        assert_eq!(read.expect("read"), b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_read_fails_closed_at_its_deadline() {
+        // A body stream that never yields must not hold the request open past the deadline.
+        let body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        // The outer timeout turns a removed-inner-deadline hang into a test failure rather than an
+        // unbounded stall.
+        let read = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bounded_body(body, 1024, Duration::from_millis(50)),
+        )
+        .await
+        .expect("the inner body-read deadline must fire");
+        assert_eq!(read, Err(PolicyRefusal::InvalidRequest));
     }
 }
