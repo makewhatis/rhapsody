@@ -11,6 +11,23 @@ one.
 
 ---
 
+## Calling a write endpoint yourself
+
+Every `POST` to the daemon's `/api/v1` (refresh, drain, config, the Teams and review controls, a
+run's stop/resume/merge/handoff/message/retain/post) passes an operator-write guard (STUDIO-982).
+The guard is there to stop a web page in your browser from driving the daemon. A write must use
+`Host` `127.0.0.1:<port>` (not `localhost`), send exactly one `X-Rhapsody-Operator: 1` header and
+a JSON body (`{}` when the endpoint takes none), and carry no cookie. Anything else gets a 403
+`operator_write_forbidden` and changes nothing:
+
+```sh
+curl -sS -X POST http://127.0.0.1:$PORT/api/v1/refresh \
+  -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'
+```
+
+Use `127.0.0.1` in the URL, and always pass `Content-Type: application/json`: curl's `-d` otherwise
+labels the body as a form, and the guard refuses form posts. Reads (`GET`) need none of this.
+
 ## Where a verdict actually lives
 
 - `gh pr view --json comments` returns **issue comments only** and can mis-render. Use

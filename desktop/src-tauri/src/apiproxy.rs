@@ -10,6 +10,15 @@
 //! [`handle`] is the ported, unit-testable core of Go's `apiProxyHandler`; the D3 window-serving
 //! task wires it (with `next` = the embedded-asset handler and `base_url` = [`usable_base_url`] over
 //! the live supervisor), exactly as Go's Wails `AssetServer.Middleware` does.
+//!
+//! The daemon's operator-write guard (STUDIO-982, Rhapsody-only) refuses a mutation unless its
+//! `Host` is the daemon's own `127.0.0.1:<port>`, it carries exactly one `X-Rhapsody-Operator: 1`,
+//! and it has no foreign `Origin` and no `Cookie`. The window's requests arrive from the bundled
+//! origin ([`BUNDLED_ORIGIN`]), which the daemon would refuse. So the proxy never forwards what the
+//! webview sent for those headers. It drops any `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` or
+//! operator header, sets `Host` to the daemon target itself, and injects exactly one operator
+//! header, but only when the request came from the bundled origin ([`from_bundled_origin`]). Any
+//! other request is forwarded without the header, so the daemon refuses its writes.
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, header};
@@ -43,6 +52,26 @@ impl ProxyResponse {
             headers: HeaderMap::new(),
             body: Bytes::from_static(body.as_bytes()),
         }
+    }
+}
+
+/// The origin the app's own window has: the `rhapsody` custom scheme it is served from
+/// (`crate::windowserver::SCHEME`, window `url` `rhapsody://localhost/` in `tauri.conf.json`).
+pub const BUNDLED_ORIGIN: &str = "rhapsody://localhost";
+
+/// The daemon's operator-write header (httpapi `operator_guard`) and its one accepted value.
+pub const OPERATOR_HEADER: &str = "x-rhapsody-operator";
+pub const OPERATOR_HEADER_VALUE: &str = "1";
+
+/// Reports whether a window request came from the bundled origin: it carries exactly one `Origin`,
+/// equal to [`BUNDLED_ORIGIN`]. A missing `Origin` is not evidence of the bundled origin, so it is
+/// refused like `null`, a repeated `Origin`, or any other origin. WebKit attaches `Origin` to every
+/// fetch whose method is not GET or HEAD, same-origin included, so the window's own writes carry it.
+pub fn from_bundled_origin(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    match (origins.next(), origins.next()) {
+        (Some(origin), None) => origin.as_bytes() == BUNDLED_ORIGIN.as_bytes(),
+        _ => false,
     }
 }
 
@@ -120,12 +149,24 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
 
     let mut builder = client.request(req.method.clone(), dst);
     for (name, value) in &req.headers {
-        // Drop Host (the client sets it from the target; the app-origin Host would misroute) and the
-        // hop-by-hop / framing headers — reqwest re-derives Content-Length from the buffered body.
-        if name == header::HOST || is_hop_by_hop(name) {
+        // Drop the hop-by-hop / framing headers (reqwest re-derives Content-Length from the buffered
+        // body) and every header the daemon's operator-write guard judges: the proxy sets those
+        // itself below, so nothing the webview sent for them reaches the daemon.
+        if is_guard_header(name) || is_hop_by_hop(name) {
             continue;
         }
         builder = builder.header(name.clone(), value.clone());
+    }
+    // The daemon's own `host:port`, not the app origin's Host (which would also misroute).
+    if let Some(host) = target.host_str() {
+        let authority = match target.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        builder = builder.header(header::HOST, authority);
+    }
+    if from_bundled_origin(&req.headers) {
+        builder = builder.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
     }
     if !req.body.is_empty() {
         builder = builder.body(req.body.clone());
@@ -155,6 +196,18 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
     }
 }
 
+/// Reports whether `name` is one of the headers the daemon's operator-write guard judges, which the
+/// proxy never forwards from the webview: `Host`, `Origin`, `Cookie`, the operator header, and the
+/// `Sec-Fetch-*` metadata. That metadata describes the webview's own fetch, not the proxy's request
+/// to the daemon, which the proxy vouches for itself.
+fn is_guard_header(name: &http::HeaderName) -> bool {
+    name == header::HOST
+        || name == header::ORIGIN
+        || name == header::COOKIE
+        || name.as_str() == OPERATOR_HEADER
+        || name.as_str().starts_with("sec-fetch-")
+}
+
 /// Reports whether `name` is a hop-by-hop / framing header that must not be forwarded across the
 /// proxy. The request/response body is re-buffered, so `Content-Length` / `Transfer-Encoding` are
 /// re-derived by the client and the serializer. Mirrors the set Go's `httputil.ReverseProxy` strips.
@@ -181,7 +234,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
@@ -222,6 +275,8 @@ mod tests {
     struct Backend {
         url: String,
         last_path: Arc<Mutex<Option<String>>>,
+        /// The headers and body of the last request, as the daemon would see them.
+        last_request: Arc<Mutex<Option<(HeaderMap, Bytes)>>>,
         _handle: tokio::task::JoinHandle<()>,
     }
 
@@ -232,6 +287,8 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let last_path = Arc::new(Mutex::new(None));
         let recorder = last_path.clone();
+        let last_request = Arc::new(Mutex::new(None));
+        let request_recorder = last_request.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -239,11 +296,21 @@ mod tests {
                 };
                 let io = TokioIo::new(stream);
                 let recorder = recorder.clone();
+                let request_recorder = request_recorder.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let recorder = recorder.clone();
+                        let request_recorder = request_recorder.clone();
                         async move {
                             *recorder.lock().expect("lock") = Some(req.uri().path().to_string());
+                            let headers = req.headers().clone();
+                            let body = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|b| b.to_bytes())
+                                .unwrap_or_default();
+                            *request_recorder.lock().expect("lock") = Some((headers, body));
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
                                 b"{\"ok\":true}",
                             ))))
@@ -258,6 +325,7 @@ mod tests {
         Backend {
             url,
             last_path,
+            last_request,
             _handle: handle,
         }
     }
@@ -376,5 +444,120 @@ mod tests {
         );
         assert_eq!(usable_base_url(State::Running, "http://127.0.0.1:0"), None);
         assert_eq!(usable_base_url(State::Running, "not a url"), None);
+    }
+
+    /// A window POST carrying every header the daemon's operator-write guard judges, forged or
+    /// duplicated, plus a body and a content type that must survive.
+    fn hostile_post(origin: Option<&'static str>) -> ProxyRequest {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            http::HeaderValue::from_static("evil.example:1"),
+        );
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, http::HeaderValue::from_static(origin));
+        }
+        headers.insert(header::COOKIE, http::HeaderValue::from_static("session=x"));
+        headers.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("cross-site"),
+        );
+        headers.append(OPERATOR_HEADER, http::HeaderValue::from_static("1"));
+        headers.append(OPERATOR_HEADER, http::HeaderValue::from_static("1"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        ProxyRequest {
+            method: Method::POST,
+            path: "/api/v1/refresh".to_string(),
+            query: None,
+            headers,
+            body: Bytes::from_static(b"{}"),
+        }
+    }
+
+    async fn forwarded(backend: &Backend, req: ProxyRequest) -> (HeaderMap, Bytes) {
+        let resp = handle(
+            req,
+            &reqwest::Client::new(),
+            |_| panic!("API request must not fall through to the asset handler"),
+            || Some(backend.url.clone()),
+        )
+        .await;
+        assert_eq!(resp.status, StatusCode::OK);
+        backend
+            .last_request
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("backend saw a request")
+    }
+
+    fn values(headers: &HeaderMap, name: &str) -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    // STUDIO-982: a window write from the bundled origin reaches the daemon with the daemon's own
+    // Host, exactly one operator header, and no Origin or Cookie. Every forged or duplicated copy
+    // the webview sent is dropped. The body and content type pass through.
+    #[tokio::test]
+    async fn a_bundled_origin_write_gets_exactly_one_operator_header_and_the_daemon_host() {
+        let backend = start_backend().await;
+        let authority = backend.url.trim_start_matches("http://").to_string();
+        let (headers, body) = forwarded(&backend, hostile_post(Some(BUNDLED_ORIGIN))).await;
+        assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
+        assert_eq!(values(&headers, OPERATOR_HEADER), ["1"]);
+        assert!(values(&headers, "origin").is_empty());
+        assert!(values(&headers, "cookie").is_empty());
+        assert!(values(&headers, "sec-fetch-site").is_empty());
+        assert_eq!(values(&headers, "content-type"), ["application/json"]);
+        assert_eq!(&body[..], b"{}");
+    }
+
+    // A request with no `Origin` carries no evidence of the bundled origin, so it gets no operator
+    // header and the daemon refuses its write. The forged copies it sent are still dropped.
+    #[tokio::test]
+    async fn a_write_without_an_origin_never_gets_the_operator_header() {
+        let backend = start_backend().await;
+        let authority = backend.url.trim_start_matches("http://").to_string();
+        let (headers, body) = forwarded(&backend, hostile_post(None)).await;
+        assert!(values(&headers, OPERATOR_HEADER).is_empty());
+        assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
+        assert!(values(&headers, "cookie").is_empty());
+        assert!(values(&headers, "sec-fetch-site").is_empty());
+        assert_eq!(&body[..], b"{}");
+    }
+
+    // Any other origin gets no operator header, even a forged one of its own, so the daemon's
+    // guard refuses its write.
+    #[tokio::test]
+    async fn a_foreign_origin_never_gets_the_operator_header() {
+        let backend = start_backend().await;
+        for origin in [
+            "null",
+            "https://evil.example",
+            "http://127.0.0.1:8799",
+            "rhapsody://localhost.evil",
+        ] {
+            let (headers, _) = forwarded(&backend, hostile_post(Some(origin))).await;
+            assert!(values(&headers, OPERATOR_HEADER).is_empty(), "{origin}");
+            assert!(values(&headers, "origin").is_empty(), "{origin}");
+            assert!(values(&headers, "cookie").is_empty(), "{origin}");
+        }
+        let mut twice = hostile_post(Some(BUNDLED_ORIGIN));
+        twice.headers.append(
+            header::ORIGIN,
+            http::HeaderValue::from_static(BUNDLED_ORIGIN),
+        );
+        let (headers, _) = forwarded(&backend, twice).await;
+        assert!(
+            values(&headers, OPERATOR_HEADER).is_empty(),
+            "a repeated Origin is not the bundled origin"
+        );
     }
 }

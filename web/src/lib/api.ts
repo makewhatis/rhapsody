@@ -523,6 +523,27 @@ export interface ApiError {
   error: { code: string; message: string };
 }
 
+// The daemon refuses every mutation that does not look like the operator's own client (its
+// operator-write guard, STUDIO-982): it wants exactly one `X-Rhapsody-Operator: 1` and a same-origin,
+// cookie-free request. So EVERY dashboard write goes through operatorPost. It always sends a JSON
+// body, the closed `{}` when the endpoint takes none, and never sends cookies: cookies are scoped
+// by host but not by port, so one another local app set on 127.0.0.1 would otherwise ride along
+// and get the write refused.
+export const OPERATOR_HEADER = "X-Rhapsody-Operator";
+
+export function operatorPost(url: string, body: unknown = {}): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    credentials: "omit",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      [OPERATOR_HEADER]: "1",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) {
@@ -603,11 +624,7 @@ export async function fetchRunProvenance(runID: number): Promise<RunProvenance> 
 // `reason` annotates an ARM only; the daemon ignores it when cancelling and when a drain is already
 // armed (re-arming never rewrites the drain that is running).
 export async function setDrain(active: boolean, reason = "operator"): Promise<DrainState> {
-  const res = await fetch("/api/v1/drain", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ active, reason }),
-  });
+  const res = await operatorPost("/api/v1/drain", { active, reason });
   if (!res.ok) {
     throw new Error(`drain ${active ? "arm" : "cancel"} failed: ${res.status}`);
   }
@@ -615,7 +632,7 @@ export async function setDrain(active: boolean, reason = "operator"): Promise<Dr
 }
 
 export async function postRefresh(): Promise<void> {
-  const res = await fetch("/api/v1/refresh", { method: "POST" });
+  const res = await operatorPost("/api/v1/refresh");
   if (!res.ok && res.status !== 202) {
     throw new Error(`refresh failed: ${res.status}`);
   }
@@ -633,10 +650,7 @@ export interface RunActionResult {
 // postRunAction POSTs a run-action endpoint and parses the daemon's error envelope on failure
 // (so the UI can toast a precise message, e.g. a Backlog/Todo move failure).
 async function postRunAction(runID: number, action: "stop" | "resume"): Promise<RunActionResult> {
-  const res = await fetch(`/api/v1/runs/${runID}/${action}`, {
-    method: "POST",
-    headers: { Accept: "application/json" },
-  });
+  const res = await operatorPost(`/api/v1/runs/${runID}/${action}`);
   const body = (await res.json().catch(() => null)) as RunActionResult | ApiError | null;
   if (!res.ok) {
     const message = body && "error" in body ? body.error.message : `${action} failed: ${res.status}`;
@@ -682,11 +696,7 @@ export type MergeRunResult = { status: "merged" | "confirm"; receipt: MergeRecei
 // merge_failed, not_found — throws with the daemon's own message, because the reason a merge was
 // refused is the whole of what the operator needs to read.
 export async function mergeRun(runID: number, confirm = ""): Promise<MergeRunResult> {
-  const res = await fetch(`/api/v1/runs/${runID}/merge`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ confirm }),
-  });
+  const res = await operatorPost(`/api/v1/runs/${runID}/merge`, { confirm });
   const body = (await res.json().catch(() => null)) as
     | MergeReceipt
     | (ApiError & { receipt?: MergeReceipt })
@@ -844,11 +854,7 @@ export async function sendRunMessage(
   runID: number,
   text: string,
 ): Promise<{ id: number; identifier: string; status: string }> {
-  const res = await fetch(`/api/v1/runs/${runID}/message`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ text }),
-  });
+  const res = await operatorPost(`/api/v1/runs/${runID}/message`, { text });
   const body = (await res.json().catch(() => null)) as
     | { id: number; identifier: string; status: string }
     | ApiError
@@ -1048,11 +1054,7 @@ export async function fetchConfig(): Promise<ConfigResponse> {
 // error envelope ({error:{code,message}}); surface that message verbatim so the form can show
 // exactly why the daemon rejected the change (e.g. "review_promote_state not in active_states").
 export async function saveConfig(req: ConfigRequest): Promise<ConfigResponse> {
-  const res = await fetch("/api/v1/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(req),
-  });
+  const res = await operatorPost("/api/v1/config", req);
   if (!res.ok) {
     let message = res.statusText;
     try {
@@ -1304,11 +1306,7 @@ export async function saveTypedConfig(
     global,
     projects: projects.map(({ effective: _effective, ...p }) => p),
   };
-  const res = await fetch("/api/v1/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await operatorPost("/api/v1/config", body);
   if (!res.ok) {
     let message = res.statusText;
     let code = `http_${res.status}`;
@@ -1613,11 +1611,7 @@ export async function fetchTeamsRecall(
 // (invalidate, save teams.yaml) both want the daemon's own complaint on screen rather than a
 // paraphrase, because the daemon's answer is the one that decides what happens.
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await operatorPost(url, body);
   if (!res.ok) {
     let message = res.statusText;
     try {
