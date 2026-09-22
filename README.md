@@ -2454,13 +2454,14 @@ process's code identity at call time, not on launch authority — and a coding h
 execute an arbitrary on-disk binary as the same OS user.
 
 - **The desktop app remains the sole Keychain owner for provider credentials.** `rhapsodyd` never
-  reads the OS Keychain for a provider secret: no source file under `crates/` calls a Keychain read
-  API (`keyring`, `security_framework::passwords`, `SecItem*`), pinned by
-  `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`. That is a property of the source, not
-  of the dependency graph — `cargo tree -p rhapsodyd` contains zero `keyring` entries, but it does
-  transitively pull in `security-framework` (via `native-tls`'s TLS backend for `reqwest`), which
-  exposes an un-gated `passwords` module on macOS. Nothing in this workspace calls it; the source
-  grep is what actually proves that, not the absent `keyring` crate.
+  reads the OS Keychain for a provider secret: no source file under `crates/` references
+  `security_framework::` (any path into that crate) or calls a `SecItem*`/`SecKeychain*`/`keyring::`
+  API, pinned by `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`. That is a property of
+  the source, not of the dependency graph — `cargo tree -p rhapsodyd` contains zero `keyring`
+  entries, but it does transitively pull in `security-framework` (via `native-tls`'s TLS backend for
+  `reqwest`), which exposes un-gated Keychain read/write functions on macOS in both its `passwords`
+  and `os::macos::{keychain,passwords}` modules. Nothing in this workspace calls any of them; the
+  source grep is what actually proves that, not the absent `keyring` crate.
 - **A new shared crate, `crates/credential-ipc`** (`rhapsody-credential-ipc`), holds the wire
   protocol (length-prefixed JSON framing, a bounded max frame size) and the authentication +
   strictly-increasing-sequence state machine both sides drive. It is a normal root-workspace member

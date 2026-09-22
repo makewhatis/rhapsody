@@ -5,13 +5,14 @@
 //!
 //! `rhapsodyd_has_no_keychain_crate_dependency` alone is NOT sufficient evidence of that: absence
 //! of the `keyring` crate from `cargo tree -p rhapsodyd` does not mean the binary is *incapable* of
-//! a direct Keychain read — `security-framework` (whose macOS `passwords` module exports
-//! `get_generic_password`/`set_generic_password` un-gated) is already transitively present via
-//! `native-tls`'s TLS backend for `reqwest`. A future direct-Keychain read through
-//! `security_framework::passwords` would leave that test green. `no_crates_source_calls_a_keychain_
-//! read_api` pins the property that actually matters: no source file under `crates/` calls into
-//! one, checked directly against the text of every `.rs` file, so a future call site fails this
-//! test even before its crate happens to show up in `cargo tree`.
+//! a direct Keychain read — `security-framework` (whose macOS `passwords` and
+//! `os::macos::{keychain,passwords}` modules export Keychain read/write functions un-gated) is
+//! already transitively present via `native-tls`'s TLS backend for `reqwest`. A future direct-
+//! Keychain read through any of those modules would leave that test green.
+//! `no_crates_source_calls_a_keychain_read_api` pins the property that actually matters: no source
+//! file under `crates/` references `security_framework::` (any path into that crate) or calls a
+//! `SecItem*`/`SecKeychain*` C API by name, checked directly against the text of every `.rs` file,
+//! so a future call site fails this test even before its crate happens to show up in `cargo tree`.
 
 use std::path::Path;
 use std::process::Command;
@@ -45,9 +46,16 @@ fn rhapsodyd_has_no_keychain_crate_dependency() {
 fn no_crates_source_calls_a_keychain_read_api() {
     let root = repo_root();
     let crates_dir = root.join("crates");
+    // Broad on purpose: `security_framework::` alone catches ANY path into that crate (its
+    // Keychain-capable modules are `passwords` and `os::macos::{keychain,passwords}`, and jimmy's
+    // review of rhapsody#213 (N4) found that a needle naming only the top-level `passwords` module
+    // missed the `os::macos` ones), and `SecItem`/`SecKeychain` catch the C API family by prefix
+    // rather than naming one function (the prior needle matched only `SecItemCopyMatching`, missing
+    // e.g. `SecItemAdd`/`SecKeychainFindGenericPassword`).
     const NEEDLES: &[&str] = &[
-        "security_framework::passwords",
-        "SecItemCopyMatching",
+        "security_framework::",
+        "SecItem",
+        "SecKeychain",
         "keyring::",
     ];
 
