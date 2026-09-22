@@ -92,16 +92,21 @@
 //! with STUDIO-959 that round is the expensive full cold read, because the old reviewed SHA is no
 //! longer an ancestor of the new head.
 //!
-//! The fix asks the sharper question: did the DIFF change? The watcher compares the pull request's
-//! three-dot diff against its base at the previously-reviewed head and at the new head (one `gh`
-//! compare per SHA, off-loop, bounded by [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT)).
-//! When the two are byte-identical it hands the reviewed SHA back in
-//! [`PrObservation::unchanged_from`], and the control task advances `last_reviewed_sha` to the new
-//! head while keeping the terminal status — an approval stays an approval, a rejection stays a
-//! rejection, and neither round is re-earned. When the diff changed (a resolved conflict is the
-//! canonical case), the comparison proves nothing, `unchanged_from` is empty, and a normal round is
-//! armed exactly as before. A comparison that failed, timed out or could not read a file in full
-//! also proves nothing: the one direction this must never fail is toward silently skipping a review.
+//! The fix asks the sharper question: did the CHANGE UNDER REVIEW change? The watcher computes the
+//! pull request's three-dot diff against its base at the previously-reviewed head and at the new
+//! head (one `gh` compare per SHA, off-loop, bounded by
+//! [`GH_EXEC_TIMEOUT`](crate::ghsummons::GH_EXEC_TIMEOUT)) and compares them by PATCH-ID
+//! ([`crate::ghsummons::same_change`]) — the diff text with hunk line numbers and blob hashes
+//! ignored, which is what a merge from the base branch rewrites. When the two changes are equal it
+//! hands the reviewed SHA back in [`PrObservation::unchanged_from`], and the control task advances
+//! `last_reviewed_sha` to the new head while keeping the terminal status — an approval stays an
+//! approval, a rejection stays a rejection, and neither round is re-earned. When the change itself
+//! differs (a resolved conflict is the canonical case), the comparison proves nothing,
+//! `unchanged_from` is empty, and a normal round is armed exactly as before. STUDIO-977 widened the
+//! predicate from STUDIO-960's byte comparison to this patch-id: the maintainer's `#209` and `#213`
+//! were both approved patches killed by a merge from `main` that a byte comparison called a change.
+//! A comparison that failed, timed out or could not read a file in full also proves nothing: the one
+//! direction this must never fail is toward silently skipping a review.
 //!
 //! Only a row that COMPLETED a round can be carried: a `requested`, `in_flight` or `truncated` row
 //! still owes a review of this head, whatever the diff says.
@@ -618,15 +623,18 @@ async fn refresh_observed_head(
     }
 }
 
-/// Which of a pull request's previously-reviewed heads carry a diff against the base that is
-/// byte-identical to `head`'s — the proof that a head move did no work (STUDIO-960).
+/// Which of a pull request's previously-reviewed heads carry a diff against the base whose
+/// CHANGE is the same as `head`'s — the proof that a head move did no work (STUDIO-960, widened by
+/// STUDIO-977).
 ///
 /// One `gh` read per DISTINCT reviewed head plus one for `head`, and none at all when nothing could
-/// have moved (the caller filters that case out). The comparison is on the three-dot diff's text,
-/// not on the SHAs and not on the history's shape: a rebase, a squash, an amend and a
-/// `gh pr update-branch` all rewrite the head and can all carry the same change, which is exactly
-/// the case this exists to detect. A rebase that resolved a conflict changes the diff text and is
-/// therefore NOT in the answer.
+/// have moved (the caller filters that case out). The comparison is a patch-id
+/// ([`crate::ghsummons::same_change`]), not the diff text and not the SHAs: a rebase, a squash, an
+/// amend, a `gh pr update-branch` AND a merge from the base branch all rewrite the head and can all
+/// carry the same change, which is exactly the case this exists to detect. STUDIO-960's byte
+/// comparison only caught the first four; a merge from the base moves the hunk line numbers, so only
+/// a patch-id catches it (STUDIO-977). A rebase that resolved a conflict changes the change itself
+/// and is therefore NOT in the answer.
 ///
 /// Every failure — an unreadable base, a compare that timed out, a diff with a file GitHub will not
 /// render — returns the reviewed heads it could NOT prove, i.e. omits them, so the caller arms a
@@ -679,7 +687,12 @@ async fn unchanged_reviewed_shas(
             break;
         }
         match src.merge_base_patch(&pr.owner, &pr.repo, &base, old).await {
-            Ok(patch) if patch == head_patch => unchanged.push(old.to_string()),
+            // A patch-id comparison, never a byte comparison (STUDIO-977): a merge from the base
+            // rewrites the hunk line numbers and the `index` blob hashes while carrying the same
+            // change, and only the patch-id is blind to those.
+            Ok(patch) if crate::ghsummons::same_change(&patch, &head_patch) => {
+                unchanged.push(old.to_string())
+            }
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
@@ -1970,6 +1983,12 @@ impl Orchestrator {
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
+        // STUDIO-977 C: the heads whose CHANGE is the same as `head`'s — `head` itself, plus every
+        // previously-reviewed head the off-loop watcher proved patch-identical (STUDIO-960's
+        // `unchanged_from`). A `ship` may satisfy approval-at-head for an approval at one of these,
+        // and only one of these; the exact-head merge gate passes a bare `&[head]`.
+        let mut proven: Vec<&str> = vec![head];
+        proven.extend(unchanged_from.iter().map(String::as_str));
         // The design's in-process re-review signal (§14.1 F-SEC's fix for the room post §13.1 had):
         // rows whose head has moved past what they recorded are parked back at `requested`, so the
         // console and the room read the same fact the dispatch below acts on. It can only ever
@@ -2098,7 +2117,7 @@ impl Orchestrator {
                 // escalation from ever resuming — an in-flight marker never reaches the resume path.
                 if !decision.settled() {
                     report.deferred += 1;
-                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                     return;
                 }
                 // The gates keep their say either way: a `ship` verdict adjudicates the open
@@ -2106,7 +2125,10 @@ impl Orchestrator {
                 // gate. A decision that still describes this head — a `ship` at it, a no-op rebase
                 // it survives, or any `escalate` — stops the loop here.
                 if decision.governs(head, unchanged_from) {
-                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
+                    // The one path that relaxes the exact-head rule (STUDIO-977 C): a `ship` may
+                    // satisfy approval-at-head for a patch the reviewers approved, which is a head
+                    // in `proven`.
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &proven, report);
                     return;
                 }
                 // A settled `ship` at a head this content-changing push has moved past. Past the
@@ -2130,14 +2152,14 @@ impl Orchestrator {
                 // half for a pull request every reviewer approved. Let it fall to the ordinary
                 // auto-merge path below, which re-applies every gate.
                 if crate::automerge::auto_merge_verdict(&mine, head).is_ok() {
-                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                     return;
                 }
                 // Never decide over a round mid-flight: findings could still land, and the author's
                 // own fix may be about to supersede the head this would decide against.
                 if self.review_round_in_flight(&mine) {
                     report.deferred += 1;
-                    self.propose_auto_merge(&mine, pr, head, merge_state, report);
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                     return;
                 }
                 let rounds = self.rounds_used(pr);
@@ -2153,6 +2175,12 @@ impl Orchestrator {
                     head: head.to_string(),
                     rounds,
                     findings,
+                    // STUDIO-977 C: `ship` is available only when every required reviewer has a
+                    // settled verdict on the change `head` carries — an approval or a findings
+                    // verdict, at `head` or at a head the watcher proved patch-identical. An
+                    // unread change makes a `ship` unavailable, so the manager's answer is recorded
+                    // as an escalation instead of stopping the loop over a head nobody has read.
+                    ship_available: crate::automerge::head_read_verdict(&mine, head, &proven),
                 };
                 if let Some(ledger) = self.adjudication_ledger.as_ref() {
                     // A decision recorded at a head this one has moved past no longer governs: it
@@ -2173,7 +2201,7 @@ impl Orchestrator {
                 }
                 report.adjudicate.push(plan);
                 report.deferred += 1;
-                self.propose_auto_merge(&mine, pr, head, merge_state, report);
+                self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                 return;
             }
         }
@@ -2437,7 +2465,7 @@ impl Orchestrator {
                 "auto-merge: the origin ticket is held for a human; not merging"
             );
         } else {
-            self.propose_auto_merge(&mine, pr, head, merge_state, report);
+            self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
         }
     }
 
@@ -2585,12 +2613,18 @@ impl Orchestrator {
     /// EITHER reading; a row the loop dispatched is `in_flight` on either; and a row whose verdict
     /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
     /// closing one would refuse.
+    ///
+    /// `proven` is the set of heads whose CHANGE is the same as `head`'s (STUDIO-977 C): the head
+    /// itself on every ordinary path, plus the patch-id-proven SHAs on the one path where a `ship`
+    /// may satisfy approval-at-head. It is not a way to merge a verdict nobody proved: a verdict at
+    /// a head outside the set is still refused as stale.
     fn propose_auto_merge(
         &mut self,
         mine: &[&ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
         merge_state: &str,
+        proven: &[&str],
         report: &mut ReviewSweepReport,
     ) {
         if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
@@ -2615,7 +2649,7 @@ impl Orchestrator {
             );
             return;
         }
-        match crate::automerge::auto_merge_verdict(mine, head) {
+        match crate::automerge::auto_merge_verdict_with_proof(mine, head, proven) {
             Ok(approved_by) => {
                 // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
                 // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
@@ -3980,6 +4014,113 @@ mod tests {
         assert_eq!(report.dispatched, 1);
         assert_eq!(report.skipped, 0);
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
+    // --- STUDIO-977: a merge from the base branch is the same change ---------------------------
+
+    /// **Acceptance, named after the maintainer's `#209`.** The merge from `main` is the case
+    /// STUDIO-960's byte comparison missed: the change under review is identical, but the base
+    /// moved, so the hunk line numbers and the `index` blob hashes moved with it and the diff TEXT
+    /// differs. Only a patch-id comparison — never a byte comparison — proves them the same.
+    ///
+    /// MUTATION: compare the diffs byte-for-byte in `unchanged_reviewed_shas` (revert to
+    /// `patch == head_patch`) and this reds — `unchanged_from` is empty. Narrow the predicate back
+    /// to STUDIO-960's `unchanged_from` alone and the orchestration test below reds.
+    #[tokio::test]
+    async fn pr_209_a_merge_from_main_is_the_same_change_by_patch_id() {
+        let signal = CancelSignal::new();
+        for source in [
+            FakeDiffSource::merged_from_base(),
+            FakeDiffSource::merged_from_base_213(),
+        ] {
+            let old = source.old_patch.as_ref().expect("fixture");
+            let head = source.head_patch.as_ref().expect("fixture");
+            assert_ne!(
+                old, head,
+                "the premise: the two diff TEXTS are not byte-equal"
+            );
+            assert!(
+                crate::ghsummons::same_change(old, head),
+                "but the two CHANGES are identical by patch-id"
+            );
+
+            let proven = unchanged_reviewed_shas(
+                &signal.wait(),
+                &source,
+                &coord(12),
+                HEAD_B,
+                &[HEAD_A.to_string()],
+            )
+            .await;
+            assert_eq!(
+                proven,
+                vec![HEAD_A.to_string()],
+                "an approved patch survives the merge from the base"
+            );
+        }
+    }
+
+    /// **Acceptance (A and B together), reproducing `#209` end to end.** Approved at the old head,
+    /// the author merges `main`, and the patch is identical. The approval carries to the new head,
+    /// the head move charges NO round against the durable budget, and with auto-merge on the pull
+    /// request clears every gate on the following sweep with no further review.
+    ///
+    /// MUTATION: charge a round for the patch-preserving move and the budget assertion reds; fail to
+    /// carry the verdict and the row/merge assertions red.
+    #[tokio::test]
+    async fn pr_209_an_approved_patch_merges_after_a_merge_from_main() {
+        let mut teams = ticketless(&["alice", "bob"]);
+        teams.review.auto_merge = true;
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        // The one round that produced the approval is already on the counter.
+        let charged = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), charged);
+
+        let signal = CancelSignal::new();
+        let proven = unchanged_reviewed_shas(
+            &signal.wait(),
+            &FakeDiffSource::merged_from_base(),
+            &coord(12),
+            HEAD_B,
+            &[HEAD_A.to_string()],
+        )
+        .await;
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+
+        assert_eq!(report.dispatched, 0, "an approved patch re-arms nobody");
+        assert_eq!(
+            report.skipped, 1,
+            "the round that did not happen is reported"
+        );
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))).copied(),
+            Some(charged),
+            "B: a patch-preserving head move must cost NO round"
+        );
+        let row = watch_row(&o, 12, "bob");
+        assert_eq!(row.status, REVIEW_STATUS_APPROVED);
+        assert_eq!(
+            row.last_reviewed_sha, HEAD_B,
+            "the verdict moved to the new head"
+        );
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "nothing reached a worker — the fixture starts from an already-approved row"
+        );
+
+        // The following sweep reads the carried row fresh, every gate clears, and it merges.
+        let merged = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            merged.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_B.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "an approved patch must merge after a merge from main, with no further round"
+        );
     }
 
     /// The skip is confined to a row that COMPLETED a round. A `truncated` row read the head only
@@ -7166,6 +7307,77 @@ mod tests {
         );
     }
 
+    /// **Acceptance (STUDIO-977, C): a `ship` satisfies approval-at-head for a patch the reviewers
+    /// actually approved.** The manager shipped at `HEAD_A`; the author then merged the base, moving
+    /// the head to `HEAD_B` with the SAME change (proven). The row still records its approval at
+    /// `HEAD_A`, and the settled ship governs the move — the merge gate must read that approval, not
+    /// refuse it as stale.
+    ///
+    /// MUTATION: pass a bare `&[head]` to `propose_auto_merge` on the settled-decision branch and
+    /// this reds — `report.merge` is empty.
+    #[test]
+    fn a_settled_ship_merges_an_approved_patch_after_a_base_merge() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        // The branch moves to HEAD_B by a merge from the base; the change is proven identical.
+        let proven = vec![HEAD_A.to_string()];
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+
+        assert_eq!(report.dispatched, 0, "the settled decision arms nothing");
+        assert!(report.adjudicate.is_empty(), "and is not re-asked");
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_B.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "the ship's approval-at-head holds for the patch it was made against"
+        );
+    }
+
+    /// **A settled `ship` still cannot merge through a CONFLICT (STUDIO-977 C, criterion 6).** The
+    /// proof widens only approval-at-head; the merge gates that answer "is this broken" — a conflict
+    /// here, CI and draft off-loop — remain absolute.
+    #[test]
+    fn a_settled_ship_does_not_merge_a_conflicted_pull_request() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let mut snap = match open_at(12, HEAD_A).lookup {
+            PrLookup::Found(s) => s,
+            _ => unreachable!(),
+        };
+        snap.merge_state = crate::ghsummons::MERGE_STATE_DIRTY.to_string();
+        let report = o.handle_review_sweep(&[observed(12, PrLookup::Found(snap))]);
+
+        assert!(
+            report.merge.is_empty(),
+            "a `ship` adjudicates the findings, never a conflict"
+        );
+    }
+
     // --- STUDIO-971: a shipped pull request that gets another commit -----------------------------
 
     /// **Acceptance, named after the pull request that filed it.** Reproduce `makewhatis/rhapsody#202`
@@ -9392,6 +9604,40 @@ mod tests {
                 base: Err("gh: boom".to_string()),
                 head_patch: Ok("diff".to_string()),
                 old_patch: Ok("diff".to_string()),
+            }
+        }
+        /// **The reported incident (STUDIO-977).** A merge from the base branch: the change under
+        /// review is identical, but the base moved, so every hunk's line numbers and every file's
+        /// `index` blob hashes moved with it. The two fingerprints are NOT byte-equal — a byte
+        /// comparison calls this a change — while `git patch-id --stable` (and
+        /// [`crate::ghsummons::same_change`]) calls them the same.
+        fn merged_from_base() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok(
+                    "src/lib.rs\u{0}modified\u{0}index 1212783..bbb2222 100644\n\
+                                @@ -42,7 +42,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
+                        .to_string(),
+                ),
+                old_patch: Ok(
+                    "src/lib.rs\u{0}modified\u{0}index 47ae5b0..aaa1111 100644\n\
+                               @@ -10,7 +10,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
+                        .to_string(),
+                ),
+            }
+        }
+        /// **The second live incident (STUDIO-977).** `makewhatis/rhapsody#213`: approved at
+        /// `e2c52c1`, merged `main` to `d17d0b7`, patch-id `2b6d540f…` both sides. A different
+        /// file, a different hunk — the predicate must not be a single hard-coded shape.
+        fn merged_from_base_213() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}index 9f0a1c2..d4e5f6a 100644\n\
+                                @@ -300,6 +300,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
+                    .to_string()),
+                old_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}index 1122334..d4e5f6a 100644\n\
+                               @@ -120,6 +120,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
+                    .to_string()),
             }
         }
         fn old_fails() -> FakeDiffSource {

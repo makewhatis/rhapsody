@@ -110,11 +110,12 @@ impl std::fmt::Display for PrCoord {
 pub struct PrObservation {
     pub pr: PrCoord,
     pub lookup: PrLookup,
-    /// The previously-REVIEWED head SHAs whose diff against the pull request's base is
-    /// byte-identical to this observation's head (STUDIO-960). Filled in by the off-loop watcher,
-    /// which is the only place that can spend the `gh` comparison; empty means "no proof", and the
-    /// control task then arms a normal round exactly as before. A `gh` read that failed, timed out
-    /// or could not fingerprint the whole diff leaves this empty on purpose.
+    /// The previously-REVIEWED head SHAs whose CHANGE against the pull request's base is the same
+    /// as this observation's head's — a patch-id comparison, not a byte comparison (STUDIO-960,
+    /// widened by STUDIO-977). Filled in by the off-loop watcher, which is the only place that can
+    /// spend the `gh` comparison; empty means "no proof", and the control task then arms a normal
+    /// round exactly as before. A `gh` read that failed, timed out or could not fingerprint the
+    /// whole diff leaves this empty on purpose.
     pub unchanged_from: Vec<String>,
 }
 

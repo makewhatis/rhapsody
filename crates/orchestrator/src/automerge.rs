@@ -134,20 +134,46 @@ pub(crate) fn auto_merge_verdict(
     rows: &[&ReviewWatchRow],
     head: &str,
 ) -> Result<Vec<String>, AutoMergeRefusal> {
-    if head.trim().is_empty() {
+    // The exact-head reading: a verdict counts only at `head` itself. This is the gate the dispatch
+    // loop and the convergence check use, and it is deliberately unchanged.
+    auto_merge_verdict_with_proof(rows, head, &[head])
+}
+
+/// [`auto_merge_verdict`], with the head set to the heads whose CHANGE is the same as `head`'s — the
+/// patch-id proof from [`crate::reviewwatch`] (STUDIO-977, C).
+///
+/// A `ship` adjudication may satisfy approval-at-head for a patch the reviewers actually approved,
+/// but the rows it is read from may still name the OLD head: the carry-over advances
+/// `last_reviewed_sha` on its own tick, and a same-tick read sees the pre-advance snapshot. `proven`
+/// (the head plus the SHAs [`crate::ghsummons::same_change`] proved identical, computed off-loop)
+/// lets an approval whose commit differs but whose change does not still count.
+///
+/// This is NOT a relaxation of what counts as an approval. A row that is `requested`, `in_flight` or
+/// `truncated` still refuses — nobody finished reading the change — and a row approved at a head
+/// OUTSIDE `proven` is still [`AutoMergeRefusal::StaleVerdict`], because the change there was never
+/// proven the same. With `proven == [head]` this is byte-for-byte the old rule.
+pub(crate) fn auto_merge_verdict_with_proof(
+    rows: &[&ReviewWatchRow],
+    head: &str,
+    proven: &[&str],
+) -> Result<Vec<String>, AutoMergeRefusal> {
+    let head = head.trim();
+    if head.is_empty() {
         return Err(AutoMergeRefusal::NoHead);
     }
     if rows.is_empty() {
         return Err(AutoMergeRefusal::NoVerdict);
     }
+    let proven: Vec<&str> = proven.iter().map(|p| p.trim()).collect();
     let mut approved_by = Vec::with_capacity(rows.len());
     for row in rows {
         match row.status.as_str() {
             REVIEW_STATUS_APPROVED => {
                 // The head-keying, and the reason this is not merely `status == approved`: the
-                // verdict is a statement about the commit the reviewer READ, which is the SHA
-                // `mark_review_completed` stamped alongside it.
-                if row.last_reviewed_sha != head.trim() {
+                // verdict is a statement about the CHANGE the reviewer READ, which is the SHA
+                // `mark_review_completed` stamped alongside it — or a head proven to carry the same
+                // change.
+                if !proven.contains(&row.last_reviewed_sha.as_str()) {
                     return Err(AutoMergeRefusal::StaleVerdict);
                 }
                 approved_by.push(row.key.reviewer.clone());
@@ -160,6 +186,30 @@ pub(crate) fn auto_merge_verdict(
         }
     }
     Ok(approved_by)
+}
+
+/// Whether every LIVE row has a SETTLED verdict — an approval or a findings verdict — on the change
+/// `head` carries, `proven` being the heads whose change matches it (STUDIO-977, C).
+///
+/// This is the question a manager's `ship` availability turns on, and it is deliberately weaker than
+/// [`auto_merge_verdict_with_proof`]: it asks whether a human-equivalent reviewer has READ this
+/// change, not whether every one approved it. A `reviewed` row means somebody read it and said no —
+/// the manager may still adjudicate those findings — while a `requested`, `in_flight` or `truncated`
+/// row means NOBODY has finished reading it, and a `ship` must not stand in for that. This is what
+/// makes "when the head is genuinely unread, the manager escalates" structural rather than a
+/// judgement the model re-derives each turn: with an unread change, `ship` is not available at all.
+pub(crate) fn head_read_verdict(rows: &[&ReviewWatchRow], head: &str, proven: &[&str]) -> bool {
+    let head = head.trim();
+    if head.is_empty() || rows.is_empty() {
+        return false;
+    }
+    let proven: Vec<&str> = proven.iter().map(|p| p.trim()).collect();
+    rows.iter().all(|row| {
+        matches!(
+            row.status.as_str(),
+            REVIEW_STATUS_APPROVED | REVIEW_STATUS_REVIEWED
+        ) && proven.contains(&row.last_reviewed_sha.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -346,5 +396,94 @@ mod tests {
             auto_merge_verdict(&refs, HEAD),
             Err(AutoMergeRefusal::StaleVerdict)
         );
+    }
+
+    // ── STUDIO-977 C: a verdict at a head proven to carry the same change ────────────────────────
+
+    /// **Acceptance.** A verdict recorded at `OLD` clears the gate at `HEAD` once `HEAD`'s change is
+    /// PROVEN the same as `OLD`'s — the patch-id proof the ship path passes. Without the proof, the
+    /// exact-head rule stands.
+    ///
+    /// MUTATION: drop the `proven` argument (compare `last_reviewed_sha` to `head` alone) and the
+    /// first assertion reds.
+    #[test]
+    fn a_verdict_at_a_proven_head_clears_the_gate() {
+        let rows = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+        assert_eq!(
+            auto_merge_verdict(&refs, HEAD),
+            Err(AutoMergeRefusal::StaleVerdict)
+        );
+        assert_eq!(
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD, OLD]),
+            Ok(vec!["alice".to_string()]),
+            "an approval on the proven-identical change is an approval of this head"
+        );
+    }
+
+    /// The proof is not a wildcard: a verdict at a head OUTSIDE the proven set is still stale, so a
+    /// real change to the branch re-opens the gate.
+    #[test]
+    fn a_verdict_outside_the_proof_is_still_stale() {
+        let rows = [row(
+            "alice",
+            REVIEW_STATUS_APPROVED,
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+        assert_eq!(
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD, OLD]),
+            Err(AutoMergeRefusal::StaleVerdict)
+        );
+    }
+
+    /// The proof never manufactures a verdict: a row that still OWES a round refuses under the
+    /// proof exactly as without it.
+    #[test]
+    fn the_proof_does_not_carry_a_round_still_owed() {
+        for status in [
+            REVIEW_STATUS_REQUESTED,
+            REVIEW_STATUS_IN_FLIGHT,
+            REVIEW_STATUS_TRUNCATED,
+        ] {
+            let rows = [row("alice", status, OLD)];
+            let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+            assert_eq!(
+                auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD, OLD]),
+                Err(AutoMergeRefusal::RoundInFlight),
+                "({status})"
+            );
+        }
+    }
+
+    /// **`ship` availability (C).** A change is READ when every row carries a settled verdict at a
+    /// head proven to carry it — an approval OR a findings verdict. An unread change (a `requested`,
+    /// `in_flight` or `truncated` row, or no rows at all) is not.
+    #[test]
+    fn a_change_is_read_only_when_every_row_has_a_settled_verdict_on_it() {
+        let approved = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
+        let a: Vec<&ReviewWatchRow> = approved.iter().collect();
+        assert!(head_read_verdict(&a, HEAD, &[HEAD, OLD]));
+
+        let requested = [
+            row("alice", REVIEW_STATUS_APPROVED, OLD),
+            row("bob", REVIEW_STATUS_REQUESTED, HEAD),
+        ];
+        let r: Vec<&ReviewWatchRow> = requested.iter().collect();
+        assert!(
+            !head_read_verdict(&r, HEAD, &[HEAD, OLD]),
+            "a row nobody has finished reading means the change is not read"
+        );
+
+        let changed = [row("alice", REVIEW_STATUS_REVIEWED, HEAD)];
+        let c: Vec<&ReviewWatchRow> = changed.iter().collect();
+        assert!(
+            head_read_verdict(&c, HEAD, &[HEAD]),
+            "a findings verdict is still a verdict: the change was read"
+        );
+
+        // A verdict at a head nobody proved the same is not a verdict about THIS change.
+        assert!(!head_read_verdict(&a, HEAD, &[HEAD]));
+        assert!(!head_read_verdict(&[], HEAD, &[HEAD]));
     }
 }

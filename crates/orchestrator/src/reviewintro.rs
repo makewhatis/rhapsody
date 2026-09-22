@@ -672,8 +672,10 @@ impl Orchestrator {
             if self.running.contains_key(&id) || self.claimed.contains(&id) {
                 continue;
             }
-            // STUDIO-960: the head moved, but the diff it carries against the base is byte-identical
-            // to the one this row's VERDICT was made against, so there is no new work to read. The
+            // STUDIO-960, widened by STUDIO-977: the head moved, but the CHANGE it carries against
+            // the base is the same (patch-id) as the one this row's VERDICT was made against, so
+            // there is no new work to read — a merge from the base branch included, which rewrites
+            // the hunk line numbers while carrying the same change. The
             // verdict is carried forward by advancing `last_reviewed_sha` to the new head and
             // KEEPING the terminal status — the alternative, re-arming, would discard an approval
             // the diff still justifies and bill the whole round again.

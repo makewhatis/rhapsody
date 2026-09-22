@@ -1043,6 +1043,56 @@ pub type ReviewDiffResult = Result<String, Box<dyn std::error::Error + Send + Sy
 /// whose failure mode is a review that never happens.
 pub const MAX_COMPARE_FILES: usize = 300;
 
+/// The normalization `git patch-id --stable` applies to a unified diff, so that two patches which
+/// introduce the SAME change against DIFFERENT bases compare equal (STUDIO-977).
+///
+/// A head move that folds the base branch into the branch rewrites the `@@ -a,b +c,d @@` line
+/// numbers of every hunk — and the blob hashes on the `index` line — without changing a single line
+/// the branch itself adds or removes. Comparing the raw diff text therefore calls such a move a
+/// CHANGE even though the change under review is byte-identical, which is exactly the incident this
+/// ticket was filed on: two reviewers approved `1050386`, the author merged `main` to clear
+/// `BEHIND`, and the approval was discarded at `19fc650` over a diff that differs only in a
+/// blob-hash line.
+///
+/// This is that instrument, in pure text over the same compare data the watcher already reads —
+/// [`merge_base_patch`]'s fingerprint, whose parts are separated by `\0` and `\n`. It keeps the file
+/// identity and status, keeps every `+`/`-`/context line and any hunk section heading verbatim, and
+/// drops only the two things `git patch-id` drops: an `index <blob>..<blob>` line and the line
+/// numbers/ranges inside a `@@ … @@` header. `--stable`'s other property — independence of file
+/// ORDER — is already guaranteed by [`merge_base_patch`] sorting its entries.
+///
+/// Deliberately not `git patch-id` itself: the watcher holds no checkout and must not, and shelling
+/// `git` per comparison would need a mirror of a repository the daemon may not have and a second
+/// process per poll. The comparison here is over data already fetched.
+pub fn stable_patch_id(fingerprint: &str) -> String {
+    let mut out = String::with_capacity(fingerprint.len());
+    // Both `\0` (the per-file separators) and `\n` (the diff's own lines) start a segment, so a
+    // hunk header is normalized whether it follows a status field or the previous hunk.
+    for segment in fingerprint.split(['\n', '\0']) {
+        if segment.starts_with("index ") {
+            continue;
+        }
+        if let Some(rest) = segment.strip_prefix("@@") {
+            // `@@ -a,b +c,d @@ optional heading`: keep only the heading, which is the part a change
+            // to the hunk's meaning would move, and never the ranges a base move rewrites.
+            let heading = rest.split_once("@@").map(|(_, t)| t).unwrap_or("");
+            out.push_str("@@");
+            out.push_str(heading);
+        } else {
+            out.push_str(segment);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether two [`merge_base_patch`] fingerprints describe the SAME change under review — a
+/// patch-id comparison, never a byte comparison (STUDIO-977). See [`stable_patch_id`] for why the
+/// distinction is load-bearing: the raw texts differ on every base-preserving merge.
+pub fn same_change(a: &str, b: &str) -> bool {
+    stable_patch_id(a) == stable_patch_id(b)
+}
+
 /// Reads a pull request's diff-against-its-base at two different heads, so the watcher can tell a
 /// HEAD MOVE THAT CARRIED NO NEW WORK from one that did (STUDIO-960).
 ///
@@ -1076,8 +1126,10 @@ pub trait ReviewDiffSource: Send + Sync {
     /// would introduce against `base`, at exactly `sha`.
     ///
     /// Two calls to this method for two commits, with the same `base` and at the same moment, are
-    /// byte-comparable: equal fingerprints mean the two commits carry the same change, whatever
-    /// their parents are. An error means the diff could not be read IN FULL — a missing patch for a
+    /// comparable through [`same_change`]: a match means the two commits carry the same change,
+    /// whatever their parents are — a patch-id comparison that forgives the hunk line numbers and
+    /// blob hashes a base-preserving merge rewrites, never a byte comparison (STUDIO-977). An error
+    /// means the diff could not be read IN FULL — a missing patch for a
     /// binary or oversized file, or a compare too large to enumerate — and the caller must arm a
     /// normal round rather than treat it as a non-answer.
     async fn merge_base_patch(
@@ -4220,6 +4272,37 @@ mod tests {
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "no gh process should have been spawned"
+        );
+    }
+
+    /// **STUDIO-977.** The patch-id normalization drops exactly what `git patch-id --stable`
+    /// drops — the `index` blob line and the hunk line numbers — and nothing else. Two fingerprints
+    /// that differ only in those compare equal; a changed line does not, and neither does an extra
+    /// file, because the file identity is kept.
+    ///
+    /// MUTATION: make `stable_patch_id` the identity function and the second assertion reds.
+    #[test]
+    fn a_base_merge_is_the_same_patch_id_but_a_real_change_is_not() {
+        let old = "f.rs\u{0}modified\u{0}index 47ae5b0..aaa1111 100644\n\
+                   @@ -10,7 +10,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        let head = "f.rs\u{0}modified\u{0}index 1212783..bbb2222 100644\n\
+                    @@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        let changed = "f.rs\u{0}modified\u{0}index 9999999..ccc3333 100644\n\
+                       @@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+DIFFERENT\n ctx\n\u{0}";
+        let extra = format!("{head}g.rs\u{0}added\u{0}@@ -0,0 +1 @@\n+x\n\u{0}");
+
+        assert_ne!(old, head, "the premise: a base move rewrites the text");
+        assert!(
+            same_change(old, head),
+            "the same change against a moved base is the same patch-id"
+        );
+        assert!(
+            !same_change(old, changed),
+            "a changed line is a changed patch-id"
+        );
+        assert!(
+            !same_change(old, &extra),
+            "a different file set is a different patch-id"
         );
     }
 }
