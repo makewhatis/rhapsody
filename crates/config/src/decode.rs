@@ -19,8 +19,10 @@ use serde_yaml_ng::Value;
 use crate::model::{
     Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT,
     DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Opencode, Otel, Polling, Project,
-    ProviderBudget, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker, Workspace,
+    ProviderBudget, Raw, RawBrokerLimits, RawClaudeOverride, RawProject, RawProviderDefinition,
+    Server, Storage, Tracker, Workspace,
 };
+use crate::providers::{BrokerLimits, CredentialRef, ProviderDefinition};
 use crate::workflow::Definition;
 
 /// Errors from [`decode`]. `Parse` Displays with Go's `workflow_parse_error` sentinel token
@@ -124,6 +126,9 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 
     let agent = Agent {
         backend: or_str(r.agent.backend, "claude"),
+        // STUDIO-984: normalized provider/model selection, mapped verbatim (empty ⇒ legacy path).
+        provider: r.agent.provider,
+        model: r.agent.model,
         max_concurrent_agents: or_int(r.agent.max_concurrent_agents, 10),
         // STUDIO-950: no default — absent means "share `max_concurrent_agents`", the pre-key
         // behaviour. A default of 0 would be ambiguous with an explicit 0, so the raw `Option`
@@ -251,6 +256,19 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         })
         .collect();
 
+    // Global provider definitions (STUDIO-984). Rhapsody-only and purely additive: an absent
+    // `providers:` block decodes to an empty map, so a config that never writes one is byte-identical
+    // to a daemon built before this existed. The map key is the provider id and is copied onto the
+    // definition; canonical-syntax and ceiling checks run in `validate`.
+    let providers = r
+        .providers
+        .into_iter()
+        .map(|(id, rp)| {
+            let def = decode_provider(rp);
+            (id.clone(), ProviderDefinition { id, ..def })
+        })
+        .collect();
+
     Ok(Config {
         tracker,
         polling,
@@ -280,6 +298,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // byte-parity golden is affected.
         pr_label: or_str(r.pr_label, "rhapsody"),
         budgets,
+        providers,
     })
 }
 
@@ -344,6 +363,76 @@ fn decode_project(rp: RawProject) -> Project {
         promote_from_states: rp.promote_from_states,
         // Mapped verbatim (None preserved) so the enabled default is applied at resolve time.
         enabled: rp.enabled,
+        // Per-project provider definitions (STUDIO-984): mapped verbatim (empty ⇒ inherit).
+        providers: rp
+            .providers
+            .into_iter()
+            .map(|(id, rp)| {
+                let def = decode_provider(rp);
+                (id.clone(), ProviderDefinition { id, ..def })
+            })
+            .collect(),
+    }
+}
+
+/// Maps one raw provider definition to its typed form (STUDIO-984). All defaults are materialized
+/// here — `allow_insecure_http` false, the credential source verbatim (validated later), and the V1
+/// broker-limits default column — so the typed definition is complete without a second defaulting
+/// stage. The `id` is stamped by the caller from the map key.
+fn decode_provider(rp: RawProviderDefinition) -> ProviderDefinition {
+    ProviderDefinition {
+        id: String::new(),
+        protocol: rp.protocol,
+        display_name: rp.display_name,
+        base_url: rp.base_url,
+        allow_insecure_http: or_bool(rp.allow_insecure_http, false),
+        credential: rp
+            .credential
+            .map(|c| CredentialRef { source: c.source })
+            .unwrap_or_default(),
+        broker_limits: decode_broker_limits(rp.broker_limits),
+    }
+}
+
+/// Materializes the V1 broker-limits default column (`provider-broker-design.md` §8.1) over an
+/// optional raw block. An explicit value — including an explicit `0` — is carried verbatim and
+/// validated later, so a zero is refused rather than silently defaulted away.
+fn decode_broker_limits(raw: Option<RawBrokerLimits>) -> BrokerLimits {
+    let d = BrokerLimits::default();
+    let Some(r) = raw else {
+        return d;
+    };
+    BrokerLimits {
+        forwarded_requests_per_turn: r
+            .forwarded_requests_per_turn
+            .unwrap_or(d.forwarded_requests_per_turn),
+        denied_requests_before_revocation: r
+            .denied_requests_before_revocation
+            .unwrap_or(d.denied_requests_before_revocation),
+        concurrent_upstream_requests_per_turn: r
+            .concurrent_upstream_requests_per_turn
+            .unwrap_or(d.concurrent_upstream_requests_per_turn),
+        json_request_bytes: r.json_request_bytes.unwrap_or(d.json_request_bytes),
+        aggregate_request_bytes_per_turn: r
+            .aggregate_request_bytes_per_turn
+            .unwrap_or(d.aggregate_request_bytes_per_turn),
+        response_bytes_per_request: r
+            .response_bytes_per_request
+            .unwrap_or(d.response_bytes_per_request),
+        aggregate_response_bytes_per_turn: r
+            .aggregate_response_bytes_per_turn
+            .unwrap_or(d.aggregate_response_bytes_per_turn),
+        requested_output_tokens_per_request: r
+            .requested_output_tokens_per_request
+            .unwrap_or(d.requested_output_tokens_per_request),
+        reserved_token_units_per_turn: r
+            .reserved_token_units_per_turn
+            .unwrap_or(d.reserved_token_units_per_turn),
+        reserved_token_units_per_session: r
+            .reserved_token_units_per_session
+            .unwrap_or(d.reserved_token_units_per_session),
+        capability_lifetime_ms: r.capability_lifetime_ms.unwrap_or(d.capability_lifetime_ms),
+        max_reserved_token_units_per_utc_day: r.max_reserved_token_units_per_utc_day,
     }
 }
 

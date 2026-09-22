@@ -22,6 +22,8 @@ use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
+use crate::providers::ProviderDefinition;
+
 /// Default OTLP endpoint when `otel.endpoint` is unset. Empty by design: Rhapsody ships with no
 /// fleet-observability hub (the Go daemon defaulted to a company-internal collector — a DIVERGENCE,
 /// see README). With `otel.enabled` false by default nothing exports; an operator opting in sets
@@ -169,6 +171,15 @@ pub struct Hooks {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
     pub backend: String,
+    /// The normalized provider selection (`agent.provider`): the canonical provider id of an entry
+    /// in [`Config::providers`], or `""` (the default, and every install that never writes the key)
+    /// for the legacy/native-login path. Rhapsody-only (no Go counterpart); empty preserves today's
+    /// behaviour byte-for-byte. Validation refuses an explicit provider for anything but OpenCode in
+    /// v1 (`provider-auth-design.md` §3).
+    pub provider: String,
+    /// The normalized model selection (`agent.model`): opaque within §2.2's transport bounds, or
+    /// `""` to preserve the backend's own CLI default. Required when `agent.provider` is set.
+    pub model: String,
     pub max_concurrent_agents: i64,
     /// A SEPARATE global budget for ticketless review runs (STUDIO-950). `None` — the default, and
     /// every install that never writes the key — means reviews keep drawing the shared
@@ -395,6 +406,10 @@ pub struct Project {
     pub promote_from_states: Vec<String>,
     /// Per-project pause flag; `None` ⇒ enabled (default applied at resolve, INF-224).
     pub enabled: Option<bool>,
+    /// Per-project provider definitions (STUDIO-984). Rhapsody-only; an entry here overlays the
+    /// top-level [`Config::providers`] entry with the same id, following the existing
+    /// decode→validate→effective→encode pipeline. Empty ⇒ the project inherits the global set.
+    pub providers: BTreeMap<String, ProviderDefinition>,
 }
 
 /// One provider's daily token budget (STUDIO-957). Rhapsody-only — the frozen Go reference has no
@@ -454,6 +469,12 @@ pub struct Config {
     /// install that never configures one) is unlimited and byte-identical to today. Ordered so the
     /// effective view and any serialization are deterministic.
     pub budgets: BTreeMap<String, ProviderBudget>,
+    /// Operator-defined provider metadata (STUDIO-984). Rhapsody-only; EMPTY (the default, and every
+    /// install that never writes a `providers:` block) is byte-identical to today. Ordered by id so
+    /// the effective view, encode, and the reload revision are deterministic. The key is the
+    /// canonical provider id, which is also [`ProviderDefinition::id`]. No value here can carry a
+    /// secret — see [`crate::providers`].
+    pub providers: BTreeMap<String, ProviderDefinition>,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +515,8 @@ pub(crate) struct Raw {
     pub projects: Vec<RawProject>,
     /// `budgets:` front-matter block (STUDIO-957). Rhapsody-only: absent ⇒ empty ⇒ unlimited.
     pub budgets: BTreeMap<String, RawProviderBudget>,
+    /// `providers:` front-matter block (STUDIO-984). Rhapsody-only: absent ⇒ empty ⇒ no providers.
+    pub providers: BTreeMap<String, RawProviderDefinition>,
 }
 
 /// Raw `budgets.<provider>` entry. `daily_tokens` is `Option` so an absent value is distinguishable
@@ -502,6 +525,49 @@ pub(crate) struct Raw {
 #[serde(default)]
 pub(crate) struct RawProviderBudget {
     pub daily_tokens: Option<i64>,
+}
+
+/// Raw `providers.<id>` entry (STUDIO-984). Rhapsody-only, and deliberately secret-free: there is
+/// no value/token/key field, and none may be added. `allow_insecure_http` is `Option` so an absent
+/// value is distinguishable from an explicit `false` (both decode to `false`); `broker_limits` is
+/// `Option` so an absent block materializes the V1 default column.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawProviderDefinition {
+    pub protocol: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub allow_insecure_http: Option<bool>,
+    pub credential: Option<RawCredentialRef>,
+    pub broker_limits: Option<RawBrokerLimits>,
+}
+
+/// Raw `providers.<id>.credential` entry. `source` names a storage KIND; never an account, never a
+/// value.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawCredentialRef {
+    pub source: String,
+}
+
+/// Raw `providers.<id>.broker_limits` entry. Every field is `Option` so `decode` can tell an absent
+/// value (materialize the default) from an explicit one (validate it, including explicit `0`, which
+/// must be refused).
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawBrokerLimits {
+    pub forwarded_requests_per_turn: Option<u32>,
+    pub denied_requests_before_revocation: Option<u32>,
+    pub concurrent_upstream_requests_per_turn: Option<u32>,
+    pub json_request_bytes: Option<u64>,
+    pub aggregate_request_bytes_per_turn: Option<u64>,
+    pub response_bytes_per_request: Option<u64>,
+    pub aggregate_response_bytes_per_turn: Option<u64>,
+    pub requested_output_tokens_per_request: Option<u64>,
+    pub reserved_token_units_per_turn: Option<u64>,
+    pub reserved_token_units_per_session: Option<u64>,
+    pub capability_lifetime_ms: Option<u64>,
+    pub max_reserved_token_units_per_utc_day: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -561,6 +627,9 @@ pub(crate) struct RawHooks {
 #[serde(default)]
 pub(crate) struct RawAgent {
     pub backend: String,
+    /// STUDIO-984; Rhapsody-only normalized selection. Empty ⇒ legacy/native login.
+    pub provider: String,
+    pub model: String,
     pub max_concurrent_agents: Option<i64>,
     /// STUDIO-950; Rhapsody-only, absent ⇒ reviews keep the shared `max_concurrent_agents` pool.
     pub max_concurrent_reviews: Option<i64>,
@@ -689,6 +758,8 @@ pub(crate) struct RawProject {
     pub labels: Vec<String>,
     pub capabilities: Vec<String>,
     pub enabled: Option<bool>,
+    /// STUDIO-984; Rhapsody-only per-project provider definitions. Empty ⇒ inherit the top level.
+    pub providers: BTreeMap<String, RawProviderDefinition>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

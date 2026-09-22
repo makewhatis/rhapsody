@@ -27,7 +27,8 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::decode::ConfigError;
 use crate::model::{
-    Config, Project, Raw, RawClaudeOverride, RawHooks, RawProject, RawProviderBudget,
+    Config, Project, Raw, RawBrokerLimits, RawClaudeOverride, RawCredentialRef, RawHooks,
+    RawProject, RawProviderBudget, RawProviderDefinition,
 };
 use crate::workflow::Definition;
 
@@ -109,6 +110,10 @@ fn raw_from_config(c: &Config) -> Raw {
     r.hooks.timeout_ms = Some(c.hooks.timeout_ms);
 
     r.agent.backend = c.agent.backend.clone();
+    // STUDIO-984 (Rhapsody-only): emit only when set; `prune_empty` drops the empty strings so an
+    // install that never writes a normalized provider/model round-trips byte-identically.
+    r.agent.provider = c.agent.provider.clone();
+    r.agent.model = c.agent.model.clone();
     r.agent.max_concurrent_agents = Some(c.agent.max_concurrent_agents);
     // STUDIO-950: emit only when set; `prune_empty` drops the `None` so an untouched workflow
     // round-trips without the key (and stays byte-identical to the pre-key config).
@@ -205,6 +210,12 @@ fn raw_from_config(c: &Config) -> Raw {
             },
         );
     }
+    // STUDIO-984 (Rhapsody-only): a configured provider round-trips; an empty map prunes away,
+    // preserving the no-providers default.
+    for (id, def) in &c.providers {
+        r.providers
+            .insert(id.clone(), raw_provider_from_definition(def));
+    }
     r.tracker.project_slug = c.tracker.project_slug.clone();
 
     if collapsible_to_single(c) {
@@ -253,7 +264,45 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.dep_mode_prompt_file.is_empty()
         && p.promote_from_states.is_empty()
         && p.claim_mode.is_empty()
+        && p.providers.is_empty()
         && p.enabled.is_none()
+}
+
+/// Maps one typed [`ProviderDefinition`] to a [`RawProviderDefinition`] (STUDIO-984), the inverse of
+/// `decode`'s provider mapping. `allow_insecure_http` is emitted only when `true` so an omitted or
+/// explicit `false` value round-trips identically; the credential source and the full broker-limits
+/// block are emitted so a Settings save never drops them.
+fn raw_provider_from_definition(
+    def: &crate::providers::ProviderDefinition,
+) -> RawProviderDefinition {
+    let l = &def.broker_limits;
+    RawProviderDefinition {
+        protocol: def.protocol.clone(),
+        display_name: def.display_name.clone(),
+        base_url: def.base_url.clone(),
+        allow_insecure_http: if def.allow_insecure_http {
+            Some(true)
+        } else {
+            None
+        },
+        credential: Some(RawCredentialRef {
+            source: def.credential.source.clone(),
+        }),
+        broker_limits: Some(RawBrokerLimits {
+            forwarded_requests_per_turn: Some(l.forwarded_requests_per_turn),
+            denied_requests_before_revocation: Some(l.denied_requests_before_revocation),
+            concurrent_upstream_requests_per_turn: Some(l.concurrent_upstream_requests_per_turn),
+            json_request_bytes: Some(l.json_request_bytes),
+            aggregate_request_bytes_per_turn: Some(l.aggregate_request_bytes_per_turn),
+            response_bytes_per_request: Some(l.response_bytes_per_request),
+            aggregate_response_bytes_per_turn: Some(l.aggregate_response_bytes_per_turn),
+            requested_output_tokens_per_request: Some(l.requested_output_tokens_per_request),
+            reserved_token_units_per_turn: Some(l.reserved_token_units_per_turn),
+            reserved_token_units_per_session: Some(l.reserved_token_units_per_session),
+            capability_lifetime_ms: Some(l.capability_lifetime_ms),
+            max_reserved_token_units_per_utc_day: l.max_reserved_token_units_per_utc_day,
+        }),
+    }
 }
 
 /// Maps one typed [`Project`] to a [`RawProject`] (Go `rawProjectFromProject`), the inverse of
@@ -283,6 +332,11 @@ fn raw_project_from_project(p: &Project) -> RawProject {
         labels: p.labels.clone(),
         capabilities: p.capabilities.clone(),
         enabled: p.enabled,
+        providers: p
+            .providers
+            .iter()
+            .map(|(id, def)| (id.clone(), raw_provider_from_definition(def)))
+            .collect(),
     };
     if let Some(ov) = &p.claude {
         rp.claude = Some(RawClaudeOverride {
@@ -1116,5 +1170,104 @@ mod tests {
         let bare = "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n";
         let c3 = re_encode_decode(&decode_map(bare, "body"));
         assert!(c3.tracker.promote_from_states.is_empty());
+    }
+
+    // STUDIO-984 (Rhapsody-only, DATA-LOSS class): a provider definition and the normalized
+    // provider/model selection MUST survive an Encode->Decode round-trip, or a Settings save would
+    // silently drop an operator's whole provider configuration. An untouched workflow must
+    // materialize nothing, so the golden/legacy shape is unchanged.
+    #[test]
+    fn providers_round_trip_and_an_absent_block_materializes_nothing() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
+            "providers:\n",
+            "  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            "    allow_insecure_http: false\n",
+            "    credential:\n      source: keychain\n",
+            "    broker_limits:\n      reserved_token_units_per_session: 5000000\n",
+            "      max_reserved_token_units_per_utc_day: 2000000\n",
+        );
+        let c1 = decode_map(front, "body");
+        assert_eq!(c1.agent.provider, "fireworks");
+        assert_eq!(
+            c1.agent.model,
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        let def = &c1.providers["fireworks"];
+        assert_eq!(def.credential.source, "keychain");
+        assert_eq!(
+            def.broker_limits.max_reserved_token_units_per_utc_day,
+            Some(2_000_000)
+        );
+
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(
+            c2, c1,
+            "provider config must be stable through Encode->Decode"
+        );
+
+        // An untouched workflow materializes no providers block and no selection.
+        let absent = decode_map(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "body",
+        );
+        let def = encode(&absent).expect("encode");
+        assert!(!def.config.contains_key("providers"));
+        assert_eq!(nested(&def.config, "agent", "provider"), None);
+        assert_eq!(nested(&def.config, "agent", "model"), None);
+        assert!(re_encode_decode(&absent).providers.is_empty());
+    }
+
+    // MUTATION GUARD (secret hygiene / serialization shape): the serialized provider entry carries
+    // EXACTLY the non-secret keys the design allows. Adding a secret-bearing field that reaches the
+    // front matter changes this key set and reds the test.
+    #[test]
+    fn encoded_provider_entry_has_no_secret_bearing_keys() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            "    credential:\n      source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        let def = encode(&c).expect("encode");
+        let entry = def
+            .config
+            .get("providers")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get("fireworks"))
+            .and_then(Value::as_mapping)
+            .expect("provider entry present");
+        let mut keys: Vec<String> = entry
+            .keys()
+            .map(|k| k.as_str().unwrap_or_default().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "base_url",
+                "broker_limits",
+                "credential",
+                "display_name",
+                "protocol",
+            ],
+            "the serialized provider entry must carry no secret-bearing key"
+        );
+        let credential = entry
+            .get("credential")
+            .and_then(Value::as_mapping)
+            .expect("credential mapping");
+        let ckeys: Vec<&str> = credential
+            .keys()
+            .map(|k| k.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ckeys,
+            vec!["source"],
+            "credential carries only a source kind"
+        );
     }
 }

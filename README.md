@@ -2528,3 +2528,59 @@ execute an arbitrary on-disk binary as the same OS user.
   itself is untouched — this ticket's job was to prove and specify the ownership mechanism, not
   finish wiring every call site, and the supervisor's own restart/backoff state machine is heavily
   tested and deliberately left alone here.
+
+### Provider metadata in `WORKFLOW.md`, and the harness registry that gates it (STUDIO-984)
+
+Go v0.4.0 has no provider concept — it runs one backend against whatever credentials the CLI already
+has. Rhapsody adds an operator-facing `providers:` block plus a normalized `agent.provider` /
+`agent.model` selection, so a workflow can name a non-Anthropic endpoint without ever putting a
+secret in the file. This is the config-only slice: it defines and validates the metadata and the pure
+runtime types but deliberately does **not** make provider dispatch live. The whole feature is
+**additive and inert when unset**: a workflow that writes no `providers:` key decodes, validates,
+encodes and renders byte-identically to a daemon built before it existed, pinned by the existing
+config goldens and an old-vs-new round-trip test.
+
+- **`providers:` is metadata plus a credential reference, never a secret.** A provider is a canonical
+  id (`[a-z][a-z0-9_-]{0,63}`, 1–64 chars, rejected rather than case-folded), an explicit
+  `protocol` (`openai-compatible` — Chat Completions with Bearer API-key auth only, never arbitrary
+  headers), a `display_name`, a `base_url`, an `allow_insecure_http` policy, a `credential.source`
+  storage *kind* (`keychain`), and validated broker limits. No value/token/key field exists anywhere
+  in the YAML-facing or pure resolved types, and none may be added.
+- **`base_url` is the protocol root immediately above `chat/completions`.** Normalization strips a
+  trailing `/` and appends `/v1` only when the path does not already end in `/v1`, so
+  `https://api.fireworks.ai/inference/v1` and `https://api.openai.com/v1` are left alone and never
+  grow a second `/v1`.
+- **TLS policy is explicit.** `allow_insecure_http` defaults `false`, is required `true` for an
+  `http` base URL, and is rejected `true` on `https`; an omitted or explicit `false` value on
+  `https` round-trips identically. It is operator policy, never inferred from loopback/private
+  addressing or child input.
+- **Broker limits** (`provider-broker-design.md` §8.1) are typed per provider, defaulting to the V1
+  column (64 forwarded requests/turn, 4 concurrent, 8 MiB JSON request, …, 20,000,000 reserved
+  token units/run, one-hour capability lifetime) with daemon hard ceilings that are compile-time
+  constants and not configurable. An optional `max_reserved_token_units_per_utc_day` has **no
+  implicit default**: absent means no daily cap.
+- **One credential binding, one cross-surface spelling.** Normalization derives
+  `(provider_id, openai-chat-completions-bearer-v1, normalized_base_url)`, and the Keychain account
+  is `v1:<provider_id>` — derived only from the canonical id, so a definition can never name an
+  arbitrary Keychain item.
+- **V1 materializes providers for OpenCode only.** An explicit provider with `agent.backend: claude`
+  is a typed refusal; Claude keeps its native login path. The one harness registry in
+  `rhapsody-agent` declares which provider protocols each adapter can consume, so there is no second
+  compatibility switch in config.
+- **Brokered OpenCode is version-gated and fail-closed.** The supported-version table is
+  single-sourced from the PB0 probe (`1.18.30` / `@ai-sdk/openai-compatible` `2.0.41`), and the
+  initial row accepts only an empty or `build` `opencode.agent`, an empty `variant`, an
+  `auto_approve` that is absent or `true`, no `extra_args`, and a `command` that is exactly one
+  executable. Every other knob is a typed refusal that runs before any credential read.
+- **The runtime type replaces the raw-key one.** `rhapsody_agent::Provider` /
+  `ProviderAuth::ApiKey(String)` are gone; `HarnessSpec.provider` is now the non-secret
+  `ResolvedProviderPlan` (stable id, protocol, normalized endpoint, policy, canonical binding,
+  credential source kind, model, origins). The move-only prepared provider that carries an opaque
+  broker session is a later slice (PB5).
+
+Preserved-code surfaces are unchanged: `effective_json` emits the provider block and the
+`agent.provider`/`agent.model` keys only when configured, so the Go config goldens stay byte-exact;
+`encode` preserves a configured provider through a console Save; project overlays merge a project's
+own provider definitions entry-by-entry through the existing decode→validate→effective→encode
+pipeline.
+

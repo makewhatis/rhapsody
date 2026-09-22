@@ -90,6 +90,14 @@ fn build_global(c: &Config) -> Value {
         "max_retry_backoff_ms".into(),
         num(c.agent.max_retry_backoff_ms),
     );
+    // STUDIO-984 (Rhapsody-only): the normalized provider/model selection, emitted only when set so
+    // a provider-less config keeps the byte-pinned Go `agent` object unchanged.
+    if !c.agent.provider.is_empty() {
+        agent.insert("provider".into(), s(&c.agent.provider));
+    }
+    if !c.agent.model.is_empty() {
+        agent.insert("model".into(), s(&c.agent.model));
+    }
     // max_concurrent_agents_by_state is `omitempty`: emitted only when non-empty.
     if !c.agent.max_concurrent_agents_by_state.is_empty() {
         let mut m = Map::new();
@@ -134,7 +142,7 @@ fn build_global(c: &Config) -> Value {
         otel.insert("headers".into(), Value::Object(m));
     }
 
-    obj(vec![
+    let mut global = obj(vec![
         (
             "tracker",
             obj(vec![
@@ -193,6 +201,96 @@ fn build_global(c: &Config) -> Value {
         ("dependency_mode", s(&c.tracker.dependency_mode)),
         ("dep_mode_prompt_file", s(&c.tracker.dep_mode_prompt_file)),
         ("claim_mode", s(&c.tracker.claim_mode)),
+    ]);
+    // STUDIO-984 (Rhapsody-only): providers are emitted ONLY when configured, so a provider-less
+    // config keeps the byte-pinned Go global view unchanged. The block is non-secret metadata plus
+    // the validated broker limits (the "visible in effective provider status" acceptance bullet).
+    if !c.providers.is_empty()
+        && let Value::Object(m) = &mut global
+    {
+        let mut providers = Map::new();
+        for (id, def) in &c.providers {
+            providers.insert(id.clone(), provider_json(def));
+        }
+        m.insert("providers".into(), Value::Object(providers));
+    }
+    global
+}
+
+/// The non-secret view of one provider definition (STUDIO-984). Carries no key, token, envelope, or
+/// binding fingerprint — only what an operator wrote plus the derived normalized endpoint and the
+/// validated limits.
+fn provider_json(def: &crate::providers::ProviderDefinition) -> Value {
+    let l = &def.broker_limits;
+    let mut limits = Map::new();
+    limits.insert(
+        "forwarded_requests_per_turn".into(),
+        num(i64::from(l.forwarded_requests_per_turn)),
+    );
+    limits.insert(
+        "denied_requests_before_revocation".into(),
+        num(i64::from(l.denied_requests_before_revocation)),
+    );
+    limits.insert(
+        "concurrent_upstream_requests_per_turn".into(),
+        num(i64::from(l.concurrent_upstream_requests_per_turn)),
+    );
+    limits.insert(
+        "json_request_bytes".into(),
+        num(l.json_request_bytes as i64),
+    );
+    limits.insert(
+        "aggregate_request_bytes_per_turn".into(),
+        num(l.aggregate_request_bytes_per_turn as i64),
+    );
+    limits.insert(
+        "response_bytes_per_request".into(),
+        num(l.response_bytes_per_request as i64),
+    );
+    limits.insert(
+        "aggregate_response_bytes_per_turn".into(),
+        num(l.aggregate_response_bytes_per_turn as i64),
+    );
+    limits.insert(
+        "requested_output_tokens_per_request".into(),
+        num(l.requested_output_tokens_per_request as i64),
+    );
+    limits.insert(
+        "reserved_token_units_per_turn".into(),
+        num(l.reserved_token_units_per_turn as i64),
+    );
+    limits.insert(
+        "reserved_token_units_per_session".into(),
+        num(l.reserved_token_units_per_session as i64),
+    );
+    limits.insert(
+        "capability_lifetime_ms".into(),
+        num(l.capability_lifetime_ms as i64),
+    );
+    limits.insert(
+        "max_reserved_token_units_per_utc_day".into(),
+        l.max_reserved_token_units_per_utc_day
+            .map(|v| num(v as i64))
+            .unwrap_or(Value::Null),
+    );
+    obj(vec![
+        ("id", s(&def.id)),
+        ("protocol", s(&def.protocol)),
+        ("display_name", s(&def.display_name)),
+        // The normalized endpoint when derivable, else the verbatim value (a malformed URL fails
+        // validation, so a produced view is always normalized).
+        (
+            "base_url",
+            s(&def
+                .normalized_base_url()
+                .unwrap_or_else(|_| def.base_url.clone())),
+        ),
+        ("allow_insecure_http", Value::Bool(def.allow_insecure_http)),
+        (
+            "credential",
+            obj(vec![("source", s(&def.credential.source))]),
+        ),
+        ("broker_limits", Value::Object(limits)),
     ])
 }
 
@@ -592,5 +690,60 @@ mod tests {
         assert!(v.get("config").is_some(), "verbatim config still present");
         assert!(v.get("global").is_some(), "typed global still present");
         assert_eq!(v["prompt_body"], "body");
+    }
+
+    // STUDIO-984 (Rhapsody-only, ADDITIVE): providers and the normalized selection are surfaced only
+    // when configured, so the byte-pinned Go global view is unchanged for a provider-less config.
+    #[test]
+    fn providers_are_surfaced_only_when_configured() {
+        let without = render_front(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "body",
+        );
+        assert!(
+            without["global"].get("providers").is_none(),
+            "an unset providers: block must not add a key to the global view"
+        );
+        assert!(without["global"]["agent"].get("provider").is_none());
+        assert!(without["global"]["agent"].get("model").is_none());
+
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            "    credential:\n      source: keychain\n",
+        );
+        let v = render_front(front, "body");
+        assert_eq!(v["global"]["agent"]["provider"], "fireworks");
+        assert_eq!(
+            v["global"]["agent"]["model"],
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        let p = &v["global"]["providers"]["fireworks"];
+        assert_eq!(p["protocol"], "openai-compatible");
+        assert_eq!(p["display_name"], "Fireworks");
+        assert_eq!(
+            p["base_url"], "https://api.fireworks.ai/inference/v1",
+            "the view carries the normalized endpoint"
+        );
+        assert_eq!(p["credential"]["source"], "keychain");
+        assert_eq!(
+            p["broker_limits"]["reserved_token_units_per_session"],
+            20_000_000
+        );
+        assert_eq!(
+            p["broker_limits"]["max_reserved_token_units_per_utc_day"],
+            serde_json::Value::Null,
+            "an absent daily cap is reported as null, never a permissive implicit value"
+        );
+        // No secret-bearing key appears anywhere in the provider view.
+        let rendered = p.to_string();
+        for forbidden in ["value", "api_key", "token\"", "secret", "envelope"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "provider view leaked {forbidden:?}: {rendered}"
+            );
+        }
     }
 }
