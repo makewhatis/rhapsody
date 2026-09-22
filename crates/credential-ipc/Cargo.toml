@@ -1,0 +1,30 @@
+[package]
+name = "rhapsody-credential-ipc"
+description = "Authenticated desktop-to-daemon credential IPC selected by STUDIO-981 (P0c) — no Go parity, a Rhapsody-only addition."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Frame payloads are JSON (matching the rest of the workspace's wire-format idiom, e.g. httpapi) so
+# the protocol stays human-inspectable in a packet capture / log without adding a second codec.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tokio: framing is written against `AsyncRead`/`AsyncWrite` so both the desktop's Unix-socket
+# server and rhapsodyd's client (and this crate's own in-memory `tokio::io::duplex` tests) share one
+# implementation. `io-util` is the only feature this crate itself needs; the daemon/desktop binaries
+# already depend on tokio with the runtime features this crate does not require.
+tokio = { version = "1", features = ["io-util"] }
+# rand: the per-launch bootstrap token is 32 CSPRNG bytes (`rand::rng().fill_bytes`). Already in
+# Cargo.lock transitively (uuid/tempfile chains) — this adds a direct edge, not a new download.
+rand = "0.9"
+# zeroize: `BoundCredentialLease` and the raw bootstrap token must not linger in memory once
+# dropped. Already in Cargo.lock transitively (via `keyring`) — no new download.
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

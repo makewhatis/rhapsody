@@ -1647,6 +1647,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhapsody-credential-ipc"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "rhapsody-httpapi"
 version = "0.1.0"
 dependencies = [
@@ -1792,12 +1803,14 @@ dependencies = [
  "rhapsody-agent",
  "rhapsody-config",
  "rhapsody-core",
+ "rhapsody-credential-ipc",
  "rhapsody-httpapi",
  "rhapsody-mcp",
  "rhapsody-orchestrator",
  "rhapsody-store",
  "rhapsody-telemetry",
  "rhapsody-tracker",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

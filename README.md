@@ -1368,9 +1368,14 @@ silently inherit that mode. It is gated by this key alone, runs through the daem
 path with `manager.model` / `manager.timeout_ms`, and needs no `gh` on the control task: the control
 task decides and hands a plan to the watcher, which performs the turn and the writes off-loop.
 
-**Both halves are bounded, and a failed turn is bounded too.** Author re-dispatches charge the same
-counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
-the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
+**Both halves are bounded, and a failed turn is bounded too.** The threshold bounds ANSWERED
+exchanges: an author re-dispatch RECORDS a pending round (one ROUND each, whatever the reviewer
+count) and charges it only once a reviewer's verdict lands at a head outside the set the dispatch
+stood at — one round per answered amendment, which is what bounds the STUDIO-170 shape at the
+threshold. An unreviewed author loop charges ZERO BY DESIGN, so the writers that can summon an author
+with no review completing — the conflict route-back per still-dirty head, the draft poke under its
+own cap, a human `@symphony` comment — go uncharged. A turn that fails clears its in-flight marker so
+a later sweep re-asks, but only
 `MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
 turn per sweep forever — through the same room post and pull-request comment every other decision
 gets, so a model that cannot answer still reaches the operator. An operator can drop the decision —
@@ -2560,3 +2565,44 @@ speaks HTTP directly. Nothing else moves: `MAX_PR_STATE_CALLS_PER_TICK` and the 
 bound one tick, and STUDIO-953's pre-dispatch head re-read stays unconditional — it goes through
 `pr_state_unconditional`, which sends no `If-None-Match`, because acting on a stale head is the
 failure that re-read exists to prevent.
+
+### An authenticated desktop-to-daemon credential channel (STUDIO-981)
+
+Go v0.4.0 has no provider-credential feature at all, so this whole subsystem is Rhapsody-only. The
+sole open question the design record (`~/.rhapsody/docs/provider-auth-design.md` §P0c) left before a
+production provider-credential owner could be built was whether the separately signed, packaged
+`rhapsodyd` sidecar could read a provider Keychain item the desktop app wrote without an access
+prompt. Measured against real Developer-ID-signed binaries and a disposable test Keychain item
+(`~/.rhapsody/docs/provider-auth-p0c-findings.md`): a trusted-application ACL genuinely excludes
+`/usr/bin/security` and an unsigned same-user helper, but it does **not** exclude a confused-deputy
+process that simply `exec`s the trusted signed binary itself, since the ACL keys on the calling
+process's code identity at call time, not on launch authority — and a coding harness can already
+execute an arbitrary on-disk binary as the same OS user.
+
+- **The desktop app remains the sole Keychain owner for provider credentials.** `rhapsodyd` never
+  reads the OS Keychain for a provider secret: no source file under `crates/` references
+  `security_framework` (any path into that crate, including an aliased `use`) or calls a
+  `SecItem*`/`SecKeychain*`/`keyring::` API, pinned by
+  `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`. That is a property of
+  the source, not of the dependency graph — `cargo tree -p rhapsodyd` contains zero `keyring`
+  entries, but it does transitively pull in `security-framework` (via `native-tls`'s TLS backend for
+  `reqwest`), which exposes un-gated Keychain read/write functions on macOS in both its `passwords`
+  and `os::macos::{keychain,passwords}` modules. Nothing in this workspace calls any of them; the
+  source grep is what actually proves that, not the absent `keyring` crate.
+- **A new shared crate, `crates/credential-ipc`** (`rhapsody-credential-ipc`), holds the wire
+  protocol (length-prefixed JSON framing, a bounded max frame size) and the authentication +
+  strictly-increasing-sequence state machine both sides drive. It is a normal root-workspace member
+  (built with `rhapsodyd`) and ALSO a cross-workspace path dependency of `desktop/src-tauri` — it
+  carries no Tauri dependency, so this does not reintroduce the heavy-dependency coupling the root
+  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid.
+- **A one-shot bootstrap token**, delivered as the ONE frame the desktop writes to the freshly
+  spawned daemon child's piped stdin (then never written to again), authenticates the daemon's
+  connection to a Unix socket the desktop hosts — never HTTP, and the token never appears in argv,
+  an inheritable env var, `runtime.json`, or a log line.
+- **Wiring the socket server into the real supervisor spawn call is intentionally not yet done.**
+  `desktop/src-tauri/src/credential_bootstrap.rs`'s `BootstrapListener` is real and tested against a
+  real `UnixListener`/`UnixStream` pair (and, gated behind `RHAPSODY_CREDENTIAL_BOOTSTRAP_E2E=1`,
+  against the real built `rhapsodyd` binary end to end), but `supervisor::Inner::build_command`
+  itself is untouched — this ticket's job was to prove and specify the ownership mechanism, not
+  finish wiring every call site, and the supervisor's own restart/backoff state machine is heavily
+  tested and deliberately left alone here.
