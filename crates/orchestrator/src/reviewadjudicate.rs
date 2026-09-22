@@ -118,12 +118,17 @@ pub struct ReviewAdjudicationPlan {
     /// escalation, so an operator gets the specific findings rather than "needs a human".
     pub findings: Vec<String>,
     /// Whether a `ship` is AVAILABLE for this plan (STUDIO-977, C): true only when every required
-    /// reviewer has a settled verdict on the change `head` carries, proven by patch-id. Decided on
-    /// the control task from the watch rows ([`crate::automerge::head_read_verdict`]) — a manager
-    /// must not be able to ship a change nobody has read, and making that structural rather than a
-    /// turn-by-turn judgement is the point: when this is false, [`perform_adjudication`] records an
-    /// escalation whatever the model answered.
+    /// reviewer has APPROVED the change `head` carries, proven by patch-id — i.e. when the merge
+    /// gate would clear. Decided on the control task from the watch rows
+    /// ([`crate::automerge::ship_available`]) — a manager must not be able to ship a change nobody
+    /// approved, and making that structural rather than a turn-by-turn judgement is the point: when
+    /// this is false, [`perform_adjudication`] records an escalation whatever the model answered.
     pub ship_available: bool,
+    /// Why `ship` was unavailable, when it was — the specific gate that failed, computed on the
+    /// control task ([`crate::automerge::AutoMergeRefusal::why`]). Empty when `ship_available` is
+    /// true. Carried so the escalation names the real reason ("a review round is still owed at this
+    /// head", "the newest review round asked for changes") rather than a false "nobody read it".
+    pub ship_unavailable_reason: String,
 }
 
 /// What the manager is asked, and the bounds it is asked under. The turn parameters mirror
@@ -222,8 +227,9 @@ impl Adjudication {
     /// stopped only while the branch still is, or is again, that head. A later head carrying new
     /// work is a head the manager never adjudicated: the code the verdict describes no longer
     /// exists on the branch, so the loop must resume. `unchanged_from` is STUDIO-960's proof that a
-    /// head move carried no new work — the diff against the base is byte-identical to the one the
-    /// verdict was made against — and a move that changed nothing does not re-open the decision.
+    /// head move carried no new work — the change against the base is the same (a patch-id
+    /// comparison, STUDIO-977) as the one the verdict was made against — and a move that changed
+    /// nothing does not re-open the decision.
     ///
     /// **The proof must cover the ADJUDICATED head, not merely any head.** `unchanged_from` lists
     /// individual historical reviewed SHAs whose patch matches the new head; it is not a PR-wide
@@ -579,22 +585,27 @@ pub async fn perform_adjudication(
         }
     };
 
-    // STUDIO-977 C, the structural half: `ship` is not available when no reviewer has a settled
-    // verdict on the change at `head`. A manager that answers SHIP over an unread change would stop
-    // the loop on a head nobody has looked at — the deadlock `#209`/`#203` reached — so the answer
-    // is upgraded to an escalation here, where the two audit writes and the ledger cannot disagree
-    // about it. This is deliberately NOT a judgement re-derived inside the prompt each turn.
+    // STUDIO-977 C, the structural half: `ship` is not available when not every required reviewer
+    // has approved the change at `head`. A manager that answers SHIP over a change nobody approved
+    // would stop the loop on a head that cannot merge — the deadlock `#209`/`#203` reached — so the
+    // answer is upgraded to an escalation here, where the two audit writes and the ledger cannot
+    // disagree about it. This is deliberately NOT a judgement re-derived inside the prompt each
+    // turn, and the reason names the gate that actually failed rather than claiming nobody read it.
     let verdict = match verdict {
         Verdict::Ship if !plan.ship_available => {
+            let reason = if plan.ship_unavailable_reason.trim().is_empty() {
+                ship_unavailable_reason(&plan.head)
+            } else {
+                plan.ship_unavailable_reason.clone()
+            };
             tracing::info!(
                 pr = %plan.pr,
                 head = %plan.head,
-                "review adjudication: the manager shipped, but no reviewer has a settled verdict on \
+                reason = %reason,
+                "review adjudication: the manager shipped, but approval-at-head does not hold for \
                  this change; escalating to a human instead"
             );
-            Verdict::Escalate {
-                reason: ship_unavailable_reason(&plan.head),
-            }
+            Verdict::Escalate { reason }
         }
         v => v,
     };
@@ -857,12 +868,13 @@ fn snippet(s: &str) -> String {
     one.chars().take(160).collect()
 }
 
-/// Why a manager's `ship` became an escalation: no reviewer had finished reading the change at
-/// `head`, so there was nothing a ship could stand in for (STUDIO-977, C).
+/// Why a manager's `ship` became an escalation, used only when the plan carried no more specific
+/// reason: approval-at-head does not hold for the change at `head`, so there is nothing a ship could
+/// stand in for (STUDIO-977, C).
 pub fn ship_unavailable_reason(head: &str) -> String {
     format!(
-        "the manager shipped, but no reviewer has a settled verdict on the change at `{}`; a human \
-         must decide",
+        "the manager shipped, but not every required reviewer has approved the change at `{}`; a \
+         human must decide",
         head.trim()
     )
 }
@@ -968,8 +980,8 @@ mod tests {
         assert_eq!(adjudication_model(&teams, "claude"), "");
     }
 
-    /// A plan whose change the reviewers HAVE read (`ship_available`), which is the ordinary case
-    /// this module's tests exercise. The unread case has its own plan and its own test below.
+    /// A plan whose change every required reviewer has APPROVED (`ship_available`), which is the
+    /// ordinary case this module's tests exercise. The unavailable case has its own plan and test.
     fn plan() -> ReviewAdjudicationPlan {
         ReviewAdjudicationPlan {
             pr: PrCoord::new("makewhatis", "rhapsody", 192),
@@ -980,6 +992,7 @@ mod tests {
                 "bob asked for changes at c366a61".to_string(),
             ],
             ship_available: true,
+            ship_unavailable_reason: String::new(),
         }
     }
 
@@ -1557,10 +1570,10 @@ mod tests {
         );
     }
 
-    /// **Acceptance (STUDIO-977, C).** `ship` is NOT available when no reviewer has a settled
-    /// verdict on the change — the model may answer SHIP, but the daemon records an ESCALATE, so a
-    /// stopped loop over an unread head can never masquerade as a decision. The escalation goes
-    /// through the same two audit writes as any other, and names why.
+    /// **Acceptance (STUDIO-977, C).** `ship` is NOT available when approval-at-head does not hold
+    /// for the change — the model may answer SHIP, but the daemon records an ESCALATE, so a stopped
+    /// loop over a change nobody approved can never masquerade as a decision. The escalation goes
+    /// through the same two audit writes as any other, and names the gate that actually failed.
     ///
     /// MUTATION: drop the `ship_available` upgrade and this reds — the ledger holds a `Ship`.
     #[tokio::test]
@@ -1570,6 +1583,10 @@ mod tests {
         let ledger = Arc::new(AdjudicationLedger::default());
         let plan = ReviewAdjudicationPlan {
             ship_available: false,
+            ship_unavailable_reason: "the manager shipped, but not every required reviewer has \
+                                      approved the change at `be260a6` (a review round is still \
+                                      owed at this head); a human must decide"
+                .to_string(),
             ..plan()
         };
         let deps = deps(
@@ -1590,8 +1607,9 @@ mod tests {
             Some(Adjudication::Escalate { head, reason, .. }) => {
                 assert_eq!(head, plan.head);
                 assert!(
-                    reason.contains("no reviewer has a settled verdict"),
-                    "{reason}"
+                    reason.contains("not every required reviewer has approved")
+                        && reason.contains("a review round is still owed"),
+                    "the reason names the gate that failed, not a blanket 'unread': {reason}"
                 );
             }
             other => panic!("expected a settled escalation, got {other:?}"),

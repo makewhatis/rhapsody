@@ -188,28 +188,26 @@ pub(crate) fn auto_merge_verdict_with_proof(
     Ok(approved_by)
 }
 
-/// Whether every LIVE row has a SETTLED verdict — an approval or a findings verdict — on the change
-/// `head` carries, `proven` being the heads whose change matches it (STUDIO-977, C).
+/// Whether a manager's `ship` may be recorded for the change `head` carries — the structural half of
+/// STUDIO-977's rule C.
 ///
-/// This is the question a manager's `ship` availability turns on, and it is deliberately weaker than
-/// [`auto_merge_verdict_with_proof`]: it asks whether a human-equivalent reviewer has READ this
-/// change, not whether every one approved it. A `reviewed` row means somebody read it and said no —
-/// the manager may still adjudicate those findings — while a `requested`, `in_flight` or `truncated`
-/// row means NOBODY has finished reading it, and a `ship` must not stand in for that. This is what
-/// makes "when the head is genuinely unread, the manager escalates" structural rather than a
-/// judgement the model re-derives each turn: with an unread change, `ship` is not available at all.
-pub(crate) fn head_read_verdict(rows: &[&ReviewWatchRow], head: &str, proven: &[&str]) -> bool {
-    let head = head.trim();
-    if head.is_empty() || rows.is_empty() {
-        return false;
-    }
-    let proven: Vec<&str> = proven.iter().map(|p| p.trim()).collect();
-    rows.iter().all(|row| {
-        matches!(
-            row.status.as_str(),
-            REVIEW_STATUS_APPROVED | REVIEW_STATUS_REVIEWED
-        ) && proven.contains(&row.last_reviewed_sha.as_str())
-    })
+/// `ship` and `escalate` must not be the same outcome: a ship is meaningful only when the pull
+/// request can then MERGE, so it is available exactly when the merge gate's approval-at-head passes
+/// for this change. Every required reviewer must have APPROVED it — at `head`, or at a head `proven`
+/// to carry the same change (see [`auto_merge_verdict_with_proof`]). A row still owing a round
+/// (`requested`/`in_flight`/`truncated`) means nobody finished reading the change, and a `reviewed`
+/// row means a reviewer said no; in either case the manager must escalate, not ship. This is what
+/// makes "a ship over an unread head is not available" a structural fact rather than a judgement the
+/// model re-derives every turn.
+///
+/// Criterion 5's deliberate reversal of STUDIO-956 lives here: 956 said a ship must not satisfy
+/// approval-at-head at all; this says it may, but only for a patch the required reviewers approved.
+pub(crate) fn ship_available(
+    rows: &[&ReviewWatchRow],
+    head: &str,
+    proven: &[&str],
+) -> Result<(), AutoMergeRefusal> {
+    auto_merge_verdict_with_proof(rows, head, proven).map(|_| ())
 }
 
 #[cfg(test)]
@@ -456,34 +454,53 @@ mod tests {
         }
     }
 
-    /// **`ship` availability (C).** A change is READ when every row carries a settled verdict at a
-    /// head proven to carry it — an approval OR a findings verdict. An unread change (a `requested`,
-    /// `in_flight` or `truncated` row, or no rows at all) is not.
+    /// **`ship` availability (C).** A `ship` is available exactly when the merge gate would clear:
+    /// every required reviewer APPROVED the change `head` carries, at `head` or at a head proven to
+    /// carry the same change. A row still owing a round, or a `reviewed` verdict (a reviewer said
+    /// no), or no rows at all, makes it unavailable — the manager must escalate instead.
+    ///
+    /// MUTATION: accept a `REVIEW_STATUS_REVIEWED` row as "read enough to ship" and the `reviewed`
+    /// assertion reds; return `true` unconditionally and the requested/empty assertions red.
     #[test]
-    fn a_change_is_read_only_when_every_row_has_a_settled_verdict_on_it() {
+    fn a_ship_is_available_only_for_an_approved_change() {
         let approved = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
         let a: Vec<&ReviewWatchRow> = approved.iter().collect();
-        assert!(head_read_verdict(&a, HEAD, &[HEAD, OLD]));
+        assert_eq!(ship_available(&a, HEAD, &[HEAD, OLD]), Ok(()));
 
-        let requested = [
-            row("alice", REVIEW_STATUS_APPROVED, OLD),
-            row("bob", REVIEW_STATUS_REQUESTED, HEAD),
+        // A findings verdict is NOT a ship: a reviewer said no, and a ship must not override that.
+        let with_findings = [
+            row("alice", REVIEW_STATUS_APPROVED, HEAD),
+            row("bob", REVIEW_STATUS_REVIEWED, HEAD),
         ];
-        let r: Vec<&ReviewWatchRow> = requested.iter().collect();
-        assert!(
-            !head_read_verdict(&r, HEAD, &[HEAD, OLD]),
-            "a row nobody has finished reading means the change is not read"
+        let wf: Vec<&ReviewWatchRow> = with_findings.iter().collect();
+        assert_eq!(
+            ship_available(&wf, HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::ChangesRequested),
+            "a reviewer who asked for changes means the manager escalates, not ships"
         );
 
-        let changed = [row("alice", REVIEW_STATUS_REVIEWED, HEAD)];
-        let c: Vec<&ReviewWatchRow> = changed.iter().collect();
-        assert!(
-            head_read_verdict(&c, HEAD, &[HEAD]),
-            "a findings verdict is still a verdict: the change was read"
-        );
+        for status in [
+            REVIEW_STATUS_REQUESTED,
+            REVIEW_STATUS_IN_FLIGHT,
+            REVIEW_STATUS_TRUNCATED,
+        ] {
+            let rows = [row("alice", status, HEAD)];
+            let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+            assert_eq!(
+                ship_available(&refs, HEAD, &[HEAD]),
+                Err(AutoMergeRefusal::RoundInFlight),
+                "({status}) an unread change cannot be shipped"
+            );
+        }
 
         // A verdict at a head nobody proved the same is not a verdict about THIS change.
-        assert!(!head_read_verdict(&a, HEAD, &[HEAD]));
-        assert!(!head_read_verdict(&[], HEAD, &[HEAD]));
+        assert_eq!(
+            ship_available(&a, HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::StaleVerdict)
+        );
+        assert_eq!(
+            ship_available(&[], HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::NoVerdict)
+        );
     }
 }

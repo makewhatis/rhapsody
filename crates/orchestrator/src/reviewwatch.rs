@@ -103,8 +103,10 @@
 //! approval, a rejection stays a rejection, and neither round is re-earned. When the change itself
 //! differs (a resolved conflict is the canonical case), the comparison proves nothing,
 //! `unchanged_from` is empty, and a normal round is armed exactly as before. STUDIO-977 widened the
-//! predicate from STUDIO-960's byte comparison to this patch-id: the maintainer's `#209` and `#213`
-//! were both approved patches killed by a merge from `main` that a byte comparison called a change.
+//! predicate from STUDIO-960's byte comparison to this patch-id: `makewhatis/rhapsody#213` is the
+//! live case (approved at `e2c52c1`, merged `main` to `d17d0b7`, byte-different compare, identical
+//! patch-id), while `#209`'s two compares were byte-equal and were killed by the separate STUDIO-838
+//! handoff re-arm rather than here.
 //! A comparison that failed, timed out or could not read a file in full also proves nothing: the one
 //! direction this must never fail is toward silently skipping a review.
 //!
@@ -2164,6 +2166,22 @@ impl Orchestrator {
                 }
                 let rounds = self.rounds_used(pr);
                 let findings = self.open_findings(&mine, head);
+                // STUDIO-977 C: `ship` is available only when every required reviewer has APPROVED
+                // the change `head` carries — at `head`, or at a head the watcher proved
+                // patch-identical. Any reviewer still owing a round, or a `reviewed` verdict (a
+                // reviewer said no), makes it unavailable, so the manager's answer is recorded as an
+                // escalation instead of stopping the loop over a head nobody has approved. The
+                // refusal is captured here, on the control task, so the escalation can say which
+                // gate failed rather than the false "nobody read it".
+                let ship = crate::automerge::ship_available(&mine, head, &proven);
+                let ship_unavailable_reason = match ship {
+                    Ok(()) => String::new(),
+                    Err(refusal) => format!(
+                        "the manager shipped, but not every required reviewer has approved the \
+                         change at `{head}` ({}); a human must decide",
+                        refusal.why()
+                    ),
+                };
                 // A turn that has failed its bounded attempts ESCALATES rather than being re-asked,
                 // but that escalation is recorded where its two audit writes happen — off the
                 // control task, in `reviewadjudicate::perform_adjudication`. The settled entry it
@@ -2175,12 +2193,8 @@ impl Orchestrator {
                     head: head.to_string(),
                     rounds,
                     findings,
-                    // STUDIO-977 C: `ship` is available only when every required reviewer has a
-                    // settled verdict on the change `head` carries — an approval or a findings
-                    // verdict, at `head` or at a head the watcher proved patch-identical. An
-                    // unread change makes a `ship` unavailable, so the manager's answer is recorded
-                    // as an escalation instead of stopping the loop over a head nobody has read.
-                    ship_available: crate::automerge::head_read_verdict(&mine, head, &proven),
+                    ship_available: ship.is_ok(),
+                    ship_unavailable_reason,
                 };
                 if let Some(ledger) = self.adjudication_ledger.as_ref() {
                     // A decision recorded at a head this one has moved past no longer governs: it
@@ -4018,16 +4032,22 @@ mod tests {
 
     // --- STUDIO-977: a merge from the base branch is the same change ---------------------------
 
-    /// **Acceptance, named after the maintainer's `#209`.** The merge from `main` is the case
-    /// STUDIO-960's byte comparison missed: the change under review is identical, but the base
-    /// moved, so the hunk line numbers and the `index` blob hashes moved with it and the diff TEXT
-    /// differs. Only a patch-id comparison — never a byte comparison — proves them the same.
+    /// **Acceptance.** A merge from the base branch is the case STUDIO-960's byte comparison missed
+    /// for `#213`: the change under review is identical, but the base moved, so the hunk line ranges
+    /// moved with it and the diff TEXT differs. Only a patch-id comparison — never a byte
+    /// comparison — proves them the same.
+    ///
+    /// Both fixtures are the REAL shape GitHub's compare sends (`files[].patch` has no `index` line,
+    /// it starts at `@@`), checked against `compare/main...d17d0b7`: `#213`'s two compares are
+    /// byte-different. Note `#209`, the incident the ticket names first, was verified byte-EQUAL in
+    /// the daemon's own watcher data — the byte comparison already carried it, and its real killer
+    /// was the deliberate STUDIO-838 handoff re-arm (a re-introduced row is reset to `requested`),
+    /// which is a different mechanism and not touched here. See the `#209` test below.
     ///
     /// MUTATION: compare the diffs byte-for-byte in `unchanged_reviewed_shas` (revert to
-    /// `patch == head_patch`) and this reds — `unchanged_from` is empty. Narrow the predicate back
-    /// to STUDIO-960's `unchanged_from` alone and the orchestration test below reds.
+    /// `patch == head_patch`) and this reds — `unchanged_from` is empty.
     #[tokio::test]
-    async fn pr_209_a_merge_from_main_is_the_same_change_by_patch_id() {
+    async fn a_base_merge_that_rewrites_the_hunk_ranges_is_the_same_change_by_patch_id() {
         let signal = CancelSignal::new();
         for source in [
             FakeDiffSource::merged_from_base(),
@@ -4060,15 +4080,16 @@ mod tests {
         }
     }
 
-    /// **Acceptance (A and B together), reproducing `#209` end to end.** Approved at the old head,
-    /// the author merges `main`, and the patch is identical. The approval carries to the new head,
-    /// the head move charges NO round against the durable budget, and with auto-merge on the pull
-    /// request clears every gate on the following sweep with no further review.
+    /// **Acceptance (A and B together), reproducing `#213` end to end.** Approved at the old head,
+    /// the author merges `main`, and the change is identical by patch-id while the diff text is not.
+    /// The approval carries to the new head, the head move charges NO round against the durable
+    /// budget, and with auto-merge on the pull request clears every gate on the following sweep with
+    /// no further review.
     ///
     /// MUTATION: charge a round for the patch-preserving move and the budget assertion reds; fail to
     /// carry the verdict and the row/merge assertions red.
     #[tokio::test]
-    async fn pr_209_an_approved_patch_merges_after_a_merge_from_main() {
+    async fn pr_213_an_approved_patch_merges_after_a_merge_from_main() {
         let mut teams = ticketless(&["alice", "bob"]);
         teams.review.auto_merge = true;
         let (mut o, dispatched) = orch(teams);
@@ -4080,7 +4101,7 @@ mod tests {
         let signal = CancelSignal::new();
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
-            &FakeDiffSource::merged_from_base(),
+            &FakeDiffSource::merged_from_base_213(),
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -4121,6 +4142,50 @@ mod tests {
             }],
             "an approved patch must merge after a merge from main, with no further round"
         );
+    }
+
+    /// **`#209`'s data, reproduced exactly and shown to merge.** Verified against the daemon's own
+    /// compare data (`compare/main...1050386` and `compare/main...19fc650` are byte-EQUAL, as alice's
+    /// review of PR #219 established), so STUDIO-960's predicate already carried this pair — this
+    /// test pins that the end-to-end outcome the ticket asks for (carry, no round, merge) holds. The
+    /// handoff re-arm that actually killed `#209` is STUDIO-838's deliberate behaviour and is out of
+    /// scope here; see the PR body's follow-up note.
+    #[tokio::test]
+    async fn pr_209_is_byte_equal_and_merges_after_a_merge_from_main() {
+        let mut teams = ticketless(&["alice", "bob"]);
+        teams.review.auto_merge = true;
+        let (mut o, _dispatched) = orch(teams);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        let charged = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), charged);
+
+        let source = FakeDiffSource::merged_from_base_209();
+        assert_eq!(
+            source.old_patch.as_ref().expect("fixture"),
+            source.head_patch.as_ref().expect("fixture"),
+            "the premise, verified from the daemon log: #209's two compares are byte-equal"
+        );
+
+        let signal = CancelSignal::new();
+        let proven = unchanged_reviewed_shas(
+            &signal.wait(),
+            &source,
+            &coord(12),
+            HEAD_B,
+            &[HEAD_A.to_string()],
+        )
+        .await;
+        assert_eq!(proven, vec![HEAD_A.to_string()]);
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))).copied(),
+            Some(charged),
+            "no round is charged for a byte-identical head move either"
+        );
+        let merged = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(merged.merge.len(), 1, "#209's approved patch merges");
     }
 
     /// The skip is confined to a row that COMPLETED a round. A `truncated` row read the head only
@@ -7349,7 +7414,9 @@ mod tests {
 
     /// **A settled `ship` still cannot merge through a CONFLICT (STUDIO-977 C, criterion 6).** The
     /// proof widens only approval-at-head; the merge gates that answer "is this broken" — a conflict
-    /// here, CI and draft off-loop — remain absolute.
+    /// here, CI and draft off-loop — remain absolute. The head is moved to `HEAD_B` with the proof
+    /// set, so the test takes the ONE path the relaxation actually touches rather than the exact-head
+    /// path that would pass on `main` unchanged.
     #[test]
     fn a_settled_ship_does_not_merge_a_conflicted_pull_request() {
         let mut teams = adjudicating(&["alice", "bob"], 3);
@@ -7365,12 +7432,16 @@ mod tests {
             },
         );
 
-        let mut snap = match open_at(12, HEAD_A).lookup {
+        // The head moved to HEAD_B by a base merge (so the ship governs via `unchanged_from`), the
+        // change is proven identical, and the merge state is a CONFLICT.
+        let proven = vec![HEAD_A.to_string()];
+        let mut obs = open_at_proven(12, HEAD_B, &proven);
+        let snapshot = match &mut obs.lookup {
             PrLookup::Found(s) => s,
             _ => unreachable!(),
         };
-        snap.merge_state = crate::ghsummons::MERGE_STATE_DIRTY.to_string();
-        let report = o.handle_review_sweep(&[observed(12, PrLookup::Found(snap))]);
+        snapshot.merge_state = crate::ghsummons::MERGE_STATE_DIRTY.to_string();
+        let report = o.handle_review_sweep(&[obs]);
 
         assert!(
             report.merge.is_empty(),
@@ -7813,6 +7884,59 @@ mod tests {
         assert_eq!(
             plan.findings,
             vec![format!("bob asked for changes at {}", &HEAD_A[..7])]
+        );
+    }
+
+    /// **Alice's round-1 blocker (STUDIO-977, A2): pin what the SWEEP computes, not a hand-built
+    /// plan.** An adjudication plan built from rows that do not all approve the observed change gets
+    /// `ship_available == false` and a reason naming the failed gate; one where every required
+    /// reviewer approved the change — here at `HEAD_A`, proven identical to `HEAD_B` — gets `true`.
+    ///
+    /// MUTATION: hard-code `ship_available: true` and the first half reds; drop the proof
+    /// (`&[head]` instead of `&proven`) and the second reds, because the `HEAD_A` approval stops
+    /// counting.
+    #[test]
+    fn the_sweep_computes_ship_availability_from_the_rows() {
+        // (1) A reviewer still owes a round at HEAD_B: nothing approved the observed change.
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_B)
+            .expect("requested");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(report.adjudicate.len(), 1, "the manager is asked");
+        assert!(
+            !report.adjudicate[0].ship_available,
+            "an unapproved change must not be shippable"
+        );
+        assert!(
+            report.adjudicate[0]
+                .ship_unavailable_reason
+                .contains("a review round is still owed"),
+            "the reason names the gate that failed: {}",
+            report.adjudicate[0].ship_unavailable_reason
+        );
+
+        // (2) Every required reviewer approved the change — at HEAD_A, proven identical to HEAD_B.
+        let (mut o2, _d2) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l2 = ledger(&mut o2);
+        introduce(&o2, approved_row(12, "bob", HEAD_A));
+        o2.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o2.reviewers_per_round());
+
+        let report2 = o2.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+        assert_eq!(report2.adjudicate.len(), 1, "the manager is asked");
+        assert!(
+            report2.adjudicate[0].ship_available,
+            "an approval at a patch-id-proven head is an approval of this change"
+        );
+        assert!(
+            report2.adjudicate[0].ship_unavailable_reason.is_empty(),
+            "and there is no failure to explain"
         );
     }
 
@@ -9606,38 +9730,46 @@ mod tests {
                 old_patch: Ok("diff".to_string()),
             }
         }
-        /// **The reported incident (STUDIO-977).** A merge from the base branch: the change under
-        /// review is identical, but the base moved, so every hunk's line numbers and every file's
-        /// `index` blob hashes moved with it. The two fingerprints are NOT byte-equal — a byte
-        /// comparison calls this a change — while `git patch-id --stable` (and
-        /// [`crate::ghsummons::same_change`]) calls them the same.
+        /// **The reported shape (STUDIO-977).** A merge from the base branch: the change under
+        /// review is identical, but the base moved, so the hunk line ranges moved with it. The two
+        /// fingerprints are NOT byte-equal — a byte comparison calls this a change — while
+        /// [`crate::ghsummons::same_change`] calls them the same. GitHub's compare `patch` has no
+        /// `index` line; it starts at `@@`, so the fixture matches the real data.
         fn merged_from_base() -> FakeDiffSource {
             FakeDiffSource {
                 base: Ok("main".to_string()),
                 head_patch: Ok(
-                    "src/lib.rs\u{0}modified\u{0}index 1212783..bbb2222 100644\n\
-                                @@ -42,7 +42,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
+                    "src/lib.rs\u{0}modified\u{0}@@ -42,7 +42,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
                         .to_string(),
                 ),
                 old_patch: Ok(
-                    "src/lib.rs\u{0}modified\u{0}index 47ae5b0..aaa1111 100644\n\
-                               @@ -10,7 +10,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
+                    "src/lib.rs\u{0}modified\u{0}@@ -10,7 +10,7 @@ fn foo() {\n ctx\n-removed\n+added\n ctx\n\u{0}"
                         .to_string(),
                 ),
             }
         }
-        /// **The second live incident (STUDIO-977).** `makewhatis/rhapsody#213`: approved at
-        /// `e2c52c1`, merged `main` to `d17d0b7`, patch-id `2b6d540f…` both sides. A different
-        /// file, a different hunk — the predicate must not be a single hard-coded shape.
+        /// **The live incident that proves the widening is needed (STUDIO-977).**
+        /// `makewhatis/rhapsody#213`: approved at `e2c52c1`, merged `main` to `d17d0b7`. Verified
+        /// against `compare/main...e2c52c1` and `compare/main...d17d0b7`: byte-different, same
+        /// patch-id. A different file, a different hunk — the predicate must not be one shape.
         fn merged_from_base_213() -> FakeDiffSource {
             FakeDiffSource {
                 base: Ok("main".to_string()),
-                head_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}index 9f0a1c2..d4e5f6a 100644\n\
-                                @@ -300,6 +300,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
+                head_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}@@ -300,6 +300,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
                     .to_string()),
-                old_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}index 1122334..d4e5f6a 100644\n\
-                               @@ -120,6 +120,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
+                old_patch: Ok("crates/agent/src/ipc.rs\u{0}modified\u{0}@@ -120,6 +120,7 @@ pub fn select_keychain() {\n let x = 1;\n+let y = 2;\n let z = 3;\n\u{0}"
                     .to_string()),
+            }
+        }
+        /// **`#209`'s data, byte-EQUAL.** `1050386` → `19fc650`, verified from the daemon's own
+        /// compare data: identical fingerprints, so STUDIO-960's byte comparison already carried it.
+        /// Kept so the ticket's first incident is reproduced (and merges), not misattributed.
+        fn merged_from_base_209() -> FakeDiffSource {
+            let patch = "src/lib.rs\u{0}modified\u{0}@@ -42,7 +42,7 @@ fn foo() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Ok(patch.to_string()),
+                old_patch: Ok(patch.to_string()),
             }
         }
         fn old_fails() -> FakeDiffSource {

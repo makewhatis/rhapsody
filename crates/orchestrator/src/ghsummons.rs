@@ -1043,52 +1043,78 @@ pub type ReviewDiffResult = Result<String, Box<dyn std::error::Error + Send + Sy
 /// whose failure mode is a review that never happens.
 pub const MAX_COMPARE_FILES: usize = 300;
 
-/// The normalization `git patch-id --stable` applies to a unified diff, so that two patches which
-/// introduce the SAME change against DIFFERENT bases compare equal (STUDIO-977).
+/// A strict patch-id: the normalization that lets two patches introducing the SAME change against
+/// DIFFERENT bases compare equal (STUDIO-977).
 ///
-/// A head move that folds the base branch into the branch rewrites the `@@ -a,b +c,d @@` line
-/// numbers of every hunk — and the blob hashes on the `index` line — without changing a single line
-/// the branch itself adds or removes. Comparing the raw diff text therefore calls such a move a
-/// CHANGE even though the change under review is byte-identical, which is exactly the incident this
-/// ticket was filed on: two reviewers approved `1050386`, the author merged `main` to clear
-/// `BEHIND`, and the approval was discarded at `19fc650` over a diff that differs only in a
-/// blob-hash line.
+/// A head move that folds the base branch into the branch rewrites the `@@ -a,b +c,d @@` ranges of
+/// every hunk without changing a single line the branch itself adds or removes. Comparing the raw
+/// diff text therefore calls such a move a CHANGE even though the change under review is the same —
+/// `makewhatis/rhapsody#213` is the live case: approved at `e2c52c1`, the author merged `main` to
+/// `d17d0b7`, and the two GitHub compares are byte-different while `git patch-id --stable` returns
+/// the same id for both. (`#209`, the other incident the ticket names, was in fact byte-equal — its
+/// approval was killed not here but by the deliberate STUDIO-838 handoff re-arm, which resets a
+/// re-introduced row to `requested`; this function changes none of that.)
 ///
-/// This is that instrument, in pure text over the same compare data the watcher already reads —
-/// [`merge_base_patch`]'s fingerprint, whose parts are separated by `\0` and `\n`. It keeps the file
-/// identity and status, keeps every `+`/`-`/context line and any hunk section heading verbatim, and
-/// drops only the two things `git patch-id` drops: an `index <blob>..<blob>` line and the line
-/// numbers/ranges inside a `@@ … @@` header. `--stable`'s other property — independence of file
-/// ORDER — is already guaranteed by [`merge_base_patch`] sorting its entries.
+/// The input is [`merge_base_patch`]'s fingerprint: a flat NUL-separated field list,
+/// `filename \0 status \0 patch \0` per file. This splits on `\0` only and normalizes ONLY the patch
+/// field, so a filename or status can never be mistaken for diff text. Within the patch it drops the
+/// two things `git patch-id` drops: an `index <blob>..<blob>` line and the ranges inside a
+/// `@@ … @@` header, keeping the heading. `--stable`'s independence from file ORDER is already
+/// [`merge_base_patch`]'s sort.
+///
+/// **Stricter than `git patch-id --stable` in one direction, deliberately:** git also ignores ALL
+/// whitespace; this keeps it. Two patches differing only in whitespace therefore compare UNEQUAL
+/// here but equal under git. That is the safe direction for an approval carry — a whitespace-only
+/// change to a YAML block or a string literal is a real change, and silently carrying a verdict over
+/// it is the failure this feature exists to avoid. The PR body records this as a known divergence.
 ///
 /// Deliberately not `git patch-id` itself: the watcher holds no checkout and must not, and shelling
 /// `git` per comparison would need a mirror of a repository the daemon may not have and a second
 /// process per poll. The comparison here is over data already fetched.
 pub fn stable_patch_id(fingerprint: &str) -> String {
     let mut out = String::with_capacity(fingerprint.len());
-    // Both `\0` (the per-file separators) and `\n` (the diff's own lines) start a segment, so a
-    // hunk header is normalized whether it follows a status field or the previous hunk.
-    for segment in fingerprint.split(['\n', '\0']) {
-        if segment.starts_with("index ") {
+    // `merge_base_patch` emits exactly three NUL-separated fields per file and a trailing NUL, so
+    // the flat list is `[filename, status, patch, filename, status, patch, ""]`. No field may
+    // contain a `\0` (a GitHub filename, status and unified diff are all NUL-free) and only the
+    // patch may contain a `\n`, so splitting on `\0` alone preserves every boundary — a filename
+    // such as `index old`, which git permits, is emitted verbatim rather than read as diff text.
+    // Only the third field of each triple is a patch; every other field is emitted verbatim,
+    // including any trailing partial field of a malformed input.
+    for (i, field) in fingerprint.split('\0').enumerate() {
+        if i % 3 == 2 {
+            write_normalized_patch(&mut out, field);
+        } else {
+            out.push_str(field);
+        }
+        out.push('\0');
+    }
+    out
+}
+
+/// Normalize one file's patch: drop an `index <blob>..<blob>` metadata line and the line ranges of
+/// every `@@ … @@` header, keeping the hunk section heading. Appends to `out`; see
+/// [`stable_patch_id`]. Only ever called on a patch FIELD, never on a filename or status.
+fn write_normalized_patch(out: &mut String, patch: &str) {
+    for line in patch.split('\n') {
+        if line.starts_with("index ") {
             continue;
         }
-        if let Some(rest) = segment.strip_prefix("@@") {
+        if let Some(rest) = line.strip_prefix("@@") {
             // `@@ -a,b +c,d @@ optional heading`: keep only the heading, which is the part a change
             // to the hunk's meaning would move, and never the ranges a base move rewrites.
             let heading = rest.split_once("@@").map(|(_, t)| t).unwrap_or("");
             out.push_str("@@");
             out.push_str(heading);
         } else {
-            out.push_str(segment);
+            out.push_str(line);
         }
         out.push('\n');
     }
-    out
 }
 
 /// Whether two [`merge_base_patch`] fingerprints describe the SAME change under review — a
 /// patch-id comparison, never a byte comparison (STUDIO-977). See [`stable_patch_id`] for why the
-/// distinction is load-bearing: the raw texts differ on every base-preserving merge.
+/// distinction is load-bearing: the raw texts can differ on a base-preserving merge (`#213` does).
 pub fn same_change(a: &str, b: &str) -> bool {
     stable_patch_id(a) == stable_patch_id(b)
 }
@@ -4276,25 +4302,37 @@ mod tests {
     }
 
     /// **STUDIO-977.** The patch-id normalization drops exactly what `git patch-id --stable`
-    /// drops — the `index` blob line and the hunk line numbers — and nothing else. Two fingerprints
+    /// drops — the `index` blob line and the hunk line ranges — and nothing else. Two fingerprints
     /// that differ only in those compare equal; a changed line does not, and neither does an extra
     /// file, because the file identity is kept.
     ///
-    /// MUTATION: make `stable_patch_id` the identity function and the second assertion reds.
+    /// MUTATION: make `stable_patch_id` the identity function and the `same_change(old, head)`
+    /// assertion reds.
     #[test]
     fn a_base_merge_is_the_same_patch_id_but_a_real_change_is_not() {
-        let old = "f.rs\u{0}modified\u{0}index 47ae5b0..aaa1111 100644\n\
-                   @@ -10,7 +10,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
-        let head = "f.rs\u{0}modified\u{0}index 1212783..bbb2222 100644\n\
-                    @@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
-        let changed = "f.rs\u{0}modified\u{0}index 9999999..ccc3333 100644\n\
-                       @@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+DIFFERENT\n ctx\n\u{0}";
+        // The REAL shape GitHub's compare sends: `files[].patch` has no `index` line, it starts at
+        // `@@` (checked against `compare/main...d17d0b7`). The base move rewrites the ranges.
+        let old =
+            "src/lib.rs\u{0}modified\u{0}@@ -10,7 +10,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        let head =
+            "src/lib.rs\u{0}modified\u{0}@@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        // A raw `git diff` shape too, so the `index` drop (correct patch-id semantics, though
+        // production-dead because GitHub never sends the line) stays pinned.
+        let git_old = "f.rs\u{0}modified\u{0}index 47ae5b0..aaa1111 100644\n\
+                       @@ -10,7 +10,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        let git_head = "f.rs\u{0}modified\u{0}index 1212783..bbb2222 100644\n\
+                        @@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+new\n ctx\n\u{0}";
+        let changed = "src/lib.rs\u{0}modified\u{0}@@ -42,7 +42,7 @@ fn f() {\n ctx\n-old\n+DIFFERENT\n ctx\n\u{0}";
         let extra = format!("{head}g.rs\u{0}added\u{0}@@ -0,0 +1 @@\n+x\n\u{0}");
 
-        assert_ne!(old, head, "the premise: a base move rewrites the text");
+        assert_ne!(old, head, "the premise: a base move rewrites the ranges");
         assert!(
             same_change(old, head),
             "the same change against a moved base is the same patch-id"
+        );
+        assert!(
+            same_change(git_old, git_head),
+            "the index blob line is ignored, and only inside a patch"
         );
         assert!(
             !same_change(old, changed),
@@ -4304,5 +4342,31 @@ mod tests {
             !same_change(old, &extra),
             "a different file set is a different patch-id"
         );
+    }
+
+    /// **Sol's round-1 blocker (STUDIO-977).** The fingerprint is a NUL-separated field list, and
+    /// only the PATCH field may be normalized. Splitting filenames, statuses and patch lines into
+    /// one stream let a filename or status beginning `index ` be dropped as if it were a blob line,
+    /// so two changes targeting DIFFERENT files could compare equal and carry an approval onto
+    /// changed work. Git permits a filename such as `index old`.
+    ///
+    /// MUTATION: split the whole fingerprint on `['\n', '\0']` and drop `index `-prefixed segments
+    /// (the round-1 shape) and this reds.
+    #[test]
+    fn distinct_index_prefixed_filenames_never_compare_equal() {
+        let a = "index old\u{0}modified\u{0}@@ -1 +1 @@\n-a\n+b\n\u{0}";
+        let b = "index new\u{0}modified\u{0}@@ -1 +1 @@\n-a\n+b\n\u{0}";
+        assert!(
+            !same_change(a, b),
+            "a filename beginning `index ` is file identity, not a blob line"
+        );
+        // A newline in a filename must keep its own boundary too.
+        let nl = "weird\nname.rs\u{0}modified\u{0}@@ -1 +1 @@\n-a\n+b\n\u{0}";
+        let other = "weird\u{0}name.rs\u{0}@@ -1 +1 @@\n-a\n+b\n\u{0}";
+        assert!(
+            !same_change(nl, other),
+            "a filename with a newline cannot be re-split into fields"
+        );
+        assert!(same_change(a, a), "and identical fingerprints still match");
     }
 }
