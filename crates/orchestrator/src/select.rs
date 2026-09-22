@@ -23,6 +23,7 @@ use rhapsody_core::{Issue, normalize_state};
 use crate::concurrency::{global_slots, state_limit};
 use crate::dispatch::{EligibilityGate, dispatch_cmp, eligibility};
 use crate::orchestrator::Orchestrator;
+use crate::retry::DispatchRoute;
 
 /// Pairs a candidate with the INDEX of the project it was polled from (into the effective's
 /// `projects`), so routing, slot accounting, and eligibility use the issue's owning project's
@@ -317,6 +318,17 @@ impl Orchestrator {
                     "skipping dispatch: teammate at max_concurrent"
                 );
                 *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
+            }
+            // STUDIO-988: a candidate the refusal gate is suppressing is NOT admitted — skipping it
+            // here, before the slot is spent, lets the next eligible candidate take the slot.
+            // Checking only in `begin_preparation` (after this pass) let one refused ticket hold a
+            // slot and starve the queue behind it.
+            if self.preparation_suppressed(&iss, None) {
+                tracing::debug!(
+                    issue_identifier = %iss.identifier,
+                    "skipping dispatch: suppressed by the refusal gate until its next probe"
+                );
                 continue;
             }
             if count(&state_counts, &st)
@@ -656,6 +668,22 @@ impl Orchestrator {
                     "skipping dispatch: teammate at max_concurrent"
                 );
                 *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
+            }
+            // STUDIO-988: a gate-suppressed candidate is skipped BEFORE any slot is spent, so the
+            // next eligible candidate takes it — see the single-project ladder above.
+            let suppression_route = DispatchRoute {
+                slug: p.slug.clone(),
+                group: p.group.clone(),
+                repo: p.repo.clone(),
+                model: p.model.clone(),
+                workspace_mode: p.workspace_mode.clone(),
+            };
+            if self.preparation_suppressed(&ti.iss, Some(&suppression_route)) {
+                tracing::debug!(
+                    issue_identifier = %ti.iss.identifier,
+                    "skipping dispatch: suppressed by the refusal gate until its next probe"
+                );
                 continue;
             }
             if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {

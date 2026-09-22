@@ -1150,6 +1150,22 @@ impl Orchestrator {
         // confirmed.
         for obs in observed {
             self.review_watch_unreadable.remove(&obs.pr);
+            // STUDIO-988: remember the last observed head/open state so a REVIEW preparation
+            // completion can be revalidated before it reviews a commit the sweep has since seen
+            // move (or a pull request it has since seen close).
+            self.review_observed_heads.insert(
+                obs.pr.to_string(),
+                match &obs.lookup {
+                    PrLookup::Found(snap) => crate::prepare::ReviewHeadObservation {
+                        open: snap.status == PrStatus::Open,
+                        head: snap.head_sha.clone(),
+                    },
+                    PrLookup::Gone | PrLookup::Untrusted => crate::prepare::ReviewHeadObservation {
+                        open: false,
+                        head: String::new(),
+                    },
+                },
+            );
         }
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,

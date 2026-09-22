@@ -923,6 +923,15 @@ pub struct Orchestrator {
     /// The bounded refusal gate: suppresses the identical `(identity, selection, credential
     /// revision)` refusal until an input changes or its next-probe time arrives.
     pub(crate) refusal_gate: crate::prepare::RefusalGate,
+    /// The last observed pull-request head/open state per `owner/repo#n` coordinate, written by the
+    /// review sweep and read when a review preparation completes (STUDIO-988). Control-task-confined,
+    /// like every scheduling map here; empty unless the ticketless review watcher runs.
+    pub(crate) review_observed_heads: HashMap<String, crate::prepare::ReviewHeadObservation>,
+    /// A reopening ticket's captured summons, held from `promote_and_dispatch` until
+    /// `dispatch_issue` makes the run live and seeds it (STUDIO-988). Needed because the run does not
+    /// exist until an asynchronous preparation is accepted, which can be several events later. Empty
+    /// on every non-reopen dispatch.
+    pub(crate) pending_reopen_summons: HashMap<String, (DateTime<Utc>, String)>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -1062,6 +1071,8 @@ impl Orchestrator {
                 crate::prepare::MAX_PREPARATION_CONCURRENCY,
             )),
             refusal_gate: crate::prepare::RefusalGate::default(),
+            review_observed_heads: HashMap::new(),
+            pending_reopen_summons: HashMap::new(),
         }
     }
 

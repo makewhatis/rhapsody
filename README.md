@@ -1639,26 +1639,38 @@ is injected.
 
 When it engages, the control task inserts a loop-owned `preparing` reservation (keyed by ticket or
 review identity) before spawning resolver work, so a preparation counts against every duplicate and
-concurrency gate exactly as a live run does. The resolver reports back over the control channel; a
-completion is accepted only for the current token **and** config generation, after re-checking drain
-and eligibility, and a stale completion drops its move-only payload without touching loop state.
-Cancellation (Stop/reload/shutdown/a departed issue) releases a reservation exactly once, and the
-concurrency permit for a resolver task is held by that task for its whole lifetime even after the
-loop-side timeout, so retries cannot accumulate unbounded resolver work.
+concurrency gate exactly as a live run does — and the selection ladder skips a gate-suppressed
+candidate *before* spending a slot, so one refused ticket cannot starve the queue behind it. The
+resolver reports back over the control channel; a completion is accepted only for the current token
+**and** config generation, after re-checking drain and revalidating the CURRENT board — the ticket's
+tracker state, labels, existence and selection fingerprint, or the review's last observed head/open
+state — so a state flap, a label change, a disappearance or a dismissed review cannot launch stale
+work. A stale completion drops its move-only payload without touching loop state. A cancellation
+(reload/shutdown/a departed issue) re-parks a claim-held reservation exactly once, and the
+concurrency permit is owned by the resolver's own blocking work until it really exits — the loop
+hands the permit to the resolver rather than holding it, so a loop-side timeout that drops the
+`prepare` future cannot release a permit whose Keychain/IPC closure is still running and pile up
+unbounded resolver work. (Stop is not a cancellation path here: it is addressed by a live run id and
+a preparation has no run.)
 
 A typed preparation failure is a **refusal**, not a failed agent attempt: it writes exactly one
 zero-turn run row with the new Rhapsody-only outcome `refused` (distinct from `failed` and from
-queued work; the console renders it `blocked`, like a token-ceiling stop) and arms a bounded refusal
-gate. The gate is keyed by `(identity, selection fingerprint)` and REMEMBERS the opaque credential
-revision observed at the refusal: the pre-spawn check suppresses without knowing a revision a
-resolver has yet to observe, and a revision change is a fresh episode (base backoff, a new history
-row). It re-probes on a bounded backoff or immediately when an input changes — a workflow reload, an
-explicit `POST /api/v1/refresh`, or a credential mutation — and repeating an identical refusal at the
-same revision advances the backoff without appending a second history row. No claim, workspace,
-mailbox, or review-watch row is created for a refusal; a refused retry hands its claim back so the
-ticket is re-probed rather than stranded. A preparation that is deferred by an armed drain (or
-superseded by a reload or a departed issue) parks or releases that claim exactly as `on_retry` does,
-never leaving it with nothing to fire it again.
+queued work; the console renders it `blocked`, like a token-ceiling stop), carrying the resolved
+selection as provenance, and arms a bounded refusal gate. The gate is keyed by `(identity, selection
+fingerprint)` and REMEMBERS the opaque credential revision and reason code observed at the refusal:
+the pre-spawn check suppresses without knowing a revision a resolver has yet to observe, and a
+changed revision **or** reason code is a fresh episode (base backoff, a new history row). It re-probes
+on a bounded backoff or immediately when an input changes — a workflow reload, an explicit
+`POST /api/v1/refresh`, or a credential mutation — and repeating an *identical* refusal advances the
+backoff without appending a second history row. No claim, workspace, mailbox, or review-watch row is
+created for a refusal. A refused claim-held retry is RE-PARKED (claim and attempt kept, timer
+re-armed to the gate's next probe) rather than released: in pool mode the candidate query returns
+only unassigned tickets, so releasing a still-assigned ticket would strand it with nothing to
+re-select it. `on_retry` remains the single owner of release-on-gone. A preparation deferred by an
+armed drain, superseded by a reload, or hit by a stale generation re-parks the same way, never
+leaving a claim with nothing to fire it again. The multi-project candidate sweep that cancels
+preparations for issues that left the board runs only when the whole board was actually read, so one
+failed Linear fetch cannot cancel a project's live preparations.
 
 Pool-mode picks are prepared **before** the cross-daemon claim election: `claim_pool` assigns the
 ticket and may move its state, which is the very mutation a refusal must not leave behind, so the
@@ -1678,6 +1690,9 @@ error strings: the completion carries the opaque revision only, and `PreparedDis
 
 The ticketless review path shares the same machinery: its watch-set writes move behind the
 preparation gate, and a review preparation or suppression returns `Preparing` without writing a row.
+The review-REOPEN path (a summoned review-state ticket) shares it too: the promote write runs first,
+the summons is captured, and the dispatch — including the run's mailbox seed — happens only after an
+accepted preparation, so no dispatch path bypasses the gate.
 
 
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)

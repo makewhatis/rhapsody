@@ -954,8 +954,13 @@ impl Orchestrator {
                 std::time::Instant::now(),
             );
             // STUDIO-988: an issue that dropped out of this tick's candidate set must not keep a
-            // preparation reservation / resolver task / slot.
-            if !self.preparing.is_empty() {
+            // preparation reservation / resolver task / slot — but ONLY when the board was actually
+            // READ. `poll_all_projects` `continue`s past a project whose fetch FAILED and reports it
+            // through `read_the_board`; acting on a partial candidate set would treat every issue of
+            // the failed project as departed and cancel its preparation (and, before the claim-held
+            // skip, lose a retry's claim and row). A pass that could not read the whole board must
+            // not act on what it did not see, the same fail-closed call STUDIO-949 made.
+            if read_the_board && !self.preparing.is_empty() {
                 let present: std::collections::HashSet<String> =
                     tagged.iter().map(|t| t.iss.id.clone()).collect();
                 self.cancel_dropped_preparations(&present);
@@ -1439,19 +1444,15 @@ impl Orchestrator {
         tracing::info!(issue_id = %iss.id, issue_identifier = %iss.identifier, from_state = %iss.state, promote_state = %promote_state, "review-reopen: summoned ticket promoted and dispatched");
         iss.state = promote_state;
         // STUDIO-649: the summons that triggered this reopen predates the run about to start, so the
-        // mid-run router can never deliver it. Capture it before the issue moves into dispatch, then
-        // seed the fresh run's operator mailbox with it (see `message::seed_reopen_summons`).
-        let reopen_summons = iss
-            .latest_summon_at
-            .map(|at| (iss.id.clone(), at, iss.latest_summon_body.clone()));
-        // NOTE (STUDIO-988): this reopen path seeds its summons into the run's mailbox immediately
-        // after dispatch, which cannot survive an asynchronous preparation. It therefore keeps the
-        // inline dispatch until PB7 lands the provider integration; see the PR body's residual-scope
-        // note.
-        self.dispatch_issue(iss, None, route, String::new());
-        if let Some((id, at, body)) = reopen_summons {
-            self.seed_reopen_summons(&id, at, &body);
+        // mid-run router can never deliver it. Capture it BEFORE the issue enters preparation; the
+        // fresh run's mailbox is seeded by `dispatch_issue` once the run is live, which is what lets
+        // this path share the asynchronous preparation machinery (STUDIO-988) rather than bypassing
+        // it with an inline dispatch.
+        if let Some(at) = iss.latest_summon_at {
+            self.pending_reopen_summons
+                .insert(iss.id.clone(), (at, iss.latest_summon_body.clone()));
         }
+        self.dispatch_or_prepare(iss, None, route, String::new());
     }
 
     /// Removes workspaces for issues already in terminal states at startup (§8.6). Per-project when
@@ -2929,6 +2930,36 @@ mod tests {
         assert!(
             entered.load(Ordering::SeqCst),
             "the parked call must have been reconcile's tracker round-trip"
+        );
+    }
+
+    // STUDIO-988: the review-reopen path shares the preparation machinery rather than dispatching
+    // inline. With a resolver installed, `promote_and_dispatch` must promote (the Linear write) and
+    // then BEGIN a preparation; the run — and its reopening-summon mailbox seed — happens only on an
+    // accepted completion. Before this, the reopen path called `dispatch_issue` directly and bypassed
+    // the gate entirely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_reopen_begins_a_preparation_instead_of_dispatching_inline() {
+        use crate::testsupport::HangResolver;
+        let mut tr = Fake::new();
+        tr.move_to_type_name = "Todo".to_string();
+        let (mut o, spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(tr), "promptA")], 10);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_promote_state = "Todo".to_string();
+        }
+        o.prepare_timeout = Duration::from_secs(3600);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let iss = issue("1", "MT-1", "In Review");
+        let route = o.route_for(Some(0));
+        o.promote_and_dispatch(iss, route).await;
+        assert!(
+            o.preparing.contains("1"),
+            "the reopen path must begin a preparation with a resolver installed"
+        );
+        assert!(
+            spawned.lock().expect("dispatched lock").is_empty(),
+            "no run may be dispatched before the preparation completes"
         );
     }
 }
