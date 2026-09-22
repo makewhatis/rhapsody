@@ -2146,15 +2146,22 @@ impl Orchestrator {
             }
             if !resumed_round && self.rounds_used(pr) >= threshold {
                 // A pull request that CONVERGED on its last allowed round is not a failure for the
-                // manager to decide. `auto_merge_verdict` is the head-exact "every live row approved
-                // at this head" predicate the merge gate already uses; `is_ok()` is the convergence
-                // question. Sending a converged pull request to the manager would ask it to decide a
-                // loop that already did — on a prompt that asserts it did NOT converge and names no
-                // findings — and an `ESCALATE` answer would post a false alarm and freeze the author
-                // half for a pull request every reviewer approved. Let it fall to the ordinary
-                // auto-merge path below, which re-applies every gate.
-                if crate::automerge::auto_merge_verdict(&mine, head).is_ok() {
-                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
+                // manager to decide. The convergence question is the merge gate's own
+                // "every live row approved at this head" predicate, read through the patch-id PROOF
+                // (STUDIO-977): `mine` is this hand-back's opening snapshot, still naming the old
+                // SHAs that `handle_review_head_advanced` carried a moment ago, so a head-exact
+                // (`&[head]`) read would call a patch-preserving move un-converged and ask the
+                // manager to decide a loop that already did — on a prompt that asserts it did NOT
+                // converge and names no findings — where an `ESCALATE` answer posts a false alarm
+                // and freezes the author half for a pull request every reviewer approved. The proof
+                // names the carried approval the snapshot still holds, so it converges here, and
+                // the plan handed to the ordinary auto-merge path below carries the same proof.
+                //
+                // MUTATION: pass a bare `&[head]` here and
+                // `a_converged_patch_is_merged_rather_than_sent_to_the_manager` reds (the manager is
+                // asked about a pull request every reviewer approved).
+                if crate::automerge::auto_merge_verdict_with_proof(&mine, head, &proven).is_ok() {
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &proven, report);
                     return;
                 }
                 // Never decide over a round mid-flight: findings could still land, and the author's
@@ -2166,19 +2173,22 @@ impl Orchestrator {
                 }
                 let rounds = self.rounds_used(pr);
                 let findings = self.open_findings(&mine, head);
-                // STUDIO-977 C: `ship` is available only when every required reviewer has APPROVED
-                // the change `head` carries — at `head`, or at a head the watcher proved
-                // patch-identical. Any reviewer still owing a round, or a `reviewed` verdict (a
-                // reviewer said no), makes it unavailable, so the manager's answer is recorded as an
-                // escalation instead of stopping the loop over a head nobody has approved. The
-                // refusal is captured here, on the control task, so the escalation can say which
-                // gate failed rather than the false "nobody read it".
+                // STUDIO-977 C: `ship` is available only when every required reviewer has READ the
+                // change `head` carries — an `approved` or a `reviewed` verdict at `head`, or at a
+                // head the watcher proved patch-identical. A reviewer still owing a round (or a
+                // verdict about a change nobody proved the same) makes it unavailable, so the
+                // manager's answer is recorded as an escalation instead of stopping the loop over a
+                // head nobody has read. A `reviewed` row deliberately does NOT block a ship — the
+                // manager adjudicates findings, and the merge gate still decides whether a shipped
+                // pull request may merge (STUDIO-956). The refusal is captured here, on the control
+                // task, so the escalation can say which gate failed rather than the false "nobody
+                // read it".
                 let ship = crate::automerge::ship_available(&mine, head, &proven);
                 let ship_unavailable_reason = match ship {
                     Ok(()) => String::new(),
                     Err(refusal) => format!(
-                        "the manager shipped, but not every required reviewer has approved the \
-                         change at `{head}` ({}); a human must decide",
+                        "the manager shipped, but not every required reviewer has read the change \
+                         at `{head}` ({}); a human must decide",
                         refusal.why()
                     ),
                 };
@@ -2903,8 +2913,8 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
 }
 
 /// Whether every LIVE row of `pr` is an APPROVAL — the convergence question
-/// [`crate::automerge::auto_merge_verdict`] answers from a live head, reduced here to the rows' own
-/// verdicts so the author half (which holds no GitHub observation) can ask it too.
+/// [`crate::automerge::auto_merge_verdict_with_proof`] answers from a live head, reduced here to the
+/// rows' own verdicts so the author half (which holds no GitHub observation) can ask it too.
 ///
 /// A row that is `approved` has stated a verdict about the commit it read, and a head advance
 /// re-arms it to `requested` on the next sweep — so at the moment an author is summoned after a
@@ -3944,7 +3954,7 @@ mod tests {
             "the verdict moved to the new head"
         );
         assert_eq!(
-            crate::automerge::auto_merge_verdict(&[&row], HEAD_B),
+            crate::automerge::auto_merge_verdict_with_proof(&[&row], HEAD_B, &[HEAD_B]),
             Ok(vec!["bob".to_string()]),
             "the approval is valid AT THE NEW HEAD, which is what carrying it forward means"
         );
@@ -4144,12 +4154,15 @@ mod tests {
         );
     }
 
-    /// **`#209`'s data, reproduced exactly and shown to merge.** Verified against the daemon's own
-    /// compare data (`compare/main...1050386` and `compare/main...19fc650` are byte-EQUAL, as alice's
-    /// review of PR #219 established), so STUDIO-960's predicate already carried this pair — this
-    /// test pins that the end-to-end outcome the ticket asks for (carry, no round, merge) holds. The
-    /// handoff re-arm that actually killed `#209` is STUDIO-838's deliberate behaviour and is out of
-    /// scope here; see the PR body's follow-up note.
+    /// **A pair SHAPED LIKE `#209`'s — two byte-EQUAL compares — shown to merge.** The fixture is a
+    /// synthetic patch, not the literal bytes of `1050386`/`19fc650`; what it reproduces is the
+    /// SHAPE the daemon's own compare data has (`compare/main...1050386` and `compare/main...19fc650`
+    /// are byte-EQUAL, as alice's review of PR #219 established), which STUDIO-960's predicate
+    /// already carried. It pins the end-to-end outcome the ticket asks for on that shape (carry, no
+    /// round, merge); the literal pair is covered by the `#213` test above, which is the
+    /// byte-different case this PR actually fixes. The handoff re-arm that killed `#209` in
+    /// production is STUDIO-838's deliberate behaviour (a re-introduced pull request is re-reviewed
+    /// on purpose) and is out of scope here — a real, separate follow-up.
     #[tokio::test]
     async fn pr_209_is_byte_equal_and_merges_after_a_merge_from_main() {
         let mut teams = ticketless(&["alice", "bob"]);
@@ -7887,17 +7900,24 @@ mod tests {
         );
     }
 
-    /// **Alice's round-1 blocker (STUDIO-977, A2): pin what the SWEEP computes, not a hand-built
-    /// plan.** An adjudication plan built from rows that do not all approve the observed change gets
-    /// `ship_available == false` and a reason naming the failed gate; one where every required
-    /// reviewer approved the change — here at `HEAD_A`, proven identical to `HEAD_B` — gets `true`.
+    /// **A2 (STUDIO-977, C): pin what the SWEEP computes, not a hand-built plan.** `ship` is
+    /// available exactly when every required reviewer has READ the observed change — an `approved`
+    /// or `reviewed` verdict at `head` or at a patch-id-proven head.
     ///
-    /// MUTATION: hard-code `ship_available: true` and the first half reds; drop the proof
-    /// (`&[head]` instead of `&proven`) and the second reds, because the `HEAD_A` approval stops
-    /// counting.
+    /// (1) A reviewer still owes a round at `HEAD_B`: nobody read the observed change, so
+    /// `ship_available == false` and the reason names the gate that failed.
+    ///
+    /// (2) A `reviewed` (findings) verdict at `HEAD_A`, proven identical to the observed `HEAD_B`,
+    /// is a READ of this change — so `ship_available == true` and there is no failure to explain.
+    /// This pins BOTH halves of the predicate: holding `ship` to the merge gate (which refuses a
+    /// `reviewed` row as `ChangesRequested`) reds (2); dropping the patch-id proof (`&[head]` for
+    /// `&proven`) reds (2) too, because the `HEAD_A` verdict stops counting.
+    ///
+    /// MUTATION: hard-code `ship_available: true` and (1) reds; refuse a `reviewed` row and (2)
+    /// reds; pass `&[head]` instead of `&proven` and (2) reds.
     #[test]
     fn the_sweep_computes_ship_availability_from_the_rows() {
-        // (1) A reviewer still owes a round at HEAD_B: nothing approved the observed change.
+        // (1) A reviewer still owes a round at HEAD_B: nobody read the observed change.
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         introduce(&o, row(12, "bob"));
@@ -7911,7 +7931,7 @@ mod tests {
         assert_eq!(report.adjudicate.len(), 1, "the manager is asked");
         assert!(
             !report.adjudicate[0].ship_available,
-            "an unapproved change must not be shippable"
+            "an unread change must not be shippable"
         );
         assert!(
             report.adjudicate[0]
@@ -7921,10 +7941,16 @@ mod tests {
             report.adjudicate[0].ship_unavailable_reason
         );
 
-        // (2) Every required reviewer approved the change — at HEAD_A, proven identical to HEAD_B.
+        // (2) A findings verdict on the change — at HEAD_A, proven identical to the observed HEAD_B.
         let (mut o2, _d2) = orch(adjudicating(&["alice", "bob"], 3));
         let _l2 = ledger(&mut o2);
-        introduce(&o2, approved_row(12, "bob", HEAD_A));
+        introduce(&o2, row(12, "bob"));
+        o2.store()
+            .mark_review_requested(&key(12, "bob"), HEAD_A)
+            .expect("requested");
+        o2.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
         o2.review_rounds
             .insert(churn_key(&coord(12)), 3 * o2.reviewers_per_round());
 
@@ -7932,11 +7958,50 @@ mod tests {
         assert_eq!(report2.adjudicate.len(), 1, "the manager is asked");
         assert!(
             report2.adjudicate[0].ship_available,
-            "an approval at a patch-id-proven head is an approval of this change"
+            "findings on a patch-id-proven head mean the change has been READ; a ship over findings \
+             is exactly what the manager decides (STUDIO-956)"
         );
         assert!(
             report2.adjudicate[0].ship_unavailable_reason.is_empty(),
             "and there is no failure to explain"
+        );
+    }
+
+    /// **The convergence guard reads the patch-id proof (alice's round-2 blocker).** A pull request
+    /// every reviewer has approved at `HEAD_A`, whose branch has moved to `HEAD_B` by a merge from
+    /// the base carrying the SAME change, has CONVERGED and must merge — not be sent to the manager
+    /// as a decision. `mine` is this hand-back's opening snapshot, still naming `HEAD_A`, so a
+    /// head-exact convergence read would miss it and ask the manager about a pull request that
+    /// already passed every gate.
+    ///
+    /// MUTATION: pass a bare `&[head]` to the convergence check (or to `propose_auto_merge` on that
+    /// branch) and `adjudicate` is non-empty / `merge` is empty.
+    #[test]
+    fn a_converged_patch_is_merged_rather_than_sent_to_the_manager() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        // The branch moves to HEAD_B by a merge from the base; the change is proven identical.
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "a converged pull request must not be handed to the manager: {:?}",
+            report.adjudicate
+        );
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_B.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "the carried approval merges at the new head without a manager turn"
         );
     }
 

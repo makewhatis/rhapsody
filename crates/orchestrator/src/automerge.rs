@@ -21,8 +21,8 @@
 //! [`REVIEW_STATUS_APPROVED`]/[`REVIEW_STATUS_REVIEWED`] status, written by `mark_review_completed`
 //! together with the SHA the reviewer actually read. A hand-off with no readable verdict at all
 //! (STUDIO-894) is never guessed into either bucket — it parks the row `REVIEW_STATUS_TRUNCATED`,
-//! which [`auto_merge_verdict`] below already refuses as a round still owed. So the fact this
-//! module needs is a stored enum keyed to a head commit, not English.
+//! which [`auto_merge_verdict_with_proof`] below already refuses as a round still owed. So the fact
+//! this module needs is a stored enum keyed to a head commit, not English.
 //!
 //! That is also why the whole feature is gated on
 //! [`review_auto_merge`](rhapsody_config::teams::Teams::review_auto_merge), which requires
@@ -32,9 +32,9 @@
 //!
 //! # Every gate that is a REFUSAL, and why each one is not the others
 //!
-//! The decision splits in two, and the split is the containment: [`auto_merge_verdict`] is a pure
-//! function of the watch rows and the observed head, decided on the control task where the watch
-//! set is single-writer; everything that needs GitHub happens off-loop in
+//! The decision splits in two, and the split is the containment: [`auto_merge_verdict_with_proof`]
+//! is a pure function of the watch rows and the observed head, decided on the control task where
+//! the watch set is single-writer; everything that needs GitHub happens off-loop in
 //! [`crate::runautomerge`]. This half refuses on:
 //!
 //! * **No verdict at all** — a pull request with no live watch row has been reviewed by nobody.
@@ -114,11 +114,26 @@ impl AutoMergeRefusal {
     }
 }
 
-/// Whether every required reviewer of one pull request has recorded a non-blocking verdict AT
-/// `head` — the control-task half of the gate, pure over the tick's rows.
+/// Whether every required reviewer of one pull request has recorded a non-blocking verdict against
+/// the change `head` carries — the control-task half of the gate, pure over the tick's rows.
 ///
 /// `rows` is every LIVE watch row of this one pull request. The answer is the approving reviewers
 /// on success, so the caller can name them in the audit record.
+///
+/// `proven` is the patch-id proof from [`crate::reviewwatch`] (STUDIO-977, C): the set of heads whose
+/// CHANGE is the same as `head`'s — `head` itself plus every previously-reviewed head the off-loop
+/// watcher proved identical. A verdict recorded at one of those counts as a verdict about this
+/// change, which is what lets a `ship` (or a carried approval) satisfy approval-at-head after a
+/// merge from the base. With `proven == [head]` this is the exact-head gate, unchanged.
+///
+/// A `ship` adjudication may satisfy approval-at-head for a patch the reviewers actually approved,
+/// but the rows it is read from may still name the OLD head: the carry-over advances
+/// `last_reviewed_sha` on its own tick, and a same-tick read sees the pre-advance snapshot.
+///
+/// This is NOT a relaxation of what counts as an approval. A row that is `requested`, `in_flight` or
+/// `truncated` still refuses — nobody finished reading the change — and a row approved at a head
+/// OUTSIDE `proven` is still [`AutoMergeRefusal::StaleVerdict`], because the change there was never
+/// proven the same.
 ///
 /// The SHA comparison is EXACT — byte equality, never a prefix and never case-folded.
 ///
@@ -130,28 +145,6 @@ impl AutoMergeRefusal {
 /// arrangement: on a differently-cased head they would arm a re-review while this cleared the pull
 /// request to merge, which is exactly the "merging while a reviewer is mid-round" hazard. Matching
 /// them exactly makes the disagreement unrepresentable rather than merely unlikely.
-pub(crate) fn auto_merge_verdict(
-    rows: &[&ReviewWatchRow],
-    head: &str,
-) -> Result<Vec<String>, AutoMergeRefusal> {
-    // The exact-head reading: a verdict counts only at `head` itself. This is the gate the dispatch
-    // loop and the convergence check use, and it is deliberately unchanged.
-    auto_merge_verdict_with_proof(rows, head, &[head])
-}
-
-/// [`auto_merge_verdict`], with the head set to the heads whose CHANGE is the same as `head`'s — the
-/// patch-id proof from [`crate::reviewwatch`] (STUDIO-977, C).
-///
-/// A `ship` adjudication may satisfy approval-at-head for a patch the reviewers actually approved,
-/// but the rows it is read from may still name the OLD head: the carry-over advances
-/// `last_reviewed_sha` on its own tick, and a same-tick read sees the pre-advance snapshot. `proven`
-/// (the head plus the SHAs [`crate::ghsummons::same_change`] proved identical, computed off-loop)
-/// lets an approval whose commit differs but whose change does not still count.
-///
-/// This is NOT a relaxation of what counts as an approval. A row that is `requested`, `in_flight` or
-/// `truncated` still refuses — nobody finished reading the change — and a row approved at a head
-/// OUTSIDE `proven` is still [`AutoMergeRefusal::StaleVerdict`], because the change there was never
-/// proven the same. With `proven == [head]` this is byte-for-byte the old rule.
 pub(crate) fn auto_merge_verdict_with_proof(
     rows: &[&ReviewWatchRow],
     head: &str,
@@ -191,23 +184,65 @@ pub(crate) fn auto_merge_verdict_with_proof(
 /// Whether a manager's `ship` may be recorded for the change `head` carries — the structural half of
 /// STUDIO-977's rule C.
 ///
-/// `ship` and `escalate` must not be the same outcome: a ship is meaningful only when the pull
-/// request can then MERGE, so it is available exactly when the merge gate's approval-at-head passes
-/// for this change. Every required reviewer must have APPROVED it — at `head`, or at a head `proven`
-/// to carry the same change (see [`auto_merge_verdict_with_proof`]). A row still owing a round
-/// (`requested`/`in_flight`/`truncated`) means nobody finished reading the change, and a `reviewed`
-/// row means a reviewer said no; in either case the manager must escalate, not ship. This is what
-/// makes "a ship over an unread head is not available" a structural fact rather than a judgement the
-/// model re-derives every turn.
+/// The rule is "**an unread head cannot be shipped**", and nothing more. Every live row must carry a
+/// verdict that was recorded against the change `head` carries — an `approved` verdict, or a
+/// `reviewed` one (findings) — at `head` or at a head `proven` to carry the same change (see
+/// [`auto_merge_verdict_with_proof`]). A row still owing a round (`requested`/`in_flight`/
+/// `truncated`) means nobody finished reading this change, no row at all means nobody is watching,
+/// a status this daemon cannot read fails closed, and a verdict whose head was never proven the same
+/// is a verdict about a DIFFERENT change; in every one of those cases the manager must escalate.
 ///
-/// Criterion 5's deliberate reversal of STUDIO-956 lives here: 956 said a ship must not satisfy
-/// approval-at-head at all; this says it may, but only for a patch the required reviewers approved.
+/// **A `reviewed` row does NOT make `ship` unavailable.** That is the whole point of STUDIO-956, and
+/// the distinction between a `ship` and an `escalate`: a reviewer's findings are exactly what the
+/// manager exists to adjudicate, so "a reviewer said no" is a decision the manager may overrule,
+/// while "nobody has read it" is not. This is deliberately NARROWER than the merge gate (which
+/// refuses a `reviewed` row as [`AutoMergeRefusal::ChangesRequested`]): a recorded `ship` over open
+/// findings does not merge, and that is correct — it stops the loop and leaves the pull request to
+/// the normal merge gates and a human. Whether a `ship` actually MERGES is still decided by
+/// [`auto_merge_verdict_with_proof`] at `head`, untouched here; CI, draft and conflict are not
+/// consulted, let alone satisfied, by this function.
+///
+/// Criterion 5's deliberate reversal of STUDIO-956 lives in that merge gate, not here: 956 said a
+/// ship must not satisfy approval-at-head at all; this says it may, but only for a patch the
+/// required reviewers approved.
 pub(crate) fn ship_available(
     rows: &[&ReviewWatchRow],
     head: &str,
     proven: &[&str],
 ) -> Result<(), AutoMergeRefusal> {
-    auto_merge_verdict_with_proof(rows, head, proven).map(|_| ())
+    let head = head.trim();
+    if head.is_empty() {
+        return Err(AutoMergeRefusal::NoHead);
+    }
+    if rows.is_empty() {
+        return Err(AutoMergeRefusal::NoVerdict);
+    }
+    let proven: Vec<&str> = proven.iter().map(|p| p.trim()).collect();
+    for row in rows {
+        match row.status.as_str() {
+            // A settled verdict about a change the reviewer READ. `approved` and `reviewed` are the
+            // same fact here — someone finished reading this change; only the merge gate below
+            // distinguishes them.
+            REVIEW_STATUS_APPROVED => {
+                if !proven.contains(&row.last_reviewed_sha.as_str()) {
+                    return Err(AutoMergeRefusal::StaleVerdict);
+                }
+            }
+            REVIEW_STATUS_REVIEWED => {
+                // A findings verdict is read — shippable — but only for THIS change. Findings about
+                // a head whose change was never proven the same are findings about other code, so a
+                // round is genuinely owed at `head`.
+                if !proven.contains(&row.last_reviewed_sha.as_str()) {
+                    return Err(AutoMergeRefusal::RoundInFlight);
+                }
+            }
+            REVIEW_STATUS_REQUESTED | REVIEW_STATUS_IN_FLIGHT | REVIEW_STATUS_TRUNCATED => {
+                return Err(AutoMergeRefusal::RoundInFlight);
+            }
+            _ => return Err(AutoMergeRefusal::UnknownStatus),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,7 +280,7 @@ mod tests {
         ];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Ok(vec!["alice".to_string(), "jimmy".to_string()])
         );
     }
@@ -257,7 +292,7 @@ mod tests {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
     }
@@ -272,7 +307,7 @@ mod tests {
         ];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
     }
@@ -284,7 +319,7 @@ mod tests {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, "")];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
     }
@@ -298,7 +333,7 @@ mod tests {
         ];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::ChangesRequested)
         );
     }
@@ -319,7 +354,7 @@ mod tests {
             ];
             let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
             assert_eq!(
-                auto_merge_verdict(&refs, HEAD),
+                auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
                 Err(AutoMergeRefusal::RoundInFlight),
                 "({status})"
             );
@@ -332,7 +367,7 @@ mod tests {
     #[test]
     fn a_pull_request_nobody_reviewed_is_refused() {
         assert_eq!(
-            auto_merge_verdict(&[], HEAD),
+            auto_merge_verdict_with_proof(&[], HEAD, &[HEAD]),
             Err(AutoMergeRefusal::NoVerdict)
         );
     }
@@ -345,7 +380,7 @@ mod tests {
             let rows = [row("alice", status, HEAD)];
             let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
             assert_eq!(
-                auto_merge_verdict(&refs, HEAD),
+                auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
                 Err(AutoMergeRefusal::UnknownStatus),
                 "({status})"
             );
@@ -359,7 +394,7 @@ mod tests {
             let rows = [row("alice", REVIEW_STATUS_APPROVED, HEAD)];
             let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
             assert_eq!(
-                auto_merge_verdict(&refs, head),
+                auto_merge_verdict_with_proof(&refs, head, &[head]),
                 Err(AutoMergeRefusal::NoHead),
                 "({head:?})"
             );
@@ -379,7 +414,11 @@ mod tests {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, HEAD)];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, &HEAD.to_ascii_uppercase()),
+            auto_merge_verdict_with_proof(
+                &refs,
+                &HEAD.to_ascii_uppercase(),
+                &[&HEAD.to_ascii_uppercase()]
+            ),
             Err(AutoMergeRefusal::StaleVerdict)
         );
     }
@@ -391,7 +430,7 @@ mod tests {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, &HEAD[..7])];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
     }
@@ -409,7 +448,7 @@ mod tests {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
-            auto_merge_verdict(&refs, HEAD),
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
         assert_eq!(
@@ -454,20 +493,27 @@ mod tests {
         }
     }
 
-    /// **`ship` availability (C).** A `ship` is available exactly when the merge gate would clear:
-    /// every required reviewer APPROVED the change `head` carries, at `head` or at a head proven to
-    /// carry the same change. A row still owing a round, or a `reviewed` verdict (a reviewer said
-    /// no), or no rows at all, makes it unavailable — the manager must escalate instead.
+    /// **`ship` availability (C).** A `ship` is available exactly when every required reviewer has
+    /// READ the change `head` carries — an `approved` verdict or a `reviewed` one (findings), at
+    /// `head` or at a head proven to carry the same change. It is deliberately NARROWER than the
+    /// merge gate: a `reviewed` row does not block a ship (the manager adjudicates findings —
+    /// STUDIO-956), while a row still owing a round, no rows at all, an unreadable status, or a
+    /// verdict about a change nobody proved the same all make it unavailable, so the manager must
+    /// escalate.
     ///
-    /// MUTATION: accept a `REVIEW_STATUS_REVIEWED` row as "read enough to ship" and the `reviewed`
-    /// assertion reds; return `true` unconditionally and the requested/empty assertions red.
+    /// MUTATION: hold `ship_available` to the merge gate (refuse a `REVIEW_STATUS_REVIEWED` row) and
+    /// the `with_findings` assertion reds — STUDIO-956's ship is gone; treat an unreadable status as
+    /// read and the unknown-status assertion reds; return `Ok` unconditionally and the
+    /// requested/empty/stale assertions red.
     #[test]
-    fn a_ship_is_available_only_for_an_approved_change() {
+    fn a_ship_is_available_once_the_change_has_been_read() {
+        // Approved at a head proven to carry the same change.
         let approved = [row("alice", REVIEW_STATUS_APPROVED, OLD)];
         let a: Vec<&ReviewWatchRow> = approved.iter().collect();
         assert_eq!(ship_available(&a, HEAD, &[HEAD, OLD]), Ok(()));
 
-        // A findings verdict is NOT a ship: a reviewer said no, and a ship must not override that.
+        // Findings are a READ, and adjudicating them is the manager's job: a `reviewed` row must not
+        // make a ship unavailable. (This is the one distinction from the merge gate.)
         let with_findings = [
             row("alice", REVIEW_STATUS_APPROVED, HEAD),
             row("bob", REVIEW_STATUS_REVIEWED, HEAD),
@@ -475,8 +521,9 @@ mod tests {
         let wf: Vec<&ReviewWatchRow> = with_findings.iter().collect();
         assert_eq!(
             ship_available(&wf, HEAD, &[HEAD]),
-            Err(AutoMergeRefusal::ChangesRequested),
-            "a reviewer who asked for changes means the manager escalates, not ships"
+            Ok(()),
+            "a reviewer who asked for changes means the manager adjudicates the findings, not that \
+             the change is unread"
         );
 
         for status in [
@@ -498,9 +545,23 @@ mod tests {
             ship_available(&a, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::StaleVerdict)
         );
+        let reviewed = [row("bob", REVIEW_STATUS_REVIEWED, OLD)];
+        let r: Vec<&ReviewWatchRow> = reviewed.iter().collect();
+        assert_eq!(
+            ship_available(&r, HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::RoundInFlight),
+            "findings about another change leave this change unread"
+        );
         assert_eq!(
             ship_available(&[], HEAD, &[HEAD]),
             Err(AutoMergeRefusal::NoVerdict)
+        );
+        let unknown = [row("alice", "rubber-stamped", HEAD)];
+        let u: Vec<&ReviewWatchRow> = unknown.iter().collect();
+        assert_eq!(
+            ship_available(&u, HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::UnknownStatus),
+            "silence is not a read"
         );
     }
 }

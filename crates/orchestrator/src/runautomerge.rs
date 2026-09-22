@@ -238,8 +238,9 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     // that is no longer what would land. `--match-head-commit` below would catch this too; catching
     // it here spends no merge attempt and says so precisely.
     //
-    // Case-folded, unlike `automerge::auto_merge_verdict`'s deliberately exact comparison, and the
-    // difference is principled rather than an oversight: that one compares against a STORED row
+    // Case-folded, unlike `automerge::auto_merge_verdict_with_proof`'s deliberately exact
+    // comparison, and the difference is principled rather than an oversight: that one compares
+    // against a STORED row
     // that two other predicates also compare exactly, so it must not be the loosest of the three.
     // This compares two answers from GitHub about the same field, where a case difference would
     // mean the same commit — so folding can only avoid a FALSE refusal, never admit a wrong head.
