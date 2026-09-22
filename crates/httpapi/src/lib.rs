@@ -39,6 +39,10 @@
 //! * [`server`]'s [`Server::publish_runtime_port`] publishes the bound port via T1's `runtimeport`.
 //!
 //! The route registration + method-agnostic 405 semantics live in [`server`]'s `build_router`.
+//!
+//! **STUDIO-982** (Rhapsody-only) puts every mutating route behind one shared browser-origin guard,
+//! [`operator_guard`]: exact bound `Host`, exactly one `X-Rhapsody-Operator: 1`, and no cookie,
+//! preflight, foreign origin or form post.
 
 mod build_info;
 mod config_view;
@@ -57,6 +61,7 @@ mod handlers_runmerge;
 mod handlers_teams;
 mod history;
 mod logs;
+mod operator_guard;
 mod responses;
 mod responses_history;
 mod server;
@@ -69,6 +74,7 @@ mod testutil;
 
 pub use history::HistoryStore;
 pub use logs::{LogEntry, LogSource};
+pub use operator_guard::{BoundAddr, OPERATOR_HEADER, OPERATOR_HEADER_VALUE};
 pub use server::{
     ConfigValidateError, RunActionError, Server, SnapshotError, StateProvider, new_handler,
 };

@@ -644,7 +644,7 @@ mod tests {
     }
 
     async fn post(url: &str, body: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -979,7 +979,7 @@ mod tests {
             assert_eq!(resp.status(), 405, "{path}");
         }
         // `/api/v1/teams/room` answers BOTH verbs since STUDIO-661, so its 405 is anything else.
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .delete(format!("{url}/api/v1/teams/room"))
             .send()
             .await
@@ -1269,7 +1269,7 @@ mod tests {
                 .with_teams_config_path(dir.0.join("teams.yaml").to_string_lossy()),
         ))
         .await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .delete(format!("{url}/api/v1/teams/config"))
             .send()
             .await
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(resp.status(), 200, "POST is the human door now");
 
         for method in [reqwest::Method::PUT, reqwest::Method::PATCH] {
-            let resp = reqwest::Client::new()
+            let resp = crate::testutil::operator_client()
                 .request(method.clone(), format!("{url}/api/v1/teams/room"))
                 .send()
                 .await

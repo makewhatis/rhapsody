@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::extract::FromRef;
 use axum::handler::Handler;
-use axum::routing::any;
+use axum::routing::{MethodRouter, any};
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
@@ -51,6 +51,7 @@ use crate::handlers_teams::{
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
+use crate::operator_guard::{BoundAddr, require_operator_write};
 use crate::web::{WebDist, serve_web};
 
 /// The orchestrator surface the HTTP layer reads + writes. Mirrors Go's `StateProvider` interface
@@ -542,13 +543,13 @@ where
         .route("/api/v1/version", any(handle_version))
         // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
         // GET yields a 405 envelope rather than the SPA fallback.
-        .route("/api/v1/refresh", any(handle_refresh))
+        .route("/api/v1/refresh", operator_write(handle_refresh))
         // STUDIO-880 (Rhapsody-only): GET reads the drain, POST arms or cancels it. One route for
         // both — the POST answers exactly what the GET would.
-        .route("/api/v1/drain", any(handle_drain))
+        .route("/api/v1/drain", operator_write(handle_drain))
         // Read-write config (H3): GET returns the on-disk WORKFLOW.md view; POST validates + atomically
         // rewrites it (the watcher then hot-reloads). Loopback-only by server construction.
-        .route("/api/v1/config", any(handle_config))
+        .route("/api/v1/config", operator_write(handle_config))
         // Agent-capabilities registry (Rhapsody-only, no Go v0.4.0 counterpart): GET returns the
         // registry so the Settings UI can render the opt-in checkbox list. Method-agnostic like the
         // other read routes; the handler guards GET/HEAD.
@@ -565,25 +566,34 @@ where
         // NOT gated on Teams being enabled: it is how a disabled daemon gets enabled, and it
         // follows `POST /api/v1/config`'s discipline exactly — validate first, atomically rewrite
         // only when valid, leave the on-disk file untouched on a rejection.
-        .route("/api/v1/teams/config", any(handle_teams_config))
+        .route("/api/v1/teams/config", operator_write(handle_teams_config))
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
-        .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))
+        .route(
+            "/api/v1/teams/invalidate",
+            operator_write(handle_teams_invalidate),
+        )
         // §5.3's reversal, the one route that makes "nothing is deleted" worth anything to an
         // operator (STUDIO-689). Same shape as the invalidate above, one field shorter.
-        .route("/api/v1/teams/reinstate", any(handle_teams_reinstate))
+        .route(
+            "/api/v1/teams/reinstate",
+            operator_write(handle_teams_reinstate),
+        )
         // The team room, dispatched by method (the shape `/api/v1/teams/config` uses): GET is
         // T5's bounded, read-only peek that advances no identity's cursor; POST is STUDIO-661's
         // human door, an operator post the daemon stamps `operator` on.
-        .route("/api/v1/teams/room", any(handle_teams_room))
+        .route("/api/v1/teams/room", operator_write(handle_teams_room))
         // The ticketless review console (STUDIO-722, slice 8; Rhapsody-only, no Go v0.4.0
         // counterpart). One read and the operator controls §15-e moves off the room and onto
         // the authenticated console — see `handlers_reviews` for why that move is a security fix.
         // Static paths, so `/api/v1/reviews` and its children never contend.
         .route("/api/v1/reviews", any(handle_reviews))
-        .route("/api/v1/reviews/rerun", any(handle_review_rerun))
-        .route("/api/v1/reviews/dismiss", any(handle_review_dismiss))
-        .route("/api/v1/reviews/clear", any(handle_review_clear))
+        .route("/api/v1/reviews/rerun", operator_write(handle_review_rerun))
+        .route(
+            "/api/v1/reviews/dismiss",
+            operator_write(handle_review_dismiss),
+        )
+        .route("/api/v1/reviews/clear", operator_write(handle_review_clear))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
@@ -618,12 +628,15 @@ where
         // Run actions (H3): kill a running agent (+ move its ticket to Backlog) and resume a stopped
         // run (+ move it back to Todo). More-specific multi-segment POST patterns; axum's matchit
         // dispatches them ahead of the catch-all runs/{id} detail route regardless of order.
-        .route("/api/v1/runs/{id}/stop", any(handle_run_stop))
-        .route("/api/v1/runs/{id}/resume", any(handle_run_resume))
+        .route("/api/v1/runs/{id}/stop", operator_write(handle_run_stop))
+        .route(
+            "/api/v1/runs/{id}/resume",
+            operator_write(handle_run_resume),
+        )
         // The console's merge action (STUDIO-767): POST-only, more-specific than runs/{id}. The
         // body carries no pull-request coordinate — see `handlers_runmerge` for why that absence
         // is the guardrail rather than a validation.
-        .route("/api/v1/runs/{id}/merge", any(handle_run_merge))
+        .route("/api/v1/runs/{id}/merge", operator_write(handle_run_merge))
         // The console asking what that POST would do (STUDIO-790). Its own path rather than a GET
         // on the one above, so `/merge` stays POST-only and that stays a one-line invariant:
         // a route nothing can reach with a GET cannot be merged from a link somebody clicks.
@@ -637,18 +650,27 @@ where
         .route("/api/v1/runs/{id}/diff", any(handle_run_diff))
         // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
         // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
-        .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))
+        .route(
+            "/api/v1/runs/{id}/handoff",
+            operator_write(handle_run_handoff),
+        )
         // Host-stamped memory retain for a live run (STUDIO-645): the body carries `content` and
         // nothing else — the identity, ticket and commit come from the run this path names, which
         // is what makes provenance unforgeable (§5.1). More-specific than runs/{id}.
-        .route("/api/v1/runs/{id}/retain", any(handle_run_retain))
+        .route(
+            "/api/v1/runs/{id}/retain",
+            operator_write(handle_run_retain),
+        )
         // The room's write side (STUDIO-653, T6): run-scoped in its path for the same reason
         // retain is — the run id in the PATH is what `from` is stamped from, and the body carries
         // no provenance key at all.
-        .route("/api/v1/runs/{id}/post", any(handle_run_post))
+        .route("/api/v1/runs/{id}/post", operator_write(handle_run_post))
         // Operator messages (H3): POST queues a "btw" for a live run's agent; GET lists the run's
         // messages with their delivery status. More-specific than runs/{id}, so they win the match.
-        .route("/api/v1/runs/{id}/message", any(handle_run_message))
+        .route(
+            "/api/v1/runs/{id}/message",
+            operator_write(handle_run_message),
+        )
         .route("/api/v1/runs/{id}/messages", any(handle_run_messages))
         .route("/api/v1/runs/{id}", any(handle_run_detail))
         // Per-project live status + the read-only Linear surfaces for the Settings page (H2).
@@ -665,6 +687,20 @@ where
         // mounts this on "/"; axum models the same "everything else" match as the fallback.
         .fallback(web_fallback)
         .with_state(ApiState { provider, logs })
+}
+
+/// Register a MUTATING route: [`any`] (so the handler still owns its own 405, exactly as for every
+/// other route) behind the shared operator-write guard (STUDIO-982). The guard runs on the route's
+/// `POST` and on a CORS preflight, before the handler's body extractor and before any provider
+/// call. Every other method, a read included, reaches the handler unchanged. Every route with a
+/// `POST` side must be registered through this; `operator_guard`'s route-inventory test fails for
+/// one that is not.
+fn operator_write<H, T>(handler: H) -> MethodRouter<ApiState>
+where
+    H: Handler<T, ApiState>,
+    T: 'static,
+{
+    any(handler).layer(axum::middleware::from_fn(require_operator_write))
 }
 
 /// The router state: the read [`StateProvider`] + the optional process-log [`LogSource`]. Mirrors Go's
@@ -699,6 +735,10 @@ impl FromRef<ApiState> for Option<Arc<dyn LogSource>> {
 /// per-request server spans/metrics. That wrap needs the telemetry providers, which land with the
 /// telemetry lane (T1) and are initialized by the final assembly (F1); it is transparent to routing,
 /// so this returns the bare router and F1 layers telemetry on.
+///
+/// Serve it with `into_make_service_with_connect_info::<BoundAddr>()`, as [`Server`] does. The
+/// operator-write guard reads the bound port from there, so a router served without it refuses every
+/// mutation (STUDIO-982).
 pub fn new_handler(provider: Arc<dyn StateProvider>, logs: Option<Arc<dyn LogSource>>) -> Router {
     build_router(provider, logs, serve_web::<WebDist>)
 }
@@ -755,8 +795,16 @@ impl Server {
     }
 
     /// Serve requests until the serving task is dropped. Mirrors Go `Serve`.
+    ///
+    /// Each connection records its own bound address ([`BoundAddr`]); the operator-write guard
+    /// compares `Host` against that rather than anything the client sends (STUDIO-982).
     pub async fn serve(self) -> std::io::Result<()> {
-        axum::serve(self.listener, self.router).await
+        axum::serve(
+            self.listener,
+            self.router
+                .into_make_service_with_connect_info::<BoundAddr>(),
+        )
+        .await
     }
 
     /// Serve requests until `shutdown` resolves, then drain in-flight requests (graceful). The Rust
@@ -765,9 +813,13 @@ impl Server {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        axum::serve(self.listener, self.router)
-            .with_graceful_shutdown(shutdown)
-            .await
+        axum::serve(
+            self.listener,
+            self.router
+                .into_make_service_with_connect_info::<BoundAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await
     }
 }
 

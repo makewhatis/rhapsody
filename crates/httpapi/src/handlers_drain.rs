@@ -148,7 +148,7 @@ mod tests {
     }
 
     async fn post(url: &str, body: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -260,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsupported_method_gets_a_405_naming_every_verb_this_route_serves() {
         let base = spawn().await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .delete(format!("{base}/api/v1/drain"))
             .send()
             .await
