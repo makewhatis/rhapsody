@@ -2439,3 +2439,38 @@ speaks HTTP directly. Nothing else moves: `MAX_PR_STATE_CALLS_PER_TICK` and the 
 bound one tick, and STUDIO-953's pre-dispatch head re-read stays unconditional — it goes through
 `pr_state_unconditional`, which sends no `If-None-Match`, because acting on a stale head is the
 failure that re-read exists to prevent.
+
+### An authenticated desktop-to-daemon credential channel (STUDIO-981)
+
+Go v0.4.0 has no provider-credential feature at all, so this whole subsystem is Rhapsody-only. The
+sole open question the design record (`~/.rhapsody/docs/provider-auth-design.md` §P0c) left before a
+production provider-credential owner could be built was whether the separately signed, packaged
+`rhapsodyd` sidecar could read a provider Keychain item the desktop app wrote without an access
+prompt. Measured against real Developer-ID-signed binaries and a disposable test Keychain item
+(`~/.rhapsody/docs/provider-auth-p0c-findings.md`): a trusted-application ACL genuinely excludes
+`/usr/bin/security` and an unsigned same-user helper, but it does **not** exclude a confused-deputy
+process that simply `exec`s the trusted signed binary itself, since the ACL keys on the calling
+process's code identity at call time, not on launch authority — and a coding harness can already
+execute an arbitrary on-disk binary as the same OS user.
+
+- **The desktop app remains the sole Keychain owner for provider credentials.** `rhapsodyd` never
+  reads the OS Keychain for a provider secret and has no dependency capable of doing so (`cargo tree
+  -p rhapsodyd` contains zero `keyring` entries, pinned by
+  `crates/rhapsodyd/tests/no_direct_keychain_dependency.rs`).
+- **A new shared crate, `crates/credential-ipc`** (`rhapsody-credential-ipc`), holds the wire
+  protocol (length-prefixed JSON framing, a bounded max frame size) and the authentication +
+  strictly-increasing-sequence state machine both sides drive. It is a normal root-workspace member
+  (built with `rhapsodyd`) and ALSO a cross-workspace path dependency of `desktop/src-tauri` — it
+  carries no Tauri dependency, so this does not reintroduce the heavy-dependency coupling the root
+  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid.
+- **A one-shot bootstrap token**, delivered as the ONE frame the desktop writes to the freshly
+  spawned daemon child's piped stdin (then never written to again), authenticates the daemon's
+  connection to a Unix socket the desktop hosts — never HTTP, and the token never appears in argv,
+  an inheritable env var, `runtime.json`, or a log line.
+- **Wiring the socket server into the real supervisor spawn call is intentionally not yet done.**
+  `desktop/src-tauri/src/credential_bootstrap.rs`'s `BootstrapListener` is real and tested against a
+  real `UnixListener`/`UnixStream` pair (and, gated behind `RHAPSODY_CREDENTIAL_BOOTSTRAP_E2E=1`,
+  against the real built `rhapsodyd` binary end to end), but `supervisor::Inner::build_command`
+  itself is untouched — this ticket's job was to prove and specify the ownership mechanism, not
+  finish wiring every call site, and the supervisor's own restart/backoff state machine is heavily
+  tested and deliberately left alone here.
