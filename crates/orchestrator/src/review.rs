@@ -571,6 +571,17 @@ impl Orchestrator {
         } else {
             let status = declared_review_status(&e.last_state);
             self.record_review_completed(run, status);
+            // STUDIO-1004: this verdict may be the ANSWER to an author round that has been waiting
+            // for one. An author dispatch charges nothing until a reviewer's `last_reviewed_sha`
+            // reaches the head that dispatch produced, and `record_review_completed` is the only
+            // moment it moves — so the settle sits beside it and never on the truncated/crashed
+            // branches above, which advance nothing. `run.head_sha` is the head this round READ,
+            // pinned at dispatch; a verdict at a head other than the one the pending author round
+            // was recorded against is exactly that answer.
+            self.settle_author_round(
+                &crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number),
+                &run.head_sha,
+            );
             // The round is over and its verdict is known, which is the only moment the daemon can
             // tell the author findings are waiting (STUDIO-723). Handed to the off-loop task and
             // never waited on; the two branches above deliberately notify NOBODY — a crashed round
