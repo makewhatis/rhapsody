@@ -391,8 +391,12 @@ pub enum Event {
     },
     /// The operator taking a pull request out of the watch set from the authenticated console
     /// (STUDIO-722; NEW beyond Go v0.4.0). The same terminal a merge or a close reaches.
+    ///
+    /// `reviewer` narrows the dismissal to one row (STUDIO-1022); `None` drops every row of the
+    /// pull request, exactly as before that lever existed.
     ReviewDismiss {
         pr: crate::prstate::PrCoord,
+        reviewer: Option<String>,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
     /// The operator clearing a pull request's shared review↔author round budget from the
@@ -740,8 +744,12 @@ impl Orchestrator {
             Event::ReviewRerun { pr, reply } => {
                 let _ = reply.send(self.handle_review_rerun(&pr));
             }
-            Event::ReviewDismiss { pr, reply } => {
-                let _ = reply.send(self.handle_review_dismiss(&pr));
+            Event::ReviewDismiss {
+                pr,
+                reviewer,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_review_dismiss(&pr, reviewer.as_deref()));
             }
             Event::ReviewClear { pr, reply } => {
                 let _ = reply.send(self.handle_review_clear(&pr));
