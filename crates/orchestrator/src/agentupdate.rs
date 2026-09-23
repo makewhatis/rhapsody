@@ -1001,6 +1001,7 @@ mod tests {
             introduced_by: "handoff".to_string(),
             prior_sha: String::new(),
             head_patch_id: String::new(),
+            generation: 0,
         };
         let watch_key = run.watch_key();
         // The watch row the dispatch would have created, so `record_review_truncated` has a row to

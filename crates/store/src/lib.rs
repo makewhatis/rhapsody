@@ -468,7 +468,10 @@ pub trait Store {
     /// re-introduced row is not a new generation.
     ///
     /// A generation START at 1 (not 0) so a real generation is never confused with the M1 finding
-    /// rows' placeholder `0`, and so "generation 0" can only mean a bound row written before M2.
+    /// rows' placeholder `0`. Every creation path writes 1 (this one and the counter/adjudication/
+    /// evidence-revision upserts, STUDIO-1010), and the v15→v16 migration backfills every existing
+    /// row to 1, so a bound row's generation is always `>= 1` and `0` can only mean the daemon holds
+    /// no bound row at all.
     fn ensure_review_generation(&self, pr: &str) -> Result<(), StoreError>;
 
     /// The operator's deliberate reset of `pr`'s review loop (STUDIO-1009; §7.4): INCREMENTS the

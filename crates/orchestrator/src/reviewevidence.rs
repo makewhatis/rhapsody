@@ -34,8 +34,9 @@ use rhapsody_store::{
 };
 
 /// One watch row as the evidence revision sees it: the row's identity, its status, the head it was
-/// dispatched against and the head it last had read. Membership is the row's presence in the list
-/// that carries these, so an added or removed row changes the fingerprint without a separate flag.
+/// dispatched against, the head it last had read, and the last COMPLETED review recorded beside it.
+/// Membership is the row's presence in the list that carries these, so an added or removed row
+/// changes the fingerprint without a separate flag.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EvidenceWatchRow {
     /// `owner/repo#number@reviewer` — the row's identity.
@@ -46,16 +47,24 @@ pub struct EvidenceWatchRow {
     pub requested_sha: String,
     /// The head the last completed review read (F-SHA's marker).
     pub last_reviewed_sha: String,
+    /// The last review that completed with a verdict for this row, or `None` (STUDIO-1010, the M2
+    /// review's fifth follow-up). §5.2 lists "any watch row's … last-completed review" as an evidence
+    /// input, and these four values are the authoritative record of it (the four
+    /// `last_completed_*` columns, read through [`rhapsody_store::ReviewCompleted`]); `status` is
+    /// transient and `last_reviewed_sha` is written by a different path, so neither substitutes.
+    pub last_completed: Option<ReviewCompleted>,
 }
 
 impl EvidenceWatchRow {
-    /// The watch row as evidence, dropping everything the revision does not read.
-    pub fn of(row: &ReviewWatchRow) -> EvidenceWatchRow {
+    /// The watch row as evidence, dropping everything the revision does not read. `completed` is the
+    /// row's [`ReviewCompleted`] record, read by the caller from the store.
+    pub fn of(row: &ReviewWatchRow, completed: Option<&ReviewCompleted>) -> EvidenceWatchRow {
         EvidenceWatchRow {
             reviewer: row.key.reviewer.clone(),
             status: row.status.clone(),
             requested_sha: row.requested_sha.clone(),
             last_reviewed_sha: row.last_reviewed_sha.clone(),
+            last_completed: completed.cloned(),
         }
     }
 }
@@ -145,6 +154,22 @@ pub fn evidence_fingerprint(inputs: &EvidenceInputs) -> String {
         out.push_str(&row.requested_sha);
         out.push('\0');
         out.push_str(&row.last_reviewed_sha);
+        out.push('\0');
+        // The last completed review, in a fixed field order (STUDIO-1010; §5.2). `none` is the
+        // no-completion case; every value below is single-line and NUL-free, like the row's own.
+        match &row.last_completed {
+            None => out.push_str("completed=none"),
+            Some(c) => {
+                out.push_str("completed=");
+                out.push_str(&c.generation.to_string());
+                out.push('\0');
+                out.push_str(&c.sha);
+                out.push('\0');
+                out.push_str(&c.patch_id);
+                out.push('\0');
+                out.push_str(&c.verdict);
+            }
+        }
         out.push('\n');
     }
     for finding in &inputs.findings {
@@ -210,7 +235,19 @@ pub fn row_approved_at_current_patch(
     current_generation: i64,
     current_patch_id: &str,
 ) -> bool {
-    let Some(completed) = evidence.completed else {
+    completion_approved_at_current_patch(evidence.completed, current_generation, current_patch_id)
+}
+
+/// The predicate without the watch row: a completion record alone decides whether the row it
+/// belongs to is approved at the current (generation, patch). [`row_approved_at_current_patch`]
+/// delegates here, and the manager's approval eligibility (STUDIO-1010, design §6.4) calls this
+/// directly over its own row view, so the two can never disagree about §5.4.
+pub fn completion_approved_at_current_patch(
+    completed: Option<&ReviewCompleted>,
+    current_generation: i64,
+    current_patch_id: &str,
+) -> bool {
+    let Some(completed) = completed else {
         return false;
     };
     completed.verdict == REVIEW_COMPLETION_APPROVE
@@ -268,7 +305,7 @@ mod tests {
     fn inputs() -> EvidenceInputs {
         EvidenceInputs {
             head_sha: "sha1".into(),
-            watch_rows: vec![EvidenceWatchRow::of(&row("bob", "approved"))],
+            watch_rows: vec![EvidenceWatchRow::of(&row("bob", "approved"), None)],
             findings: vec!["finding-a".into()],
             human_hold: Some(false),
             draft: Some(false),
@@ -338,7 +375,7 @@ mod tests {
             (
                 "watch row status",
                 EvidenceInputs {
-                    watch_rows: vec![EvidenceWatchRow::of(&row("bob", "requested"))],
+                    watch_rows: vec![EvidenceWatchRow::of(&row("bob", "requested"), None)],
                     ..base.clone()
                 },
             ),
@@ -347,7 +384,7 @@ mod tests {
                 EvidenceInputs {
                     watch_rows: vec![EvidenceWatchRow {
                         requested_sha: "req".into(),
-                        ..EvidenceWatchRow::of(&row("bob", "approved"))
+                        ..EvidenceWatchRow::of(&row("bob", "approved"), None)
                     }],
                     ..base.clone()
                 },
@@ -357,7 +394,17 @@ mod tests {
                 EvidenceInputs {
                     watch_rows: vec![EvidenceWatchRow {
                         last_reviewed_sha: "rev".into(),
-                        ..EvidenceWatchRow::of(&row("bob", "approved"))
+                        ..EvidenceWatchRow::of(&row("bob", "approved"), None)
+                    }],
+                    ..base.clone()
+                },
+            ),
+            (
+                "watch row last completed review",
+                EvidenceInputs {
+                    watch_rows: vec![EvidenceWatchRow {
+                        last_completed: Some(completed(REVIEW_COMPLETION_APPROVE, 1, "pid")),
+                        ..EvidenceWatchRow::of(&row("bob", "approved"), None)
                     }],
                     ..base.clone()
                 },
@@ -432,15 +479,15 @@ mod tests {
     fn the_fingerprint_is_row_order_independent() {
         let a = EvidenceInputs {
             watch_rows: vec![
-                EvidenceWatchRow::of(&row("alice", "requested")),
-                EvidenceWatchRow::of(&row("bob", "approved")),
+                EvidenceWatchRow::of(&row("alice", "requested"), None),
+                EvidenceWatchRow::of(&row("bob", "approved"), None),
             ],
             ..inputs()
         };
         let b = EvidenceInputs {
             watch_rows: vec![
-                EvidenceWatchRow::of(&row("bob", "approved")),
-                EvidenceWatchRow::of(&row("alice", "requested")),
+                EvidenceWatchRow::of(&row("bob", "approved"), None),
+                EvidenceWatchRow::of(&row("alice", "requested"), None),
             ],
             ..inputs()
         };

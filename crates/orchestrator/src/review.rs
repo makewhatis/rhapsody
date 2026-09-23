@@ -110,6 +110,14 @@ pub struct ReviewRun {
     /// had no comparison to reuse (a first round, or a head it did not need to fingerprint), which the
     /// approval predicate reads as "unknown" and fails closed on.
     pub head_patch_id: String,
+    /// The review loop GENERATION this round was DISPATCHED in (STUDIO-1010, the M2 review's third
+    /// follow-up). Stamped at dispatch ([`Orchestrator::finish_review_dispatch`]) and carried to the
+    /// completion path, which records THIS value rather than reading the bound again at completion.
+    /// Reading at completion let a review dispatched before an operator `/clear` be recorded in the
+    /// NEW generation, so it counted as approved there even though it reviewed the old loop's code.
+    /// `0` is the un-stamped default (a hand-built or test run that skipped dispatch), which no real
+    /// generation can be and which the approval predicate fails closed on.
+    pub generation: i64,
 }
 
 /// The two coordinates the WORKER needs to provision a review checkout: which pull request's head
@@ -576,6 +584,11 @@ impl Orchestrator {
             .flatten()
             .map(|row| row.last_reviewed_sha)
             .unwrap_or_default();
+        // Stamp the loop generation this round is dispatched in (STUDIO-1010): the completion path
+        // records THIS value, not whatever the bound reads when the round finishes. A `/clear` that
+        // lands while the round is out bumps the bound's generation; recording the dispatch-time
+        // value is what keeps that round out of the new generation's "has had its turn" set.
+        run.generation = self.review_generation(&watch_key);
         if let Err(e) = self.store().save_review_watch(ReviewWatchRow {
             key: watch_key.clone(),
             author: run.author.clone(),
@@ -761,12 +774,12 @@ impl Orchestrator {
             );
             return;
         };
-        // The generation is read from the durable bound (STUDIO-1009; §5.4): this completion is
-        // recorded in whatever generation the pull request is on NOW, so a later `/clear` (which
-        // bumps it) invalidates this approval. A missing bound row reads as generation 0, which no
-        // real generation can be — a completion recorded before the pull request's generation was
-        // established can never satisfy the predicate.
-        let generation = self.review_generation(&run.watch_key());
+        // The generation this round was DISPATCHED in, stamped onto the run (STUDIO-1010; §5.4).
+        // Deliberately not re-read here: a `/clear` that landed while the round was out bumps the
+        // bound, and recording the completion in the NEW generation would let a review of the old
+        // loop's code count as approved there. `run.generation == 0` is an un-stamped run, which the
+        // approval predicate fails closed on.
+        let generation = run.generation;
         let completed = crate::reviewevidence::completion_record(
             status,
             generation,
@@ -848,7 +861,10 @@ impl Orchestrator {
         let plan =
             crate::reviewfindings::plan_review_findings(&crate::reviewfindings::CompletionInputs {
                 pr: &pr,
-                generation: self.review_generation(&run.watch_key()),
+                // The generation this round was dispatched in (STUDIO-1010), the same value the
+                // completion record carries: a finding raised by a pre-`/clear` round belongs to
+                // that generation's history, not the new one's.
+                generation: run.generation,
                 reviewer: &run.reviewer,
                 run_id,
                 head_sha: &run.head_sha,
@@ -869,7 +885,7 @@ impl Orchestrator {
         if plan.resolve_open
             && let Err(e) = self.store().resolve_review_findings(
                 &pr,
-                self.review_generation(&run.watch_key()),
+                run.generation,
                 &run.reviewer,
                 &run_id.to_string(),
             )
@@ -1058,6 +1074,7 @@ mod tests {
             introduced_by: "handoff".to_string(),
             prior_sha: String::new(),
             head_patch_id: String::new(),
+            generation: 0,
         }
     }
 
@@ -3065,12 +3082,22 @@ mod tests {
         let (mut o, _d) = orch_with_review(true);
         let mut run = review_run("alice", HEAD_A);
         run.head_patch_id = "pid-A".to_string();
-        o.dispatch_review(run.clone());
+        // The generation must exist BEFORE the dispatch: the dispatch stamps it onto the run
+        // (STUDIO-1010), so establishing it afterward would leave this completion at 0.
         o.store()
             .ensure_review_generation(&crate::reviewwatch::churn_key(
                 &crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number),
             ))
             .expect("generation");
+        o.dispatch_review(run.clone());
+        // The dispatch STAMPED the generation onto the run it staged; carry that value, which is
+        // exactly what the exit path would record.
+        let run = o
+            .running
+            .get(&run.key())
+            .and_then(|re| re.review.clone())
+            .expect("the dispatched review is stamped onto the running entry");
+        assert_eq!(run.generation, 1, "dispatch stamps the loop generation");
 
         o.record_review_completed(&run, REVIEW_STATUS_APPROVED);
         assert_eq!(
@@ -3100,6 +3127,64 @@ mod tests {
             },
             "a truncated round must not touch the completed record"
         );
+    }
+
+    /// **STUDIO-1010 (the M2 review's third follow-up).** A review dispatched BEFORE an operator
+    /// `/clear` must not count as approved in the generation the clear opened. The completion is
+    /// stamped with the DISPATCH-time generation, so the predicate fails against the new one even
+    /// though the review finished after it.
+    #[test]
+    fn a_review_dispatched_before_a_clear_completes_in_its_old_generation() {
+        use rhapsody_store::REVIEW_COMPLETION_APPROVE;
+        let (mut o, _d) = orch_with_review(true);
+        let mut run = review_run("alice", HEAD_A);
+        run.head_patch_id = "pid-A".to_string();
+        let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+        let churn = crate::reviewwatch::churn_key(&pr);
+        o.store()
+            .ensure_review_generation(&churn)
+            .expect("generation");
+        o.dispatch_review(run.clone());
+        let run = o
+            .running
+            .get(&run.key())
+            .and_then(|re| re.review.clone())
+            .expect("the dispatched review is stamped onto the running entry");
+        assert_eq!(run.generation, 1, "premise: dispatch stamped generation 1");
+
+        // The operator clears while the round is out: the bound moves to generation 2.
+        o.store()
+            .increment_review_generation(&churn)
+            .expect("clear");
+
+        o.record_review_completed(&run, REVIEW_STATUS_APPROVED);
+        let completed = o
+            .store()
+            .review_completed(&run.watch_key())
+            .expect("read")
+            .expect("record");
+        assert_eq!(
+            completed.generation, 1,
+            "the completion belongs to the generation it was dispatched in, not the new one"
+        );
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        let evidence = crate::reviewevidence::RowEvidence {
+            row: &row,
+            completed: Some(&completed),
+        };
+        assert!(
+            !crate::reviewevidence::row_approved_at_current_patch(&evidence, 2, "pid-A"),
+            "a pre-clear review must not satisfy approval in the generation the clear opened"
+        );
+        assert!(
+            crate::reviewevidence::row_approved_at_current_patch(&evidence, 1, "pid-A"),
+            "control: the same completion is approved in its OWN generation"
+        );
+        assert_eq!(completed.verdict, REVIEW_COMPLETION_APPROVE);
     }
 
     /// A FAILED review run is recorded failed and, like a clean one, schedules no retry: a `pr:`
@@ -3581,6 +3666,106 @@ mod tests {
         assert_eq!(rows[0].revision, 1);
         assert_eq!(rows[1].revision, 2);
         assert_eq!(rows[1].raised_at_sha, HEAD_B);
+    }
+
+    /// **STUDIO-1010 (the M2 review's second follow-up).** The patch-id carried on the dispatched
+    /// run reaches the finding revisions it produces. MUTATION: empty `head_patch_id` in
+    /// `record_review_findings` (or fail to carry it on the run) and this reds.
+    #[test]
+    fn a_reviews_carried_patch_id_reaches_its_finding_revisions() {
+        let (mut o, _d) = orch_with_review(true);
+        let mut run = review_run("alice", HEAD_A);
+        run.head_patch_id = "pid-A".to_string();
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        exit_review_with_verdict(
+            &mut o,
+            &run,
+            REVIEW_STATE_FINDINGS,
+            verdict_block(false, vec![block_finding("B8", "x")]),
+        );
+        let rows = o.store().load_review_findings(PR12).expect("load");
+        assert_eq!(
+            rows[0].raised_at_patch_id, "pid-A",
+            "the run's carried patch-id is what the revision records"
+        );
+        assert_eq!(
+            rows[0].raised_at_sha, HEAD_A,
+            "and the head it was pinned to"
+        );
+    }
+
+    /// **STUDIO-1010, the M1 carry-over through the live exit path.** A dismissed finding's
+    /// re-raise settles when the change is the same patch and reopens when it is a different one.
+    /// This exercises the whole chain (dispatch → exit → `plan_review_findings` → store), so it reds
+    /// if the patch-id is dropped anywhere between the run and the plan.
+    #[test]
+    fn a_dismissed_finding_reopens_on_a_changed_patch_and_settles_on_the_same_one() {
+        let seed = |o: &Orchestrator, patch: &str| {
+            o.store()
+                .save_review_finding(rhapsody_store::ReviewFindingRow {
+                    pr: PR12.to_string(),
+                    generation: 0,
+                    reviewer: "alice".to_string(),
+                    finding_id: "alice:B8".to_string(),
+                    revision: 1,
+                    summary_hash: crate::reviewfindings::summary_hash("same"),
+                    status: rhapsody_store::REVIEW_FINDING_DISMISSED.to_string(),
+                    raised_at_patch_id: patch.to_string(),
+                    paths: Vec::new(),
+                    ..Default::default()
+                })
+                .expect("seed dismissed revision");
+        };
+        let unscoped = || crate::reviewfindings::BlockFinding {
+            id: "B8".to_string(),
+            blocking: true,
+            summary: "same".to_string(),
+            paths: Vec::new(),
+            ..Default::default()
+        };
+
+        // Same patch-id: the repeat is recorded `settled`.
+        let (mut o, _d) = orch_with_review(true);
+        seed(&o, "pid-A");
+        let mut run = review_run("alice", HEAD_A);
+        run.head_patch_id = "pid-A".to_string();
+        o.dispatch_review(run.clone());
+        exit_review_with_verdict(
+            &mut o,
+            &run,
+            REVIEW_STATE_FINDINGS,
+            verdict_block(false, vec![unscoped()]),
+        );
+        let same = o.store().load_review_findings(PR12).expect("load");
+        let latest = same.iter().max_by_key(|r| r.revision).expect("revision");
+        assert_eq!(
+            latest.status,
+            rhapsody_store::REVIEW_FINDING_SETTLED,
+            "an unchanged patch-id is a repeat of an objection already decided"
+        );
+
+        // A different patch-id: the re-raise reopens, because the change is not the one dismissed.
+        let (mut o, _d) = orch_with_review(true);
+        seed(&o, "pid-A");
+        let mut run = review_run("alice", HEAD_B);
+        run.head_patch_id = "pid-B".to_string();
+        o.dispatch_review(run.clone());
+        exit_review_with_verdict(
+            &mut o,
+            &run,
+            REVIEW_STATE_FINDINGS,
+            verdict_block(false, vec![unscoped()]),
+        );
+        let changed = o.store().load_review_findings(PR12).expect("load");
+        let latest = changed.iter().max_by_key(|r| r.revision).expect("revision");
+        assert_eq!(
+            latest.status,
+            rhapsody_store::REVIEW_FINDING_OPEN,
+            "a changed patch-id reopens an unscoped dismissed finding"
+        );
     }
 
     /// A later approving review from the same reviewer resolves that reviewer's open revisions.

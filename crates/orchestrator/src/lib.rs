@@ -51,6 +51,7 @@ pub mod handoff;
 pub mod issuelog;
 pub mod lifecycle;
 pub mod liveness;
+pub mod managerdecision;
 pub mod managerexchange;
 pub mod mergeconsole;
 pub mod message;
