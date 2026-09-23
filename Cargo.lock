@@ -1675,6 +1675,7 @@ dependencies = [
  "rhapsody-config",
  "rhapsody-core",
  "rhapsody-orchestrator",
+ "rhapsody-provider-status",
  "rhapsody-store",
  "rust-embed",
  "serde",

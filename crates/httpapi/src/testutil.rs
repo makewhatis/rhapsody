@@ -21,6 +21,7 @@ use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
 };
+use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView};
 use rhapsody_store::Noop;
 
 use crate::{ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider};
@@ -129,6 +130,16 @@ pub(crate) struct FakeProvider {
     /// (STUDIO-982) assert a refused request leaves this at zero, i.e. the guard ran before any
     /// read or side effect.
     calls: AtomicUsize,
+    /// The canned non-secret provider status views `GET /api/v1/providers` serves (STUDIO-990).
+    provider_statuses: Vec<ProviderStatusView>,
+    /// The canned per-provider catalog snapshot `GET /api/v1/providers/{id}/models` serves, when the
+    /// id matches. `None` ⇒ the handler's 404.
+    provider_catalog: Option<CatalogSnapshot>,
+    /// What the explicit refresh POST returns once reached. `Some` ⇒ a `200` snapshot (which is how
+    /// a test drives the success path); `None` ⇒ the unknown-provider `404`. The provider id the
+    /// handler forwarded is recorded in `provider_refresh_asked`.
+    provider_refresh_result: Option<CatalogSnapshot>,
+    provider_refresh_asked: Mutex<Option<String>>,
 }
 
 impl FakeProvider {
@@ -186,6 +197,10 @@ impl FakeProvider {
             diff_outcome: None,
             diff_asked: Mutex::new(None),
             calls: AtomicUsize::new(0),
+            provider_statuses: Vec::new(),
+            provider_catalog: None,
+            provider_refresh_result: None,
+            provider_refresh_asked: Mutex::new(None),
         }
     }
 
@@ -446,6 +461,34 @@ impl FakeProvider {
     pub(crate) fn with_diff(mut self, outcome: DiffOutcome) -> Self {
         self.diff_outcome = Some(outcome);
         self
+    }
+
+    /// Canned non-secret provider status views `GET /api/v1/providers` serves (STUDIO-990).
+    pub(crate) fn with_provider_statuses(mut self, views: Vec<ProviderStatusView>) -> Self {
+        self.provider_statuses = views;
+        self
+    }
+
+    /// Canned catalog snapshot `GET /api/v1/providers/{id}/models` serves for that id (STUDIO-990).
+    pub(crate) fn with_provider_catalog(mut self, snapshot: CatalogSnapshot) -> Self {
+        self.provider_catalog = Some(snapshot);
+        self
+    }
+
+    /// Canned success snapshot the explicit refresh POST returns (STUDIO-990). Unset ⇒ the
+    /// unknown-provider `404`.
+    pub(crate) fn with_provider_refresh_result(mut self, snapshot: CatalogSnapshot) -> Self {
+        self.provider_refresh_result = Some(snapshot);
+        self
+    }
+
+    /// The provider id the last refresh POST forwarded, or `None` if it was never called — the
+    /// proof that a GET never triggers a refresh.
+    pub(crate) fn provider_refresh_asked(&self) -> Option<String> {
+        self.provider_refresh_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// How many [`StateProvider`] calls this fake has served.
@@ -834,6 +877,42 @@ impl StateProvider for FakeProvider {
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
         self.touch();
         self.capabilities_registry.clone()
+    }
+
+    fn provider_statuses(&self) -> Vec<ProviderStatusView> {
+        self.touch();
+        self.provider_statuses.clone()
+    }
+
+    fn provider_status(&self, provider_id: &str) -> Option<ProviderStatusView> {
+        self.touch();
+        self.provider_statuses
+            .iter()
+            .find(|view| view.provider_id == provider_id)
+            .cloned()
+    }
+
+    fn provider_catalog(&self, provider_id: &str) -> Option<CatalogSnapshot> {
+        self.touch();
+        self.provider_catalog
+            .as_ref()
+            .filter(|snapshot| snapshot.provider_id == provider_id)
+            .cloned()
+    }
+
+    async fn refresh_provider_catalog(
+        &self,
+        provider_id: &str,
+    ) -> Result<CatalogSnapshot, CatalogError> {
+        self.touch();
+        *self
+            .provider_refresh_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider_id.to_string());
+        match &self.provider_refresh_result {
+            Some(snapshot) => Ok(snapshot.clone()),
+            None => Err(CatalogError::Unsupported),
+        }
     }
 }
 

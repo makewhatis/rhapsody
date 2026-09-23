@@ -366,6 +366,8 @@ mod router_tests {
         "/api/v1/runs/7/retain",
         "/api/v1/runs/7/post",
         "/api/v1/runs/7/message",
+        // STUDIO-990: the ONE credentialed provider operation — the catalog refresh POST.
+        "/api/v1/providers/7/models/refresh",
     ];
 
     /// Every path `build_router` registers, read from its source so a new route cannot be missed

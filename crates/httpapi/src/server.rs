@@ -24,6 +24,7 @@ use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RunMessageResult, Snapshot, StopResult,
 };
+use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView};
 use rhapsody_store::StoreError;
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
@@ -39,6 +40,9 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
+use crate::handlers_providers::{
+    handle_provider_models, handle_provider_models_refresh, handle_providers,
+};
 use crate::handlers_reviews::{
     handle_review_clear, handle_review_dismiss, handle_review_rerun, handle_reviews,
 };
@@ -359,6 +363,43 @@ pub trait StateProvider: Send + Sync {
         Err(TeamsMemoryError::Disabled)
     }
 
+    // --- the provider status + model catalog surface (STUDIO-990, P9; design §P9/§6) ---
+    //
+    // Every one of these defaults to an EMPTY/dormant answer so a provider that predates the feature
+    // — the parity fake, and anything embedding this crate for the Go-shaped API — serves exactly
+    // what a daemon with no `providers:` block serves. The real implementor is `DaemonState`, which
+    // holds the non-secret status cache and the off-loop coordinator. The two `GET` reads are
+    // cache-only by construction: they call no owner, no IPC, and no provider.
+
+    /// Every configured provider's non-secret status (`GET /api/v1/providers`). Cache-only.
+    fn provider_statuses(&self) -> Vec<ProviderStatusView> {
+        Vec::new()
+    }
+
+    /// One provider's non-secret status, or `None` when the daemon does not know the id (`None` ⇒
+    /// the handler's 404). Cache-only.
+    fn provider_status(&self, _provider_id: &str) -> Option<ProviderStatusView> {
+        None
+    }
+
+    /// One provider's cached model catalog, or `None` when the id is unknown (`None` ⇒ 404).
+    /// Cache-only: never performs the credentialed refresh.
+    fn provider_catalog(&self, _provider_id: &str) -> Option<CatalogSnapshot> {
+        None
+    }
+
+    /// Run the explicit, bounded, off-loop model-catalog refresh (`POST
+    /// /api/v1/providers/{id}/models/refresh`). The route is behind the operator-write guard and the
+    /// body is a closed empty JSON object, so a browser can never reach it. `Err(CatalogError::Unsupported)`
+    /// means the provider id is unknown (the handler's 404); any other outcome is a `CatalogSnapshot`
+    /// whose own `error` field carries a catalog failure — a catalog failure is visible, never fatal.
+    async fn refresh_provider_catalog(
+        &self,
+        _provider_id: &str,
+    ) -> Result<CatalogSnapshot, CatalogError> {
+        Err(CatalogError::Unsupported)
+    }
+
     // --- the ticketless review console (STUDIO-722, slice 8; design §7, §15-e, §16) ---
     //
     // The three default to a DORMANT subsystem rather than to an error, unlike the `teams_*`
@@ -560,6 +601,16 @@ where
         // registry so the Settings UI can render the opt-in checkbox list. Method-agnostic like the
         // other read routes; the handler guards GET/HEAD.
         .route("/api/v1/capabilities", any(handle_capabilities))
+        // Provider status + model catalog (STUDIO-990, P9; Rhapsody-only, no Go v0.4.0 counterpart).
+        // The two GETs are cache-only; the refresh is the ONE credentialed operation and is behind
+        // the shared operator-write guard. The more-specific `/refresh` and `/models` patterns are
+        // distinct multi-segment paths, so axum's matchit keeps them apart regardless of order.
+        .route("/api/v1/providers", any(handle_providers))
+        .route("/api/v1/providers/{id}/models", any(handle_provider_models))
+        .route(
+            "/api/v1/providers/{id}/models/refresh",
+            operator_write(handle_provider_models_refresh),
+        )
         // Rhapsody Teams memory (STUDIO-645, Rhapsody-only — no Go v0.4.0 counterpart): the roster
         // with derived status, an identity's recalled memory, and the per-record invalidate that
         // §5.2.3 wants "reachable at the moment someone notices". All static paths, so they never
