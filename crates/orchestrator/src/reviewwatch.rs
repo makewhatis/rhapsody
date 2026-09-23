@@ -141,8 +141,8 @@ use rhapsody_config::room::Message;
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
 use rhapsody_store::{
-    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED,
-    ReviewWatchKey, ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED,
+    REVIEW_STATUS_TRUNCATED, ReviewWatchKey, ReviewWatchRow,
 };
 
 use crate::control_loop::{CancelWait, Event};
@@ -1641,7 +1641,12 @@ impl Orchestrator {
     }
 
     /// The configured adjudication threshold, or `None` when adjudication is off (STUDIO-956).
-    fn adjudication_threshold(&self) -> Option<usize> {
+    ///
+    /// `pub(crate)` for [`crate::reviewreconcile`], which uses "adjudication is on" to keep its own
+    /// converged-escalation suppression out of the unset path (STUDIO-1021's byte-identical
+    /// acceptance): a durable decision left behind by an install that has since UNSET the key is
+    /// rendered exactly as it was before this ticket.
+    pub(crate) fn adjudication_threshold(&self) -> Option<usize> {
         self.teams
             .as_ref()
             .and_then(|t| t.review_adjudicate_after_rounds())
@@ -1889,21 +1894,30 @@ impl Orchestrator {
             })
     }
 
-    /// Whether `pr` still owes its ONE resumed round at `head` (STUDIO-971).
+    /// Whether `pr` still owes its ONE resumed round at `head` (STUDIO-971, STUDIO-1021).
     ///
     /// Past the adjudication threshold a content-changing head move buys exactly one review round;
     /// this answers "is that round still owed?", so the fresh adjudication is held back until it is
-    /// spent. It is decided from the ROWS — the round is owed while ANY live row still owes a review
-    /// of `head`, the same [`review_round_due`] the dispatch loop itself uses.
+    /// spent. STUDIO-1021 asks it with or without a settled decision — a head no live reviewer has
+    /// COMPLETED a review of is not the manager's to decide, whether the threshold was crossed by a
+    /// push after a decision or by a push before any decision existed. It is decided from the ROWS —
+    /// the round is owed while ANY live row still owes a review of `head`, the same
+    /// [`review_round_due`] the dispatch loop itself uses.
     ///
-    /// Deliberately NOT `rounds_used(pr) <= decision.rounds()`. A round costs one dispatch per live
-    /// reviewer, and `rounds_used` is the floor of the dispatch counter divided by
-    /// `review.reviewers`. When a pull request has fewer live rows than that configured count — a
-    /// smaller eligible roster, a retired or unassignable row — the resumed round does not carry the
-    /// counter across the next whole multiple, so the floor comparison keeps reporting the round
-    /// owed forever, the threshold branch is never reached, the stale `ship` is never cleared, and
-    /// the pull request stalls exactly as it did before this ticket, one round later. Reading the
-    /// rows answers the question the counter was a proxy for.
+    /// `carried` is the head-advance's `skipped` list (STUDIO-960/977): the rows whose own terminal
+    /// verdict the watcher PROVED is about this very change (a patch-id match), so it does not owe a
+    /// round. Without that exclusion a patch-preserving move would arm a round to re-read a diff a
+    /// reviewer already read, which is exactly the saving STUDIO-960 exists to keep.
+    ///
+    /// Deliberately NOT a comparison of `rounds_used(pr)` against the round count a decision was
+    /// recorded at. A round costs one dispatch per live reviewer, and `rounds_used` is the floor of
+    /// the dispatch counter divided by `review.reviewers`. When a pull request has fewer live rows
+    /// than that configured count — a smaller eligible roster, a retired or unassignable row — the
+    /// resumed round does not carry the counter across the next whole multiple, so the floor
+    /// comparison keeps reporting the round owed forever, the threshold branch is never reached, the
+    /// stale decision is never cleared, and the pull request stalls exactly as it did before
+    /// STUDIO-971, one round later. Reading the rows answers the question the counter was a proxy
+    /// for.
     ///
     /// **A round the per-pull-request hard cap will refuse is not owed.** Once
     /// `dispatches >= REVIEW_ROUNDS_PER_PR_CAP * reviewers_per_round` the dispatch loop `continue`s
@@ -1917,11 +1931,44 @@ impl Orchestrator {
     /// human hold, a drain — still owes its round, and some later sweep can arm it. An unassignable
     /// row is the one such deferral that can persist; it is reported as `stalled` by
     /// [`Self::note_unassignable`] rather than silently, and the round genuinely has not happened.
-    fn resumed_round_owed(&self, pr: &PrCoord, mine: &[&ReviewWatchRow], head: &str) -> bool {
+    ///
+    /// **The round is spent the moment it is DISPATCHED at `head`.** `requested_sha` is written at
+    /// dispatch ([`Orchestrator::dispatch_review`]), so a row that has already been dispatched here
+    /// has had the one round this head buys. That matters for the two non-terminal ends: a round
+    /// that parks `truncated` (the `max_turns` backstop, or a STUDIO-967 ceiling stop) and a round
+    /// that CRASHES (`in_flight` with no live run) both keep `requested_sha == head`, so
+    /// [`review_round_due`] reports them owed again and, without this, the resumed arm would re-arm
+    /// them on every sweep until [`REVIEW_ROUNDS_PER_PR_CAP`] — spending the whole gap between the
+    /// configured threshold and the hard cap on the most expensive kind of round. The unfinished head
+    /// is the MANAGER's instead, and [`Self::open_findings`] names the review that never finished.
+    /// A row still owed its FIRST round here carries an older `requested_sha` (or none), so it is
+    /// unaffected; a live run is excluded above by [`review_round_due`]'s in-flight arm.
+    fn resumed_round_owed(
+        &self,
+        pr: &PrCoord,
+        mine: &[&ReviewWatchRow],
+        head: &str,
+        carried: &[ReviewWatchKey],
+    ) -> bool {
         if self.round_budget_spent(pr) {
             return false;
         }
         mine.iter().any(|r| {
+            // A verdict the head-advance CARRIED across a patch-id-preserving move is a completed
+            // review of this same change; it does not owe another round.
+            if carried.contains(&r.key) {
+                return false;
+            }
+            // STUDIO-1021: the one round was already DISPATCHED at this head. `requested_sha` is
+            // written at dispatch, and only a non-terminal end (`truncated`, or a crashed
+            // `in_flight` with no live run) leaves it naming this very head while
+            // `review_round_due` calls the row due again — the unbounded re-arm alice's round-2
+            // review found. The head goes to the manager.
+            if r.requested_sha.trim() == head
+                && (r.status == REVIEW_STATUS_TRUNCATED || r.status == REVIEW_STATUS_IN_FLIGHT)
+            {
+                return false;
+            }
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             review_round_due(r, head, live)
@@ -2738,53 +2785,75 @@ impl Orchestrator {
         // STUDIO-956: at the configured round threshold the loop stops ARMING and the MANAGER
         // decides — ship it, or escalate — instead of the loop silently stopping at the hard cap.
         // Checked before the dispatch loop so no row of this pull request is dispatched once the
-        // threshold is reached — except the ONE resumed round STUDIO-971 grants a new head below.
+        // threshold is reached — except the ONE resumed round a new head buys (STUDIO-971, and
+        // STUDIO-1021 for the no-decision and `escalate` shapes).
         //
         // STUDIO-971: a decision applies to the HEAD it was made at, never to the pull request for
-        // ever. A route-back after a `ship` adjudication is a NORMAL flow — the threshold fires on
-        // exactly the pull requests that are churning — so a push since the decision used to leave
-        // the loop stopped at a head that no longer existed, and the pull request could neither be
-        // reviewed nor merged. The maintained policy: past the threshold each new head buys exactly
-        // ONE round. The decision stops governing, the loop arms a single round at the new head,
-        // and a round that returns findings buys a FRESH adjudication there. The durable count is
-        // never reset, so it still shows the churn.
+        // ever. A route-back after an adjudication is a NORMAL flow — the threshold fires on exactly
+        // the pull requests that are churning — so a push since the decision used to leave the loop
+        // stopped at a head that no longer existed, and the pull request could neither be reviewed
+        // nor merged. The maintained policy: past the threshold each new head buys exactly ONE
+        // round. The decision stops governing, the loop arms a single round at the new head, and a
+        // round that returns findings buys a FRESH adjudication there. The durable count is never
+        // reset, so it still shows the churn.
+        //
+        // STUDIO-1021: the same rule answers two shapes the earlier code got wrong. (1) With NO
+        // decision yet, a threshold crossed by a head nobody has reviewed used to ask the manager
+        // about that unread head; it now arms the one round instead. (2) An `escalate` used to
+        // govern however far the head moved, so a fix pushed after an escalation was never read and
+        // every push paged a human; it is head-scoped now, exactly like a `ship`. The manager is
+        // asked only when every live reviewer has COMPLETED a review of the change at this head (or
+        // at a patch-id-proven head), and only after that round returns.
         if !mine.is_empty()
             && let Some(threshold) = self.adjudication_threshold()
         {
-            // Whether this head still owes its one resumed round: set only by a settled `ship`
-            // whose head a content-changing push has moved past and whose one round is not yet
-            // spent. It suppresses the fresh adjudication below so the round is armed instead —
-            // exactly once.
-            let mut resumed_round = false;
             if let Some(decision) = self.adjudication(pr) {
                 // A turn is out right now: arm nothing and ask nothing. This is also what keeps an
-                // escalation from ever resuming — an in-flight marker never reaches the resume path.
+                // in-flight adjudication from being interrupted by a resume.
                 if !decision.settled() {
                     report.deferred += 1;
                     self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                     return;
                 }
-                // The gates keep their say either way: a `ship` verdict adjudicates the open
-                // findings, never CI, approval-at-head, a draft, a conflict, or any other merge
-                // gate. A decision that still describes this head — a `ship` at it, a no-op rebase
-                // it survives, or any `escalate` — stops the loop here.
+                // The gates keep their say either way: an adjudication settles the open findings,
+                // never CI, approval-at-head, a draft, a conflict, or any other merge gate. A
+                // decision that still describes this head — one made at it, or a no-op rebase it
+                // survives — stops the loop here.
                 if decision.governs(head, unchanged_from) {
-                    // The one path that relaxes the exact-head rule (STUDIO-977 C): a `ship` may
-                    // satisfy approval-at-head for a patch the reviewers approved, which is a head
-                    // in `proven`.
+                    // The one path that relaxes the exact-head rule (STUDIO-977 C): an adjudication
+                    // may satisfy approval-at-head for a patch the reviewers approved, which is a
+                    // head in `proven`.
                     self.propose_auto_merge(&mine, pr, head, merge_state, &proven, report);
                     return;
                 }
-                // A settled `ship` at a head this content-changing push has moved past. Past the
-                // threshold the new head buys exactly one round. Whether that one round is still
-                // owed is answered from the ROWS ([`Self::resumed_round_owed`]) and NOT from
-                // `rounds_used`: a round dispatches one row per live reviewer, and when fewer rows
-                // than `review.reviewers` exist the floor-divided counter never reaches the next
-                // whole multiple, so a counter comparison would consider the round owed forever and
-                // reproduce this ticket's stall one round later. Once the round is spent the fresh
-                // adjudication below takes over — and a round that came back with findings is
-                // exactly what re-adjudicates here.
-                resumed_round = self.resumed_round_owed(pr, &mine, head);
+            }
+            // Whether this head still owes its one resumed round: some live row has not yet
+            // COMPLETED a review of the change `head` carries — at `head`, or at a patch-id-proven
+            // head its verdict was carried from. Asked with or without a settled decision, because
+            // a head no live reviewer has finished is not the manager's to decide either way.
+            //
+            // Decided from the ROWS ([`Self::resumed_round_owed`]) and NOT from `rounds_used`: a
+            // round dispatches one row per live reviewer, and when fewer rows than
+            // `review.reviewers` exist the floor-divided counter never reaches the next whole
+            // multiple, so a counter comparison would consider the round owed forever and reproduce
+            // the STUDIO-971 stall one round later. Once the round is spent the fresh adjudication
+            // below takes over — and a round that came back with findings is exactly what
+            // re-adjudicates here.
+            let resumed_round = self.resumed_round_owed(pr, &mine, head, &advance.skipped);
+            if resumed_round && self.rounds_used(pr) >= threshold {
+                // The one round is held back, like a decision, while either half of the loop is
+                // live: a review already running, or an author actively fixing whose push is about
+                // to move this head. A live review row is already excluded from `resumed_round` by
+                // `review_round_due`'s in-flight arm, so this catches the author half — the actor
+                // most likely to be mid-fix here, since the findings that moved the head summoned
+                // them. The round arms on a later sweep, once the head has settled.
+                if self.review_round_in_flight(&mine) {
+                    report.deferred += 1;
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
+                    return;
+                }
+                // Otherwise fall through to the dispatch loop below: it arms the owed rows at this
+                // head, exactly one round.
             }
             if !resumed_round && self.rounds_used(pr) >= threshold {
                 // A pull request that CONVERGED on its last allowed round is not a failure for the
@@ -4209,6 +4278,18 @@ mod tests {
             run_ids: &[i64],
         ) -> Result<std::collections::HashMap<i64, rs::RunProvenance>, rs::StoreError> {
             self.0.load_run_provenances(run_ids)
+        }
+        fn set_review_verdict(&self, run_id: i64, verdict: &str) -> Result<(), rs::StoreError> {
+            self.0.set_review_verdict(run_id, verdict)
+        }
+        fn review_verdict(&self, run_id: i64) -> Result<Option<String>, rs::StoreError> {
+            self.0.review_verdict(run_id)
+        }
+        fn load_review_verdicts(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, String>, rs::StoreError> {
+            self.0.load_review_verdicts(run_ids)
         }
         fn tokens_by_provider(
             &self,
@@ -8449,12 +8530,14 @@ mod tests {
     }
 
     /// **Acceptance.** Once the adjudication threshold is reached, BOTH sides stop: the review sweep
-    /// refuses the round and the author re-dispatch is refused, on the same counter.
+    /// refuses the round and the author re-dispatch is refused, on the same counter. The head is one
+    /// a reviewer has already READ — an unreviewed head buys the one resumed round instead
+    /// (STUDIO-1021; see `an_unreviewed_head_at_the_threshold_arms_one_round_not_the_manager`).
     #[test]
     fn a_reached_threshold_stops_the_review_side_and_the_author_side() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         let iss = author_issue("STUDIO-170", 12);
         // Three rounds reached.
         o.review_rounds
@@ -8665,7 +8748,7 @@ mod tests {
     fn a_turn_short_of_its_attempts_re_asks() {
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         o.review_rounds
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
         for _ in 0..(crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS - 1) {
@@ -8922,14 +9005,15 @@ mod tests {
         );
     }
 
-    /// **Acceptance.** With the threshold set to 3, a pull request reaching round 3 dispatches NO
-    /// further review or author round, and instead produces a manager decision naming the head and
-    /// the round count.
+    /// **Acceptance.** With the threshold set to 3, a pull request whose reviewers have READ the head
+    /// and reached round 3 dispatches NO further review or author round, and instead produces a
+    /// manager decision naming the head and the round count. An UNREAD head arms one more round
+    /// instead (STUDIO-1021).
     #[test]
     fn a_threshold_of_three_stops_the_loop_and_produces_a_manager_decision() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         // Three rounds already run (one reviewer per round, so three dispatches).
         o.review_rounds
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
@@ -9469,17 +9553,19 @@ mod tests {
         );
     }
 
-    /// **An escalation never resumes on the author's own push (acceptance, ⚠️).** The escalation
-    /// named a HUMAN as the next actor; resuming it on a push the author made themselves would mean
-    /// the escalation never reaches that human. Only `ship` resumes.
+    /// **STUDIO-1021 (the makewhatis/rhapsody#221 replay): an `escalate` is head-scoped.** The
+    /// escalation named a head; a content-changing push past it is code the manager never saw, so —
+    /// exactly as STUDIO-971 does for a `ship` — that new head buys exactly ONE round. When the
+    /// round returns findings the manager is asked again AT the new head; the escalation never
+    /// resumes the loop on its own.
     ///
-    /// MUTATION (the ticket's): let `Escalate` fall through the resume path too and this reds with a
-    /// round armed.
+    /// MUTATION (the ticket's): keep `Escalate` governing however far the head moves (the old
+    /// `governs`) and this reds with `dispatched == 0`.
     #[test]
-    fn an_escalated_pull_request_does_not_resume_on_a_push() {
+    fn an_escalation_is_head_scoped_and_a_content_change_buys_one_round() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         o.review_rounds
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
         l.record(
@@ -9492,18 +9578,122 @@ mod tests {
             },
         );
 
+        // The author pushes HEAD_B, changing the code the escalation was made about.
         let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
 
         assert_eq!(
+            report.dispatched, 1,
+            "the content-changing push buys exactly one round"
+        );
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager is not called for the resumed round"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_IN_FLIGHT,
+            "the round armed at the new head"
+        );
+        assert_eq!(
+            l.peek(&coord(12)).map(|d| d.head().to_string()),
+            Some(HEAD_A.to_string()),
+            "the escalation is not cleared until the round's findings re-adjudicate"
+        );
+
+        // The round returns findings: the manager decides again at HEAD_B.
+        complete(&mut o, 12, "bob", HEAD_B);
+        let next = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            next.adjudicate.len(),
+            1,
+            "a round with findings buys a fresh adjudication at the new head"
+        );
+        assert_eq!(next.adjudicate[0].head, HEAD_B);
+        assert!(
+            !l.peek(&coord(12)).expect("a plan is in flight").settled(),
+            "the superseded escalation is cleared and the fresh plan is marked in flight"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// **STUDIO-1021 (the makewhatis/rhapsody#221 replay, the approval half): a resumed round that
+    /// APPROVES merges.** When the round the content change bought comes back clean, the loop has
+    /// converged and the ordinary merge gate proceeds — no manager turn is needed.
+    #[test]
+    fn a_resumed_round_after_an_escalation_that_approves_merges() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaaaaaa".to_string()],
+                reason: "a human is needed".to_string(),
+            },
+        );
+
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+        approve(&mut o, 12, "bob", HEAD_B);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "an approved resumed round converges rather than asking the manager"
+        );
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(12),
+                head: HEAD_B.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }],
+            "the escalation's head moved and the new head is approved: auto-merge proceeds"
+        );
+    }
+
+    /// **STUDIO-1021: a push that leaves the patch-id unchanged buys NOTHING, so the escalation
+    /// stands.** The off-loop watcher proved HEAD_B carries the same change the escalation was made
+    /// against; there is no new work for a round to read, so nothing arms.
+    ///
+    /// MUTATION (the ticket's): let a content-UNCHANGING move resume the escalation and this reds
+    /// with a round armed.
+    #[test]
+    fn a_patch_preserving_push_does_not_resume_an_escalation() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: vec!["bob asked for changes at aaaaaaa".to_string()],
+                reason: "a human is needed".to_string(),
+            },
+        );
+
+        // The branch moves to HEAD_B with a byte-identical diff against the base.
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+
+        assert_eq!(
             report.dispatched, 0,
-            "an escalation is a human's; a push does not re-open the loop"
+            "a no-op move buys nothing: the escalation still stands"
         );
         assert!(report.adjudicate.is_empty());
         assert!(dispatched.lock().expect("lock").is_empty());
         assert_eq!(
             l.peek(&coord(12)).map(|d| d.head().to_string()),
             Some(HEAD_A.to_string()),
-            "and the escalation still stands, still naming its head"
+            "and the escalation is not cleared"
         );
     }
 
@@ -9591,8 +9781,10 @@ mod tests {
     /// available exactly when every required reviewer has READ the observed change — an `approved`
     /// or `reviewed` verdict at `head` or at a patch-id-proven head.
     ///
-    /// (1) A reviewer still owes a round at `HEAD_B`: nobody read the observed change, so
-    /// `ship_available == false` and the reason names the gate that failed.
+    /// (1) A reviewer still owes a round at `HEAD_B` and the per-pull-request cap is spent, so no
+    /// round can arm: nobody read the observed change, so `ship_available == false` and the reason
+    /// names the gate that failed. (Below the cap the sweep arms the one resumed round instead of
+    /// asking the manager — STUDIO-1021.)
     ///
     /// (2) A `reviewed` (findings) verdict at `HEAD_A`, proven identical to the observed `HEAD_B`,
     /// is a READ of this change — so `ship_available == true` and there is no failure to explain.
@@ -9610,15 +9802,17 @@ mod tests {
     /// alone and (2) reds on the unread-head line.
     #[test]
     fn the_sweep_computes_ship_availability_from_the_rows() {
-        // (1) A reviewer still owes a round at HEAD_B: nobody read the observed change.
+        // (1) A reviewer still owes a round at HEAD_B and no round can arm: nobody read the change.
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         introduce(&o, row(12, "bob"));
         o.store()
             .mark_review_requested(&key(12, "bob"), HEAD_B)
             .expect("requested");
-        o.review_rounds
-            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        o.review_rounds.insert(
+            churn_key(&coord(12)),
+            REVIEW_ROUNDS_PER_PR_CAP * o.reviewers_per_round(),
+        );
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!(report.adjudicate.len(), 1, "the manager is asked");
@@ -9704,22 +9898,23 @@ mod tests {
         );
     }
 
-    /// **The head the manager would decide against has moved past the last one read.** When the
-    /// threshold is crossed by an ANSWERED author round and the author then pushes again, every row
-    /// is still at the head that round was answered at, so a finding filter keyed on
-    /// `status == reviewed && last_reviewed_sha == head` names nothing at all and the manager is
-    /// asked to decide on a blank prompt. The plan must instead name the head that was actually
-    /// read and the unread head the author pushed.
+    /// **STUDIO-1021, requirement 1 (the makewhatis/rhapsody#222/#223 replay): the threshold is
+    /// crossed, then the author pushes a head NOBODY has read. One round arms; the manager is NOT
+    /// called.** The old code asked the manager to adjudicate that unread head — and an `ESCALATE`
+    /// answer posted a false "nobody read it" and paged a human for a fix that was exactly what the
+    /// reviewers were about to read. Only once the round returns findings is the manager asked, and
+    /// then it is asked about the head the reviewer actually read.
     ///
     /// STUDIO-1004 moved the round that crosses an EVEN threshold from the author's dispatch (which
-    /// no longer charges) to a reviewer's verdict, so this is the shape that replaces the old
-    /// "the author's own dispatch crossed it" reproduction: the push that follows the crossing is
-    /// what leaves an unread head.
+    /// no longer charges) to a reviewer's verdict, so this is the shape that replaces the old "the
+    /// author's own dispatch crossed it" reproduction: the push that follows the crossing is what
+    /// leaves an unread head.
     ///
-    /// Mutation check: restoring the exact-head/`reviewed`-only filter reds this test.
+    /// MUTATION (the ticket's): adjudicate an unreviewed head (drop the resumed-round arm) and this
+    /// reds with `adjudicate.len() == 1` and `dispatched == 0`.
     #[test]
-    fn the_plan_names_the_unread_head_when_a_push_follows_an_answered_round() {
-        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+    fn an_unreviewed_head_at_the_threshold_arms_one_round_not_the_manager() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         introduce(&o, reviewed_row(12, "bob", HEAD_A));
         // The review half is at two of the three rounds: one more answered author round crosses it.
@@ -9739,6 +9934,76 @@ mod tests {
         o.note_author_round(&iss);
         let report = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
 
+        assert_eq!(
+            report.dispatched, 1,
+            "the unread head buys exactly one round"
+        );
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not be asked to adjudicate a head nobody has read: {:?}",
+            report.adjudicate
+        );
+
+        // The round returns findings at HEAD_C: NOW the manager decides, and the plan names bob's
+        // findings — not a blank "nobody has read it" over a change he just read.
+        complete(&mut o, 12, "bob", HEAD_C);
+        let next = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
+        assert_eq!(next.adjudicate.len(), 1, "the spent round buys a decision");
+        let plan = &next.adjudicate[0];
+        assert_eq!(plan.head, HEAD_C);
+        assert!(
+            plan.findings.iter().any(|f| f.contains(&HEAD_C[..7])),
+            "the plan names the findings on the head that was read: {:?}",
+            plan.findings
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// **STUDIO-1021: a `rhapsody:human` hold still stops the resumed round.** The arming path falls
+    /// through to the ordinary dispatch loop, so the origin-ticket hold gate still refuses the round
+    /// and nothing is dispatched — and the manager is not asked either, because a held pull request
+    /// is not the daemon's to decide.
+    #[test]
+    fn a_human_hold_still_stops_the_resumed_round() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
+        o.human_holds.note_human_label("STUDIO-721");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "a held ticket's round must not dispatch"
+        );
+        assert!(
+            report.adjudicate.is_empty(),
+            "and the manager is not asked about a held ticket"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// **A plan formed where no round can arm still names the UNREAD head.** At the per-pull-request
+    /// cap the resumed round cannot be dispatched, so the manager IS asked about a head nobody read;
+    /// the prompt must say which head was last read and which the author pushed, rather than hand the
+    /// manager a blank "none recorded".
+    ///
+    /// Mutation check: restoring the exact-head/`reviewed`-only filter reds this test.
+    #[test]
+    fn the_plan_names_the_unread_head_when_no_round_can_arm() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        // The review half is spent: the unread head is the manager's, because no round can arm.
+        o.review_rounds.insert(
+            churn_key(&coord(12)),
+            REVIEW_ROUNDS_PER_PR_CAP * o.reviewers_per_round(),
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
+
         assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
         let plan = &report.adjudicate[0];
         assert_eq!(plan.head, HEAD_C);
@@ -9750,14 +10015,49 @@ mod tests {
         assert!(
             plan.findings
                 .iter()
-                .any(|f| f.contains(&HEAD_B[..7]) && f.contains(&HEAD_C[..7])),
+                .any(|f| f.contains(&HEAD_A[..7]) && f.contains(&HEAD_C[..7])),
             "the finding names the head that was last read AND the unread head: {:?}",
             plan.findings
         );
     }
 
+    /// **STUDIO-1021: "reviewed" follows STUDIO-977's patch-id proof.** With no decision yet, a
+    /// threshold crossed by a head whose change a reviewer has ALREADY read — at a patch-identical
+    /// head — is the manager's to decide: the verdict `handle_review_head_advanced` carried across is
+    /// a completed review of this very change, so the resumed-round arm must not fire. Pinned on the
+    /// FIRST sweep, because without the carried exclusion in `resumed_round_owed` the arm would
+    /// suppress this decision and the dispatch loop would skip the carried row, stalling a tick with
+    /// nothing in the report.
+    #[test]
+    fn a_patch_preserving_head_still_reaches_the_manager_without_a_resumed_round() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+
+        assert_eq!(
+            report.adjudicate.len(),
+            1,
+            "the change was read (patch-id proven): the manager decides, no round is owed"
+        );
+        assert_eq!(
+            report.dispatched, 0,
+            "and no round is armed for a change already read"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
     /// A TRUNCATED round at the threshold is a review that never happened; the plan must say that
     /// rather than hand the manager "none recorded" over a round nobody completed.
+    ///
+    /// **STUDIO-1021:** the round here was already DISPATCHED at `HEAD_A` (`requested_sha`), so the
+    /// one round this head buys is spent. The threshold hands the head to the MANAGER rather than
+    /// re-arming it — the unbounded re-arm alice's round-2 review found, which spent the whole gap
+    /// between the threshold and the hard cap on the most expensive kind of round. The same fixture
+    /// at `REVIEW_ROUNDS_PER_PR_CAP` is the cap's own case and is unchanged.
     #[test]
     fn a_truncated_round_at_the_threshold_names_the_review_that_never_finished() {
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
@@ -9786,6 +10086,58 @@ mod tests {
         );
     }
 
+    /// **STUDIO-1021 (alice's round-2 P2): a truncated resumed round does not re-arm at the same
+    /// head.** The unread head arms its one round; the round is DISPATCHED (so `requested_sha`
+    /// names this head) and then ends without a verdict. The one round is spent — the next sweep
+    /// hands the unfinished head to the manager instead of re-arming. Without the `requested_sha`
+    /// exclusion in `resumed_round_owed`, `review_round_due` calls the `truncated` row owed again
+    /// every sweep, so a review that keeps hitting the token ceiling spends every round between
+    /// `review.adjudicate_after_rounds` and `REVIEW_ROUNDS_PER_PR_CAP` before the manager is asked.
+    ///
+    /// MUTATION (the ticket's): drop the `requested_sha == head` exclusion and the second sweep
+    /// re-arms (`dispatched == 1`, `adjudicate` empty) instead of adjudicating.
+    #[test]
+    fn a_truncated_resumed_round_does_not_re_arm_at_the_same_head() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        // The unread head arms exactly one round, which records `requested_sha == HEAD_B`.
+        let first = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(first.dispatched, 1, "the unread head buys one round");
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+
+        // The round ends without declaring a verdict — the run is gone (as a real exit leaves it)
+        // and the row is parked `truncated` at the head it was dispatched against.
+        let id = review_key(OWNER, REPO, 12, "bob");
+        o.running.remove(&id);
+        o.claimed.remove(&id);
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_B, REVIEW_STATUS_TRUNCATED)
+            .expect("completed");
+
+        // The one round is spent: the manager decides, no second round arms.
+        let next = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            next.dispatched, 0,
+            "the dispatched round is not re-armed at the same head"
+        );
+        assert_eq!(
+            next.adjudicate.len(),
+            1,
+            "the unfinished head goes to the manager: {:?}",
+            next.adjudicate
+        );
+        assert_eq!(next.adjudicate[0].head, HEAD_B);
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "exactly one dispatch across both sweeps"
+        );
+    }
+
     /// **Unset ⇒ today's behaviour, byte-identical.** No threshold means no plan is ever emitted,
     /// whatever the counter says, and the review and author halves fall back to the legacy cap.
     #[test]
@@ -9809,6 +10161,46 @@ mod tests {
         assert!(
             !o.author_round_budget_spent(&iss),
             "three rounds is far inside the legacy cap, so the author half is still open"
+        );
+    }
+
+    /// **STUDIO-1021's byte-identical claim, pinned directly.** The whole adjudication block — the
+    /// decision lookup included — is gated on `review.adjudicate_after_rounds`, so with the
+    /// threshold unset a recorded decision (durable from when it WAS set) does not stop the loop: a
+    /// head advance still arms its round and the manager is never asked. **This assertion holds on
+    /// the pre-STUDIO-1021 code too** — the decision check was inside the same threshold gate then —
+    /// which is what makes it the unset-path control for the escalate head-scoping change.
+    #[test]
+    fn an_unset_threshold_ignores_a_recorded_decision_and_still_arms() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        let l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "a human is needed".to_string(),
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "no threshold ⇒ no adjudication, whatever the ledger holds"
+        );
+        assert_eq!(
+            report.dispatched, 1,
+            "and the head advance arms its round exactly as it did before this feature"
+        );
+        assert_eq!(
+            l.peek(&coord(12)).map(|d| d.head().to_string()),
+            Some(HEAD_A.to_string()),
+            "the ledger is not consulted, so it is left untouched"
         );
     }
 

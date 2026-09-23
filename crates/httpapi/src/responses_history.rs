@@ -553,15 +553,37 @@ pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) ->
 /// derives an attempt's ordinal from its position in the list, so folding reviews in would silently
 /// renumber every attempt label (STUDIO-976 trap 1). An empty array rather than an absent field: a
 /// ticket with no reviews renders exactly as it did before this field existed.
+///
+/// Each review row gains `verdict` when `verdicts` has one for its run id (STUDIO-1020): the
+/// daemon's own `approved`/`changes_requested` reading of that ROUND, so the strip can colour each
+/// past round by what it actually found rather than from the per-(PR, reviewer) watch set's latest
+/// status, which cannot describe an older round. The decoration sits HERE and never in
+/// `run_summary_json`, which is byte-pinned to the Go `/api/v1/history` golden — the same rule
+/// [`issue_runs_response`] follows. Absent — never null — when the run recorded none, so a round
+/// with no verdict renders exactly as it did before the field existed.
 pub(crate) fn issue_history_response(
     identifier: &str,
     runs: &[RunSummary],
     reviews: &[RunSummary],
+    verdicts: &HashMap<i64, String>,
 ) -> Value {
     json!({
         "issue_identifier": identifier,
         "runs": Value::Array(runs.iter().map(run_summary_json).collect()),
-        "reviews": Value::Array(reviews.iter().map(run_summary_json).collect()),
+        "reviews": Value::Array(
+            reviews
+                .iter()
+                .map(|r| {
+                    let mut row = run_summary_json(r);
+                    if let Some(verdict) = verdicts.get(&r.id)
+                        && let Some(obj) = row.as_object_mut()
+                    {
+                        obj.insert("verdict".to_string(), json!(verdict));
+                    }
+                    row
+                })
+                .collect(),
+        ),
     })
 }
 

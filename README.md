@@ -906,6 +906,29 @@ thing that lifts a bound in place; the operator's **Re-run** refunds one round a
 without resetting the budget. **Off is still off:** with `storage.path: off` there is nowhere to
 remember a bound, so the daemon keeps the per-boot behaviour it had before this ticket.
 
+### A fifth schema table with no Go counterpart — `rhapsody_review_verdicts` (STUDIO-1020)
+
+The run detail's review strip rendered every round the same neutral grey. The daemon knows each
+round's verdict the moment it completes, but records it only on `rhapsody_review_watch.status` — a
+per-(pull request, reviewer) row that holds the **latest** status and therefore cannot describe an
+older round. A ticket with three rounds whose last review approved would colour all three green. So
+each review RUN's verdict is recorded against its own `runs.id` and never rewritten:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **12** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound` and `rhapsody_review_verdicts` |
+| a review round's verdict | — | `rhapsody_review_verdicts.verdict` (`approved` / `changes_requested`), keyed by the run id |
+
+**Only a DECLARED verdict is written.** A round the max_turns backstop truncated, one whose
+`HANDOFF:` payload was unrecognised, a round whose worker crashed, and one still running all record
+nobody's verdict — the console shows them neutral, because "nobody judged this" is an answer and
+neither verdict would be. The row is written once at the run's exit, so a run that is later pruned
+simply leaves an orphan row no query joins from, exactly as `rhapsody_run_provenance` does. **Off is
+still off:** `storage.path: off` records nothing and the strip shows the neutral chip it always did.
+The `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` now pins the fourth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
@@ -1361,6 +1384,22 @@ gate. A manager that could merge a red pull request would be worse than the loop
 shipped pull request whose rows are not all approved is therefore reported as `review_shipped` (the
 gate still holds it, and no round will ever arm), while one whose rows are all approved either
 merges or falls to the ordinary `approved_still_open` report after the staleness threshold.
+
+**Past the threshold each new head buys exactly ONE round, and the manager is asked only about a
+head a reviewer has READ (STUDIO-971, STUDIO-1021).** A decision — ship OR escalate — is a statement
+about the head it was made at, never about the pull request for ever: a content-changing push after
+it buys one round (a patch-id-identical move buys nothing, STUDIO-960), and a round that comes back
+with findings buys a FRESH decision at the new head. An `escalate` is head-scoped exactly like a
+`ship`; it used to govern however far the head moved, which paged a human for every fix pushed after
+one. Symmetrically, a head no live reviewer has completed a review of is never handed to the
+manager: a threshold crossed by such a head arms the one round instead, and the manager is asked only
+once that round returns findings. That one round is spent the moment it is DISPATCHED at the head, so
+a round that ends `truncated` — or crashes with no live run — does not re-arm sweep after sweep up to
+the hard cap; the unfinished head is the manager's. At `REVIEW_ROUNDS_PER_PR_CAP` no round can arm, so
+the unread head is the manager's there. A decision whose loop converges past it — its resumed round
+approves the change the branch now carries — stops being reported, exactly as a fully-approved `ship`
+is left to the merge gate rather than the `review_escalated`/`review_shipped` report. A
+`rhapsody:human` hold still stops all of it.
 
 **Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
 assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot

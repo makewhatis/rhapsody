@@ -278,6 +278,12 @@ export interface RunSummary {
   usage_estimated: boolean;
   error: string;
   transcript_path: string;
+  // The daemon's own verdict for this REVIEW RUN (STUDIO-1020), present only on the review rows of
+  // GET /api/v1/issues/<id>/history when that round ended with a declared one. `approved` or
+  // `changes_requested`; ABSENT — never null — for an ordinary attempt, a review still running, and
+  // a round that ended without a verdict (failed, truncated, stopped). The strip reads absence as
+  // its neutral state rather than a guessed one.
+  verdict?: "approved" | "changes_requested";
 }
 
 // HistoryResponse is the GET /api/v1/history payload. next_offset is the offset to
