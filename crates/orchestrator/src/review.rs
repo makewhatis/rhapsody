@@ -280,6 +280,31 @@ fn declared_review_status(exit_state: &str) -> &'static str {
     }
 }
 
+/// The verdict this review is RECORDED with, reconciling the agent's declared hand-off with the
+/// structured block it emitted (STUDIO-1008).
+///
+/// The two must agree, and disagreement is resolved the conservative way — as [`REVIEW_STATUS_REVIEWED`]
+/// (changes requested). That direction is STUDIO-894's, established for a recorded verdict that
+/// contradicted the review text: a fabricated "approved" must never let a pull request past a
+/// reviewer who actually objected.
+///
+/// * A declared `findings`/`changes` verdict stays changes whatever the block says, so a block whose
+///   `approve` is `true` can NEVER override a recorded rejection.
+/// * A declared `approved` verdict with a block that says `approve: false` becomes changes.
+/// * A declared `approved` verdict with no block (or an approving one) stays approved.
+fn effective_review_status(
+    exit_state: &str,
+    block: Option<&crate::reviewfindings::ReviewVerdictBlock>,
+) -> &'static str {
+    match declared_review_status(exit_state) {
+        REVIEW_STATUS_APPROVED => match block {
+            Some(b) if !b.approve => REVIEW_STATUS_REVIEWED,
+            _ => REVIEW_STATUS_APPROVED,
+        },
+        other => other,
+    }
+}
+
 /// Canonicalizes a `rhapsody_review_watch.status` that a COMPLETED review round may be recorded
 /// with, or `None` for anything outside that closed domain (STUDIO-716).
 ///
@@ -659,7 +684,13 @@ impl Orchestrator {
             self.record_review_truncated(run);
             (store::OUTCOME_COMPLETED, "")
         } else {
-            let status = declared_review_status(&e.last_state);
+            let status = effective_review_status(&e.last_state, e.review_verdict.as_ref());
+            // STRUCTURED FINDINGS (STUDIO-1008): the same completed round that records the verdict
+            // also records the finding revisions it produced (or resolves the reviewer's open ones on
+            // an approval). Placed beside the two verdict writes because it is the same fact, and
+            // gated on the ticketless path structurally — `on_review_exit` is reachable only for a
+            // review run. Best-effort like every other store write here.
+            self.record_review_findings(run, re.run_id, status, e.review_verdict.as_ref());
             self.record_review_completed(run, status);
             // The SAME verdict, recorded against the RUN (STUDIO-1020). The watch set above holds
             // only the latest status per (PR, reviewer), so a ticket whose newest review approved
@@ -721,6 +752,78 @@ impl Orchestrator {
             .mark_review_completed(&run.watch_key(), &run.head_sha, status)
         {
             tracing::warn!(review = %run.key(), err = %e, "recording the reviewed head failed");
+        }
+    }
+
+    /// Records the finding revisions a completed review produced, and resolves the reviewer's open
+    /// revisions on an approval (STUDIO-1008; design record `manager-agent-design.md` §5.3).
+    ///
+    /// `status` is the EFFECTIVE verdict ([`effective_review_status`]), not the raw hand-off: an
+    /// approving review resolves; any other terminal verdict records finding revisions. A changes
+    /// verdict with no machine-readable findings records the single unstructured fallback, scoped to
+    /// this run so it blocks once and then never again on its own.
+    ///
+    /// Best-effort like every other store write on this path — a failure is logged, never fatal. A
+    /// store-disabled daemon (`run_id == 0`) has nowhere to record and nothing that reads it. The
+    /// prior-findings read is the one write this method SKIPS on failure rather than degrading: a
+    /// revision computed against an unreadable history would silently collide with an existing row
+    /// and be dropped, so recording nothing (with a warning) is the honest failure.
+    pub(crate) fn record_review_findings(
+        &self,
+        run: &ReviewRun,
+        run_id: i64,
+        status: &str,
+        block: Option<&crate::reviewfindings::ReviewVerdictBlock>,
+    ) {
+        if run_id == 0 {
+            return; // storage off: nowhere to record it (the run verdict follows the same rule)
+        }
+        let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number).to_string();
+        let prior = match self.store().load_review_findings(&pr) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    review = %run.key(),
+                    err = %e,
+                    "reading the pull request's prior findings failed; recording no finding \
+                     revisions for this round rather than computing them against an unknown history"
+                );
+                return;
+            }
+        };
+        let plan =
+            crate::reviewfindings::plan_review_findings(&crate::reviewfindings::CompletionInputs {
+                pr: &pr,
+                generation: crate::reviewfindings::FINDING_GENERATION_PLACEHOLDER,
+                reviewer: &run.reviewer,
+                run_id,
+                head_sha: &run.head_sha,
+                approved: status == REVIEW_STATUS_APPROVED,
+                block,
+                prior: &prior,
+            });
+        for row in plan.rows {
+            if let Err(e) = self.store().save_review_finding(row) {
+                tracing::warn!(
+                    review = %run.key(),
+                    err = %e,
+                    "recording a review finding revision failed"
+                );
+            }
+        }
+        if plan.resolve_open
+            && let Err(e) = self.store().resolve_review_findings(
+                &pr,
+                crate::reviewfindings::FINDING_GENERATION_PLACEHOLDER,
+                &run.reviewer,
+                &run_id.to_string(),
+            )
+        {
+            tracing::warn!(
+                review = %run.key(),
+                err = %e,
+                "resolving the reviewer's open findings failed"
+            );
         }
     }
 
@@ -875,6 +978,7 @@ mod tests {
                 labels: Vec::new(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             }],
             ..Teams::disabled()
         });
@@ -1156,6 +1260,7 @@ mod tests {
                 labels: Vec::new(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             });
         }
         o.eff.as_mut().expect("eff").cfg.budgets.insert(
@@ -2280,6 +2385,32 @@ mod tests {
             // empty — the exact input that made every clean review exit an OUTCOME_CONTINUED.
             last_state: last_state.to_string(),
             declared_handoff,
+            // The unstructured fallback: these tests predate the structured contract and emit no
+            // block (STUDIO-1008). `exit_review_with_verdict` below carries a parsed one.
+            review_verdict: None,
+            refused: false,
+        });
+        run_id
+    }
+
+    /// [`exit_review_as`] with a parsed structured verdict block attached (STUDIO-1008).
+    fn exit_review_with_verdict(
+        o: &mut Orchestrator,
+        run: &ReviewRun,
+        last_state: &str,
+        verdict: crate::reviewfindings::ReviewVerdictBlock,
+    ) -> i64 {
+        let id = run.key();
+        let re = o.running.get(&id).expect("the review is running");
+        let (started_at, run_id) = (re.started_at, re.run_id);
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: id,
+            failed: false,
+            started_at,
+            err_msg: String::new(),
+            last_state: last_state.to_string(),
+            declared_handoff: true,
+            review_verdict: Some(verdict),
             refused: false,
         });
         run_id
@@ -3001,6 +3132,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: true,
+            review_verdict: None,
             refused: false,
         });
 
@@ -3169,6 +3301,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
 
@@ -3240,6 +3373,216 @@ mod tests {
             o.running[&id].model_override.is_empty(),
             "{:?}",
             o.running[&id].model_override
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // STUDIO-1008 — the structured finding revisions a completed review records.
+    // ---------------------------------------------------------------------------------------------
+
+    const PR12: &str = "makewhatis/rhapsody#12";
+
+    /// One declared finding, blocking, with the given id and summary.
+    fn block_finding(id: &str, summary: &str) -> crate::reviewfindings::BlockFinding {
+        crate::reviewfindings::BlockFinding {
+            id: id.to_string(),
+            blocking: true,
+            summary: summary.to_string(),
+            paths: vec!["src/a.rs".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn verdict_block(
+        approve: bool,
+        findings: Vec<crate::reviewfindings::BlockFinding>,
+    ) -> crate::reviewfindings::ReviewVerdictBlock {
+        crate::reviewfindings::ReviewVerdictBlock { approve, findings }
+    }
+
+    /// Dispatches one review and gives it a completed exit carrying `verdict`, returning its run id.
+    fn run_one_review(
+        o: &mut Orchestrator,
+        reviewer: &str,
+        head: &str,
+        last_state: &str,
+        verdict: Option<crate::reviewfindings::ReviewVerdictBlock>,
+    ) -> i64 {
+        let run = review_run(reviewer, head);
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        match verdict {
+            Some(v) => exit_review_with_verdict(o, &run, last_state, v),
+            None => exit_review_as(o, &run, false, "", true, last_state),
+        }
+    }
+
+    /// A structured block is parsed into finding revisions: one row per declared finding, scoped per
+    /// reviewer and recorded blocking.
+    #[test]
+    fn a_structured_block_is_recorded_as_finding_revisions() {
+        let (mut o, _d) = orch_with_review(true);
+        let block = verdict_block(
+            false,
+            vec![block_finding("B8", "abort bypasses cancellation")],
+        );
+        run_one_review(&mut o, "alice", HEAD_A, REVIEW_STATE_FINDINGS, Some(block));
+
+        let rows = o.store().load_review_findings(PR12).expect("load findings");
+        assert_eq!(rows.len(), 1, "one revision for one declared finding");
+        let row = &rows[0];
+        assert_eq!(row.finding_id, "alice:B8", "scope the id per reviewer");
+        assert_eq!(row.revision, 1);
+        assert!(row.blocking);
+        assert_eq!(row.status, rhapsody_store::REVIEW_FINDING_OPEN);
+        assert_eq!(row.paths, vec!["src/a.rs".to_string()]);
+        assert_eq!(row.raised_at_sha, HEAD_A);
+        assert_eq!(
+            o.store().open_blocking_findings(PR12).expect("open").len(),
+            1
+        );
+        let _ = row;
+    }
+
+    /// The acceptance rule that makes a repeat raise comparable to the revision before it: the same
+    /// reviewer raising the same id again increments `revision` rather than overwriting.
+    #[test]
+    fn a_repeat_raise_increments_revision() {
+        let (mut o, _d) = orch_with_review(true);
+        run_one_review(
+            &mut o,
+            "alice",
+            HEAD_A,
+            REVIEW_STATE_FINDINGS,
+            Some(verdict_block(false, vec![block_finding("B8", "same")])),
+        );
+        run_one_review(
+            &mut o,
+            "alice",
+            HEAD_B,
+            REVIEW_STATE_FINDINGS,
+            Some(verdict_block(false, vec![block_finding("B8", "same")])),
+        );
+
+        let rows = o.store().load_review_findings(PR12).expect("load");
+        assert_eq!(rows.len(), 2, "a repeat raise is a NEW revision row");
+        assert_eq!(rows[0].revision, 1);
+        assert_eq!(rows[1].revision, 2);
+        assert_eq!(rows[1].raised_at_sha, HEAD_B);
+    }
+
+    /// A later approving review from the same reviewer resolves that reviewer's open revisions.
+    #[test]
+    fn an_approving_review_resolves_that_reviewers_open_revisions() {
+        let (mut o, _d) = orch_with_review(true);
+        run_one_review(
+            &mut o,
+            "alice",
+            HEAD_A,
+            REVIEW_STATE_FINDINGS,
+            Some(verdict_block(false, vec![block_finding("B8", "fix me")])),
+        );
+        assert_eq!(
+            o.store().open_blocking_findings(PR12).expect("open").len(),
+            1
+        );
+
+        let approving = run_one_review(&mut o, "alice", HEAD_B, REVIEW_STATE_APPROVED, None);
+
+        assert!(
+            o.store()
+                .open_blocking_findings(PR12)
+                .expect("open after approval")
+                .is_empty(),
+            "the approving review resolved the open revision"
+        );
+        let rows = o.store().load_review_findings(PR12).expect("load");
+        assert_eq!(rows[0].status, rhapsody_store::REVIEW_FINDING_RESOLVED);
+        assert_eq!(rows[0].resolved_by, approving.to_string());
+    }
+
+    /// Mutation discipline: a stable unstructured id would let one dismissal silence a reviewer's
+    /// later, unrelated objections. Two unstructured reviews by one reviewer must be two findings.
+    #[test]
+    fn two_unstructured_reviews_get_distinct_finding_ids() {
+        let (mut o, _d) = orch_with_review(true);
+        run_one_review(&mut o, "alice", HEAD_A, REVIEW_STATE_FINDINGS, None);
+        run_one_review(&mut o, "alice", HEAD_B, REVIEW_STATE_FINDINGS, None);
+
+        let rows = o.store().load_review_findings(PR12).expect("load");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one synthetic finding per unstructured review"
+        );
+        assert_ne!(
+            rows[0].finding_id, rows[1].finding_id,
+            "each unstructured finding is scoped to its own review run"
+        );
+        assert!(rows.iter().all(|r| r.blocking && r.paths.is_empty()));
+        assert!(
+            rows.iter()
+                .all(|r| r.finding_id.starts_with("alice:unstructured:")),
+            "{:?}",
+            rows.iter().map(|r| &r.finding_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Mutation discipline: `approve: true` in the block must NOT be authoritative over a recorded
+    /// `changes` verdict (STUDIO-894's conservative direction). The review stays changes, and it
+    /// blocks via the unstructured fallback since the approving block declares no findings.
+    #[test]
+    fn approve_true_does_not_override_a_recorded_changes_verdict() {
+        let (mut o, _d) = orch_with_review(true);
+        let mut rx = o.open_review_notify_channel();
+        let run = review_run("alice", HEAD_A);
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        exit_review_with_verdict(
+            &mut o,
+            &run,
+            REVIEW_STATE_FINDINGS,
+            verdict_block(true, vec![]),
+        );
+
+        let watch = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("watch read")
+            .expect("row");
+        assert_eq!(
+            watch.status, REVIEW_STATUS_REVIEWED,
+            "a block's approve:true must not upgrade a recorded changes verdict"
+        );
+        assert_eq!(
+            drain_notifications(&mut rx),
+            vec![(PR12.to_string(), false)],
+            "the author is not told the pull request was approved"
+        );
+        let rows = o.store().load_review_findings(PR12).expect("load");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].blocking, "the changes verdict still blocks");
+    }
+
+    /// Outside ticketless review nothing changes: a Teams-off daemon refuses the review before any
+    /// write, so the finding table is never touched.
+    #[test]
+    fn a_teams_off_daemon_records_no_findings() {
+        let (mut o, _d) = orch_with_review(false);
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::TeamsOff
+        );
+        assert!(
+            o.store()
+                .load_review_findings(PR12)
+                .expect("load")
+                .is_empty(),
+            "a Teams-off daemon writes no finding rows"
         );
     }
 }

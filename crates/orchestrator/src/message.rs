@@ -520,6 +520,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
 

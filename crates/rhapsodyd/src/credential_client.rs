@@ -390,23 +390,56 @@ async fn read_over_channel(
     };
     match client.read_bound(account, expected_binding).await {
         Ok(read) => read,
-        // A clean EOF here is the ONLY signal a rejected `Hello` ever produces (the server closes
-        // silently rather than answering — see `credential_bootstrap::serve_one`), so this is the
-        // closest available approximation of `OwnerUnauthorized`. It is not perfectly precise: an
-        // owner that authenticated us and then crashed/closed before answering this exact request
-        // produces the identical EOF and would also be classified `OwnerUnauthorized` rather than
-        // `OwnerUnavailable`. Disambiguating the two needs the server to distinguish them on the
-        // wire, which the deliberate no-oracle rejection design does not do; accepted here as a
-        // P0c-scope approximation rather than population of a state PB7 depends on for anything
-        // safety-critical (both states already forbid any credential use).
-        Err(ClientError::Frame(FrameError::Eof)) => CredentialRead {
+        Err(e) => classify_read_bound_failure(&e),
+    }
+}
+
+/// Classifies a `read_bound` call that followed a completed `Hello` handshake but received no
+/// response — the only observable outcome of a rejected `Hello`.
+///
+/// A clean EOF is the signal a rejected `Hello` produces on macOS: the server closes silently
+/// rather than answering (see `credential_bootstrap::serve_one`), and the design has no rejection
+/// frame to send. On Linux the same close — a unix socket closed while an inbound frame is still
+/// unread — surfaces as a connection RESET (`ECONNRESET`) instead, or as a BROKEN PIPE (`EPIPE`) if
+/// the reset lands on the request write (STUDIO-1029). All three mean "the owner closed on us", so
+/// all three are the same `OwnerUnauthorized` approximation the EOF arm already carried. Treating
+/// the reset as `OwnerUnavailable`, as the pre-STUDIO-1029 code did, told an operator the owner was
+/// *down* when it had in fact *rejected the token*.
+///
+/// The approximation is not perfectly precise: an owner that authenticated us and then crashed or
+/// was reset before answering produces an identical error and is also classified `OwnerUnauthorized`
+/// rather than `OwnerUnavailable`. Disambiguating the two needs the server to distinguish them on
+/// the wire, which the deliberate no-oracle rejection design does not do; accepted as a P0c-scope
+/// approximation rather than population of a state PB7 depends on for anything safety-critical
+/// (both states already forbid any credential use).
+///
+/// Everything else is `OwnerUnavailable`: a `Hello`-accepted owner that never answers within
+/// [`RESPONSE_TIMEOUT`] (wedged, or simply too slow), a decode/oversize protocol failure, or any
+/// other transport error, none of which is the owner rejecting us.
+fn classify_read_bound_failure(err: &ClientError) -> CredentialRead {
+    if is_owner_closed(err) {
+        CredentialRead {
             revision: Revision::INITIAL,
             state: CredentialState::OwnerUnauthorized,
-        },
-        // A `Hello`-accepted owner that never answers within `RESPONSE_TIMEOUT` (wedged, or simply
-        // too slow) is unavailable, not unauthorized — the connection itself was never rejected.
-        // Every other connect/frame failure is unavailable too.
-        Err(_) => unavailable_read(),
+        }
+    } else {
+        unavailable_read()
+    }
+}
+
+/// True when `err` is the owner's end of the connection going away: a clean EOF, or the
+/// reset/broken-pipe a peer that closes on an unread inbound frame produces (Linux `ECONNRESET`/
+/// `EPIPE` where macOS gives EOF). See [`classify_read_bound_failure`].
+fn is_owner_closed(err: &ClientError) -> bool {
+    match err {
+        ClientError::Frame(FrameError::Eof) => true,
+        ClientError::Frame(FrameError::Io(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ),
+        // `Timeout`, `Poisoned`, a decode/oversize frame error, and every other Io error are NOT the
+        // owner closing on us — they must stay `OwnerUnavailable`.
+        _ => false,
     }
 }
 
@@ -683,6 +716,135 @@ mod tests {
 
         accept.await.unwrap();
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Forces an abortive close of `stream`: with `SO_LINGER` enabled and a zero timeout, `close(2)`
+    /// discards the send queue and sends RST instead of FIN. That reproduces, on any platform, the
+    /// Linux shape STUDIO-1029 is about — a peer that closes while an inbound frame is still unread,
+    /// which the reader observes as `ECONNRESET` rather than the clean EOF macOS delivers.
+    fn set_linger_zero(stream: &tokio::net::UnixStream) {
+        use std::os::unix::io::AsRawFd;
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt(SO_LINGER, 0) failed");
+    }
+
+    // STUDIO-1029: the Linux half of the rejected-owner classification. On macOS a peer that rejects
+    // `Hello` and closes gives the client a clean EOF; on Linux a socket closed with an unread
+    // inbound frame yields `ECONNRESET` (or `EPIPE` if the reset lands on the request write). Both
+    // mean the owner closed on us after a rejected `Hello`, so both must classify as
+    // `OwnerUnauthorized` — NOT `OwnerUnavailable`, which is what a bolted-on reset arm used to
+    // report and what an operator would read as "the owner is down" for a token it in fact
+    // rejected. `SO_LINGER(0)` forces the RST deterministically, so this pins the Linux shape from
+    // any platform.
+    #[tokio::test]
+    async fn resolve_credential_reports_owner_unauthorized_when_the_owner_resets_the_connection() {
+        let path = unix_socket_path("reset");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            set_linger_zero(&stream);
+            let (mut r, _w) = tokio::io::split(stream);
+            // Consume `Hello`, then let both halves drop with `SO_LINGER(0)` set — the close sends
+            // RST while our own `ReadBound` request sits unread in the receive queue, exactly the
+            // Linux rejection shape. The token is irrelevant: the rejection is the close itself.
+            let _hello: HelloFrame = read_frame(&mut r).await.expect("read hello");
+        });
+
+        let (mut tx, rx) = duplex(4096);
+        write_frame(
+            &mut tx,
+            &BootstrapMessage {
+                token: "wrong-token".into(),
+                socket_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let resolver = CredentialResolver::new();
+        resolver.learn_bootstrap(rx).await;
+        let read = resolver.read_bound("v1:x".into(), a_binding()).await;
+        assert_eq!(
+            read.read.state.tag(),
+            CredentialStateTag::OwnerUnauthorized,
+            "a reset connection after `Hello` is a rejected owner, not an unavailable one"
+        );
+
+        accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    // STUDIO-1029: the same classification, driven directly so it is pinned on every platform
+    // (macOS gives a real socket a clean EOF where Linux gives a reset, so the socket tests above
+    // cannot exercise the reset arm on a Mac). The Linux `ECONNRESET` and its write-side sibling
+    // `EPIPE`, plus the macOS EOF, are all "the owner closed on us"; a timeout, a decode/oversize
+    // protocol failure, and any other transport error are not, and must stay `OwnerUnavailable` —
+    // a genuinely unreachable owner must NOT be read as a rejection.
+    #[test]
+    fn a_peer_close_is_unauthorized_and_a_real_transport_failure_is_unavailable() {
+        let reset = ClientError::Frame(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "ECONNRESET",
+        )));
+        let broken_pipe = ClientError::Frame(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "EPIPE",
+        )));
+        for closed in [reset, broken_pipe, ClientError::Frame(FrameError::Eof)] {
+            assert!(
+                is_owner_closed(&closed),
+                "{closed:?} is the owner closing on us"
+            );
+            assert_eq!(
+                classify_read_bound_failure(&closed).state.tag(),
+                CredentialStateTag::OwnerUnauthorized,
+                "{closed:?} must classify as a rejected owner, not an unavailable one"
+            );
+        }
+
+        let decode = ClientError::Frame(FrameError::Decode(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        ));
+        let other_io = ClientError::Frame(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "EACCES",
+        )));
+        let too_large = ClientError::Frame(FrameError::TooLarge {
+            got: 64 * 1024 + 1,
+            max: 64 * 1024,
+        });
+        for failed in [
+            ClientError::Timeout,
+            ClientError::Poisoned,
+            decode,
+            other_io,
+            too_large,
+        ] {
+            assert!(
+                !is_owner_closed(&failed),
+                "{failed:?} must not be read as the owner closing on us"
+            );
+            assert_eq!(
+                classify_read_bound_failure(&failed).state.tag(),
+                CredentialStateTag::OwnerUnavailable,
+                "{failed:?} must stay OwnerUnavailable"
+            );
+        }
     }
 
     // A wedged owner (accepted `Hello`, then never answers) must not hang the calling daemon task

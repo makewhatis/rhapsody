@@ -10,6 +10,9 @@
 //! For a non-streaming response, [`SseUsageObserver::observe_json`] reads the top-level `usage`
 //! object directly (design §7.3).
 //!
+//! The parsed [`UsageObservation`] value lives in the always-compiled core ([`crate::usage`]); only
+//! the parser is part of this `loopback`-gated adapter.
+//!
 //! Usage values must be finite non-negative integers; a present-but-invalid value makes the whole
 //! observation unknown (design §7.3). The last `usage` object in the stream is judged as a whole —
 //! fields from an earlier object never mix into a later one.
@@ -18,51 +21,11 @@
 //! syntactically valid provider report can never re-open admission is why nothing here releases a
 //! reservation.
 
+use crate::usage::UsageObservation;
+
 /// The maximum bytes held for one SSE line before it is treated as malformed (design §7.1's 64 KiB
 /// maximum SSE event).
 pub const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
-
-/// The provider-reported usage observed from a response. Every field is optional and only set when
-/// the provider reported a syntactically valid non-negative integer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UsageObservation {
-    /// Provider-reported input (prompt) tokens.
-    pub input_tokens: Option<u64>,
-    /// Provider-reported output (completion) tokens.
-    pub output_tokens: Option<u64>,
-    /// Provider-reported cached input tokens, when the provider reports them.
-    pub cached_tokens: Option<u64>,
-    /// Provider-reported total tokens.
-    pub total_tokens: Option<u64>,
-    /// A syntactically valid usage object with input, output and total was observed.
-    pub complete: bool,
-    /// The reported total disagreed with the component counts (a bounded diagnostic; settlement uses
-    /// the larger conservative value).
-    pub inconsistent: bool,
-    /// Count of events that were malformed or oversized. Non-zero makes usage unknown.
-    pub malformed_events: u64,
-}
-
-impl UsageObservation {
-    /// The conservative token count for settlement: the larger of the reported total and the sum of
-    /// the reported components. `None` when nothing usable was reported.
-    pub fn conservative_total(&self) -> Option<u64> {
-        let components = match (self.input_tokens, self.output_tokens) {
-            (Some(input), Some(output)) => input.checked_add(output),
-            _ => None,
-        };
-        match (self.total_tokens, components) {
-            (Some(total), Some(sum)) => Some(total.max(sum)),
-            (Some(total), None) => Some(total),
-            (None, sum) => sum,
-        }
-    }
-
-    /// Whether the provider never supplied usable usage: every request is conservatively unknown.
-    pub fn is_unknown(&self) -> bool {
-        !self.complete || self.malformed_events > 0
-    }
-}
 
 /// The maximum bytes of the raw `usage` member a non-streaming body may carry before the observer
 /// treats it as malformed. A usage object is a handful of integers; refusing to parse anything
