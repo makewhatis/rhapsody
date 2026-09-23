@@ -1583,19 +1583,41 @@ mod tests {
         assert_eq!(got, N, "registered worktrees:\n{out}");
     }
 
-    // Mirror of TestEnsureFromRepo_HookRunsUnlocked: two concurrent same-repo after_create hooks
-    // must OVERLAP (the mirror lock is released before the hook).
+    // Mirror of TestEnsureFromRepo_HookRunsUnlocked, made DETERMINISTIC (STUDIO-1032): two concurrent
+    // same-repo after_create hooks must run CONCURRENTLY, i.e. the per-repo mirror lock is released
+    // before the hook. The Go mirror inferred this from wall-clock [start,end] intervals around a
+    // sleep. That inference false-failed on a loaded Linux runner: the second task's own
+    // mirror/worktree work (done under the lock, before its hook) can outlast the first hook's
+    // sleep, so the two intervals missed overlapping by ~12ms even though both hooks ran
+    // concurrently (and the lock is a process-local `tokio::sync::Mutex` dropped well before the
+    // hook — there is no OS lock fd to inherit). A cross-process BARRIER proves concurrency
+    // directly instead: each hook signals its arrival under the shared per-repo dir and blocks until
+    // BOTH have arrived, bounded so a hook whose peer never starts (the lock held across the hook)
+    // FAILS rather than hangs. No wall-clock tolerance is involved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ensure_from_repo_hook_runs_unlocked() {
         let origin = init_local_origin();
-        // Perl Time::HiRes (present on macOS + Linux) rather than $EPOCHREALTIME (bash >= 5 only).
-        // The hook stamps a start time, sleeps, then stamps an end time; the two concurrent hooks'
-        // [start,end] intervals must OVERLAP to prove the mirror lock is NOT held across the hook.
-        // The sleep is the jitter tolerance: it must exceed the scheduling skew between the two
-        // spawned tasks' hook starts, or a concurrent-but-skewed pair reads as non-overlapping under
-        // load (a false failure on busy CI). 1s comfortably exceeds real task-startup skew while a
-        // SERIALIZED pair (start2 == end1) still clearly fails the overlap check. (TRA-243)
-        let hook = r#"now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; now > .hook_times; sleep 1; now >> .hook_times"#;
+        // The hook cwd is the per-issue worktree, so `..` is the shared <root>/<RepoKey> dir they
+        // rendezvous in. `$$` keeps each arrival file distinct. The bounded poll (200 * 50ms = 10s,
+        // well under the 30s hook timeout) turns a peer that never starts into a hook failure.
+        let hook = r#"
+            bar=..
+            mkdir -p "$bar/.barrier"
+            : > "$bar/.barrier/$$"
+            n=0
+            while :; do
+                set -- "$bar/.barrier"/*
+                [ "$#" -ge 2 ] && break
+                n=$((n + 1))
+                if [ "$n" -gt 200 ]; then
+                    echo "after_create barrier timed out: the peer hook never started (mirror lock held across the hook?)" >&2
+                    exit 1
+                fi
+                sleep 0.05
+            done
+            sleep 0.3
+            : > .hook_done
+        "#;
         let (m, _root) = repo_test_manager(after(hook));
         let m = Arc::new(m);
 
@@ -1609,33 +1631,35 @@ mod tests {
                     .map(|_| ())
             });
         }
-        while let Some(joined) = set.join_next().await {
-            joined.expect("task panicked").expect("ensure failed");
+        // Both ensures return Ok only if both hooks exited 0, which requires both to have passed the
+        // barrier — i.e. run concurrently. A serialized pair times the first hook out (exit 1) and
+        // fails here carrying the barrier message. The outer timeout bounds the hang a genuine
+        // lock-across-hook regression would otherwise produce (the first hook would wait on a peer
+        // that can never start).
+        let deadline = std::time::Duration::from_secs(25);
+        loop {
+            let joined = tokio::time::timeout(deadline, set.join_next())
+                .await
+                .expect("after_create hooks never both ran: the mirror lock is held across the hook");
+            match joined {
+                Some(joined) => joined.expect("task panicked").expect("ensure failed"),
+                None => break,
+            }
         }
 
-        let read_interval = |id: &str| -> (f64, f64) {
-            let p = join(&[
+        // Both hooks reached the barrier and ran to completion (each in its own worktree).
+        for i in 0..2 {
+            let done = join(&[
                 &m.root,
                 &repo_key(&origin.path),
-                &sanitize_key(id),
-                ".hook_times",
+                &sanitize_key(&format!("MT-OVL-{i}")),
+                ".hook_done",
             ]);
-            let body = std::fs::read_to_string(&p).unwrap();
-            let nums: Vec<f64> = body
-                .split_whitespace()
-                .map(|x| x.parse().unwrap())
-                .collect();
-            assert_eq!(nums.len(), 2, "hook times malformed: {body:?}");
-            (nums[0], nums[1])
-        };
-        let (s0, e0) = read_interval("MT-OVL-0");
-        let (s1, e1) = read_interval("MT-OVL-1");
-        // Two intervals overlap iff each starts before the other ends.
-        assert!(
-            s0 < e1 && s1 < e0,
-            "after_create hooks did not overlap (mirror lock held across hook?): \
-             [{s0:.6},{e0:.6}] [{s1:.6},{e1:.6}]"
-        );
+            assert!(
+                std::fs::metadata(&done).is_ok(),
+                "hook MT-OVL-{i} did not complete the barrier rendezvous"
+            );
+        }
     }
 
     // Mirror of TestEnsureFromRepo_ClearsStaleLockBeforeMutating.
