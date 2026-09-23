@@ -24,6 +24,7 @@
 //! A kept directory carries exactly what the run mode already allowed (for a brokered session, no
 //! `auth.json` at all — `provider-broker-design.md` §9.1).
 
+use std::collections::HashSet;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
@@ -143,22 +144,44 @@ pub fn discard(state_root: &str, issue: &str) {
 /// to to be dispatched again. [`select`]'s retention check only runs when that SAME issue is
 /// redispatched, so an issue that goes terminal, is cancelled by hand, or simply never comes back
 /// would otherwise keep its directory forever — and in legacy mode that directory holds a copy of
-/// the operator's credential. The daemon calls this at startup and once per tick, which is what makes
-/// the retention bound hold with no redispatch (STUDIO-1043 review B1).
+/// the operator's credential. The daemon calls this once per tick (and discards a terminal issue's
+/// session directly at every terminal seam), which is what makes the retention bound hold with no
+/// redispatch (STUDIO-1043 review B1).
+///
+/// `running` is the set of issue identifiers the daemon currently has a live run for. A record whose
+/// issue is in that set is left alone even when it is past its window: `select` adopts such a session
+/// and leaves the record on disk with its ORIGINAL `saved_at_ms`, so a long run can outlive the
+/// window it was retained under, and sweeping it here would delete the live session's
+/// `XDG_DATA_HOME` — and in legacy mode the seeded credential — out from under the running child
+/// (STUDIO-1043 review B2). The record is bounded as soon as that issue stops running: either a later
+/// `select` on a fresh dispatch, or the next sweep once it leaves the running set.
 ///
 /// A record file that does not parse is removed too: it can never be selected, and leaving it would
 /// only re-log the same warning on every sweep. Returns how many records were discarded.
-pub fn sweep(state_root: &str, now_ms: i64) -> usize {
+pub fn sweep(state_root: &str, now_ms: i64, running: &HashSet<String>) -> usize {
     let Ok(root) = resolved_root(state_root) else {
         return 0;
     };
     let Ok(entries) = std::fs::read_dir(root.join(RECORDS_DIR)) else {
         return 0;
     };
+    // Compare against the same sanitized key `save` names the record file with, so the running
+    // identifier and the on-disk stem agree whatever characters the tracker put in the identifier.
+    let running_keys: HashSet<String> = running
+        .iter()
+        .map(|id| rhapsody_workspace::sanitize_key(id))
+        .collect();
     let mut discarded = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| running_keys.contains(stem))
+        {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -478,7 +501,11 @@ mod tests {
 
         // 25h after the expired record was written; no dispatch of either issue.
         let now = 1_000_000 + 25 * 60 * 60 * 1000;
-        assert_eq!(sweep(&r, now), 1, "exactly the expired record is swept");
+        assert_eq!(
+            sweep(&r, now, &HashSet::new()),
+            1,
+            "exactly the expired record is swept"
+        );
         assert!(!expired_dir.exists(), "the expired directory is removed");
         assert!(
             record_path(&r, "STUDIO-1").is_some_and(|p| !p.exists()),
@@ -495,8 +522,41 @@ mod tests {
         let path = record_path(&r, "STUDIO-1043").expect("path");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, b"{ not json").expect("write");
-        assert_eq!(sweep(&r, 1_000_000), 0, "a corrupt record is not a discard");
+        assert_eq!(
+            sweep(&r, 1_000_000, &HashSet::new()),
+            0,
+            "a corrupt record is not a discard"
+        );
         assert!(!path.exists(), "but it is removed");
+    }
+
+    #[test]
+    fn the_retention_sweep_keeps_a_running_issues_session() {
+        let tmp = TempDir::new();
+        let r = root(&tmp);
+        let running_dir = session_dir(&r, "rhapsody-opencode-STUDIO-1-1-1-0");
+        let idle_dir = session_dir(&r, "rhapsody-opencode-STUDIO-2-2-2-0");
+        let mut running = record(&running_dir, "m");
+        running.saved_at_ms = 1_000_000;
+        save(&r, "STUDIO-1", &running).expect("save running");
+        let mut idle = record(&idle_dir, "m");
+        idle.saved_at_ms = 1_000_000;
+        save(&r, "STUDIO-2", &idle).expect("save idle");
+
+        // Both records are past the window, but STUDIO-1 has a live run.
+        let now = 1_000_000 + 25 * 60 * 60 * 1000;
+        let live = HashSet::from(["STUDIO-1".to_string()]);
+        assert_eq!(sweep(&r, now, &live), 1, "only the idle record is swept");
+        assert!(
+            running_dir.exists(),
+            "a running issue's retained session must survive the sweep"
+        );
+        assert!(
+            record_path(&r, "STUDIO-1").is_some_and(|p| p.exists()),
+            "and its record must survive"
+        );
+        assert!(!idle_dir.exists(), "an idle expired session is still swept");
+        assert!(record_path(&r, "STUDIO-2").is_some_and(|p| !p.exists()));
     }
 
     #[test]

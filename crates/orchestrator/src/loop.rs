@@ -1551,12 +1551,23 @@ impl Orchestrator {
     /// forever — and in legacy mode that directory holds a copy of the operator's credential. Runs
     /// from `on_tick` ABOVE every early return, so a daemon held by a bad config or an armed drain
     /// still bounds its retained sessions.
+    ///
+    /// Every identifier with a LIVE run is passed as an exclusion set: `select` adopts a retained
+    /// session and leaves its record's original `saved_at_ms` in place, so a run can outlive the 24h
+    /// window it was retained under, and a sweep that ignored `self.running` would delete the live
+    /// session's `XDG_DATA_HOME` (and, in legacy mode, the seeded credential) mid-run (STUDIO-1043
+    /// review B2). The record is bounded the moment that issue stops running.
     fn sweep_retained_opencode_sessions(&self) {
         let Some(root) = self.opencode_state_root() else {
             return;
         };
+        let running: std::collections::HashSet<String> = self
+            .running
+            .values()
+            .map(|re| re.issue.identifier.clone())
+            .collect();
         let discarded =
-            rhapsody_agent::opencode::resume::sweep(&root, Utc::now().timestamp_millis());
+            rhapsody_agent::opencode::resume::sweep(&root, Utc::now().timestamp_millis(), &running);
         if discarded > 0 {
             tracing::info!(
                 discarded,
@@ -2710,6 +2721,37 @@ mod tests {
             "an expired retained session must be swept by a tick with no redispatch"
         );
         assert!(!rec.exists(), "and its record removed");
+    }
+
+    // STUDIO-1043 review B2: the sweep must NOT delete the state directory of a session whose issue
+    // is running. `select` adopts a retained session but leaves its record's ORIGINAL `saved_at_ms`
+    // in place, so a run can outlive the 24h window it was retained under; a sweep that ignored
+    // `self.running` would delete the live session's `XDG_DATA_HOME` (and, in legacy mode, the
+    // seeded credential) mid-run. Here the record is already expired AND its issue is running, so
+    // only the running-set exclusion can save it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_does_not_sweep_a_running_issues_session() {
+        use crate::testsupport::{TempDir, add_running, seed_opencode_session};
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(Fake::new()), "p")], 10);
+        let state_root = TempDir::new();
+        o.eff.as_mut().expect("eff").cfg.opencode.state_root = state_root.path.clone();
+        // saved_at_ms at the epoch ⇒ far past the 24h retention window.
+        let (dir, rec) =
+            seed_opencode_session(std::path::Path::new(&state_root.path), "STUDIO-1043", 0);
+        add_running(&mut o, "1", "STUDIO-1043", "In Progress", Utc::now());
+        assert!(dir.is_dir() && rec.is_file(), "seed sanity");
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            dir.exists(),
+            "a running issue's retained session directory must survive the tick sweep (B2)"
+        );
+        assert!(rec.exists(), "and its record must survive");
     }
 
     // Mirrors Go `TestOnTickPollsAllProjectsAndDispatches`: onTick polls EVERY resolved project's
