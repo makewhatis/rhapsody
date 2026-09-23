@@ -1756,6 +1756,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhapsody-provider-status"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rhapsody-credential-ipc",
+ "rhapsody-provider-broker",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rhapsody-store"
 version = "0.1.0"
 dependencies = [

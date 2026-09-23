@@ -1,0 +1,47 @@
+[package]
+name = "rhapsody-provider-status"
+description = "Non-secret provider credential status cache, bounded model-catalog cache, and the off-loop refresh coordinator (STUDIO-990, P9). Rhapsody-only; no Go parity."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# rhapsody-credential-ipc: the shared, already-tested credential vocabulary this cache is built
+# over — `Binding`, `Revision`, `CredentialState`/`CredentialStateTag`, `BoundCredentialLease`, and
+# the derived `v1:<id>` account. Reusing them keeps the cache's notion of a credential identical to
+# the owner's, instead of a second parallel model that could drift. PB1-only (no loopback) enters
+# through this edge by default.
+rhapsody-credential-ipc = { path = "../credential-ipc" }
+# rhapsody-provider-broker: the credential lease type moves into the broker's own move-only lease,
+# which is the value the fixed catalog adapter consumes. The `loopback` feature is optional here
+# because the REAL `/models` egress adapter lives in the broker behind that feature; the cache,
+# status matrix and coordinator are pure and build without any HTTP stack.
+rhapsody-provider-broker = { path = "../provider-broker", default-features = false, optional = true }
+# async-trait: `ModelDiscovery` and `CredentialReadSource` are async traits the coordinator holds as
+# trait objects (`Arc<dyn ...>`), so the object-safe form needs async-trait — the same crate + reason
+# the tracker/agent/httpapi crates already record. Already in Cargo.lock.
+async-trait = "0.1"
+# serde (derive): the non-secret DTOs the HTTP layer serializes (`ModelEntry`, the status view) are
+# owned here and re-exported, so a client and the daemon cannot disagree about the wire shape.
+# Already in Cargo.lock.
+serde = { version = "1", features = ["derive"] }
+# tokio: `sync` for the bounded-concurrency semaphore and the in-flight set's mutex, `time` for the
+# off-loop refresh deadlines. Already in Cargo.lock (axum/tracker/etc.).
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+# thiserror: typed, actionable refusals (errors are values, never panics). Same version the
+# orchestrator crate records.
+thiserror = "2"
+
+[features]
+# `discovery` turns on the REAL fixed-endpoint `/models` egress adapter, which is the broker's PB2
+# loopback stack. Default OFF so the deserializable cache/DTO half carries no HTTP dependency — the
+# httpapi embedding and the desktop never link axum/hyper/reqwest through this crate.
+default = []
+discovery = ["dep:rhapsody-provider-broker", "rhapsody-provider-broker/loopback"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+
+[lints]
+workspace = true
