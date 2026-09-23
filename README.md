@@ -994,6 +994,39 @@ author runs plus its pull request's review runs, split by `rhapsody_run_provenan
 `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the eighth name.
 
+### The review evidence ledger — loop generation, evidence revision and "approved at the current patch" (STUDIO-1009)
+
+Every later manager decision must be tied to **what it was decided against**, and today "approved"
+is read from the watch row's transient `status` column — which a re-introduction resets to
+`requested` (the F9 incident, `makewhatis/rhapsody#216`). This adds durable RECORDS and a predicate;
+no existing gate consumes them yet. No new table: two columns join the Rhapsody-only
+`rhapsody_review_bound` and four join `rhapsody_review_watch`, so the schema golden's name rule is
+untouched.
+
+| what | where | increments / set when |
+| -- | -- | -- |
+| loop **generation** | `rhapsody_review_bound.generation` | the pull request's FIRST introduction into the watch set, and every operator `POST /api/v1/reviews/clear`; **not** on a head change, a handoff re-introduction or a restart |
+| **evidence revision** | `rhapsody_review_bound.evidence_rev` | any change to the head, a watch row (status/requested sha/last review/membership), the finding set, the `rhapsody:human` hold (read through `labelled_and_primed`, failing closed when unprimed), the observed draft/conflict/CI state, or the generation — **not** on a `rhapsody-manager`-marked comment or a tracker state move, so a decision cannot invalidate itself |
+| **completed review** | `rhapsody_review_watch.last_completed_generation` / `_sha` / `_patch_id` / `_verdict` | only when a review run COMPLETES with a verdict (`approve`/`changes`); a truncated, dropped, failed or crashed round leaves them empty |
+
+`row_approved_at_current_patch` is true when the recorded completed verdict is `approve`, its
+patch-id (STUDIO-977's stable patch-id, over `merge-base(base, head)..head`) equals the current
+head's, and its generation equals the current one — defined on the recorded review, **never** on
+`status`. A changed patch-id comparison (`makewhatis/rhapsody#213`: approved at `e2c52c1`, head
+moved to `d17d0b7`, identical patch-id) stays approved; an operator `/clear` bumps the generation
+and invalidates it.
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_review_bound` | — | the same row, plus `generation` and `evidence_rev` |
+| `rhapsody_review_watch` | — | the same row, plus the four `last_completed_*` columns |
+| `PRAGMA user_version` | 6 | **16** |
+
+Every existing bound row is brought to generation `1` (its first introduction already happened) and
+every M1 finding row is backfilled onto the same value in the same migration step. The whole ledger
+is dormant unless `teams.enabled` and `review.mode: ticketless`, so every other installation is
+byte-identical.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
