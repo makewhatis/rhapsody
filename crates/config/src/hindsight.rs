@@ -387,11 +387,12 @@ impl HindsightBackend {
     /// experience-only list showed almost nothing (STUDIO-1036 measured 0
     /// `experience` facts against 4–5 `world` ones for one real record).
     ///
-    /// `ListMemoryUnitsResponse.items` is untyped in the OpenAPI this module was
-    /// written against, so the mapping reads the same field names `RecallResult`
-    /// uses and treats every one of them as optional — an item that names no text
-    /// is skipped rather than rendered blank, and an item whose `fact_type` is
-    /// `observation` is dropped before it can be rendered at all.
+    /// Each list item carries `fact_type` (`world`, `experience` or
+    /// `observation` in 0.10.1); the rest of the mapping still reads the same
+    /// field names `RecallResult` uses and treats every one of them as optional —
+    /// an item that names no text is skipped rather than rendered blank, and an
+    /// item whose `fact_type` is `observation` is dropped before it can be
+    /// rendered at all.
     async fn browse(
         &self,
         bank: &str,
@@ -1675,14 +1676,14 @@ mod tests {
             2,
             "experience and world are listed; observation and the textless item are not"
         );
-        let types: Vec<&str> = got.facts.iter().map(|f| f.content.as_str()).collect();
+        let contents: Vec<&str> = got.facts.iter().map(|f| f.content.as_str()).collect();
         assert!(
-            types.contains(&"two"),
-            "a world fact reaches the browse listing: {types:?}"
+            contents.contains(&"two"),
+            "a world fact reaches the browse listing: {contents:?}"
         );
         assert!(
-            !types.contains(&"three"),
-            "an observation never reaches the browse listing: {types:?}"
+            !contents.contains(&"three"),
+            "an observation never reaches the browse listing: {contents:?}"
         );
         assert_eq!(got.facts[0].ticket, "STUDIO-1");
         assert_eq!(
