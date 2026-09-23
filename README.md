@@ -218,6 +218,34 @@ binaries and the sidecar can drift from the shell. Because it is served over the
 than the Tauri bridge, the stamp now also renders in a plain browser, where the footer previously
 showed nothing.
 
+### Provider status and model catalog APIs — `GET /api/v1/providers{,/{id}/models}` (STUDIO-990)
+
+The provider-auth feature (`provider-auth-design.md`, `provider-broker-design.md`) has no Go
+counterpart, so the three routes that expose its **non-secret** status and model catalog are an
+additive divergence:
+
+```text
+GET  /api/v1/providers                        non-secret credential-status list (cache-only)
+GET  /api/v1/providers/{id}/models            cached model catalog (cache-only)
+POST /api/v1/providers/{id}/models/refresh    explicit, operator-guarded, credentialed refresh
+```
+
+The two `GET`s read only a non-secret cache: they never open the Keychain, prompt, perform IPC,
+shell `opencode models`, or contact a provider, and they never return a credential, a stored
+binding/fingerprint, a credential revision, or a raw provider response. The one credentialed
+operation is the `POST`, which is behind the shared operator-write guard (STUDIO-982) and requires a
+closed empty JSON body (1 KiB ceiling). The credentialed `/models` fetch reuses the provider
+broker's PB2 egress stack (redirects/proxies off, HTTP/1 only, platform roots, bounded timeouts,
+identity encoding, Bearer-only, exact-secret redaction) and never mints an agent capability. With no
+`providers:` block every route serves an empty/unknown answer, so legacy Claude and native-login
+OpenCode behavior is byte-identical.
+
+The provider set is applied from the resolved workflow at boot. Hot-reload re-application (the
+design's "a provider reload marks affected status unknown/refreshing and schedules one bounded
+off-loop refresh") is implemented and tested in the cache/coordinator domain but not yet wired to
+the orchestrator's internal reload event, which exposes no notification seam; that wiring is a
+follow-up.
+
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 
 Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies
