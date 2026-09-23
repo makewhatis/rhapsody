@@ -85,6 +85,7 @@ pub mod runautomerge;
 pub mod rundiff;
 pub mod runmerge;
 pub mod select;
+pub mod selection;
 pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
