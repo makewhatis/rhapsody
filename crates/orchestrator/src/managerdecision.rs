@@ -1599,6 +1599,36 @@ mod tests {
         assert!(parse_decision(&text, &[known("alice:F1", 1, REVIEW_FINDING_OPEN, true)]).is_ok());
     }
 
+    /// `dismiss` is allowed on `RERUN_REVIEW`, `ROUTE_TO_AUTHOR` and `APPROVE`, and each parses
+    /// with its rationale recorded.
+    #[test]
+    fn accepts_dismissals_where_they_apply() {
+        let known = [known("sol:B8", 1, REVIEW_FINDING_OPEN, true)];
+        let dismiss = serde_json::json!([
+            {"finding": "sol:B8", "revision": 1, "rationale": "already handled"}
+        ]);
+        for variant in ["RERUN_REVIEW", "ROUTE_TO_AUTHOR", "APPROVE"] {
+            let mut obj = serde_json::json!({
+                "decision": variant, "head": "h", "evidence_rev": 1,
+                "dismiss": dismiss.clone(), "rationale": "r"
+            });
+            if variant == "RERUN_REVIEW" {
+                obj["rerun"] = serde_json::json!({});
+            }
+            if variant == "ROUTE_TO_AUTHOR" {
+                obj["route"] = serde_json::json!({
+                    "fix": [{"finding": "sol:B8", "revision": 1}],
+                    "instructions": "x"
+                });
+            }
+            let d = parse_decision(&block_json(obj), &known)
+                .unwrap_or_else(|e| panic!("{variant} with a dismissal must parse: {e:?}"));
+            assert_eq!(d.dismiss.len(), 1, "{variant}");
+            assert_eq!(d.dismiss[0].finding.finding, "sol:B8");
+            assert_eq!(d.dismiss[0].finding.revision, 1);
+        }
+    }
+
     #[test]
     fn rejects_secret_shaped_posted_text() {
         let text = block_json(serde_json::json!({
