@@ -122,7 +122,24 @@ impl BrokerListener {
         clock: Arc<dyn crate::clock::Clock>,
         rng: Arc<dyn crate::random::RandomSource>,
     ) -> std::io::Result<(Self, Broker)> {
-        let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        Self::bind_at(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), clock, rng)
+    }
+
+    /// Bind the listener at an explicit loopback IPv4 address. Production always passes
+    /// `127.0.0.1:0`; the daemon integration tests use this to force a real `EADDRINUSE` bind
+    /// failure. A non-loopback or non-IPv4 address is refused, so the one private listener can
+    /// never be pointed at a routable interface.
+    pub fn bind_at(
+        addr: std::net::SocketAddr,
+        clock: Arc<dyn crate::clock::Clock>,
+        rng: Arc<dyn crate::random::RandomSource>,
+    ) -> std::io::Result<(Self, Broker)> {
+        if !addr.ip().is_loopback() || !addr.is_ipv4() {
+            return Err(std::io::Error::other(
+                "the provider broker listener must bind 127.0.0.1",
+            ));
+        }
+        let std_listener = std::net::TcpListener::bind(addr)?;
         let addr = std_listener.local_addr()?;
         let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let broker = Broker::new(base_url, clock, rng).map_err(std::io::Error::other)?;
@@ -237,9 +254,9 @@ impl Drop for ShutdownBroadcast {
 
 impl std::fmt::Debug for BrokerListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BrokerListener")
-            .field("addr", &self.addr)
-            .finish_non_exhaustive()
+        // The exact loopback address/port is never a log, banner, or diagnostic surface (design
+        // §2.1, §13): the only publication is the in-process `local_addr` handle.
+        f.write_str("<provider broker listener>")
     }
 }
 

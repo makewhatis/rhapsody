@@ -1000,6 +1000,18 @@ pub struct Orchestrator {
     /// exist until an asynchronous preparation is accepted, which can be several events later. Empty
     /// on every non-reopen dispatch.
     pub(crate) pending_reopen_summons: HashMap<String, (DateTime<Utc>, String)>,
+
+    // --- STUDIO-999 (PB4): the daemon's broker registration handle (Rhapsody-only). ---
+    /// The cloneable provider-broker registration handle the composition root injects before
+    /// [`control`](Orchestrator::control) moves the orchestrator into the control task (design
+    /// §11.1). It is create-only: preparation can register a move-only broker session and observe
+    /// availability, but it holds no credential and cannot enumerate or revoke sessions.
+    ///
+    /// **`None` is the default for tests and any embedding with no broker**; PB7's prepared dispatch
+    /// is its first consumer. PB4 only carries it — nothing reads it yet, and when the broker is
+    /// unavailable, `register_session` on the handle returns the typed `provider_broker_unavailable`
+    /// refusal rather than any direct-key fallback.
+    pub provider_broker: Option<rhapsody_provider_broker::BrokerRegistrar>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -1148,6 +1160,9 @@ impl Orchestrator {
             refusal_gate: crate::prepare::RefusalGate::default(),
             prepare_expected_revision: None,
             pending_reopen_summons: HashMap::new(),
+            // STUDIO-999 (PB4): no broker handle by default. The daemon injects the real one after
+            // construction and before `control()`; tests leave it `None`.
+            provider_broker: None,
         }
     }
 
@@ -1171,6 +1186,14 @@ impl Orchestrator {
     pub fn set_store(&mut self, st: Arc<dyn Store + Send + Sync>) {
         self.store = st;
         self.store_injected = true;
+    }
+
+    /// Injects the daemon's provider-broker registration handle (STUDIO-999, PB4; design §11.1).
+    /// The composition root calls this once, before [`control`](Orchestrator::control) snapshots the
+    /// off-loop handle and moves the orchestrator into the control task, so a later prepared
+    /// dispatch (PB7) reads exactly the broker the daemon bound.
+    pub fn set_provider_broker(&mut self, registrar: rhapsody_provider_broker::BrokerRegistrar) {
+        self.provider_broker = Some(registrar);
     }
 
     /// Installs the orchestrator's lifetime cancellation BEFORE [`Run`](Orchestrator::run) sets it, so
