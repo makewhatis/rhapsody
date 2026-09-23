@@ -902,6 +902,13 @@ mod tests {
         }
     }
 
+    fn unauthorized() -> CredentialRead {
+        CredentialRead {
+            revision: Revision::INITIAL,
+            state: CredentialState::OwnerUnauthorized,
+        }
+    }
+
     // What a refusal gate must key on: BOTH the owner revision and the daemon availability
     // generation. One `u64` cannot carry both (alice's round-3 review of rhapsody#221), so a gate
     // keyed on the pair re-arms on an owner mutation OR on an availability transition.
@@ -1044,5 +1051,52 @@ mod tests {
             Revision(1),
             "owner revision untouched"
         );
+    }
+
+    // alice's non-blocking note on rhapsody#221: the sequences above drive Answered/Unavailable,
+    // but `OwnerUnauthorized` is a THIRD reachability class sharing the same generation counter. A
+    // transition into or out of it must bump the generation exactly like the other two, or a refusal
+    // gate keyed on the pair would keep suppressing a ticket after a wedged owner (Unavailable)
+    // starts actively rejecting us (Unauthorized) — and vice versa.
+    #[test]
+    fn authorization_transitions_advance_the_generation_like_availability_ones() {
+        let resolver = CredentialResolver::new();
+
+        // Unavailable -> Unauthorized: a different refusal class must change the gate key.
+        let gone = resolver.observe("v1:x", unavailable());
+        let rejected = resolver.observe("v1:x", unauthorized());
+        assert_eq!(
+            rejected.read.revision,
+            Revision::INITIAL,
+            "a refused read carries no owner revision"
+        );
+        assert_ne!(
+            gate_key(&gone),
+            gate_key(&rejected),
+            "Unavailable -> Unauthorized must change the gate key"
+        );
+
+        // Unauthorized -> Unavailable: the reverse transition must change it again.
+        let back = resolver.observe("v1:x", unavailable());
+        assert_ne!(
+            gate_key(&rejected),
+            gate_key(&back),
+            "Unauthorized -> Unavailable must change the gate key"
+        );
+
+        // Answered -> Unauthorized is a class change too; the owner's revision is not carried on a
+        // refused read, so the transition is visible only on the generation.
+        let answered = resolver.observe("v1:x", answered(7));
+        let rejected_again = resolver.observe("v1:x", unauthorized());
+        assert_ne!(
+            gate_key(&answered),
+            gate_key(&rejected_again),
+            "Answered -> Unauthorized must change the gate key"
+        );
+
+        // A steady Unauthorized repeat does not manufacture a generation, exactly as Unavailable
+        // does not.
+        let repeat = resolver.observe("v1:x", unauthorized());
+        assert_eq!(gate_key(&rejected_again), gate_key(&repeat));
     }
 }
