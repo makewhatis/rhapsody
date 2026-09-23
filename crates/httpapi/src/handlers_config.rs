@@ -698,6 +698,76 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    providers:\n     
         );
     }
 
+    // STUDIO-992 (Rhapsody-only): the Settings Providers surface edits the global provider/model
+    // selection through the typed POST. Before this, `apply_typed_config` never wrote
+    // `agent.provider`/`agent.model`, so a Settings save silently discarded the selection and the
+    // subsequent GET echoed the old (empty) value. This pins the write path AND that the provider
+    // registry block survives it.
+    #[tokio::test]
+    async fn config_post_typed_edits_global_provider_selection() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  project_slug: solo\n\
+providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n    base_url: https://api.fireworks.ai/inference/v1\n    credential:\n      source: keychain\n\
+agent:\n  backend: opencode\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let mut got = get_config_ok(&base).await;
+        assert!(
+            got["global"]["agent"].get("provider").is_none(),
+            "precondition: the selection starts unset"
+        );
+        got["global"]["agent"]["provider"] = json!("fireworks");
+        got["global"]["agent"]["model"] = json!("accounts/fireworks/models/deepseek-v4p1-flash");
+        let resp = post_config(&base, &got).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+
+        let after = get_config_ok(&base).await;
+        assert_eq!(after["global"]["agent"]["provider"], "fireworks");
+        assert_eq!(
+            after["global"]["agent"]["model"],
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        // The provider definition is not part of the typed view, so it must be carried through the
+        // edit from base — a save that drops it would also invalidate the selection.
+        let on_disk = fs::read_to_string(wf.path()).expect("read WORKFLOW.md");
+        assert!(
+            on_disk.contains("fireworks") && on_disk.contains("api.fireworks.ai"),
+            "provider registry dropped by the selection edit:\n{on_disk}"
+        );
+    }
+
+    // An OLDER client that omits agent.provider/agent.model from a typed payload must NOT clear an
+    // existing selection: the DTO fields are `Option` and overwrite only when present.
+    #[tokio::test]
+    async fn config_post_typed_omitted_provider_selection_is_preserved() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  project_slug: solo\n\
+providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n    base_url: https://api.fireworks.ai/inference/v1\n    credential:\n      source: keychain\n\
+agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let mut got = get_config_ok(&base).await;
+        let agent = got["global"]["agent"]
+            .as_object_mut()
+            .expect("agent object");
+        agent.remove("provider");
+        agent.remove("model");
+        let resp = post_config(&base, &got).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+
+        let after = get_config_ok(&base).await;
+        assert_eq!(
+            after["global"]["agent"]["provider"], "fireworks",
+            "an omitted provider key must preserve, not clear, the selection"
+        );
+        assert_eq!(
+            after["global"]["agent"]["model"],
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+    }
+
     // Mirrors Go `TestConfigTypedClaudeOverridesRoundTrip` (the INF-239 acceptance): the four
     // newly-surfaced per-project claude knobs (turn/stall timeouts, billing_guard, command) round-trip
     // as overrides on the overriding project and stay ABSENT (inherited) on the inheriting one.

@@ -15,6 +15,7 @@ import {
 import type { Updater } from "@/hooks/useUpdater";
 import { GeneralTab } from "./GeneralTab";
 import { ProjectsTab } from "./ProjectsTab";
+import { ProvidersTab } from "./ProvidersTab";
 import { AddAgentSheet } from "./AddAgentSheet";
 import { TeamsTab } from "./TeamsTab";
 import { ToolsTab } from "./ToolsTab";
@@ -25,6 +26,7 @@ import { UpdatesTab } from "./UpdatesTab";
 // badge; "Tools" carries an amber warning-dot slot lit by the doctor (wired in D6).
 const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
   { id: "general", label: "General" },
+  { id: "providers", label: "Providers" },
   { id: "projects", label: "Projects" },
   { id: "teams", label: "Teams" },
   { id: "tools", label: "Tools" },
@@ -34,6 +36,10 @@ const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
 
 const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
   general: { title: "General", desc: "Global defaults every agent inherits." },
+  providers: {
+    title: "Providers",
+    desc: "Inference provider definitions, credential status, and the global provider/model selection.",
+  },
   projects: {
     title: "Projects",
     desc: "Each agent watches one Linear project and runs coding agents on its tickets.",
@@ -249,6 +255,8 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
         onDisconnect={cfg.onDisconnect}
       />
     );
+  } else if (tab === "providers") {
+    body = <ProvidersTab value={cfg.uiGlobal} onChange={cfg.onGlobalChange} />;
   } else {
     body = (
       <ProjectsTab

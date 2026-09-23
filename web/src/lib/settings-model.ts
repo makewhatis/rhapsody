@@ -12,9 +12,11 @@ import type {
   LinearProject,
   ProjectConfigDTO,
   ProjectStatus,
+  ProviderConfigDTO,
 } from "@/lib/api";
 import type { ToolResult } from "@/lib/bindings";
 import { repoShortName } from "@/lib/project";
+import { providerRegistry } from "@/lib/providers-model";
 import { GLOBAL_DEFAULTS } from "@/lib/settings-data";
 
 // REPO_PROMPT_PATH is the canonical repo-relative prompt path the "use this repo's prompt" checkbox
@@ -111,6 +113,19 @@ export interface UiGlobal {
   mcpAllowSendMessage: boolean;
   mcpAllowStop: boolean;
   mcpAllowResume: boolean;
+  /** Global provider selection (`agent.provider`, STUDIO-992). "" = the legacy/native-login path;
+   *  only opencode can consume a provider in v1. Edited on the Providers tab. Rhapsody-only. */
+  provider: string;
+  /** Global provider-first model selection (`agent.model`, STUDIO-992) — distinct from the Claude
+   *  `model` above; this is the model a selected provider uses. Required when `provider` is set. */
+  agentModel: string;
+  /** Read-only provider registry (the global `providers:` block) surfaced so the Providers tab can
+   *  list definitions and the compatibility check can resolve a selection. Preserved verbatim on
+   *  save via applyUiGlobal's `...g` base spread (the typed view never edits definitions). */
+  providers: ProviderConfigDTO[];
+  /** Read-only agent backend (`agent.backend`) surfaced so the Providers tab can explain that only
+   *  opencode can consume a provider. Not editable here (no control); preserved verbatim on save. */
+  agentBackend: string;
 }
 
 // UiAgent is the design's agent shape (one entry per Linear project the agent watches).
@@ -229,6 +244,12 @@ export function toUiGlobal(g: GlobalConfigDTO): UiGlobal {
     mcpAllowSendMessage: g.mcp.allow_send_message,
     mcpAllowStop: g.mcp.allow_stop,
     mcpAllowResume: g.mcp.allow_resume,
+    // STUDIO-992: the provider-first global selection + the read-only registry. Both are Rhapsody-
+    // only; an unset selection reads as "" (the legacy path), matching the daemon's omitted keys.
+    provider: g.agent.provider ?? "",
+    agentModel: g.agent.model ?? "",
+    providers: providerRegistry(g.providers),
+    agentBackend: g.agent.backend,
   };
 }
 
@@ -268,6 +289,11 @@ export function applyUiGlobal(
       max_concurrent_agents: ui.maxConcurrent,
       max_turns: ui.maxTurns,
       max_retry_backoff_ms: backoffToMs(ui.backoff),
+      // STUDIO-992: the global provider/model selection, written through as the user set it. An
+      // empty pair clears the selection (the daemon prunes empty keys, so a provider-less install is
+      // unchanged). The registry (`providers`) is NOT editable here and rides through `...g`.
+      provider: ui.provider,
+      model: ui.agentModel,
     },
     claude: {
       // command + stall_timeout_ms have no General-tab control; they are preserved verbatim from

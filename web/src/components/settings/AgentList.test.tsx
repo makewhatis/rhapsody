@@ -38,6 +38,10 @@ const global = {
   mcpAllowSendMessage: true,
   mcpAllowStop: false,
   mcpAllowResume: false,
+  provider: "",
+  agentModel: "",
+  providers: [],
+  agentBackend: "claude",
 } satisfies UiGlobal;
 
 function agent(over: Partial<UiAgent> = {}): UiAgent {

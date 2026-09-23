@@ -1117,6 +1117,12 @@ export interface GlobalAgentDTO {
   max_turns: number;
   max_retry_backoff_ms: number;
   max_concurrent_agents_by_state?: Record<string, number>;
+  /** The normalized global provider selection (`agent.provider`, STUDIO-984/992). Absent/"" means the
+   *  legacy/native-login path; only emitted by the daemon when set. Rhapsody-only. */
+  provider?: string;
+  /** The normalized global model selection (`agent.model`, STUDIO-984/992). Opaque within transport
+   *  bounds; required when `provider` is set. Only emitted by the daemon when set. */
+  model?: string;
 }
 
 export interface GlobalClaudeDTO {
@@ -1191,6 +1197,23 @@ export interface GlobalConfigDTO {
    *  (fetch unassigned pool tickets and run the single-claimant claim protocol). Per-agent overrides
    *  live in ProjectConfigDTO.overrides.claim_mode (INF-477). */
   claim_mode: string;
+  /** Global provider registry (`providers:<id>` blocks, STUDIO-984). Non-secret metadata only: the
+   *  daemon emits it only when configured, so a provider-less install is byte-identical to before.
+   *  Rhapsody-only. Read-only in the Settings UI (the registry is authored in WORKFLOW.md). */
+  providers?: Record<string, ProviderConfigDTO>;
+}
+
+// ProviderConfigDTO is one `providers.<id>` definition as the daemon's typed view renders it
+// (STUDIO-984). Deliberately secret-free: no key, token, envelope, or binding fingerprint is ever
+// serialized here — only what an operator wrote plus the derived normalized endpoint.
+export interface ProviderConfigDTO {
+  id: string;
+  protocol: string;
+  display_name: string;
+  /** The normalized base URL when derivable, else "" (the daemon never echoes a malformed URL). */
+  base_url: string;
+  allow_insecure_http: boolean;
+  credential: { source: string };
 }
 
 // ClaudeOverridesDTO is the sparse per-agent override map. A field is present (non-null) only
@@ -1351,6 +1374,86 @@ export async function saveTypedConfig(
   saved.config ??= {};
   saved.prompt_body ??= "";
   return saved;
+}
+
+// --- Provider status and model catalogs (STUDIO-990, consumed by the STUDIO-992 Settings surface) ---
+//
+// GET /api/v1/providers is cache-only: it reads the daemon's non-secret status cache and never opens
+// Keychain, performs IPC, or contacts a provider. The model-catalog GET is likewise cache-only; the
+// refresh POST is the ONE credentialed operation and is guarded as an operator write.
+
+/** One provider's non-secret credential status (`GET /api/v1/providers`, STUDIO-990). Mirrors the
+ *  Rust `ProviderStatusView`; carries no credential value, binding, or revision. */
+export interface ProviderStatusViewDTO {
+  provider_id: string;
+  /** Closed status set: absent | denied_or_locked | malformed | owner_unavailable |
+   *  owner_unauthorized | configured | binding_mismatch | unknown_refreshing. */
+  status: string;
+  /** Milliseconds since this status was published; null while never published (unknown/refreshing) —
+   *  an unknown state must never be misread as a fresh "absent". */
+  cache_age_ms: number | null;
+  refreshing: boolean;
+  /** The daemon broker's live availability; false means credentialed dispatch is refused. */
+  broker_available: boolean;
+  /** The one closed recovery action the UI may offer, or null when the credential is usable. */
+  recovery: string | null;
+}
+
+/** One discovered model in a provider catalog. Only non-secret display fields are cached. */
+export interface ProviderModelEntryDTO {
+  id: string;
+  display_name?: string;
+  capabilities?: string[];
+}
+
+/** The cache-only model catalog for one provider (`GET /api/v1/providers/{id}/models`, STUDIO-990). */
+export interface ProviderCatalogDTO {
+  provider_id: string;
+  models: ProviderModelEntryDTO[];
+  truncated: boolean;
+  cache_age_ms: number | null;
+  /** The bounded failure code, when the last refresh failed; a failed catalog NEVER disables manual
+   *  model entry (`manual_entry_allowed` stays true). */
+  error?: string;
+  error_message?: string;
+  manual_entry_allowed: boolean;
+}
+
+/** GET /api/v1/providers — the cache-only provider status list. */
+export async function fetchProviderStatuses(): Promise<ProviderStatusViewDTO[]> {
+  const body = await getJSON<{ providers: ProviderStatusViewDTO[] }>("/api/v1/providers");
+  return body.providers ?? [];
+}
+
+/** GET /api/v1/providers/{id}/models — the cache-only catalog snapshot (404 on an unknown id). */
+export async function fetchProviderCatalog(providerId: string): Promise<ProviderCatalogDTO> {
+  return getJSON<ProviderCatalogDTO>(
+    `/api/v1/providers/${encodeURIComponent(providerId)}/models`,
+  );
+}
+
+/** POST /api/v1/providers/{id}/models/refresh — the explicit, bounded, credentialed catalog refresh
+ *  (operator-only). A business catalog failure still answers 200 with the error in the snapshot. */
+export async function refreshProviderCatalog(providerId: string): Promise<ProviderCatalogDTO> {
+  const res = await operatorPost(
+    `/api/v1/providers/${encodeURIComponent(providerId)}/models/refresh`,
+    {},
+  );
+  if (!res.ok) {
+    let code = `http_${res.status}`;
+    let message = res.statusText;
+    try {
+      const body = (await res.json()) as ApiError;
+      if (body?.error) {
+        code = body.error.code;
+        message = body.error.message;
+      }
+    } catch {
+      /* non-JSON body */
+    }
+    throw new Error(`${code}: ${message}`);
+  }
+  return (await res.json()) as ProviderCatalogDTO;
 }
 
 // --- Linear identity + project listing (INF-224) ---
