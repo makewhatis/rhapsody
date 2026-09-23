@@ -433,17 +433,33 @@ fn drain(
 mod tests {
     use super::*;
 
-    /// Slack over the configured timeout for the timing assertions. It must swallow the ~200ms
-    /// process-tree sweep plus scheduler noise on a loaded runner, yet stay well under the `sleep`
-    /// a broken implementation would wait for (the fixtures use 5–30s), so the guard still reds.
-    const TIMEOUT_SLACK: Duration = Duration::from_secs(2);
+    /// The timeout every test whose expected outcome is NOT a timeout probes with. Generous on
+    /// purpose: on a heavily loaded runner the probe thread can be starved past a tighter wall clock
+    /// even though the command succeeded, which turned a correct acceptance, refusal or parse failure
+    /// into `TimedOut` at random (STUDIO-1030). The probe timeout is not what these tests check, so
+    /// it sits far above any plausible stall.
+    const GENEROUS_TIMEOUT: Duration = Duration::from_secs(60);
 
-    /// The probe timeout the process-tree fixtures use. Generous on purpose: a heavily loaded CI
-    /// runner can stall the exec of a freshly written script past a tighter bound, which reds these
-    /// tests even though the probe is correct (observed at 3s on the shared `test` job). It stays
-    /// far below the 30s `sleep` a broken implementation would wait for, so the timing guards below
-    /// still red under mutation.
-    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The timeout the timeout-behaviour tests probe with. It is short next to the fixture's
+    /// hour-long sleep ([`HANG`]), so only the probe's own deadline can end these probes — what the
+    /// test measures is the timeout, never the machine's speed.
+    const HANG_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The body the timeout-behaviour fixtures run to genuinely hang. Orders of magnitude above any
+    /// probe timeout, so a probe can only return from it by enforcing its own deadline: a removed
+    /// timeout leaves the probe waiting here rather than returning a verdict.
+    const HANG: &str = "sleep 3600\n";
+
+    /// How many times a fixture that must ARM itself (record a descendant pid) is retried when a
+    /// loaded runner starved its exec past the deadline. Real attempts arm on the first try; the
+    /// bound only keeps a genuinely broken fixture from looping forever.
+    const ARM_ATTEMPTS: usize = 10;
+
+    /// Slack over the configured timeout for the timeout tests' wall-clock assertions. It must
+    /// swallow the ~200ms process-tree sweep plus scheduler noise on a heavily loaded runner, yet
+    /// stay far below [`HANG`], so a probe that waited the fixture out instead of enforcing its
+    /// timeout still reds.
+    const TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
     /// Whether `pid` is still running. SIGKILL cannot be caught; signal 0 checks for existence only.
     fn process_alive(pid: i32) -> bool {
@@ -458,6 +474,14 @@ mod tests {
             .trim()
             .parse()
             .expect("descendant pid")
+    }
+
+    /// [`read_pid`] without the panic: `None` when the fixture never recorded a pid, so a caller can
+    /// distinguish "the fixture armed" from "the runner starved it past its deadline" and retry.
+    fn read_pid_if_armed(pidfile: &std::path::Path) -> Option<i32> {
+        std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
     }
 
     /// Polls until `pid` is gone, or `timeout` elapses. The signal may not have been reaped yet, so
@@ -505,14 +529,16 @@ mod tests {
         (dir, rendered)
     }
 
-    /// Runs `probe`, retrying the Linux `ETXTBSY` race a bounded number of times. A test that writes
-    /// a script and immediately execs it races every other test binary thread: a sibling `fork()`
-    /// between our write and our `execve` inherits the write fd (Rust sets `O_CLOEXEC`, so it is
-    /// released at the sibling's next exec, not at fork), and our `execve` then fails with
-    /// `ETXTBSY` (os error 26). The window is the sibling's `fork`→`exec`, so a short sleep clears
-    /// it. Production never probes a file the same process just wrote, so this stays test-only.
+    /// Runs `probe` at [`GENEROUS_TIMEOUT`], retrying the Linux `ETXTBSY` race a bounded number of
+    /// times. The caller asserts a non-timeout outcome, so the timeout must never be what decides
+    /// the result. A test that writes a script and immediately execs it races every other test binary
+    /// thread: a sibling `fork()` between our write and our `execve` inherits the write fd (Rust sets
+    /// `O_CLOEXEC`, so it is released at the sibling's next exec, not at fork), and our `execve` then
+    /// fails with `ETXTBSY` (os error 26). The window is the sibling's `fork`→`exec`, so a short
+    /// sleep clears it. Production never probes a file the same process just wrote, so this stays
+    /// test-only.
     fn probe_retrying_etxtbsy(command: &str) -> Result<&'static CompatibilityRow, ProbeError> {
-        retry_etxtbsy(|| probe(command))
+        retry_etxtbsy(|| probe_with_timeout(command, GENEROUS_TIMEOUT))
     }
 
     /// [`probe_retrying_etxtbsy`]'s timeout-taking twin, for the process-tree fixtures.
@@ -635,7 +661,7 @@ mod tests {
 
     #[test]
     fn probe_refuses_a_missing_binary() {
-        let err = probe("/nonexistent/pb0/opencode").unwrap_err();
+        let err = probe_with_timeout("/nonexistent/pb0/opencode", GENEROUS_TIMEOUT).unwrap_err();
         assert_eq!(err.reason(), PROBE_FAILED);
         assert!(matches!(err, ProbeError::Spawn { .. }));
     }
@@ -657,7 +683,9 @@ mod tests {
 
     #[test]
     fn probe_enforces_a_process_tree_timeout() {
-        let (_dir, command) = script("sleep 5\n");
+        // The fixture hangs for an hour, so nothing but the probe's 150ms deadline can end it: the
+        // measurement is the timeout, not the machine's speed.
+        let (_dir, command) = script(HANG);
         let start = Instant::now();
         let err =
             probe_with_timeout_retrying_etxtbsy(&command, Duration::from_millis(150)).unwrap_err();
@@ -665,7 +693,7 @@ mod tests {
         assert_eq!(err.reason(), PROBE_FAILED);
         assert_eq!(err, ProbeError::TimedOut);
         // The assertion is on wall-clock time, not the variant: without the tree kill the probe
-        // would simply `wait()` out the child's `sleep 5`.
+        // would simply `wait()` out the fixture's hour-long `sleep`.
         assert!(
             elapsed < Duration::from_millis(150) + TIMEOUT_SLACK,
             "the probe outran its deadline: {elapsed:?}"
@@ -674,29 +702,43 @@ mod tests {
 
     /// The timeout path must kill the process TREE, not wait the leader out. A descendant that the
     /// script left behind has to be gone, and the probe must still return on its deadline.
+    ///
+    /// The fixture has to ARM — background its descendant and record the pid — before the probe's
+    /// deadline ends it. A loaded runner can starve the child's exec past that deadline, which is
+    /// NOT an observation of the timeout path (the probe killed a process that had not started
+    /// anything), so the whole fixture is retried until it arms. The deadline stays short
+    /// ([`HANG_TIMEOUT`]) and the fixture's hour-long `sleep` can only end by the probe's own
+    /// timeout, so the measurement never depends on the machine's speed (STUDIO-1030).
     #[test]
     fn probe_timeout_kills_a_descendant_instead_of_waiting_for_it() {
-        let dir = crate::opencode::testdir::TempDir::new();
-        let pidfile = dir.path().join("descendant.pid");
-        let body = format!(
-            "sleep 30 &\necho $! > {pidfile}\nsleep 30\n",
-            pidfile = pidfile.display()
-        );
-        let (_script_dir, command) = script(&body);
+        let mut armed = None;
+        for _ in 0..ARM_ATTEMPTS {
+            let dir = crate::opencode::testdir::TempDir::new();
+            let pidfile = dir.path().join("descendant.pid");
+            let body = format!(
+                "sleep 3600 &\necho $! > {pidfile}\nsleep 3600\n",
+                pidfile = pidfile.display()
+            );
+            let (_script_dir, command) = script(&body);
+            let start = Instant::now();
+            let err = probe_with_timeout_retrying_etxtbsy(&command, HANG_TIMEOUT).unwrap_err();
+            let elapsed = start.elapsed();
+            if let Some(pid) = read_pid_if_armed(&pidfile) {
+                armed = Some((err, elapsed, pid));
+                break;
+            }
+        }
+        let (err, elapsed, pid) = armed.expect("the timeout fixture never armed its descendant");
 
-        let start = Instant::now();
-        let err = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT).unwrap_err();
-        let elapsed = start.elapsed();
         assert_eq!(err, ProbeError::TimedOut);
-        // Without the tree kill, `sleep 30` outlives the probe's deadline by a wide margin.
+        // The fixture hangs for an hour, so only the deadline can end the probe; without the tree
+        // kill the leader's `sleep 3600` outlives it by a wide margin.
         assert!(
-            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
+            elapsed < HANG_TIMEOUT + TIMEOUT_SLACK,
             "the probe waited for the descendant: {elapsed:?}"
         );
-
-        let pid = read_pid(&pidfile);
         assert!(
-            wait_until_dead(pid, FIXTURE_TIMEOUT),
+            wait_until_dead(pid, GENEROUS_TIMEOUT),
             "descendant {pid} survived the probe's process-tree kill"
         );
     }
@@ -705,28 +747,29 @@ mod tests {
     /// background descendant keeps stdout open. The probe must read the version and stay bounded,
     /// and it must not leak the descendant — the success path's tree kill closes the pipe the
     /// descendant held. The `$!` pidfile is what pins that kill: without it this test stayed green
-    /// even when the post-loop `kill_tree` was gated on `timed_out`, leaving `sleep 30` orphaned.
+    /// even when the post-loop `kill_tree` was gated on `timed_out`, leaving the `sleep` orphaned.
     #[test]
     fn probe_bounds_a_wrapper_whose_descendant_holds_stdout_and_kills_it() {
         let dir = crate::opencode::testdir::TempDir::new();
         let pidfile = dir.path().join("descendant.pid");
         let body = format!(
-            "sleep 30 &\necho $! > {pidfile}\necho 1.18.30\n",
+            "sleep 3600 &\necho $! > {pidfile}\necho 1.18.30\n",
             pidfile = pidfile.display()
         );
         let (_script_dir, command) = script(&body);
         let start = Instant::now();
-        let row = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT)
+        let row = probe_with_timeout_retrying_etxtbsy(&command, GENEROUS_TIMEOUT)
             .expect("the version line is still read from the bounded pipe");
         let elapsed = start.elapsed();
         assert_eq!(row.opencode_version, "1.18.30");
-        // Without the tree kill the read blocks on the descendant's `sleep 30`, far past the bound.
+        // A success is a non-timeout outcome, so the generous bound is not the check: this only
+        // guards against waiting out the descendant's hour-long `sleep`.
         assert!(
-            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
+            elapsed < GENEROUS_TIMEOUT,
             "a descendant holding stdout outran the deadline: {elapsed:?}"
         );
         let pid = read_pid(&pidfile);
-        let dead = wait_until_dead(pid, FIXTURE_TIMEOUT);
+        let dead = wait_until_dead(pid, GENEROUS_TIMEOUT);
         if !dead {
             reap(pid);
         }
@@ -747,13 +790,13 @@ mod tests {
         let dir = crate::opencode::testdir::TempDir::new();
         let pidfile = dir.path().join("escaped.pid");
         let body = format!(
-            "/bin/bash -c 'set -m; sleep 30 & echo $! > {pidfile}'\necho 1.18.30\n",
+            "/bin/bash -c 'set -m; sleep 3600 & echo $! > {pidfile}'\necho 1.18.30\n",
             pidfile = pidfile.display()
         );
         let (_script_dir, command) = script(&body);
 
         let start = Instant::now();
-        let result = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT);
+        let result = probe_with_timeout_retrying_etxtbsy(&command, GENEROUS_TIMEOUT);
         let elapsed = start.elapsed();
         // The survivor is the wrapper's leaked process, not something the probe can reach; reap it
         // FIRST, so a failing assertion below cannot leave a sleeper behind.
@@ -768,27 +811,24 @@ mod tests {
             matches!(err, ProbeError::DescendantHeldStdout),
             "a wrapper it could not contain was accepted: {err:?}"
         );
-        // The pipe is held, not blocked on: the non-blocking drain still returns on time.
+        // The pipe is held, not blocked on: the non-blocking drain still returns, and a refusal is a
+        // non-timeout outcome, so the generous bound is not the check — it only guards against
+        // waiting on the escaped descendant's hour-long `sleep`.
         assert!(
-            elapsed < FIXTURE_TIMEOUT + TIMEOUT_SLACK,
+            elapsed < GENEROUS_TIMEOUT,
             "the probe waited on the escaped descendant: {elapsed:?}"
         );
     }
 
     /// Output larger than one pipe buffer must be drained, not deadlocked: a `--version` that floods
     /// stdout is unparseable, but it has to be read (and bounded) rather than reported as a timeout.
+    /// A deadlock would leave the child blocked on the full pipe and surface as `TimedOut` at the
+    /// generous bound, so the outcome is the assertion.
     #[test]
     fn probe_drains_output_larger_than_the_pipe_buffer() {
         let (_dir, command) = script("yes 1.18.30 | head -c 200000\n");
-        let start = Instant::now();
-        let err =
-            probe_with_timeout_retrying_etxtbsy(&command, Duration::from_secs(5)).unwrap_err();
-        let elapsed = start.elapsed();
+        let err = probe_with_timeout_retrying_etxtbsy(&command, GENEROUS_TIMEOUT).unwrap_err();
         assert_eq!(err, ProbeError::UnparseableOutput);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the drain deadlocked: {elapsed:?}"
-        );
     }
 
     /// `env_clear()` is the guard, not the allow-list: an ambient credential must not reach the
