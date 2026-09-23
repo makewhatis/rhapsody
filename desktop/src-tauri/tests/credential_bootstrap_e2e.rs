@@ -212,6 +212,7 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
 
     let port = pick_free_port();
     let mut child = Command::new(&bin)
+        .env("HOME", &dir.path)
         .args([
             "--credential-bootstrap",
             "--credential-probe-account",
@@ -316,6 +317,7 @@ async fn wrong_token_launch_reports_owner_unauthorized() {
 
     let port = pick_free_port();
     let mut child = Command::new(&bin)
+        .env("HOME", &dir.path)
         .args([
             "--credential-bootstrap",
             "--credential-probe-account",
@@ -384,6 +386,7 @@ async fn direct_launch_with_no_bootstrap_gets_no_credential_owner() {
     // arrives, because there is no real desktop parent on the other end of a pipe.
     let port = pick_free_port();
     let mut child = Command::new(&bin)
+        .env("HOME", &dir.path)
         .args(["--credential-bootstrap", "--port", &port.to_string()])
         .arg(dir.join("WORKFLOW.md"))
         .stdin(Stdio::null())

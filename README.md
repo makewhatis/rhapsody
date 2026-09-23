@@ -157,6 +157,27 @@ This makes the Settings › General "Logs path" setting real — in Go it was pl
 shown in the UI but nothing ever wrote files to it. The retention count (7) is hardcoded; no new
 config field is added, keeping the config schema at parity with Go.
 
+### The daemon guards and repairs its own `runtime.json` (STUDIO-1041)
+
+`rhapsodyd mcp` — an operator's CLI and every dispatched worker — finds the daemon through
+`~/.rhapsody/runtime.json`. Go's daemon writes that file once at startup (unconditional overwrite) and
+removes it on a clean shutdown; if it is deleted, corrupted, or left naming a crashed daemon's PID,
+the MCP facade falls back to the config `server.port` — which the desktop app never uses (it launches
+the daemon on a dynamic `--port`), so every MCP tool fails `daemon_unreachable` until the daemon is
+restarted.
+
+Rhapsody therefore (a) publishes under an **ownership guard** — a file naming another *live* daemon is
+left untouched, so a test or a second daemon can no longer clobber a running daemon's port — and (b)
+runs an off-loop **self-heal** check every 30s that rewrites the file when it is missing, unreadable,
+or stale (dead PID), logging one `warn` per repair. The file's JSON shape and the read-side resolution
+(prefer a published port only when its PID is alive, else config `server.port`) are unchanged.
+
+| `~/.rhapsody/runtime.json` | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| write at startup | unconditional overwrite | overwrite unless another **live** daemon owns it |
+| mid-run repair | none | 30s off-loop self-heal (missing / unreadable / dead PID) |
+| file format + MCP-side lookup | — | unchanged (byte-identical) |
+
 ### `review_states` classifies a clean worker exit (TRA-279)
 
 Go's `classifyCleanExit` never receives `review_states`. An agent that follows its prompt — open a

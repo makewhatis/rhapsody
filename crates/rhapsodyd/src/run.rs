@@ -42,6 +42,25 @@ use crate::state::DaemonState;
 /// Bounds the observability server drain at daemon shutdown (Go's `srv.Shutdown` 5s ctx).
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+/// How often the off-loop self-heal task re-checks `runtime.json` (STUDIO-1041). Rhapsody-only, no Go
+/// counterpart: if the file is deleted, corrupted, or left stale by a crashed daemon, `rhapsodyd mcp`
+/// falls back to the stale `server.port` and every agent's MCP tools fail `daemon_unreachable` — so
+/// the running daemon repairs its own publication on this cadence instead of waiting for a restart.
+const RUNTIME_HEAL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The daemon boot's injected seams. Production passes [`BootSeams::default()`] — every seam `None`
+/// and the runtime home resolved from `$HOME`. Tests inject a broker/provider observer and, crucially
+/// for STUDIO-1041, an explicit temp `home` so an in-process `run` publishes/self-heals/logs into a
+/// temp tree and NEVER touches the operator's live `~/.rhapsody`.
+#[derive(Default)]
+struct BootSeams {
+    broker: Option<crate::broker::BrokerSeam>,
+    provider: Option<crate::providers::ProviderSeam>,
+    home: Option<PathBuf>,
+    /// Overrides [`RUNTIME_HEAL_INTERVAL`] so a test can observe the self-heal without waiting 30s.
+    heal_interval: Option<Duration>,
+}
+
 /// Starts the Rhapsody daemon for the workflow selected by `args`, running until `ctx` is cancelled.
 /// Returns the process exit code (Go's `run` `int`): `0` on a clean shutdown, `1` on a fatal boot /
 /// run error, `2` on a flag-parse error. `stderr` is any `MakeWriter` (the binary passes
@@ -59,25 +78,40 @@ pub async fn run<W>(
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
-    run_with_seam(ctx, args, stderr, is_terminal, install_probe, None, None).await
+    run_with_seam(
+        ctx,
+        args,
+        stderr,
+        is_terminal,
+        install_probe,
+        BootSeams::default(),
+    )
+    .await
 }
 
-/// [`run`] with the daemon's broker-wiring seam (STUDIO-999, PB4). Production passes `None`; the
-/// integration tests inject a binder that can fail and an observer that captures the live broker
-/// handles, so the composition — bind → inject → serve → supervise → shutdown — is directly
-/// exercised rather than only the pieces it calls.
+/// [`run`] with the daemon's injectable seams ([`BootSeams`], STUDIO-999/1041). Production passes
+/// `BootSeams::default()`; the integration tests inject a broker binder/observer, a provider
+/// observer, and an explicit temp runtime home, so the composition — bind → inject → serve →
+/// supervise → shutdown — is directly exercised rather than only the pieces it calls, and no test
+/// touches the operator's live `~/.rhapsody`.
 async fn run_with_seam<W>(
     ctx: CancelWait,
     args: &[String],
     stderr: W,
     is_terminal: bool,
     install_probe: bool,
-    seam: Option<crate::broker::BrokerSeam>,
-    provider_seam: Option<crate::providers::ProviderSeam>,
+    seams: BootSeams,
 ) -> i32
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
+    let BootSeams {
+        broker: seam,
+        provider: provider_seam,
+        home,
+        heal_interval,
+    } = seams;
+    let heal_interval = heal_interval.unwrap_or(RUNTIME_HEAL_INTERVAL);
     // `rhapsodyd mcp [WORKFLOW.md]` runs the local MCP facade over stdio instead of the daemon
     // (INF-473). Dispatched at the very top so the daemon's run-lock / flag parsing is untouched and
     // `rhapsodyd <workflow>` behaves identically. Mirrors Go `run`'s `args[0] == "mcp"` branch.
@@ -112,13 +146,22 @@ where
         }
     };
 
+    // The runtime/log home (STUDIO-1041): resolved ONCE here and threaded explicitly to the process
+    // log dir, `runtime.json` publication and its off-loop self-heal. Production gets `$HOME`; an
+    // in-process test injects a temp home, so the daemon it boots can never write into (or delete a
+    // file under) the operator's live `~/.rhapsody`.
+    let runtime_home = match home {
+        Some(h) => Some(h),
+        None => runtimeport::home().ok(),
+    };
+
     // Resolve telemetry config (best-effort load; a bad load → env-only telemetry, the daemon's own
     // load reports config errors). The synthetic default applies `OTEL_*` env even when the workflow
     // fails to load OR decode, so env-only telemetry configuration still takes effect on a config error.
     let otel_cfg = resolve_boot_otel(&flags.path);
     // Resolve the process-log dir (TRA-267): the daemon writes rotating file logs into `logging.dir`
     // (default `~/.rhapsody/logs`), independent of OTLP export. Best-effort, like `resolve_boot_otel`.
-    let log_dir = resolve_boot_logdir(&flags.path);
+    let log_dir = resolve_boot_logdir(&flags.path, runtime_home.as_deref());
     let tel = telemetry::init(&otel_cfg, Some(&log_dir), stderr.clone());
     // Install the composed subscriber as the process default so the orchestrator + server tasks log
     // through it (Go passes `tel.Logger` explicitly; the Rust crates use the global `tracing`
@@ -538,6 +581,7 @@ where
     let mut dashboard_url = String::new();
     let mut server_task = None;
     let mut runtime_port_published = false;
+    let mut runtime_heal_task = None;
     if let (eff_port, true) = resolve_server_port(flags.port, &flags.path) {
         // The enable flow (STUDIO-652) reads and writes the SAME `teams.yaml` the boot load above
         // resolved, so `GET/POST /api/v1/teams/config` and the daemon can never disagree about
@@ -598,13 +642,50 @@ where
                 };
                 tracing::info!(%addr, "observability server listening");
                 dashboard_url = format!("http://{addr}");
+                let bound_port = i32::from(addr.port());
                 // Publish the ACTUAL bound loopback port so `rhapsodyd mcp` reaches a daemon launched
-                // on a dynamic/ephemeral --port (best-effort; removed on clean shutdown).
-                match server.publish_runtime_port() {
-                    Ok(()) => runtime_port_published = true,
-                    Err(e) => {
-                        tracing::warn!(err = %e, "could not write runtime port file (rhapsodyd mcp will fall back to config server.port)")
-                    }
+                // on a dynamic/ephemeral --port (best-effort; removed on clean shutdown). The write is
+                // GUARDED (STUDIO-1041): a runtime file naming another LIVE daemon is left untouched.
+                match runtime_home.as_deref() {
+                    Some(home) => match server.publish_runtime_port(home) {
+                        Ok(rhapsody_core::runtimeport::Published::SkippedLiveDaemon) => {
+                            tracing::info!(
+                                "another live daemon owns runtime.json; not publishing this daemon's port"
+                            )
+                        }
+                        Ok(_) => runtime_port_published = true,
+                        Err(e) => {
+                            tracing::warn!(err = %e, "could not write runtime port file (rhapsodyd mcp will fall back to config server.port)")
+                        }
+                    },
+                    None => tracing::warn!(
+                        "could not resolve a runtime home (HOME unset); runtime port not published (rhapsodyd mcp will fall back to config server.port)"
+                    ),
+                }
+                // Self-heal (STUDIO-1041): an off-loop check repairs the runtime file if it is
+                // deleted, corrupted, or left naming a dead PID, so `rhapsodyd mcp` does not fall
+                // back to a stale config port mid-run. `runtime_port_published` is the gate: if we
+                // never published (no file, or a live peer owns it) there is nothing of ours to keep.
+                if runtime_port_published && let Some(home) = runtime_home.clone() {
+                    let mut heal_ctx = shutdown.wait();
+                    runtime_heal_task = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = heal_ctx.cancelled() => break,
+                                _ = tokio::time::sleep(heal_interval) => {}
+                            }
+                            match runtimeport::ensure_in(&home, bound_port) {
+                                Ok(runtimeport::Published::Wrote) => tracing::warn!(
+                                    port = bound_port,
+                                    "runtime.json was missing, unreadable or stale; republished this daemon's port"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(err = %e, "runtime.json self-heal failed; will retry")
+                                }
+                            }
+                        }
+                    }));
                 }
                 // Serve until the shutdown signal fires, then drain in-flight requests (graceful).
                 let mut serve_ctx = shutdown.wait();
@@ -1292,13 +1373,19 @@ where
     if let Some(t) = broker_supervisor {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
+    // Stop the runtime-file self-heal task BEFORE the remove below, so it cannot rewrite the file
+    // between the removal and process exit. It rides the same shutdown signal the server does.
+    if let Some(t) = runtime_heal_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
     if let Some(t) = server_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
-    // Remove the runtime port file we published (only ours; runtimeport guards the PID).
-    if runtime_port_published {
-        let _ = runtimeport::remove();
+    // Remove the runtime port file we published (only ours; runtimeport guards the PID). Uses the
+    // SAME home we published into, so an in-process test removes only its own temp file (STUDIO-1041).
+    if runtime_port_published && let Some(home) = runtime_home.as_deref() {
+        let _ = runtimeport::remove_in(home);
     }
     // Flush + stop telemetry exporters (bounded internally so an unreachable collector can't stall).
     tel.shutdown();
@@ -1994,12 +2081,33 @@ fn load_resolved(path: &Path) -> Option<Config> {
 }
 
 /// Resolves the daemon's process-log dir for the boot (TRA-267), best-effort: the resolved
-/// `logging.dir` when the workflow loads + decodes + resolves, else the resolved default
-/// `~/.rhapsody/logs` — obtained by resolving a blank config, so it reuses the exact tilde-expand /
-/// absolutize / default logic in `rhapsody_config::resolve` (mirrors how `resolve_boot_otel` falls
-/// back to its synthetic base). Passed to `telemetry::init` as the rolling-file log target.
-fn resolve_boot_logdir(path: &Path) -> PathBuf {
-    let dir = load_resolved(path)
+/// `logging.dir` when the workflow explicitly configures one, else the `~/.rhapsody/logs` default.
+///
+/// `home` is the runtime home the boot resolved (STUDIO-1041): when the workflow was EXPLICITLY
+/// configured, its normalized `logging.dir` is returned unchanged; when it was not (or the workflow
+/// failed to load/decode), the default is anchored to `home/.rhapsody/logs`. Production passes
+/// `$HOME`, so the result is the same `~/.rhapsody/logs` the blank-config resolution would produce;
+/// an in-process test passes a temp home, so the daemon never creates or writes into the operator's
+/// real log tree. (The blank-config fallback via `rhapsody_config::resolve` would expand `~` against
+/// the process `$HOME`, which a test cannot safely override — hence the explicit home parameter.)
+fn resolve_boot_logdir(path: &Path, home: Option<&Path>) -> PathBuf {
+    // An explicitly-configured `logging.dir` is honoured verbatim (normalized by `resolve`). `decode`
+    // stores the field verbatim, so a non-empty value means the operator wrote one.
+    let configured = workflow::load(path)
+        .ok()
+        .and_then(|def| decode(&def).ok())
+        .is_some_and(|cfg| !cfg.logging.dir.trim().is_empty());
+    if configured && let Some(cfg) = load_resolved(path) {
+        return PathBuf::from(cfg.logging.dir);
+    }
+
+    // Default: `~/.rhapsody/logs`, anchored to the explicit home when the boot resolved one. Fall
+    // back to the blank-config resolution (which expands `~` against `$HOME`) only when there is no
+    // explicit home, preserving the production default exactly.
+    if let Some(home) = home {
+        return home.join(".rhapsody").join("logs");
+    }
+    load_resolved(path)
         .or_else(|| {
             // Fallback: resolve a defaulted-but-unresolved config (empty WORKFLOW.md front matter run
             // through `decode`) so the default inherits the exact `logging.dir` default +
@@ -2012,8 +2120,8 @@ fn resolve_boot_logdir(path: &Path) -> PathBuf {
             resolve(blank, &workflow_dir(path)).ok()
         })
         .map(|cfg| cfg.logging.dir)
-        .unwrap_or_default();
-    PathBuf::from(dir)
+        .unwrap_or_default()
+        .into()
 }
 
 /// Resolves the Linear key owner (the user whose assigned issues Rhapsody processes) for the startup
@@ -2092,14 +2200,21 @@ mod tests {
         // Configured: a valid workflow's resolved `logging.dir` (the temp `logs` dir) is returned.
         let dir = TempDir::new();
         let wf = write_wf(&dir, "", "");
-        assert_eq!(resolve_boot_logdir(&wf), dir.child("logs"));
+        assert_eq!(resolve_boot_logdir(&wf, None), dir.child("logs"));
+        // Even with an explicit home, a CONFIGURED `logging.dir` wins verbatim (never redirected).
+        assert_eq!(resolve_boot_logdir(&wf, Some(&dir.path)), dir.child("logs"));
 
         // Bad/missing config path: falls back to the resolved `~/.rhapsody/logs` default.
         let home = std::env::var("HOME").expect("HOME set in test env");
         let bad = dir.child("does-not-exist").join("WORKFLOW.md");
         assert_eq!(
-            resolve_boot_logdir(&bad),
+            resolve_boot_logdir(&bad, None),
             PathBuf::from(format!("{home}/.rhapsody/logs")),
+        );
+        // …and with an explicit temp home, the default is anchored there instead.
+        assert_eq!(
+            resolve_boot_logdir(&bad, Some(&dir.path)),
+            dir.path.join(".rhapsody").join("logs"),
         );
     }
 
@@ -2124,13 +2239,27 @@ mod tests {
     }
 
     /// Runs the daemon until a short deadline, then cancels ctx and awaits a clean exit, returning the
-    /// code (mirrors Go's `context.WithTimeout` daemon tests). `buf` captures stderr.
+    /// code (mirrors Go's `context.WithTimeout` daemon tests). `buf` captures stderr. The daemon is
+    /// booted against a fresh temp home (`BootSeams::home`), so an in-process `run` never touches the
+    /// operator's live `~/.rhapsody` — not `runtime.json`, not the default log dir (STUDIO-1041).
     async fn run_briefly(args: &[&str], buf: &SharedBuf) -> i32 {
+        let home = TempDir::new();
+        run_briefly_in(&home, args, buf).await
+    }
+
+    /// [`run_briefly`] against a caller-supplied home, so a test can seed a runtime file in the SAME
+    /// home the daemon will use (STUDIO-1041).
+    async fn run_briefly_in(home: &TempDir, args: &[&str], buf: &SharedBuf) -> i32 {
         let signal = CancelSignal::new();
         let ctx = signal.wait();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let buf = buf.clone();
-        let handle = tokio::spawn(async move { run(ctx, &argv, buf, false, false).await });
+        let seams = BootSeams {
+            home: Some(home.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(async move { run_with_seam(ctx, &argv, buf, false, false, seams).await });
         tokio::time::sleep(Duration::from_millis(250)).await;
         signal.cancel();
         tokio::time::timeout(Duration::from_secs(5), handle)
@@ -2139,11 +2268,19 @@ mod tests {
             .expect("run task join")
     }
 
-    /// Runs the daemon to completion with a never-cancelled ctx (for the fast-exit error paths).
+    /// Runs the daemon to completion with a never-cancelled ctx (for the fast-exit error paths). As
+    /// with `run_briefly`, a temp home keeps the boot out of the operator's live `~/.rhapsody`.
     async fn run_now(args: &[&str], buf: &SharedBuf) -> i32 {
         let signal = CancelSignal::new();
+        let home = TempDir::new();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run(signal.wait(), &argv, buf.clone(), false, false).await
+        let seams = BootSeams {
+            home: Some(home.path.clone()),
+            ..BootSeams::default()
+        };
+        let code = run_with_seam(signal.wait(), &argv, buf.clone(), false, false, seams).await;
+        drop(home);
+        code
     }
 
     // Mirrors Go `TestRunStartsDaemonAndStopsCleanly` (storage forced off to stay hermetic — the
@@ -2160,6 +2297,160 @@ mod tests {
             "daemon should exit 0 on cancel; stderr={}",
             buf.contents()
         );
+    }
+
+    /// STUDIO-1041 acceptance: running the in-process start/stop test must leave an existing runtime
+    /// file owned by ANOTHER LIVE daemon byte-identical — the file the operator's live daemon owns
+    /// (here PID 1, always alive and never ours). The daemon is pointed at the SAME temp home the
+    /// file lives in, so this is the in-process analogue of the operator's `~/.rhapsody/runtime.json`.
+    ///
+    /// MUTATION GUARD: publish through the unguarded `runtimeport::write_in` (or run `remove_in` on
+    /// shutdown regardless of ownership) and the record is rewritten/deleted → red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_leaves_another_daemons_runtime_file_untouched() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "server:\n  port: 0\n");
+        let rt = dir.path.join(".rhapsody");
+        std::fs::create_dir_all(&rt).expect("mkdir .rhapsody");
+        // PID 1 (init/launchd) is live and can never be this test process, so the daemon must treat
+        // this as another daemon's file and leave it exactly as it found it.
+        let body = r#"{"port":51074,"pid":1}"#;
+        std::fs::write(rt.join("runtime.json"), body).expect("seed the operator's runtime file");
+
+        let buf = SharedBuf::new();
+        let code = run_briefly_in(&dir, &[&wf.to_string_lossy()], &buf).await;
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+
+        assert_eq!(
+            std::fs::read_to_string(rt.join("runtime.json"))
+                .expect("the live daemon's runtime.json must survive the run"),
+            body,
+            "a file owned by another live daemon must be left byte-identical"
+        );
+    }
+
+    /// STUDIO-1041 acceptance: the daemon publishes ITS port into the injected temp home (never the
+    /// real `~/.rhapsody`), and a clean shutdown removes only that file.
+    ///
+    /// This is the test that turns RED if the home injection is removed: with no injected home the
+    /// daemon resolves `$HOME`, the temp `runtime.json` never appears, and the poll below times out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_publishes_the_runtime_port_into_the_injected_home() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "server:\n  port: 0\n");
+        let buf = SharedBuf::new();
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let seams = BootSeams {
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
+
+        let path = runtimeport::path_in(&dir.path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut published = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(info) = runtimeport::read_in(&dir.path) {
+                published = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let info = published.unwrap_or_else(|| {
+            panic!(
+                "the injected temp home must receive runtime.json; stderr={}",
+                buf.contents()
+            )
+        });
+        assert_eq!(
+            info.pid,
+            std::process::id() as i32,
+            "the published record must name THIS in-process daemon"
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+        assert!(
+            !path.exists(),
+            "a clean shutdown must remove the runtime file we published"
+        );
+    }
+
+    /// STUDIO-1041 acceptance: the running daemon's off-loop self-heal rewrites `runtime.json` after
+    /// it is deleted, within one check interval — so an agent's `rhapsodyd mcp` never falls back to
+    /// the stale config `server.port` mid-run. The interval is shortened through `BootSeams` so the
+    /// test observes the repair without waiting 30s.
+    ///
+    /// MUTATION GUARD: drop the `runtime_heal_task` spawn (or its `ensure_in` call) and the deleted
+    /// file never reappears → the poll below times out → red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_self_heals_a_deleted_runtime_file() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "server:\n  port: 0\n");
+        let buf = SharedBuf::new();
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let seams = BootSeams {
+            home: Some(dir.path.clone()),
+            heal_interval: Some(Duration::from_millis(25)),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
+
+        let path = runtimeport::path_in(&dir.path);
+        let wait_for_file = |present: bool| {
+            let path = path.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if path.exists() == present {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                false
+            }
+        };
+
+        assert!(
+            wait_for_file(true).await,
+            "the daemon must publish runtime.json; stderr={}",
+            buf.contents()
+        );
+        std::fs::remove_file(&path).expect("delete the published runtime file");
+        assert!(
+            wait_for_file(true).await,
+            "self-heal must rewrite the deleted runtime.json within a check interval; stderr={}",
+            buf.contents()
+        );
+        assert_eq!(
+            runtimeport::read_in(&dir.path)
+                .expect("read healed file")
+                .pid,
+            std::process::id() as i32,
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
     }
 
     /// STUDIO-999 (PB4): the broker's ephemeral port is private implementation state (design §2.1,
@@ -2246,9 +2537,15 @@ mod tests {
         let wait = signal.wait();
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
-        let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
-        });
+        let seams = BootSeams {
+            broker: Some(seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
             .await
@@ -2318,17 +2615,14 @@ mod tests {
         };
         let signal = CancelSignal::new();
         let argv = vec![wf.to_string_lossy().into_owned()];
+        let seams = BootSeams {
+            broker: Some(seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
         let code = tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_seam(
-                signal.wait(),
-                &argv,
-                buf.clone(),
-                false,
-                false,
-                Some(seam),
-                None,
-            ),
+            run_with_seam(signal.wait(), &argv, buf.clone(), false, false, seams),
         )
         .await
         .expect("a bind failure must be fatal, not a daemon that boots on with no broker");
@@ -2369,9 +2663,15 @@ mod tests {
         let wait = signal.wait();
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
-        let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
-        });
+        let seams = BootSeams {
+            broker: Some(seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
             .await
@@ -2444,9 +2744,15 @@ mod tests {
         let wait = signal.wait();
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
-        let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
-        });
+        let seams = BootSeams {
+            broker: Some(seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
             .await
@@ -3588,18 +3894,15 @@ mod tests {
         let wait = signal.wait();
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
-        let handle = tokio::spawn(async move {
-            run_with_seam(
-                wait,
-                &argv,
-                run_buf,
-                false,
-                false,
-                None,
-                Some(provider_seam),
-            )
-            .await
-        });
+        let seams = BootSeams {
+            provider: Some(provider_seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
             .await
@@ -3645,18 +3948,15 @@ mod tests {
         let wait = signal.wait();
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
-        let handle = tokio::spawn(async move {
-            run_with_seam(
-                wait,
-                &argv,
-                run_buf,
-                false,
-                false,
-                None,
-                Some(provider_seam),
-            )
-            .await
-        });
+        let seams = BootSeams {
+            provider: Some(provider_seam),
+            home: Some(dir.path.clone()),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
             .await

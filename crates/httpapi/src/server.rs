@@ -2,6 +2,7 @@
 //! [`Server`] listener wrapper. Parity port of `$REF/internal/httpapi/server.go`.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -840,15 +841,21 @@ impl Server {
     /// (`symphony mcp` then falls back to the config port), exactly as Go does.
     ///
     /// This is the server-side capability the H3 lane owns; the *invocation* (call after bind, and
-    /// `runtimeport::remove()` on clean shutdown) lands with the final assembly's `run.rs`, mirroring
-    /// Go's `cmd/symphony/run.go` — which is also where Go places and tests `runtimeport.Write`, so
-    /// like Go there is no httpapi-level test here (T1's `runtimeport` unit tests cover the atomic
-    /// write; F1's boot e2e covers the daemon-to-`symphony mcp` round-trip). No httpapi test drives it
-    /// because `runtimeport::write` targets the single shared `~/.rhapsody/runtime.json`, which a
-    /// test must not clobber on the self-hosted CI runner (a live daemon may own it).
-    pub fn publish_runtime_port(&self) -> std::io::Result<()> {
+    /// `runtimeport::remove_in()` on clean shutdown) lands with the final assembly's `run.rs`,
+    /// mirroring Go's `cmd/symphony/run.go` — which is also where Go places and tests
+    /// `runtimeport.Write`, so like Go there is no httpapi-level test here (T1's `runtimeport` unit
+    /// tests cover the atomic write; F1's boot e2e covers the daemon-to-`symphony mcp` round-trip).
+    ///
+    /// `home` is the runtime home the caller resolved (`$HOME` in production; a temp home in an
+    /// in-process test), threaded in explicitly so no test can ever clobber the single shared
+    /// `~/.rhapsody/runtime.json` a live daemon may own (STUDIO-1041). The write is GUARDED
+    /// ([`rhapsody_core::runtimeport::ensure_in`]): a file naming another live daemon is left alone.
+    pub fn publish_runtime_port(
+        &self,
+        home: &Path,
+    ) -> std::io::Result<rhapsody_core::runtimeport::Published> {
         let port = self.local_addr()?.port();
-        rhapsody_core::runtimeport::write(i32::from(port))
+        rhapsody_core::runtimeport::ensure_in(home, i32::from(port))
     }
 
     /// Serve requests until the serving task is dropped. Mirrors Go `Serve`.
