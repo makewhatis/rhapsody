@@ -26,8 +26,8 @@ permissions:
   contents: read
 
 # Per-PR, cancel-in-progress: unlike every other workflow here, `edited` fires without a new commit, so
-# a few quick title corrections would otherwise queue several runs — each one taking the single
-# self-hosted Mac runner ahead of the lint/test/web jobs that actually need it. Only the newest title
+# a few quick title corrections would otherwise queue several runs — each one taking a Linux runner
+# ahead of the lint/web jobs that actually need it. Only the newest title
 # matters, and it reports on the same head SHA, so superseding an in-flight run is safe.
 concurrency:
   group: pr-title-${{ github.event.pull_request.number }}
@@ -37,11 +37,12 @@ jobs:
   # Job id `pr-title` is the branch-protection context name. Add it to the required checks alongside
   # lint/test/web (needs admin — see the PR body) or a bad title still merges.
   pr-title:
-    # Same fork-PR guard as ci.yml: on the self-hosted Mac runner every job runs only for a same-repo
+    # Same fork-PR guard as ci.yml: on the self-hosted Linux runner every job runs only for a same-repo
     # PR, so a fork PR skips all of them and stays unmergeable until a maintainer pulls it to a
     # same-repo branch — at which point this check runs on that PR's title.
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64]
+    # Bash + git only (no compiler), so it lives on the Linux pool like the other PR-time jobs.
+    runs-on: [self-hosted, Linux, rhapsody-linux]
     steps:
       - uses: actions/checkout@v4
       # Prove the validator itself still behaves before trusting its verdict — the case table is what

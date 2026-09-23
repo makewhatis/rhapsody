@@ -380,7 +380,13 @@ pub trait StateProvider: Send + Sync {
     }
 
     /// `POST /api/v1/reviews/dismiss` — the operator taking a pull request out of the watch set.
-    async fn review_dismiss(&self, _pr: PrCoord) -> ReviewControlOutcome {
+    /// `reviewer` narrows it to that reviewer's single watch row; `None` drops every row of the
+    /// pull request (STUDIO-1022).
+    async fn review_dismiss(
+        &self,
+        _pr: PrCoord,
+        _reviewer: Option<String>,
+    ) -> ReviewControlOutcome {
         ReviewControlOutcome::Dormant
     }
 

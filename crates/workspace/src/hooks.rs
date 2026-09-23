@@ -29,12 +29,22 @@ const MAX_HOOK_OUTPUT: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct HookRunner {
     timeout: Duration,
+    /// Extra `KEY=VALUE` entries layered onto every spawned hook, AFTER [`Self::run_env`]'s `extra`.
+    /// Empty in production — the hook then inherits the daemon's environment unchanged (byte-for-byte
+    /// Go's `cmd.Env = os.Environ()`). It exists so the workspace tests can hand a hook a scratch
+    /// `HOME`, so the `bash -lc` they run never sources the runner host's login dotfiles: on a bare
+    /// Linux host those dotfiles (pyenv init, RVM, bash-completion) made a trivial hook exceed the
+    /// tests' 5s timeout, which is a test-hermeticity defect, not a hook-runner one (STUDIO-1028).
+    pub(crate) env_overlay: Vec<(String, String)>,
 }
 
 impl HookRunner {
     /// Builds a runner with the given per-hook timeout.
     pub(crate) fn new(timeout: Duration) -> HookRunner {
-        HookRunner { timeout }
+        HookRunner {
+            timeout,
+            env_overlay: Vec::new(),
+        }
     }
 
     /// Executes `script` via `bash -lc` in `dir` with the inherited environment unchanged — the
@@ -86,6 +96,10 @@ impl HookRunner {
                     cmd.env(k, v);
                 }
             }
+        }
+        // Test-only overlay, applied last so it wins; empty in production (see `env_overlay`).
+        for (k, v) in &self.env_overlay {
+            cmd.env(k, v);
         }
         let child = cmd
             .spawn()
@@ -156,11 +170,23 @@ mod tests {
     use crate::testutil::TempDir;
     use std::time::Instant;
 
+    /// A [`HookRunner`] whose hooks get a scratch `HOME` under `dir`, so the `bash -lc` they run
+    /// never sources the runner host's login dotfiles: on a bare Linux host those dotfiles (pyenv
+    /// init, RVM, bash-completion) made a trivial hook exceed the 5s timeout (STUDIO-1028).
+    /// Production hooks inherit the daemon's real environment — this is a test seam only.
+    fn hermetic(dir: &TempDir, timeout: Duration) -> HookRunner {
+        let home = dir.child("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut r = HookRunner::new(timeout);
+        r.env_overlay = vec![("HOME".to_string(), home)];
+        r
+    }
+
     // Mirror of TestHookSuccessRunsInWorkspaceDir: a relative-path write proves cwd == dir.
     #[tokio::test]
     async fn hook_success_runs_in_workspace_dir() {
         let dir = TempDir::new();
-        let r = HookRunner::new(Duration::from_secs(5));
+        let r = hermetic(&dir, Duration::from_secs(5));
         r.run("after_create", "echo hi > marker.txt", &dir.path)
             .await
             .unwrap();
@@ -173,8 +199,8 @@ mod tests {
     // Mirror of TestHookEmptyScriptIsNoop.
     #[tokio::test]
     async fn hook_empty_script_is_noop() {
-        let r = HookRunner::new(Duration::from_secs(5));
         let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_secs(5));
         r.run("before_run", "", &dir.path)
             .await
             .expect("empty script should be a no-op");
@@ -185,8 +211,8 @@ mod tests {
     // error-VALUE assertions: category ErrHookFailed and the hook output carried in the message.
     #[tokio::test]
     async fn hook_failure_returns_err_hook_failed() {
-        let r = HookRunner::new(Duration::from_secs(5));
         let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_secs(5));
         let err = r
             .run("before_run", "echo boom-output; exit 3", &dir.path)
             .await
@@ -204,8 +230,8 @@ mod tests {
     // Mirror of TestHookTimeoutReturnsErrHookTimeout.
     #[tokio::test]
     async fn hook_timeout_returns_err_hook_timeout() {
-        let r = HookRunner::new(Duration::from_millis(100));
         let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_millis(100));
         let start = Instant::now();
         let err = r
             .run("after_create", "sleep 5", &dir.path)
@@ -225,8 +251,8 @@ mod tests {
     // Mirror of TestHookOutputTruncated: emit > 4KB then fail, so the error carries truncated output.
     #[tokio::test]
     async fn hook_output_truncated() {
-        let r = HookRunner::new(Duration::from_secs(5));
         let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_secs(5));
         let err = r
             .run(
                 "before_run",
@@ -245,11 +271,28 @@ mod tests {
         );
     }
 
+    // STUDIO-1028: the scratch-HOME seam must actually reach the spawned bash, or the "hermetic
+    // hook" claim is vacuous. Pins that `env_overlay` overrides an inherited variable.
+    #[tokio::test]
+    async fn hook_env_overlay_overrides_inherited_env() {
+        let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_secs(5));
+        r.run("before_run", "printf '%s' \"$HOME\" > home.txt", &dir.path)
+            .await
+            .unwrap();
+        let seen = std::fs::read_to_string(dir.child("home.txt")).unwrap();
+        assert_eq!(
+            seen,
+            dir.child("home"),
+            "env_overlay did not reach the hook"
+        );
+    }
+
     // Mirror of TestHookRunEnvInjectsExtraVars.
     #[tokio::test]
     async fn hook_run_env_injects_extra_vars() {
         let dir = TempDir::new();
-        let r = HookRunner::new(Duration::from_secs(5));
+        let r = hermetic(&dir, Duration::from_secs(5));
         let script = r#"printf '%s|%s' "$SYMPHONY_REPO" "$SYMPHONY_ISSUE" > seen.txt"#;
         r.run_env(
             "after_create",
@@ -272,8 +315,8 @@ mod tests {
     // reap hang here — so this timing bound genuinely proves the grandchild died.
     #[tokio::test]
     async fn hook_timeout_kills_backgrounded_grandchild() {
-        let r = HookRunner::new(Duration::from_millis(200));
         let dir = TempDir::new();
+        let r = hermetic(&dir, Duration::from_millis(200));
         let start = Instant::now();
         let err = r
             .run("before_run", "sleep 30 & sleep 30", &dir.path)

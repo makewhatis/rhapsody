@@ -359,6 +359,13 @@ impl Orchestrator {
     /// [`rhapsody_store::Store::drop_review_watch`], the same terminal the watcher uses for a merged
     /// or closed pull request, so a dismissal and a merge leave identical state.
     ///
+    /// `reviewer` narrows it to ONE row (STUDIO-1022): with `Some(name)`, only that reviewer's row
+    /// of the pull request is dropped, and the pull request keeps its place in the watch set on its
+    /// remaining rows. That is the in-place lever the incident had no answer for — a review whose
+    /// named reviewer can never serve it now that the roster or `review.reviewers` changed, without
+    /// the whole-pull-request dismissal that would also stop the reviews somebody is still waiting
+    /// on. `None` is the original behaviour verbatim: every row of the pull request goes.
+    ///
     /// A dismissal is a soft delete: both SHAs stay as the record of what was reviewed, and the row
     /// keeps its place in the console's list as a `dropped` one. It is idempotent, so dismissing
     /// twice is not an error, and it is deliberately NOT allowlist-gated (see the module doc).
@@ -367,7 +374,11 @@ impl Orchestrator {
     /// `POST /api/v1/runs/{id}/stop`'s job, and this control's contract is the watch set. Its
     /// completion cannot resurrect the row: `mark_review_completed` writes the two SHAs and the
     /// status and never touches `open`, so the row stays closed and out of every live read.
-    pub(crate) fn handle_review_dismiss(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
+    pub(crate) fn handle_review_dismiss(
+        &mut self,
+        pr: &PrCoord,
+        reviewer: Option<&str>,
+    ) -> ReviewControlOutcome {
         if !self.review_ticketless_enabled() {
             return ReviewControlOutcome::Dormant; // §16
         }
@@ -384,6 +395,12 @@ impl Orchestrator {
         let mine: Vec<ReviewWatchRow> = rows
             .into_iter()
             .filter(|r| row_is(r, pr) && !(r.status == REVIEW_STATUS_DROPPED && !r.open))
+            // A named reviewer narrows the dismissal to that row alone. Matched
+            // case-insensitively, because GitHub logins are and the console may not spell the
+            // stored name identically; `None` keeps every row, byte-identical to before STUDIO-1022.
+            .filter(|r| {
+                reviewer.is_none_or(|name| r.key.reviewer.eq_ignore_ascii_case(name.trim()))
+            })
             .collect();
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no watched review of that pull request");
@@ -421,7 +438,13 @@ impl Orchestrator {
                 }
             }
         }
-        if dropped > 0 {
+        // The PR-level records below are cleared only for a WHOLE-pull-request dismissal
+        // (STUDIO-1022). A named-reviewer dismissal leaves the pull request watched on its other
+        // rows, so its churn budget, its durable bound, its unreadability and observed-head records
+        // are all still facts about a live watch — clearing them would refund rounds for a pull
+        // request the operator was NOT taking out of the set, and drop the head memo a still-watched
+        // escalation may be compared against.
+        if dropped > 0 && reviewer.is_none() {
             // The churn budget goes with the rows, for `retire_review_pr`'s reason: a re-introduced
             // pull request should not inherit the spent budget of the one that was dismissed.
             self.review_rounds.remove(&churn_key(pr));
@@ -497,10 +520,19 @@ impl ControlHandle {
     }
 
     /// The operator's **dismiss** (`POST /api/v1/reviews/dismiss`), the same path for the same
-    /// reason.
-    pub async fn dismiss_review(&self, pr: PrCoord) -> ReviewControlOutcome {
-        self.review_control(|reply| Event::ReviewDismiss { pr, reply })
-            .await
+    /// reason. `reviewer` drops only that reviewer's row of the pull request; `None` drops every
+    /// row of it (STUDIO-1022).
+    pub async fn dismiss_review(
+        &self,
+        pr: PrCoord,
+        reviewer: Option<String>,
+    ) -> ReviewControlOutcome {
+        self.review_control(|reply| Event::ReviewDismiss {
+            pr,
+            reviewer,
+            reply,
+        })
+        .await
     }
 
     /// The operator's **clear** (`POST /api/v1/reviews/clear`) — drop a pull request's shared
@@ -1196,7 +1228,7 @@ mod tests {
         watch(&mut o, "carol", REVIEW_STATUS_IN_FLIGHT, HEAD_B, "");
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(2)
         );
         assert!(
@@ -1215,6 +1247,58 @@ mod tests {
         );
     }
 
+    /// **STUDIO-1022: a named dismissal drops ONE reviewer's row and leaves the pull request
+    /// watched.** This is the in-place lever the incident had no answer for — the departed
+    /// reviewer's slot can be retired without also stopping the reviews the pull request is still
+    /// waiting on. The PR-level records stay, because the pull request is still under watch.
+    #[test]
+    fn a_named_reviewer_dismissal_drops_only_that_row() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        watch(&mut o, "carol", REVIEW_STATUS_IN_FLIGHT, HEAD_B, "");
+        o.review_rounds.insert(churn_key(&pr()), 3);
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr(), Some("bob")),
+            ReviewControlOutcome::Applied(1)
+        );
+
+        assert_eq!(row_of(&o, "bob").status, REVIEW_STATUS_DROPPED);
+        assert_eq!(
+            row_of(&o, "carol").status,
+            REVIEW_STATUS_IN_FLIGHT,
+            "carol's row is untouched"
+        );
+        assert_eq!(
+            o.store().load_live_review_watch().expect("read").len(),
+            1,
+            "the pull request is still watched on carol's row"
+        );
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&pr())),
+            Some(&3),
+            "a pull request that is still watched keeps its churn budget"
+        );
+    }
+
+    /// A named dismissal matches the reviewer case-insensitively, and refuses when that reviewer has
+    /// no row — the same refusal an unqualified dismissal gives for a pull request with none.
+    #[test]
+    fn a_named_dismissal_is_case_insensitive_and_refuses_an_unknown_reviewer() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr(), Some("BOB")),
+            ReviewControlOutcome::Applied(1),
+            "GitHub logins are case-insensitive; a differently-cased name still selects the row"
+        );
+        assert_eq!(
+            o.handle_review_dismiss(&pr(), Some("nobody")),
+            ReviewControlOutcome::Refused("no watched review of that pull request")
+        );
+    }
+
     /// Dismissing twice is not an error. The second call finds only rows that are already `dropped`
     /// and refuses rather than reporting a change it did not make.
     #[test]
@@ -1222,11 +1306,11 @@ mod tests {
         let mut o = ticketless();
         watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Refused("no watched review of that pull request")
         );
     }
@@ -1245,7 +1329,7 @@ mod tests {
         assert!(!o.review_repo_is_configured("makewhatis", "rhapsody"));
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert_eq!(row_of(&o, "bob").status, REVIEW_STATUS_DROPPED);
@@ -1270,7 +1354,7 @@ mod tests {
             });
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         // The interrupted run finishes and records what it read, as it would have anyway.
@@ -1294,7 +1378,7 @@ mod tests {
         o.review_rounds
             .insert("makewhatis/rhapsody#12".to_string(), 3);
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert_eq!(o.review_rounds.get("makewhatis/rhapsody#12"), None);
@@ -1318,7 +1402,7 @@ mod tests {
         assert!(o.review_rounds_stalled());
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
@@ -1350,7 +1434,7 @@ mod tests {
         );
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
@@ -1378,7 +1462,7 @@ mod tests {
         );
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
@@ -1404,7 +1488,7 @@ mod tests {
         // keyed the record on.
         let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
         assert_eq!(
-            o.handle_review_dismiss(&typed),
+            o.handle_review_dismiss(&typed, None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
@@ -1446,7 +1530,7 @@ mod tests {
 
         let typed = PrCoord::new("MakeWhatIs", "Rhapsody", 12);
         assert_eq!(
-            o.handle_review_dismiss(&typed),
+            o.handle_review_dismiss(&typed, None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
@@ -1475,7 +1559,7 @@ mod tests {
                 "enabled={enabled} mode={mode:?}"
             );
             assert_eq!(
-                o.handle_review_dismiss(&pr()),
+                o.handle_review_dismiss(&pr(), None),
                 ReviewControlOutcome::Dormant,
                 "enabled={enabled} mode={mode:?}"
             );
@@ -1498,7 +1582,7 @@ mod tests {
             ReviewControlOutcome::Applied(1)
         );
         assert_eq!(
-            o.handle_review_dismiss(&PrCoord::new("MAKEWHATIS", "RHAPSODY", 12)),
+            o.handle_review_dismiss(&PrCoord::new("MAKEWHATIS", "RHAPSODY", 12), None),
             ReviewControlOutcome::Applied(1)
         );
     }
@@ -1558,7 +1642,7 @@ mod tests {
             .expect("review reservation");
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
