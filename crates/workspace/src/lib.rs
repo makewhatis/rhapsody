@@ -166,16 +166,26 @@ pub(crate) mod testutil {
         }
     }
 
+    /// The hook `env_overlay` a workspace test installs so a hook's `bash -lc` never sources the
+    /// runner host's login dotfiles (STUDIO-1028). It hands the hook a scratch `HOME` under `root`.
+    /// Production Managers leave the overlay empty and inherit the daemon's real environment.
+    pub(crate) fn hook_home_overlay(root: &str) -> Vec<(String, String)> {
+        let home = join(&[root, ".hook-home"]);
+        std::fs::create_dir_all(&home).unwrap();
+        vec![("HOME".to_string(), home)]
+    }
+
     /// Builds a Manager over a fresh temp root with the given hooks (mirror of `repoTestManager`).
     /// The returned [`TempDir`] must be kept alive for the root to persist.
     pub(crate) fn repo_test_manager(hooks: HookScripts) -> (Manager, TempDir) {
         let root = TempDir::new();
-        let m = Manager::new(Config {
+        let mut m = Manager::new(Config {
             root: root.path.clone(),
             hooks,
             hook_timeout: Duration::from_secs(30),
         })
         .unwrap();
+        m.runner.env_overlay = hook_home_overlay(&root.path);
         (m, root)
     }
 

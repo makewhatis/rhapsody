@@ -929,19 +929,38 @@ still off:** `storage.path: off` records nothing and the strip shows the neutral
 The `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` now pins the fourth name.
 
-### A sixth schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
+### A sixth schema table with no Go counterpart — `rhapsody_review_done` (STUDIO-1007)
+
+A merged pull request's ticket could be moved back out of its terminal state, and a terminal move
+that failed was never retried. On 2026-09-22 four merged tickets sat In Review and eighteen others
+were `blockedBy` them, because a `blockedBy` edge clears only on a terminal state. The merged fact
+therefore has to survive a restart, so the daemon records it durably before the move is first tried:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **14** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done` and `rhapsody_breaker_crossings` |
+| the owed terminal move | — | `rhapsody_review_done` (`identifier`, `pr`, `state`, `attempts`, `next_at`, `gave_up`), one row per ticket |
+| a ticket's breaker crossings | — | `rhapsody_breaker_crossings` (`notified_rounds`, `notified_providers`), keyed by the ticket identifier |
+
+One row per TICKET identifies the pull request that merged and the terminal state its ticket is
+going to. It is written before the first move attempt and deleted only when the move lands, so three
+readers can all tell a merged pull request from a merely reviewed one even across a restart: the
+bounded retry on the review watcher's tick, the handoff's terminal/merged guard, and the
+reconciliation sweep's `merged_ticket_not_terminal` report. The retry is bounded (three attempts
+over `[0, 900, 3300]` seconds, so the last lands beyond a Linear hourly quota window) and ends in
+`gave_up`, which the sweep keeps reporting rather than dropping. The sweep only REPORTS — the move
+lives on the watcher's off-loop half — and a default installation with `teams.review.done_state`
+unset writes no row and makes no extra tracker read. `divergent_objects_are_gated_by_name_only`
+pins the sixth name.
+
+### A seventh schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
 
 The runaway-loop circuit breaker holds a ticket and notifies the operator when its completed review
 rounds, or its per-ticket spend, crosses a configured limit. It must notify **once per crossing**,
 survive a restart without repeating, and leave the default install byte-identical. The persisted row
 is what buys the first two: the highest round count at which a round-crossing fired, and the
 providers whose per-ticket cap has fired.
-
-| Store schema | Go Symphony v0.4.0 | Rhapsody |
-| --- | --- | --- |
-| `PRAGMA user_version` | 6 | **13** |
-| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts` and `rhapsody_breaker_crossings` |
-| a ticket's breaker crossings | — | `rhapsody_breaker_crossings` (`notified_rounds`, `notified_providers`), keyed by the ticket identifier |
 
 The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
 (`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
@@ -950,7 +969,7 @@ The controls themselves are Rhapsody-only config, all off when unset: `teams.rev
 `clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
 author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
 `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
-`divergent_objects_are_gated_by_name_only` pins the sixth name.
+`divergent_objects_are_gated_by_name_only` pins the seventh name.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
