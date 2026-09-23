@@ -279,6 +279,10 @@ impl RefreshCoordinator {
         let account = CredentialRef::for_provider(provider_id)
             .map(|r| r.account().to_string())
             .unwrap_or_default();
+        // The generation this refresh is scoped to. If a definition reload moves it while the
+        // discovery request is in flight, `apply_reload` has already invalidated every catalog; a
+        // late publish must not resurrect a stale list keyed to the old generation.
+        let generation = Self::lock(&self.status).generation();
         let observed = self
             .source
             .read_bound(account, config.binding.clone())
@@ -286,7 +290,7 @@ impl RefreshCoordinator {
         let key = CatalogKey {
             provider_id: provider_id.to_string(),
             endpoint: config.binding.base_url.clone(),
-            generation: Self::lock(&self.status).generation(),
+            generation,
             credential_revision: observed.owner_revision.0,
         };
         let result = match observed.state {
@@ -302,6 +306,12 @@ impl RefreshCoordinator {
             ObservedState::BindingMismatch => Err(CatalogError::BindingMismatch),
             _ => Err(CatalogError::NoCredential),
         };
+        // Re-check AFTER the discovery await: a definition reload that raced this request already
+        // invalidated every catalog, so publishing here would resurrect a list keyed to the old
+        // generation. Leave the cache invalidated and report the unknown state instead.
+        if Self::lock(&self.status).generation() != generation {
+            return Ok(unknown_catalog(provider_id));
+        }
         let mut catalog = Self::lock(&self.catalog);
         catalog.publish(key, result, self.now_ms());
         let snapshot = catalog
@@ -330,6 +340,21 @@ impl RefreshCoordinator {
             provider_id: provider_id.to_string(),
             in_flight: Arc::clone(&self.catalog_in_flight),
         })
+    }
+}
+
+/// The empty, unknown-aged catalog a provider serves before its first successful refresh — and the
+/// answer a refresh whose definition reloaded mid-flight returns instead of resurrecting a stale
+/// list.
+fn unknown_catalog(provider_id: &str) -> CatalogSnapshot {
+    CatalogSnapshot {
+        provider_id: provider_id.to_string(),
+        models: Vec::new(),
+        truncated: false,
+        cache_age_ms: None,
+        error: None,
+        error_message: None,
+        manual_entry_allowed: true,
     }
 }
 
@@ -521,6 +546,63 @@ mod tests {
         assert_eq!(snap.models.len(), 1);
         assert!(snap.error.is_none());
         assert_eq!(discovery.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A discovery whose single call blocks until the test releases it, so a definition reload can
+    /// race the in-flight discovery deterministically.
+    struct GatedDiscovery {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ModelDiscovery for GatedDiscovery {
+        async fn list_models(
+            &self,
+            _request: DiscoveryRequest,
+        ) -> Result<DiscoveredCatalog, CatalogError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(DiscoveredCatalog {
+                entries: vec![ModelEntry {
+                    id: "stale".into(),
+                    display_name: None,
+                    capabilities: Vec::new(),
+                }],
+                truncated: false,
+            })
+        }
+    }
+
+    // MUTATION GUARD (a reload invalidates the old catalog; a late completion may not resurrect it):
+    // a refresh whose definition reloads mid-flight returns the unknown state and does NOT cache the
+    // stale list. An implementation without the generation check would re-insert `stale`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_during_a_catalog_refresh_is_not_resurrected() {
+        let source = FakeSource::new(ObservedState::Present(owned_lease()), 1);
+        let gated = Arc::new(GatedDiscovery {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let coordinator = RefreshCoordinator::with_now(
+            source,
+            Arc::clone(&gated) as Arc<dyn ModelDiscovery>,
+            fixed_now(0),
+        );
+        let _ = coordinator.apply_reload(1, &[config("https://api.example/v1")]);
+        let runner = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move { runner.refresh_catalog("fireworks").await });
+        // Wait until the discovery call is in flight, then reload the definition.
+        gated.entered.notified().await;
+        let _ = coordinator.apply_reload(2, &[config("https://api.example/v1")]);
+        gated.release.notify_one();
+        let snapshot = task.await.expect("join").expect("snapshot");
+        assert!(snapshot.models.is_empty(), "the stale list was resurrected");
+        assert!(snapshot.cache_age_ms.is_none());
+        assert!(
+            coordinator.catalog_view("fireworks").is_none(),
+            "the reload invalidated the catalog and it stayed invalidated"
+        );
     }
 
     #[tokio::test]
