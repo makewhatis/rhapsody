@@ -784,8 +784,9 @@ impl Orchestrator {
             summon_at = %at,
             run_started_at = %w.started_at,
             run_ended_at = ?w.ended_at,
-            "ignoring a summons created while this ticket's own author run was live: the author's \
-             own comment (same GitHub account as every agent) is not a request to re-engage it"
+            "ignoring a summons created while this ticket's own author run was live: every agent \
+             posts from the operator's one GitHub account, so a comment inside the run's window is \
+             treated as the author's own and is not a request to re-engage it"
         );
     }
 
