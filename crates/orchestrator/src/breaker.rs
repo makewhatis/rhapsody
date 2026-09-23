@@ -194,7 +194,14 @@ pub fn crossing_body(plan: &BreakerPlan) -> String {
         .iter()
         .filter(|s| s.spent > 0)
         .map(|s| match s.cap {
-            Some(cap) => format!("{} {}", s.provider, human_tokens(s.spent.min(cap))),
+            // Report the spend that actually HAPPENED, with the cap beside it — reporting
+            // `min(spent, cap)` would name the cap as the spend and hide the overshoot.
+            Some(cap) => format!(
+                "{} {} (cap {})",
+                s.provider,
+                human_tokens(s.spent),
+                human_tokens(cap)
+            ),
             None => format!("{} {}", s.provider, human_tokens(s.spent)),
         })
         .collect::<Vec<_>>();
@@ -1297,6 +1304,34 @@ mod tests {
         assert!(body.contains("**5**"), "names the rounds: {body}");
         assert!(body.contains("14"), "names the attempts: {body}");
         assert!(body.contains("259.0M"), "names the spend: {body}");
+    }
+
+    /// A spend crossing names the spend that HAPPENED **and** the cap it crossed — never the cap
+    /// alone. Mutation: report `min(spent, cap)` and the overshoot disappears from the body.
+    #[test]
+    fn the_notification_body_names_the_real_spend_beside_the_cap() {
+        let plan = BreakerPlan {
+            kinds: vec![CrossingKind::Spend],
+            ticket: "STUDIO-984".into(),
+            issue_id: "iss".into(),
+            team_id: "team".into(),
+            owner: "makewhatis".into(),
+            repo: "rhapsody".into(),
+            number: 222,
+            rounds: 1,
+            threshold: 0,
+            attempts: 6,
+            spend: vec![ProviderSpend {
+                provider: "anthropic".into(),
+                spent: 40_000_000,
+                cap: Some(30_000_000),
+            }],
+            latest_review: String::new(),
+            reason: String::new(),
+        };
+        let body = crossing_body(&plan);
+        assert!(body.contains("anthropic 40.0M"), "the real spend: {body}");
+        assert!(body.contains("cap 30.0M"), "the cap it crossed: {body}");
     }
 
     // ── the off-loop perform ─────────────────────────────────────────────────────────────────────
