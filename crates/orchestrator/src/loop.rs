@@ -433,6 +433,17 @@ pub enum Event {
         outcome: crate::runmerge::MergeControlOutcome,
         reply: oneshot::Sender<()>,
     },
+    /// The §8.3 manager-approval pre-merge recheck (STUDIO-1011; NEW beyond Go v0.4.0). The
+    /// off-loop auto-merge half asks the control task whether the approval a merge plan counted is
+    /// still current, immediately before it merges. Loop-confined because the answer reads
+    /// loop-owned state: the current generation and evidence revision, the current-label hold set,
+    /// and the configured authority. A reply of `false` means "do not merge".
+    ManagerApprovalRecheck {
+        intervention_id: String,
+        generation: i64,
+        evidence_rev: i64,
+        reply: oneshot::Sender<bool>,
+    },
     /// An off-loop preparation's completion (STUDIO-988, P6; NEW beyond Go v0.4.0). The resolver task
     /// sends this back; the control task accepts it only for the CURRENT token/config generation and
     /// drops a stale payload without touching loop state.
@@ -768,6 +779,18 @@ impl Orchestrator {
             } => {
                 self.settle_run_merge(&plan, &outcome);
                 let _ = reply.send(());
+            }
+            Event::ManagerApprovalRecheck {
+                intervention_id,
+                generation,
+                evidence_rev,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_manager_approval_recheck(
+                    &intervention_id,
+                    generation,
+                    evidence_rev,
+                ));
             }
         }
     }
@@ -1895,6 +1918,43 @@ impl ControlHandle {
         };
         if self.events.send(ev).is_err() {
             return false; // the loop is gone: there is no live run to reach.
+        }
+        let mut lifetime = self.ctx.clone();
+        let reply = async {
+            tokio::select! {
+                r = rx => r.unwrap_or(false),
+                _ = lifetime.cancelled() => false,
+            }
+        };
+        tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, reply)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// The §8.3 manager-approval pre-merge recheck (STUDIO-1011): is the approval a merge plan
+    /// counted still current? Round-trips the control channel because the answer reads loop-owned
+    /// state. **Fails closed**: a gone loop, a dropped reply or a timed-out wait all answer `false`,
+    /// so a merge that relied on a manager approval is never performed without the recheck.
+    ///
+    /// Bounded by [`TEAMS_POST_MIRROR_WAIT`]'s reason in reverse: this runs on the off-loop merge
+    /// half immediately before an irreversible `gh pr merge`, and a control task busy on the network
+    /// must cost the merge one honest "not now" (re-decided next tick) rather than parking the
+    /// watcher's task indefinitely.
+    pub async fn manager_approval_recheck(
+        &self,
+        intervention_id: &str,
+        generation: i64,
+        evidence_rev: i64,
+    ) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let ev = Event::ManagerApprovalRecheck {
+            intervention_id: intervention_id.to_string(),
+            generation,
+            evidence_rev,
+            reply: tx,
+        };
+        if self.events.send(ev).is_err() {
+            return false; // the loop is gone: fail closed.
         }
         let mut lifetime = self.ctx.clone();
         let reply = async {
