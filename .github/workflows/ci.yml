@@ -87,7 +87,10 @@ jobs:
       # there); the workspace run above has already compiled everything, so each iteration only
       # re-runs the one test.
       - if: runner.os != 'macOS'
-        run: for i in $(seq 1 50); do TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace ensure_from_repo_hook_runs_unlocked || exit 1; done
+        run: |
+          for i in $(seq 1 50); do
+            TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace --lib repo::tests::ensure_from_repo_hook_runs_unlocked -- --exact | grep -q 'test result: ok. 1 passed' || exit 1
+          done
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
 
   web:
