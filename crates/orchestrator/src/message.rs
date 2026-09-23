@@ -578,6 +578,8 @@ mod tests {
             review_verdict: None,
             refused: false,
         });
+        // The reopen ladder is the unit under test; drop the dispatch's claim so
+        // `review_reopen_eligible` reaches its store half rather than being refused as "claimed".
         o.claimed.clear();
 
         let mut review = cand.clone();
