@@ -3,6 +3,7 @@ import { Button } from "@/components/ui";
 import { Note } from "@/components/console/Note";
 import { STATE_QUERY_KEY, useStateQuery } from "@/hooks/useStateQuery";
 import { setDrain } from "@/lib/api";
+import { errText } from "@/lib/teams-model";
 
 /**
  * The console's view of an armed drain, and the way out of one (STUDIO-880).
@@ -53,7 +54,7 @@ export function DrainBanner() {
         >
           {cancel.isPending ? "Cancelling…" : "Cancel drain"}
         </Button>
-        {cancel.isError ? " The daemon refused the cancel — check that it is still running." : null}
+        {cancel.isError ? ` The daemon refused the cancel: ${errText(cancel.error)}` : null}
       </Note>
     </div>
   );
