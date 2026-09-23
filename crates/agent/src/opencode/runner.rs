@@ -321,6 +321,18 @@ impl Harness for Runner {
     fn capabilities(&self) -> &HarnessCapabilities {
         &CAPABILITIES
     }
+
+    /// The brokered materialization (PB7, STUDIO-1002): provision a credential-FREE run state and a
+    /// managed session whose turns mint a per-turn capability from the broker attempt. This is the
+    /// one entry point a prepared provider dispatch uses; it never reads a harness-native credential.
+    fn start_brokered_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.start_brokered(workspace_path, issue, transcript)
+    }
 }
 
 #[async_trait]
