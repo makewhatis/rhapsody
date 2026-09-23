@@ -929,6 +929,30 @@ still off:** `storage.path: off` records nothing and the strip shows the neutral
 The `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` now pins the fourth name.
 
+### A sixth schema table with no Go counterpart — `rhapsody_review_done` (STUDIO-1007)
+
+A merged pull request's ticket could be moved back out of its terminal state, and a terminal move
+that failed was never retried. On 2026-09-22 four merged tickets sat In Review and eighteen others
+were `blockedBy` them, because a `blockedBy` edge clears only on a terminal state. The merged fact
+therefore has to survive a restart, so the daemon records it durably before the move is first tried:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **13** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts` and `rhapsody_review_done` |
+| the owed terminal move | — | `rhapsody_review_done` (`identifier`, `pr`, `state`, `attempts`, `next_at`, `gave_up`), one row per ticket |
+
+One row per TICKET identifies the pull request that merged and the terminal state its ticket is
+going to. It is written before the first move attempt and deleted only when the move lands, so three
+readers can all tell a merged pull request from a merely reviewed one even across a restart: the
+bounded retry on the review watcher's tick, the handoff's terminal/merged guard, and the
+reconciliation sweep's `merged_ticket_not_terminal` report. The retry is bounded (three attempts
+over `[0, 900, 3300]` seconds, so the last lands beyond a Linear hourly quota window) and ends in
+`gave_up`, which the sweep keeps reporting rather than dropping. The sweep only REPORTS — the move
+lives on the watcher's off-loop half — and a default installation with `teams.review.done_state`
+unset writes no row and makes no extra tracker read. `divergent_objects_are_gated_by_name_only`
+pins the sixth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
