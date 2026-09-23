@@ -215,4 +215,28 @@ mod tests {
             );
         }
     }
+
+    /// Pins the three independent copies of the model-id/catalog bounds against each other. Config,
+    /// `rhapsody-provider-status` and `rhapsody-provider-broker` each keep a local constant to avoid
+    /// a dependency edge; this is the one crate that depends on all three, so it is where drift is
+    /// caught.
+    #[test]
+    fn model_id_and_catalog_bounds_agree_across_crates() {
+        assert_eq!(
+            rhapsody_config::MODEL_ID_MAX_BYTES,
+            rhapsody_provider_status::catalog::MAX_MODEL_ID_BYTES
+        );
+        assert_eq!(
+            rhapsody_config::MODEL_ID_MAX_BYTES,
+            rhapsody_provider_broker::catalog::MAX_MODEL_ID_BYTES
+        );
+        assert_eq!(
+            rhapsody_provider_status::catalog::MAX_CATALOG_BODY_BYTES,
+            rhapsody_provider_broker::catalog::MAX_CATALOG_BODY_BYTES
+        );
+        assert_eq!(
+            rhapsody_provider_status::catalog::MAX_CATALOG_ENTRIES,
+            rhapsody_provider_broker::catalog::MAX_CATALOG_ENTRIES
+        );
+    }
 }

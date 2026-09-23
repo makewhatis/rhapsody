@@ -32,9 +32,9 @@ use crate::error::CatalogError;
 pub const MAX_CATALOG_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// The v1 cap on unique model entries per provider (design §2.6).
 pub const MAX_CATALOG_ENTRIES: usize = 10_000;
-/// The model id byte cap, mirroring `rhapsody_config::providers::MODEL_ID_MAX_BYTES`. Kept local so
-/// this crate does not take a config dependency for one constant; a cross-crate pin test in config
-/// asserts they agree.
+/// The model id byte cap, mirroring `rhapsody_config::providers::MODEL_ID_MAX_BYTES` and the
+/// broker's own copy. Kept local so this crate takes no config dependency for one constant; a
+/// cross-crate pin test in `rhapsodyd` (the one crate that depends on all three) asserts they agree.
 pub const MAX_MODEL_ID_BYTES: usize = 512;
 
 /// One discovered model. Only the fields the API may show: an id, an optional display name, and
