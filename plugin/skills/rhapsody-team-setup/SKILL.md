@@ -98,8 +98,8 @@ extends: swe
   just text, and there is no interpolation surface.
 
 Optional front matter, all inherited from the built-in when omitted: `model`, `effort`,
-`harness`, `capabilities`, `tools`. (`tools` is parsed and reported by `teams show`, but does not
-yet gate anything — do not rely on it to restrict a teammate.)
+`harness`, `provider`, `capabilities`, `tools`. (`tools` is parsed and reported by `teams show`,
+but does not yet gate anything — do not rely on it to restrict a teammate.)
 
 - **`harness`** — which coding-agent backend this teammate's runs use: `claude` or `opencode`
   today (`codex` is a recognized name with no runner yet, and falls back to the configured backend
@@ -108,6 +108,17 @@ yet gate anything — do not rely on it to restrict a teammate.)
   `model`/`effort` already follow, *not* a fork the way an absent `extends:` is. `rhapsodyd teams
   show <name>` renders the resolved value with its origin, and marks it when this build can't
   actually run it.
+
+- **`provider`** — the canonical id of a provider declared in `WORKFLOW.md`'s `providers:` block,
+  selected for this teammate's runs (empty ⇒ inherit the daemon's configured selection). It is a
+  plain operator-chosen id, **never a credential**, and an unknown or non-canonical one is a
+  dispatch refusal rather than a fallback. A provider only makes sense with the harness that will
+  use it, so do not set `provider` on a `claude` teammate — Claude uses its native login.
+
+The same `harness`/`provider`/`model`/`effort` fields may also be set directly on a **roster
+identity**, overriding whatever the profile names; and the `manager:` block has its own tuple
+(`manager.harness`/`manager.provider`/`manager.model`) that never borrows a teammate's — an absent
+`manager.harness` means `claude`.
 
 ⚠️ **A model name means nothing without its harness.** Setting `model: claude-opus-5` on a profile
 that also sets `harness: opencode` hands that CLI a Claude model name — the provider rejects it
@@ -129,6 +140,7 @@ roster:
     labels: [server, go] # deterministic routing: matches the ticket's Linear labels
     bank: ''             # empty ⇒ <memory.bank_prefix><name>
     max_concurrent: 0    # 0 ⇒ unlimited
+    # harness/provider/model/effort may also be set here to override the profile
 ```
 
 - **`labels`** is how a ticket reaches a teammate without the manager thinking about it. Leave
@@ -194,7 +206,7 @@ repo has genuinely separate areas, not by giving one a thinner profile.
 ## What not to do
 
 - Don't invent front-matter fields. The set is `extends`, `model`, `effort`, `harness`,
-  `capabilities`, `tools` — everything else belongs in the body.
+  `provider`, `capabilities`, `tools` — everything else belongs in the body.
 - Don't put a person's name, a bank id, or history in a profile. It is a role.
 - Don't restate the built-in's engineering discipline; `{{ base }}` already includes it.
 - Don't set the Linear **assignee** to route work — that field is the daemon's claim lock.

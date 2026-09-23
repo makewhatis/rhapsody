@@ -1322,6 +1322,7 @@ mod tests {
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
             bank: String::new(),
             max_concurrent,
+            ..Default::default()
         }
     }
 
