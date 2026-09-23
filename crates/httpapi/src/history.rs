@@ -16,7 +16,8 @@ use std::collections::HashMap;
 
 use rhapsody_store::{
     DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
-    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
+    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, RunUsage,
+    StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -82,6 +83,12 @@ pub trait HistoryStore: Send + Sync {
     /// the feature, which is the honest "unknown" rather than a zero value. Rhapsody-only; Go
     /// records no such thing.
     fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
+    /// One run's broker usage record — the provider-reported total, the conservative
+    /// admission-reservation total, the usage authority and the unknown-request accounting
+    /// (`GET /api/v1/runs/{id}/provenance`, STUDIO-987). `Ok(None)` for a run that recorded none,
+    /// which is every native-login run and every run that predates the feature. Rhapsody-only; Go
+    /// has no broker.
+    fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError>;
     /// The provenance of a PAGE of runs in one query, keyed by run id, decorating
     /// `GET /api/v1/history/issues` with each row's provider (STUDIO-909). Missing ids are absent.
     fn load_run_provenances(
@@ -160,6 +167,9 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
         rhapsody_store::Store::run_provenance(self, run_id)
+    }
+    fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError> {
+        rhapsody_store::Store::run_usage(self, run_id)
     }
     fn load_run_provenances(
         &self,

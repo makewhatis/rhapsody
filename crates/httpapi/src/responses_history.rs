@@ -17,7 +17,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
 use rhapsody_store::{
     DayProviderRollup, DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunCostBucket,
-    RunProvenance, RunSummary,
+    RunProvenance, RunSummary, RunUsage,
 };
 use serde_json::{Value, json};
 
@@ -491,15 +491,26 @@ pub(crate) fn history_costs_response(
     })
 }
 
-/// `{run_id, harness?, harness_origin?, model?, model_origin?, provider?}` — the
-/// `GET /api/v1/runs/{id}/provenance` payload (STUDIO-909). Each field is OMITTED when the run
-/// recorded nothing for it, so a run started before this feature renders as unknown rather than a
-/// guessed value; `harness_origin`/`model_origin` name the config key the value came from, which is
-/// what makes an invisible override (`review.model.opencode`) visible.
+/// `{run_id, harness?, harness_origin?, model?, model_origin?, provider?, provider_origin?,
+/// usage?}` — the `GET /api/v1/runs/{id}/provenance` payload (STUDIO-909; `provider_origin` and
+/// `usage` are STUDIO-987). Each identity field is OMITTED when the run recorded nothing for it, so
+/// a run started before this feature renders as unknown rather than a guessed value;
+/// `harness_origin`/`model_origin`/`provider_origin` name the config tier the value came from, which
+/// is what makes an invisible override (`review.model.opencode`) visible.
+///
+/// The `usage` object is emitted only when a broker usage row exists, and its two token figures are
+/// kept APART on purpose: `provider_reported_tokens` is the provider's own UNVERIFIED report (the
+/// `usage_authority` spells that out; v1 never labels it "measured"), while `reserved_tokens` is the
+/// conservative admission charge the broker actually consumed. A client must never add them or read
+/// one as the other, so neither is ever folded into a generic "total_tokens".
 ///
 /// Rhapsody-only — Go records none of it. Kept a separate additive endpoint rather than fields on
 /// `GET /api/v1/runs/{id}`, whose body is byte-pinned to the Go capture by `api/run_detail.json`.
-pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) -> Value {
+pub(crate) fn run_provenance_response(
+    run_id: i64,
+    p: Option<&RunProvenance>,
+    u: Option<&RunUsage>,
+) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("run_id".to_string(), json!(run_id));
     if let Some(p) = p {
@@ -509,6 +520,7 @@ pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) ->
             ("model", &p.model),
             ("model_origin", &p.model_origin),
             ("provider", &p.provider),
+            ("provider_origin", &p.provider_origin),
         ] {
             if !value.is_empty() {
                 obj.insert(key.to_string(), json!(value));
@@ -538,6 +550,25 @@ pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) ->
                 }),
             );
         }
+    }
+    // The broker usage record (STUDIO-987). Every field is spelled so a client cannot mistake the
+    // unverified provider report for exact measured usage: the report lives under its own name with
+    // its authority beside it, and the conservative reservation is a separate sibling.
+    if let Some(u) = u {
+        let mut usage = serde_json::Map::new();
+        if let Some(tokens) = u.provider_reported_tokens {
+            usage.insert("provider_reported_tokens".to_string(), json!(tokens));
+        }
+        usage.insert("reserved_tokens".to_string(), json!(u.reserved_tokens));
+        if !u.usage_authority.is_empty() {
+            usage.insert("usage_authority".to_string(), json!(u.usage_authority));
+        }
+        usage.insert("usage_incomplete".to_string(), json!(u.usage_incomplete));
+        usage.insert(
+            "unknown_usage_requests".to_string(),
+            json!(u.unknown_usage_requests),
+        );
+        obj.insert("usage".to_string(), Value::Object(usage));
     }
     Value::Object(obj)
 }

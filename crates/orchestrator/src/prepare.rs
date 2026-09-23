@@ -1635,6 +1635,10 @@ impl Orchestrator {
         if run_id != 0 {
             let prov = rhapsody_store::RunProvenance {
                 provider: resolved.provider.clone(),
+                // A refusal row records WHAT was selected, not the tier each field came from; the
+                // origins are deliberately empty here, exactly as `harness_origin`/`model_origin`
+                // are (STUDIO-909), so `provider_origin` is empty too.
+                provider_origin: String::new(),
                 harness: resolved.harness.clone(),
                 harness_origin: String::new(),
                 model: resolved.model.clone(),

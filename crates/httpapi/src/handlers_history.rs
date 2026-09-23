@@ -202,9 +202,15 @@ pub(crate) async fn handle_run_provenance(
         Ok(p) => p,
         Err(_) => return store_error("run provenance lookup failed"),
     };
+    // The broker usage record (STUDIO-987) rides the same endpoint. Its absence is the ordinary
+    // state for a native-login run, not an error.
+    let usage = match provider.history().run_usage(run_id) {
+        Ok(u) => u,
+        Err(_) => return store_error("run usage lookup failed"),
+    };
     write_json(
         StatusCode::OK,
-        &run_provenance_response(run_id, provenance.as_ref()),
+        &run_provenance_response(run_id, provenance.as_ref(), usage.as_ref()),
     )
 }
 
@@ -1491,6 +1497,9 @@ mod tests {
             run_id: i64,
         ) -> Result<Option<rhapsody_store::RunProvenance>, StoreError> {
             Store::run_provenance(&self.inner, run_id)
+        }
+        fn run_usage(&self, run_id: i64) -> Result<Option<rhapsody_store::RunUsage>, StoreError> {
+            Store::run_usage(&self.inner, run_id)
         }
         fn load_run_provenances(
             &self,
@@ -3901,6 +3910,7 @@ mod tests {
                     model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash".into(),
                     model_origin: "review.model.opencode".into(),
                     provider: "fireworks-ai".into(),
+                    provider_origin: "default".into(),
                 },
             )
             .expect("set provenance");
@@ -3917,6 +3927,7 @@ mod tests {
         );
         assert_eq!(body["model_origin"], "review.model.opencode");
         assert_eq!(body["provider"], "fireworks-ai");
+        assert_eq!(body["provider_origin"], "default");
         // STUDIO-978: the observability fidelity the console renders, derived from the harness the
         // run actually ran on. opencode emits structured per-step events and can be steered between
         // turns, so the Trace spine is real and the steering field is shown.
@@ -3974,6 +3985,99 @@ mod tests {
         );
     }
 
+    /// STUDIO-987 §7.3: a complete generic provider report is rendered as
+    /// `provider_reported_unverified` MEASUREMENT, beside the separate conservative reservation.
+    /// The mutation this guards: folding the reservation into the report, or presenting the report
+    /// as exact measured usage. Both would show up here as a wrong figure or a missing authority.
+    #[tokio::test]
+    async fn run_provenance_labels_broker_usage_unverified_and_keeps_the_reservation_separate() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        store
+            .set_run_usage(
+                run_id,
+                &rhapsody_store::RunUsage {
+                    provider_reported_tokens: Some(1_234),
+                    reserved_tokens: 9_000,
+                    usage_authority: rhapsody_store::USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED
+                        .to_string(),
+                    usage_incomplete: false,
+                    unknown_usage_requests: 0,
+                },
+            )
+            .expect("set usage");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        let usage = &body["usage"];
+        assert_eq!(usage["provider_reported_tokens"], 1_234);
+        // The reservation is its OWN field, not added into the report and not relabeled as it.
+        assert_eq!(usage["reserved_tokens"], 9_000);
+        assert_eq!(
+            usage["usage_authority"], "provider_reported_unverified",
+            "a generic report is never exact measured authority: {body}"
+        );
+        assert_eq!(usage["usage_incomplete"], false);
+        assert_eq!(usage["unknown_usage_requests"], 0);
+        // No generic "total" a client could mistake for exact measured usage.
+        assert!(
+            usage.get("total_tokens").is_none(),
+            "reserved/reported tokens must not be folded into a generic total: {body}"
+        );
+    }
+
+    /// STUDIO-987 §7.3: a request whose usage never arrived keeps its FULL reservation, is counted
+    /// unknown, and is NOT given a provider-reported figure. The mutation this guards: claiming a
+    /// provider-reported total (or a made-up zero) for an unknown request, or releasing the
+    /// reservation as unused.
+    #[tokio::test]
+    async fn run_provenance_keeps_a_full_reservation_for_unknown_usage() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        store
+            .set_run_usage(
+                run_id,
+                &rhapsody_store::RunUsage {
+                    provider_reported_tokens: None,
+                    reserved_tokens: 5_000,
+                    usage_authority: String::new(),
+                    usage_incomplete: true,
+                    unknown_usage_requests: 2,
+                },
+            )
+            .expect("set usage");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        let usage = &body["usage"];
+        assert!(
+            usage.get("provider_reported_tokens").is_none(),
+            "an unknown request has no provider-reported figure: {body}"
+        );
+        // The conservative charge survives in full; it is not released and not relabeled.
+        assert_eq!(usage["reserved_tokens"], 5_000);
+        assert_eq!(usage["usage_incomplete"], true);
+        assert_eq!(usage["unknown_usage_requests"], 2);
+    }
+
+    /// A run with no broker usage row (every native-login run) omits the `usage` object entirely
+    /// rather than rendering a fabricated zero-usage record.
+    #[tokio::test]
+    async fn run_provenance_omits_usage_for_a_run_with_no_broker_record() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.get("usage").is_none(),
+            "no usage row ⇒ no usage: {body}"
+        );
+    }
+
     /// An unknown run is 404 (never a fabricated provenance), an unparseable id is 404, and POST is
     /// 405 — the same contract `GET /api/v1/runs/{id}` already keeps.
     #[tokio::test]
@@ -4007,6 +4111,7 @@ mod tests {
                     model: "fireworks-ai/x".into(),
                     model_origin: "profile".into(),
                     provider: "fireworks-ai".into(),
+                    provider_origin: "default".into(),
                 },
             )
             .expect("set provenance");
@@ -4040,6 +4145,7 @@ mod tests {
                     model: "claude-sonnet-4".into(),
                     model_origin: "claude.model".into(),
                     provider: "anthropic".into(),
+                    provider_origin: "default".into(),
                 },
             )
             .expect("set provenance");
@@ -4076,6 +4182,7 @@ mod tests {
                     model: "claude-sonnet-4".into(),
                     model_origin: "claude.model".into(),
                     provider: "anthropic".into(),
+                    provider_origin: "default".into(),
                 },
             )
             .expect("set provenance");
@@ -4098,6 +4205,7 @@ mod tests {
                     model: "fireworks-ai/dsv4".into(),
                     model_origin: "opencode.model".into(),
                     provider: "fireworks-ai".into(),
+                    provider_origin: "default".into(),
                 },
             )
             .expect("set old provenance");

@@ -243,6 +243,20 @@ pub trait Store {
     /// per distinct pair, empty provider included; order is stable (identifier, then provider).
     fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError>;
 
+    // --- per-run broker usage (STUDIO-987) ---
+    // Additive Rhapsody-only surface: the frozen reference has no broker, so it collects no provider
+    // usage. Where [`Store::set_run_provenance`] is written ONCE before the worker starts, usage is
+    // settled at run END from the broker's finalized ledger, so it lives in its own
+    // `rhapsody_run_usage` table (see the README "Divergences" entry). A run with no row — every
+    // native-login run, and every run that predates this feature — reads back as `None`, the honest
+    // "no broker usage recorded" rather than a zero.
+    //
+    // [`Store::set_run_usage`] upserts on `run_id` unconditionally and never checks that `run_id`
+    // names a live `runs` row; callers pass the id [`Store::start_run`] returned.
+    fn set_run_usage(&self, run_id: i64, u: &RunUsage) -> Result<(), StoreError>;
+    /// One run's broker usage record, or `Ok(None)` when the run recorded none.
+    fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError>;
+
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`
     /// is the operator's ORIGINAL (unwrapped) text.
