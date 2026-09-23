@@ -1071,6 +1071,34 @@ impl Orchestrator {
         self.running_ticketless_reviews().saturating_add(preparing)
     }
 
+    /// How many of `pr`'s review ROUNDS are in flight as `preparing` reservations — begun by this or
+    /// an earlier sweep and not yet accepted (so not yet charged to [`Orchestrator::review_rounds`]).
+    ///
+    /// The per-pull-request cap ([`REVIEW_ROUNDS_PER_PR_CAP`]) is charged on ACCEPTANCE (STUDIO-988
+    /// review round 7, sol #1), and every due row of one sweep reads the same uncharged counter — so
+    /// without this count a pull request could begin `reviewers` preparations against a budget one
+    /// short and, once all were accepted, overshoot the cap by up to `reviewers - 1`. Adding the
+    /// in-flight reservations to the charged count makes the N-th row's check see the `N - 1` the
+    /// earlier rows of the same sweep started, so the sweep stops at `budget` exactly as the
+    /// synchronous path does (STUDIO-988 review round 8, alice #2).
+    ///
+    /// Keyed by the same [`churn_key`] the counter is, so a case-variant spelling of one repository
+    /// cannot get a second budget. Ticket reservations are ignored — their dispatch does not touch
+    /// the review round budget.
+    pub(crate) fn review_preparations_for(&self, pr: &PrCoord) -> usize {
+        let key = churn_key(pr);
+        self.preparing
+            .values()
+            .filter_map(|e| match &e.target {
+                crate::prepare::PreparedTarget::Review { run, .. } => {
+                    Some((run.owner.as_str(), run.repo.as_str(), run.number))
+                }
+                crate::prepare::PreparedTarget::Ticket { .. } => None,
+            })
+            .filter(|(owner, repo, number)| churn_key(&PrCoord::new(owner, repo, *number)) == key)
+            .count()
+    }
+
     /// How many running entries currently SPEND the global pool the review watcher draws against
     /// (STUDIO-950). When `agent.max_concurrent_reviews` gives reviews their own pool that is the
     /// ticketless review runs alone; unset, it is EVERY running run on the shared
@@ -2566,11 +2594,19 @@ impl Orchestrator {
             // The counter is in dispatches and the cap is in rounds, so the budget is scaled by the
             // required-reviewer count to make the two comparable (STUDIO-727). Without that, a
             // two-reviewer config would get four rounds and an eight-reviewer config exactly one.
-            let dispatched = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
+            //
+            // The in-flight reservations this pull request already holds are counted BESIDE the
+            // charged counter, because the counter is charged only on acceptance: every due row of
+            // one sweep would otherwise read the same uncharged number and the sweep could begin
+            // `reviewers` preparations against a budget one short, overshooting on acceptance
+            // (STUDIO-988 review round 8, alice #2).
+            let charged = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
+            let in_flight = self.review_preparations_for(pr);
+            let dispatched = charged.saturating_add(in_flight);
             let budget = REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round);
             if dispatched >= budget {
                 tracing::debug!(
-                    pr = %pr, dispatched, budget,
+                    pr = %pr, charged, in_flight, budget,
                     "ticketless review: the per-pull-request re-review cap is reached; no further \
                      round is dispatched until the daemon restarts or the pull request closes"
                 );
@@ -2694,10 +2730,20 @@ impl Orchestrator {
                     if reserved {
                         *slots -= 1;
                     }
-                    // The reviewer chosen for this round is committed by the reservation, so the
-                    // later rows of THIS sweep must treat that teammate as assigned — the same
-                    // bookkeeping the synchronous arm does, kept here because it is sweep-local
-                    // state the reservation cannot carry.
+                    // The chosen reviewer is committed by the reservation, so the later rows of THIS
+                    // sweep must treat that teammate as assigned — the same bookkeeping the
+                    // synchronous arm does, kept here because it is sweep-local state the
+                    // reservation cannot carry.
+                    //
+                    // Deliberately unconditional, INCLUDING a gate `Suppressed` `reserved: false`
+                    // (STUDIO-988 review round 8, alice #3). A re-offer that JOINED a reservation
+                    // obviously holds the substitute, and a suppression takes them out of the sweep
+                    // just as surely: the gate's fingerprint is keyed by the CHOSEN reviewer's
+                    // identity (plus the head and the route) and carries no incumbent, so any later
+                    // row that re-chose them would compute the IDENTICAL fingerprint and be
+                    // suppressed in turn. Marking them assigned here is therefore not an
+                    // over-reservation — it steers the rest of the sweep to a reviewer who can
+                    // actually be dispatched rather than into a second suppression.
                     assigned[idx] = picked;
                     tracing::debug!(pr = %pr, reserved, "ticketless review: preparation in flight");
                 }
@@ -9992,6 +10038,111 @@ mod tests {
             watch_row(&o, 12, "carol").requested_sha,
             HEAD_A,
             "and the substitute's row carries the round"
+        );
+    }
+
+    /// **An in-flight review PREPARATION counts against the per-pull-request round cap (STUDIO-988
+    /// review round 8, alice #2).** The cap is charged on ACCEPTANCE, so every due row of one sweep
+    /// reads the same uncharged counter; with two reviewers the sweep could begin two preparations
+    /// against a budget one short and, once both were accepted, overshoot to `budget + 1` — where the
+    /// synchronous path stops at `budget`.
+    ///
+    /// MUTATION GUARD: drop `review_preparations_for` from the cap check and both rows begin a
+    /// preparation, so the accepted pair charges `budget + 1`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_flight_review_preparation_counts_against_the_per_pr_round_cap() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let mut teams = ticketless(&["bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, _dispatched) = orch(teams);
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "carol"));
+        // One dispatch short of the whole per-pull-request budget (`8 * 2`).
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.shared_round_budget() - 1);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0, "prepared, not dispatched");
+        assert_eq!(
+            o.preparing.len(),
+            1,
+            "only the last free dispatch may begin a preparation; the second row must see the \
+             first's in-flight reservation"
+        );
+
+        let keys: Vec<String> = o.preparing.values().map(|e| e.id().to_string()).collect();
+        for key in keys {
+            let token = o
+                .preparing
+                .get(&key)
+                .map(|e| e.token)
+                .expect("review reservation");
+            o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+                .await;
+        }
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))).copied(),
+            Some(o.shared_round_budget()),
+            "the accepted preparations must stop at the budget, never overshoot it"
+        );
+    }
+
+    /// **A PREPARED reassignment still reserves its substitute for this tick's other rows
+    /// (STUDIO-988 review round 8, alice #3).**
+    /// `two_reassignments_in_one_tick_do_not_land_on_the_same_substitute` pins the synchronous arm's
+    /// `assigned[idx] = picked`; the prepared arm dispatches nothing, so the reservation is the only
+    /// record, and without the same bookkeeping the second row re-chooses the first row's substitute
+    /// and its preparation is refused as `AlreadyPreparing` instead of taking the next eligible
+    /// reviewer.
+    ///
+    /// MUTATION GUARD: drop the `assigned[idx] = picked` update from the `Preparing` arm and only
+    /// carol's reservation exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prepared_reassignment_reserves_its_substitute_for_this_ticks_other_rows() {
+        use crate::testsupport::HangResolver;
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0), ident("carol", 0), ident("erin", 0)],
+        ));
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "dave"));
+        // `erin` carries a standing load so `carol` stays the least-loaded candidate even after the
+        // first row reserves her — without which the live load snapshot alone would separate the two
+        // and this test would pass with the bookkeeping it exists to pin absent.
+        for (n, who) in [("iss-3", "erin"), ("iss-4", "erin")] {
+            let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+                id: n.to_string(),
+                identifier: format!("STUDIO-{n}"),
+                ..Default::default()
+            });
+            busy.identity = who.to_string();
+            o.running.insert(n.to_string(), busy);
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "both rounds are prepared, not dispatched"
+        );
+        let mut picked: Vec<String> = o
+            .preparing
+            .values()
+            .filter_map(|e| match &e.target {
+                crate::prepare::PreparedTarget::Review { run, .. } => Some(run.reviewer.clone()),
+                crate::prepare::PreparedTarget::Ticket { .. } => None,
+            })
+            .collect();
+        picked.sort();
+        assert_eq!(
+            picked,
+            vec!["carol".to_string(), "erin".to_string()],
+            "one substitute must not take both of a pull request's required reviews"
         );
     }
 

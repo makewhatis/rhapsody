@@ -732,16 +732,20 @@ impl Orchestrator {
     /// IDENTITY (the review harness check) does not pay for the turn-1 section compose — which
     /// advances the room catch-up watermark as a side effect, so calling it twice for one dispatch
     /// would eat a window.
+    ///
+    /// **The load is [`teammate_load`](Self::teammate_load), NOT a bare running+retries snapshot**
+    /// (STUDIO-988 review round 8, alice #1). This is the router that runs again at ACCEPTANCE
+    /// (`dispatch_issue` re-routes after `handle_dispatch_prepared` removed the accepting entry
+    /// from `preparing`), so a snapshot blind to other reservations could send the ticket to a seat
+    /// a still-preparing sibling holds and put two live runs on a `max_concurrent: 1` teammate. The
+    /// ladder already routes against `teammate_load`, and this is the same load, so the two agree.
+    /// The accepting reservation is already gone from `preparing`, so the router never counts the
+    /// work it is accepting against itself. A review's synthetic issue carries `rhapsody:@<reviewer>`,
+    /// which Tier 0 answers outright regardless of load, so this change cannot move a review off its
+    /// pinned reviewer.
     fn route_identity(&self, teams: &Teams, iss: &Issue) -> Routed {
-        self.apply_pending_assignment(
-            teams,
-            iss,
-            route(
-                teams,
-                iss,
-                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
-            ),
-        )
+        let load = self.teammate_load();
+        self.apply_pending_assignment(teams, iss, route(teams, iss, &load))
     }
 
     /// The harness a routed identity's profile asks for, WITHOUT composing the turn-1 section
@@ -916,13 +920,13 @@ impl Orchestrator {
         if crate::triage::has_any_identity_label(iss) {
             return false;
         }
-        route(
-            teams,
-            iss,
-            &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
-        )
-        .reason
-            == RouteReason::Unrouted
+        // The same load [`route_identity`](Self::route_identity) now routes against (STUDIO-988
+        // review round 8, alice #1): the predicate's whole claim is that it IS the router's own
+        // answer, so the two must ask over one snapshot. A teammate held by a `preparing`
+        // reservation is at capacity exactly as a running one is, so a ticket whose only matching
+        // teammate is that reservation reads `Unrouted` here and waits, rather than being dispatched
+        // past the cap by a load that had not counted the reservation yet.
+        route(teams, iss, &self.teammate_load()).reason == RouteReason::Unrouted
     }
 
     /// The identity this candidate WOULD be dispatched to, or `None` when the ladder has no
@@ -1703,6 +1707,106 @@ mod tests {
         assert!(
             o.teams_awaiting_assignment(&iss),
             "her only candidate parked, the ticket is held rather than dispatched unrouted"
+        );
+    }
+
+    /// **The router that runs at ACCEPTANCE must see the seats other preparations hold (STUDIO-988
+    /// review round 8, alice #1).** The selection ladder defers to
+    /// [`teammate_load`](Orchestrator::teammate_load), but `dispatch_issue` re-routes through
+    /// [`route_identity`], and a snapshot blind to `preparing` sent the accepted ticket to a seat a
+    /// still-preparing sibling held — two live runs on a `max_concurrent: 1` teammate, which the
+    /// synchronous path cannot do because `running` advances between routes.
+    ///
+    /// MUTATION GUARD: route `route_identity` off `from_running_and_retries` again and this reds —
+    /// the accepted ticket lands on alice beside her in-flight preparation, putting two runs on her
+    /// single seat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_routes_around_a_preparing_teammates_reserved_seat() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let teams = teams_with(vec![
+            ident("alice", &["rust", "config"], 1),
+            ident("bob", &["rust"], 0),
+        ]);
+        let (mut o, _) = orch_with_teams(teams);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        // MT-1 is alice's own (`rhapsody:@alice`) and its preparation is still hanging, so it holds
+        // alice's only seat without a `RunningEntry` to show for it.
+        let target = PreparedTarget::Ticket {
+            issue: Issue {
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..issue("prep", "MT-1", "Todo")
+            },
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        // MT-2 overlaps alice best (`rust,config`) but she is spent; bob is the next-best candidate.
+        o.dispatch_issue(with_labels(&["rust", "config"]), None, None, String::new());
+
+        assert_eq!(
+            o.running["1"].identity, "bob",
+            "the accepted ticket must not land on a teammate whose only seat an in-flight \
+             preparation holds"
+        );
+    }
+
+    /// The triage-hold twin of [`a_ticket_whose_only_candidate_is_parked_is_held_for_triage`] for a
+    /// PREPARATION rather than a parked retry (STUDIO-988 review round 8, alice #1):
+    /// [`teams_awaiting_assignment`](Orchestrator::teams_awaiting_assignment) claims to be the
+    /// router's own answer, so it must read the same preparing-inclusive load
+    /// [`route_identity`](Orchestrator::route_identity) now does, or the two disagree about whether
+    /// the ticket has a teammate at all.
+    ///
+    /// MUTATION GUARD: leave the `Unrouted` check on `from_running_and_retries` and this reds — the
+    /// ticket reads routed to alice and is dispatched rather than held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_whose_only_candidate_is_preparing_is_held_for_triage() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let teams = teams_with(vec![ident("alice", &["rust"], 1)]);
+        let (mut o, _) = orch_with_teams(teams);
+        o.teams_triage = Some(Arc::new(crate::triage::TriageHandle::new()));
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..with_labels(&["rust"])
+        };
+
+        assert!(
+            !o.teams_awaiting_assignment(&iss),
+            "with alice idle the ticket routes to her and is never held"
+        );
+
+        let target = PreparedTarget::Ticket {
+            issue: Issue {
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..issue("prep", "MT-1", "Todo")
+            },
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        assert!(
+            o.teams_awaiting_assignment(&iss),
+            "alice's only seat held by a preparation, the ticket is held rather than dispatched \
+             unrouted"
         );
     }
 
