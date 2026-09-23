@@ -243,20 +243,25 @@ impl Adjudication {
     /// the move only when the head it was made at is itself proven unchanged to the new head
     /// (`unchanged_from` contains [`Self::head`]).
     ///
-    /// Only a [`Verdict::Ship`] can stop governing. An [`Adjudication::Escalate`] names a HUMAN as
-    /// the next actor; resuming it on a push the author made themselves would mean the escalation
-    /// never reaches that human, so an escalation governs however far the head moves.
+    /// **An `Escalate` is head-scoped too (STUDIO-1021).** It governs the head it was made at — or a
+    /// no-op move that PROVES that head is what the branch now carries — exactly as a `Ship` does.
+    /// A content-changing push is not a reason to keep a human escalation standing over code the
+    /// manager never saw: past the threshold it buys exactly one round
+    /// (`Orchestrator::resumed_round_owed`), and a round that returns findings buys a FRESH
+    /// adjudication. A push that leaves the patch-id unchanged buys nothing, because
+    /// there is no new change for a round to read, so the escalation stands. This replaces the
+    /// earlier rule that an escalation governed however far the head moved — that is what made every
+    /// pushed fix page a human; a human is still named the moment the loop's own bound cannot settle
+    /// it.
     ///
     /// An in-flight marker governs too — a turn is out right now — but callers test
     /// [`Self::settled`] first, because the resume question is about a LANDED verdict.
     pub fn governs(&self, head: &str, unchanged_from: &[String]) -> bool {
         match self {
             Adjudication::InFlight { .. } => true,
-            // A push the author made themselves must never cancel a human escalation.
-            Adjudication::Escalate { .. } => true,
             // The decision's own head, or a no-op move that PROVES that head is what the branch now
             // carries. Any other non-empty list is a partial proof for some other row's history.
-            Adjudication::Ship { .. } => {
+            Adjudication::Ship { .. } | Adjudication::Escalate { .. } => {
                 self.head() == head || unchanged_from.iter().any(|old| old == self.head())
             }
         }
@@ -1272,22 +1277,23 @@ mod tests {
 
     // ── STUDIO-971: a decision governs only the head it was made at ──────────────────────────────
 
-    /// **Acceptance.** A `ship` decision applies to the head the loop stopped at and to a no-op head
-    /// move that PROVES that same head (STUDIO-960's `unchanged_from`), and to nothing else. An
-    /// escalation governs however far the head moves — it named a human, and a push the author made
-    /// themselves must not cancel it.
+    /// **Acceptance.** A decision — a `ship` OR (STUDIO-1021) an `escalate` — applies to the head
+    /// the loop stopped at and to a no-op head move that PROVES that same head (STUDIO-960's
+    /// `unchanged_from`), and to nothing else. An escalation used to govern however far the head
+    /// moved, which meant every fix pushed after one paged a human; it is now head-scoped, so a
+    /// content-changing push buys one round instead (the `reviewwatch` half of this ticket).
     ///
     /// **The partial-proof case is the load-bearing one.** `unchanged_from` proves individual rows'
     /// histories; a list that does not contain the adjudicated head is not proof the decision's head
     /// is what the branch carries. Treating any non-empty list as PR-wide proof suppresses an
-    /// unmatched row's owed review, so `["other"]` must NOT govern a `Ship` at `"aaa"`.
+    /// unmatched row's owed review, so `["other"]` must NOT govern a decision at `"aaa"`.
     ///
     /// MUTATION: make `governs` return `true` unconditionally (gate on `settled()` alone) and the
-    /// `governs("bbb", &[])` case below reds; make it ignore `unchanged_from` and the
+    /// `governs("bbb", &[])` cases below red; make it ignore `unchanged_from` and the
     /// `unchanged_from == ["aaa"]` case reds; accept any non-empty `unchanged_from` and the
     /// `unchanged_from == ["other"]` case reds.
     #[test]
-    fn a_ship_decision_governs_only_the_head_it_was_made_at() {
+    fn a_decision_governs_only_the_head_it_was_made_at() {
         let ship = Adjudication::Ship {
             head: "aaa".to_string(),
             rounds: 3,
@@ -1317,9 +1323,19 @@ mod tests {
             findings: Vec::new(),
             reason: "a human is needed".to_string(),
         };
+        assert!(escalated.governs("aaa", &[]), "the head it was made at");
         assert!(
-            escalated.governs("bbb", &[]),
-            "an escalation names a human and is never resumed by a push"
+            !escalated.governs("bbb", &[]),
+            "STUDIO-1021: an escalation is HEAD-SCOPED — a content-changing push is a head the \
+             manager never adjudicated and buys one round, rather than paging a human for every push"
+        );
+        assert!(
+            escalated.governs("bbb", &["aaa".to_string()]),
+            "a no-op head move carries the escalation forward: there is no new change to read"
+        );
+        assert!(
+            !escalated.governs("bbb", &["other".to_string()]),
+            "a proof for a DIFFERENT head's history does not carry the escalation either"
         );
 
         assert!(
