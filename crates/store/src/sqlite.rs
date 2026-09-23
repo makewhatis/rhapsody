@@ -2004,8 +2004,13 @@ impl Store for Sqlite {
         // table: the counter and the decision have DIFFERENT writers (the control task and the
         // off-loop adjudication half), so neither upsert may carry the other's columns or a
         // last-write-wins race would silently erase a landed decision.
+        // The row is created at generation 1 (STUDIO-1010, the M2 review's fourth follow-up): a
+        // bound row written by the counter alone must not stay at the 0 default, which no real
+        // generation can be. `ON CONFLICT` deliberately does NOT touch the generation — a later
+        // counter write on an existing row must never reset a generation the operator's `/clear`
+        // bumped.
         conn.execute(
-            "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES (?1, ?2)
+            "INSERT INTO rhapsody_review_bound (pr, dispatches, generation) VALUES (?1, ?2, 1)
              ON CONFLICT(pr) DO UPDATE SET dispatches = excluded.dispatches",
             params![pr, dispatches],
         )?;
@@ -2019,8 +2024,8 @@ impl Store for Sqlite {
     ) -> Result<(), StoreError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO rhapsody_review_bound (pr, decision, head, rounds, findings, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO rhapsody_review_bound (pr, decision, head, rounds, findings, reason, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
              ON CONFLICT(pr) DO UPDATE SET
                decision = excluded.decision,
                head     = excluded.head,
@@ -2138,7 +2143,7 @@ impl Store for Sqlite {
     fn set_review_evidence_rev(&self, pr: &str, evidence_rev: i64) -> Result<(), StoreError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO rhapsody_review_bound (pr, evidence_rev) VALUES (?1, ?2)
+            "INSERT INTO rhapsody_review_bound (pr, evidence_rev, generation) VALUES (?1, ?2, 1)
              ON CONFLICT(pr) DO UPDATE SET evidence_rev = excluded.evidence_rev",
             params![pr, evidence_rev],
         )?;
@@ -4766,14 +4771,14 @@ mod tests {
                         findings: vec!["alice asked for changes at aaa111".into()],
                         reason: "the two reviewers disagree about the schema".into(),
                     }),
-                    generation: 0,
+                    generation: 1,
                     evidence_rev: 0,
                 },
                 ReviewBoundRow {
                     pr: "makewhat/rhapsody#85".into(),
                     dispatches: 2,
                     adjudication: None,
-                    generation: 0,
+                    generation: 1,
                     evidence_rev: 0,
                 },
             ],
@@ -4895,11 +4900,117 @@ mod tests {
                 pr: pr.into(),
                 dispatches: 8,
                 adjudication: None,
-                generation: 0,
+                generation: 1,
                 evidence_rev: 0,
             }],
             "the re-run's override drops the decision and keeps the budget"
         );
+    }
+
+    /// **STUDIO-1010 (the M2 review's fourth follow-up).** Every path that CREATES a bound row
+    /// establishes generation 1 — the counter, the adjudication, the evidence revision and
+    /// `ensure_review_generation` — so a bound row's generation is never the 0 default. And a later
+    /// write on an existing row must not reset a generation the operator's `/clear` bumped.
+    ///
+    /// MUTATION: drop `generation` from any of the four INSERT column lists and its assertion reds.
+    #[test]
+    fn every_bound_creation_path_establishes_generation_one() {
+        let store = open_mem();
+        let adjudication = ReviewAdjudication {
+            decision: REVIEW_ADJUDICATION_SHIP.into(),
+            head: "aaa111".into(),
+            rounds: 1,
+            findings: Vec::new(),
+            reason: String::new(),
+        };
+        store.set_review_rounds("o/r#counter", 4).expect("count");
+        store
+            .record_review_adjudication("o/r#decision", &adjudication)
+            .expect("decide");
+        store
+            .set_review_evidence_rev("o/r#evidence", 3)
+            .expect("evidence");
+        store
+            .ensure_review_generation("o/r#ensure")
+            .expect("ensure");
+
+        for pr in ["o/r#counter", "o/r#decision", "o/r#evidence", "o/r#ensure"] {
+            let bound = store
+                .review_bound(pr)
+                .expect("read bound")
+                .expect("row exists");
+            assert_eq!(
+                bound.generation, 1,
+                "{pr}: a creation path must establish generation 1, not the 0 default"
+            );
+        }
+
+        // A `/clear` bumps it; a later counter write must leave the new generation standing.
+        store
+            .increment_review_generation("o/r#counter")
+            .expect("clear");
+        store
+            .set_review_rounds("o/r#counter", 5)
+            .expect("count again");
+        let bound = store
+            .review_bound("o/r#counter")
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            bound.generation, 2,
+            "a counter write must not reset the generation"
+        );
+        assert_eq!(bound.dispatches, 5);
+    }
+
+    /// **STUDIO-1010.** A database written before the evidence ledger (a step-15 schema) migrates
+    /// forward with its bound and finding rows brought onto generation 1, not left at the 0 default:
+    /// a pull request whose introduction has already happened has had a generation. On a fresh
+    /// database the UPDATEs match nothing.
+    ///
+    /// MUTATION: remove either backfill UPDATE from the v15→v16 step and the corresponding
+    /// assertion reds.
+    #[test]
+    fn a_v15_database_backfills_generation_one() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v15.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..15] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 15")
+                .expect("stamp v15");
+            tx.commit().expect("commit");
+            conn.execute(
+                "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES ('makewhat/rhapsody#84', 2)",
+                [],
+            )
+            .expect("insert legacy bound");
+            conn.execute(
+                "INSERT INTO rhapsody_review_finding \
+                   (pr, generation, reviewer, finding_id, revision, review_run_id) \
+                 VALUES ('makewhat/rhapsody#84', 0, 'alice', 'alice:B8', 1, 100)",
+                [],
+            )
+            .expect("insert legacy finding");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let bound = store
+            .review_bound("makewhat/rhapsody#84")
+            .expect("read")
+            .expect("the pre-existing bound survives");
+        assert_eq!(
+            bound.generation, 1,
+            "a row written before the generation column existed is backfilled onto generation 1"
+        );
+        let findings = store
+            .load_review_findings("makewhat/rhapsody#84")
+            .expect("load findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].generation, 1, "and so is the finding history");
     }
 
     /// A pull request that leaves the watch set forgets BOTH halves, so one that is later
