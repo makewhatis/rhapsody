@@ -2311,14 +2311,11 @@ mod tests {
         o.store()
             .mark_review_truncated(&watch_key("bob"))
             .expect("truncated");
-        let completed = o
-            .store()
-            .review_completed(&watch_key("bob"))
-            .expect("read")
-            .expect("row");
-        assert_eq!(completed.verdict, "", "no verdict");
-        assert_eq!(completed.patch_id, "", "no patch-id");
-        assert_eq!(completed.sha, "", "no completed sha");
+        let completed = o.store().review_completed(&watch_key("bob")).expect("read");
+        assert!(
+            completed.is_none(),
+            "a truncated round records no completed review, got {completed:?}"
+        );
     }
 
     /// The evidence revision moves when the HEAD moves, and the first observation after a restart is

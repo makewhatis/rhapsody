@@ -2137,7 +2137,13 @@ impl Store for Sqlite {
             })
         })?;
         match rows.next() {
-            Some(row) => Ok(Some(row?)),
+            // The row exists but no review of this pair has completed with a verdict: answer `None`,
+            // which is the trait's contract, rather than an all-empty record a caller would have to
+            // inspect.
+            Some(row) => {
+                let completed = row?;
+                Ok((!completed.verdict.is_empty()).then_some(completed))
+            }
             None => Ok(None),
         }
     }
