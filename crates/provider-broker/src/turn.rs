@@ -11,12 +11,14 @@ use std::sync::Arc;
 use crate::clock::MonotonicTime;
 use crate::error::BrokerError;
 use crate::ledger::{TurnLedger, TurnOutcome};
+use crate::metrics::BrokerMetrics;
 use crate::policy::{BrokerLimits, BrokerProtocol};
 use crate::reservations::{ConcurrencyPermit, ReserveRequest};
 use crate::secret::CapabilityToken;
 use crate::state::{
     MAX_TOKEN_RETRIES, TOKEN_BYTES, TokenDigest, TurnGateGuard, TurnInner, encode_token, lock,
 };
+use crate::usage::UsageObservation;
 
 /// Adapter-supplied metadata for one outer turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -406,12 +408,110 @@ impl CapabilityGrant {
         self.inner.acquire_concurrency()
     }
 
+    /// The remaining reserved-token units under the configured durable UTC-day cap, or `None` when
+    /// no daily cap is configured. The grant exposes this remainder so a request whose reservation
+    /// does not fit receives the ordinary non-retryable budget error before egress (design §8.2).
+    pub fn remaining_day_tokens(&self) -> Option<u64> {
+        let policy = &self.inner.session.policy;
+        let cap = policy.limits().max_reserved_token_units_per_utc_day?;
+        let authority = policy.day_authority()?;
+        let charged = authority.charged_today(self.inner.session.plan.stable_provider_id());
+        Some(cap.saturating_sub(charged))
+    }
+
+    /// Begin settling one admitted request's provider usage. The returned handle records exactly one
+    /// settlement into the turn ledger — the explicit [`RequestSettlement::observe`] call, or a
+    /// conservative unknown on drop.
+    ///
+    /// This explicit-settlement entry point is driven by the `loopback` adapter (it is the only
+    /// caller), so a `loopback`-off build — `rhapsody-credential-ipc`'s — has no user for it and
+    /// would otherwise warn. The settlement *type* and its accounting stay in the always-compiled
+    /// core; only the call site is adapter-specific.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
+    pub(crate) fn begin_request_settlement(&self) -> RequestSettlement {
+        RequestSettlement {
+            inner: Arc::clone(&self.inner),
+            metrics: Arc::clone(&self.inner.session.broker.metrics),
+            reserved_response_bytes: self.inner.session.policy.limits().max_response_bytes,
+            settled: false,
+        }
+    }
+
     /// Count one locally denied authenticated request. The denial that *reaches* the configured
     /// threshold is counted and refused so the caller can revoke the turn; further denials keep
     /// returning the same refusal without incrementing past the cap. Refused if the capability has
     /// expired or the turn has been revoked or finalized.
     pub fn record_denied(&self) -> Result<(), BrokerError> {
         self.inner.record_denied()
+    }
+}
+
+/// A per-request usage settlement handle. It records exactly one settlement into the turn ledger:
+/// an explicit [`RequestSettlement::observe`], or a conservative unknown on drop when the request
+/// never produced a usable observation (a pre-mint refusal after admission, an upstream transport
+/// error, a client disconnect, turn revocation, or absolute expiry).
+///
+/// This is what makes finalization exactly once across parser, stream EOF, cancellation, and Drop
+/// (design §7.3, §4.3): a request that is admitted but never settles is automatically charged and
+/// counted unknown rather than silently dropped.
+#[cfg_attr(not(feature = "loopback"), allow(dead_code))]
+pub(crate) struct RequestSettlement {
+    inner: Arc<TurnInner>,
+    metrics: Arc<BrokerMetrics>,
+    /// The response-byte reservation charged at admission (`max_response_bytes`).
+    reserved_response_bytes: u64,
+    settled: bool,
+}
+
+impl fmt::Debug for RequestSettlement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestSettlement")
+            .field("turn_ordinal", &self.inner.ordinal)
+            .field("settled", &self.settled)
+            .finish()
+    }
+}
+
+#[cfg_attr(not(feature = "loopback"), allow(dead_code))]
+impl RequestSettlement {
+    /// Settle this request exactly once. `forwarded_bytes` is `Some(n)` only for a successfully
+    /// forwarded response, whose response-byte reservation settles down to `n`; an aborted,
+    /// malformed, or cancelled response passes `None` and keeps the full response-byte reservation
+    /// (design §8.2). The token reservation never settles downward; the observation is only
+    /// measurement. A second call (or a call after drop) is ignored.
+    pub(crate) fn settle(&mut self, observation: &UsageObservation, forwarded_bytes: Option<u64>) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.inner.settle_usage(observation);
+        if let Some(actual) = forwarded_bytes {
+            self.inner
+                .settle_response_bytes(self.reserved_response_bytes, actual);
+            self.metrics.record_response_bytes(actual);
+        }
+        match (observation.is_unknown(), observation.conservative_total()) {
+            (false, Some(tokens)) => {
+                self.metrics.record_reported(tokens);
+                if observation.inconsistent {
+                    self.metrics.record_inconsistent_usage();
+                }
+            }
+            _ => self.metrics.record_unknown_usage(),
+        }
+    }
+}
+
+impl Drop for RequestSettlement {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            // No usable observation and no completed forward: the request remains conservatively
+            // charged (full response-byte and token reservations) and is counted unknown
+            // (design §7.3: failed, aborted, or usage-less requests may still be billable).
+            self.inner.settle_usage(&UsageObservation::default());
+            self.metrics.record_unknown_usage();
+        }
     }
 }
 
