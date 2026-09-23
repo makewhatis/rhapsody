@@ -262,7 +262,10 @@ async fn shared_team_bank_live_smoke() {
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut target = None;
     loop {
-        let recalled = bank.recall_shared(&bank_id, &q).await.expect("shared recall");
+        let recalled = bank
+            .recall_shared(&bank_id, &q)
+            .await
+            .expect("shared recall");
         if let Some(f) = recalled
             .facts
             .iter()
@@ -295,9 +298,15 @@ async fn shared_team_bank_live_smoke() {
         .await
         .expect("shared invalidate");
     println!("[3/4] invalidate_shared-> ok, changed={changed}");
-    assert!(changed, "a freshly retained shared fact was already invalidated");
+    assert!(
+        changed,
+        "a freshly retained shared fact was already invalidated"
+    );
 
-    let after = bank.recall_shared(&bank_id, &q).await.expect("shared recall");
+    let after = bank
+        .recall_shared(&bank_id, &q)
+        .await
+        .expect("shared recall");
     println!("[4/4] recall_shared    -> {} fact(s)", after.facts.len());
     assert!(
         !after.facts.iter().any(|f| f.id == target.id),
