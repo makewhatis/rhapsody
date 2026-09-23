@@ -906,6 +906,29 @@ thing that lifts a bound in place; the operator's **Re-run** refunds one round a
 without resetting the budget. **Off is still off:** with `storage.path: off` there is nowhere to
 remember a bound, so the daemon keeps the per-boot behaviour it had before this ticket.
 
+### A fifth schema table with no Go counterpart — `rhapsody_review_verdicts` (STUDIO-1020)
+
+The run detail's review strip rendered every round the same neutral grey. The daemon knows each
+round's verdict the moment it completes, but records it only on `rhapsody_review_watch.status` — a
+per-(pull request, reviewer) row that holds the **latest** status and therefore cannot describe an
+older round. A ticket with three rounds whose last review approved would colour all three green. So
+each review RUN's verdict is recorded against its own `runs.id` and never rewritten:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **12** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound` and `rhapsody_review_verdicts` |
+| a review round's verdict | — | `rhapsody_review_verdicts.verdict` (`approved` / `changes_requested`), keyed by the run id |
+
+**Only a DECLARED verdict is written.** A round the max_turns backstop truncated, one whose
+`HANDOFF:` payload was unrecognised, a round whose worker crashed, and one still running all record
+nobody's verdict — the console shows them neutral, because "nobody judged this" is an answer and
+neither verdict would be. The row is written once at the run's exit, so a run that is later pruned
+simply leaves an orphan row no query joins from, exactly as `rhapsody_run_provenance` does. **Off is
+still off:** `storage.path: off` records nothing and the strip shows the neutral chip it always did.
+The `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` now pins the fourth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
