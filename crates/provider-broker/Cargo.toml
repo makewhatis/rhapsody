@@ -102,6 +102,10 @@ static_assertions = "1"
 # tokio test runtime extras: `#[tokio::test]` with a real multi-threaded runtime for the loopback
 # listener + fake upstream tests. Already in Cargo.lock.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# serde: `compile_guards.rs` names `serde::Serialize` in a negative-impl assertion for PB1's custody
+# handles. `serde` is an optional PB2 dependency, so it is named here too; otherwise the guard cannot
+# compile when `loopback` is off (a PB1-only build). Already in Cargo.lock.
+serde = "1"
 
 # The PB2 loopback integration test exercises the adapter, so it is gated on the feature: a
 # `--no-default-features` build (as credential-ipc's) skips it instead of failing to compile.
