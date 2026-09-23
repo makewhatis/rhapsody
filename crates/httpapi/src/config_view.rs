@@ -114,6 +114,13 @@ struct GlobalAgentReq {
     max_turns: i64,
     max_retry_backoff_ms: i64,
     max_concurrent_agents_by_state: std::collections::HashMap<String, i64>,
+    /// The normalized global provider selection (STUDIO-992; Rhapsody-only). `Option` distinguishes
+    /// an omitted key (an older client) from an explicit empty string (clear the selection), so a
+    /// client that never modeled the field can never silently drop an operator's provider.
+    provider: Option<String>,
+    /// The normalized global model selection (STUDIO-992). Required by validation when `provider` is
+    /// set; an explicit empty string clears both together.
+    model: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -296,6 +303,16 @@ fn apply_typed_config(base: &Config, req: &ConfigPostReq) -> Config {
     out.agent.max_turns = g.agent.max_turns;
     out.agent.max_retry_backoff_ms = g.agent.max_retry_backoff_ms;
     out.agent.max_concurrent_agents_by_state = g.agent.max_concurrent_agents_by_state.clone();
+    // STUDIO-992: the Settings Providers surface edits the global provider/model selection. Only a
+    // PRESENT key overwrites (the Option), so a payload that omits them preserves the on-disk
+    // selection; the `base.clone()` above already carries it. `providers` themselves are not part of
+    // the typed view and are likewise preserved from base.
+    if let Some(provider) = &g.agent.provider {
+        out.agent.provider = provider.clone();
+    }
+    if let Some(model) = &g.agent.model {
+        out.agent.model = model.clone();
+    }
 
     out.claude.command = g.claude.command.clone();
     out.claude.model = g.claude.model.clone();
