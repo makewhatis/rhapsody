@@ -59,7 +59,7 @@ mod state;
 
 pub use binding::{
     BindingFingerprint, BoundCredentialLease, CredentialBinding, MAX_API_KEY_BYTES,
-    MAX_CREDENTIAL_ENVELOPE_BYTES,
+    MAX_CREDENTIAL_ENVELOPE_BYTES, validate_api_key_value,
 };
 pub use broker::{Broker, BrokerRegistration, BrokerRegistrationPlan};
 pub use budget::{WeightedBudget, WeightedGuard};

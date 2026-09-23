@@ -129,7 +129,7 @@ impl BoundCredentialLease {
     /// owner-held bytes.
     pub fn new(binding: CredentialBinding, value: impl Into<Vec<u8>>) -> Result<Self, BrokerError> {
         let secret = ZeroizingBytes::new(value.into());
-        validate_api_key(secret.as_slice()).map_err(BrokerError::InvalidCredential)?;
+        validate_api_key_value(secret.as_slice()).map_err(BrokerError::InvalidCredential)?;
         let fingerprint = binding.fingerprint();
         Ok(Self {
             binding,
@@ -170,7 +170,11 @@ impl fmt::Debug for BoundCredentialLease {
 /// Validate a v1 API-key value: non-empty, at most [`MAX_API_KEY_BYTES`], and matching RFC 6750's
 /// `b64token` shape `[A-Za-z0-9._~+/-]+=*` with `=` only as a trailing run. The value is never
 /// trimmed or rewritten (design §3.2).
-fn validate_api_key(value: &[u8]) -> Result<(), CredentialRejection> {
+///
+/// Public so the credential owner (P1, `rhapsody-credential-ipc`) can enforce the broker's exact
+/// size/syntax bound *before* storing a value rather than duplicating the rule — the two call sites
+/// share one implementation by construction.
+pub fn validate_api_key_value(value: &[u8]) -> Result<(), CredentialRejection> {
     if value.is_empty() {
         return Err(CredentialRejection::Empty);
     }
