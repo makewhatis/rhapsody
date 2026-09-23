@@ -796,10 +796,14 @@ pub fn production_owner_factory() -> OwnerFactory {
     })
 }
 
-/// Load, resolve, and validate a WORKFLOW.md into its typed [`rhapsody_config::Config`]. The full
-/// pipeline (load → decode → resolve → validate) is the SAME one the daemon runs, so the binding the
-/// desktop derives is byte-identical to the one the daemon will read under — the boundary this whole
-/// ticket is about.
+/// Load, resolve, and provider-validate a WORKFLOW.md into its typed [`rhapsody_config::Config`].
+/// The pipeline is load → decode → resolve → [`rhapsody_config::validate_providers_only`]: the same
+/// stages the daemon runs, but only the PROVIDER half of the preflight. The daemon's full
+/// [`rhapsody_config::validate`] also requires a non-empty `tracker.api_key`, and a desktop-written
+/// config stores `api_key: $LINEAR_API_KEY` with the value supplied only to the sidecar — so the
+/// desktop process sees an empty key and the full preflight would refuse every provider command.
+/// The provider definitions are what the credential surface derives its binding from (and the daemon
+/// validates the same ones), so validating them here is sufficient and still byte-identical.
 pub fn load_resolved_config(path: &Path) -> Result<rhapsody_config::Config, ProviderCommandError> {
     let definition = rhapsody_config::workflow::load(path)
         .map_err(|e| ProviderCommandError::ConfigUnavailable(e.to_string()))?;
@@ -811,7 +815,7 @@ pub fn load_resolved_config(path: &Path) -> Result<rhapsody_config::Config, Prov
         .unwrap_or_default();
     config = rhapsody_config::resolve(config, &dir)
         .map_err(|e| ProviderCommandError::ConfigUnavailable(e.to_string()))?;
-    rhapsody_config::validate(&mut config)
+    rhapsody_config::validate_providers_only(&config)
         .map_err(|e| ProviderCommandError::ConfigUnavailable(e.to_string()))?;
     Ok(config)
 }
@@ -1144,6 +1148,106 @@ mod tests {
             fx.service.test_connection("fireworks").await.unwrap_err(),
             ProviderCommandError::UnknownProvider
         );
+    }
+
+    /// A WORKFLOW.md as the desktop writes it — `onboarding::render_initial_workflow` renders the
+    /// real initial file, whose tracker `api_key` is the `$LINEAR_API_KEY` indirection — with one
+    /// `providers:` entry added the way an operator would. This is the config the provider commands
+    /// actually run against on a desktop install.
+    fn desktop_workflow_with_provider(endpoint: &str) -> String {
+        let rendered = crate::onboarding::render_initial_workflow("proj")
+            .expect("render the desktop's initial workflow");
+        let text = String::from_utf8(rendered).expect("workflow is utf-8");
+        let after = text.strip_prefix("---\n").expect("front matter opens");
+        let (front, body) = after.split_once("\n---\n").expect("front matter closes");
+        let mut doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(front).expect("front matter parses");
+        doc["providers"] = serde_yaml_ng::from_str(&format!(
+            "fireworks:\n  protocol: openai-compatible\n  display_name: Fireworks\n  base_url: {endpoint}\n  credential:\n    source: keychain\n"
+        ))
+        .expect("providers parse");
+        let front = serde_yaml_ng::to_string(&doc).expect("front matter re-serializes");
+        format!("---\n{front}---\n{body}")
+    }
+
+    /// MUTATION GUARD (STUDIO-991 finding 2): every provider command must run on the WORKFLOW.md the
+    /// desktop itself writes. That file stores `api_key: $LINEAR_API_KEY`, and the desktop process
+    /// never holds the token (it feeds the value only to the spawned sidecar), so the daemon's full
+    /// `validate()` refuses the config with `missing_tracker_api_key` and every command would return
+    /// `config_unavailable`. Running the provider-only preflight is what this pins; reverting to the
+    /// full `validate()` reds it.
+    #[tokio::test]
+    async fn provider_commands_run_on_the_desktop_written_workflow() {
+        let dir = crate::testutil::TempDir::new("rd-pc-desktop");
+        let path = dir.join("WORKFLOW.md");
+        std::fs::write(
+            &path,
+            desktop_workflow_with_provider("https://api.example/v1"),
+        )
+        .expect("write workflow");
+        let fx = build_fixture(Some(path));
+
+        // Reproduce the desktop process: `$LINEAR_API_KEY` is unset there (the token lives only in
+        // the sidecar's environment). Scope the removal to this test and restore it after.
+        let prev = std::env::var_os("LINEAR_API_KEY");
+        // SAFETY: set_var/remove_var are unsafe in Rust 2024; tests share the process env. Scoped
+        // tightly and restored below. No other test in this crate reads `$LINEAR_API_KEY`.
+        unsafe { std::env::remove_var("LINEAR_API_KEY") };
+
+        let statuses = fx.service.statuses();
+        let status = fx.service.status("fireworks");
+        let prepared = fx.service.prepare("fireworks", ProviderOperation::Connect);
+        let connection = fx.service.test_connection("fireworks").await;
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("LINEAR_API_KEY", v) },
+            None => unsafe { std::env::remove_var("LINEAR_API_KEY") },
+        }
+
+        let statuses =
+            statuses.expect("statuses must derive the provider set without the tracker preflight");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].provider_id, "fireworks");
+        assert_eq!(statuses[0].status, "absent");
+        let status = status.expect("status must work on the desktop-written workflow");
+        assert_eq!(status.endpoint, "https://api.example/v1");
+        let prepared = prepared.expect("prepare must work on the desktop-written workflow");
+        assert_eq!(prepared.endpoint, "https://api.example/v1");
+        assert_eq!(
+            connection.unwrap_err(),
+            ProviderCommandError::NoCredential,
+            "an absent credential is a typed refusal, not config_unavailable"
+        );
+
+        // The commit path loads the config too, so round-trip a full connect + remove.
+        let connected = fx
+            .service
+            .commit(
+                "fireworks",
+                ProviderOperation::Connect,
+                &prepared.nonce,
+                Some("sk-desktop".into()),
+                DaemonObservation::offline(),
+            )
+            .expect("commit must work on the desktop-written workflow");
+        assert!(connected.mutated);
+        assert_eq!(connected.status, "configured");
+        let prepared = fx
+            .service
+            .prepare("fireworks", ProviderOperation::Remove)
+            .expect("prepare remove");
+        let removed = fx
+            .service
+            .commit(
+                "fireworks",
+                ProviderOperation::Remove,
+                &prepared.nonce,
+                None,
+                DaemonObservation::offline(),
+            )
+            .expect("commit remove");
+        assert!(removed.mutated);
+        assert_eq!(removed.status, "absent");
     }
 
     // ---- status: absent vs denied ---------------------------------------------------------------

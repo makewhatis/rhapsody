@@ -196,6 +196,19 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validates ONLY the provider half of the dispatch preflight (STUDIO-991, Rhapsody-only).
+///
+/// The desktop credential surface reads the SAME WORKFLOW.md the daemon reads, but its process never
+/// holds the Linear token: a desktop-written config stores `api_key: $LINEAR_API_KEY` and the app
+/// supplies the value only to the spawned `rhapsodyd` sidecar, so [`validate`]'s tracker check
+/// (`missing_tracker_api_key`) fails in-process on a config that is otherwise perfectly valid. The
+/// credential surface needs exactly the provider half — the definitions whose derived bindings must
+/// match the daemon's — and nothing about the tracker, so it runs this instead. Provider problems
+/// surface with the same typed errors the full preflight would produce.
+pub fn validate_providers_only(config: &Resolved) -> Result<(), ValidationError> {
+    validate_providers(config)
+}
+
 /// The effective turn deadline (milliseconds) that bounds a provider's capability lifetime
 /// (`provider-broker-design.md` §8.1). V1 materializes providers for OpenCode only, so this is
 /// OpenCode's deadline with an absent/explicit-`0` value materialized to one hour exactly as the

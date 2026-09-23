@@ -133,6 +133,12 @@ bytes = "1"
 # (same version/features) — repeating it here only grants the separate integration-test crate extern
 # access; no new crate is added.
 serde_json = "1"
+# tauri's `test` feature (STUDIO-991): the credential-surface CSP test builds a mock Tauri app
+# (`tauri::test::mock_builder`) so it can pin the Content-Security-Policy the window ACTUALLY
+# receives from `serve_asset` — Tauri delivers the policy only as a response header on the HTML
+# asset, so a config-string assertion cannot see the bug. Same crate as the normal `tauri`
+# dependency, only its `test` feature (test-only, never in the shipped app); no new crate.
+tauri = { version = "2", features = ["test"] }
 
 [features]
 # `fakedaemon` gates the compile of the supervisor test-stub bin below. It is a DEFAULT feature, so a

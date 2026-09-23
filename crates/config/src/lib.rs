@@ -47,4 +47,4 @@ pub use providers::{
     normalize_provider_base_url, validate_model_id,
 };
 pub use resolve::{Resolved, resolve};
-pub use validate::{ValidationError, validate};
+pub use validate::{ValidationError, validate, validate_providers_only};

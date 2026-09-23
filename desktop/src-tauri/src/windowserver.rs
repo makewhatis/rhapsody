@@ -81,6 +81,15 @@ pub fn serve_asset<R: Runtime>(app: &AppHandle<R>, req: ProxyRequest) -> ProxyRe
             if let Ok(ct) = HeaderValue::from_str(&asset.mime_type) {
                 headers.insert(header::CONTENT_TYPE, ct);
             }
+            // Tauri computes the app's Content-Security-Policy and attaches it to the HTML asset
+            // (`Context`/`AppManager::get_asset`). It is delivered ONLY as a response header — the
+            // built dist carries no `<meta>` fallback — so a custom scheme handler that drops it
+            // serves the window with NO CSP at all. Forward it verbatim on the asset we serve.
+            if let Some(csp) = asset.csp_header
+                && let Ok(value) = HeaderValue::from_str(&csp)
+            {
+                headers.insert(header::CONTENT_SECURITY_POLICY, value);
+            }
             ProxyResponse {
                 status: StatusCode::OK,
                 headers,
@@ -233,6 +242,43 @@ mod tests {
         .await;
         assert_eq!(out.status(), StatusCode::OK);
         assert_eq!(out.body(), b"asset-body");
+    }
+
+    // STUDIO-991 finding 1: the window loads its HTML through this custom scheme handler, and Tauri
+    // computes the app's restrictive CSP and attaches it ONLY as a response header on the HTML asset
+    // (the built dist carries no `<meta>` fallback). A handler that drops `asset.csp_header` serves
+    // the credential surface with NO CSP at all — the state before this fix. This pins the header on
+    // `serve_asset`'s ACTUAL output for a real HTML asset, not on the config string.
+    //
+    // The fixture config carries the same restrictive policy as `tauri.conf.json` plus a committed
+    // `static/index.html`, so the assertion holds in CI where the real `web-dist` is only the
+    // committed `.gitkeep` anchor and has no `index.html` to serve.
+    #[test]
+    fn the_window_html_response_carries_the_application_csp() {
+        let context = tauri::generate_context!("tests/fixtures/csp/tauri.conf.json", test = true);
+        let app = tauri::test::mock_builder()
+            .build(context)
+            .expect("build the test app");
+        let response = serve_asset(
+            app.handle(),
+            ProxyRequest {
+                method: Method::GET,
+                path: "/".to_string(),
+                query: None,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        assert_eq!(response.status, StatusCode::OK);
+        let csp = response
+            .headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .expect("the window's HTML response must carry a Content-Security-Policy header");
+        assert!(
+            csp.contains("script-src 'self'") && csp.contains("object-src 'none'"),
+            "the window must load under the app's restrictive CSP; got: {csp}"
+        );
     }
 
     // An /api path proxies via base_url (unusable target here → 503), never touching the asset handler.
