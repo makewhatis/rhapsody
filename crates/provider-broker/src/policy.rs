@@ -261,6 +261,47 @@ mod tests {
         assert_eq!(DEFAULT_BROKER_LIMITS.validate(), Ok(()));
     }
 
+    /// Pin the exact §8.1 default and hard-ceiling table. A drift in any number (in particular the
+    /// 20M default / 640M hard ceiling for the session/run cap) must redden this test rather than
+    /// quietly change what a grant enforces.
+    #[test]
+    fn the_default_and_hard_limit_blocks_materialize_the_design_table() {
+        assert_eq!(
+            DEFAULT_BROKER_LIMITS,
+            BrokerLimits {
+                max_forwarded_requests: 64,
+                max_denied_requests: 16,
+                max_concurrent_requests: 4,
+                max_request_bytes: 8 * 1024 * 1024,
+                max_request_bytes_turn: 32 * 1024 * 1024,
+                max_response_bytes: 16 * 1024 * 1024,
+                max_response_bytes_turn: 64 * 1024 * 1024,
+                max_output_tokens_request: 32_000,
+                max_reserved_tokens_turn: 1_000_000,
+                max_reserved_tokens_session: 20_000_000,
+                max_reserved_token_units_per_utc_day: None,
+                max_capability_lifetime: Duration::from_secs(60 * 60),
+            }
+        );
+        assert_eq!(
+            HARD_BROKER_LIMITS,
+            BrokerLimits {
+                max_forwarded_requests: 256,
+                max_denied_requests: 64,
+                max_concurrent_requests: 8,
+                max_request_bytes: 16 * 1024 * 1024,
+                max_request_bytes_turn: 128 * 1024 * 1024,
+                max_response_bytes: 32 * 1024 * 1024,
+                max_response_bytes_turn: 256 * 1024 * 1024,
+                max_output_tokens_request: 131_072,
+                max_reserved_tokens_turn: 32_000_000,
+                max_reserved_tokens_session: 640_000_000,
+                max_reserved_token_units_per_utc_day: None,
+                max_capability_lifetime: Duration::from_secs(60 * 60),
+            }
+        );
+    }
+
     #[test]
     fn zero_limit_is_refused_by_name() {
         let limits = BrokerLimits {

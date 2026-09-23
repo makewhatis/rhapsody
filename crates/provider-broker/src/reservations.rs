@@ -454,6 +454,63 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_session_reservations_never_oversubscribe_the_run_cap() {
+        // Many independent turns of one session race the session/run cap across a barrier. Its
+        // `fetch_update` is the one atomic charge; a read-then-write charge would let a lost update
+        // admit more requests than the cap allows (fewer charges stored than threads that read a
+        // slot). The turn limits are generous, so the session cap is the binding constraint.
+        //
+        // Several rounds of high contention so a broken counter is reliably caught; each
+        // round starts from a fresh session, and the success count is the discriminating invariant
+        // (`reserved` alone never exceeds the cap even for a read-then-write, because every store
+        // re-checks).
+        let threads = 256u64;
+        let cost = 100u64;
+        let cap = 800u64;
+        for round in 0..64 {
+            let session = Arc::new(SessionReservations::new(cap));
+            let barrier = Arc::new(Barrier::new(threads as usize));
+            let successes = Arc::new(AtomicU64::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..threads {
+                let reservations = Reservations::new(limits());
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                let successes = Arc::clone(&successes);
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let request = ReserveRequest {
+                        request_bytes: cost,
+                        response_bytes: 0,
+                        output_tokens: 0,
+                    };
+                    if reservations
+                        .try_reserve(&session, "provider-a", None, request, || Ok(()))
+                        .is_ok()
+                    {
+                        successes.fetch_add(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("thread");
+            }
+
+            assert_eq!(
+                successes.load(Ordering::Acquire),
+                cap / cost,
+                "round {round}: the shared session/run cap admitted more than it allows"
+            );
+            assert_eq!(
+                session.reserved(),
+                cap,
+                "round {round}: the shared session/run cap is never oversubscribed"
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_permits_never_exceed_the_concurrency_limit() {
         let reservations = Reservations::new(limits());
         let threads = 16;
