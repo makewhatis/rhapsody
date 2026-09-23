@@ -137,8 +137,9 @@ where
     // per-read call, and bound to this local so it is retained for the whole of `run` (the process
     // lifetime). A tracker rebuilt per read could never observe an availability/authorization
     // transition, which is exactly the defect sol's review of rhapsody#221 found. The detached task
-    // below performs the first read; PB7's prepared dispatch is expected to read through this same
-    // `Arc`. The binding is intentionally underscore-named: it is held, not otherwise consulted yet.
+    // below performs the first read; PB7's prepared dispatch reads through this same `Arc`, and the
+    // provider-status runtime (STUDIO-990) reads through it too, so this one tracker observes every
+    // owner availability transition for both surfaces.
     let credential_owner_boundary: Option<
         std::sync::Arc<crate::credential_client::CredentialResolver>,
     > = if flags.credential_bootstrap {
