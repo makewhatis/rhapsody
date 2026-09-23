@@ -558,6 +558,105 @@ describe("zone A — the sticky header (§3A)", () => {
     );
   });
 
+  // STUDIO-1020 — each round's chip is painted from its OWN verdict, and the tooltip names it. A
+  // running review and a round with no verdict both read their own state, so the strip tells the
+  // three apart without opening each run.
+  it("paints each review round's chip from its own verdict and names it in the tooltip", async () => {
+    const writing = run({
+      id: 803,
+      issue_identifier: "pr:makewhatis/rhapsody#223@sol",
+      started_at: "2026-09-01T18:00:00Z",
+      ended_at: "",
+      outcome: "running",
+      verdict: "approved", // a stale verdict must not colour a round that is still running
+    });
+    const changes = run({
+      id: 802,
+      issue_identifier: "pr:makewhatis/rhapsody#223@sol",
+      started_at: "2026-09-01T17:30:00Z",
+      verdict: "changes_requested",
+    });
+    const approved = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      verdict: "approved",
+    });
+    mountDetail([run({ id: 522 })], vi.fn(), [writing, changes, approved]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(3));
+    expect(
+      [...document.querySelectorAll(".trrev")].map((b) => b.getAttribute("data-verdict")),
+    ).toEqual(["reviewing", "changes_requested", "approved"]);
+    // The verdict is ADDED to what the tooltip already showed, not instead of it.
+    const titles = [...document.querySelectorAll(".trrev")].map((b) => b.getAttribute("title"));
+    expect(titles[0]).toMatch(/^review · sol · reviewing · run 803 · started /);
+    expect(titles[1]).toMatch(/^review · sol · changes requested · run 802 · started /);
+    expect(titles[2]).toMatch(/^review · alice · approved · run 801 · started /);
+    // The button's text is unchanged: the state rides in the chip's form (a `::before` glyph) and
+    // its colour, so a screen reader and the existing strip assertions both still read the label.
+    expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
+      "review · sol",
+      "review · sol",
+      "review · alice",
+    ]);
+  });
+
+  // A review whose `pr:` key carries no reviewer falls back to "review <id>" as its label, which
+  // IS the run id — so the verdict the tooltip adds must not also repeat it (STUDIO-1020).
+  it("does not repeat the run id in an unnamed review's tooltip", async () => {
+    const orphan = run({
+      id: 804,
+      issue_identifier: "pr:makewhatis/rhapsody#223",
+      started_at: "2026-09-01T16:00:00Z",
+      verdict: "changes_requested",
+    });
+    mountDetail([run({ id: 522 })], vi.fn(), [orphan]);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(1));
+    const chip = document.querySelector(".trrev") as HTMLElement;
+    expect(chip.textContent).toBe("review 804");
+    const title = chip.getAttribute("title") ?? "";
+    expect(title).toMatch(/^changes requested · run 804 · started /);
+    expect(title).not.toMatch(/run 804.*run 804/);
+  });
+
+  // The WIRING half of the round-6 fix: `historyPollInterval` is unit-tested, but the rule only
+  // reaches the strip through `useIssueHistory`'s `refetchInterval`. Nothing else on the detail
+  // invalidates `["issue-history", …]`, `staleTime` is 10s and window-focus refetch is off, so
+  // dropping that one wiring line brings the round-6 bug back in full — a violet "reviewing" chip
+  // that never leaves while the page stays open — and every other test in this file stays green.
+  // So this drives a real poll tick, the way the ledger test below does, and pins the flip.
+  it("flips a live review's chip to its verdict while the page stays open", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const author = run({ id: 700, started_at: "2026-08-30T20:21:00Z" });
+    const live = run({
+      id: 802,
+      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "",
+      outcome: "running",
+    });
+    mountDetail([author], vi.fn(), [live]);
+    await waitFor(() =>
+      expect(document.querySelector(".trrev")?.getAttribute("data-verdict")).toBe("reviewing"),
+    );
+
+    // The review ends between polls: the next payload carries its verdict, and only the strip's
+    // own refresh can bring it in.
+    h.fetchIssueHistory.mockResolvedValue({
+      issue_identifier: "STUDIO-654",
+      runs: [author],
+      reviews: [
+        { ...live, ended_at: "2026-09-01T18:00:00Z", outcome: "completed", verdict: "approved" },
+      ],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 1);
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".trrev")?.getAttribute("data-verdict")).toBe("approved"),
+    );
+  });
+
   // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
   // so selecting it drives the same detail fetch and the same header pill as an attempt.
   it("opens a review run's own trace from the review strip", async () => {
@@ -792,6 +891,48 @@ describe("zone A — the sticky header (§3A)", () => {
     mountDetail([]);
     await waitFor(() => expect(screen.getByText("This ticket has no recorded runs.")).toBeTruthy());
     expect(document.querySelector(".trsplit")).toBeNull();
+  });
+
+  // STUDIO-1020's opening bugbot finding. `.trreviews .trrev[data-verdict="…"]` carries an extra
+  // specificity token, so it beat the bare `.trrev.on`: a selected chip with a verdict lost its
+  // selection, and once every finished round has a verdict that is most of the strip — picking a
+  // round was the whole job of the STUDIO-976 strip. Asserted through the real cascade, because the
+  // defect was a CASCADE one and a rule-shaped assertion would have read the declaration and missed
+  // that it lost.
+  describe("through the whole theme cascade", () => {
+    beforeAll(mountThemeCascade);
+    afterAll(unmountThemeCascade);
+
+    it("keeps the selected chip's selection even when it carries a verdict", async () => {
+      const changes = run({
+        id: 802,
+        issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+        started_at: "2026-09-01T17:30:00Z",
+        verdict: "changes_requested",
+      });
+      const approved = run({
+        id: 801,
+        issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+        started_at: "2026-09-01T17:00:00Z",
+        verdict: "approved",
+      });
+      // No author runs, so the newest review is the default selection.
+      mountDetail([], vi.fn(), [changes, approved]);
+      await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(2));
+      const [selected, other] = [...document.querySelectorAll<HTMLElement>(".trrev")];
+
+      // The UNselected chip keeps its verdict colour on both text and border: the fix must not
+      // repaint the strip, only give selection its own sign.
+      expect(getComputedStyle(other).color).toBe("var(--ok)");
+      expect(getComputedStyle(other).borderColor).toBe("var(--ok)");
+
+      // The SELECTED chip marks the selection with the solid rust border it always had, and the
+      // verdict colour stays on its text. Drop the scoped `.trreviews .trrev.on` rule and this
+      // reds: the verdict rule wins again and the border goes amber-on-amber.
+      expect(getComputedStyle(selected).borderStyle).toBe("solid");
+      expect(getComputedStyle(selected).borderColor).toBe("var(--rust-text)");
+      expect(getComputedStyle(selected).color).toBe("var(--warn)");
+    });
   });
 });
 
