@@ -533,9 +533,48 @@ pub async fn run_agent_attempt(
                 crate::reviewprompt::FullReviewReason::NoPriorRound,
             ),
         };
-        issue.description = Some(crate::reviewprompt::review_round_description(
+        // STUDIO-1034: quote the origin ticket's acceptance criteria into the prompt. The reviewer
+        // has no Linear access, so without this it judges acceptance against the author's own
+        // summary in the pull request body. The read is OFF the control loop — this attempt's own
+        // task — which is why dispatch carries only the ticket KEY and adds no network call. A read
+        // that fails, or an origin that names no ticket, is stated explicitly in the prompt rather
+        // than silently omitting the section.
+        let origin = match rev.origin_ticket.as_deref() {
+            None => None,
+            Some(identifier) => match deps
+                .tracker
+                .fetch_issue_description_by_identifier(identifier)
+                .await
+            {
+                Ok(Some(description)) => Some(crate::reviewprompt::OriginTicket {
+                    identifier: identifier.to_string(),
+                    description,
+                }),
+                Ok(None) => {
+                    tracing::warn!(
+                        issue_identifier = %issue.identifier,
+                        origin_ticket = %identifier,
+                        "review: the origin ticket's description could not be read; the review \
+                         prompt will say no ticket is available"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issue_identifier = %issue.identifier,
+                        origin_ticket = %identifier,
+                        error = %e,
+                        "review: reading the origin ticket's description failed; the review prompt \
+                         will say no ticket is available"
+                    );
+                    None
+                }
+            },
+        };
+        issue.description = Some(crate::reviewprompt::review_round_description_with_ticket(
             &mode,
             &rev.head_sha,
+            origin.as_ref(),
         ));
     }
     if let Err(e) = deps
@@ -1277,35 +1316,7 @@ mod tests {
     /// exists in git.
     #[tokio::test]
     async fn worker_provisions_a_detached_review_worktree_and_pins_the_head() {
-        fn git_run(dir: &str, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .expect("run git");
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let origin = TempDir::new();
-        git_run(&origin.path, &["init", "-b", "main"]);
-        std::fs::write(origin.child("README.md"), "hello\n").expect("write README");
-        git_run(&origin.path, &["add", "README.md"]);
-        git_run(&origin.path, &["commit", "-m", "initial"]);
-        git_run(&origin.path, &["commit", "--allow-empty", "-m", "pr head"]);
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&origin.path)
-            .output()
-            .expect("rev-parse");
-        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
+        let (origin, head) = review_git_origin();
 
         // The review turn ends with a structured verdict block (STUDIO-1008); the exit declaration
         // below must carry it, which is what makes the worker the place the block is read.
@@ -1332,6 +1343,7 @@ mod tests {
             pr_number: 12,
             head_sha: head.clone(),
             delta: None,
+            origin_ticket: None,
         });
         let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
 
@@ -1382,6 +1394,205 @@ mod tests {
             "the review worktree is on a branch, not detached"
         );
         drop(root);
+    }
+
+    /// A real local git origin carrying `refs/pull/12/head`, so a ticketless review's detached
+    /// checkout has something to detach at. Returns the origin directory (kept alive by the caller)
+    /// and the head SHA. Shared by the review-dispatch tests.
+    fn review_git_origin() -> (TempDir, String) {
+        fn git_run(dir: &str, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").expect("write README");
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        git_run(&origin.path, &["commit", "--allow-empty", "-m", "pr head"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin.path)
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
+        (origin, head)
+    }
+
+    /// STUDIO-1034: a ticketless review whose origin ticket the tracker can read carries that
+    /// ticket's acceptance text in its prompt, under the heading.
+    ///
+    /// Mutation: dropping the `fetch_issue_description_by_identifier` call from the worker (or the
+    /// origin section from the composer) reds the acceptance-text assertion.
+    #[tokio::test]
+    async fn a_ticketless_review_prompt_carries_the_origin_tickets_acceptance_text() {
+        let (origin, head) = review_git_origin();
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let mut tr = trackerfake::Fake::new();
+        tr.candidates = vec![Issue {
+            identifier: "STUDIO-1034".into(),
+            description: Some(
+                "- A review contains the origin ticket's acceptance section.".to_string(),
+            ),
+            ..Issue::default()
+        }];
+        let tr = Arc::new(tr);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            Arc::clone(&ws),
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "p",
+            1,
+        );
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+            delta: None,
+            origin_ticket: Some("STUDIO-1034".to_string()),
+        });
+
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("acceptance source of truth"),
+            "the review prompt must name the acceptance source:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("A review contains the origin ticket's acceptance section."),
+            "the origin ticket's acceptance items must reach the reviewer:\n{prompt}"
+        );
+        assert_eq!(
+            tr.description_by_identifier_calls(),
+            1,
+            "the worker must read the origin ticket exactly once"
+        );
+    }
+
+    /// STUDIO-1034: with no origin ticket, the review prompt says so explicitly — never a silent
+    /// omission — and the tracker is not asked at all.
+    #[tokio::test]
+    async fn a_ticketless_review_without_an_origin_ticket_says_so() {
+        let (origin, head) = review_git_origin();
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let mut tr = trackerfake::Fake::new();
+        tr.candidates = vec![Issue {
+            identifier: "STUDIO-1034".into(),
+            description: Some("should not be quoted".to_string()),
+            ..Issue::default()
+        }];
+        let tr = Arc::new(tr);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            Arc::clone(&ws),
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "p",
+            1,
+        );
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+            delta: None,
+            origin_ticket: None,
+        });
+
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("No ticket available"),
+            "an origin-less review must state it, not omit the section:\n{prompt}"
+        );
+        assert_eq!(
+            tr.description_by_identifier_calls(),
+            0,
+            "with no origin ticket the tracker must not be asked"
+        );
+    }
+
+    /// STUDIO-1034: a tracker read that FAILS does not fail the run; the prompt says no ticket is
+    /// available, so the reviewer knows it is checking against the pull request body only.
+    #[tokio::test]
+    async fn a_failed_origin_ticket_read_says_no_ticket_available() {
+        let (origin, head) = review_git_origin();
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let mut tr = trackerfake::Fake::new();
+        tr.description_by_identifier_err =
+            Some(rhapsody_tracker::TrackerError::Other("boom".into()));
+        let tr = Arc::new(tr);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            Arc::clone(&ws),
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "p",
+            1,
+        );
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+            delta: None,
+            origin_ticket: Some("STUDIO-1034".to_string()),
+        });
+
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        assert!(
+            err.is_none(),
+            "a failed read must not fail the run, got {err:?}"
+        );
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("No ticket available"),
+            "a failed read must degrade to the explicit line:\n{prompt}"
+        );
     }
 
     /// A fake [`crate::ghsummons::ReviewDeltaSource`] for the worker-level delta tests: each read is
@@ -1493,6 +1704,7 @@ mod tests {
                 prior_sha: "abc1234abc1234abc1234abc1234abc1234abc1".into(),
                 head_sha: head.clone(),
             }),
+            origin_ticket: None,
         });
 
         let (_last, _declared, err) = run_agent_attempt(
@@ -1548,6 +1760,7 @@ mod tests {
             pr_number: 12,
             head_sha: head.clone(),
             delta: None,
+            origin_ticket: None,
         });
 
         let (_last, _declared, err) = run_agent_attempt(
@@ -2176,6 +2389,7 @@ mod tests {
             pr_number: 12,
             head_sha: head.clone(),
             delta: None,
+            origin_ticket: None,
         });
         d.drain
             .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
@@ -2411,6 +2625,7 @@ mod tests {
             pr_number: 12,
             head_sha: "a".repeat(40),
             delta: None,
+            origin_ticket: None,
         });
         let sess = ag
             .start_session("", review_issue(), None)

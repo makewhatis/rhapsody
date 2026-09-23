@@ -129,6 +129,9 @@ pub struct Fake {
     pub by_id_err: Option<TrackerError>,
     /// When set, returned by `fetch_issue_labels_by_ids` (the call is still recorded). STUDIO-735.
     pub labels_by_id_err: Option<TrackerError>,
+    /// When set, returned by `fetch_issue_description_by_identifier` (the call is still recorded).
+    /// STUDIO-1034: it drives the review prompt's "the daemon could not read the ticket" path.
+    pub description_by_identifier_err: Option<TrackerError>,
 
     /// When set, returned by `move_issue_state` (the move is still recorded).
     pub move_err: Option<TrackerError>,
@@ -238,6 +241,8 @@ struct Inner {
     labels_by_id_calls: usize,
     blocked_backlog_calls: usize,
     branch_by_id_calls: usize,
+    /// STUDIO-1034.
+    description_by_identifier_calls: usize,
 
     /// `comment_seq` generates unique, monotonically-ordered comment IDs so a tie on `created_at`
     /// resolves deterministically (smaller id = earlier caller).
@@ -292,6 +297,10 @@ impl Fake {
     /// Number of `fetch_issue_branch_by_id` calls.
     pub fn branch_by_id_calls(&self) -> usize {
         self.lock().branch_by_id_calls
+    }
+    /// Number of `fetch_issue_description_by_identifier` calls (STUDIO-1034).
+    pub fn description_by_identifier_calls(&self) -> usize {
+        self.lock().description_by_identifier_calls
     }
     /// Number of `list_comments` calls.
     pub fn list_comments_calls(&self) -> usize {
@@ -438,6 +447,28 @@ impl Tracker for Fake {
             return Err(e.clone());
         }
         Ok(self.blocked_backlog.clone())
+    }
+
+    /// Serves the `candidates` list: the first issue whose identifier matches (case-insensitively),
+    /// returning its non-empty description. An empty identifier returns `None` WITHOUT recording a
+    /// call, mirroring the real adapters' no-API-call contract.
+    async fn fetch_issue_description_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<String>, TrackerError> {
+        if identifier.trim().is_empty() {
+            return Ok(None);
+        }
+        self.lock().description_by_identifier_calls += 1;
+        if let Some(e) = &self.description_by_identifier_err {
+            return Err(e.clone());
+        }
+        Ok(self
+            .candidates
+            .iter()
+            .find(|iss| iss.identifier.eq_ignore_ascii_case(identifier.trim()))
+            .and_then(|iss| iss.description.clone())
+            .filter(|d| !d.trim().is_empty()))
     }
 
     async fn fetch_issue_branch_by_id(&self, id: &str) -> Result<(String, i64), TrackerError> {
