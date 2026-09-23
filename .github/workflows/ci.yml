@@ -77,6 +77,20 @@ jobs:
       # nobody removed (or a reverted one) leaves a directory the scan then names.
       - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --workspace --no-fail-fast
+      # STUDIO-1032: `ensure_from_repo_hook_runs_unlocked` now proves the two same-repo after_create
+      # hooks run concurrently with a cross-process barrier instead of inferring it from wall-clock
+      # [start,end] interval overlap. The flake it replaces was a Linux-only timing artifact (the
+      # second task's prehook git work outlasted the first hook's sleep), so a single run is not
+      # evidence of determinism — this loop pins 50 consecutive passes. It runs under the same
+      # job-private TMPDIR, before the STUDIO-1031 leak scan, so the scan still covers it, and
+      # `runner.os != 'macOS'` keeps the repetition off the shared Macs (the push-to-main leg runs
+      # there); the workspace run above has already compiled everything, so each iteration only
+      # re-runs the one test.
+      - if: runner.os != 'macOS'
+        run: |
+          for i in $(seq 1 50); do
+            TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace --lib repo::tests::ensure_from_repo_hook_runs_unlocked -- --exact | grep -q 'test result: ok. 1 passed' || exit 1
+          done
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
 
   web:
