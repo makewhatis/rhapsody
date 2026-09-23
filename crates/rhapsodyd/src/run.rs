@@ -2365,6 +2365,72 @@ mod tests {
         );
     }
 
+    /// STUDIO-999 (PB4), shutdown half: a clean shutdown through `run`'s composition must revoke any
+    /// registry entry still live when the control loop returns (design §11.3: "the broker revokes any
+    /// remaining registry entries … and drains its server"). The grant minted here is registered
+    /// directly through the injected registrar, so it is owned by no worker session and only the
+    /// tail `broker_runtime.revoke_all()` can revoke it.
+    ///
+    /// MUTATION GUARD: deleting the tail `revoke_all()` in `run` leaves the grant live, so the
+    /// `Unauthorized` assertion below fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_shutdown_through_run_revokes_a_remaining_grant() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "");
+        let buf = SharedBuf::new();
+
+        let (obs_tx, obs_rx) = tokio::sync::oneshot::channel();
+        let seam = crate::broker::BrokerSeam {
+            bind: Box::new(crate::broker::BrokerRuntime::bind),
+            observe: Some(Box::new(move |observation| {
+                let _ = obs_tx.send(observation);
+            })),
+        };
+
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let handle = tokio::spawn(async move {
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
+            .await
+            .expect("the seam must observe the serving broker")
+            .expect("observation");
+
+        // Mint a live grant through the registrar the run wiring exposed (a clone of the one
+        // injected into the orchestrator, over the same registry).
+        let (token, access, receipt, session) = crate::broker::mint_live(&observation.registrar);
+        assert!(
+            observation.broker.lookup_capability(&token).is_ok(),
+            "the minted capability must be live through the run wiring"
+        );
+
+        // Cancel the daemon's signal: the control loop returns and the run tail must revoke the
+        // still-live grant (and, because this is a clean shutdown, leave the broker available).
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+
+        assert!(
+            observation.broker.is_available(),
+            "a clean shutdown must not mark the broker unavailable"
+        );
+        assert_eq!(
+            observation.broker.lookup_capability(&token).unwrap_err(),
+            BrokerError::Unauthorized,
+            "a clean shutdown through `run` must revoke the remaining grant"
+        );
+        drop(access);
+        drop(receipt);
+        drop(session);
+    }
+
     // Mirrors Go `TestRunMissingFileExitsNonZero`.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_missing_file_exits_nonzero() {
