@@ -78,5 +78,7 @@ lock.
   against the committed `db/go-daemon-rows.json`, then does the same round trip through rows
   written by the Rust API itself. `project_golden_to_api_shape` documents the one deliberate shape
   difference: `EventRow` omits the storage-internal `id`/`run_id` columns Go's raw dump includes.
-- `scratch_dir()` (pid + atomic counter under the system temp dir) is this crate's own throwaway-db
-  helper — reuse it rather than adding a `tempfile` dependency.
+- `scratch_dir()` (pid + nanosecond nonce + atomic counter under the system temp dir, cleared on
+  create and removed on drop) is this crate's own throwaway-db helper — reuse it rather than adding a
+  `tempfile` dependency. `scratch_dir_path()` is the non-drop-cleaned variant for a directory the
+  caller keeps using after the helper returns (e.g. `open_temp`'s store).

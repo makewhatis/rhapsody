@@ -1811,17 +1811,113 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique, freshly-created scratch directory under the system temp dir. Avoids a
-    /// tempfile dependency; uniqueness comes from the pid + a per-process atomic counter.
-    fn scratch_dir() -> PathBuf {
+    /// A freshly-created, deliberately-empty scratch directory under the system temp dir that is
+    /// removed when the guard drops.
+    ///
+    /// Uniqueness comes from pid + a nanosecond nonce + a per-process counter, so a **reused** pid —
+    /// two processes over time that happened to draw the same pid — can never reopen the previous
+    /// process's `symphony.db`. That collision produced `duplicate column name: project_slug` when
+    /// an old database was opened against a newer schema (STUDIO-1027). `remove_dir_all` before
+    /// `create_dir_all` is the belt to that braces: even an exactly-reused name starts empty.
+    struct ScratchDir(PathBuf);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The scratch directory's name. `nonce` distinguishes otherwise-identical `(pid, seq)` pairs,
+    /// so a name never depends on pid + counter alone — the reused-pid collision (STUDIO-1027).
+    fn scratch_dir_name(pid: u32, nonce: u128, seq: u32) -> String {
+        format!("rhapsody-store-test-{pid}-{nonce}-{seq}")
+    }
+
+    /// The current-time nonce used in a scratch directory name.
+    fn scratch_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// Clear anything already at `dir`, then create it, and return the path. `create_dir_all` alone
+    /// would leave a stale database in place.
+    fn clear_scratch_dir(dir: &Path) -> PathBuf {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("create scratch dir");
+        dir.to_path_buf()
+    }
+
+    /// A unique, freshly-created scratch directory that is removed on drop. Avoids a tempfile
+    /// dependency; uniqueness is pid + nanosecond nonce + a per-process atomic counter.
+    fn scratch_dir() -> ScratchDir {
         static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rhapsody-store-test-{}-{}",
+        let dir = std::env::temp_dir().join(scratch_dir_name(
             std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
+            scratch_nonce(),
+            N.fetch_add(1, Ordering::Relaxed),
         ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+        ScratchDir(clear_scratch_dir(&dir))
+    }
+
+    // A REUSED pid must not reopen the previous process's database. Two processes that draw the same
+    // pid and the same counter produce the same name under the old scheme and collide; the nanosecond
+    // nonce makes them distinct. Zeroing the nonce (the old pid+counter name) reds this.
+    #[test]
+    fn scratch_dir_names_do_not_collide_when_a_pid_is_reused() {
+        assert_ne!(
+            scratch_dir_name(4242, 111, 0),
+            scratch_dir_name(4242, 222, 0),
+            "a reused pid at the same counter must not reuse a scratch directory"
+        );
+    }
+
+    // Creating a scratch directory over a stale one must START EMPTY, so a leftover `symphony.db`
+    // can never be reopened against a newer schema (`duplicate column name: project_slug`). Dropping
+    // the `remove_dir_all` from `clear_scratch_dir` — the old plain `create_dir_all` — reds this.
+    #[test]
+    fn a_reused_scratch_dir_is_cleared_before_use() {
+        let dir = std::env::temp_dir().join(scratch_dir_name(
+            std::process::id(),
+            scratch_nonce(),
+            u32::MAX,
+        ));
+        std::fs::create_dir_all(&dir).expect("seed stale dir");
+        std::fs::write(dir.join("symphony.db"), b"stale schema").expect("seed stale db");
+
+        let fresh = clear_scratch_dir(&dir);
+        assert_eq!(
+            std::fs::read_dir(&fresh).expect("read fresh dir").count(),
+            0,
+            "a reused scratch directory must be cleared, not reopened"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like [`scratch_dir`], but NOT drop-cleaned: the caller keeps using the directory after the
+    /// helper returns, so removing it on drop would pull the floor out from under the open store.
+    fn scratch_dir_path() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        clear_scratch_dir(&std::env::temp_dir().join(scratch_dir_name(
+            std::process::id(),
+            scratch_nonce(),
+            N.fetch_add(1, Ordering::Relaxed),
+        )))
     }
 
     /// Reassemble the live schema the way `sqlite3 .schema` (which produced the fixture) does.
@@ -1946,7 +2042,7 @@ mod tests {
     /// Fresh file-backed store under a scratch dir (Go `openTemp`) so WAL behavior — and sharing
     /// one store across threads — can be exercised against a real on-disk database.
     fn open_temp() -> Sqlite {
-        let dir = scratch_dir();
+        let dir = scratch_dir_path();
         Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp")
     }
 
@@ -1964,7 +2060,8 @@ mod tests {
     // returns CANTOPEN and the daemon silently loses persistence.
     #[test]
     fn open_creates_missing_parent_dir() {
-        let dir = scratch_dir()
+        let scratch = scratch_dir();
+        let dir = scratch
             .join("does")
             .join("not")
             .join("exist")
@@ -2084,7 +2181,8 @@ mod tests {
     // store is an idempotent no-op.
     #[test]
     fn open_migrates_to_schema_version() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         let s1 = Sqlite::open(StorePath::Disk(path.clone())).expect("open file");
         s1.close().expect("close");
         let s2 = Sqlite::open(StorePath::Disk(path)).expect("re-open file"); // migrate is a no-op
@@ -2103,7 +2201,8 @@ mod tests {
     // stalled/timed_out->failed; failed/interrupted/running are left untouched.
     #[test]
     fn migrate_outcomes_v5() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         // Build a v4 database by applying the first four migration steps directly, then stamping
         // user_version=4 so Open() runs ONLY the new v4->v5 (and v5->v6) steps.
         {
