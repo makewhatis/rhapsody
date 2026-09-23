@@ -782,7 +782,7 @@ fn merge_finding_ref(
             },
             _ => return Err(DecisionError::MissingField("dismiss.revision")),
         },
-        _ => unreachable!("caller matches only finding/revision"),
+        other => return Err(DecisionError::UnknownField(format!("dismiss.{other}"))),
     }
     Ok(r)
 }
