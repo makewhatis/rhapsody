@@ -24,6 +24,7 @@ pub mod prompt;
 pub mod providers;
 pub mod resolve;
 pub mod room;
+pub mod routing;
 pub mod teams;
 pub mod validate;
 pub mod workflow;

@@ -1737,7 +1737,7 @@ impl Orchestrator {
             );
             let (final_state, declared, err) = tokio::select! {
                 res = run => res,
-                _ = cancel.cancelled() => (iss.state.clone(), false, None),
+                _ = cancel.cancelled() => (iss.state.clone(), crate::worker::WorkerDeclaration::default(), None),
             };
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
@@ -1749,7 +1749,8 @@ impl Orchestrator {
                 started_at,
                 err_msg: err.map(|e| e.to_string()).unwrap_or_default(),
                 last_state: final_state,
-                declared_handoff: declared,
+                declared_handoff: declared.declared_handoff,
+                review_verdict: declared.review_verdict,
                 refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
@@ -2039,6 +2040,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: String::new(),
                 declared_handoff: false,
+                review_verdict: None,
                 refused: false,
             }));
         }));

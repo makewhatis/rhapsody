@@ -171,6 +171,18 @@ pub struct Manager {
     /// Consulted ONLY in `labels+model`, and only on a Tier-1 miss.
     #[serde(default)]
     pub model: String,
+    /// The harness the manager's model turn runs on (STUDIO-985). **Absent means `claude`**, and
+    /// that default is independent of `agent.backend` and of every teammate: per the parent decision
+    /// D6 the manager never borrows a teammate's tuple. Read through [`Manager::effective_harness`],
+    /// never raw.
+    #[serde(default)]
+    pub harness: String,
+    /// The provider the manager's model turn runs on (STUDIO-985). Empty is the default-Claude
+    /// case and is the only legal value while the harness is Claude: the manager uses Claude's
+    /// native auth and names no provider. Selecting an explicit provider requires a non-Claude
+    /// harness (which in turn requires `model`).
+    #[serde(default)]
+    pub provider: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i64,
     #[serde(default = "default_timeout_ms")]
@@ -183,9 +195,31 @@ impl Default for Manager {
             mode: ManagerMode::default(),
             default_identity: String::new(),
             model: String::new(),
+            harness: String::new(),
+            provider: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }
+    }
+}
+
+impl Manager {
+    /// The harness the manager's model turn runs on: the explicit `harness`, else **`claude`** —
+    /// never `agent.backend` and never a teammate's harness (STUDIO-985, §2.3 / parent D6). The
+    /// independent Claude default is what keeps the manager stable on an installation whose
+    /// teammates all moved to another harness.
+    pub fn effective_harness(&self) -> &str {
+        if self.harness.is_empty() {
+            "claude"
+        } else {
+            &self.harness
+        }
+    }
+
+    /// Whether the tuple is the default Claude manager: no explicit harness (so `claude`) and no
+    /// provider. Its `model` may still be empty (today's CLI-default behavior) or set.
+    pub fn is_default_claude(&self) -> bool {
+        self.harness.is_empty() && self.provider.is_empty()
     }
 }
 
@@ -529,6 +563,20 @@ pub struct Review {
     /// only to a run `dispatch_review` staged — and only `mode: ticketless` ever stages one.
     #[serde(default)]
     pub model: HarnessScoped,
+    /// The PROVIDER a review run uses, per HARNESS (STUDIO-985; `provider-auth-design.md` §2.3/§5).
+    /// The sibling of [`Review::model`], scoped by harness for the same reason: a provider name has
+    /// no meaning without the harness that will talk to it, so the key is
+    /// `review.provider.<harness>` (or the legacy bare scalar, belonging to `agent.backend`).
+    ///
+    /// Unset means a review run inherits the routed reviewer's own provider/selection — exactly the
+    /// "absent means whatever would have happened" rule `model` follows. A value configured for a
+    /// harness the routed reviewer does **not** use is REFUSED at dispatch, never applied to the
+    /// wrong run; [`Teams::review_provider_for`] is that check's home.
+    ///
+    /// Every configured value must be a canonical provider id (§2.2): a provider field is an
+    /// operator-chosen key, never a credential, and [`Teams::validate`] rejects anything else.
+    #[serde(default)]
+    pub provider: HarnessScoped,
     /// The effort a REVIEW run uses, paired with [`Review::model`] for the same reason `Config` and
     /// a teammate's profile pair the two everywhere else in this codebase: setting `model` alone
     /// would leave whatever effort was already in play — profile or installation-wide — applying to
@@ -600,6 +648,7 @@ impl Default for Review {
             changes_state: String::new(),
             auto_merge: false,
             model: HarnessScoped::default(),
+            provider: HarnessScoped::default(),
             effort: HarnessScoped::default(),
             required: Vec::new(),
             adjudicate_after_rounds: 0,
@@ -745,6 +794,23 @@ pub struct Identity {
     /// The profile this identity wears. Unresolved in T1 (profiles are T2).
     #[serde(default)]
     pub profile: String,
+    /// The teammate-identity tier of the selection precedence (STUDIO-985, §2.3): an explicit
+    /// harness **on the roster entry itself**, overriding whatever the profile names. Empty means
+    /// inherit the profile, which in turn inherits `agent.backend`. Validated as a routing field —
+    /// an unknown non-empty name is a dispatch refusal, never a silent fallback.
+    #[serde(default)]
+    pub harness: String,
+    /// The provider for this identity's runs (STUDIO-985). Empty inherits the profile. Must be a
+    /// canonical provider id when set: this is an operator-chosen key, never a credential.
+    #[serde(default)]
+    pub provider: String,
+    /// The model for this identity's runs (STUDIO-985). Empty inherits the profile. Opaque beyond
+    /// the model-id transport bounds (§2.2).
+    #[serde(default)]
+    pub model: String,
+    /// The effort for this identity's runs (STUDIO-985). Empty inherits the profile.
+    #[serde(default)]
+    pub effort: String,
     /// What the deterministic router matches against the ticket's labels (T3a).
     #[serde(default)]
     pub labels: Vec<String>,
@@ -1044,6 +1110,38 @@ impl Teams {
         ))
     }
 
+    /// What a REVIEW run dispatched to a reviewer on `harness` should do about `review.provider`
+    /// (STUDIO-985) — the provider half of [`review_model_for`](Self::review_model_for), gated and
+    /// scoped identically and for the same reasons: `harness` is the harness the run will actually
+    /// use, `fallback` is the configured `agent.backend` the legacy bare scalar belongs to.
+    ///
+    /// A provider configured for a harness the routed reviewer does **not** use is
+    /// [`ReviewModelChoice::Refuse`] rather than applied to the wrong run — the design's "a
+    /// configured provider for a harness that the routed reviewer does not use is refused". A
+    /// missing entry everywhere inherits.
+    pub fn review_provider_for(&self, harness: &str, fallback: &str) -> ReviewModelChoice<'_> {
+        if !self.review_ticketless() || self.review.provider.is_empty() {
+            return ReviewModelChoice::Inherit;
+        }
+        if let Some(value) = self.review.provider.for_harness(harness, fallback) {
+            return ReviewModelChoice::Use(value);
+        }
+        let listed = self
+            .review
+            .provider
+            .resolved(fallback)
+            .iter()
+            .map(|(h, v)| format!("{h} (provider {v})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ReviewModelChoice::Refuse(format!(
+            "review.provider is set for {listed}, but this reviewer runs the {harness} harness. \
+             The review was refused rather than run on a provider scoped to another harness — add a \
+             `review.provider.{harness}` entry, or remove `review.provider` so every reviewer \
+             inherits its own selection (origin: review.provider)"
+        ))
+    }
+
     /// The effort a REVIEW run on `harness` uses; the pair to
     /// [`review_model_for`](Self::review_model_for), gated the same way and for the same reason.
     /// `fallback` is read for [`review_model_for`](Self::review_model_for)'s reason: the legacy
@@ -1296,6 +1394,60 @@ impl Teams {
                 "manager.default_identity {:?} is not a roster entry",
                 self.manager.default_identity
             )));
+        }
+        // ── STUDIO-985: the selection tuple schema ─────────────────────────────
+        // The manager carries its OWN tuple and never inherits a teammate's (§2.3, parent D6). An
+        // absent harness means `claude`, so `manager.provider` with no harness is a provider on the
+        // native-Claude path — refused. A non-Claude harness must name provider and model.
+        let manager_harness = self.manager.effective_harness();
+        if !self.manager.harness.is_empty()
+            && !crate::routing::is_known_harness(&self.manager.harness)
+        {
+            return Err(TeamsError::Invalid(format!(
+                "manager.harness {:?} is not a recognized harness ({}); an absent manager.harness \
+                 means `claude`",
+                self.manager.harness,
+                crate::harness::HARNESS_NAMES.join(", ")
+            )));
+        }
+        if !self.manager.provider.is_empty() {
+            crate::providers::canonical_provider_id(&self.manager.provider).map_err(|reason| {
+                TeamsError::Invalid(format!(
+                    "manager.provider {:?} is not a canonical provider id: {reason}",
+                    self.manager.provider
+                ))
+            })?;
+        }
+        if manager_harness == "claude" {
+            if !self.manager.provider.is_empty() {
+                return Err(TeamsError::Invalid(
+                    "manager.provider is set while the manager runs the default `claude` harness. \
+                     The default Claude manager uses native auth and names no provider — set \
+                     manager.harness to a non-Claude harness, or remove manager.provider"
+                        .to_string(),
+                ));
+            }
+        } else if self.manager.provider.is_empty() || self.manager.model.is_empty() {
+            return Err(TeamsError::Invalid(format!(
+                "manager.harness {:?} requires an explicit manager.provider and manager.model — a \
+                 non-Claude manager cannot inherit a teammate's selection",
+                manager_harness
+            )));
+        }
+        // Every configured `review.provider` value must be a canonical operator-chosen id. A
+        // provider field can never carry a credential, and a non-canonical value refuses the file
+        // rather than travelling to a later resolver.
+        for (harness, value) in self.review.provider.resolved("") {
+            if let Err(reason) = crate::providers::canonical_provider_id(value) {
+                let label = if harness.is_empty() {
+                    "review.provider".to_string()
+                } else {
+                    format!("review.provider.{harness}")
+                };
+                return Err(TeamsError::Invalid(format!(
+                    "{label} {value:?} is not a canonical provider id: {reason}"
+                )));
+            }
         }
         // Mutual exclusion, §15-d: the two review paths read the same handoff,
         // so an installation that asks for BOTH has asked for two agent runs
@@ -3077,6 +3229,7 @@ mod tests {
                 changes_state: "In Progress".to_string(),
                 auto_merge: true,
                 model: HarnessScoped::bare("claude-opus-5"),
+                provider: HarnessScoped::default(),
                 effort: HarnessScoped::bare("high"),
                 required: vec!["jimmy".to_string()],
                 adjudicate_after_rounds: 3,
@@ -3215,6 +3368,8 @@ mod tests {
                 mode: ManagerMode::Off,
                 default_identity: "alice".to_string(),
                 model: "m".to_string(),
+                harness: "opencode".to_string(),
+                provider: "fireworks".to_string(),
                 max_tokens: 1,
                 timeout_ms: 2,
             },
@@ -3247,6 +3402,10 @@ mod tests {
             roster: vec![Identity {
                 name: "alice".to_string(),
                 profile: "swe".to_string(),
+                harness: "opencode".to_string(),
+                provider: "fireworks".to_string(),
+                model: "accounts/fireworks/models/deepseek-v4p1-flash".to_string(),
+                effort: "high".to_string(),
                 labels: vec!["rust".to_string()],
                 bank: "b".to_string(),
                 max_concurrent: 2,
@@ -3277,5 +3436,184 @@ mod tests {
         assert!(yaml.contains("labels+model"), "wire spelling: {yaml}");
         assert!(yaml.contains("hindsight"), "wire spelling: {yaml}");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), other);
+    }
+
+    // ── STUDIO-985: provider selection fields ─────────────────────────────────
+
+    /// The manager's harness default is **always `claude`**, independent of `agent.backend` and of
+    /// every teammate (§2.3 / parent D6). The mutation this pins: making the manager default
+    /// inherit the selected teammate turns this red.
+    #[test]
+    fn manager_harness_defaults_to_claude_independent_of_every_teammate() {
+        assert_eq!(Manager::default().effective_harness(), "claude");
+        assert!(Manager::default().is_default_claude());
+
+        // A roster of opencode teammates does not move the manager's default.
+        let teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                harness: "opencode".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        assert_eq!(
+            teams.manager.effective_harness(),
+            "claude",
+            "the manager borrowed a teammate's harness"
+        );
+
+        // An explicit manager harness wins and is never the teammate's.
+        let teams = Teams {
+            manager: Manager {
+                harness: "opencode".to_string(),
+                provider: "fireworks".to_string(),
+                model: "m".to_string(),
+                ..Manager::default()
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                harness: "claude".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        assert_eq!(teams.manager.effective_harness(), "opencode");
+        teams
+            .validate()
+            .expect("an explicit non-Claude manager tuple is valid");
+    }
+
+    /// The manager tuple's validation rules (STUDIO-985).
+    #[test]
+    fn manager_tuple_validation() {
+        let base = |m: Manager| Teams {
+            enabled: true,
+            manager: m,
+            ..Teams::disabled()
+        };
+
+        // A provider on the default Claude path refuses: the manager uses native auth.
+        let err = base(Manager {
+            provider: "fireworks".to_string(),
+            ..Manager::default()
+        })
+        .validate()
+        .expect_err("provider on claude must refuse");
+        assert!(matches!(err, TeamsError::Invalid(_)), "{err}");
+
+        // An explicit non-Claude harness must name provider AND model.
+        let err = base(Manager {
+            harness: "opencode".to_string(),
+            ..Manager::default()
+        })
+        .validate()
+        .expect_err("missing tuple must refuse");
+        assert!(err.to_string().contains("requires an explicit"), "{err}");
+
+        // An unknown harness refuses rather than silently trying another runner.
+        let err = base(Manager {
+            harness: "goose".to_string(),
+            provider: "fireworks".to_string(),
+            model: "m".to_string(),
+            ..Manager::default()
+        })
+        .validate()
+        .expect_err("unknown harness must refuse");
+        assert!(
+            err.to_string().contains("not a recognized harness"),
+            "{err}"
+        );
+
+        // A credential cannot be a provider.
+        let err = base(Manager {
+            harness: "opencode".to_string(),
+            provider: "sk-live:ABC/1".to_string(),
+            model: "m".to_string(),
+            ..Manager::default()
+        })
+        .validate()
+        .expect_err("non-canonical provider must refuse");
+        assert!(err.to_string().contains("canonical provider id"), "{err}");
+
+        // Explicit `claude` with only a model is fine: today's CLI-default behavior, preserved.
+        base(Manager {
+            harness: "claude".to_string(),
+            model: "claude-opus-5".to_string(),
+            ..Manager::default()
+        })
+        .validate()
+        .expect("explicit claude with model is valid");
+    }
+
+    /// `review.provider` is harness-scoped, round-trips, and every value must be canonical.
+    #[test]
+    fn review_provider_is_harness_scoped_and_validated() {
+        let mut review = Review {
+            mode: ReviewMode::Ticketless,
+            reviewers: 1,
+            ..Review::default()
+        };
+        review.provider.insert("opencode", "fireworks");
+        let teams = Teams {
+            enabled: true,
+            review,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        teams.validate().expect("a scoped provider is valid");
+
+        let yaml = serde_yaml_ng::to_string(&teams).expect("serialize");
+        assert_eq!(Teams::parse(&yaml).expect("reparse"), teams);
+
+        // The accessor is harness-scoped: a reviewer on another harness is refused, not handed the
+        // value configured for opencode.
+        assert!(matches!(
+            teams.review_provider_for("opencode", "claude"),
+            ReviewModelChoice::Use("fireworks")
+        ));
+        assert!(matches!(
+            teams.review_provider_for("claude", "claude"),
+            ReviewModelChoice::Refuse(_)
+        ));
+
+        // A credential-shaped value refuses the file.
+        let mut bad = Review::default();
+        bad.provider.insert("opencode", "sk-live:ABC/1");
+        let err = Teams {
+            enabled: true,
+            review: bad,
+            ..Teams::disabled()
+        }
+        .validate()
+        .expect_err("non-canonical review provider must refuse");
+        assert!(err.to_string().contains("canonical provider id"), "{err}");
+    }
+
+    /// A credential has no slot in `teams.yaml`: an unknown `api_key`/`token` key is not part of
+    /// the typed model and never round-trips. (A secret cannot ride in `provider` either — every
+    /// provider value is validated canonical, above.) STUDIO-985 mutation #4.
+    #[test]
+    fn credentials_cannot_be_represented_in_teams_yaml() {
+        let text = "\
+enabled: true
+manager:
+  mode: off
+  api_key: supersecret
+roster:
+  - name: alice
+    profile: swe
+    token: supersecret
+";
+        let teams = Teams::parse(text).expect("unknown keys are tolerated, not typed");
+        let yaml = serde_yaml_ng::to_string(&teams).expect("serialize");
+        assert!(
+            !yaml.contains("supersecret"),
+            "a credential round-tripped through the typed model: {yaml}"
+        );
     }
 }

@@ -1086,6 +1086,34 @@ mod tests {
         fn load_review_done(&self) -> Result<Vec<rhapsody_store::ReviewDoneRow>, StoreError> {
             self.0.load_review_done()
         }
+        fn save_review_finding(
+            &self,
+            row: rhapsody_store::ReviewFindingRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_review_finding(row)
+        }
+        fn load_review_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rhapsody_store::ReviewFindingRow>, StoreError> {
+            self.0.load_review_findings(pr)
+        }
+        fn open_blocking_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rhapsody_store::ReviewFindingRow>, StoreError> {
+            self.0.open_blocking_findings(pr)
+        }
+        fn resolve_review_findings(
+            &self,
+            pr: &str,
+            generation: i64,
+            reviewer: &str,
+            resolved_by: &str,
+        ) -> Result<(), StoreError> {
+            self.0
+                .resolve_review_findings(pr, generation, reviewer, resolved_by)
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }

@@ -515,6 +515,39 @@ pub trait Store {
     /// rehydrated from, so a restart never re-notifies a crossing.
     fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError>;
 
+    // --- structured review findings (STUDIO-1008; no Go counterpart) -----------------------------
+    // One row per finding REVISION a reviewer raised on a pull request (design record
+    // `manager-agent-design.md` §5.3). The review path writes a revision at each completed round; a
+    // later approving review by the same reviewer resolves that reviewer's open revisions. Nothing
+    // writes `dismissed` yet — the manager (a later ticket) is its only writer — but the reopen rule
+    // (§6.3) is already defined against it. Backed by `rhapsody_review_finding` (see the README
+    // "Divergences" entry).
+
+    /// Records one finding revision. A revision row is IMMUTABLE once written — a duplicate write is
+    /// a no-op rather than a rewrite — so the row stays the record of what one completed review said.
+    fn save_review_finding(&self, row: ReviewFindingRow) -> Result<(), StoreError>;
+
+    /// Every finding revision recorded for `pr`, in `(reviewer, finding_id, revision)` order. The
+    /// writer's read: it folds these to find the latest revision of each scoped finding id before
+    /// appending the next one.
+    fn load_review_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError>;
+
+    /// The revisions that are still `open` AND `blocking` for `pr` — the read the manager and the
+    /// later tickets consume. Resolved, dismissed and settled revisions, and non-blocking ones, are
+    /// filtered in SQL.
+    fn open_blocking_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError>;
+
+    /// Resolves every `open` revision of `reviewer`'s on `pr`/`generation`, recording the approving
+    /// review's run id in `resolved_by`. Part of §5.3's resolution rule; a no-op when the reviewer
+    /// has nothing open.
+    fn resolve_review_findings(
+        &self,
+        pr: &str,
+        generation: i64,
+        reviewer: &str,
+        resolved_by: &str,
+    ) -> Result<(), StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

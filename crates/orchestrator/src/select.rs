@@ -2336,6 +2336,7 @@ mod tests {
                 labels: roster_labels.iter().map(|s| (*s).to_string()).collect(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             }],
             ..rhapsody_config::teams::Teams::disabled()
         });
@@ -2532,6 +2533,7 @@ mod tests {
                 labels: vec!["rust".to_string()],
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             }],
             ..rhapsody_config::teams::Teams::disabled()
         });

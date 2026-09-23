@@ -628,3 +628,75 @@ pub struct ReviewDoneRow {
     /// only so the reconciliation sweep keeps reporting the stuck transition until a human clears it.
     pub gave_up: bool,
 }
+
+// --- structured review findings (STUDIO-1008) --------------------------------------------------
+// Values for rhapsody_review_finding.status. NOT a Go port: the frozen reference has no review
+// feature. The set is closed: a revision is always in exactly one of these four states. Nothing
+// writes `dismissed` yet — the manager's decisions (a later ticket) are its only writer — but the
+// reopen rule (§6.3) is already defined against it and tested with synthetic dismissals.
+
+/// The revision is live: the reviewer has raised it and it has not been resolved or dismissed.
+pub const REVIEW_FINDING_OPEN: &str = "open";
+/// A later approving review by the SAME reviewer resolved this revision.
+pub const REVIEW_FINDING_RESOLVED: &str = "resolved";
+/// The manager dismissed this revision (§6.3). No Go counterpart; written only by a later ticket.
+pub const REVIEW_FINDING_DISMISSED: &str = "dismissed";
+/// A dismissed finding was raised again with no material change — recorded, non-blocking (§6.3).
+pub const REVIEW_FINDING_SETTLED: &str = "settled";
+
+/// One REVISION of one reviewer's finding on one pull request (STUDIO-1008). No Go counterpart.
+///
+/// The design record `~/.rhapsody/docs/manager-agent-design.md` §5.3 defines the row: one row per
+/// finding revision, keyed by `(pr, generation, reviewer, finding_id, revision)`. `finding_id` is
+/// scoped per reviewer (`sol:B8`), and `revision` increments each time that reviewer raises the same
+/// finding again — so a repeat raise is a NEW row rather than an update of the old one, which is what
+/// lets the reopen rule (§6.3) compare a re-raise against the dismissed revision it follows.
+///
+/// `summary_hash` is a digest of the NORMALIZED summary, never the summary text itself: the row
+/// answers "is this the same objection as before?" and stores nothing that could leak a reviewer's
+/// prose into a table no surface renders.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewFindingRow {
+    /// `owner/repo#number` — the pull request the finding is about. Part of the primary key.
+    pub pr: String,
+    /// The review GENERATION (§5.1). Constant `0` until M2 introduces the real value; part of the
+    /// primary key so a future generation bump starts a fresh finding history rather than appending
+    /// to an old one.
+    pub generation: i64,
+    /// The reviewing teammate's Teams identity — the same value `ReviewWatchRow`'s key carries.
+    pub reviewer: String,
+    /// The finding id SCOPED per reviewer (`sol:B8`), so two reviewers can both raise a `B8` without
+    /// colliding. The unstructured fallback uses `<reviewer>:unstructured:<review_run_id>`, which is
+    /// unique per completed review on purpose (§5.3) — a stable id would let one dismissal silence
+    /// every later unrelated objection from that reviewer.
+    pub finding_id: String,
+    /// Increments each time this reviewer raises this `finding_id` again. Starts at 1.
+    pub revision: i64,
+    /// The `runs.id` of the completed review that raised this revision.
+    pub review_run_id: i64,
+    /// The head SHA the review was pinned to (design §14.1 F-SHA) — what the reviewer actually read.
+    pub raised_at_sha: String,
+    /// The patch-id the review read, when known. Empty until M2 tracks patch ids on the review path;
+    /// the reopen rule is a pure function over values its caller supplies, so this column is written
+    /// empty at M1 and populated by the ticket that adds patch-id tracking.
+    pub raised_at_patch_id: String,
+    /// The files the finding is about. EMPTY means UNSCOPED, which the reopen rule treats as
+    /// always-relevant (§6.3) — an unscoped finding can never be settled by a diff that touches none
+    /// of its paths, because it names none.
+    pub paths: Vec<String>,
+    /// A digest of the normalized summary. See the struct doc.
+    pub summary_hash: String,
+    /// As the reviewer declared it.
+    pub blocking: bool,
+    /// As the reviewer declared it — material new evidence, which reopens even at the same head.
+    pub new_evidence: bool,
+    /// As the reviewer declared it — a regression, which reopens even at the same head.
+    pub regression: bool,
+    /// One of the four `REVIEW_FINDING_*` values above.
+    pub status: String,
+    /// The `runs.id` of the later approving review that resolved this revision, as a string, or empty.
+    pub resolved_by: String,
+    /// The manager intervention that dismissed this revision (id + rationale + `dismissed_at_patch_id`),
+    /// or empty. Written only by a later ticket.
+    pub dismissed_by: String,
+}

@@ -938,8 +938,8 @@ therefore has to survive a restart, so the daemon records it durably before the 
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **14** |
-| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done` and `rhapsody_breaker_crossings` |
+| `PRAGMA user_version` | 6 | **15** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done`, `rhapsody_review_finding` and `rhapsody_breaker_crossings` |
 | the owed terminal move | — | `rhapsody_review_done` (`identifier`, `pr`, `state`, `attempts`, `next_at`, `gave_up`), one row per ticket |
 | a ticket's breaker crossings | — | `rhapsody_breaker_crossings` (`notified_rounds`, `notified_providers`), keyed by the ticket identifier |
 
@@ -954,7 +954,30 @@ lives on the watcher's off-loop half — and a default installation with `teams.
 unset writes no row and makes no extra tracker read. `divergent_objects_are_gated_by_name_only`
 pins the sixth name.
 
-### A seventh schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
+### A seventh schema table with no Go counterpart — `rhapsody_review_finding` (STUDIO-1008)
+
+A review's verdict used to be only a per-(reviewer, sha) status plus free text, so nothing downstream
+could tell which objection was which, whether it was addressed, or whether a later review was raising
+the same thing again. The reviewer output contract now ends with one machine-readable verdict block
+(fenced, tagged `rhapsody-review-verdict`), and each finding revision it declares is recorded durably:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **15** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done`, `rhapsody_review_finding` and `rhapsody_breaker_crossings` |
+| a reviewer's findings | — | `rhapsody_review_finding`, one row per finding REVISION, keyed by `(pr, generation, reviewer, finding_id, revision)` |
+
+One row per revision, not per finding: a repeat raise increments `revision`, which is what lets the
+reopen rule compare a re-raise against the dismissed revision it follows. A later **approving** review
+by the same reviewer resolves every revision that reviewer has open. A completed `changes` review with
+no parseable block records one synthetic `blocking` finding scoped to that run
+(`<reviewer>:unstructured:<run_id>`), so two unstructured reviews are two distinct findings and one
+dismissal cannot silence a reviewer's later, unrelated objection. `generation` is a documented `0`
+until the manager's next slice introduces the real value. `divergent_objects_are_gated_by_name_only`
+pins the seventh name. **Off is still off:** `storage.path: off` records nothing, and every non-
+ticketless install takes no part of this path.
+
+### An eighth schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
 
 The runaway-loop circuit breaker holds a ticket and notifies the operator when its completed review
 rounds, or its per-ticket spend, crosses a configured limit. It must notify **once per crossing**,
@@ -969,7 +992,7 @@ The controls themselves are Rhapsody-only config, all off when unset: `teams.rev
 `clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
 author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
 `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
-`divergent_objects_are_gated_by_name_only` pins the seventh name.
+`divergent_objects_are_gated_by_name_only` pins the eighth name.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
