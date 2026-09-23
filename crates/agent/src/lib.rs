@@ -45,6 +45,7 @@ pub use humanize::{LogEntry, humanize_stream_line};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rhapsody_core::Issue;
+use rhapsody_provider_broker::BrokerTurnAttempt;
 use tokio::sync::mpsc;
 
 // --- EventType (upstream §10.4) ---------------------------------------------------------------
@@ -249,6 +250,28 @@ pub trait Session: Send + Sync {
         messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
     ) -> (TurnResult, Option<AgentError>);
+
+    /// Runs one BROKERED turn: the worker has already synchronously armed the turn receipt and
+    /// passes the paired move-only [`BrokerTurnAttempt`] here (design §10.2/§10.3). A brokered
+    /// adapter re-probes its command, mints at most one `TurnAccess` from the attempt, generates its
+    /// per-turn capability config/auth, and revokes the access before process-tree teardown.
+    ///
+    /// The DEFAULT is the legacy behavior: it drops any attempt (finalizing the pre-armed receipt as
+    /// `no_capability`) and runs the ordinary [`Session::run_turn`]. That keeps every existing
+    /// backend — and every run with no explicit provider — byte-identical, while a backend that
+    /// materializes a broker session (`crate::opencode`) overrides it. Passing `Some` to a session
+    /// that does not consume it is therefore fail-closed: the capability is never minted.
+    async fn run_turn_brokered(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        broker: Option<BrokerTurnAttempt>,
+    ) -> (TurnResult, Option<AgentError>) {
+        drop(broker);
+        self.run_turn(prompt, attempt, messages, on_event).await
+    }
 
     /// Releases any backend resources held by the session. Per-turn backends (like Claude, which
     /// spawns a fresh process per turn) may implement this as a no-op, since no persistent process

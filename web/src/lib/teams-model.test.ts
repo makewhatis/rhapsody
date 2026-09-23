@@ -142,7 +142,7 @@ describe("toDraft / toConfig", () => {
   const onDisk: TeamsConfig = {
     enabled: true,
     manager: { mode: "labels+model", default_identity: "alice", model: "claude-opus-5", max_tokens: 4000, timeout_ms: 5000 },
-    memory: { backend: "local", path: "", endpoint: "", api_key: "", bank_prefix: "agent-", recall_top_k: 8 },
+    memory: { backend: "local", path: "", endpoint: "", api_key: "", bank_prefix: "agent-", recall_top_k: 8, team_bank: "", team_recall_top_k: 3 },
     quorum: { enabled: false, reviewers: 2 },
     roster: [{ name: "alice", profile: "swe", labels: ["rust", "config"], bank: "", max_concurrent: 0 }],
     prompt_budget_bytes: 16000,
@@ -267,6 +267,8 @@ describe("toDraft / toConfig", () => {
       api_key: "$HINDSIGHT_API_KEY",
       bank_prefix: "team-",
       recall_top_k: 12,
+      team_bank: "",
+      team_recall_top_k: 3,
     });
     expect(saved.prompt_budget_bytes).toBe(20000);
   });

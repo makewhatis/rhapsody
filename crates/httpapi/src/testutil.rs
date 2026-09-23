@@ -800,6 +800,18 @@ impl StateProvider for FakeProvider {
         self.teams()?.recall(identity, query, state).await
     }
 
+    async fn teams_recall_team(
+        &self,
+        query: &str,
+        state: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RecallView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.touch();
+        self.teams()?.recall_team(query, state).await
+    }
+
     async fn teams_invalidate(
         &self,
         identity: &str,
@@ -811,6 +823,18 @@ impl StateProvider for FakeProvider {
     > {
         self.touch();
         self.teams()?.invalidate(identity, fact_id, reason).await
+    }
+
+    async fn teams_invalidate_team(
+        &self,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::InvalidateView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.touch();
+        self.teams()?.invalidate_team(fact_id, reason).await
     }
 
     async fn teams_reinstate(
@@ -825,6 +849,17 @@ impl StateProvider for FakeProvider {
         self.teams()?.reinstate(identity, fact_id).await
     }
 
+    async fn teams_reinstate_team(
+        &self,
+        fact_id: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::ReinstateView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.touch();
+        self.teams()?.reinstate_team(fact_id).await
+    }
+
     async fn teams_retain(
         &self,
         run_id: i64,
@@ -836,6 +871,20 @@ impl StateProvider for FakeProvider {
         self.touch();
         self.teams()?
             .retain_for_run(run_id, content, fixed_instant())
+            .await
+    }
+
+    async fn teams_retain_shared(
+        &self,
+        run_id: i64,
+        content: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RetainView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.touch();
+        self.teams()?
+            .retain_for_run_scoped(run_id, content, true, fixed_instant())
             .await
     }
 
