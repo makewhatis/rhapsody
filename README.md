@@ -2527,7 +2527,11 @@ execute an arbitrary on-disk binary as the same OS user.
   strictly-increasing-sequence state machine both sides drive. It is a normal root-workspace member
   (built with `rhapsodyd`) and ALSO a cross-workspace path dependency of `desktop/src-tauri` — it
   carries no Tauri dependency, so this does not reintroduce the heavy-dependency coupling the root
-  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid.
+  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid. Since STUDIO-983 it also owns the
+  `CredentialOwner` abstraction the daemon and desktop build units both program against (the
+  Connect/Replace/Rebind/Remove compare-and-swap contract and its typed outcomes), the move-only
+  bound-credential lease with no ordinary string accessor, and the broker's size/syntax bounds
+  (re-used from `rhapsody-provider-broker`, not duplicated) that the owner enforces before storage.
 - **A one-shot bootstrap token**, delivered as the ONE frame the desktop writes to the freshly
   spawned daemon child's piped stdin (then never written to again), authenticates the daemon's
   connection to a Unix socket the desktop hosts — never HTTP, and the token never appears in argv,
