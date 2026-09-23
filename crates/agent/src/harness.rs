@@ -107,39 +107,130 @@ pub enum HarnessId {
     Opencode,
 }
 
-/// A non-default model provider/endpoint (design §3's "the multi-provider axis": base URL + auth
-/// kind). No adapter constructs one yet — Claude always uses its own CLI's default auth — so this
-/// is the type slice 4's resolution chain will populate, not yet a live code path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Provider {
-    pub base_url: String,
-    pub auth: ProviderAuth,
+/// A provider protocol a harness adapter can consume. One variant in v1: OpenAI Chat Completions
+/// with Bearer API-key auth — the reviewed adapter `provider-auth-design.md` §3 means by the config
+/// value `openai-compatible`, NOT arbitrary auth headers or fields.
+///
+/// The `as_str`/`adapter_id` pair is a cross-surface contract: `as_str` matches the YAML protocol
+/// name config validates, and `adapter_id` is the identity half of every credential binding. The
+/// agreement with `rhapsody-config`'s constants is pinned by
+/// [`tests::protocol_and_adapter_names_are_pinned_to_the_config_crate`], so a rename on either side
+/// reds a test rather than silently drifting the two crates apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    /// `openai-compatible`: Chat Completions + Bearer API-key auth.
+    OpenAiCompatible,
 }
 
-/// How a [`Provider`] authenticates. `ApiKey` carries the credential itself (design §4.5: the
-/// daemon does not write provider configs, so this is passed through, never stored). `Debug` is
-/// hand-written to redact the key, because `HarnessSpec` derives `Debug` transitively and a future
-/// `tracing::debug!(?spec)` must never write a raw credential to the rotating file logs.
-/// `HarnessKnobs::Claude`'s own `crate::claude::Config` carries a second credential
-/// (`tracker_api_key`, the resolved Linear key) reachable the same way, so its `Debug` is likewise
-/// hand-written rather than derived — both fields are covered, not just this one. This is a new
-/// redacting-`Debug` pattern in the crate, not a repeat of an existing one: the repo's other
-/// secret-bearing type, `crates/orchestrator/src/reads.rs`'s `ReadsTarget`, has no `Debug` impl at
-/// all and masks only at its reporting boundary (`mask_token`) — the convention both share is that a
-/// secret-bearing type never lets the raw value reach a log line, not the specific mechanism.
-#[derive(Clone, PartialEq, Eq)]
-pub enum ProviderAuth {
-    ApiKey(String),
-    None,
-}
+impl ProviderProtocol {
+    /// The config-facing protocol name (`providers.<id>.protocol`).
+    pub const fn as_str(self) -> &'static str {
+        "openai-compatible"
+    }
 
-impl fmt::Debug for ProviderAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ApiKey(_) => f.write_str("ApiKey(***)"),
-            Self::None => f.write_str("None"),
+    /// The reviewed adapter identity, part of the canonical credential binding
+    /// `(provider_id, adapter, base_url)`. Must equal `rhapsody_config`'s
+    /// `ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1`.
+    pub const fn adapter_id(self) -> &'static str {
+        "openai-chat-completions-bearer-v1"
+    }
+
+    /// The protocol for a config-facing name, or `None` when unknown. The one parser; callers must
+    /// not re-spell the values.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "openai-compatible" => Some(Self::OpenAiCompatible),
+            _ => None,
         }
     }
+}
+
+/// The pure, non-secret validated broker limits carried by a [`ResolvedProviderPlan`]
+/// (`provider-broker-design.md` §3.1's `limits`).
+///
+/// The config-side `rhapsody_config::BrokerLimits` is the authoritative definition; this crate must
+/// not depend on `rhapsody-config` at runtime, so the fields are mirrored here and a cross-crate pin
+/// test asserts the defaults agree field-for-field. PB5 lowers a plan's `limits` into the broker's
+/// own `BrokerLimits`/`BrokerRegistrationPlan`; keeping the block on the plan means PB5 needs no
+/// second input and cannot re-derive (or drift from) the config defaults.
+///
+/// A raw reusable key is unrepresentable: every field is a number or `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderLimits {
+    pub forwarded_requests_per_turn: u32,
+    pub denied_requests_before_revocation: u32,
+    pub concurrent_upstream_requests_per_turn: u32,
+    pub json_request_bytes: u64,
+    pub aggregate_request_bytes_per_turn: u64,
+    pub response_bytes_per_request: u64,
+    pub aggregate_response_bytes_per_turn: u64,
+    pub requested_output_tokens_per_request: u64,
+    pub reserved_token_units_per_turn: u64,
+    pub reserved_token_units_per_session: u64,
+    pub capability_lifetime_ms: u64,
+    /// Optional durable UTC-day cap; `None` means no Rhapsody daily cap.
+    pub max_reserved_token_units_per_utc_day: Option<u64>,
+}
+
+impl Default for ProviderLimits {
+    /// The V1 default column (`provider-broker-design.md` §8.1) with no daily cap. Kept identical to
+    /// `rhapsody_config::BrokerLimits::default()` by `provider_limits_agree_with_the_config_crate`.
+    fn default() -> Self {
+        Self {
+            forwarded_requests_per_turn: 64,
+            denied_requests_before_revocation: 16,
+            concurrent_upstream_requests_per_turn: 4,
+            json_request_bytes: 8 * 1024 * 1024,
+            aggregate_request_bytes_per_turn: 32 * 1024 * 1024,
+            response_bytes_per_request: 16 * 1024 * 1024,
+            aggregate_response_bytes_per_turn: 64 * 1024 * 1024,
+            requested_output_tokens_per_request: 32_000,
+            reserved_token_units_per_turn: 1_000_000,
+            reserved_token_units_per_session: 20_000_000,
+            capability_lifetime_ms: 3_600_000,
+            max_reserved_token_units_per_utc_day: None,
+        }
+    }
+}
+
+/// The pure, non-secret result of selecting and normalizing a provider for one dispatch
+/// (`provider-auth-design.md` §3's `ResolvedProviderPlan`; STUDIO-984 owns this shape, PB5 owns
+/// `PreparedProvider`).
+///
+/// **A raw reusable API key is unrepresentable here** — there is no value/token/key field, and none
+/// may be added. The plan carries only stable metadata, the normalized endpoint, the canonical
+/// credential *binding identity*, a credential *source kind*, the validated broker limits, and the
+/// model/provider/origin inputs P4/PB5 need. `credential_binding`/`credential_ref` are non-secret
+/// identifiers: the binding names WHICH credential to read, never the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProviderPlan {
+    /// The canonical operator-chosen provider id (the cross-surface identifier contract).
+    pub stable_id: String,
+    pub protocol: ProviderProtocol,
+    /// The normalized protocol root immediately above `/chat/completions`.
+    pub normalized_endpoint: String,
+    /// Operator policy reaching the plan as policy, never child-controlled input.
+    pub allow_insecure_http: bool,
+    /// The canonical `(provider_id, adapter, base_url)` binding identity. Non-secret; names which
+    /// credential to read. Empty when no binding could be derived.
+    pub credential_binding: String,
+    /// The credential *source kind* (e.g. `keychain`). Never an account and never a value.
+    pub credential_ref: String,
+    /// The validated broker limits PB5 lowers into the broker's registration plan.
+    pub limits: ProviderLimits,
+    /// The exact model selection, preserved for P4/PB5.
+    pub model: String,
+    /// Where each field came from, preserved for P4.
+    pub origins: ProviderOrigins,
+}
+
+/// The origin of each provider-tuple field (which selection tier supplied it),
+/// `provider-auth-design.md` §2.3's `origins` half. Values are surface names (`"ticket"`,
+/// `"profile"`, `"project"`, `"global"`, …), non-secret and for diagnostics/provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderOrigins {
+    pub provider: String,
+    pub model: String,
 }
 
 /// The per-harness opaque knob block (design §4.2: "a normalized core plus an opaque per-harness
@@ -159,18 +250,22 @@ pub enum HarnessKnobs {
 }
 
 /// What was asked for, fully resolved (design §3): the harness, its model, an optional non-default
-/// provider, and its per-harness knobs. Constructed today only at effective-build time (see the
+/// provider plan, and its per-harness knobs. Constructed today only at effective-build time (see the
 /// module doc's "what this slice does not do") from the installation's static config; `model` and
 /// `provider` are `None` at every call site that exists today because Claude's equivalent values
 /// already live inside its own `knobs` block, not because the fields are unused in principle —
 /// slice 4's dispatch-time resolution chain is what will populate them independently of a
 /// per-harness knob block (e.g. a teammate profile naming a model, STUDIO-868, already does this
 /// on `Session` directly, ahead of and independent of this type).
+///
+/// `provider` is a [`ResolvedProviderPlan`] — pure and non-secret. A prepared, move-only provider
+/// (PB5's `PreparedProvider`, carrying an opaque broker session) is what a live dispatch will carry;
+/// this slice deliberately does not add it. A raw reusable key is unrepresentable in both.
 #[derive(Debug, Clone)]
 pub struct HarnessSpec {
     pub harness: HarnessId,
     pub model: Option<String>,
-    pub provider: Option<Provider>,
+    pub provider: Option<ResolvedProviderPlan>,
     pub knobs: HarnessKnobs,
 }
 
@@ -514,40 +609,210 @@ pub fn declared_capabilities(id: HarnessId) -> HarnessCapabilities {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The harness registry (provider-protocol compatibility, single-sourced)
+// ---------------------------------------------------------------------------
+
+/// How a harness materializes a provider credential (`provider-auth-design.md` §3's compatibility
+/// table). A brokered harness receives a per-turn bounded capability over a loopback URL; it NEVER
+/// receives the reusable upstream key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialTransport {
+    /// The CLI's own login (Claude today). No explicit Rhapsody provider in v1.
+    NativeLogin,
+    /// A loopback broker URL plus a per-turn bounded capability (OpenCode in v1).
+    BrokeredLoopback,
+}
+
+/// One harness's declared provider compatibility: which protocols its adapter can consume and how it
+/// materializes credentials. This is the source of truth for provider compatibility
+/// (`provider-auth-design.md` §3: "It is not acceptable to add a second provider compatibility switch
+/// in config"). `rhapsody-config` cannot depend on this crate (layering), so it declares the same
+/// accepted-backend subset in its `PROVIDER_HARNESS_BACKENDS` constant and the cross-crate pin test
+/// [`config_provider_policy_agrees_with_the_harness_registry`] asserts the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessRegistryEntry {
+    pub id: HarnessId,
+    /// The provider protocols this harness's adapter supports. EMPTY means "no explicit Rhapsody
+    /// provider in v1" — the legacy/native-login branch.
+    pub protocols: &'static [ProviderProtocol],
+    pub credential_transport: CredentialTransport,
+}
+
+/// The harness registry, in the design's compatibility-table order. V1 deliberately enables only the
+/// measured OpenCode row: OpenCode may consume `openai-compatible`; Claude has no provider adapter
+/// yet. Goose and Codex are absent because no adapter exists — adding one is a real, reviewed change
+/// to this table (and to every `match` on [`HarnessId`]).
+pub const HARNESS_REGISTRY: &[HarnessRegistryEntry] = &[
+    HarnessRegistryEntry {
+        id: HarnessId::Claude,
+        protocols: &[],
+        credential_transport: CredentialTransport::NativeLogin,
+    },
+    HarnessRegistryEntry {
+        id: HarnessId::Opencode,
+        protocols: &[ProviderProtocol::OpenAiCompatible],
+        credential_transport: CredentialTransport::BrokeredLoopback,
+    },
+];
+
+/// Whether `id`'s adapter can consume `protocol`. Single-sourced from [`HARNESS_REGISTRY`], so a
+/// resolver and a validator cannot disagree.
+pub fn harness_supports_protocol(id: HarnessId, protocol: ProviderProtocol) -> bool {
+    HARNESS_REGISTRY
+        .iter()
+        .any(|e| e.id == id && e.protocols.contains(&protocol))
+}
+
+/// The credential transport for `id`. Falls back to [`CredentialTransport::NativeLogin`] for a
+/// harness with no registry row — the conservative default (an unknown harness gets no brokered
+/// credential). `registry_covers_every_harness_id` pins that every current id HAS a row.
+pub fn credential_transport(id: HarnessId) -> CredentialTransport {
+    HARNESS_REGISTRY
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| e.credential_transport)
+        .unwrap_or(CredentialTransport::NativeLogin)
+}
+
+// ---------------------------------------------------------------------------
+// Brokered OpenCode compatibility (fail-closed, version-gated)
+// ---------------------------------------------------------------------------
+
+/// The supported managed-OpenCode compatibility table. SINGLE-SOURCED from the PB0 probe
+/// (`crate::opencode::probe::SUPPORTED`) so a dispatch-time compatibility check and the probe cannot
+/// disagree. Fail-closed: an unknown or unmeasured version refuses rather than assuming a configured
+/// `opencode` binary honors the pinned controls (`provider-auth-design.md` §3, `provider-broker-design.md`
+/// §9.1).
+pub const SUPPORTED_OPENCODE_VERSIONS: &[crate::opencode::probe::CompatibilityRow] =
+    crate::opencode::probe::SUPPORTED;
+
+/// A typed, pre-credential refusal for a brokered OpenCode control the initial compatibility row
+/// does not accept. These run BEFORE any credential read, because the managed controls and closed
+/// request schema are version-sensitive (`provider-broker-design.md` §9.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokeredOpenCodeRefusal {
+    /// The configured `opencode` version is outside [`SUPPORTED_OPENCODE_VERSIONS`].
+    UnsupportedVersion { found: String },
+    /// `opencode.agent` is neither empty nor the pinned `build` agent.
+    AgentUnsupported { agent: String },
+    /// `opencode.variant` (its reasoning-effort knob) is non-empty.
+    VariantUnsupported { variant: String },
+    /// `opencode.auto_approve` is explicitly `false`; brokered v1 always emits `--auto`.
+    AutoApprovalDisabled,
+    /// `opencode.extra_args` is non-empty; brokered v1 pins the argv rather than maintaining a
+    /// security deny-list over one CLI release's aliases.
+    ExtraArgsUnsupported { count: usize },
+    /// `opencode.command` is not exactly one executable (embedded arguments / shell fragments).
+    CommandHasEmbeddedArgs,
+}
+
+impl fmt::Display for BrokeredOpenCodeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion { found } => write!(
+                f,
+                "opencode version {found:?} is not a supported managed version; refusing before any \
+                 credential read"
+            ),
+            Self::AgentUnsupported { agent } => write!(
+                f,
+                "opencode.agent {agent:?} is unsupported for brokered mode (only \"build\" or empty \
+                 is accepted until fixture-backed)"
+            ),
+            Self::VariantUnsupported { variant } => write!(
+                f,
+                "opencode.variant {variant:?} is unsupported for brokered mode (only empty is \
+                 accepted until fixture-backed)"
+            ),
+            Self::AutoApprovalDisabled => write!(
+                f,
+                "opencode.auto_approve: false is unsupported for brokered mode (brokered turns are \
+                 always unattended)"
+            ),
+            Self::ExtraArgsUnsupported { count } => write!(
+                f,
+                "opencode.extra_args has {count} entries; brokered mode requires an empty extra_args"
+            ),
+            Self::CommandHasEmbeddedArgs => write!(
+                f,
+                "opencode.command must be exactly one executable with no embedded arguments for \
+                 brokered mode"
+            ),
+        }
+    }
+}
+
+/// Resolves the compatibility row for an exact reported OpenCode version, or a typed refusal. A near
+/// miss is not compatibility evidence.
+pub fn brokered_opencode_version_row(
+    version: &str,
+) -> Result<&'static crate::opencode::probe::CompatibilityRow, BrokeredOpenCodeRefusal> {
+    SUPPORTED_OPENCODE_VERSIONS
+        .iter()
+        .find(|row| row.opencode_version == version)
+        .ok_or_else(|| BrokeredOpenCodeRefusal::UnsupportedVersion {
+            found: version.to_string(),
+        })
+}
+
+/// Checks the OpenCode knobs the initial brokered compatibility row accepts
+/// (`provider-broker-design.md` §9.2): only an empty or `build` agent, an empty variant/effort, an
+/// `auto_approve` that is absent or `true`, no `extra_args`, and a `command` that is exactly one
+/// executable. Everything through here is credential-free and must run BEFORE the credential owner
+/// is contacted.
+pub fn check_brokered_opencode_controls(
+    agent: &str,
+    variant: &str,
+    auto_approve: Option<bool>,
+    extra_args: &[String],
+    command: &str,
+) -> Result<(), BrokeredOpenCodeRefusal> {
+    if !command_is_single_executable(command) {
+        return Err(BrokeredOpenCodeRefusal::CommandHasEmbeddedArgs);
+    }
+    if !variant.is_empty() {
+        return Err(BrokeredOpenCodeRefusal::VariantUnsupported {
+            variant: variant.to_string(),
+        });
+    }
+    if !(agent.is_empty() || agent == "build") {
+        return Err(BrokeredOpenCodeRefusal::AgentUnsupported {
+            agent: agent.to_string(),
+        });
+    }
+    if auto_approve == Some(false) {
+        return Err(BrokeredOpenCodeRefusal::AutoApprovalDisabled);
+    }
+    if !extra_args.is_empty() {
+        return Err(BrokeredOpenCodeRefusal::ExtraArgsUnsupported {
+            count: extra_args.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `command` is exactly one executable: non-empty and lacking any whitespace. `env …
+/// opencode`, `npx opencode`, and shell fragments all contain whitespace and are refused; a directly
+/// executable wrapper path is allowed (its version is what the probe gates).
+fn command_is_single_executable(command: &str) -> bool {
+    !command.is_empty() && !command.chars().any(char::is_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A `{:?}` on a `ProviderAuth::ApiKey` must never print the credential it carries — `Debug`
-    // is hand-written specifically to redact it (see the doc comment on `ProviderAuth`), and the
-    // derive that would print it is the mistake this test catches on any regression back to it.
-    #[test]
-    fn provider_auth_debug_redacts_the_api_key() {
-        let secret = ProviderAuth::ApiKey("sk-super-secret-value".to_string());
-        let rendered = format!("{secret:?}");
-        assert!(
-            !rendered.contains("sk-super-secret-value"),
-            "Debug output leaked the raw key: {rendered}"
-        );
-        assert_eq!(rendered, "ApiKey(***)");
-
-        assert_eq!(format!("{:?}", ProviderAuth::None), "None");
-    }
-
-    // A full `HarnessSpec`'s `{:?}` reaches two credentials transitively — `Provider::auth` and
-    // `HarnessKnobs::Claude`'s `tracker_api_key` — and neither must ever appear raw in a
-    // `tracing::debug!(?spec)` line. This is the round-3 review finding: `ProviderAuth`'s own test
-    // above only proves that ONE of the two is redacted in isolation, not that a real, fully
-    // populated spec is safe end to end.
+    // A full `HarnessSpec`'s `{:?}` reaches the one credential still in the type — `HarnessKnobs::
+    // Claude`'s `tracker_api_key` — and it must never appear raw in a `tracing::debug!(?spec)` line.
+    // The provider half of the spec is now a `ResolvedProviderPlan`, which carries no secret at all,
+    // so this test also pins that the plan's Debug output stays non-secret.
     #[test]
     fn harness_spec_debug_redacts_every_credential_it_carries() {
         let spec = HarnessSpec {
-            harness: HarnessId::Claude,
-            model: None,
-            provider: Some(Provider {
-                base_url: "https://example".to_string(),
-                auth: ProviderAuth::ApiKey("sk-provider-secret".to_string()),
-            }),
+            harness: HarnessId::Opencode,
+            model: Some("accounts/fireworks/models/deepseek-v4p1-flash".to_string()),
+            provider: Some(resolved_plan()),
             knobs: HarnessKnobs::Claude(crate::claude::Config {
                 tracker_api_key: "lin-tracker-secret".to_string(),
                 ..Default::default()
@@ -555,13 +820,49 @@ mod tests {
         };
         let rendered = format!("{spec:?}");
         assert!(
-            !rendered.contains("sk-provider-secret"),
-            "Debug output leaked the provider key: {rendered}"
-        );
-        assert!(
             !rendered.contains("lin-tracker-secret"),
             "Debug output leaked the tracker key: {rendered}"
         );
+        // The plan's own Debug shape is pinned so ADDING a field to it — the mutation the ticket
+        // names ("add a secret field to … ResolvedProviderPlan") — changes this string and reds the
+        // test. No secret-bearing field exists today, and this is the tripwire for one appearing.
+        let plan = resolved_plan();
+        assert_eq!(
+            format!("{plan:?}"),
+            "ResolvedProviderPlan { stable_id: \"fireworks\", protocol: OpenAiCompatible, \
+             normalized_endpoint: \"https://api.example/v1\", allow_insecure_http: false, \
+             credential_binding: \"fireworks\\u{1f}openai-chat-completions-bearer-v1\\u{1f}https://api.example/v1\", \
+             credential_ref: \"keychain\", limits: ProviderLimits { forwarded_requests_per_turn: 64, \
+             denied_requests_before_revocation: 16, concurrent_upstream_requests_per_turn: 4, \
+             json_request_bytes: 8388608, aggregate_request_bytes_per_turn: 33554432, \
+             response_bytes_per_request: 16777216, aggregate_response_bytes_per_turn: 67108864, \
+             requested_output_tokens_per_request: 32000, reserved_token_units_per_turn: 1000000, \
+             reserved_token_units_per_session: 20000000, capability_lifetime_ms: 3600000, \
+             max_reserved_token_units_per_utc_day: None }, model: \"m\", \
+             origins: ProviderOrigins { provider: \"global\", model: \"global\" } }",
+            "ResolvedProviderPlan's Debug shape changed; if a field was added, justify it and \
+             confirm it cannot carry a reusable secret"
+        );
+    }
+
+    /// A fully-populated, non-secret resolved provider plan, used by the registry/binding tests.
+    fn resolved_plan() -> ResolvedProviderPlan {
+        ResolvedProviderPlan {
+            stable_id: "fireworks".to_string(),
+            protocol: ProviderProtocol::OpenAiCompatible,
+            normalized_endpoint: "https://api.example/v1".to_string(),
+            allow_insecure_http: false,
+            credential_binding:
+                "fireworks\u{1f}openai-chat-completions-bearer-v1\u{1f}https://api.example/v1"
+                    .to_string(),
+            credential_ref: "keychain".to_string(),
+            limits: ProviderLimits::default(),
+            model: "m".to_string(),
+            origins: ProviderOrigins {
+                provider: "global".to_string(),
+                model: "global".to_string(),
+            },
+        }
     }
 
     /// A fully-capable harness: the baseline every table row starts from, so each row isolates the
@@ -935,5 +1236,288 @@ mod tests {
             s.contains("codex") && s.contains("not implemented"),
             "unknown-harness refusal must name the harness and say it is unimplemented: {s}"
         );
+    }
+
+    // ---- STUDIO-984 harness registry / provider-protocol compatibility ----
+
+    /// Every current `HarnessId` has exactly one registry row, so a reader can never silently get a
+    /// fallback for an implemented harness. Adding a variant without a row reds this.
+    #[test]
+    fn registry_covers_every_harness_id() {
+        for id in [HarnessId::Claude, HarnessId::Opencode] {
+            let rows: Vec<_> = HARNESS_REGISTRY.iter().filter(|e| e.id == id).collect();
+            assert_eq!(rows.len(), 1, "exactly one registry row for {id:?}");
+        }
+    }
+
+    /// The V1 compatibility table, as a table: OpenCode may consume `openai-compatible` via a
+    /// brokered loopback; Claude has no provider protocol and uses native login. A registry that
+    /// claimed Claude could consume a provider would red the first row.
+    #[test]
+    fn registry_protocol_compatibility_matches_the_v1_table() {
+        assert!(
+            !harness_supports_protocol(HarnessId::Claude, ProviderProtocol::OpenAiCompatible),
+            "Claude has no provider adapter in v1"
+        );
+        assert!(harness_supports_protocol(
+            HarnessId::Opencode,
+            ProviderProtocol::OpenAiCompatible
+        ));
+        assert_eq!(
+            credential_transport(HarnessId::Claude),
+            CredentialTransport::NativeLogin
+        );
+        assert_eq!(
+            credential_transport(HarnessId::Opencode),
+            CredentialTransport::BrokeredLoopback
+        );
+    }
+
+    /// The protocol names are a cross-surface contract: `as_str` matches the YAML protocol config
+    /// validates, and `adapter_id` is the binding identity. These literals pin THIS crate's spelling;
+    /// the cross-crate agreement is pinned separately by
+    /// [`protocol_and_adapter_names_are_pinned_to_the_config_crate`].
+    #[test]
+    fn protocol_names_are_the_cross_surface_contract() {
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.as_str(),
+            "openai-compatible"
+        );
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.adapter_id(),
+            "openai-chat-completions-bearer-v1"
+        );
+        assert_eq!(
+            ProviderProtocol::from_name("openai-compatible"),
+            Some(ProviderProtocol::OpenAiCompatible)
+        );
+        assert_eq!(ProviderProtocol::from_name("anthropic-messages"), None);
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review): the agent's protocol name and adapter id must equal the
+    /// config crate's constants, so a rename on EITHER side reds this test. The literals in
+    /// [`protocol_names_are_the_cross_surface_contract`] cannot catch drift — they compare this
+    /// crate's own spelling to itself.
+    #[test]
+    fn protocol_and_adapter_names_are_pinned_to_the_config_crate() {
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.as_str(),
+            rhapsody_config::PROTOCOL_OPENAI_COMPATIBLE
+        );
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.adapter_id(),
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1
+        );
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review, sol): the canonical credential-binding adapter identity
+    /// is ONE value used by config, agent AND broker registration. Comparing agent's literal to
+    /// config's constant was not enough — renaming the broker's `canonical_id` (which is actually
+    /// hashed into the binding fingerprint) left every test green. This compares all three crates.
+    #[test]
+    fn canonical_adapter_identity_agrees_across_config_agent_and_broker() {
+        assert_eq!(
+            ProviderProtocol::OpenAiCompatible.adapter_id(),
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1
+        );
+        assert_eq!(
+            rhapsody_config::ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1,
+            rhapsody_provider_broker::BrokerProtocol::OpenAiChatCompletions.canonical_id(),
+            "the broker hashes this id into its credential binding, so it must be the same value"
+        );
+    }
+
+    /// CROSS-CRATE PIN (STUDIO-984 review, sol): `ResolvedProviderPlan.limits` carries the validated
+    /// V1 default column, not a second, divergent copy. There is no shared type across the layering
+    /// (broker must not depend on config; agent must not depend on config at runtime), so this
+    /// asserts the agent mirror equals config's default field-for-field — changing a default in one
+    /// crate reds it.
+    #[test]
+    fn provider_limits_agree_with_the_config_crate() {
+        let ours = ProviderLimits::default();
+        let theirs = rhapsody_config::BrokerLimits::default();
+        assert_eq!(
+            ours.forwarded_requests_per_turn,
+            theirs.forwarded_requests_per_turn
+        );
+        assert_eq!(
+            ours.denied_requests_before_revocation,
+            theirs.denied_requests_before_revocation
+        );
+        assert_eq!(
+            ours.concurrent_upstream_requests_per_turn,
+            theirs.concurrent_upstream_requests_per_turn
+        );
+        assert_eq!(ours.json_request_bytes, theirs.json_request_bytes);
+        assert_eq!(
+            ours.aggregate_request_bytes_per_turn,
+            theirs.aggregate_request_bytes_per_turn
+        );
+        assert_eq!(
+            ours.response_bytes_per_request,
+            theirs.response_bytes_per_request
+        );
+        assert_eq!(
+            ours.aggregate_response_bytes_per_turn,
+            theirs.aggregate_response_bytes_per_turn
+        );
+        assert_eq!(
+            ours.requested_output_tokens_per_request,
+            theirs.requested_output_tokens_per_request
+        );
+        assert_eq!(
+            ours.reserved_token_units_per_turn,
+            theirs.reserved_token_units_per_turn
+        );
+        assert_eq!(
+            ours.reserved_token_units_per_session,
+            theirs.reserved_token_units_per_session
+        );
+        // Config keeps the lifetime `None` (derived at read time); the plan carries the materialized V1
+        // value. Pin the plan's concrete default to config's derived default on a 1-hour deadline.
+        assert_eq!(
+            ours.capability_lifetime_ms,
+            rhapsody_config::BrokerLimits::default()
+                .effective_capability_lifetime_ms(rhapsody_config::DEFAULT_CAPABILITY_LIFETIME_MS)
+        );
+        assert_eq!(
+            ours.max_reserved_token_units_per_utc_day,
+            theirs.max_reserved_token_units_per_utc_day
+        );
+    }
+
+    /// CROSS-CRATE PIN: config's provider-selection policy agrees with the ONE harness registry. For
+    /// every registered harness, config permits an explicit provider on exactly the backends whose
+    /// registry row can consume `openai-compatible`. Giving Claude a protocol in [`HARNESS_REGISTRY`]
+    /// without teaching `rhapsody-config` reds this test — the drift the design forbids when it says
+    /// there must not be a second compatibility switch in config.
+    #[test]
+    fn config_provider_policy_agrees_with_the_harness_registry() {
+        for entry in HARNESS_REGISTRY {
+            let name = match entry.id {
+                HarnessId::Claude => "claude",
+                HarnessId::Opencode => "opencode",
+            };
+            let config_allows = rhapsody_config::PROVIDER_HARNESS_BACKENDS.contains(&name);
+            let registry_supports = entry
+                .protocols
+                .contains(&ProviderProtocol::OpenAiCompatible);
+            assert_eq!(
+                config_allows, registry_supports,
+                "config's provider policy and HARNESS_REGISTRY disagree for harness {name:?}"
+            );
+        }
+    }
+
+    /// MUTATION GUARD: the supported-version table is fail-closed and single-sourced from the PB0
+    /// probe. An implementation that "assumes any version is fine" cannot resolve an unknown one and
+    /// reds the unknown row.
+    #[test]
+    fn supported_opencode_versions_are_fail_closed_and_single_sourced() {
+        assert_eq!(SUPPORTED_OPENCODE_VERSIONS.len(), 1);
+        let row =
+            brokered_opencode_version_row("1.18.30").expect("the pinned version is supported");
+        assert_eq!(row.adapter_version, "2.0.41");
+        assert_eq!(
+            SUPPORTED_OPENCODE_VERSIONS,
+            crate::opencode::probe::SUPPORTED,
+            "the registry table must BE the probe's table, not an independent copy"
+        );
+        for unknown in ["1.18.31", "9.9.9", ""] {
+            let err = brokered_opencode_version_row(unknown).unwrap_err();
+            assert!(
+                matches!(err, BrokeredOpenCodeRefusal::UnsupportedVersion { .. }),
+                "{unknown:?}: {err:?}"
+            );
+        }
+    }
+
+    /// MUTATION GUARD: the initial brokered compatibility row accepts only the pinned knobs. A check
+    /// that permitted an unknown agent, a variant, `auto_approve: false`, or `extra_args` reds a row
+    /// here, and the refusal is the typed pre-credential one.
+    #[test]
+    fn brokered_opencode_controls_table() {
+        // Accepted shapes.
+        assert!(check_brokered_opencode_controls("", "", None, &[], "opencode").is_ok());
+        assert!(
+            check_brokered_opencode_controls("build", "", Some(true), &[], "/opt/opencode").is_ok()
+        );
+
+        // Refused shapes.
+        assert_eq!(
+            check_brokered_opencode_controls("plan", "", None, &[], "opencode"),
+            Err(BrokeredOpenCodeRefusal::AgentUnsupported {
+                agent: "plan".to_string()
+            })
+        );
+        assert_eq!(
+            check_brokered_opencode_controls("", "high", None, &[], "opencode"),
+            Err(BrokeredOpenCodeRefusal::VariantUnsupported {
+                variant: "high".to_string()
+            })
+        );
+        assert_eq!(
+            check_brokered_opencode_controls("", "", Some(false), &[], "opencode"),
+            Err(BrokeredOpenCodeRefusal::AutoApprovalDisabled)
+        );
+        assert_eq!(
+            check_brokered_opencode_controls(
+                "",
+                "",
+                Some(true),
+                &["--log-level".to_string(), "DEBUG".to_string()],
+                "opencode"
+            ),
+            Err(BrokeredOpenCodeRefusal::ExtraArgsUnsupported { count: 2 })
+        );
+        assert_eq!(
+            check_brokered_opencode_controls("", "", None, &[], "env opencode"),
+            Err(BrokeredOpenCodeRefusal::CommandHasEmbeddedArgs)
+        );
+    }
+
+    /// Each brokered refusal's Display is actionable — it names what was refused and why, so an
+    /// operator can fix it. A generic string would be a regression.
+    #[test]
+    fn brokered_refusal_display_is_actionable() {
+        let cases = [
+            (
+                BrokeredOpenCodeRefusal::UnsupportedVersion {
+                    found: "9.9.9".to_string(),
+                },
+                "9.9.9",
+            ),
+            (
+                BrokeredOpenCodeRefusal::AgentUnsupported {
+                    agent: "plan".to_string(),
+                },
+                "plan",
+            ),
+            (
+                BrokeredOpenCodeRefusal::VariantUnsupported {
+                    variant: "high".to_string(),
+                },
+                "high",
+            ),
+            (
+                BrokeredOpenCodeRefusal::AutoApprovalDisabled,
+                "auto_approve",
+            ),
+            (
+                BrokeredOpenCodeRefusal::ExtraArgsUnsupported { count: 1 },
+                "extra_args",
+            ),
+            (
+                BrokeredOpenCodeRefusal::CommandHasEmbeddedArgs,
+                "embedded arguments",
+            ),
+        ];
+        for (refusal, needle) in cases {
+            let s = refusal.to_string();
+            assert!(
+                s.contains(needle),
+                "refusal {refusal:?} must name {needle:?}: {s}"
+            );
+        }
     }
 }
