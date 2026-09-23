@@ -710,8 +710,10 @@ impl Orchestrator {
                 return;
             }
         };
-        // Unique (ticket, coordinate), preserving the watch set's stable order. A pull request with
-        // several reviewer rows is ONE ticket and must cross once.
+        // Unique by TICKET, preserving the watch set's stable order. A ticket with several
+        // reviewers, or (pathologically) several watched pull requests, is ONE ticket and must
+        // cross once — its persisted row is per ticket, so a second plan in the same pass would
+        // race the first save against a stale `persisted` snapshot.
         let mut seen: Vec<(String, String, String, i64)> = Vec::new();
         for row in &rows {
             let Some(ticket) = crate::reviewdone::origin_ticket(&row.introduced_by) else {
@@ -720,15 +722,15 @@ impl Orchestrator {
             if ticket.is_empty() || labelled.contains(&ticket.to_ascii_lowercase()) {
                 continue; // already held (by a prior crossing or by the operator)
             }
-            let key = (
+            if seen.iter().any(|(t, _, _, _)| t == ticket) {
+                continue;
+            }
+            seen.push((
                 ticket.to_string(),
                 row.key.owner.clone(),
                 row.key.repo.clone(),
                 row.key.number,
-            );
-            if !seen.contains(&key) {
-                seen.push(key);
-            }
+            ));
         }
         for (ticket, owner, repo, number) in seen {
             if let Some(plan) = self.plan_crossing(&ticket, &owner, &repo, number, &persisted) {
