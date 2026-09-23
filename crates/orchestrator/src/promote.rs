@@ -1167,6 +1167,30 @@ mod tests {
             self.0
                 .resolve_review_findings(pr, generation, reviewer, resolved_by)
         }
+        fn save_manager_approval(
+            &self,
+            row: rhapsody_store::ManagerApprovalRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_manager_approval(row)
+        }
+        fn set_manager_approval_state(
+            &self,
+            intervention_id: &str,
+            state: &str,
+        ) -> Result<(), StoreError> {
+            self.0.set_manager_approval_state(intervention_id, state)
+        }
+        fn manager_approval(
+            &self,
+            intervention_id: &str,
+        ) -> Result<Option<rhapsody_store::ManagerApprovalRow>, StoreError> {
+            self.0.manager_approval(intervention_id)
+        }
+        fn load_manager_approvals(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ManagerApprovalRow>, StoreError> {
+            self.0.load_manager_approvals()
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }

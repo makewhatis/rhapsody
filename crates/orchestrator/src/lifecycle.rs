@@ -2972,6 +2972,31 @@ mod tests {
         ) -> Result<(), rhapsody_store::StoreError> {
             self.0.resolve_review_findings(a0, a1, a2, a3)
         }
+        fn save_manager_approval(
+            &self,
+            a0: rhapsody_store::ManagerApprovalRow,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_manager_approval(a0)
+        }
+        fn set_manager_approval_state(
+            &self,
+            a0: &str,
+            a1: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_manager_approval_state(a0, a1)
+        }
+        fn manager_approval(
+            &self,
+            a0: &str,
+        ) -> Result<Option<rhapsody_store::ManagerApprovalRow>, rhapsody_store::StoreError>
+        {
+            self.0.manager_approval(a0)
+        }
+        fn load_manager_approvals(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ManagerApprovalRow>, rhapsody_store::StoreError> {
+            self.0.load_manager_approvals()
+        }
         fn prune(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
             self.0.prune(a0)
         }

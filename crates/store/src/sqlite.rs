@@ -16,14 +16,16 @@
 //! (`rhapsody_breaker_crossings`, STUDIO-1026), step 16 (the review evidence ledger's
 //! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009),
 //! step 17 (`rhapsody_run_provenance`'s
-//! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987) and step 18
+//! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987), step 18
+//! (`rhapsody_manager_approval`, STUDIO-1011) and step 19
 //! (`rhapsody_manager_exchange`, STUDIO-1012) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
 //! ledger, the structured review-finding revisions, the runaway-loop breaker's crossings, the
 //! review evidence ledger's columns, the
-//! provider origin plus broker usage record, and the manager exchange authorizations, none of which the frozen
+//! provider origin plus broker usage record, the manager approval record and the manager exchange
+//! authorizations, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -51,14 +53,15 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 17 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 19 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
 /// review evidence ledger, then the
-/// provider origin + broker usage record) and are
+/// provider origin + broker usage record, then the manager approval record, then the manager
+/// exchange authorizations) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -393,10 +396,34 @@ CREATE TABLE IF NOT EXISTS rhapsody_run_usage (
   unknown_usage_requests   INTEGER NOT NULL DEFAULT 0
 );
 "#,
-    // v17 -> v18: manager EXCHANGE AUTHORIZATIONS (STUDIO-1012, design record
+    // v17 -> v18: the MANAGER APPROVAL RECORD (STUDIO-1011, design record `manager-agent-design.md`
+    // §3.1 and §6.5). Rhapsody-only, so the `rhapsody_` prefix gates it out of the Go-recaptured
+    // schema golden by name exactly as steps 7-17 are.
+    //
+    // A table of its own and NEVER a row in `rhapsody_review_watch`: the manager is never a reviewer,
+    // so an approval stored in the watch set would count toward its own eligibility (§3.1). Its
+    // primary key is the manager intervention, not a (PR, reviewer) pair, which is also what the
+    // pre-merge recheck carries. `covered_reviewers` is newline-joined in one column, exactly as
+    // `rhapsody_review_bound.findings` is — a reviewer identity never contains a newline.
+    // `intervention_id TEXT PRIMARY KEY` on a rowid table gets SQLite's implicit auto-index (whose
+    // `sqlite_master.sql IS NULL`), so no explicit index reaches the golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_manager_approval (
+  intervention_id   TEXT    NOT NULL PRIMARY KEY,
+  pr                TEXT    NOT NULL DEFAULT '',
+  generation        INTEGER NOT NULL DEFAULT 0,
+  head              TEXT    NOT NULL DEFAULT '',
+  patch_id          TEXT    NOT NULL DEFAULT '',
+  evidence_rev      INTEGER NOT NULL DEFAULT 0,
+  covered_reviewers TEXT    NOT NULL DEFAULT '',
+  membership_hash   TEXT    NOT NULL DEFAULT '',
+  state             TEXT    NOT NULL DEFAULT 'pending'
+);
+"#,
+    // v18 -> v19: manager EXCHANGE AUTHORIZATIONS (STUDIO-1012, design record
     // `manager-agent-design.md` §7.8). Rhapsody-only, on a Rhapsody-only table, so the
     // `rhapsody_` prefix gates every column out of the Go-recaptured schema golden by name exactly
-    // as steps 7-17 are.
+    // as steps 7-18 are.
     //
     // One row per authorization the manager's activation transaction (M4) writes: a `review_round`
     // (a re-review of the current head) or an `author_round` (an author dispatch, plus the review
@@ -520,6 +547,30 @@ fn map_review_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding
         status: row.get(13)?,
         resolved_by: row.get(14)?,
         dismissed_by: row.get(15)?,
+    })
+}
+
+/// The `rhapsody_manager_approval` columns, in DDL order — the single shared list for every
+/// approval query, read POSITIONALLY by [`map_manager_approval`] exactly as [`REVIEW_FINDING_COLS`]
+/// is by [`map_review_finding`].
+const MANAGER_APPROVAL_COLS: &str = "intervention_id, pr, generation, head, patch_id, evidence_rev, \
+     covered_reviewers, membership_hash, state";
+
+/// Scan one `rhapsody_manager_approval` row selected with [`MANAGER_APPROVAL_COLS`] (positional, in
+/// DDL order). `covered_reviewers` is the newline-joined TEXT column read back through
+/// [`split_findings`], the same shared join the adjudication ledger uses — a reviewer identity never
+/// contains a newline.
+fn map_manager_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerApprovalRow> {
+    Ok(ManagerApprovalRow {
+        intervention_id: row.get(0)?,
+        pr: row.get(1)?,
+        generation: row.get(2)?,
+        head: row.get(3)?,
+        patch_id: row.get(4)?,
+        evidence_rev: row.get(5)?,
+        covered_reviewers: split_findings(&row.get::<_, String>(6)?),
+        membership_hash: row.get(7)?,
+        state: row.get(8)?,
     })
 }
 
@@ -2514,6 +2565,85 @@ impl Store for Sqlite {
             ],
         )?;
         Ok(())
+    }
+
+    fn save_manager_approval(&self, row: ManagerApprovalRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A whole-row upsert because the control task (the applier and the activation transaction) is
+        // the single writer: the row it last wrote IS authoritative. `covered_reviewers` rides the
+        // shared newline-join the adjudication ledger uses.
+        conn.execute(
+            "INSERT INTO rhapsody_manager_approval
+               (intervention_id, pr, generation, head, patch_id, evidence_rev, covered_reviewers,
+                membership_hash, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(intervention_id) DO UPDATE SET
+               pr                = excluded.pr,
+               generation        = excluded.generation,
+               head              = excluded.head,
+               patch_id          = excluded.patch_id,
+               evidence_rev      = excluded.evidence_rev,
+               covered_reviewers = excluded.covered_reviewers,
+               membership_hash   = excluded.membership_hash,
+               state             = excluded.state",
+            params![
+                row.intervention_id,
+                row.pr,
+                row.generation,
+                row.head,
+                row.patch_id,
+                row.evidence_rev,
+                join_findings(&row.covered_reviewers),
+                row.membership_hash,
+                row.state,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn set_manager_approval_state(
+        &self,
+        intervention_id: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Only `state` moves: the record of what was decided against is preserved through
+        // effective → expired/cancelled, so the audit trail survives the lifecycle.
+        conn.execute(
+            "UPDATE rhapsody_manager_approval SET state = ?2 WHERE intervention_id = ?1",
+            params![intervention_id, state],
+        )?;
+        Ok(())
+    }
+
+    fn manager_approval(
+        &self,
+        intervention_id: &str,
+    ) -> Result<Option<ManagerApprovalRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_APPROVAL_COLS} FROM rhapsody_manager_approval \
+               WHERE intervention_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map(params![intervention_id], map_manager_approval)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_APPROVAL_COLS} FROM rhapsody_manager_approval \
+               ORDER BY intervention_id"
+        ))?;
+        let rows = stmt.query_map([], map_manager_approval)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
@@ -6401,6 +6531,7 @@ mod tests {
                 "rhapsody_review_finding".to_string(),
                 "rhapsody_breaker_crossings".to_string(),
                 "rhapsody_run_usage".to_string(),
+                "rhapsody_manager_approval".to_string(),
                 "rhapsody_manager_exchange".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
@@ -6812,5 +6943,94 @@ mod tests {
             "another reviewer is untouched"
         );
         assert!(bob.resolved_by.is_empty());
+    }
+
+    // --- manager approval record (STUDIO-1011) ------------------------------------------------
+
+    fn approval(id: &str) -> ManagerApprovalRow {
+        ManagerApprovalRow {
+            intervention_id: id.into(),
+            pr: "o/r#1".into(),
+            generation: 2,
+            head: "abc123".into(),
+            patch_id: "pid".into(),
+            evidence_rev: 7,
+            covered_reviewers: vec!["alice".into(), "jimmy".into()],
+            membership_hash: "hash".into(),
+            state: MANAGER_APPROVAL_PENDING.into(),
+        }
+    }
+
+    // The whole row round-trips, `covered_reviewers` included, and the state moves in place without
+    // rewriting what the decision was made against.
+    #[test]
+    fn manager_approval_round_trips_and_moves_state_in_place() {
+        let st = open_mem();
+        st.save_manager_approval(approval("iv-1")).expect("save");
+
+        let got = st.manager_approval("iv-1").expect("read").expect("present");
+        assert_eq!(got, approval("iv-1"));
+        assert_eq!(got.state, MANAGER_APPROVAL_PENDING);
+
+        st.set_manager_approval_state("iv-1", MANAGER_APPROVAL_EFFECTIVE)
+            .expect("activate");
+        let got = st.manager_approval("iv-1").expect("read").expect("present");
+        assert_eq!(got.state, MANAGER_APPROVAL_EFFECTIVE);
+        assert_eq!(
+            got.covered_reviewers,
+            vec!["alice".to_string(), "jimmy".to_string()],
+            "moving the state must not drop what it stands in for"
+        );
+        assert_eq!((got.generation, got.evidence_rev), (2, 7));
+
+        // Setting a state on an intervention with no row is a no-op, not an error.
+        st.set_manager_approval_state("iv-missing", MANAGER_APPROVAL_CANCELLED)
+            .expect("no-op");
+        assert!(st.manager_approval("iv-missing").expect("read").is_none());
+        assert_eq!(st.manager_approval("nobody").expect("read"), None);
+    }
+
+    // The load is ordered by intervention id and returns every row.
+    #[test]
+    fn manager_approvals_load_in_id_order() {
+        let st = open_mem();
+        st.save_manager_approval(approval("iv-b")).expect("save b");
+        st.save_manager_approval(approval("iv-a")).expect("save a");
+        let ids: Vec<String> = st
+            .load_manager_approvals()
+            .expect("load")
+            .into_iter()
+            .map(|r| r.intervention_id)
+            .collect();
+        assert_eq!(ids, vec!["iv-a".to_string(), "iv-b".to_string()]);
+    }
+
+    // ⚠️ **The ticket's self-eligibility guard.** The manager approval lives in its OWN table, so
+    // recording one never puts the manager in the watch set, where it would count toward its own
+    // eligibility. MUTATION: store the approval as a `rhapsody_review_watch` row and this reds.
+    #[test]
+    fn a_manager_approval_is_never_a_watch_row() {
+        let st = open_mem();
+        st.save_manager_approval(approval("iv-1")).expect("save");
+        assert!(
+            st.load_review_watch().expect("watch").is_empty(),
+            "the manager must never have a watch row"
+        );
+        assert!(st.load_live_review_watch().expect("live").is_empty());
+    }
+
+    // A row whose state column is an unrecognised value still round-trips verbatim: the store does
+    // not reinterpret it, so the merge gate's status reader (`managerapproval`) is the one place the
+    // closed set is enforced.
+    #[test]
+    fn an_unknown_approval_state_is_preserved_verbatim() {
+        let st = open_mem();
+        let mut row = approval("iv-1");
+        row.state = "rubber-stamped".into();
+        st.save_manager_approval(row).expect("save");
+        assert_eq!(
+            st.manager_approval("iv-1").expect("read").unwrap().state,
+            "rubber-stamped"
+        );
     }
 }

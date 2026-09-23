@@ -203,6 +203,14 @@ use crate::teams::LoadSnapshot;
 /// rebuilt pull request never inherits a spent budget.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
+/// Whether `manager.review_authority` is `act` (STUDIO-1011; design record §9).
+///
+/// **Always `false` until M6 adds the key**, so no manager approval can ever become `effective`
+/// yet — the design's explicit "treat it as always `off`". It is a named input rather than a
+/// hard-coded `false` inside the recheck so M6 changes exactly one place, and because the pure
+/// rules ([`crate::managerapproval`]) already take it as a parameter and are tested both ways.
+pub(crate) const MANAGER_REVIEW_AUTHORITY_ACT: bool = false;
+
 /// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
 /// that as ordinary back-pressure and calls it stalled (STUDIO-891).
 ///
@@ -3647,6 +3655,83 @@ impl Orchestrator {
         self.request_review_notify(Some(completion));
     }
 
+    /// The §8.3 pre-merge recheck (STUDIO-1011): may a merge that relied on manager approval
+    /// `intervention_id` still be requested, given the plan was made at `(generation,
+    /// evidence_rev)`?
+    ///
+    /// Loop-confined because every input but the stored record is loop-owned state: the pull
+    /// request's CURRENT generation and evidence revision (read back from the durable bound), the
+    /// current-label hold set, and the configured authority. It is a READ — nothing is decided or
+    /// written here — and it fails CLOSED on every uncertainty, because the answer gates an
+    /// irreversible `gh pr merge` on the other side of the seam.
+    ///
+    /// **Nothing is ever effective yet.** [`MANAGER_REVIEW_AUTHORITY_ACT`] is `false` until M6 adds
+    /// `manager.review_authority`, so this always answers `false` today — the design's "treat it as
+    /// always `off`". The machinery is complete so M6 need only make the authority input truthful.
+    pub(crate) fn handle_manager_approval_recheck(
+        &self,
+        intervention_id: &str,
+        generation: i64,
+        evidence_rev: i64,
+    ) -> bool {
+        let approval = match self.store().manager_approval(intervention_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return false, // no record: never assume an approval
+            Err(e) => {
+                tracing::warn!(
+                    intervention_id, err = %e,
+                    "manager approval recheck: the approval record could not be read; not merging"
+                );
+                return false;
+            }
+        };
+        let bound = match self.store().review_bound(&approval.pr) {
+            Ok(Some(bound)) => bound,
+            // No bound row means the pull request's generation and revision are unknown, so neither
+            // half of the plan's binding can be confirmed. Fail closed.
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    pr = %approval.pr, err = %e,
+                    "manager approval recheck: the review bound could not be read; not merging"
+                );
+                return false;
+            }
+        };
+        // Fail closed while the label set has not been read (the same rule every other hold gate
+        // follows), otherwise refuse if any of this pull request's origin tickets wears the hold.
+        let (held, primed) = self.human_holds.labelled_and_primed();
+        let hold_applied = !primed || self.manager_approval_pr_is_held(&approval.pr, &held);
+        crate::managerapproval::approval_still_effective(&crate::managerapproval::RecheckInputs {
+            state: &approval.state,
+            plan_generation: generation,
+            current_generation: bound.generation,
+            plan_evidence_rev: evidence_rev,
+            current_evidence_rev: bound.evidence_rev,
+            hold_applied,
+            authority_act: MANAGER_REVIEW_AUTHORITY_ACT,
+        })
+    }
+
+    /// Whether any live watch row of `pr` names a ticket wearing the `rhapsody:human` hold. Reads
+    /// every live row (a pull request has a handful) rather than the single-PR accessor, because the
+    /// hold is per-TICKET and the ticket is derived from the row's origin. A store failure answers
+    /// `true` — the recheck's caller fails closed on a hold, so an unreadable watch set is one.
+    fn manager_approval_pr_is_held(&self, pr: &str, held: &HashSet<String>) -> bool {
+        let rows = match self.store().load_live_review_watch() {
+            Ok(rows) => rows,
+            Err(_) => return true,
+        };
+        rows.iter()
+            .filter(|row| {
+                churn_key(&PrCoord::new(&row.key.owner, &row.key.repo, row.key.number)) == pr
+            })
+            .any(|row| {
+                crate::reviewdone::origin_ticket(&row.introduced_by)
+                    .is_some_and(|ticket| held.contains(&ticket.to_ascii_lowercase()))
+            })
+    }
+
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
     /// (STUDIO-874), appending the plan to `report` if they do.
     ///
@@ -3717,6 +3802,13 @@ impl Orchestrator {
                     pr: pr.clone(),
                     head: head.to_string(),
                     approved_by,
+                    // No manager approval yet (STUDIO-1011). The record and the verdict's input
+                    // exist, but nothing can be EFFECTIVE until M6 adds `manager.review_authority`
+                    // (the design says to treat it as always `off`), so the activation transaction
+                    // that would carry an approval into a plan has no writer. This is the natural
+                    // seam for M5/M6 to fill: read the pull request's effective approval here and
+                    // pass its `ApprovalScope` to `auto_merge_verdict_with_proof_and_approval`.
+                    manager_approval: None,
                 });
             }
             // At DEBUG, not INFO: on a pull request awaiting review this is the answer on every
@@ -4819,6 +4911,25 @@ mod tests {
             self.0
                 .resolve_review_findings(pr, generation, reviewer, resolved_by)
         }
+        fn save_manager_approval(&self, row: rs::ManagerApprovalRow) -> Result<(), rs::StoreError> {
+            self.0.save_manager_approval(row)
+        }
+        fn set_manager_approval_state(
+            &self,
+            intervention_id: &str,
+            state: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_approval_state(intervention_id, state)
+        }
+        fn manager_approval(
+            &self,
+            intervention_id: &str,
+        ) -> Result<Option<rs::ManagerApprovalRow>, rs::StoreError> {
+            self.0.manager_approval(intervention_id)
+        }
+        fn load_manager_approvals(&self) -> Result<Vec<rs::ManagerApprovalRow>, rs::StoreError> {
+            self.0.load_manager_approvals()
+        }
         fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
             self.0.prune(retention_days)
         }
@@ -5597,6 +5708,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "an approved patch must merge after a merge from main, with no further round"
         );
@@ -6705,6 +6817,7 @@ mod tests {
                 pr: coord(64),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }]
         );
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
@@ -6785,6 +6898,7 @@ mod tests {
                 pr: coord(70),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["alice".to_string()],
+                manager_approval: None,
             }],
             "the surviving approval now clears auto-merge — the stall this ticket closes"
         );
@@ -9944,6 +10058,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "a shipped pull request whose rows are all approved still reaches the merge gate"
         );
@@ -9984,6 +10099,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the ship's approval-at-head holds for the patch it was made against"
         );
@@ -10448,6 +10564,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the escalation's head moved and the new head is approved: auto-merge proceeds"
         );
@@ -10688,6 +10805,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the carried approval merges at the new head without a manager turn"
         );
@@ -14335,5 +14453,49 @@ mod tests {
             watch_row(&guard, 13, "bob").requested_sha.is_empty(),
             "a head the budget can no longer afford must stay un-dispatched, re-considered next tick"
         );
+    }
+
+    // --- manager approval recheck (STUDIO-1011) -------------------------------------------------
+
+    /// The control-task recheck fails CLOSED on every uncertainty, and — until M6 makes
+    /// `manager.review_authority` a real config key — on the authority too: `off` means an approval
+    /// can never be effective, so even a nominally `effective` record with a matching generation and
+    /// evidence revision answers "do not merge".
+    #[tokio::test]
+    async fn the_manager_approval_recheck_fails_closed() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+        store
+            .save_manager_approval(rhapsody_store::ManagerApprovalRow {
+                intervention_id: "iv-1".into(),
+                pr: "o/r#1".into(),
+                generation: 1,
+                head: "sha".into(),
+                patch_id: "pid".into(),
+                evidence_rev: 7,
+                covered_reviewers: vec!["bob".into()],
+                membership_hash: "hash".into(),
+                state: rhapsody_store::MANAGER_APPROVAL_EFFECTIVE.into(),
+            })
+            .expect("seed approval");
+        store.ensure_review_generation("o/r#1").expect("generation");
+        store.set_review_evidence_rev("o/r#1", 7).expect("rev");
+
+        let (o, _) = orch_on(ticketless(&["bob", "carol"]), Arc::clone(&store));
+
+        // No record at all: never assume an approval.
+        assert!(!o.handle_manager_approval_recheck("nobody", 1, 7));
+        // A record whose authority is off is not effective — the M6 gate, pinned here so enabling
+        // the key is the only change needed to switch it on.
+        assert!(
+            !o.handle_manager_approval_recheck("iv-1", 1, 7),
+            "with review_authority off, nothing is ever effective"
+        );
+
+        // A generation / evidence revision that does not match the plan's binding also refuses —
+        // though with authority off the authority gate already refuses first; the pure
+        // `managerapproval` tests exercise the other triggers directly.
+        assert!(!o.handle_manager_approval_recheck("iv-1", 2, 7));
+        assert!(!o.handle_manager_approval_recheck("iv-1", 1, 8));
     }
 }

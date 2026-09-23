@@ -845,3 +845,63 @@ pub struct ReviewFindingRow {
     /// or empty. Written only by a later ticket.
     pub dismissed_by: String,
 }
+
+// --- the manager approval record (STUDIO-1011) -------------------------------------------------
+// Values for rhapsody_manager_approval.state. NOT a Go port: the frozen reference has no review
+// feature and no manager. The set is closed and exhaustive — an approval is always in exactly one
+// of these four states.
+
+/// The approval was decided but has not been activated. It is **never** effective: the design
+/// (§6.5, §7.7) makes a confirmed comment alone insufficient, and nothing may satisfy a reviewer
+/// requirement while a row is pending.
+pub const MANAGER_APPROVAL_PENDING: &str = "pending";
+/// The approval passed the activation transaction and stands in for its `covered_reviewers` at its
+/// `(generation, patch_id)`. The ONLY state that satisfies a row in the merge gate.
+pub const MANAGER_APPROVAL_EFFECTIVE: &str = "effective";
+/// The approval no longer applies — one of §6.5's expiry triggers fired (a changed patch-id or
+/// generation, a changed membership hash, a completed blocking finding, a hold, or authority
+/// leaving `act`). Terminal.
+pub const MANAGER_APPROVAL_EXPIRED: &str = "expired";
+/// The approval was cancelled before it became effective — the intervention ended `superseded` or
+/// `stale` at activation, or a later effect was refused. Terminal.
+pub const MANAGER_APPROVAL_CANCELLED: &str = "cancelled";
+
+/// The manager's approval RECORD for one intervention (STUDIO-1011; design record
+/// `manager-agent-design.md` §6.5). No Go counterpart.
+///
+/// It is deliberately a table of its own and **never** a row in `rhapsody_review_watch`: the
+/// manager is never a reviewer (§3.1), so an approval stored in the watch set would count toward
+/// its own eligibility. The merge gate reads this record beside the watch rows and lets an
+/// `effective` approval satisfy a covered row, without the manager ever appearing as a reviewer.
+///
+/// The row is bound to what the decision was made against — `generation`, `head`, `patch_id` and
+/// `evidence_rev` — and to the reviewer set it stands in for (`covered_reviewers`). `membership_hash`
+/// is the digest of that set at decision time, so an added or dropped reviewer row expires it
+/// without the daemon having to diff two lists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagerApprovalRow {
+    /// The manager intervention this approval belongs to — the primary key, and the id the pre-merge
+    /// recheck carries.
+    pub intervention_id: String,
+    /// `owner/repo#number`, case-folded — the same spelling `ReviewBoundRow::pr` carries.
+    pub pr: String,
+    /// The loop generation the approval was decided in (§5.1).
+    pub generation: i64,
+    /// The head the decision was bound to.
+    pub head: String,
+    /// The patch-id of `head` against the base. A head move that keeps it leaves the approval valid
+    /// (§6.5); a different patch-id expires it.
+    pub patch_id: String,
+    /// The evidence revision the approval was bound to (§5.2). The pre-merge recheck refuses when
+    /// the current revision has moved past it.
+    pub evidence_rev: i64,
+    /// The live reviewer rows — not approved at the current patch — that this approval stands in
+    /// for. Newline-joined in one column, exactly as `ReviewAdjudication::findings` is; a reviewer
+    /// identity never contains a newline.
+    pub covered_reviewers: Vec<String>,
+    /// A digest of the live reviewer-row set at decision time (§6.5). Any reviewer row added or
+    /// dropped changes it, which expires the approval.
+    pub membership_hash: String,
+    /// One of the four `MANAGER_APPROVAL_*` values above.
+    pub state: String,
+}
