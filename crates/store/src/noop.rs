@@ -238,6 +238,20 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    // STUDIO-1007: with persistence off there is nowhere to remember an owed terminal move, so the
+    // daemon keeps the pre-STUDIO-1007 behaviour — a refused auto-Done move is simply lost, and the
+    // ticket stays in review. Exactly the `summon_watermark`/`review_bound` stance above: a no-op
+    // store is a store, not a second policy.
+    fn save_review_done(&self, _row: ReviewDoneRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn clear_review_done(&self, _identifier: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn load_review_done(&self) -> Result<Vec<ReviewDoneRow>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {
         Ok(())
     }
