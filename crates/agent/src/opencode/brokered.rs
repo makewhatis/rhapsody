@@ -57,10 +57,11 @@ const PROVIDER_ID_CHARS: usize = 22;
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Bound on a generated config/auth blob before spawn, so a serialization failure cannot fall back
-/// to another auth source (`§9.2`).
-pub const MAX_GENERATED_JSON_BYTES: usize = 256 * 1024;
+/// to another auth source (`§9.2`). Kept under Linux's `MAX_ARG_STRLEN` (128 KiB per environment
+/// string) so a large generated value cannot make `execve` fail.
+pub const MAX_GENERATED_JSON_BYTES: usize = 64 * 1024;
 /// Bound on the complete child environment before `execve`, same rationale.
-pub const MAX_ENV_BYTES: usize = 1024 * 1024;
+pub const MAX_ENV_BYTES: usize = 512 * 1024;
 
 /// The marker substituted for the exact turn capability in child output.
 pub const CAPABILITY_MARKER: &[u8] = b"[redacted-capability]";
@@ -264,7 +265,9 @@ pub fn build_brokered_args(
 
 /// One brokered turn's generated values, plus the private directories they point at. It performs the
 /// pre-spawn size checks and knows how to restate the authoritative environment.
-#[derive(Debug)]
+///
+/// `Debug` is manual and redacting: the auth content carries the turn capability, so a `{:?}` here
+/// must never print it.
 pub struct BrokeredMaterial {
     config_content: String,
     auth_content: String,
@@ -356,7 +359,11 @@ pub fn broker_authority(base_url: &str) -> Option<&str> {
 /// is a proper prefix of one of its secrets — the same technique `rhapsody-provider-broker`'s own
 /// response redactor uses, reimplemented here because the agent crate deliberately links only the
 /// broker's protocol-neutral core, not its HTTP-backed `loopback` feature.
-#[derive(Debug)]
+///
+/// It assumes no secret is a strict prefix of another. That holds for the values it is given (a
+/// 43-character random capability, the `http://…` base URL, and its `host:port` authority, none of
+/// which prefixes another); a caller with prefix-related secrets would need the longest-match rule
+/// tightened. `Debug` is manual and redacting.
 pub struct CapabilityRedactor {
     entries: Vec<(Vec<u8>, &'static [u8])>,
     pending: Vec<u8>,
@@ -445,6 +452,26 @@ impl CapabilityRedactor {
             .iter()
             .find(|(secret, _)| rest.len() >= secret.len() && rest[..secret.len()] == secret[..])
             .map(|(secret, _)| secret.len())
+    }
+}
+
+impl fmt::Debug for BrokeredMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrokeredMaterial")
+            .field("config_content_len", &self.config_content.len())
+            .field("auth_content", &"<redacted capability config>")
+            .field("config_dir", &self.config_dir)
+            .field("xdg_data_home", &self.xdg_data_home)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CapabilityRedactor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapabilityRedactor")
+            .field("secrets", &self.entries.len())
+            .field("pending", &self.pending.len())
+            .finish()
     }
 }
 
@@ -537,6 +564,22 @@ mod tests {
             v.pointer(&format!("/provider/{}/options/baseURL", id.as_str()))
                 .and_then(Value::as_str),
             Some("http://127.0.0.1:9/v1")
+        );
+        // The selected model is the ONLY model declared on the provider, keyed by its exact id — a
+        // `json!` object key that stringified the identifier would name the model "model".
+        assert_eq!(
+            v.pointer(&format!(
+                "/provider/{}/models/accounts~1models~1x/name",
+                id.as_str()
+            ))
+            .and_then(Value::as_str),
+            Some("accounts/models/x")
+        );
+        assert_eq!(
+            v.pointer(&format!("/provider/{}/models", id.as_str()))
+                .and_then(Value::as_object)
+                .map(serde_json::Map::len),
+            Some(1)
         );
         // Every native model-calling agent pinned to the internal provider/model.
         for agent in PINNED_MODEL_AGENTS {
@@ -733,6 +776,31 @@ mod tests {
         let chunks: Vec<&[u8]> = b"xrhp-secrety".chunks(1).collect();
         let out = redact(("rhp-secret", "http://127.0.0.1:9/v1"), &chunks);
         assert_eq!(out, b"x[redacted-capability]y");
+    }
+
+    #[test]
+    fn material_and_redactor_debug_do_not_leak_the_capability() {
+        let id = pid("rhapsody-AAAAAAAAAAAAAAAAAAAAAA");
+        let material = BrokeredMaterial::build(
+            &id,
+            "m",
+            "http://127.0.0.1:9/v1",
+            "rhp-super-secret-capability",
+            PathBuf::from("/c"),
+            PathBuf::from("/x"),
+            None,
+        )
+        .expect("material");
+        let rendered = format!("{material:?}");
+        assert!(
+            !rendered.contains("rhp-super-secret-capability"),
+            "{rendered}"
+        );
+
+        let mut redactor =
+            CapabilityRedactor::new("rhp-super-secret-capability", "http://127.0.0.1:9/v1");
+        let _ = redactor.push(b"rhp-sup");
+        assert!(!format!("{redactor:?}").contains("rhp-sup"));
     }
 
     #[test]
