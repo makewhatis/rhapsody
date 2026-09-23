@@ -20,6 +20,7 @@ use rhapsody_desktop::provider_commands::{
     ProviderCommandError, ProviderCommandService, ProviderOperation, ProviderStatusDto,
     TestConnectionDto, authorize_invocation,
 };
+use rhapsody_desktop::supervisor;
 use rhapsody_desktop::toolcheck::ToolResult;
 use rhapsody_desktop::update::{self, UpdateState};
 use rhapsody_desktop::version::{self, VersionDto};
@@ -179,13 +180,17 @@ fn authorize(window: &tauri::WebviewWindow) -> Result<(), CommandFailure> {
 }
 
 /// The daemon observation a commit folds into its sync verdict: whether the supervised daemon is
-/// Running, and the newest revision it has been served for this provider's account.
-async fn daemon_observation(
+/// Running, and the newest revision it has been served for this provider's account. Reads the
+/// supervisor's raw state rather than `App::status()` — the sync verdict only needs Running/not, and
+/// `status()` performs live health/agent-count HTTP probes a mutation must not wait on.
+fn daemon_observation(
     app: &App,
     state: &ProviderCommandState,
     provider_id: &str,
 ) -> DaemonObservation {
-    let running = app.status().await.state == "running";
+    let running = app
+        .get_sup()
+        .is_some_and(|sup| sup.status().state == supervisor::State::Running);
     let observed_revision = CredentialRef::for_provider(provider_id)
         .ok()
         .and_then(|reference| state.observations.observed(reference.account()));
@@ -194,7 +199,6 @@ async fn daemon_observation(
         observed_revision,
     }
 }
-
 /// Every configured provider's non-secret credential status.
 #[tauri::command]
 async fn provider_statuses(
@@ -250,7 +254,7 @@ async fn commit_command(
     secret: Option<String>,
 ) -> Result<MutationResultDto, CommandFailure> {
     authorize(window)?;
-    let daemon = daemon_observation(app, state, &provider_id).await;
+    let daemon = daemon_observation(app, state, &provider_id);
     state
         .service
         .commit(&provider_id, operation, &nonce, secret, daemon)
