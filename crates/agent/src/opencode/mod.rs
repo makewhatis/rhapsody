@@ -54,6 +54,7 @@
 //! trade is real.
 
 pub mod args;
+pub mod brokered;
 pub mod mcpinject;
 pub mod parse;
 pub mod probe;
@@ -61,10 +62,16 @@ pub mod runner;
 pub mod state;
 
 pub use args::{Config, auto_approve_enabled, build_args};
-pub use mcpinject::{INJECTED_CONFIG_NAME, SERVER_KEY, inject_daemon_mcp, rewrite_tool_names};
+pub use brokered::{
+    BrokeredMaterial, CapabilityRedactor, InternalProviderId, MAX_ENV_BYTES,
+    MAX_GENERATED_JSON_BYTES, build_brokered_args, generate_auth_json, generate_config_json,
+};
+pub use mcpinject::{
+    INJECTED_CONFIG_NAME, SERVER_KEY, daemon_mcp_server, inject_daemon_mcp, rewrite_tool_names,
+};
 pub use parse::{Classified, Failure, add_usage, classify};
 pub use probe::{CompatibilityRow, ProbeError, SUPPORTED, parse_probe_output, probe, resolve_row};
-pub use runner::Runner;
+pub use runner::{Runner, start_brokered_session};
 pub use state::RunState;
 
 /// A RAII scratch directory for this module's tests.

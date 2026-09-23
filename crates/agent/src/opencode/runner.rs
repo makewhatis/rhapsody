@@ -40,6 +40,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use rhapsody_core::Issue;
+use rhapsody_provider_broker::BrokerTurnAttempt;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -49,10 +50,17 @@ use crate::claude::{TRACKER_ENV_VARS, append_me_env, append_review_env, scrub_en
 use crate::harness::{
     EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
     StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
+    check_brokered_opencode_controls,
 };
 use crate::opencode::args::{Config, build_args};
-use crate::opencode::mcpinject::{inject_daemon_mcp, rewrite_tool_names};
+use crate::opencode::brokered::{
+    BrokeredMaterial, CapabilityRedactor, InternalProviderId, build_brokered_args,
+};
+use crate::opencode::mcpinject::{
+    SERVER_KEY, daemon_mcp_server, inject_daemon_mcp, rewrite_tool_names,
+};
 use crate::opencode::parse::{Failure, add_usage, classify};
+use crate::opencode::probe;
 use crate::opencode::state::RunState;
 use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
@@ -95,6 +103,179 @@ impl Runner {
         }
         Runner { cfg }
     }
+
+    /// The brokered preparation sequence (see [`start_brokered_session`]). Every refusal here is
+    /// typed and happens before a credential could be read: brokered mode never reads one, and the
+    /// version probe is credential-free.
+    fn start_brokered(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        if self.cfg.model.is_empty() {
+            return Err(AgentError::Other(
+                "opencode_model_missing: brokered mode requires an exact selected model"
+                    .to_string(),
+            ));
+        }
+        // The brokered compatibility row refuses unsupported agent/variant/approval knobs, a
+        // non-empty extra_args, and a command that is not exactly one executable — all BEFORE any
+        // probe or credential contact (`§9.2`).
+        check_brokered_opencode_controls(
+            &self.cfg.agent,
+            &self.cfg.variant,
+            self.cfg.auto_approve,
+            &self.cfg.extra_args,
+            &self.cfg.command,
+        )
+        .map_err(|e| AgentError::Other(format!("unsupported_brokered_opencode: {e}")))?;
+
+        // A brokered command is exactly one executable; `split_command` must therefore yield no
+        // embedded base arguments. Checked (not asserted) so the invariant is a typed refusal even
+        // if the compatibility check above ever drifts.
+        let (name, base_args) = split_command(&self.cfg.command)?;
+        if !base_args.is_empty() {
+            return Err(AgentError::Other(
+                "unsupported_brokered_opencode: command must be exactly one executable".to_string(),
+            ));
+        }
+
+        // The exact supported version is probed before anything is provisioned (`§9.1`). Unknown,
+        // unparseable, or unreachable versions refuse with their own typed reason.
+        probe::probe(&self.cfg.command)
+            .map_err(|e| AgentError::Other(format!("{}: {}", e.reason(), e.message())))?;
+
+        // A credential-FREE private state directory: no auth.json is created or copied.
+        let state = RunState::provision_brokered(
+            &self.cfg.state_root,
+            &issue.identifier,
+            &self.cfg.workspace_root,
+        )?;
+        let provider_id = InternalProviderId::generate()?;
+
+        Ok(Box::new(OpencodeSession {
+            cfg: self.cfg.clone(),
+            cmd_name: name,
+            cmd_args: base_args,
+            ws_path: workspace_path.to_string(),
+            issue,
+            state,
+            config_path: String::new(),
+            brokered: Some(BrokeredParams {
+                provider_id,
+                model: self.cfg.model.clone(),
+                command: self.cfg.command.clone(),
+            }),
+            session_id: Mutex::new(String::new()),
+            turn_n: AtomicI64::new(0),
+            transcript: Mutex::new(transcript),
+            transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
+            poisoned: AtomicBool::new(false),
+        }))
+    }
+}
+
+/// One brokered session's non-secret, per-session invariants (PB6): the internal provider id stable
+/// for this session, the resolved exact model, and the trusted single-executable command whose
+/// version is re-probed before every turn.
+struct BrokeredParams {
+    provider_id: InternalProviderId,
+    model: String,
+    command: String,
+}
+
+/// Holds one turn's live [`TurnAccess`] and pins its revocation ordering. Declared AFTER the turn's
+/// `KillTreeOnDrop`, so a cancelled turn drops this first: the capability is revoked before
+/// process-tree teardown can block. The explicit [`BrokerTurnGuard::finish`]/[`BrokerTurnGuard::revoke`]
+/// calls pin the same ordering on the normal path.
+struct BrokerTurnGuard {
+    access: Option<rhapsody_provider_broker::TurnAccess>,
+}
+
+impl BrokerTurnGuard {
+    /// Declare normal completion. The following drop finalizes the receipt as `completed`.
+    fn finish(&mut self) {
+        if let Some(access) = self.access.take() {
+            access.finish();
+        }
+    }
+
+    /// Revoke the capability now (turn error, timeout, or Stop) rather than waiting for drop.
+    fn revoke(&mut self) {
+        drop(self.access.take());
+    }
+}
+
+impl Drop for BrokerTurnGuard {
+    fn drop(&mut self) {
+        // A guard dropped without an explicit finish/revoke (a cancelled future) still revokes.
+        self.revoke();
+    }
+}
+
+/// One turn's teardown, owning its capability guard and its process-tree guard. Its [`Drop`]
+/// delegates to [`teardown_turn`], which revokes the capability BEFORE the process-tree kill can
+/// block (`§9.4`) — a property pinned by a unit test, not by the field declaration order a comment
+/// used to describe (the old code's two `let` bindings could be reordered with every test green).
+struct TurnTeardown {
+    access: BrokerTurnGuard,
+    tree: KillTreeOnDrop,
+}
+
+impl TurnTeardown {
+    /// Declare normal completion. The following drop finalizes the receipt as `completed`.
+    fn finish(&mut self) {
+        self.access.finish();
+    }
+
+    /// Revoke the capability now (turn error, timeout, or Stop) rather than waiting for drop.
+    fn revoke(&mut self) {
+        self.access.revoke();
+    }
+
+    /// Stand the process-tree kill down once the child has been reaped (the normal path).
+    fn disarm_tree(&mut self) {
+        self.tree.disarm();
+    }
+}
+
+impl Drop for TurnTeardown {
+    fn drop(&mut self) {
+        // Take both guards out and run them through the one ordering function, so the
+        // revoke-then-kill order is a tested property rather than an implicit field-drop order.
+        let access = std::mem::replace(&mut self.access, BrokerTurnGuard { access: None });
+        let tree = std::mem::replace(&mut self.tree, KillTreeOnDrop::new(0));
+        teardown_turn(|| drop(access), || drop(tree));
+    }
+}
+
+/// Runs the two teardown actions in the pinned order (`§9.4`): revoke the turn capability FIRST,
+/// then tear down the process tree. [`KillTreeOnDrop`]'s kill shells out to `ps` and can block for
+/// the sweep's whole bounded budget; a capability left live across that window is replayable. Kept a
+/// pure function so a unit test can pin the order with two recording closures — swapping the two
+/// lines reds the test and flips the production order, because [`TurnTeardown::drop`] delegates here.
+fn teardown_turn(revoke: impl FnOnce(), kill_tree: impl FnOnce()) {
+    revoke();
+    kill_tree();
+}
+
+/// Prepares a BROKERED OpenCode session (STUDIO-1001 / PB6).
+///
+/// Fail-closed ordering, all before any credential contact: unsupported brokered knobs refuse, then
+/// the exact supported OpenCode version is probed, then a credential-free private state directory
+/// (no `auth.json`) is provisioned and the per-session internal provider id is minted. The returned
+/// session consumes a per-turn `BrokerTurnAttempt` through [`Session::run_turn_brokered`].
+pub async fn start_brokered_session(
+    cfg: Config,
+    workspace_path: &str,
+    issue: Issue,
+    transcript: Option<Transcript>,
+) -> Result<Box<dyn Session>, AgentError> {
+    Runner::new(cfg).start_brokered(workspace_path, issue, transcript)
 }
 
 /// opencode's declared capabilities, each matching what this file actually does and what the
@@ -155,7 +336,7 @@ impl crate::Runner for Runner {
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError> {
         let (name, base_args) = split_command(&self.cfg.command)?;
-        let state = RunState::provision(
+        let state = RunState::provision_legacy(
             &self.cfg.state_root,
             &self.cfg.auth_source,
             &issue.identifier,
@@ -192,6 +373,7 @@ impl crate::Runner for Runner {
             issue,
             state,
             config_path,
+            brokered: None,
             session_id: Mutex::new(String::new()),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
@@ -199,6 +381,7 @@ impl crate::Runner for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            poisoned: AtomicBool::new(false),
         }))
     }
 }
@@ -214,6 +397,10 @@ struct OpencodeSession {
     state: RunState,
     /// The injected `OPENCODE_CONFIG` path; empty when nothing was injected.
     config_path: String,
+    /// `Some` for a brokered session (PB6), `None` for the legacy native-login path. An explicit
+    /// provider selects brokered mode; a legacy run always selects legacy — the two never infer
+    /// their behavior from an empty path (`§9.1`).
+    brokered: Option<BrokeredParams>,
     /// opencode's `ses_…` id, captured from the first line that carries one.
     session_id: Mutex<String>,
     turn_n: AtomicI64,
@@ -222,6 +409,9 @@ struct OpencodeSession {
     run_id: AtomicI64,
     review_head: Mutex<String>,
     model_override: Mutex<crate::ModelOverride>,
+    /// Set when a re-probe between turns finds the command changed: the already prepared session is
+    /// dropped (its state removed) and every later turn refuses before minting or spawning (`§9.1`).
+    poisoned: AtomicBool,
 }
 
 impl OpencodeSession {
@@ -351,8 +541,38 @@ impl Session for OpencodeSession {
         &self,
         prompt: &str,
         attempt: Option<i64>,
+        messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+    ) -> (TurnResult, Option<AgentError>) {
+        self.run_turn_inner(prompt, attempt, messages, on_event, None)
+            .await
+    }
+
+    /// A brokered turn: see [`Session::run_turn_brokered`]. A brokered session requires its
+    /// per-turn attempt — a missing one refuses rather than silently running an unbrokered child.
+    async fn run_turn_brokered(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        broker: Option<BrokerTurnAttempt>,
+    ) -> (TurnResult, Option<AgentError>) {
+        self.run_turn_inner(prompt, attempt, messages, on_event, broker)
+            .await
+    }
+}
+
+impl OpencodeSession {
+    /// The one turn implementation both trait entry points delegate to. `broker` is `Some` only for
+    /// a brokered turn; a legacy session's entry point passes `None`.
+    async fn run_turn_inner(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
         mut messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
+        broker: Option<BrokerTurnAttempt>,
     ) -> (TurnResult, Option<AgentError>) {
         // The same containment invariant the claude runner enforces before every exec (§9.5): the
         // workspace must be inside the root and equal to the cwd.
@@ -380,8 +600,117 @@ impl Session for OpencodeSession {
         // prompts name tools literally, including the one that ends the run.
         let prompt = rewrite_tool_names(prompt);
         let cfg = self.turn_cfg();
-        let mut args = self.cmd_args.clone();
-        args.extend(build_args(&cfg, &self.ws_path, &resume, &prompt));
+
+        // Resolve the brokered inputs for THIS turn. A brokered session without its per-turn attempt
+        // refuses; a legacy session drops any attempt (fail-closed: the capability is never minted).
+        let brokered = match (self.brokered.as_ref(), broker) {
+            (Some(params), Some(attempt)) => Some((params, attempt)),
+            (Some(_), None) => {
+                return (
+                    failed(Usage::default()),
+                    Some(AgentError::Other(
+                        "opencode_broker_attempt_missing: a brokered session requires a per-turn \
+                         broker attempt"
+                            .to_string(),
+                    )),
+                );
+            }
+            (None, attempt) => {
+                drop(attempt);
+                None
+            }
+        };
+
+        // The live turn's capability, held until after the loop so its `finish`/drop ordering is
+        // explicit, and the two per-stream redactors (`§9.4`). A redactor is applied to raw child
+        // chunks BEFORE parsing, transcript teeing, event extraction, or error construction.
+        let mut brokered_access: Option<rhapsody_provider_broker::TurnAccess> = None;
+        let mut stdout_redactor: Option<CapabilityRedactor> = None;
+        let mut stderr_redactor: Option<CapabilityRedactor> = None;
+        let mut brokered_material: Option<BrokeredMaterial> = None;
+
+        let args = if let Some((params, attempt)) = brokered {
+            if self.poisoned.load(Ordering::SeqCst) {
+                return (
+                    failed(Usage::default()),
+                    Some(AgentError::Other(
+                        "opencode_command_changed: the prepared opencode session was dropped"
+                            .to_string(),
+                    )),
+                );
+            }
+            // ⚠️ Re-probe BEFORE minting. A command changed after preparation fails this turn with no
+            // new capability and no child, and the already prepared session is dropped (`§9.1`).
+            if let Err(e) = probe::probe(&params.command) {
+                self.poisoned.store(true, Ordering::SeqCst);
+                self.state.cleanup();
+                on_event(Event {
+                    event_type: EVENT_STARTUP_FAILED.to_string(),
+                    timestamp: Some(Utc::now()),
+                    message: e.message(),
+                    ..Default::default()
+                });
+                return (
+                    failed(Usage::default()),
+                    Some(AgentError::Other(format!(
+                        "{}: {}",
+                        e.reason(),
+                        e.message()
+                    ))),
+                );
+            }
+            let access = match attempt.mint_access() {
+                Ok(access) => access,
+                Err(e) => {
+                    return (
+                        failed(Usage::default()),
+                        Some(AgentError::Other(format!(
+                            "opencode_broker_mint_failed: {e}"
+                        ))),
+                    );
+                }
+            };
+            let base_url = access.base_url.clone();
+            let capability = access.api_key.expose_for_child(str::to_owned);
+            let mcp = if self.cfg.inject_mcp {
+                Some(serde_json::json!({
+                    SERVER_KEY: daemon_mcp_server(&self.cfg.daemon_bin, &self.cfg.workflow_path),
+                }))
+            } else {
+                None
+            };
+            let material = match BrokeredMaterial::build(
+                &params.provider_id,
+                &params.model,
+                &base_url,
+                &capability,
+                self.state.config_dir(),
+                self.state.xdg_data_home().to_path_buf(),
+                mcp,
+            ) {
+                Ok(material) => material,
+                Err(e) => {
+                    // Dropping the access revokes the capability before any child exists.
+                    drop(access);
+                    return (failed(Usage::default()), Some(e));
+                }
+            };
+            stdout_redactor = Some(CapabilityRedactor::new(&capability, &base_url));
+            stderr_redactor = Some(CapabilityRedactor::new(&capability, &base_url));
+            brokered_access = Some(access);
+            brokered_material = Some(material);
+            build_brokered_args(
+                &self.ws_path,
+                &resume,
+                &prompt,
+                &params.provider_id,
+                &params.model,
+            )
+        } else {
+            let mut args = self.cmd_args.clone();
+            args.extend(build_args(&cfg, &self.ws_path, &resume, &prompt));
+            args
+        };
 
         let mut cmd = Command::new(&self.cmd_name);
         cmd.args(&args);
@@ -403,19 +732,33 @@ impl Session for OpencodeSession {
             &self.issue.identifier,
             self.run_id.load(Ordering::SeqCst),
         );
-        let mut env = append_review_env(env, &self.locked_review_head());
-        // ⚠️ The isolation that stops concurrent turns being LOST (see `super::state`). Pushed AFTER
-        // the scrub so it cannot be filtered out, and set unconditionally so an operator's own
-        // XDG_DATA_HOME is overridden rather than merged with.
-        env.retain(|kv| !kv.starts_with("XDG_DATA_HOME="));
-        env.push(format!(
-            "XDG_DATA_HOME={}",
-            self.state.xdg_data_home().to_string_lossy()
-        ));
-        if !self.config_path.is_empty() {
-            env.retain(|kv| !kv.starts_with("OPENCODE_CONFIG="));
-            env.push(format!("OPENCODE_CONFIG={}", self.config_path));
-        }
+        let env = append_review_env(env, &self.locked_review_head());
+        let env = if let Some(material) = brokered_material.as_ref() {
+            // ⚠️ Brokered mode strips every inherited OPENCODE_*/XDG_DATA_HOME BEFORE appending the
+            // authoritative managed allow-list (`§9.2`), and size-checks the result before spawn.
+            match material.apply_env(env) {
+                Ok(env) => env,
+                Err(e) => {
+                    drop(brokered_access.take());
+                    return (failed(Usage::default()), Some(e));
+                }
+            }
+        } else {
+            let mut env = env;
+            // ⚠️ The isolation that stops concurrent turns being LOST (see `super::state`). Pushed
+            // AFTER the scrub so it cannot be filtered out, and set unconditionally so an operator's
+            // own XDG_DATA_HOME is overridden rather than merged with.
+            env.retain(|kv| !kv.starts_with("XDG_DATA_HOME="));
+            env.push(format!(
+                "XDG_DATA_HOME={}",
+                self.state.xdg_data_home().to_string_lossy()
+            ));
+            if !self.config_path.is_empty() {
+                env.retain(|kv| !kv.starts_with("OPENCODE_CONFIG="));
+                env.push(format!("OPENCODE_CONFIG={}", self.config_path));
+            }
+            env
+        };
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -463,7 +806,16 @@ impl Session for OpencodeSession {
         // held-open stdin is claude's mailbox, not this harness's contract.
         drop(stdin);
 
-        let mut tree_kill = KillTreeOnDrop::new(pid);
+        // ⚠️ §9.4 ordering: one composite owns both guards and revokes the capability BEFORE the
+        // process-tree kill can block (see [`TurnTeardown`]). Before this point the access lives in
+        // `brokered_access`; there is no await between its mint and this construction, so a
+        // cancelled future can only drop it here or later, through this composite.
+        let mut teardown = TurnTeardown {
+            access: BrokerTurnGuard {
+                access: brokered_access.take(),
+            },
+            tree: KillTreeOnDrop::new(pid),
+        };
 
         let mut usage = Usage::default();
         let mut result_text = String::new();
@@ -500,6 +852,91 @@ impl Session for OpencodeSession {
         let deadline = tokio::time::sleep_until(Instant::now() + cfg.turn_timeout);
         tokio::pin!(deadline);
 
+        // Extracted so it can run both on every stdout chunk AND once more after the redactor's
+        // `finish()` flushes its retained prefix on EOF. A macro (not a closure) so it can mutate
+        // the captured turn accumulators directly.
+        macro_rules! scan_stdout_lines {
+            () => {{
+                let mut abort = false;
+                loop {
+                    let Some(pos) = acc.iter().position(|&b| b == b'\n') else {
+                        if acc.len() > MAX_STDOUT_LINE {
+                            scan_err = Some("token too long".to_string());
+                            abort = true;
+                        }
+                        break;
+                    };
+                    let mut line: Vec<u8> = acc.drain(..=pos).collect();
+                    line.pop();
+                    if line.len() > MAX_STDOUT_LINE {
+                        scan_err = Some("token too long".to_string());
+                        abort = true;
+                        break;
+                    }
+                    self.tee_stdout(&line);
+                    let c = classify(&line);
+                    // Every line carries the session id and there is no announcement line, so seed
+                    // from whichever arrives first — on the measured captures that is a
+                    // `step_start`, which is not surfaced as an event at all.
+                    if !c.session_id.is_empty() {
+                        let mut sid = self.locked_session_id();
+                        if sid.is_empty() {
+                            *sid = c.session_id.clone();
+                        }
+                    }
+                    // Synthesize the session event opencode never emits (design §6.1's
+                    // `SessionEstablished`, once per process).
+                    if !session_announced && !c.session_id.is_empty() {
+                        session_announced = true;
+                        on_event(Event {
+                            event_type: EVENT_SESSION_STARTED.to_string(),
+                            timestamp: Some(Utc::now()),
+                            pid: pid as i64,
+                            message: c.session_id.clone(),
+                            ..Default::default()
+                        });
+                    }
+                    if let Some(step) = c.step_usage {
+                        // Per-STEP: summed, never replaced (see `super::parse`).
+                        add_usage(&mut usage, &step);
+                    }
+                    let mut ev = c.event.clone();
+                    ev.pid = pid as i64;
+                    // ⚠️ A usage-bearing NOTIFICATION must carry the RUNNING TURN TOTAL, not this
+                    // step's own figures. The orchestrator's live estimate is LAST-WINS, not
+                    // additive (`agentupdate.rs`: "the assistant message.usage is
+                    // CUMULATIVE-within-the-turn, so the LATEST snapshot already IS the current turn
+                    // total"). Claude satisfies that because its per-message usage really is
+                    // cumulative; opencode's `step_finish.tokens` is PER STEP and resets every step,
+                    // so passing it through unchanged would make the dashboard's live token count
+                    // jump DOWN at each step boundary and finish reporting one step instead of the
+                    // turn. Substituting the accumulator restores the contract the consumer
+                    // documents.
+                    if c.step_usage.is_some() {
+                        ev.usage = Some(usage);
+                    }
+                    if !c.text.is_empty() {
+                        result_text = c.text.clone();
+                    }
+                    if let Some(f) = c.failure.clone() {
+                        // First error wins: later ones are consequences of it, so the `surfaced`
+                        // flag tracks THAT line's emit (just below).
+                        if failure.is_none() {
+                            failure = Some(f);
+                            failure_surfaced = c.ok;
+                        }
+                    }
+                    if c.ok {
+                        on_event(ev);
+                    }
+                    if c.terminal {
+                        terminal_seen = true;
+                    }
+                }
+                abort
+            }};
+        }
+
         'outer: loop {
             tokio::select! {
                 _ = &mut deadline => {
@@ -509,84 +946,29 @@ impl Session for OpencodeSession {
                 }
                 r = stdout.read(&mut out_chunk) => {
                     match r {
-                        Ok(0) => break 'outer, // EOF — the terminal condition for this harness
+                        Ok(0) => {
+                            // ⚠️ EOF: flush the redactor's retained prefix FIRST, so a capability
+                            // split across the final read boundary is still redacted before the last
+                            // line is parsed or teed (`§9.4`).
+                            if let Some(redactor) = stdout_redactor.as_mut() {
+                                let tail = redactor.finish();
+                                acc.extend_from_slice(&tail);
+                            }
+                            if scan_stdout_lines!() {
+                                break 'outer;
+                            }
+                            break 'outer; // EOF — the terminal condition for this harness
+                        }
                         Ok(n) => {
-                            acc.extend_from_slice(&out_chunk[..n]);
-                            loop {
-                                let Some(pos) = acc.iter().position(|&b| b == b'\n') else {
-                                    if acc.len() > MAX_STDOUT_LINE {
-                                        scan_err = Some("token too long".to_string());
-                                        break 'outer;
-                                    }
-                                    break;
-                                };
-                                let mut line: Vec<u8> = acc.drain(..=pos).collect();
-                                line.pop();
-                                if line.len() > MAX_STDOUT_LINE {
-                                    scan_err = Some("token too long".to_string());
-                                    break 'outer;
-                                }
-                                self.tee_stdout(&line);
-                                let c = classify(&line);
-                                // Every line carries the session id and there is no announcement
-                                // line, so seed from whichever arrives first — on the measured
-                                // captures that is a `step_start`, which is not surfaced as an
-                                // event at all.
-                                if !c.session_id.is_empty() {
-                                    let mut sid = self.locked_session_id();
-                                    if sid.is_empty() {
-                                        *sid = c.session_id.clone();
-                                    }
-                                }
-                                // Synthesize the session event opencode never emits (design §6.1's
-                                // `SessionEstablished`, once per process).
-                                if !session_announced && !c.session_id.is_empty() {
-                                    session_announced = true;
-                                    on_event(Event {
-                                        event_type: EVENT_SESSION_STARTED.to_string(),
-                                        timestamp: Some(Utc::now()),
-                                        pid: pid as i64,
-                                        message: c.session_id.clone(),
-                                        ..Default::default()
-                                    });
-                                }
-                                if let Some(step) = c.step_usage {
-                                    // Per-STEP: summed, never replaced (see `super::parse`).
-                                    add_usage(&mut usage, &step);
-                                }
-                                let mut ev = c.event.clone();
-                                ev.pid = pid as i64;
-                                // ⚠️ A usage-bearing NOTIFICATION must carry the RUNNING TURN TOTAL,
-                                // not this step's own figures. The orchestrator's live estimate is
-                                // LAST-WINS, not additive (`agentupdate.rs`: "the assistant
-                                // message.usage is CUMULATIVE-within-the-turn, so the LATEST
-                                // snapshot already IS the current turn total"). Claude satisfies
-                                // that because its per-message usage really is cumulative; opencode's
-                                // `step_finish.tokens` is PER STEP and resets every step, so passing
-                                // it through unchanged would make the dashboard's live token count
-                                // jump DOWN at each step boundary and finish reporting one step
-                                // instead of the turn. Substituting the accumulator restores the
-                                // contract the consumer documents.
-                                if c.step_usage.is_some() {
-                                    ev.usage = Some(usage);
-                                }
-                                if !c.text.is_empty() {
-                                    result_text = c.text.clone();
-                                }
-                                if let Some(f) = c.failure.clone() {
-                                    // First error wins: later ones are consequences of it, so the
-                                    // `surfaced` flag tracks THAT line's emit (just below).
-                                    if failure.is_none() {
-                                        failure = Some(f);
-                                        failure_surfaced = c.ok;
-                                    }
-                                }
-                                if c.ok {
-                                    on_event(ev);
-                                }
-                                if c.terminal {
-                                    terminal_seen = true;
-                                }
+                            // Redact the raw chunk before it can reach the line accumulator,
+                            // transcript, or classifier.
+                            let redacted = match stdout_redactor.as_mut() {
+                                Some(redactor) => redactor.push(&out_chunk[..n]),
+                                None => out_chunk[..n].to_vec(),
+                            };
+                            acc.extend_from_slice(&redacted);
+                            if scan_stdout_lines!() {
+                                break 'outer;
                             }
                         }
                         Err(e) => {
@@ -597,10 +979,21 @@ impl Session for OpencodeSession {
                 }
                 r = stderr.read(&mut err_chunk), if stderr_open => {
                     match r {
-                        Ok(0) => stderr_open = false,
+                        Ok(0) => {
+                            if let Some(redactor) = stderr_redactor.as_mut() {
+                                let tail = redactor.finish();
+                                stderr_buf.write(&tail);
+                                self.tee_stderr(&tail);
+                            }
+                            stderr_open = false;
+                        }
                         Ok(n) => {
-                            stderr_buf.write(&err_chunk[..n]);
-                            self.tee_stderr(&err_chunk[..n]);
+                            let redacted = match stderr_redactor.as_mut() {
+                                Some(redactor) => redactor.push(&err_chunk[..n]),
+                                None => err_chunk[..n].to_vec(),
+                            };
+                            stderr_buf.write(&redacted);
+                            self.tee_stderr(&redacted);
                         }
                         Err(_) => stderr_open = false,
                     }
@@ -625,6 +1018,16 @@ impl Session for OpencodeSession {
             }
         }
 
+        // ⚠️ §9.4 ordering: declare normal completion (or revoke) for the turn capability BEFORE
+        // process-tree teardown can block. `finish` marks a clean turn; dropping without it revokes
+        // the grant and records the turn as revoked. Either way no capability remains valid between
+        // outer turns.
+        if terminal_seen && failure.is_none() {
+            teardown.finish();
+        } else {
+            teardown.revoke();
+        }
+
         let drain_out = async {
             let mut buf = [0u8; 4096];
             while let Ok(n) = stdout.read(&mut buf).await {
@@ -640,16 +1043,26 @@ impl Session for OpencodeSession {
                     match stderr.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            stderr_buf.write(&buf[..n]);
-                            self.tee_stderr(&buf[..n]);
+                            // Redact the post-loop drain too: it reaches the error buffer.
+                            let redacted = match stderr_redactor.as_mut() {
+                                Some(redactor) => redactor.push(&buf[..n]),
+                                None => buf[..n].to_vec(),
+                            };
+                            stderr_buf.write(&redacted);
+                            self.tee_stderr(&redacted);
                         }
                     }
+                }
+                if let Some(redactor) = stderr_redactor.as_mut() {
+                    let tail = redactor.finish();
+                    stderr_buf.write(&tail);
+                    self.tee_stderr(&tail);
                 }
             }
         };
         tokio::join!(drain_out, drain_err);
         let wait_res = child.wait().await;
-        tree_kill.disarm();
+        teardown.disarm_tree();
 
         if dropped_messages > 0 {
             tracing::warn!(
@@ -1713,5 +2126,24 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         // stdin: ClosedAtStart is the measured difference from claude; the runner test
         // `the_prompt_is_a_positional_...` asserts the child observes it closed.
         assert_eq!(caps.stdin, StdinPolicy::ClosedAtStart);
+    }
+
+    // ⚠️ §9.4 mutation target: the turn must revoke its capability BEFORE the process-tree kill can
+    // block. The production `TurnTeardown::drop` delegates to `teardown_turn`, so swapping the two
+    // calls there — the exact reordering that used to leave every test green — reds this.
+    #[test]
+    fn teardown_revokes_the_capability_before_it_kills_the_process_tree() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let revoke_sink = Arc::clone(&log);
+        let kill_sink = Arc::clone(&log);
+        teardown_turn(
+            || revoke_sink.lock().expect("log").push("revoke"),
+            || kill_sink.lock().expect("log").push("kill-tree"),
+        );
+        assert_eq!(
+            *log.lock().expect("log"),
+            vec!["revoke", "kill-tree"],
+            "the turn capability must be revoked before the process-tree kill can block"
+        );
     }
 }
