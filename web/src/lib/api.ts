@@ -86,6 +86,24 @@ export interface StateResponse {
   // surfaced by the reconciliation sweep). Read the ticket half as
   // `state.budget_held?.filter((h) => h.pr === "")`.
   budget_held?: BudgetHeld[];
+  // Pending desktop notifications for the runaway-loop breaker (STUDIO-1026), or ABSENT when there
+  // are none. Optional for `drain`'s reason: emitted only while the macOS channel has something
+  // queued, so a daemon with no `notify.macos` serves the Go-identical payload. Read it as
+  // `state.notifications ?? []`. `useNotifications` turns each new one into a native notification.
+  notifications?: NotificationEntry[];
+}
+
+// NotificationEntry is one row of /api/v1/state's `notifications` key (STUDIO-1026): a crossing the
+// breaker held a ticket for, queued for the desktop host to show natively. `id` is monotonic per
+// daemon PROCESS, so the desktop de-dupes on `at` + `id` (the pair stays stable across a poll but
+// changes across a daemon restart, when the id counter resets).
+export interface NotificationEntry {
+  id: number;
+  at: string; // RFC3339
+  title: string;
+  body: string;
+  ticket: string;
+  pr: string; // the coordinate `owner/repo#n`, empty for a ticket with no PR
 }
 
 // HeldForHuman is one row of /api/v1/state's `held_for_human` key (STUDIO-949): a ticket the

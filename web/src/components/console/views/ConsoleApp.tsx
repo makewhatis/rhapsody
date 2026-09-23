@@ -13,6 +13,7 @@ import { hasOverlayTitlebar, onNavigate, onShuttingDown } from "@/lib/bindings";
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useIssueRuns } from "@/hooks/useHistory";
+import { useNotifications } from "@/hooks/useNotifications";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { useUpdater, type Updater } from "@/hooks/useUpdater";
@@ -70,6 +71,10 @@ export function ConsoleApp() {
   // binding it calls is a no-op, so the daemon-served dashboard mounts it inert.
   const updater = useUpdater();
   const [shuttingDown, setShuttingDown] = useState(false);
+  // The runaway-loop breaker's native notifications (STUDIO-1026). Mounted by the shell so it rides
+  // every route, not just Jobs: a crossing can land while the operator is in Settings. Inert in a
+  // plain browser (no Tauri bridge), so the daemon-served dashboard is untouched.
+  useNotifications();
   // The desktop window's chrome (STUDIO-701). A property of the HOST, not of state: under macOS
   // `titleBarStyle: "Overlay"` there is no system title bar to move the window by and the native
   // traffic lights float over the top-left of the web content, so whichever surface is mounted

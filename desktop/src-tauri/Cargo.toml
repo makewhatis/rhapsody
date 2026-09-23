@@ -33,6 +33,14 @@ tauri-plugin-process = "2"
 # pinned to the same major as `tauri`; the `dialog:allow-open` permission is granted in
 # capabilities/default.json (a Tauri v2 gotcha — without it the dialog IPC is silently denied).
 tauri-plugin-dialog = "2"
+# tauri-plugin-notification (STUDIO-1026): the native macOS notification behind `notify.macos`.
+# The daemon's runaway-loop breaker queues a notification on `/api/v1/state`; the webview reads the
+# `notifications` key and calls this plugin's `sendNotification` (bindings.ts `notifyNative`), so the
+# operator sees the hold without watching the console. Tauri-official 2.x plugin, pinned to the same
+# major as `tauri`; the three `notification:allow-*` grants it needs (permission-granted,
+# request-permission, notify) live in capabilities/default.json (the same allowlist gotcha as
+# `dialog:allow-open` — without them the IPC is silently denied).
+tauri-plugin-notification = "2"
 # rhapsody-credential-ipc (STUDIO-981/P0c): the shared wire types + bootstrap-token/session state
 # machine for the authenticated desktop-to-daemon provider-credential channel. A path dependency
 # reaching into the root workspace's `crates/` tree (this crate's own workspace deliberately
