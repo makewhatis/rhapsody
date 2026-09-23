@@ -132,6 +132,26 @@ impl Store for Noop {
     ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
         Ok(std::collections::HashMap::new())
     }
+    // Structured review findings (STUDIO-1008): a store that holds nothing has no finding revisions,
+    // so every write is a silent success and every read is empty — the guard-free contract above.
+    fn save_review_finding(&self, _row: ReviewFindingRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn load_review_findings(&self, _pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn open_blocking_findings(&self, _pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn resolve_review_findings(
+        &self,
+        _pr: &str,
+        _generation: i64,
+        _reviewer: &str,
+        _resolved_by: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }

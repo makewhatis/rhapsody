@@ -40,6 +40,7 @@ use crate::effective::{Effective, ResolvedProject};
 use crate::orchestrator::{
     Orchestrator, RetryEntry, RunningEntry, find_by_id, find_by_identifier, normalize_attempt,
 };
+use crate::reviewfindings::ReviewVerdictBlock;
 
 /// A fired retry timer for one issue (Go `evRetry`). The control loop (O7) delivers it to
 /// [`Orchestrator::on_retry`]; O5's tests construct it directly.
@@ -65,6 +66,12 @@ pub struct EvWorkerExit {
     /// True when the agent's final result text ended with a `HANDOFF:` line. A clean exit into a
     /// non-terminal, non-active state records `completed` only when declared, else `stopped`. (INF-272)
     pub declared_handoff: bool,
+    /// The structured `rhapsody-review-verdict` block a REVIEW run emitted, when one parsed
+    /// (STUDIO-1008). `None` on every non-review run and on any review whose block is absent,
+    /// ambiguous or unparseable — the unstructured fallback the review exit records. Parsed in the
+    /// worker, where the agent's final text is still in hand; the exit path never re-reads a
+    /// transcript.
+    pub review_verdict: Option<ReviewVerdictBlock>,
     /// True when the exit is a TYPED CAPABILITY REFUSAL decided before any session was spawned
     /// (STUDIO-978): the resolved harness cannot honor a correctness requirement, or it is not
     /// implemented by this build. A refusal is terminal — the profile's harness name and the
@@ -1586,6 +1593,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Review".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
 
@@ -1770,6 +1778,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: state.into(),
                 declared_handoff: false,
+                review_verdict: None,
                 refused: false,
             });
             let runs = store_handle
@@ -1879,6 +1888,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
         assert!(
@@ -1913,6 +1923,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
         assert_eq!(
@@ -1935,6 +1946,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
         assert_eq!(
@@ -1956,6 +1968,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
@@ -1991,6 +2004,7 @@ mod tests {
                 .into(),
             last_state: "Todo".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: true,
         });
 
@@ -2028,6 +2042,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
         assert!(
@@ -2085,6 +2100,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "Done".into(),
             declared_handoff: true,
+            review_verdict: None,
             refused: false,
         });
 
@@ -2115,6 +2131,7 @@ mod tests {
             err_msg: String::new(),
             last_state: String::new(),
             declared_handoff: true,
+            review_verdict: None,
             refused: false,
         });
 
@@ -2142,6 +2159,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "Done".into(),
             declared_handoff: true,
+            review_verdict: None,
             refused: false,
         });
 
@@ -2174,6 +2192,7 @@ mod tests {
             err_msg: String::new(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
 
@@ -2204,6 +2223,7 @@ mod tests {
             err_msg: "boom".into(),
             last_state: "In Progress".into(),
             declared_handoff: false,
+            review_verdict: None,
             refused: false,
         });
 

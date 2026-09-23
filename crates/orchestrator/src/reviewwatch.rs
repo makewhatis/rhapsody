@@ -4045,6 +4045,31 @@ mod tests {
         fn load_review_done(&self) -> Result<Vec<rs::ReviewDoneRow>, rs::StoreError> {
             self.0.load_review_done()
         }
+        fn save_review_finding(&self, row: rs::ReviewFindingRow) -> Result<(), rs::StoreError> {
+            self.0.save_review_finding(row)
+        }
+        fn load_review_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rs::ReviewFindingRow>, rs::StoreError> {
+            self.0.load_review_findings(pr)
+        }
+        fn open_blocking_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rs::ReviewFindingRow>, rs::StoreError> {
+            self.0.open_blocking_findings(pr)
+        }
+        fn resolve_review_findings(
+            &self,
+            pr: &str,
+            generation: i64,
+            reviewer: &str,
+            resolved_by: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0
+                .resolve_review_findings(pr, generation, reviewer, resolved_by)
+        }
         fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
             self.0.prune(retention_days)
         }
@@ -7715,6 +7740,7 @@ mod tests {
                 last_state: String::new(),
                 // The max_turns backstop, not a declared hand-off.
                 declared_handoff: false,
+                review_verdict: None,
                 refused: false,
             },
         );
@@ -7773,6 +7799,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
                 declared_handoff: true,
+                review_verdict: None,
                 refused: false,
             },
         );
