@@ -144,7 +144,11 @@ pub struct RecallView {
     /// Which bank this answer came from: `identity` (the default, and what every
     /// pre-STUDIO-1040 caller gets) or `team` for the shared bank. It is echoed so
     /// a reader can tell the two apart when the `identity` field carries a bank
-    /// name rather than a teammate.
+    /// name rather than a teammate — and **omitted when it is `identity`**, the
+    /// only case where it says nothing a reader does not already know, so a
+    /// personal recall's JSON is byte-identical to before this field existed (the
+    /// "no extra API field" half of the off guarantee).
+    #[serde(skip_serializing_if = "is_identity_scope")]
     pub scope: String,
     /// Which states this answer was allowed to contain: `valid` (the default and
     /// what an agent asks for), `invalidated`, or `all` (STUDIO-689). Echoed
@@ -999,6 +1003,13 @@ impl TeamsMemory {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether a recall's `scope` names an identity's own bank (STUDIO-1040). The
+/// `RecallView` field skips serializing on this, so a personal recall's JSON has
+/// no `scope` key at all and matches a build from before the shared bank existed.
+fn is_identity_scope(scope: &str) -> bool {
+    scope == "identity"
 }
 
 /// The configured manager mode's name, for the overview view — the `teams.yaml` wire spelling,

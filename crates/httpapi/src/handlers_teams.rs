@@ -1400,6 +1400,75 @@ mod tests {
         );
     }
 
+    /// A memory runtime with a SHARED team bank configured (STUDIO-1040), so the
+    /// `scope=team` recall path is reachable.
+    fn teams_memory_with_team_bank(dir: &TempDir) -> Arc<TeamsMemory> {
+        let mut teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: vec!["rust".to_string()],
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        teams.memory.team_bank = "agent-team".to_string();
+        let bank = LocalBank::new(dir.0.join(DEFAULT_BANKS_SUBDIR), "agent-");
+        Arc::new(TeamsMemory::new(Arc::new(teams), Arc::new(bank)))
+    }
+
+    /// **The off-state guarantee for the recall RESPONSE** (STUDIO-1040): a personal recall's JSON
+    /// carries no `scope` key, so it is byte-identical to a build from before the shared bank
+    /// existed. The field appears only when the answer came from the shared bank — which is the only
+    /// case where it says something the reader cannot already infer.
+    #[tokio::test]
+    async fn a_personal_recall_response_has_no_scope_field() {
+        let dir = TempDir::new();
+        let mem = teams_memory_with_team_bank(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn_with(Arc::clone(&mem)).await;
+        post(
+            &format!("{url}/api/v1/runs/7/retain"),
+            r#"{"content":"the mirror lock is per-repo"}"#,
+        )
+        .await;
+        post(
+            &format!("{url}/api/v1/runs/7/retain"),
+            r#"{"content":"goldens are recaptured only","shared":true}"#,
+        )
+        .await;
+
+        let own = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/recall?identity=alice&query="))
+                .await
+                .expect("GET own recall"),
+        )
+        .await;
+        assert!(
+            own.get("scope").is_none(),
+            "a personal recall must add no field: {own}"
+        );
+        assert_eq!(own["identity"], "alice", "{own}");
+
+        let team = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/recall?scope=team&query="))
+                .await
+                .expect("GET team recall"),
+        )
+        .await;
+        assert_eq!(team["scope"], "team", "{team}");
+        assert_eq!(team["identity"], "agent-team", "{team}");
+        assert_eq!(team["facts"][0]["identity"], "alice", "{team}");
+    }
+
     // ── the room's read side (STUDIO-650, T5) ──────────────────────────────────────────────────
 
     /// The endpoint serves the room's newest posts, oldest first, with the host-stamped `from` and
