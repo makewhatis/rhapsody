@@ -75,9 +75,18 @@ export function WorkflowRowGlyph(props: Glyph) {
   );
 }
 
-/** The Settings "Storage" row badge. */
-export function StorageRowGlyph(props: Glyph) {
+/** The Settings "Providers" row badge (STUDIO-992): a key over a pluggable endpoint. */
+export function ProvidersRowGlyph(props: Glyph) {
   return (
+    <Stroke strokeWidth={1.5} {...props}>
+      <circle cx="5.5" cy="8" r="2.5" />
+      <path d="M8 8h6M12 8v2.2M10 8v1.6" />
+    </Stroke>
+  );
+}
+
+/** The Settings "Storage" row badge. */
+export function StorageRowGlyph(props: Glyph) {  return (
     <Stroke strokeWidth={1.5} {...props}>
       <path d="M2 4h12v8H2zM2 7h12" />
     </Stroke>

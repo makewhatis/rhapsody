@@ -1,0 +1,228 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { GlobalConfigDTO, ProviderCatalogDTO, ProviderConfigDTO } from "@/lib/api";
+import { toUiGlobal } from "@/lib/settings-model";
+
+const h = vi.hoisted(() => ({
+  hasProviderBridge: vi.fn(() => false),
+  providerStatuses: vi.fn(),
+  fetchProviderStatuses: vi.fn(),
+  fetchProviderCatalog: vi.fn(),
+  refreshProviderCatalog: vi.fn(),
+}));
+
+vi.mock("@/lib/provider-credentials", async (orig) => {
+  const actual = await orig<typeof import("@/lib/provider-credentials")>();
+  return {
+    ...actual,
+    hasProviderBridge: h.hasProviderBridge,
+    providerStatuses: h.providerStatuses,
+  };
+});
+
+vi.mock("@/lib/api", async (orig) => {
+  const actual = await orig<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    fetchProviderStatuses: h.fetchProviderStatuses,
+    fetchProviderCatalog: h.fetchProviderCatalog,
+    refreshProviderCatalog: h.refreshProviderCatalog,
+  };
+});
+
+import { ProvidersTab } from "@/components/settings/ProvidersTab";
+
+const PROVIDER: ProviderConfigDTO = {
+  id: "fireworks",
+  protocol: "openai-compatible",
+  display_name: "Fireworks",
+  base_url: "https://api.fireworks.ai/inference/v1",
+  allow_insecure_http: false,
+  credential: { source: "keychain" },
+};
+
+function makeGlobal(): GlobalConfigDTO {
+  return {
+    tracker: { kind: "linear", endpoint: "e", api_key_set: true },
+    polling: { interval_ms: 30000 },
+    agent: {
+      backend: "opencode",
+      max_concurrent_agents: 8,
+      max_turns: 20,
+      max_retry_backoff_ms: 300000,
+      provider: "fireworks",
+      model: "accounts/fireworks/models/x",
+    },
+    claude: {
+      command: "claude",
+      model: "claude-sonnet-4-6",
+      effort: "high",
+      permission_mode: "acceptEdits",
+      billing_guard: true,
+      ultracode: false,
+      turn_timeout_ms: 120000,
+      read_timeout_ms: 0,
+      stall_timeout_ms: 0,
+      mcp_config: "",
+    },
+    workspace: { root: "/ws" },
+    storage: { path: "/db", retention_days: 30 },
+    otel: { enabled: false, endpoint: "", protocol: "grpc", service_name: "s", insecure: false },
+    mcp: { enabled: true, allow_send_message: true, allow_stop: false, allow_resume: false },
+    server: { port: 4317 },
+    logging: { dir: "/logs" },
+    repo: "",
+    active_states: [],
+    terminal_states: [],
+    canceled_states: [],
+    review_states: null,
+    review_promote_state: "",
+    summon_token: "",
+    github_summons: false,
+    milestone: "",
+    labels: [],
+    capabilities: [],
+    prompt: "",
+    prompt_file: "",
+    git_flow: "",
+    workspace_mode: "",
+    dependency_mode: "",
+    claim_mode: "",
+    providers: { fireworks: PROVIDER },
+  };
+}
+
+const CATALOG: ProviderCatalogDTO = {
+  provider_id: "fireworks",
+  models: [{ id: "accounts/fireworks/models/suggested" }],
+  truncated: false,
+  cache_age_ms: 1000,
+  manual_entry_allowed: true,
+};
+
+function renderTab(onChange = vi.fn()) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return {
+    onChange,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <ProvidersTab value={toUiGlobal(makeGlobal())} onChange={onChange} />
+      </QueryClientProvider>,
+    ),
+  };
+}
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  h.hasProviderBridge.mockReturnValue(false);
+});
+
+beforeEach(() => {
+  h.fetchProviderStatuses.mockResolvedValue([
+    { provider_id: "fireworks", status: "configured", cache_age_ms: 42, refreshing: false, broker_available: true, recovery: null },
+  ]);
+  h.fetchProviderCatalog.mockResolvedValue(CATALOG);
+});
+
+describe("ProvidersTab", () => {
+  // MUTATION GUARD: in a plain browser (no Tauri bridge) the tab must NOT render any credential
+  // action. A UI that rendered Connect/Replace/Rebind/Remove without the bridge reds here.
+  it("shows status but no credential action in browser-only mode", async () => {
+    h.hasProviderBridge.mockReturnValue(false);
+    renderTab();
+    await waitFor(() => expect(screen.getByText("Connected")).toBeTruthy());
+    expect(screen.getByText(/require the Rhapsody desktop app/i)).toBeTruthy();
+    for (const name of ["Connect", "Replace key", "Rebind to this endpoint", "Remove", "Test connection"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  it("offers credential actions in the desktop app", async () => {
+    h.hasProviderBridge.mockReturnValue(true);
+    h.providerStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        display_name: "Fireworks",
+        endpoint: "https://api.fireworks.ai/inference/v1",
+        adapter: "openai-chat-completions-bearer-v1",
+        insecure_http: false,
+        status: "absent",
+        recovery: "connect",
+        can_connect: true,
+        can_replace: false,
+        can_rebind: false,
+        can_remove: false,
+      },
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy());
+  });
+
+  // MUTATION GUARD: after an endpoint/protocol edit the daemon reports unknown_refreshing, then
+  // binding_mismatch. A view that kept showing "Connected" (or derived status from the config
+  // definition) reds here.
+  it("renders the feed's status through unknown_refreshing to binding_mismatch", async () => {
+    h.fetchProviderStatuses.mockResolvedValueOnce([
+      { provider_id: "fireworks", status: "unknown_refreshing", cache_age_ms: null, refreshing: true, broker_available: true, recovery: "refresh" },
+    ]);
+    const first = renderTab();
+    await waitFor(() => expect(screen.getByText("Checking…")).toBeTruthy());
+    expect(screen.queryByText("Connected")).toBeNull();
+    first.unmount();
+
+    h.fetchProviderStatuses.mockResolvedValue([
+      { provider_id: "fireworks", status: "binding_mismatch", cache_age_ms: 5, refreshing: false, broker_available: true, recovery: "rebind" },
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByText(/Endpoint changed/i)).toBeTruthy());
+    expect(screen.queryByText("Connected")).toBeNull();
+  });
+
+  // MUTATION GUARD: a failed catalog must not disable manual model entry. A UI that disabled the
+  // model field (or refused the value) when the catalog errored reds here.
+  it("keeps manual model entry when the catalog fails", async () => {
+    h.fetchProviderCatalog.mockResolvedValue({
+      provider_id: "fireworks",
+      models: [],
+      truncated: false,
+      cache_age_ms: 1,
+      error: "timeout",
+      error_message: "deadline exceeded",
+      manual_entry_allowed: true,
+    });
+    renderTab();
+    const input = (await screen.findByLabelText("Global model")) as HTMLInputElement;
+    expect(input.disabled).toBe(false);
+    expect(input.value).toBe("accounts/fireworks/models/x");
+    expect(await screen.findByText(/Manual entry remains available/i)).toBeTruthy();
+  });
+
+  // MUTATION GUARD (secrets): a status row carrying forbidden fields (a credential value, a stored
+  // binding, a revision) must never surface any of them in the DOM.
+  it("never renders a credential, binding, or revision from a status row", async () => {
+    const canary = "sk-CANARY-secret";
+    h.fetchProviderStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        status: "configured",
+        cache_age_ms: 1,
+        refreshing: false,
+        broker_available: true,
+        recovery: null,
+        // Hostile extras a real daemon would never send; the view must ignore them.
+        credential: canary,
+        binding_fingerprint: "binding-FFFF",
+        revision: "rev-1234",
+      } as never,
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByText("Connected")).toBeTruthy());
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain(canary);
+    expect(text).not.toContain("binding-FFFF");
+    expect(text).not.toContain("rev-1234");
+  });
+});

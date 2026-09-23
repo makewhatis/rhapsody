@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { LogsTab } from "@/components/settings/LogsTab";
 import { ToolsTab } from "@/components/settings/ToolsTab";
 import { UpdatesTab } from "@/components/settings/UpdatesTab";
+import { ProvidersTab } from "@/components/settings/ProvidersTab";
+import { useConfigDraft } from "@/hooks/useConfigDraft";
 import type { Updater } from "@/hooks/useUpdater";
 import "@/theme/console-settings-tabs.css";
 
@@ -63,6 +65,33 @@ export function UpdatesView({ onNavigate, updater }: SettingsTabViewProps & { up
       lead="Keep Rhapsody current — check for, download and install new versions."
     >
       <UpdatesTab updater={updater} />
+    </Page>
+  );
+}
+
+/**
+ * Providers — the provider registry, credential status, and global provider/model selection
+ * (STUDIO-992). Unlike Tools/Logs/Updates this surface reads (and edits) the WORKFLOW.md draft, so
+ * it renders the SAME `useConfigDraft` model the Podium Settings and the Workflow editor use — one
+ * editor of one file, not a second copy. It is not teams-gated: providers exist on a solo daemon.
+ */
+export function ProvidersView({ onNavigate }: SettingsTabViewProps) {
+  const cfg = useConfigDraft();
+  return (
+    <Page
+      onNavigate={onNavigate}
+      title="Providers"
+      lead="Inference provider definitions, credential status, and the global provider/model selection."
+    >
+      {cfg.unavailable ? (
+        <p style={{ fontSize: 13, color: "var(--tx-3)" }}>
+          Couldn't load the daemon configuration. Is the daemon running?
+        </p>
+      ) : !cfg.uiGlobal ? (
+        <p style={{ fontSize: 13, color: "var(--tx-3)" }}>Loading configuration…</p>
+      ) : (
+        <ProvidersTab value={cfg.uiGlobal} onChange={cfg.onGlobalChange} />
+      )}
     </Page>
   );
 }

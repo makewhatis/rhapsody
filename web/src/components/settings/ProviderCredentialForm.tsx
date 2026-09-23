@@ -22,6 +22,7 @@ import {
   providerReplace,
   providerTestConnection,
   statusLabel,
+  type PreparedCommand,
   type ProviderStatus,
 } from "@/lib/provider-credentials";
 
@@ -31,12 +32,13 @@ export interface ProviderCredentialFormProps {
   onChanged?: (message: string) => void;
 }
 
-type Editing = "none" | "connect" | "replace";
+type Editing = "none" | "connect" | "replace" | "rebind";
 
 export function ProviderCredentialForm({ provider, onChanged }: ProviderCredentialFormProps) {
   const bridged = hasProviderBridge();
   const [editing, setEditing] = useState<Editing>("none");
   const [key, setKey] = useState("");
+  const [prepared, setPrepared] = useState<PreparedCommand | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -64,11 +66,11 @@ export function ProviderCredentialForm({ provider, onChanged }: ProviderCredenti
     }
     setBusy(true);
     try {
-      const prepared = await providerPrepare(provider.provider_id, operation);
+      const preparedCommand = await providerPrepare(provider.provider_id, operation);
       const result =
         operation === "connect"
-          ? await providerConnect(provider.provider_id, prepared.nonce, secret)
-          : await providerReplace(provider.provider_id, prepared.nonce, secret);
+          ? await providerConnect(provider.provider_id, preparedCommand.nonce, secret)
+          : await providerReplace(provider.provider_id, preparedCommand.nonce, secret);
       setEditing("none");
       report(syncNotice(result.mutated, result.sync));
     } catch (e) {
@@ -78,16 +80,49 @@ export function ProviderCredentialForm({ provider, onChanged }: ProviderCredenti
     }
   };
 
-  const mutate = async (operation: "rebind" | "remove") => {
+  // beginRebind mints the one-use confirmation WITHOUT committing. The returned non-secret endpoint
+  // is the current canonical destination the confirmation must display before the operator agrees.
+  const beginRebind = async () => {
     setError(null);
     setNotice(null);
     setBusy(true);
     try {
-      const prepared = await providerPrepare(provider.provider_id, operation);
-      const result =
-        operation === "rebind"
-          ? await providerRebind(provider.provider_id, prepared.nonce)
-          : await providerRemove(provider.provider_id, prepared.nonce);
+      const preparedCommand = await providerPrepare(provider.provider_id, "rebind");
+      setPrepared(preparedCommand);
+      setEditing("rebind");
+    } catch (e) {
+      setError(failureMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmRebind = async () => {
+    if (!prepared) return;
+    // The nonce is one-use: drop the local reference before the call so a second click cannot reuse it.
+    const nonce = prepared.nonce;
+    setPrepared(null);
+    setEditing("none");
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const result = await providerRebind(provider.provider_id, nonce);
+      report(syncNotice(result.mutated, result.sync));
+    } catch (e) {
+      setError(failureMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const preparedCommand = await providerPrepare(provider.provider_id, "remove");
+      const result = await providerRemove(provider.provider_id, preparedCommand.nonce);
       report(syncNotice(result.mutated, result.sync));
     } catch (e) {
       setError(failureMessage(e));
@@ -144,12 +179,12 @@ export function ProviderCredentialForm({ provider, onChanged }: ProviderCredenti
             </button>
           )}
           {provider.can_rebind && (
-            <button type="button" disabled={busy} onClick={() => void mutate("rebind")}>
+            <button type="button" disabled={busy} onClick={() => void beginRebind()}>
               Rebind to this endpoint
             </button>
           )}
           {provider.can_remove && (
-            <button type="button" disabled={busy} onClick={() => void mutate("remove")}>
+            <button type="button" disabled={busy} onClick={() => void remove()}>
               Remove
             </button>
           )}
@@ -159,7 +194,7 @@ export function ProviderCredentialForm({ provider, onChanged }: ProviderCredenti
         </div>
       )}
 
-      {bridged && editing !== "none" && (
+      {bridged && (editing === "connect" || editing === "replace") && (
         <form
           className="mt-3 flex items-center gap-2"
           onSubmit={(e) => {
@@ -188,6 +223,43 @@ export function ProviderCredentialForm({ provider, onChanged }: ProviderCredenti
             Cancel
           </button>
         </form>
+      )}
+
+      {bridged && editing === "rebind" && prepared && (
+        // The explicit Rebind confirmation: the operator must see the EXACT canonical destination the
+        // stored credential will be moved to, and an extra plaintext-HTTP warning when the new
+        // endpoint is not TLS. Rebind changes only the binding; it never replaces the stored key.
+        <div
+          data-testid="rebind-confirmation"
+          className="mt-3 rounded-md border border-amber-700/60 p-3"
+        >
+          <p className="text-xs text-neutral-200">
+            Rebind this credential to the new canonical destination? The stored key is kept; only the
+            endpoint binding changes.
+          </p>
+          <p className="mono mt-1 break-all text-xs text-neutral-300">{prepared.endpoint}</p>
+          {prepared.insecure_http && (
+            <p className="mt-1 text-xs text-amber-400">
+              This destination uses plaintext HTTP — the credential will be sent without transport
+              encryption.
+            </p>
+          )}
+          <div className="mt-2 flex items-center gap-2">
+            <button type="button" disabled={busy} onClick={() => void confirmRebind()}>
+              Confirm rebind
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setPrepared(null);
+                setEditing("none");
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {notice && <p className="mt-2 text-xs text-emerald-400">{notice}</p>}

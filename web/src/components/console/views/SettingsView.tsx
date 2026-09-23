@@ -5,6 +5,7 @@ import type { Updater } from "@/hooks/useUpdater";
 import { doctorHasWarnings } from "@/lib/settings-model";
 import {
   LogsRowGlyph,
+  ProvidersRowGlyph,
   StorageRowGlyph,
   TeamsRowGlyph,
   TelemetryRowGlyph,
@@ -36,7 +37,7 @@ export function SettingsView({
   onManageTeam: () => void;
   onEditWorkflow: () => void;
   /** Open one of the Settings child routes that embeds a shipped Podium tab (§8.1). */
-  onOpen: (route: "tools" | "logs" | "updates") => void;
+  onOpen: (route: "providers" | "tools" | "logs" | "updates") => void;
 }) {
   return (
     <section>
@@ -50,6 +51,7 @@ export function SettingsView({
       <div className="setgrp">
         {teamsEnabled ? <TeamsOnRow onManageTeam={onManageTeam} /> : <TeamsOffRow />}
         <WorkflowRow onEdit={onEditWorkflow} />
+        <ProvidersRow onOpen={() => onOpen("providers")} />
         <ToolsRow onOpen={() => onOpen("tools")} />
         <LogsRow onOpen={() => onOpen("logs")} />
         <UpdatesRow pending={updater.pending} onOpen={() => onOpen("updates")} />
@@ -147,6 +149,25 @@ function WorkflowRow({ onEdit }: { onEdit: () => void }) {
       action={
         <Button variant="sec" onClick={onEdit}>
           Edit →
+        </Button>
+      }
+    />
+  );
+}
+
+/**
+ * Providers — the provider registry, credential status, and global provider/model selection
+ * (STUDIO-992). A child route of Settings, not teams-gated: a solo daemon configures providers too.
+ */
+function ProvidersRow({ onOpen }: { onOpen: () => void }) {
+  return (
+    <SettingRow
+      icon={<ProvidersRowGlyph />}
+      title="Providers"
+      detail="Inference provider definitions, credential status, and the global provider/model selection."
+      action={
+        <Button variant="sec" aria-label="Open Providers" onClick={onOpen}>
+          Open →
         </Button>
       }
     />

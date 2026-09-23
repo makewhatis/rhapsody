@@ -29,7 +29,7 @@ import { ManageTeamView } from "./ManageTeamView";
 import { MemoryView } from "./MemoryView";
 import { ReviewsView } from "./ReviewsView";
 import { SettingsView } from "./SettingsView";
-import { LogsView, ToolsView, UpdatesView } from "./SettingsTabView";
+import { LogsView, ProvidersView, ToolsView, UpdatesView } from "./SettingsTabView";
 import { WorkflowView } from "./WorkflowView";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
@@ -231,6 +231,8 @@ function ConsoleBody({
     // the log tail and the desktop updater all exist on a solo daemon.
     case "tools":
       return <ToolsView onNavigate={(to) => go(to)} />;
+    case "providers":
+      return <ProvidersView onNavigate={(to) => go(to)} />;
     case "logs":
       return <LogsView onNavigate={(to) => go(to)} />;
     case "updates":

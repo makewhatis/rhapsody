@@ -136,6 +136,64 @@ describe("ProviderCredentialForm", () => {
     expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
+  it("requires an explicit Rebind confirmation showing the exact destination + plaintext warning", async () => {
+    providerPrepare.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "rebind",
+      endpoint: "http://new-host.example/v1",
+      insecure_http: true,
+      nonce: "rebind-nonce",
+      expires_in_ms: 120000,
+    });
+    providerRebind.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "rebind",
+      mutated: true,
+      status: "configured",
+      sync: "synchronized",
+    });
+    render(
+      <ProviderCredentialForm
+        provider={provider({ status: "binding_mismatch", can_connect: false, can_rebind: true, can_remove: true })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Rebind to this endpoint" }));
+    // The prepare must happen first and MUST NOT commit on its own.
+    await waitFor(() => expect(providerPrepare).toHaveBeenCalledWith("fireworks", "rebind"));
+    expect(providerRebind).not.toHaveBeenCalled();
+
+    const confirmation = await screen.findByTestId("rebind-confirmation");
+    // The exact canonical destination and the plaintext-HTTP warning are both shown.
+    expect(confirmation.textContent).toContain("http://new-host.example/v1");
+    expect(confirmation.textContent).toMatch(/plaintext HTTP/i);
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm rebind" }));
+    await waitFor(() => expect(providerRebind).toHaveBeenCalledWith("fireworks", "rebind-nonce"));
+    expect(screen.queryByTestId("rebind-confirmation")).toBeNull();
+  });
+
+  it("cancelling the Rebind confirmation commits nothing", async () => {
+    providerPrepare.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "rebind",
+      endpoint: "https://api.fireworks.ai/inference/v1",
+      insecure_http: false,
+      nonce: "rebind-nonce",
+      expires_in_ms: 120000,
+    });
+    render(
+      <ProviderCredentialForm
+        provider={provider({ status: "binding_mismatch", can_connect: false, can_rebind: true })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Rebind to this endpoint" }));
+    await screen.findByTestId("rebind-confirmation");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByTestId("rebind-confirmation")).toBeNull());
+    expect(providerRebind).not.toHaveBeenCalled();
+  });
+
   it("reports a stored-offline sync honestly", async () => {
     providerPrepare.mockResolvedValue({
       provider_id: "fireworks",
