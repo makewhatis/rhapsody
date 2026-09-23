@@ -88,6 +88,11 @@ pub trait HistoryStore: Send + Sync {
         &self,
         run_ids: &[i64],
     ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
+    /// The verdicts of a SET of review runs in one query, keyed by run id (STUDIO-1020). Missing ids
+    /// are absent — a run still reviewing, one that ended without a verdict, or one that predates
+    /// the feature — which the run detail's strip reads as its neutral "no verdict". Rhapsody-only;
+    /// Go has no review feature.
+    fn load_review_verdicts(&self, run_ids: &[i64]) -> Result<HashMap<i64, String>, StoreError>;
     /// Token totals grouped by recorded provider over the same window as `day_totals` — the
     /// cost-attribution tally the dashboard's summary carries (STUDIO-909). Rhapsody-only; Go cannot
     /// attribute a token at all.
@@ -161,6 +166,9 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
         run_ids: &[i64],
     ) -> Result<HashMap<i64, RunProvenance>, StoreError> {
         rhapsody_store::Store::load_run_provenances(self, run_ids)
+    }
+    fn load_review_verdicts(&self, run_ids: &[i64]) -> Result<HashMap<i64, String>, StoreError> {
+        rhapsody_store::Store::load_review_verdicts(self, run_ids)
     }
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         rhapsody_store::Store::tokens_by_provider(self, since)

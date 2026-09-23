@@ -649,6 +649,52 @@ export interface ReviewOption {
   named: boolean;
   /** The run's `started_at`, verbatim — the view formats it for the tooltip. */
   startedAt: string;
+  /** What this round's chip says about its verdict — see [`reviewState`] (STUDIO-1020). */
+  state: ReviewState;
+}
+
+/**
+ * The verdict a review strip entry shows (STUDIO-1020), derived ENTIRELY from the run the daemon
+ * served — the client parses no `HANDOFF:` line, exactly as it derives no other status.
+ *
+ * The four states are mutually exclusive and in this priority:
+ *
+ * - `reviewing` — the run has no `ended_at`. A live review is the violet the product already
+ *   reserves for "an agent doing a review" (`PILL_COLORS.reviewing`), whether or not a verdict
+ *   somehow lingers on the row.
+ * - `approved` / `changes_requested` — the run ended and the daemon's `verdict` field says so.
+ * - `none` — an ended round the daemon recorded no verdict for: failed, cancelled, truncated,
+ *   stopped at the token ceiling, or one that predates this feature. Deliberately NOT rounded to
+ *   either verdict: "nobody judged it" is a real answer, and the neutral chip is how it reads.
+ */
+export type ReviewState = "reviewing" | "changes_requested" | "approved" | "none";
+
+/**
+ * The phrase each state contributes to the chip's tooltip, or "" for `none`. Empty rather than a
+ * word like "no verdict", so a neutral entry's tooltip is exactly what it was before this field
+ * existed — "review · jimmy · run 612 · started …".
+ */
+export const REVIEW_STATE_LABELS: Record<ReviewState, string> = {
+  reviewing: "reviewing",
+  changes_requested: "changes requested",
+  approved: "approved",
+  none: "",
+};
+
+/**
+ * The state a review run is in: its own `ended_at`, then the daemon's verdict for the run.
+ *
+ * `ended_at` decides the FIRST question because a running review has no verdict to show and the
+ * violet "reviewing" chip is the answer for it — the same fact the outcome pill reads. Only once
+ * the run has ended does the daemon's per-run `verdict` decide, and an unrecognised or absent value
+ * is `none` rather than a guess (the field is `approved | changes_requested` today; a future value
+ * this build does not know must not be coloured as either).
+ */
+export function reviewState(run: RunSummary): ReviewState {
+  if (run.ended_at.trim() === "") return "reviewing";
+  if (run.verdict === "approved") return "approved";
+  if (run.verdict === "changes_requested") return "changes_requested";
+  return "none";
 }
 
 /**
@@ -671,6 +717,10 @@ export interface ReviewOption {
  * the attempt labels use, so a review entry can never name a different teammate than the header
  * does once the review is selected — the identity invariant `JobDetailView` states. A review run
  * carries its reviewer in its own `pr:…@reviewer` key, so nothing is fetched.
+ *
+ * Each option also carries its own [`ReviewState`] (STUDIO-1020), read from the run the daemon
+ * served, so the strip colours one round differently from another — the whole reason the verdict is
+ * recorded per run rather than read off the per-(PR, reviewer) watch set.
  */
 export function reviewOptions(
   reviews: readonly RunSummary[],
@@ -684,6 +734,7 @@ export function reviewOptions(
       label: who === "" ? `review ${run.id}` : `review · ${who}`,
       named: who !== "",
       startedAt: run.started_at,
+      state: reviewState(run),
     };
   });
 }

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use rhapsody_core::Issue;
 use rhapsody_store::{
     self as store, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
-    ReviewWatchKey, ReviewWatchRow,
+    REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey, ReviewWatchRow,
 };
 
 use crate::orchestrator::{Orchestrator, RunningEntry};
@@ -661,6 +661,11 @@ impl Orchestrator {
         } else {
             let status = declared_review_status(&e.last_state);
             self.record_review_completed(run, status);
+            // The SAME verdict, recorded against the RUN (STUDIO-1020). The watch set above holds
+            // only the latest status per (PR, reviewer), so a ticket whose newest review approved
+            // would read approved all the way back; this keyed-by-run row is what lets the run
+            // detail's strip colour each round by its own answer.
+            self.record_review_verdict(re.run_id, status);
             // STUDIO-1004: this verdict may be the ANSWER to an author round that has been waiting
             // for one. An author dispatch charges nothing until a reviewer's `last_reviewed_sha`
             // reaches the head that dispatch produced, and `record_review_completed` is the only
@@ -716,6 +721,43 @@ impl Orchestrator {
             .mark_review_completed(&run.watch_key(), &run.head_sha, status)
         {
             tracing::warn!(review = %run.key(), err = %e, "recording the reviewed head failed");
+        }
+    }
+
+    /// Records this review RUN's own verdict, keyed by its `runs.id` (STUDIO-1020).
+    ///
+    /// The verdict is `status`, the SAME value [`record_review_completed`](Orchestrator::record_review_completed)
+    /// just wrote to the watch set — that method owns which statuses are terminal, and this maps its
+    /// two outcomes onto the console's two colours. Called only on the declared-verdict branch of
+    /// [`Orchestrator::on_review_exit`]: a failed, truncated or undeclared round records NO verdict,
+    /// which is the console's neutral state, not a guessed one.
+    ///
+    /// Keyed by run id rather than by the watch row because the question is per-ROUND. Best-effort
+    /// like every other store write on this path — a failure is logged, never fatal. A store-disabled
+    /// daemon (`run_id == 0`) has nowhere to record it and nothing that reads it.
+    pub(crate) fn record_review_verdict(&self, run_id: i64, status: &str) {
+        if run_id == 0 {
+            return;
+        }
+        let verdict = if status == REVIEW_STATUS_APPROVED {
+            REVIEW_VERDICT_APPROVED
+        } else {
+            // The only other status `record_review_completed` accepts is the discussed-findings
+            // reading. An out-of-domain status reaching here is a caller bug; refuse rather than
+            // colour a round the console has no state for.
+            if status != REVIEW_STATUS_REVIEWED {
+                tracing::error!(
+                    run_id,
+                    status,
+                    "refusing to record a review verdict for a run whose status is neither \
+                     approved nor reviewed"
+                );
+                return;
+            }
+            REVIEW_VERDICT_CHANGES_REQUESTED
+        };
+        if let Err(e) = self.store().set_review_verdict(run_id, verdict) {
+            tracing::warn!(run_id, err = %e, "recording the review run's verdict failed");
         }
     }
 
@@ -2590,6 +2632,60 @@ mod tests {
             .expect("row exists");
         assert_eq!(row.status, REVIEW_STATUS_APPROVED);
         assert_eq!(row.last_reviewed_sha, HEAD_A);
+    }
+
+    /// STUDIO-1020: the verdict is recorded against the RUN id, so a ticket's several rounds keep
+    /// their own answers. The watch set cannot express this — it holds only the LATEST status per
+    /// (PR, reviewer), so colouring an older round from it shows a past round as approved once a
+    /// later one approved. This is the acceptance the run detail's strip is built on.
+    #[test]
+    fn each_review_round_records_its_own_verdict() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+
+        o.dispatch_review(run.clone());
+        let findings = exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+        o.dispatch_review(run.clone());
+        let approved = exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_APPROVED);
+
+        assert_ne!(findings, approved, "two rounds are two runs");
+        assert_eq!(
+            o.store()
+                .review_verdict(findings)
+                .expect("first")
+                .as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+        assert_eq!(
+            o.store()
+                .review_verdict(approved)
+                .expect("second")
+                .as_deref(),
+            Some(REVIEW_VERDICT_APPROVED),
+            "the later approval must not overwrite the earlier round's findings"
+        );
+    }
+
+    /// The other half of the acceptance: a round that ended WITHOUT a declared verdict — the
+    /// max_turns backstop, an undeclared payload, or a crashed worker — records NO verdict. The
+    /// console then shows it neutral rather than colouring a round nobody actually judged.
+    #[test]
+    fn a_round_without_a_declared_verdict_records_none() {
+        for (declared, state, failed) in [
+            (false, REVIEW_STATE_FINDINGS, false), // the max_turns backstop fired
+            (true, REVIEW_STATE_UNDECLARED, false), // an unrecognised HANDOFF payload
+            (false, "", true),                     // the worker crashed
+        ] {
+            let (mut o, _d) = orch_with_review(true);
+            let run = review_run("alice", HEAD_A);
+            o.dispatch_review(run.clone());
+            let id = exit_review_as(&mut o, &run, failed, "boom", declared, state);
+            assert_eq!(
+                o.store().review_verdict(id).expect("verdict"),
+                None,
+                "declared={declared} state={state} failed={failed}"
+            );
+        }
     }
 
     /// The verdict is read off the agent's OWN hand-off line, and only an exact `approved` payload
