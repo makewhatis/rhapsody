@@ -132,6 +132,35 @@ impl Store for Noop {
     ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
         Ok(std::collections::HashMap::new())
     }
+    // Runaway-loop breaker crossings (STUDIO-1026). With persistence off there is no run history to
+    // count and nowhere to remember a crossing, so the breaker simply never fires — the same "no
+    // history ⇒ no spend signal" the rest of this backend gives every cost surface.
+    fn count_completed_review_runs(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+    ) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn count_runs_for(&self, _identifier: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn ticket_spend_by_provider(
+        &self,
+        _ticket: &str,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+    ) -> Result<Vec<ProviderTokens>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn save_breaker_crossing(&self, _row: &BreakerCrossingRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError> {
+        Ok(Vec::new())
+    }
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }

@@ -329,6 +329,13 @@ where
     // sender lives on the orchestrator alone and never on `o.control()`: the only thing that sends
     // on it is the review's own exit, which runs on the control task.
     let review_notify_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_notify_channel());
+    // --- runaway-loop breaker (STUDIO-1026) ---
+    //
+    // The channel a crossed review-round or per-ticket-spend limit — and a manager escalation —
+    // hands to the off-loop task that holds the ticket, posts the room line and pushes the
+    // notifications. Spawned on exactly the introduction's condition: a round can only exist where
+    // one was introduced, so a non-ticketless daemon has nothing to bound.
+    let breaker_rx = spawn_review_intro(&teams_cfg).then(|| o.open_breaker_channel());
     // --- ticketless review watcher (STUDIO-721, slice 5; design record §14.1, §14.4) ---
     //
     // The slice that makes reviews actually fire. It owns its own poll cadence and every `gh` call
@@ -559,6 +566,9 @@ where
     // poke's human escalation is a manager post, and it must serialize with every other appender's
     // for the reason above.
     let watch_room = teams_room.clone();
+    // The breaker's room line (STUDIO-1026), another clone of the same handle for the same reason:
+    // it must serialize with every other appender's.
+    let breaker_room = teams_room.clone();
     let quorum_room = teams_room;
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
@@ -835,6 +845,51 @@ where
         })
     });
 
+    // The runaway-loop breaker task (STUDIO-1026). It holds the ONE tracker write the breaker makes
+    // (`rhapsody:human`), the room append, and every configured `notify:` channel — all off the
+    // control task, for the notification task's reason: a slow tracker round-trip or a hung webhook
+    // must park this task and nothing else. The control task already DECIDED the crossing and
+    // persisted it; this task only performs the consequences.
+    let breaker_notifications = o.notifications_state();
+    let breaker_task = breaker_rx.map(|rx| {
+        let breaker_ctx = shutdown.wait();
+        let hold_handle = handle.clone();
+        let mut channels: Vec<Arc<dyn rhapsody_orchestrator::breaker::NotifyChannel>> = Vec::new();
+        if let Some(cfg) = resolved.as_ref() {
+            if cfg.notify.macos {
+                channels.push(Arc::new(rhapsody_orchestrator::breaker::MacosChannel::new(
+                    breaker_notifications.clone(),
+                )));
+            }
+            let webhook = cfg.notify.webhook.trim();
+            if !webhook.is_empty() {
+                channels.push(Arc::new(
+                    rhapsody_orchestrator::breaker::WebhookChannel::new(webhook.to_string()),
+                ));
+            }
+            let ntfy = cfg.notify.ntfy.trim();
+            if !ntfy.is_empty() {
+                channels.push(Arc::new(rhapsody_orchestrator::breaker::NtfyChannel::new(
+                    ntfy.to_string(),
+                )));
+            }
+        }
+        let deps = rhapsody_orchestrator::breaker::BreakerDeps {
+            // Read lazily per crossing, exactly as the quorum reads its tracker per request: the
+            // handle is built before the first reload, so the trackers arrive later.
+            hold: Some(Arc::new(
+                rhapsody_orchestrator::breaker::TrackerHoldSink::new(move || {
+                    hold_handle.reads_tracker()
+                }),
+            )),
+            room: breaker_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            channels,
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::breaker::run_breaker_task(breaker_ctx, deps, rx).await;
+        })
+    });
+
     // The auto-merge ledger (STUDIO-874), built HERE — beside `triage_seam` above and for the same
     // reason — so the SAME `Arc` can go to two consumers: the off-loop `AutoMergeDeps` below, which
     // writes it, and `o.automerge_ledger`, which the control task's reconciliation sweep reads
@@ -1080,6 +1135,11 @@ where
     // The notification task is cancelled by the same signal and checks it on both sides of its
     // receive, so the wait is bounded by whatever `gh pr comment` is already in flight.
     if let Some(t) = review_notify_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The breaker task is cancelled by the same signal and checks it on both sides of its receive,
+    // so the wait is bounded by whatever tracker write or notification is already in flight.
+    if let Some(t) = breaker_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as

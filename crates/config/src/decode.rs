@@ -18,7 +18,7 @@ use serde_yaml_ng::Value;
 
 use crate::model::{
     Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT,
-    DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Opencode, Otel, Polling, Project,
+    DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Notify, Opencode, Otel, Polling, Project,
     ProviderBudget, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker, Workspace,
 };
 use crate::workflow::Definition;
@@ -246,10 +246,22 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
                 provider,
                 ProviderBudget {
                     daily_tokens: b.daily_tokens.unwrap_or(0),
+                    per_ticket: b.per_ticket.unwrap_or(0),
                 },
             )
         })
         .collect();
+
+    // Notify channels (STUDIO-1026). Rhapsody-only and off when absent: every value maps to its
+    // zero default, so a workflow that never writes `notify:` decodes byte-identically to before.
+    let notify = match r.notify {
+        Some(n) => Notify {
+            macos: n.macos.unwrap_or(false),
+            webhook: n.webhook,
+            ntfy: n.ntfy,
+        },
+        None => Notify::default(),
+    };
 
     Ok(Config {
         tracker,
@@ -280,6 +292,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // byte-parity golden is affected.
         pr_label: or_str(r.pr_label, "rhapsody"),
         budgets,
+        notify,
     })
 }
 
@@ -871,6 +884,53 @@ mod tests {
         // An entry with no daily_tokens still lands as 0 (unlimited) rather than failing.
         let c = decode_yaml("budgets:\n  openai: {}\n", "body");
         assert_eq!(c.budgets["openai"].daily_tokens, 0);
+    }
+
+    // STUDIO-1026: per-TICKET provider caps sit beside the daily cap, and the unset case is
+    // load-bearing — absent (or 0) means unlimited, byte-identical to before the key existed.
+    #[test]
+    fn decode_budgets_per_ticket_defaults_zero_and_parses() {
+        let unset = decode_yaml("budgets:\n  anthropic:\n    daily_tokens: 200\n", "body");
+        assert_eq!(
+            unset.budgets["anthropic"].per_ticket, 0,
+            "an entry with no per_ticket is unlimited"
+        );
+
+        let c = decode_yaml(
+            "budgets:\n  anthropic:\n    daily_tokens: 200000000\n    per_ticket: 30000000\n  fireworks-ai:\n    per_ticket: 0\n",
+            "body",
+        );
+        assert_eq!(c.budgets["anthropic"].per_ticket, 30_000_000);
+        assert_eq!(
+            c.budgets["fireworks-ai"].per_ticket, 0,
+            "0 is a configured UNLIMITED, kept distinct from unset only by presence"
+        );
+    }
+
+    // STUDIO-1026: the `notify:` channels. Rhapsody-only, and the unset case is load-bearing — an
+    // absent block leaves every channel off, byte-identical to a daemon built before the key.
+    #[test]
+    fn decode_notify_defaults_off_and_parses() {
+        let unset = decode_yaml("tracker:\n  kind: linear\n", "body");
+        assert_eq!(unset.notify, Notify::default());
+        assert!(
+            !unset.notify.macos && unset.notify.webhook.is_empty() && unset.notify.ntfy.is_empty()
+        );
+
+        let c = decode_yaml(
+            "notify:\n  macos: true\n  webhook: https://example.test/hook\n  ntfy: rhapsody-alerts\n",
+            "body",
+        );
+        assert!(c.notify.macos);
+        assert_eq!(c.notify.webhook, "https://example.test/hook");
+        assert_eq!(c.notify.ntfy, "rhapsody-alerts");
+    }
+
+    // STUDIO-1026: an explicit `notify: {}` (or `macos: false`) is off, not a parse error.
+    #[test]
+    fn decode_notify_explicit_empty_is_off() {
+        let c = decode_yaml("notify: {}\n", "body");
+        assert_eq!(c.notify, Notify::default());
     }
 
     // Mirrors Go `TestDecodeOtelDefaults`.

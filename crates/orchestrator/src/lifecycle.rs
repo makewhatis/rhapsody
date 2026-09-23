@@ -2709,6 +2709,37 @@ mod tests {
         ) -> Result<std::collections::HashMap<i64, String>, rhapsody_store::StoreError> {
             self.0.load_review_verdicts(a0)
         }
+        fn count_completed_review_runs(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.count_completed_review_runs(owner, repo, number)
+        }
+        fn count_runs_for(&self, identifier: &str) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.count_runs_for(identifier)
+        }
+        fn ticket_spend_by_provider(
+            &self,
+            ticket: &str,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, rhapsody_store::StoreError> {
+            self.0.ticket_spend_by_provider(ticket, owner, repo, number)
+        }
+        fn save_breaker_crossing(
+            &self,
+            row: &rhapsody_store::BreakerCrossingRow,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_breaker_crossing(row)
+        }
+        fn load_breaker_crossings(
+            &self,
+        ) -> Result<Vec<rhapsody_store::BreakerCrossingRow>, rhapsody_store::StoreError> {
+            self.0.load_breaker_crossings()
+        }
         fn tokens_by_provider(
             &self,
             a0: &str,

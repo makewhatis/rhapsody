@@ -1161,12 +1161,12 @@ impl Orchestrator {
         // the same false page on the second sweep. The count is deliberately NOT compared, only its
         // presence: it climbs on every failed lookup, so comparing the number would make every
         // outage sweep a transition and defeat the rate limit.
-        let previous: HashMap<&str, (Option<CapacityHold>, bool, bool)> = self
+        let previous: HashMap<String, (Option<CapacityHold>, bool, bool)> = self
             .review_divergence
             .iter()
             .map(|d| {
                 (
-                    d.pr.as_str(),
+                    d.pr.clone(),
                     (
                         d.capacity_held,
                         d.capacity_unreadable.is_some(),
@@ -1192,8 +1192,7 @@ impl Orchestrator {
             let (prev_hold, prev_unreadable, prev_superseded) = previous
                 .get(d.pr.as_str())
                 .copied()
-                .unwrap_or((None, false, false));
-            // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
+                .unwrap_or((None, false, false)); // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
             // annotations' reason one paragraph up: the head move is the news, and waiting out the
             // steady-state rate limit would leave the log repeating "still unaddressed" for a full
             // `RECONCILE_LOG_EVERY` window after the branch moved. Presence only — `current_head`
@@ -1270,6 +1269,10 @@ impl Orchestrator {
                             note
                         );
                     }
+                    // STUDIO-1026: the escalation also notifies the operator through the configured
+                    // `notify:` channels, so they do not have to watch the console banner. Deduped
+                    // per (PR, head) in memory.
+                    self.notify_escalation(d);
                     continue;
                 }
                 // STUDIO-956's decider: the manager SHIPPED the loop and the merge gate still holds
@@ -1473,9 +1476,11 @@ impl Orchestrator {
                  progressing again"
             );
         }
+        // STUDIO-1026: drop dedupe keys for escalations no longer present, so one that recovers and
+        // later recurs notifies again.
+        self.prune_escalations(&found);
         self.review_divergence = found;
     }
-
     /// The divergences this daemon is currently reporting — read by `project_statuses` to light
     /// [`REVIEW_DIVERGENCE_WARNING`] and by `build_snapshot` to serve the detail.
     pub(crate) fn review_divergences(&self) -> &[Divergence] {

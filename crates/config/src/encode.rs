@@ -27,7 +27,7 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::decode::ConfigError;
 use crate::model::{
-    Config, Project, Raw, RawClaudeOverride, RawHooks, RawProject, RawProviderBudget,
+    Config, Project, Raw, RawClaudeOverride, RawHooks, RawNotify, RawProject, RawProviderBudget,
 };
 use crate::workflow::Definition;
 
@@ -196,14 +196,25 @@ fn raw_from_config(c: &Config) -> Raw {
     r.workspace_mode = c.workspace_mode.clone();
     r.pr_label = c.pr_label.clone(); // defaulted "rhapsody" is non-empty, survives pruning (AIE-301)
     // STUDIO-957 (Rhapsody-only): a configured daily budget round-trips; an empty map prunes away,
-    // preserving the pre-957 (unlimited) default.
+    // preserving the pre-957 (unlimited) default. STUDIO-1026 adds `per_ticket`, emitted only when
+    // positive so an install that never sets it round-trips byte-identically.
     for (provider, b) in &c.budgets {
         r.budgets.insert(
             provider.clone(),
             RawProviderBudget {
                 daily_tokens: Some(b.daily_tokens),
+                per_ticket: (b.per_ticket > 0).then_some(b.per_ticket),
             },
         );
+    }
+    // STUDIO-1026 (Rhapsody-only): emit the `notify:` block only when some channel is configured, so
+    // a workflow that never writes it round-trips byte-identically (every channel defaults off).
+    if c.notify.macos || !c.notify.webhook.is_empty() || !c.notify.ntfy.is_empty() {
+        r.notify = Some(RawNotify {
+            macos: c.notify.macos.then_some(true),
+            webhook: c.notify.webhook.clone(),
+            ntfy: c.notify.ntfy.clone(),
+        });
     }
     r.tracker.project_slug = c.tracker.project_slug.clone();
 

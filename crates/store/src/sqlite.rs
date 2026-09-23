@@ -41,11 +41,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 12 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 13 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
-/// per-pull-request review bound, then the per-review-run verdict) and are the one documented
+/// per-pull-request review bound, then the per-review-run verdict, then the breaker's persisted
+/// crossings) and are the one documented
 /// reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -245,6 +246,24 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_bound (
 CREATE TABLE IF NOT EXISTS rhapsody_review_verdicts (
   run_id  INTEGER NOT NULL PRIMARY KEY,
   verdict TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v12 -> v13: the runaway-loop breaker's persisted CROSSINGS (STUDIO-1026). Rhapsody-only, so
+    // the `rhapsody_` prefix gates it out of the Go-recaptured schema golden by name exactly as
+    // steps 7-12 are.
+    //
+    // One row per TICKET: the highest round count at which a round-crossing notified, and the
+    // providers whose per-ticket cap has already notified. Persisting them is what makes a crossing
+    // notify ONCE across a restart — the maintainer asked to be told when a loop crosses a limit,
+    // not reminded every tick and not re-told after a restart. `ticket TEXT PRIMARY KEY` on a rowid
+    // table gets SQLite's implicit auto-index, whose `sqlite_master.sql IS NULL`, so no explicit
+    // index reaches the golden comparison. `notified_providers` is newline-joined in one column,
+    // exactly as `rhapsody_review_bound.findings` is.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_breaker_crossings (
+  ticket             TEXT    NOT NULL PRIMARY KEY,
+  notified_rounds    INTEGER NOT NULL DEFAULT 0,
+  notified_providers TEXT    NOT NULL DEFAULT ''
 );
 "#,
 ];
@@ -546,6 +565,20 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// The LIKE pattern matching every REVIEW run of one pull request's coordinate — the
+/// `pr:<owner>/<repo>#<n>@<reviewer>` identifier the ticketless watcher stores on a review run
+/// (STUDIO-1026). The trailing `@%` matches any reviewer; the owner/repo are `escape_like`d and the
+/// caller's query carries `ESCAPE '\'`, so a repo name containing `_` (a legal GitHub character)
+/// matches literally rather than as a wildcard.
+fn review_run_pattern(owner: &str, repo: &str, number: i64) -> String {
+    format!(
+        "pr:{}/{}#{}@%",
+        escape_like(owner),
+        escape_like(repo),
+        number
+    )
 }
 
 /// The non-empty `transcript_path` values of every ended run older than `cutoff` (the same
@@ -1112,6 +1145,122 @@ impl Store for Sqlite {
                 let (id, verdict) = r?;
                 out.insert(id, verdict);
             }
+        }
+        Ok(out)
+    }
+
+    fn count_completed_review_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. `outcome =
+        // completed` is the whole point: the breaker bounds spend that HAPPENED, so a run that
+        // failed or was truncated never counts.
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs \
+              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2",
+            params![review_run_pattern(owner, repo, number), OUTCOME_COMPLETED],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE issue_identifier = ?1",
+            params![identifier],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    fn ticket_spend_by_provider(
+        &self,
+        ticket: &str,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<ProviderTokens>, StoreError> {
+        let conn = self.lock();
+        // LEFT JOIN like `run_costs`: a run with no provenance row still spent tokens and must land
+        // in the empty-provider bucket rather than vanish. The author runs (`= ticket`) and the
+        // review runs (`LIKE pr:…@%`) are one bucket each per provider; `escape_like` keeps a ticket
+        // identifier containing `_` literal.
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(p.provider, ''),
+                    COUNT(*),
+                    COALESCE(SUM(r.input_tokens), 0),
+                    COALESCE(SUM(r.output_tokens), 0),
+                    COALESCE(SUM(r.total_tokens), 0)
+               FROM runs r
+               LEFT JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.issue_identifier = ?1
+                 OR r.issue_identifier LIKE ?2 ESCAPE '\\'
+              GROUP BY COALESCE(p.provider, '')
+              ORDER BY COALESCE(SUM(r.total_tokens), 0) DESC, COALESCE(p.provider, '') ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![ticket, review_run_pattern(owner, repo, number)],
+            |row| {
+                Ok(ProviderTokens {
+                    provider: row.get(0)?,
+                    runs: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn save_breaker_crossing(&self, row: &BreakerCrossingRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_breaker_crossings (ticket, notified_rounds, notified_providers)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ticket) DO UPDATE SET
+               notified_rounds    = excluded.notified_rounds,
+               notified_providers = excluded.notified_providers",
+            params![
+                row.ticket,
+                row.notified_rounds,
+                row.notified_providers.join("\n"),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ticket, notified_rounds, notified_providers \
+               FROM rhapsody_breaker_crossings ORDER BY ticket",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let providers: String = row.get(2)?;
+            Ok(BreakerCrossingRow {
+                ticket: row.get(0)?,
+                notified_rounds: row.get(1)?,
+                // An empty column is no providers, not one empty provider.
+                notified_providers: if providers.is_empty() {
+                    Vec::new()
+                } else {
+                    providers.split('\n').map(str::to_string).collect()
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
@@ -5034,6 +5183,7 @@ mod tests {
                 "rhapsody_run_provenance".to_string(),
                 "rhapsody_review_bound".to_string(),
                 "rhapsody_review_verdicts".to_string(),
+                "rhapsody_breaker_crossings".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -5180,5 +5330,171 @@ mod tests {
         let later = crate::format_summon_at(precise + chrono::Duration::days(400));
         assert_eq!(later.len(), once.len());
         assert!(once < later, "lexicographic order is chronological order");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Runaway-loop breaker (STUDIO-1026)
+    // ---------------------------------------------------------------------------------------------
+
+    fn start_run_at(store: &Sqlite, key: &str, at: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_identifier: key.into(),
+                started_at: at.into(),
+                ..Default::default()
+            })
+            .expect("start_run")
+    }
+
+    fn end_run_with(store: &Sqlite, id: i64, outcome: &str, tokens: i64, at: &str) {
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: outcome.into(),
+                    total_tokens: tokens,
+                    ended_at: at.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end_run");
+    }
+
+    fn set_provider(store: &Sqlite, id: i64, provider: &str) {
+        store
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: provider.into(),
+                    harness: "claude".into(),
+                    model: "m".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+    }
+
+    /// The breaker's round counter: COMPLETED review runs of the coordinate only — its sibling
+    /// PR's runs, other reviewers' non-completed runs, and non-review runs never count.
+    ///
+    /// Mutation: drop `outcome = completed` and the failed review is counted (3).
+    #[test]
+    fn breaker_counts_only_completed_review_runs_of_the_coordinate() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let a = start_run_at(&store, "pr:makewhatis/rhapsody#12@alice", at);
+        let b = start_run_at(&store, "pr:makewhatis/rhapsody#12@bob", at);
+        let failed = start_run_at(&store, "pr:makewhatis/rhapsody#12@carol", at);
+        let other_pr = start_run_at(&store, "pr:makewhatis/rhapsody#13@alice", at);
+        let author = start_run_at(&store, "STUDIO-988", at);
+        end_run_with(&store, a, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, b, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, failed, OUTCOME_FAILED, 10, at);
+        end_run_with(&store, other_pr, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, author, OUTCOME_COMPLETED, 10, at);
+
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            2,
+            "two completed review runs of #12"
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 99)
+                .expect("count"),
+            0,
+            "a coordinate with no runs is zero, not an error"
+        );
+    }
+
+    /// The pattern escapes LIKE wildcards: a repo name containing `_` must not match a different
+    /// repo whose name merely fits the wildcard.
+    ///
+    /// Mutation: drop `escape_like` from `review_run_pattern` and the `a_b` query also counts the
+    /// `axb` run (2).
+    #[test]
+    fn breaker_pattern_treats_a_repo_underscore_literally() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let underscore = start_run_at(&store, "pr:o/a_b#1@alice", at);
+        let wildcard_lookalike = start_run_at(&store, "pr:o/axb#1@alice", at);
+        end_run_with(&store, underscore, OUTCOME_COMPLETED, 1, at);
+        end_run_with(&store, wildcard_lookalike, OUTCOME_COMPLETED, 1, at);
+
+        assert_eq!(
+            store
+                .count_completed_review_runs("o", "a_b", 1)
+                .expect("count"),
+            1,
+            "the underscore is literal, so only the matching repo counts"
+        );
+    }
+
+    /// The per-ticket spend sums the author runs AND the review runs of the PR, split by provider
+    /// through the provenance join. A run with no provenance lands in the empty bucket rather than
+    /// vanishing, exactly as `tokens_by_provider` reports it.
+    ///
+    /// Mutation: drop the `OR ... LIKE` half and the review runs disappear from the author's total.
+    #[test]
+    fn breaker_ticket_spend_covers_author_and_review_runs_by_provider() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let author1 = start_run_at(&store, "STUDIO-988", at);
+        let author2 = start_run_at(&store, "STUDIO-988", at);
+        let review = start_run_at(&store, "pr:o/r#12@alice", at);
+        let other = start_run_at(&store, "STUDIO-999", at);
+        end_run_with(&store, author1, OUTCOME_COMPLETED, 100, at);
+        end_run_with(&store, author2, OUTCOME_COMPLETED, 50, at);
+        end_run_with(&store, review, OUTCOME_COMPLETED, 25, at);
+        end_run_with(&store, other, OUTCOME_COMPLETED, 9999, at);
+        set_provider(&store, author1, "anthropic");
+        set_provider(&store, author2, "anthropic");
+        set_provider(&store, review, "fireworks-ai");
+        set_provider(&store, other, "anthropic");
+
+        let mut spend = store
+            .ticket_spend_by_provider("STUDIO-988", "o", "r", 12)
+            .expect("spend");
+        spend.sort_by(|a, b| a.provider.cmp(&b.provider));
+        assert_eq!(spend.len(), 2, "two providers: {spend:?}");
+        assert_eq!(spend[0].provider, "anthropic");
+        assert_eq!(spend[0].total_tokens, 150, "both author runs");
+        assert_eq!(spend[1].provider, "fireworks-ai");
+        assert_eq!(spend[1].total_tokens, 25, "the review run on the PR");
+        assert!(
+            spend.iter().all(|s| s.total_tokens != 9999),
+            "another ticket's spend must not leak in"
+        );
+    }
+
+    /// Crossings round-trip, and a second save UPSERTS rather than duplicating — the property that
+    /// makes a restart never re-notify while a later crossing still can.
+    #[test]
+    fn breaker_crossings_round_trip_and_upsert() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let first = BreakerCrossingRow {
+            ticket: "STUDIO-988".into(),
+            notified_rounds: 5,
+            notified_providers: vec!["anthropic".into()],
+        };
+        store.save_breaker_crossing(&first).expect("save");
+        assert_eq!(
+            store.load_breaker_crossings().expect("load"),
+            vec![first.clone()]
+        );
+
+        let later = BreakerCrossingRow {
+            ticket: "STUDIO-988".into(),
+            notified_rounds: 10,
+            notified_providers: vec!["anthropic".into(), "fireworks-ai".into()],
+        };
+        store.save_breaker_crossing(&later).expect("re-save");
+        assert_eq!(
+            store.load_breaker_crossings().expect("load"),
+            vec![later],
+            "one row per ticket, upserted on the identifier"
+        );
     }
 }

@@ -154,6 +154,14 @@ pub struct Snapshot {
     /// a daemon with no configured budget (the default) serves a `/api/v1/state` payload
     /// byte-identical to the Go daemon's — which is what `harness/fixtures/api/state.json` pins.
     pub budget_held: Vec<crate::budget::BudgetHeld>,
+    /// Pending desktop notifications for the runaway-loop breaker (STUDIO-1026), oldest first.
+    ///
+    /// Empty is the load-bearing half, exactly as [`Snapshot::budget_held`]'s is:
+    /// [`crate::snapshot_json::render`] emits the `notifications` key ONLY when this is non-empty,
+    /// and it only ever fills when the operator set `notify.macos: true` — so a daemon that never
+    /// configured a macOS channel serves a `/api/v1/state` payload byte-identical to the Go
+    /// daemon's, which is what `harness/fixtures/api/state.json` pins.
+    pub notifications: Vec<crate::breaker::Notification>,
     /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
     ///
     /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
@@ -270,6 +278,9 @@ impl Orchestrator {
             // STUDIO-957: the current per-provider budget refusals; empty on a daemon with no
             // configured budget, which keeps the wire payload — and the golden — unchanged.
             budget_held: self.budget_ledger.held(self.budget_hold_ttl()),
+            // STUDIO-1026: the pending desktop notifications; empty on a daemon with no macOS
+            // channel, which keeps the wire payload — and the golden — unchanged.
+            notifications: self.notifications.pending(),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {

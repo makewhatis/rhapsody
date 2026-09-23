@@ -929,6 +929,29 @@ still off:** `storage.path: off` records nothing and the strip shows the neutral
 The `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` now pins the fourth name.
 
+### A sixth schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
+
+The runaway-loop circuit breaker holds a ticket and notifies the operator when its completed review
+rounds, or its per-ticket spend, crosses a configured limit. It must notify **once per crossing**,
+survive a restart without repeating, and leave the default install byte-identical. The persisted row
+is what buys the first two: the highest round count at which a round-crossing fired, and the
+providers whose per-ticket cap has fired.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **13** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts` and `rhapsody_breaker_crossings` |
+| a ticket's breaker crossings | — | `rhapsody_breaker_crossings` (`notified_rounds`, `notified_providers`), keyed by the ticket identifier |
+
+The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
+(`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
+(`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs from the `runs` ledger**
+(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter — an operator
+`clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
+author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
+`rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` pins the sixth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so

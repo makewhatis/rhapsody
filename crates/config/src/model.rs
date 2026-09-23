@@ -410,6 +410,25 @@ pub struct ProviderBudget {
     /// `max_concurrent` idiom, so an unset or zero budget never refuses anything. An absent map
     /// entry is likewise unlimited (the whole [`Config::budgets`] map defaults empty).
     pub daily_tokens: i64,
+    /// Per-TICKET token ceiling for this provider (STUDIO-1026). `<= 0` means UNLIMITED, exactly as
+    /// [`Self::daily_tokens`] does. The ticket's author runs AND the review runs on its pull request
+    /// both count toward it (joined through `rhapsody_run_provenance.provider`), so a single ticket
+    /// cannot consume a whole day's budget one run at a time. Rhapsody-only.
+    pub per_ticket: i64,
+}
+
+/// The `notify:` channels the runaway-loop breaker escalates to (STUDIO-1026). Rhapsody-only: the
+/// frozen Go reference has no such block, and an installation that sets none is byte-identical to
+/// one built before it existed (every channel is off by default).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Notify {
+    /// Whether the DESKTOP app should raise a native notification. Fed by a `notifications` key on
+    /// `/api/v1/state`, present only while a crossing is pending — the desktop polls that surface.
+    pub macos: bool,
+    /// A URL to POST a JSON notification body to. Empty ⇒ off.
+    pub webhook: String,
+    /// An ntfy topic (or full `https://ntfy.sh/<topic>` URL) to push to. Empty ⇒ off.
+    pub ntfy: String,
 }
 
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
@@ -454,6 +473,11 @@ pub struct Config {
     /// install that never configures one) is unlimited and byte-identical to today. Ordered so the
     /// effective view and any serialization are deterministic.
     pub budgets: BTreeMap<String, ProviderBudget>,
+
+    /// The operator-notification channels the runaway-loop breaker escalates to (STUDIO-1026).
+    /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
+    /// byte-identical to one built before the key existed.
+    pub notify: Notify,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +518,20 @@ pub(crate) struct Raw {
     pub projects: Vec<RawProject>,
     /// `budgets:` front-matter block (STUDIO-957). Rhapsody-only: absent ⇒ empty ⇒ unlimited.
     pub budgets: BTreeMap<String, RawProviderBudget>,
+    /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
+    /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
+    /// unconfigured workflow byte-identical on the round-trip.
+    pub notify: Option<RawNotify>,
+}
+
+/// Raw `notify:` block (STUDIO-1026). `macos` is `Option` so an explicit `false` is
+/// distinguishable from unset (both mean off), mirroring the rest of the Raw tree.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawNotify {
+    pub macos: Option<bool>,
+    pub webhook: String,
+    pub ntfy: String,
 }
 
 /// Raw `budgets.<provider>` entry. `daily_tokens` is `Option` so an absent value is distinguishable
@@ -502,6 +540,8 @@ pub(crate) struct Raw {
 #[serde(default)]
 pub(crate) struct RawProviderBudget {
     pub daily_tokens: Option<i64>,
+    /// STUDIO-1026; Rhapsody-only, absent ⇒ unlimited (0). A per-ticket token ceiling.
+    pub per_ticket: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

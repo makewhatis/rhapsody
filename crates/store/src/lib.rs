@@ -445,6 +445,54 @@ pub trait Store {
     /// never pays a query per round.
     fn load_review_verdicts(&self, run_ids: &[i64]) -> Result<HashMap<i64, String>, StoreError>;
 
+    // --- runaway-loop breaker crossings (STUDIO-1026; no Go counterpart — see
+    // [`BreakerCrossingRow`]) ------------------------------------------------------------------
+
+    /// How many COMPLETED review runs this daemon has recorded for one pull request — every `runs`
+    /// row whose `issue_identifier` is `pr:<owner>/<repo>#<number>@<any reviewer>` with
+    /// `outcome = completed`.
+    ///
+    /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
+    /// an operator's `clear` resets it. The breaker bounds SPEND, so it counts the runs that
+    /// actually HAPPENED. Reads with the caller's explicit empty/whitespace identifiers truncated by
+    /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
+    fn count_completed_review_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<i64, StoreError>;
+
+    /// How many runs this daemon has recorded for one exact `issue_identifier` — a ticket's
+    /// "attempts" for the breaker's notification, counting every author run whatever its outcome.
+    /// `0` for an identifier with no runs.
+    fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError>;
+
+    /// A ticket's lifetime token spend per provider, covering BOTH its author runs
+    /// (`runs.issue_identifier = ticket`) AND the review runs on its pull request
+    /// (`pr:<owner>/<repo>#<number>@*`), joined through `rhapsody_run_provenance.provider`
+    /// (STUDIO-1026).
+    ///
+    /// The per-ticket cap's input. A run with no recorded provider lands in the empty-provider
+    /// bucket exactly as [`Store::tokens_by_provider`] reports it, so the figure is never silently
+    /// short by the rows a pre-STUDIO-909 daemon wrote.
+    fn ticket_spend_by_provider(
+        &self,
+        ticket: &str,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<ProviderTokens>, StoreError>;
+
+    /// Records one ticket's breaker crossings, upserting on the ticket identifier. The caller
+    /// passes the whole row, so a crossing is persisted as an absolute fact (the highest notified
+    /// round count and the providers already notified) rather than an increment.
+    fn save_breaker_crossing(&self, row: &BreakerCrossingRow) -> Result<(), StoreError>;
+
+    /// Every persisted breaker crossing, in ticket order — the boot snapshot the crossing ledger is
+    /// rehydrated from, so a restart never re-notifies a crossing.
+    fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

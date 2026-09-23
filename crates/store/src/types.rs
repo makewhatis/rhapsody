@@ -552,3 +552,30 @@ pub struct ReviewBoundRow {
     /// The manager's settled decision, or `None` when there is none.
     pub adjudication: Option<ReviewAdjudication>,
 }
+
+/// One ticket's durable runaway-loop-breaker crossings (STUDIO-1026). No Go counterpart — the
+/// breaker is a Rhapsody addition end to end.
+///
+/// It exists so a crossing NOTIFIES ONCE and survives a restart: the maintainer wants to be told
+/// when a loop crosses a limit, not reminded every tick, and a daemon restart must not re-tell them
+/// about a crossing they have already seen. The row records the highest round count at which a
+/// round-crossing fired and the providers whose per-ticket cap has fired; the next round-crossing
+/// fires only at `notified_rounds + hold_after_rounds`, and a provider fires only once. An operator
+/// who un-holds the ticket by removing the label therefore gets the next crossing (for example
+/// round ten after five) rather than the same one again.
+///
+/// Keyed by the TICKET identifier. A ticket's PR can change (a rebuilt or re-introduced pull
+/// request), and "the ticket's spend" is what the maintainer wants bounded, so the key is the
+/// ticket and not the pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BreakerCrossingRow {
+    /// The human ticket id, e.g. `STUDIO-988`. The primary key.
+    pub ticket: String,
+    /// How many COMPLETED review runs had HAPPENED when the last round-crossing notified. `0`
+    /// before the first crossing. The next crossing fires at
+    /// `notified_rounds + review.hold_after_rounds`.
+    pub notified_rounds: i64,
+    /// The providers whose per-ticket cap has already notified. Newline-joined in one column, like
+    /// [`ReviewAdjudication::findings`]' reasons; a provider fires at most once per row.
+    pub notified_providers: Vec<String>,
+}

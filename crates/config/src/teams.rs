@@ -580,6 +580,15 @@ pub struct Review {
     /// DOES get adjudication; one that does not set it gets nothing, exactly as before.
     #[serde(default)]
     pub adjudicate_after_rounds: i64,
+    /// How many COMPLETED review runs on a pull request since it was introduced before the
+    /// runaway-loop breaker HOLDS the ticket and notifies the operator (STUDIO-1026). `0` — the
+    /// default — leaves the breaker off for round counting.
+    ///
+    /// ⚠️ Counts the review runs that actually HAPPENED (the `runs` ledger, `pr:<owner>/<repo>#<n>@*`),
+    /// never [`crate::Teams`]'s own dispatch counter: a round that was dispatched and never ran, or
+    /// that an operator cleared, spent nothing and must not count. The point is to bound real spend.
+    #[serde(default)]
+    pub hold_after_rounds: i64,
 }
 
 impl Default for Review {
@@ -594,6 +603,7 @@ impl Default for Review {
             effort: HarnessScoped::default(),
             required: Vec::new(),
             adjudicate_after_rounds: 0,
+            hold_after_rounds: 0,
         }
     }
 }
@@ -892,6 +902,24 @@ impl Teams {
             return None;
         }
         let n = self.review.adjudicate_after_rounds;
+        (n > 0).then(|| usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// The number of COMPLETED review runs on a pull request that trips the runaway-loop breaker
+    /// (STUDIO-1026), or `None` when the breaker is off.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: the `pr:` run ledger this counts is
+    /// written only by the ticketless path, so on any other installation the key is dead config and
+    /// must read as off rather than promise a hold that can never fire.
+    ///
+    /// Floored at one: a non-positive value is "off", and the smallest meaningful threshold is one
+    /// completed review run.
+    pub fn review_hold_after_rounds(&self) -> Option<usize> {
+        if !self.review_ticketless() {
+            return None;
+        }
+        let n = self.review.hold_after_rounds;
         (n > 0).then(|| usize::try_from(n).unwrap_or(usize::MAX))
     }
 
@@ -3052,6 +3080,7 @@ mod tests {
                 effort: HarnessScoped::bare("high"),
                 required: vec!["jimmy".to_string()],
                 adjudicate_after_rounds: 3,
+                hold_after_rounds: 5,
             },
             // Four, because `reviewers: 3` must be a config the ceiling accepts
             // (STUDIO-891: a roster of N satisfies at most N−1). The property
@@ -3097,6 +3126,47 @@ mod tests {
             Teams::load(&path).review_adjudicate_after_rounds(),
             Some(3),
             "the opt-in adjudication threshold must survive a save/load round-trip"
+        );
+        assert_eq!(
+            Teams::load(&path).review_hold_after_rounds(),
+            Some(5),
+            "the runaway-loop breaker threshold must survive a save/load round-trip"
+        );
+    }
+
+    /// STUDIO-1026: the breaker threshold is off when unset, non-positive, or on a non-ticketless
+    /// install — the three ways the key must be dead config rather than a promise nothing can keep.
+    #[test]
+    fn review_hold_after_rounds_is_off_unless_ticketless_and_positive() {
+        let on = |yaml: &str| {
+            Teams::parse(yaml)
+                .expect("parse")
+                .review_hold_after_rounds()
+        };
+        assert_eq!(
+            on("enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n"),
+            None,
+            "unset ⇒ off"
+        );
+        assert_eq!(
+            on(
+                "enabled: true\nreview:\n  mode: ticketless\n  hold_after_rounds: 0\nroster:\n  - name: alice\n"
+            ),
+            None,
+            "0 ⇒ off"
+        );
+        assert_eq!(
+            on(
+                "enabled: true\nreview:\n  mode: tickets\n  hold_after_rounds: 5\nroster:\n  - name: alice\n"
+            ),
+            None,
+            "not ticketless ⇒ off"
+        );
+        assert_eq!(
+            on(
+                "enabled: true\nreview:\n  mode: ticketless\n  hold_after_rounds: 5\nroster:\n  - name: alice\n"
+            ),
+            Some(5)
         );
     }
 
