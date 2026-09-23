@@ -1642,7 +1642,7 @@ mod tests {
             .expect("review reservation");
 
         assert_eq!(
-            o.handle_review_dismiss(&pr()),
+            o.handle_review_dismiss(&pr(), None),
             ReviewControlOutcome::Applied(1)
         );
         assert!(
