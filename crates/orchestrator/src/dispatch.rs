@@ -14,6 +14,12 @@
 //!     (single-project path) or a resolved project (multi path), exactly as the Go call sites pass.
 //!   * `running`/`claimed`/state sets are Go `map[string]bool` SETs → Rust [`HashSet`].
 //!   * Go's zero-`time.Time` sentinel from `lastRunStartedAt` becomes `Option<DateTime<Utc>>`.
+//!   * **A deliberate divergence, not a porting detail (STUDIO-1045):** `pr_suppressed` and
+//!     `review_reopen_eligible` measure a summons against the ticket's last author-run WINDOW (its
+//!     start and end), not its start alone, so a summon-token comment created while the author run
+//!     was live (or before it handed off) does not re-engage the author. The divergence from Go's
+//!     run-START boundary is recorded in the README "Divergences" entry for GitHub summons
+//!     (STUDIO-875/882).
 //!   * The otherwise-silent blocked-skip diagnostic (INF-249) logs via `tracing` (as the sibling
 //!     crates do) instead of a threaded `slog` logger; the fields (`issue_identifier`, `blocker`,
 //!     `blocker_state`) and per-blocker cadence are preserved.
@@ -671,13 +677,17 @@ impl Orchestrator {
     /// Reports whether a FRESH dispatch of `iss` should be suppressed because a prior run already
     /// materialized work as a linked GitHub PR (open OR merged) and no newer summons has arrived. It
     /// is the dispatch-side guard against re-picking an issue whose work is already done/in-review
-    /// when its Linear state briefly flaps back to active. Mirrors Go `prSuppressed`.
+    /// when its Linear state briefly flaps back to active. Mirrors Go `prSuppressed`, except for the
+    /// author-run window rule below (STUDIO-1045 — see README "Divergences").
     ///
-    /// Re-open rule (INF-448): a summons strictly newer than the ticket's LAST RUN START lifts the
-    /// suppression. Comparing to run START (not PR activity) honors a summons posted while a run was
-    /// in flight. Store-off fallback: with no run-start watermark the pre-INF-448 PR-activity
-    /// comparison applies; a PR with no comparable activity time stays lenient so a legitimately-
-    /// summoned issue is never wedged by missing metadata. Applied to FRESH pickups only.
+    /// Re-open rule (INF-448): a summons strictly newer than the ticket's LAST RUN lifts the
+    /// suppression. Comparing to the run's END (STUDIO-1045) rather than its start means a comment
+    /// created while the run was live — or before it handed off — is not a summons: every agent
+    /// posts from the operator's one GitHub account, so the author's own "I fixed it" reply must not
+    /// re-dispatch the author. A summons posted after the window still lifts the suppression.
+    /// Store-off fallback: with no run watermark the pre-INF-448 PR-activity comparison applies; a
+    /// PR with no comparable activity time stays lenient so a legitimately-summoned issue is never
+    /// wedged by missing metadata. Applied to FRESH pickups only.
     pub(crate) fn pr_suppressed(&self, iss: &Issue) -> bool {
         if !iss.linked_pr {
             return false;
@@ -687,16 +697,25 @@ impl Orchestrator {
             // a linked PR but no summons → already-done work, nothing new → suppress.
             None => return true,
         };
-        match self.last_run_started_at(&iss.identifier) {
+        match self.last_run_window(&iss.identifier) {
             None => match iss.latest_pr_activity_at {
                 // no watermark of any kind but a summons exists → be lenient.
                 None => false,
                 // pre-INF-448 fallback: suppress unless the summons is after the PR's last activity.
                 Some(pr) => summon <= pr,
             },
-            // suppress unless the summons arrived after the last run began (feedback the last round
-            // could not have consumed from its start).
-            Some(start) => summon <= start,
+            Some(w) => {
+                if w.contains(summon) {
+                    self.log_ignored_author_summons(iss, &w, summon);
+                }
+                match w.ended_at {
+                    // A run still live (no end recorded) cannot have its window beaten: any summons
+                    // the window does not contain predates it, and nothing newer has arrived.
+                    None => true,
+                    // Only a summons strictly newer than the run's END lifts the suppression.
+                    Some(end) => summon <= end,
+                }
+            }
         }
     }
 
@@ -704,12 +723,14 @@ impl Orchestrator {
     /// (symphony-29). The review-branch counterpart to [`eligible`] (which intentionally rejects
     /// non-active states); a review issue is handled ONLY here. Eligible iff it is neither running
     /// nor claimed, carries a `team_id` (required to promote it), carries a summons, AND that
-    /// summons is strictly newer than the START of the daemon's last run on it. No run / store
+    /// summons is strictly newer than the END of the daemon's last run on it. No run / store
     /// disabled / unparseable start ⇒ NOT eligible (the daemon never grabs a human-managed review
     /// ticket it has never worked; the check converges). A `rhapsody:human` ticket is NEVER eligible
     /// (STUDIO-949) — this ladder bypasses `eligibility`, so the human gate must be repeated here or
     /// the label leaks dispatch through the one path that does not consult it. Mirrors Go
-    /// `reviewReopenEligible`.
+    /// `reviewReopenEligible`, except for the run-END boundary (STUDIO-1045 — see README
+    /// "Divergences"): a comment created while the ticket's own author run was live, or before it
+    /// handed off, is not a summons and must not re-engage the author.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
         // Human-only gate (STUDIO-949). This ladder runs BEFORE `eligibility` — a review-state issue
         // is never active, so `eligibility` rejects it outright and the reopen path is the only one
@@ -731,21 +752,57 @@ impl Orchestrator {
             Some(s) => s,
             None => return false,
         };
-        match self.last_run_started_at(&iss.identifier) {
-            None => false, // never worked it (or store off / no start time) → don't grab it.
-            Some(last) => summon > last,
+        match self.last_run_window(&iss.identifier) {
+            // never worked it (or store off / no start time) → don't grab it.
+            None => false,
+            Some(w) => {
+                // ONLY a summons strictly newer than the run's END re-engages the author: the
+                // author-run window is `[start, end]`, and a comment created inside it is the
+                // author's own (every agent posts from the operator's account). A still-live run
+                // (no end) is never beaten. This boundary is the STUDIO-1045 fix.
+                let eligible = w.ended_at.is_some_and(|end| summon > end);
+                if !eligible && w.contains(summon) {
+                    self.log_ignored_author_summons(iss, &w, summon);
+                }
+                eligible
+            }
         }
     }
 
-    /// Returns the `started_at` of the most recent non-interrupted run the daemon recorded for
-    /// `identifier`, parsed as RFC3339; `None` when there is no such run, the store is disabled, or
-    /// no recent run has a parseable start time. It deliberately counts a still-running newest row
-    /// (its start IS the boundary a mid-run summons must beat, INF-448); INTERRUPTED rows are skipped
-    /// (boot recovery re-dispatches them, so counting their start would bury the triggering summons).
-    /// Runs come back newest-first, so the first qualifying start is the newest. Mirrors Go
-    /// `lastRunStartedAt` (its zero-`time.Time` sentinel becomes `None`).
-    pub(crate) fn last_run_started_at(&self, identifier: &str) -> Option<DateTime<Utc>> {
-        // Newest 10 rows only (Go's `issueHistory(…, 10)` bound) — enough to find a recent start and
+    /// Logs, at most once per (ticket, summon instant), that a summons was IGNORED because the
+    /// comment was created inside the live window of the ticket's own author run (STUDIO-1045).
+    /// Every agent posts to GitHub under the operator's ONE account, so the daemon cannot tell the
+    /// author's own reply from a human's by actor; the run window is what it does know. Repeating
+    /// this on every poll (both predicates consult the window) would be background noise, hence the
+    /// [`IgnoredSummonLog`] memo.
+    fn log_ignored_author_summons(&self, iss: &Issue, w: &RunWindow, at: DateTime<Utc>) {
+        if !self.ignored_author_summons.claim(&iss.identifier, at) {
+            return;
+        }
+        tracing::info!(
+            issue_identifier = %iss.identifier,
+            summon_at = %at,
+            run_started_at = %w.started_at,
+            run_ended_at = ?w.ended_at,
+            "ignoring a summons created while this ticket's own author run was live: the author's \
+             own comment (same GitHub account as every agent) is not a request to re-engage it"
+        );
+    }
+
+    /// The live window of the most recent non-interrupted, non-refused run the daemon recorded for
+    /// `identifier`; `None` when there is no such run, the store is disabled, or no qualifying row
+    /// has a parseable `started_at`. It deliberately includes a still-running newest row with
+    /// `ended_at: None` (its window is open until it ends); INTERRUPTED rows are skipped (boot
+    /// recovery re-dispatches them, so counting their start would bury the triggering summons), and
+    /// so are `refused` rows (a zero-turn refusal is not a run a summons had to beat). Runs come
+    /// back newest-first, so the first qualifying row is the newest.
+    ///
+    /// The END is the boundary both [`pr_suppressed`] and [`review_reopen_eligible`] measure a
+    /// summons against (STUDIO-1045): a comment created before the run ended was posted while the
+    /// author could have written it. Mirrors Go `lastRunStartedAt`'s row selection, widened to carry
+    /// the run's end; its zero-`time.Time` sentinel becomes `None`.
+    pub(crate) fn last_run_window(&self, identifier: &str) -> Option<RunWindow> {
+        // Newest 10 rows only (Go's `issueHistory(…, 10)` bound) — enough to find a recent run and
         // bound the store read on the dispatch path. A ticket whose ten newest rows were ALL refusal
         // episodes (ten separate episodes, so unlikely) reads as "never worked"; the window is
         // deliberately not widened here (STUDIO-988 review round 5, jimmy smaller).
@@ -760,11 +817,69 @@ impl Orchestrator {
             {
                 continue;
             }
-            if let Ok(t) = DateTime::parse_from_rfc3339(&r.started_at) {
-                return Some(t.with_timezone(&Utc));
-            }
+            let Ok(start) = DateTime::parse_from_rfc3339(&r.started_at) else {
+                continue;
+            };
+            // An empty `ended_at` is a row still running (`end_run` always stamps one otherwise).
+            // A corrupt (unparseable) end is treated as absent too, which makes the window
+            // open-ended: a daemon that cannot read when a run ended errs toward NOT re-engaging
+            // the author rather than toward a spurious re-dispatch.
+            let ended_at = if r.ended_at.is_empty() {
+                None
+            } else {
+                DateTime::parse_from_rfc3339(&r.ended_at)
+                    .ok()
+                    .map(|t| t.with_timezone(&Utc))
+            };
+            return Some(RunWindow {
+                started_at: start.with_timezone(&Utc),
+                ended_at,
+            });
         }
         None
+    }
+}
+
+/// The live window of one author run: when it began and, once it ended, when it ended
+/// (`ended_at: None` while the run is still going). A summon-token comment created inside this
+/// window cannot be the author asking for new work — every agent posts from the operator's one
+/// GitHub account — so it does not re-engage the author (STUDIO-1045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunWindow {
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) ended_at: Option<DateTime<Utc>>,
+}
+
+impl RunWindow {
+    /// Whether `at` falls inside the window: at or after the run's start and, once the run has
+    /// ended, at or before that end. A run with no recorded end has an open-ended window.
+    fn contains(&self, at: DateTime<Utc>) -> bool {
+        at >= self.started_at
+            && match self.ended_at {
+                Some(end) => at <= end,
+                None => true,
+            }
+    }
+}
+
+/// Which "this summon-token comment was created inside the ticket's own author-run window" notices
+/// have already been logged (STUDIO-1045). Mirrors [`crate::ghenrich::SummonDropLog`]: interior-
+/// mutable for the `&self` predicates, control-task-owned, and NOT an off-loop state seam. A
+/// poisoned lock is recovered rather than propagated — the worst a lost set costs is a repeated
+/// info line.
+#[derive(Debug, Default)]
+pub struct IgnoredSummonLog {
+    seen: Mutex<HashSet<String>>,
+}
+
+impl IgnoredSummonLog {
+    /// Claims the one log slot for (ticket, summon instant); `false` when already claimed.
+    fn claim(&self, identifier: &str, at: DateTime<Utc>) -> bool {
+        let key = format!("{identifier}@{}", at.to_rfc3339());
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key)
     }
 }
 
@@ -1307,22 +1422,106 @@ mod tests {
         base.identifier = "MT-1".into();
         base.linked_pr = true;
 
-        // Summons AFTER run start → NOT suppressed (re-dispatch); PR activity newer than the summons
-        // must no longer matter (the INF-448 dead zone).
+        // Summons AFTER the run's window (which `seed_run` ends a minute after `run_start`) → NOT
+        // suppressed (re-dispatch); PR activity newer than the summons must no longer matter (the
+        // INF-448 dead zone).
         let mut newer = base.clone();
         newer.latest_summon_at = Some(run_start + ChronoDuration::hours(1));
         newer.latest_pr_activity_at = Some(run_start + ChronoDuration::hours(2));
         assert!(
             !o.pr_suppressed(&newer),
-            "summons newer than last run START must lift suppression"
+            "summons newer than the last run's window must lift suppression"
         );
 
-        // Summons BEFORE run start → suppressed (stale).
+        // Summons BEFORE the run's window → suppressed (stale).
         let mut older = base.clone();
         older.latest_summon_at = Some(run_start - ChronoDuration::hours(1));
         assert!(
             o.pr_suppressed(&older),
-            "summons older than last run START must stay suppressed"
+            "summons older than the last run's window must stay suppressed"
+        );
+    }
+
+    // STUDIO-1045 acceptance, the reported STUDIO-1002 shape: a summon-token comment created INSIDE
+    // the ticket's own author-run window (the author's own "I fixed it" PR reply) must not reopen or
+    // re-dispatch the author. The window is `[start, end]`; the comment sits inside it.
+    //
+    // MUTATION: measure the summons against the run's START (the pre-STUDIO-1045 rule) instead of
+    // its window end and every `inside` assertion here reds.
+    #[test]
+    fn a_summons_created_inside_the_author_run_window_does_not_re_dispatch() {
+        let (o, st) = orch_with_store();
+        // `seed_run(ended_at)` seeds the window `[ended_at - 1m, ended_at]`.
+        let win_start = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        seed_run(
+            st.as_ref(),
+            "ID-1",
+            "MT-1",
+            win_start + ChronoDuration::minutes(1),
+        );
+        let inside = win_start + ChronoDuration::seconds(30);
+
+        let mut iss = base_issue();
+        iss.id = "ID-1".into();
+        iss.identifier = "MT-1".into();
+        iss.linked_pr = true;
+        iss.latest_summon_at = Some(inside);
+
+        assert!(
+            o.pr_suppressed(&iss),
+            "a summons created while the author run was live must not lift linked-PR suppression"
+        );
+
+        let mut review = iss.clone();
+        review.state = "In Review".into();
+        review.team_id = "team-1".into();
+        assert!(
+            !o.review_reopen_eligible(&review, &HashSet::new()),
+            "a summons created while the author run was live must not reopen the author"
+        );
+
+        // Control: the SAME comment, timestamped after the run ended (i.e. after it handed off),
+        // still summons — the daemon's own review-completion comment and a genuine operator comment
+        // land there, and neither may be blocked by the window rule.
+        let after = win_start + ChronoDuration::hours(1);
+        let mut outside = iss.clone();
+        outside.latest_summon_at = Some(after);
+        assert!(
+            !o.pr_suppressed(&outside),
+            "a summons after the run window still lifts suppression"
+        );
+        let mut outside_review = review.clone();
+        outside_review.latest_summon_at = Some(after);
+        assert!(
+            o.review_reopen_eligible(&outside_review, &HashSet::new()),
+            "a summons after the run window still reopens"
+        );
+    }
+
+    // STUDIO-1045: a run still live (no `ended_at`) has an OPEN window — a summon posted after its
+    // start is inside it, so it cannot reopen. Mirrors the incident's live window before the run
+    // ended.
+    #[test]
+    fn a_summon_after_a_still_live_runs_start_is_inside_its_window() {
+        let (o, st) = orch_with_store();
+        let start = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        st.start_run(rhapsody_store::RunStart {
+            issue_identifier: "MT-1".into(),
+            started_at: "2026-06-03T12:00:00Z".into(),
+            ..rhapsody_store::RunStart::default()
+        })
+        .expect("start run");
+
+        let mut review = base_issue();
+        review.id = "ID-1".into();
+        review.identifier = "MT-1".into();
+        review.state = "In Review".into();
+        review.team_id = "team-1".into();
+        review.latest_summon_at = Some(start + ChronoDuration::minutes(30));
+
+        assert!(
+            !o.review_reopen_eligible(&review, &HashSet::new()),
+            "a live run's window is open: a mid-run summons cannot reopen"
         );
     }
 
