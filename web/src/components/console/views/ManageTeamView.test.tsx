@@ -584,6 +584,8 @@ describe("Settings parity — the four fields the Podium editor also edits", () 
         api_key: "",
         bank_prefix: "rhap-",
         recall_top_k: 12,
+        team_bank: "",
+        team_recall_top_k: 3,
       },
       quorum: { enabled: true, reviewers: 3 },
       roster: [

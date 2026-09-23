@@ -66,9 +66,11 @@ use crate::server::StateProvider;
 /// what the surface is for (§5.1: a *constructed record, never a transcript*).
 const MAX_RETAIN_BODY: usize = 1 << 16;
 
-/// `GET /api/v1/teams/recall?identity=&query=&state=`.
+/// `GET /api/v1/teams/recall?identity=&query=&state=&scope=`.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RecallParams {
+    /// The teammate's bank to read. Ignored when `scope=team` (the shared bank
+    /// has no identity) and required otherwise.
     #[serde(default)]
     identity: String,
     #[serde(default)]
@@ -82,6 +84,11 @@ pub(crate) struct RecallParams {
     /// served with the valid records would read as a bank nobody has ever corrected.
     #[serde(default)]
     state: String,
+    /// Which bank to read (STUDIO-1040): absent/`identity`/`own` for a roster
+    /// identity's bank, `team` for the shared team bank. Validated by the daemon
+    /// so a typo is refused rather than silently answered from the wrong bank.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `GET /api/v1/teams/room?limit=` (STUDIO-650, T5).
@@ -108,22 +115,32 @@ impl RoomParams {
 /// `POST /api/v1/teams/invalidate` body.
 #[derive(Debug, Default, Deserialize)]
 struct InvalidateReq {
+    /// The teammate whose bank holds the record. Ignored when `scope: "team"`.
     #[serde(default)]
     identity: String,
     #[serde(default)]
     fact_id: String,
     #[serde(default)]
     reason: String,
+    /// `team` targets the shared bank (STUDIO-1040); absent/`identity`/`own`
+    /// targets the identity's own.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `POST /api/v1/teams/reinstate` body (STUDIO-689) — the invalidate's two identifying fields and
 /// **no `reason`**: a reinstate drops the stored one with the correction it explained.
 #[derive(Debug, Default, Deserialize)]
 struct ReinstateReq {
+    /// The teammate whose bank holds the record. Ignored when `scope: "team"`.
     #[serde(default)]
     identity: String,
     #[serde(default)]
     fact_id: String,
+    /// `team` targets the shared bank (STUDIO-1040); absent/`identity`/`own`
+    /// targets the identity's own.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `POST /api/v1/runs/{id}/post` body (STUDIO-653, T6). No `from` and no
@@ -141,13 +158,41 @@ struct PostReq {
     refs: Vec<String>,
 }
 
-/// `POST /api/v1/runs/{id}/retain` body — `content` and nothing else. Any other
-/// key is ignored, which is the point: there is no field an agent could add to
-/// influence the provenance the host stamps.
+/// `POST /api/v1/runs/{id}/retain` body — `content` and nothing else an agent
+/// could use to influence provenance. `shared` (STUDIO-1040) chooses the SHARED
+/// team bank over the run's own; it names no bank and no author, so it cannot
+/// forge either — the host still stamps the writer's identity.
 #[derive(Debug, Default, Deserialize)]
 struct RetainReq {
     #[serde(default)]
     content: String,
+    /// `true` ⇒ write to `memory.team_bank` instead of the caller's own bank.
+    #[serde(default)]
+    shared: bool,
+}
+
+/// Parses a memory request's `scope` (STUDIO-1040). Empty, `identity` and `own`
+/// select a roster identity's bank; `team` selects the shared bank. Anything else
+/// is `None`, which the caller turns into a loud `bad_request`: a mistyped scope
+/// served from the wrong bank would read as a bank with nothing in it.
+fn is_team_scope(scope: &str) -> Option<bool> {
+    match scope.trim() {
+        "" | "identity" | "own" => Some(false),
+        "team" => Some(true),
+        _ => None,
+    }
+}
+
+/// The `bad_request` body for an unrecognised scope. A plain `fn` rather than an
+/// `Err` arm so no `Result` carries a 128-byte `Response` (clippy's
+/// `result_large_err`).
+fn bad_scope(scope: &str) -> Response {
+    write_error(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        format!("scope {scope:?} is not one of identity, own, team"),
+        None,
+    )
 }
 
 /// Maps a [`TeamsMemoryError`] onto the response envelope. The split matters:
@@ -207,10 +252,20 @@ pub(crate) async fn handle_teams_recall(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    match provider
-        .teams_recall(&params.identity, &params.query, &params.state)
-        .await
-    {
+    let team = match is_team_scope(&params.scope) {
+        Some(team) => team,
+        None => return bad_scope(&params.scope),
+    };
+    let result = if team {
+        provider
+            .teams_recall_team(&params.query, &params.state)
+            .await
+    } else {
+        provider
+            .teams_recall(&params.identity, &params.query, &params.state)
+            .await
+    };
+    match result {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -304,10 +359,20 @@ pub(crate) async fn handle_teams_invalidate(
         Ok(req) => req,
         Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
     };
-    match provider
-        .teams_invalidate(&req.identity, &req.fact_id, &req.reason)
-        .await
-    {
+    let team = match is_team_scope(&req.scope) {
+        Some(team) => team,
+        None => return bad_scope(&req.scope),
+    };
+    let result = if team {
+        provider
+            .teams_invalidate_team(&req.fact_id, &req.reason)
+            .await
+    } else {
+        provider
+            .teams_invalidate(&req.identity, &req.fact_id, &req.reason)
+            .await
+    };
+    match result {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -327,7 +392,16 @@ pub(crate) async fn handle_teams_reinstate(
         Ok(req) => req,
         Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
     };
-    match provider.teams_reinstate(&req.identity, &req.fact_id).await {
+    let team = match is_team_scope(&req.scope) {
+        Some(team) => team,
+        None => return bad_scope(&req.scope),
+    };
+    let result = if team {
+        provider.teams_reinstate_team(&req.fact_id).await
+    } else {
+        provider.teams_reinstate(&req.identity, &req.fact_id).await
+    };
+    match result {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -360,7 +434,12 @@ pub(crate) async fn handle_run_retain(
         Ok(req) => req,
         Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
     };
-    match provider.teams_retain(run_id, &req.content).await {
+    let result = if req.shared {
+        provider.teams_retain_shared(run_id, &req.content).await
+    } else {
+        provider.teams_retain(run_id, &req.content).await
+    };
+    match result {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -1319,6 +1398,75 @@ mod tests {
             Some(2),
             "an empty query lists the bank: {body}"
         );
+    }
+
+    /// A memory runtime with a SHARED team bank configured (STUDIO-1040), so the
+    /// `scope=team` recall path is reachable.
+    fn teams_memory_with_team_bank(dir: &TempDir) -> Arc<TeamsMemory> {
+        let mut teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: vec!["rust".to_string()],
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        teams.memory.team_bank = "agent-team".to_string();
+        let bank = LocalBank::new(dir.0.join(DEFAULT_BANKS_SUBDIR), "agent-");
+        Arc::new(TeamsMemory::new(Arc::new(teams), Arc::new(bank)))
+    }
+
+    /// **The off-state guarantee for the recall RESPONSE** (STUDIO-1040): a personal recall's JSON
+    /// carries no `scope` key, so it is byte-identical to a build from before the shared bank
+    /// existed. The field appears only when the answer came from the shared bank — which is the only
+    /// case where it says something the reader cannot already infer.
+    #[tokio::test]
+    async fn a_personal_recall_response_has_no_scope_field() {
+        let dir = TempDir::new();
+        let mem = teams_memory_with_team_bank(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn_with(Arc::clone(&mem)).await;
+        post(
+            &format!("{url}/api/v1/runs/7/retain"),
+            r#"{"content":"the mirror lock is per-repo"}"#,
+        )
+        .await;
+        post(
+            &format!("{url}/api/v1/runs/7/retain"),
+            r#"{"content":"goldens are recaptured only","shared":true}"#,
+        )
+        .await;
+
+        let own = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/recall?identity=alice&query="))
+                .await
+                .expect("GET own recall"),
+        )
+        .await;
+        assert!(
+            own.get("scope").is_none(),
+            "a personal recall must add no field: {own}"
+        );
+        assert_eq!(own["identity"], "alice", "{own}");
+
+        let team = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/recall?scope=team&query="))
+                .await
+                .expect("GET team recall"),
+        )
+        .await;
+        assert_eq!(team["scope"], "team", "{team}");
+        assert_eq!(team["identity"], "agent-team", "{team}");
+        assert_eq!(team["facts"][0]["identity"], "alice", "{team}");
     }
 
     // ── the room's read side (STUDIO-650, T5) ──────────────────────────────────────────────────

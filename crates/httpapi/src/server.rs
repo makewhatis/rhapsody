@@ -294,6 +294,20 @@ pub trait StateProvider: Send + Sync {
         Err(TeamsMemoryError::Disabled)
     }
 
+    /// The SHARED team bank's memory for a free-text query (`GET
+    /// /api/v1/teams/recall?scope=team`, STUDIO-1040). The sibling of
+    /// [`teams_recall`](StateProvider::teams_recall): same query and state
+    /// handling against `memory.team_bank` instead of a roster identity's bank.
+    /// Defaults to `teams_disabled`, so a provider without a Teams runtime keeps
+    /// answering exactly as a Teams-off daemon.
+    async fn teams_recall_team(
+        &self,
+        _query: &str,
+        _state: &str,
+    ) -> Result<RecallView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
     /// The newest posts in the team room (`GET /api/v1/teams/room`, STUDIO-650 T5). Read-only:
     /// serving it advances no identity's cursor.
     async fn teams_room(&self, _limit: usize) -> Result<RoomView, TeamsMemoryError> {
@@ -304,6 +318,17 @@ pub trait StateProvider: Send + Sync {
     async fn teams_invalidate(
         &self,
         _identity: &str,
+        _fact_id: &str,
+        _reason: &str,
+    ) -> Result<InvalidateView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Mark one record in the SHARED team bank non-valid (`POST
+    /// /api/v1/teams/invalidate`, `scope: "team"`; STUDIO-1040). Same rules,
+    /// including the required reason.
+    async fn teams_invalidate_team(
+        &self,
         _fact_id: &str,
         _reason: &str,
     ) -> Result<InvalidateView, TeamsMemoryError> {
@@ -321,9 +346,31 @@ pub trait StateProvider: Send + Sync {
         Err(TeamsMemoryError::Disabled)
     }
 
+    /// Put one invalidated record in the SHARED team bank back into recall
+    /// (`POST /api/v1/teams/reinstate`, `scope: "team"`; STUDIO-1040).
+    async fn teams_reinstate_team(
+        &self,
+        _fact_id: &str,
+    ) -> Result<ReinstateView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
     /// Record what a live run learned, with the provenance stamped by the HOST from the run id —
     /// never from the request body (`POST /api/v1/runs/{id}/retain`, §5.1).
     async fn teams_retain(
+        &self,
+        _run_id: i64,
+        _content: &str,
+    ) -> Result<RetainView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Record what a live run learned into the SHARED team bank
+    /// (`POST /api/v1/runs/{id}/retain` with `shared: true`; STUDIO-1040).
+    /// Provenance is stamped by the host exactly as
+    /// [`teams_retain`](StateProvider::teams_retain) stamps it — the caller's
+    /// identity is still the record's author, so a shared fact cannot be forged.
+    async fn teams_retain_shared(
         &self,
         _run_id: i64,
         _content: &str,

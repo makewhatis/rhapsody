@@ -126,12 +126,17 @@ export function useTeamsRecall(identity: string, query: string, enabled: boolean
 
 // useInvalidateFact marks one record non-valid with its reason. On success it invalidates the
 // recall cache so the fact leaves the listing immediately — the round-trip design §5.2.3 asks the
-// button to close, with no reload.
+// button to close, with no reload. `scope: "team"` (STUDIO-1040) targets the shared bank instead
+// of the author's own; it is omitted for a personal fact so that request is byte-identical.
 export function useInvalidateFact() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (v: { identity: string; factID: string; reason: string }) =>
-      postTeamsInvalidate(v.identity, v.factID, v.reason),
+    mutationFn: (v: { identity: string; factID: string; reason: string; scope?: string }) =>
+      // Only a shared fact names a scope: a personal invalidation keeps the exact three-field call
+      // it made before STUDIO-1040.
+      v.scope === "team"
+        ? postTeamsInvalidate(v.identity, v.factID, v.reason, "team")
+        : postTeamsInvalidate(v.identity, v.factID, v.reason),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: TEAMS_RECALL_QUERY_KEY });
     },
@@ -140,12 +145,14 @@ export function useInvalidateFact() {
 
 // useReinstateFact undoes one invalidation (STUDIO-689) — §5.3's reversal, refreshing the same
 // recall cache the invalidate does, so the card the operator is looking at agrees with the bank
-// without a reload.
+// without a reload. `scope: "team"` targets the shared bank (STUDIO-1040).
 export function useReinstateFact() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (v: { identity: string; factID: string }) =>
-      postTeamsReinstate(v.identity, v.factID),
+    mutationFn: (v: { identity: string; factID: string; scope?: string }) =>
+      v.scope === "team"
+        ? postTeamsReinstate(v.identity, v.factID, "team")
+        : postTeamsReinstate(v.identity, v.factID),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: TEAMS_RECALL_QUERY_KEY });
     },
