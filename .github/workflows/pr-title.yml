@@ -25,13 +25,15 @@ on:
 permissions:
   contents: read
 
-# Per-PR, cancel-in-progress: unlike every other workflow here, `edited` fires without a new commit, so
-# a few quick title corrections would otherwise queue several runs — each one taking the single
-# self-hosted Mac runner ahead of the lint/test/web jobs that actually need it. Only the newest title
-# matters, and it reports on the same head SHA, so superseding an in-flight run is safe.
+# Per-branch, cancel-in-progress (STUDIO-1027): `github.ref` is the PR's merge ref, so this is
+# per-PR — a few quick title corrections/commits supersede the older run instead of queueing several
+# behind the single self-hosted Mac runner. `main` is excluded from cancellation for the same reason
+# as ci.yml, even though this workflow only runs on pull_request events. Unlike every other workflow
+# here, `edited` fires without a new commit; only the newest title matters and it reports on the same
+# head SHA, so superseding an in-flight run is safe.
 concurrency:
-  group: pr-title-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Job id `pr-title` is the branch-protection context name. Add it to the required checks alongside
