@@ -930,6 +930,15 @@ impl Orchestrator {
                 // Left the active set: declared hand-off (completed), external non-terminal move
                 // (stopped), a Done-type terminal (completed), or a cancel-type terminal (stopped).
                 // Drop the claim + continuation marker and DON'T schedule a retry.
+                //
+                // When the departure was to a TERMINAL state (not a configured review state that a
+                // later dispatch may resume), its retained opencode session is dead weight — and in
+                // legacy mode a copy of the operator's credential (STUDIO-1043 B1).
+                if terminal.contains(&normalize_state(&e.last_state))
+                    || terminal.contains(&normalize_state(&re.issue.state))
+                {
+                    self.discard_retained_opencode_session(&re.issue.identifier);
+                }
                 self.completed.remove(&e.issue_id);
                 self.claimed.remove(&e.issue_id);
                 self.persist_end_run(&re, &outcome, &reason);
@@ -1612,6 +1621,46 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, store::OUTCOME_COMPLETED);
         assert_eq!(runs[0].error, "", "no 'ticket moved externally' diagnosis");
+    }
+
+    /// STUDIO-1043: a run whose agent moved the ticket to a TERMINAL state itself ends through this
+    /// release branch (not reconcile's terminate), and its retained opencode session must be
+    /// discarded there — a terminal ticket never resumes it (review B1).
+    #[test]
+    fn on_worker_exit_terminal_discards_the_retained_opencode_session() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let state_root = TempDir::new();
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.opencode.state_root = state_root.path.clone();
+        }
+        let (kept_dir, rec) = seed_opencode_session(
+            std::path::Path::new(&state_root.path),
+            "MT-1",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st,
+            err_msg: String::new(),
+            last_state: "Done".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            refused: false,
+        });
+
+        assert!(
+            !o.running.contains_key("1"),
+            "terminal exit releases the run"
+        );
+        assert!(
+            !kept_dir.exists(),
+            "a terminal ticket's retained opencode session directory must be discarded"
+        );
+        assert!(!rec.exists(), "and its record removed");
     }
 
     /// STUDIO-909: a plain, unrouted dispatch records what it ACTUALLY ran on — the configured

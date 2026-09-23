@@ -139,6 +139,44 @@ pub fn discard(state_root: &str, issue: &str) {
     clear(state_root, issue);
 }
 
+/// Discards every retained session older than [`RETENTION_MS`], without needing the issue it belongs
+/// to to be dispatched again. [`select`]'s retention check only runs when that SAME issue is
+/// redispatched, so an issue that goes terminal, is cancelled by hand, or simply never comes back
+/// would otherwise keep its directory forever — and in legacy mode that directory holds a copy of
+/// the operator's credential. The daemon calls this at startup and once per tick, which is what makes
+/// the retention bound hold with no redispatch (STUDIO-1043 review B1).
+///
+/// A record file that does not parse is removed too: it can never be selected, and leaving it would
+/// only re-log the same warning on every sweep. Returns how many records were discarded.
+pub fn sweep(state_root: &str, now_ms: i64) -> usize {
+    let Ok(root) = resolved_root(state_root) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(root.join(RECORDS_DIR)) else {
+        return 0;
+    };
+    let mut discarded = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<ResumeRecord>(&text) {
+            Ok(rec) if now_ms.saturating_sub(rec.saved_at_ms) > RETENTION_MS => {
+                discard_record_dir(&root, &rec);
+                remove_file_best_effort(&path);
+                discarded += 1;
+            }
+            Ok(_) => {}
+            Err(_) => remove_file_best_effort(&path),
+        }
+    }
+    discarded
+}
+
 /// Removes the directory a record names, if it is a managed child of `root`.
 fn discard_record_dir(root: &Path, rec: &ResumeRecord) {
     let dir = Path::new(&rec.dir);
@@ -247,6 +285,13 @@ pub fn select(
         return ResumeDecision::Cold(
             "the retained session is past its retention window".to_string(),
         );
+    }
+    // A record with no session id can never be passed back as `-s <id>`; treat it as stale rather
+    // than keeping a directory nothing can ever resume.
+    if rec.session_id.is_empty() {
+        discard_record_dir(&root, &rec);
+        clear(state_root, issue);
+        return ResumeDecision::Cold("the retained session has no session id".to_string());
     }
     if rec.harness != harness {
         discard_record_dir(&root, &rec);
@@ -416,6 +461,57 @@ mod tests {
             other => panic!("expected cold start, got {other:?}"),
         }
         assert!(!dir.exists(), "a session past retention must be removed");
+    }
+
+    #[test]
+    fn the_retention_sweep_discards_an_expired_record_without_a_dispatch() {
+        let tmp = TempDir::new();
+        let r = root(&tmp);
+        let expired_dir = session_dir(&r, "rhapsody-opencode-STUDIO-1-1-1-0");
+        let fresh_dir = session_dir(&r, "rhapsody-opencode-STUDIO-2-2-2-0");
+        let mut expired = record(&expired_dir, "m");
+        expired.saved_at_ms = 1_000_000;
+        save(&r, "STUDIO-1", &expired).expect("save expired");
+        let mut fresh = record(&fresh_dir, "m");
+        fresh.saved_at_ms = 1_000_000 + 25 * 60 * 60 * 1000;
+        save(&r, "STUDIO-2", &fresh).expect("save fresh");
+
+        // 25h after the expired record was written; no dispatch of either issue.
+        let now = 1_000_000 + 25 * 60 * 60 * 1000;
+        assert_eq!(sweep(&r, now), 1, "exactly the expired record is swept");
+        assert!(!expired_dir.exists(), "the expired directory is removed");
+        assert!(
+            record_path(&r, "STUDIO-1").is_some_and(|p| !p.exists()),
+            "the expired record is removed"
+        );
+        assert!(fresh_dir.exists(), "a fresh session survives the sweep");
+        assert!(record_path(&r, "STUDIO-2").is_some_and(|p| p.exists()));
+    }
+
+    #[test]
+    fn the_retention_sweep_removes_a_corrupt_record_file() {
+        let tmp = TempDir::new();
+        let r = root(&tmp);
+        let path = record_path(&r, "STUDIO-1043").expect("path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"{ not json").expect("write");
+        assert_eq!(sweep(&r, 1_000_000), 0, "a corrupt record is not a discard");
+        assert!(!path.exists(), "but it is removed");
+    }
+
+    #[test]
+    fn a_record_without_a_session_id_colds_and_is_discarded() {
+        let tmp = TempDir::new();
+        let r = root(&tmp);
+        let dir = session_dir(&r, "rhapsody-opencode-STUDIO-1043-1-2-0");
+        let mut rec = record(&dir, "m");
+        rec.session_id = String::new();
+        save(&r, "STUDIO-1043", &rec).expect("save");
+        match select(&r, "STUDIO-1043", HARNESS, "m", "/ws", 1_000_100) {
+            ResumeDecision::Cold(reason) => assert!(reason.contains("session id"), "{reason}"),
+            other => panic!("expected cold start, got {other:?}"),
+        }
+        assert!(!dir.exists());
     }
 
     #[test]
