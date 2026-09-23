@@ -242,6 +242,36 @@ impl Store for Noop {
     fn mark_review_truncated(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())
     }
+    // The review evidence ledger (STUDIO-1009) disappears with the rest of the watch state: with
+    // persistence off there is no watch row to carry a completed-review record and no bound row to
+    // carry a generation or an evidence revision, so every write is a silent success and every read
+    // is empty — the guard-free contract above.
+    fn record_review_completion(
+        &self,
+        _key: &ReviewWatchKey,
+        _status: &str,
+        _completed: &ReviewCompleted,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn review_completed(
+        &self,
+        _key: &ReviewWatchKey,
+    ) -> Result<Option<ReviewCompleted>, StoreError> {
+        Ok(None)
+    }
+    fn ensure_review_generation(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn increment_review_generation(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_review_evidence_rev(&self, _pr: &str, _evidence_rev: i64) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn review_bound(&self, _pr: &str) -> Result<Option<ReviewBoundRow>, StoreError> {
+        Ok(None)
+    }
     fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())
     }

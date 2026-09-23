@@ -1083,6 +1083,35 @@ mod tests {
         fn load_review_bounds(&self) -> Result<Vec<rhapsody_store::ReviewBoundRow>, StoreError> {
             self.0.load_review_bounds()
         }
+        fn ensure_review_generation(&self, pr: &str) -> Result<(), StoreError> {
+            self.0.ensure_review_generation(pr)
+        }
+        fn increment_review_generation(&self, pr: &str) -> Result<(), StoreError> {
+            self.0.increment_review_generation(pr)
+        }
+        fn set_review_evidence_rev(&self, pr: &str, evidence_rev: i64) -> Result<(), StoreError> {
+            self.0.set_review_evidence_rev(pr, evidence_rev)
+        }
+        fn review_bound(
+            &self,
+            pr: &str,
+        ) -> Result<Option<rhapsody_store::ReviewBoundRow>, StoreError> {
+            self.0.review_bound(pr)
+        }
+        fn record_review_completion(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+            status: &str,
+            completed: &rhapsody_store::ReviewCompleted,
+        ) -> Result<(), StoreError> {
+            self.0.record_review_completion(key, status, completed)
+        }
+        fn review_completed(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<Option<rhapsody_store::ReviewCompleted>, StoreError> {
+            self.0.review_completed(key)
+        }
         fn save_review_done(&self, row: rhapsody_store::ReviewDoneRow) -> Result<(), StoreError> {
             self.0.save_review_done(row)
         }

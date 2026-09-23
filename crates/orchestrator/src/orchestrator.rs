@@ -757,6 +757,12 @@ pub struct Orchestrator {
     /// prepared-review completion revalidation (by `.open` + `.head`).
     pub(crate) review_observed_head:
         HashMap<crate::prstate::PrCoord, crate::prepare::ReviewHeadObservation>,
+    /// The evidence ledger's per-pull-request last-seen fingerprint and revision (STUDIO-1009;
+    /// design record `manager-agent-design.md` §5.2). Written and read ONLY on the control task,
+    /// beside `review_rounds`. The revision half is durable (`rhapsody_review_bound.evidence_rev`);
+    /// the fingerprint half is in-memory, so a restart re-baselines it on the first observation
+    /// (which does not increment) while the revision itself survives.
+    pub(crate) review_evidence: HashMap<crate::prstate::PrCoord, (String, i64)>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
     /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
@@ -1087,6 +1093,7 @@ impl Orchestrator {
             review_watch_swept: None,
             review_watch_unreadable: HashMap::new(),
             review_observed_head: HashMap::new(),
+            review_evidence: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
             automerge_ledger: None,

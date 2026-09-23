@@ -2876,6 +2876,39 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ReviewBoundRow>, rhapsody_store::StoreError> {
             self.0.load_review_bounds()
         }
+        fn ensure_review_generation(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.ensure_review_generation(a0)
+        }
+        fn increment_review_generation(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.increment_review_generation(a0)
+        }
+        fn set_review_evidence_rev(
+            &self,
+            a0: &str,
+            a1: i64,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_review_evidence_rev(a0, a1)
+        }
+        fn review_bound(
+            &self,
+            a0: &str,
+        ) -> Result<Option<rhapsody_store::ReviewBoundRow>, rhapsody_store::StoreError> {
+            self.0.review_bound(a0)
+        }
+        fn record_review_completion(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+            a1: &str,
+            a2: &rhapsody_store::ReviewCompleted,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.record_review_completion(a0, a1, a2)
+        }
+        fn review_completed(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<Option<rhapsody_store::ReviewCompleted>, rhapsody_store::StoreError> {
+            self.0.review_completed(a0)
+        }
         fn save_review_done(
             &self,
             row: rhapsody_store::ReviewDoneRow,

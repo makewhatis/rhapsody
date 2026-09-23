@@ -324,6 +324,29 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
+    /// Records the EVIDENCE the last review that COMPLETED with a verdict left behind (STUDIO-1009;
+    /// design record `manager-agent-design.md` §5.4) — the four `last_completed_*` columns beside
+    /// [`Store::mark_review_completed`]'s `last_reviewed_sha`/`status`.
+    ///
+    /// `status` is the same terminal verdict [`Store::mark_review_completed`] takes, so the two
+    /// writes that describe one completed round can be one call. The record's `sha` is written to
+    /// `last_reviewed_sha` as well, so `last_completed_sha` and `last_reviewed_sha` always describe
+    /// the same round. This is the ONLY writer of the four columns, and it is called ONLY for a
+    /// review run that completed with a declared verdict — a truncated, dropped, failed or crashed
+    /// round calls [`Store::mark_review_truncated`] (or nothing) instead, and must leave them
+    /// untouched. A no-op when the row is absent.
+    fn record_review_completion(
+        &self,
+        key: &ReviewWatchKey,
+        status: &str,
+        completed: &ReviewCompleted,
+    ) -> Result<(), StoreError>;
+
+    /// The completed-review record for one (PR, reviewer) row, or `None` when no review of that pair
+    /// has completed with a verdict (or the row does not exist).
+    fn review_completed(&self, key: &ReviewWatchKey)
+    -> Result<Option<ReviewCompleted>, StoreError>;
+
     /// Records that a reviewer run ENDED without a declared verdict — it either burned its whole
     /// turn budget mid-review (STUDIO-721) or declared a hand-off whose payload was neither
     /// `approved` nor a recognised rejection (STUDIO-894) — by parking `status` at
@@ -438,6 +461,33 @@ pub trait Store {
     /// Every durable review bound, in `pr` order — the boot snapshot the round counter and the
     /// adjudication ledger are rehydrated from.
     fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError>;
+
+    /// Establishes `pr`'s review LOOP GENERATION at 1 if no bound row exists, and does nothing when
+    /// one does (STUDIO-1009; design record §5.1). Called at the pull request's FIRST introduction
+    /// into the watch set; a handoff re-introduction is a no-op, which is exactly the F9 rule — a
+    /// re-introduced row is not a new generation.
+    ///
+    /// A generation START at 1 (not 0) so a real generation is never confused with the M1 finding
+    /// rows' placeholder `0`, and so "generation 0" can only mean a bound row written before M2.
+    fn ensure_review_generation(&self, pr: &str) -> Result<(), StoreError>;
+
+    /// The operator's deliberate reset of `pr`'s review loop (STUDIO-1009; §7.4): INCREMENTS the
+    /// loop generation and zeroes the round counter and any settled adjudication in the same write.
+    /// This is the `/clear` path's durable effect, replacing the old wholesale delete — the row (and
+    /// its generation) must survive a clear so later rounds know a reset happened.
+    ///
+    /// The row is created at generation 1 when it does not exist, so a clear on a watched pull
+    /// request the daemon has never charged still leaves a generation behind.
+    fn increment_review_generation(&self, pr: &str) -> Result<(), StoreError>;
+
+    /// Writes `pr`'s evidence revision (§5.2), creating the bound row when it does not exist. Like
+    /// [`Store::set_review_rounds`] the value is the caller's total rather than an increment: the
+    /// control task is the single writer and holds the last-seen fingerprint in memory, so a
+    /// last-write-wins column can never drift.
+    fn set_review_evidence_rev(&self, pr: &str, evidence_rev: i64) -> Result<(), StoreError>;
+
+    /// One pull request's durable review bound, or `None` when the daemon holds none for it.
+    fn review_bound(&self, pr: &str) -> Result<Option<ReviewBoundRow>, StoreError>;
 
     // --- durable terminal-move ledger (STUDIO-1007; no Go counterpart — see [`ReviewDoneRow`]) ---
 

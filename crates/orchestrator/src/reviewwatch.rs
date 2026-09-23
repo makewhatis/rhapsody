@@ -647,6 +647,7 @@ async fn refresh_observed_head(
     {
         Ok(lookup) => PrObservation {
             unchanged_from: obs.unchanged_from,
+            head_patch_id: obs.head_patch_id,
             pr: obs.pr,
             lookup,
         },
@@ -685,10 +686,10 @@ async fn unchanged_reviewed_shas(
     pr: &PrCoord,
     head: &str,
     reviewed: &[String],
-) -> Vec<String> {
+) -> (Vec<String>, String) {
     let head = head.trim();
     if head.is_empty() {
-        return Vec::new();
+        return (Vec::new(), String::new());
     }
     let olds: Vec<&str> = reviewed
         .iter()
@@ -696,7 +697,7 @@ async fn unchanged_reviewed_shas(
         .filter(|s| !s.is_empty() && *s != head)
         .collect();
     if olds.is_empty() {
-        return Vec::new();
+        return (Vec::new(), String::new());
     }
     let base = match src.pr_base_ref(&pr.owner, &pr.repo, pr.number).await {
         Ok(base) => base,
@@ -706,7 +707,7 @@ async fn unchanged_reviewed_shas(
                 "ticketless review: the pull request's base branch could not be read; a head move \
                  is not proven to have carried no work, so a normal round will be armed"
             );
-            return Vec::new();
+            return (Vec::new(), String::new());
         }
     };
     let head_patch = match src.merge_base_patch(&pr.owner, &pr.repo, &base, head).await {
@@ -717,9 +718,13 @@ async fn unchanged_reviewed_shas(
                 "ticketless review: the head's diff against the base could not be read; a normal \
                  round will be armed"
             );
-            return Vec::new();
+            return (Vec::new(), String::new());
         }
     };
+    // The head's own patch-id (STUDIO-1009): computed from the fingerprint already in hand, so it
+    // costs no extra `gh` call. Recorded on the dispatched run so a completion can persist it as the
+    // reviewed change's patch-id.
+    let head_patch_id = crate::ghsummons::stable_patch_id(&head_patch);
     let mut unchanged = Vec::new();
     for old in olds {
         if ctx.is_cancelled() {
@@ -744,7 +749,7 @@ async fn unchanged_reviewed_shas(
             }
         }
     }
-    unchanged
+    (unchanged, head_patch_id)
 }
 
 /// The effective watcher cadence in milliseconds, read fresh from the shared atomic (STUDIO-974).
@@ -875,7 +880,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                     .chain(known.requested_shas.iter())
                     .any(|s| !s.is_empty() && s == &snap.head_sha)
             {
-                fresh.unchanged_from = unchanged_reviewed_shas(
+                let (unchanged, head_patch_id) = unchanged_reviewed_shas(
                     &ctx,
                     diff.as_ref(),
                     &fresh.pr,
@@ -883,6 +888,8 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                     &known.reviewed_shas,
                 )
                 .await;
+                fresh.unchanged_from = unchanged;
+                fresh.head_patch_id = head_patch_id;
             }
             let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
             slots = Some(left);
@@ -1390,6 +1397,8 @@ impl Orchestrator {
                             head: &snap.head_sha,
                             merge_state: &snap.merge_state,
                             unchanged_from: &obs.unchanged_from,
+                            head_patch_id: &obs.head_patch_id,
+                            draft: snap.is_draft,
                         },
                         &mut slots,
                         &mut report,
@@ -1813,6 +1822,108 @@ impl Orchestrator {
                  budget or forgets a manager decision"
             );
         }
+        // The evidence revisions (STUDIO-1009; §5.2) come back with the counters — but only their
+        // durable half is rehydrated here, by NOT touching `review_evidence`. An absent map entry
+        // means "this process has observed nothing yet", and `record_review_evidence` reads the
+        // durable revision and treats its first fingerprint as a baseline rather than a change, so a
+        // restart does not look like every pull request's evidence moved.
+    }
+
+    /// Maintains one pull request's EVIDENCE REVISION (STUDIO-1009; design record §5.2), on the
+    /// control task.
+    ///
+    /// Reads every listed evidence input — the head, the pull request's live watch rows, its finding
+    /// set, the `rhapsody:human` hold (through `labelled_and_primed`, which fails closed when the
+    /// label set has not been read), the observed draft/conflict state and the generation — renders
+    /// them to a fingerprint, and increments the durable revision when the fingerprint CHANGED since
+    /// the last observation on this process. The first observation after a restart is a baseline, not
+    /// a change, because a restart is not evidence moving.
+    ///
+    /// Comments carrying a `rhapsody-manager` marker and tracker state moves are deliberately absent
+    /// from [`crate::reviewevidence::EvidenceInputs`]'s fingerprint: a decision's own external
+    /// effects must not invalidate the decision. Best-effort like every other store write here.
+    pub(crate) fn record_review_evidence(
+        &mut self,
+        pr: &PrCoord,
+        rows: &[ReviewWatchRow],
+        head: &str,
+        draft: Option<bool>,
+        conflict: Option<bool>,
+    ) {
+        if !self.review_ticketless_enabled() {
+            return; // §16
+        }
+        let key = churn_key(pr);
+        let bound = match self.store().review_bound(&key) {
+            Ok(bound) => bound,
+            Err(e) => {
+                // Fail closed: without the current generation and revision there is nothing to
+                // compare against, and a fabricated change would be a false evidence event.
+                tracing::warn!(pr = %pr, err = %e, "ticketless review: the review bound could not be read; the evidence revision is left alone");
+                return;
+            }
+        };
+        let (generation, durable_rev) = match bound {
+            Some(bound) => (bound.generation, bound.evidence_rev),
+            None => (0, 0),
+        };
+        let findings = match self.store().load_review_findings(&pr.to_string()) {
+            Ok(findings) => findings,
+            Err(e) => {
+                tracing::warn!(pr = %pr, err = %e, "ticketless review: the finding set could not be read; the evidence revision is left alone");
+                return;
+            }
+        };
+        // The hold, through the pair that fails closed: an unprimed label set is `None`, NOT
+        // "no hold".
+        let (labelled, primed) = self.human_holds.labelled_and_primed();
+        let held_origin = rows.iter().filter(|r| row_is(r, pr)).any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()))
+        });
+        let human_hold = primed.then_some(held_origin);
+        let watch_rows: Vec<crate::reviewevidence::EvidenceWatchRow> = rows
+            .iter()
+            .filter(|r| row_is(r, pr))
+            .map(crate::reviewevidence::EvidenceWatchRow::of)
+            .collect();
+        let finding_tokens: Vec<String> = findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    f.pr, f.generation, f.reviewer, f.finding_id, f.revision, f.status
+                )
+            })
+            .collect();
+        let inputs = crate::reviewevidence::EvidenceInputs {
+            head_sha: head.to_string(),
+            watch_rows,
+            findings: finding_tokens,
+            human_hold,
+            draft,
+            conflict,
+            // CI state is not observed anywhere on this path yet; `None` renders as unobserved and
+            // is what a later ticket replaces when it reads a checks state.
+            ci: None,
+            generation,
+            ..Default::default()
+        };
+        let fingerprint = crate::reviewevidence::evidence_fingerprint(&inputs);
+        let (prev_fingerprint, current_rev) = match self.review_evidence.get(pr) {
+            Some((fp, rev)) if !fp.is_empty() => (Some(fp.as_str()), *rev),
+            Some((_, rev)) => (None, *rev),
+            None => (None, durable_rev),
+        };
+        let next_rev =
+            crate::reviewevidence::next_evidence_rev(prev_fingerprint, current_rev, &fingerprint);
+        if next_rev != current_rev
+            && let Err(e) = self.store().set_review_evidence_rev(&key, next_rev)
+        {
+            tracing::warn!(pr = %pr, err = %e, "ticketless review: the evidence revision could not be persisted");
+        }
+        self.review_evidence
+            .insert(pr.clone(), (fingerprint, next_rev));
     }
 
     /// The decision-relevant open facts at `head`, one human-readable line per live row. Named on an
@@ -2721,10 +2832,26 @@ impl Orchestrator {
             head,
             merge_state,
             unchanged_from,
+            head_patch_id,
+            draft,
         } = observed;
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
+        // The evidence revision (STUDIO-1009; §5.2) is maintained HERE, once per pull request this
+        // tick re-evaluated, from the observation and the local reads. Above every gate below so a
+        // change is recorded even on a tick that dispatches nothing — the head moving is evidence
+        // whether or not a round follows it.
+        self.record_review_evidence(
+            pr,
+            rows,
+            head,
+            draft,
+            // An EMPTY merge state is an unsettled read, not "no conflict" (the same tri-state the
+            // draft field keeps): fold it to `None` so the evidence revision does not treat a
+            // non-observation as a changed input.
+            (!merge_state.is_empty()).then_some(merge_state == MERGE_STATE_DIRTY),
+        );
         // STUDIO-977 C: the heads whose CHANGE is the same as `head`'s — `head` itself, plus every
         // previously-reviewed head the off-loop watcher proved patch-identical (STUDIO-960's
         // `unchanged_from`). A `ship` may satisfy approval-at-head for an approval at one of these,
@@ -3204,6 +3331,10 @@ impl Orchestrator {
                 // `last_reviewed_sha` before the dispatch writes this head as requested
                 // (STUDIO-959). The watcher has no prior-round record to offer here.
                 prior_sha: String::new(),
+                // The head's patch-id, computed off-loop by the watcher when it had a `gh`
+                // comparison to reuse (STUDIO-1009); empty when it did not, which the completion
+                // path records as unknown and the approval predicate fails closed on.
+                head_patch_id: head_patch_id.to_string(),
             };
             // The watcher bookkeeping travels WITH the dispatch, so an asynchronous preparation can
             // apply it on acceptance exactly as the synchronous arm does here (STUDIO-988 review
@@ -3838,6 +3969,11 @@ struct ObservedHead<'a> {
     /// The head SHAs this pull request's rows have already READ, for STUDIO-960's proof that a head
     /// move carried no new work.
     unchanged_from: &'a [String],
+    /// The current head's patch-id, when the watcher computed one off-loop (STUDIO-1009). Empty when
+    /// it had no comparison to reuse; carried onto the dispatched run so a completion can record it.
+    head_patch_id: &'a str,
+    /// Whether the pull request is a draft, as last observed (STUDIO-1009's evidence input).
+    draft: Option<bool>,
 }
 
 /// One pull request's record of the conflict route-back the watcher has already fired
@@ -4544,6 +4680,36 @@ mod tests {
         fn load_review_bounds(&self) -> Result<Vec<rs::ReviewBoundRow>, rs::StoreError> {
             self.0.load_review_bounds()
         }
+        fn ensure_review_generation(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.ensure_review_generation(pr)
+        }
+        fn increment_review_generation(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.increment_review_generation(pr)
+        }
+        fn set_review_evidence_rev(
+            &self,
+            pr: &str,
+            evidence_rev: i64,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_review_evidence_rev(pr, evidence_rev)
+        }
+        fn review_bound(&self, pr: &str) -> Result<Option<rs::ReviewBoundRow>, rs::StoreError> {
+            self.0.review_bound(pr)
+        }
+        fn record_review_completion(
+            &self,
+            key: &rs::ReviewWatchKey,
+            status: &str,
+            completed: &rs::ReviewCompleted,
+        ) -> Result<(), rs::StoreError> {
+            self.0.record_review_completion(key, status, completed)
+        }
+        fn review_completed(
+            &self,
+            key: &rs::ReviewWatchKey,
+        ) -> Result<Option<rs::ReviewCompleted>, rs::StoreError> {
+            self.0.review_completed(key)
+        }
         fn save_review_done(&self, row: rs::ReviewDoneRow) -> Result<(), rs::StoreError> {
             self.0.save_review_done(row)
         }
@@ -4656,6 +4822,7 @@ mod tests {
                 merge_state: String::new(),
             }),
             unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
         }
     }
 
@@ -4701,6 +4868,7 @@ mod tests {
             pr: coord(number),
             lookup,
             unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
         }
     }
 
@@ -5089,7 +5257,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
         assert_eq!(proven, vec![HEAD_A.to_string()]);
         let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
 
@@ -5159,7 +5328,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
         assert!(
             proven.is_empty(),
             "a conflict resolution is not a content-preserving move"
@@ -5188,7 +5358,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
         assert!(proven.is_empty(), "a read that failed proves nothing");
 
         let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
@@ -5238,7 +5409,8 @@ mod tests {
                 HEAD_B,
                 &[HEAD_A.to_string()],
             )
-            .await;
+            .await
+            .0;
             assert_eq!(
                 proven,
                 vec![HEAD_A.to_string()],
@@ -5273,7 +5445,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
 
         let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
 
@@ -5342,7 +5515,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
         let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
 
         assert_eq!(report.skipped, 1, "the head move re-arms nobody");
@@ -5394,7 +5568,8 @@ mod tests {
             HEAD_B,
             &[HEAD_A.to_string()],
         )
-        .await;
+        .await
+        .0;
         assert_eq!(proven, vec![HEAD_A.to_string()]);
 
         let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &proven)]);
@@ -7139,6 +7314,7 @@ mod tests {
             // STUDIO-960's unchanged-head comparison is not what these fixtures exercise: an empty
             // list is "no head this row has already read", so the advance re-arms as it always did.
             unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
         }
     }
 
@@ -8071,6 +8247,7 @@ mod tests {
             pr: coord(12),
             lookup: PrLookup::Gone,
             unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
         }]);
         assert!(
             o.review_unassignable.is_empty(),
@@ -12765,6 +12942,7 @@ mod tests {
                 merge_state: String::new(),
             }),
             unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
         };
 
         let out = refresh_observed_head(
@@ -12951,7 +13129,8 @@ mod tests {
 
         let same =
             unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &reviewed)
-                .await;
+                .await
+                .0;
         assert_eq!(same, vec![HEAD_A.to_string()]);
 
         for source in [
@@ -12959,7 +13138,9 @@ mod tests {
             FakeDiffSource::base_fails(),
             FakeDiffSource::old_fails(),
         ] {
-            let got = unchanged_reviewed_shas(&ctx, &source, &coord(12), HEAD_B, &reviewed).await;
+            let got = unchanged_reviewed_shas(&ctx, &source, &coord(12), HEAD_B, &reviewed)
+                .await
+                .0;
             assert!(got.is_empty(), "only a fully-read, identical diff is proof");
         }
     }
@@ -12975,6 +13156,7 @@ mod tests {
         assert!(
             unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &[])
                 .await
+                .0
                 .is_empty()
         );
         assert!(
@@ -12986,6 +13168,7 @@ mod tests {
                 &[HEAD_A.to_string()],
             )
             .await
+            .0
             .is_empty()
         );
     }

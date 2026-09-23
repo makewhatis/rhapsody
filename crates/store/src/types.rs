@@ -595,7 +595,52 @@ pub struct ReviewBoundRow {
     pub dispatches: i64,
     /// The manager's settled decision, or `None` when there is none.
     pub adjudication: Option<ReviewAdjudication>,
+    /// The pull request's review LOOP GENERATION (STUDIO-1009; design record
+    /// `manager-agent-design.md` §5.1). Incremented when the pull request is first introduced into
+    /// the watch set and on every operator `POST /api/v1/reviews/clear`; NOT on a head change, a
+    /// handoff re-introduction, or a daemon restart. It bounds the "approved at the current patch"
+    /// predicate (§5.4): an approval is only current within the generation it was made in, so a
+    /// deliberate loop reset invalidates every prior approval without touching the rows.
+    pub generation: i64,
+    /// The pull request's EVIDENCE REVISION (STUDIO-1009; §5.2): a counter bumped whenever any of
+    /// the listed evidence inputs changed — the head, a watch row, the finding set, the
+    /// `rhapsody:human` hold, the observed draft/conflict/CI state, or the generation. Maintained on
+    /// the control task. Comments carrying a `rhapsody-manager` marker and tracker state moves are
+    /// deliberately NOT inputs, so a decision's own external effects cannot invalidate it.
+    pub evidence_rev: i64,
 }
+
+/// One completed review round's outcome, recorded against a watch row (STUDIO-1009; design record
+/// `manager-agent-design.md` §5.4). No Go counterpart.
+///
+/// Where [`ReviewWatchRow::status`] is the TRANSIENT latest state (a re-introduction resets it to
+/// `requested`), these four values describe the last review that actually COMPLETED with a verdict,
+/// and are set by exactly one write: a review run that finished declaring `approved` or `findings`.
+/// A truncated, dropped, failed or crashed round never sets them, which is what makes "had their
+/// turn" — and [`crate::ReviewCompleted::verdict`]-based approval — survive the F9 reset.
+///
+/// A separate struct rather than four more fields on [`ReviewWatchRow`]: the watch row is read and
+/// written by dozens of call sites that have no completion to offer, so the completion record is a
+/// value written and read on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewCompleted {
+    /// The loop generation the completed review was recorded in (§5.1).
+    pub generation: i64,
+    /// The head SHA the completed review actually read — the same value `mark_review_completed`
+    /// writes to `last_reviewed_sha`.
+    pub sha: String,
+    /// The patch-id of `sha` against the pull request's base (STUDIO-977's stable patch-id).
+    /// Empty when the change could not be fingerprinted; an empty patch-id never satisfies the
+    /// approval predicate (it fails closed).
+    pub patch_id: String,
+    /// `approve` or `changes` — the EFFECTIVE verdict the round was recorded with.
+    pub verdict: String,
+}
+
+/// The verdict of a completed review that found nothing to fix ([`ReviewCompleted::verdict`]).
+pub const REVIEW_COMPLETION_APPROVE: &str = "approve";
+/// The verdict of a completed review that returned findings ([`ReviewCompleted::verdict`]).
+pub const REVIEW_COMPLETION_CHANGES: &str = "changes";
 
 /// One ticket's durable runaway-loop-breaker crossings (STUDIO-1026). No Go counterpart — the
 /// breaker is a Rhapsody addition end to end.
