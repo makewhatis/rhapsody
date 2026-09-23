@@ -99,6 +99,7 @@ pub(crate) struct RetryTarget<'a> {
 /// The owning resolved project's routing snapshot, passed by value to [`Orchestrator::dispatch_issue`]
 /// (Go passes a `*resolvedProject`; the Rust borrow checker forbids holding that borrow across the
 /// `&mut self` dispatch, so the fields the dispatch stamps are cloned out).
+#[derive(Debug, Clone)]
 pub(crate) struct DispatchRoute {
     pub slug: String,
     pub group: String,
@@ -651,7 +652,14 @@ impl Orchestrator {
             spawn(&iss, attempt, &re);
         }
         let production = self.spawn.is_none();
+        // STUDIO-988: seed a reopening summons once the run is actually live. Moved here from
+        // `promote_and_dispatch` so it survives an asynchronous preparation — the run does not exist
+        // until the completion is accepted, which may be several events after the promote.
+        let reopen_summons = self.pending_reopen_summons.remove(&id);
         self.running.insert(id, re);
+        if let Some((summon_at, body)) = reopen_summons {
+            self.seed_reopen_summons(&iss.id, summon_at, &body);
+        }
         if production {
             self.spawn_worker(
                 cancel,
@@ -1256,7 +1264,7 @@ impl Orchestrator {
             }
         }
         let attempt = re.attempt;
-        self.dispatch_issue(iss, Some(attempt), cfg.route, String::new());
+        self.dispatch_or_prepare(iss, Some(attempt), cfg.route, String::new());
     }
 
     /// Resolves a fired retry's routing against the current effective set. Snapshots the config into

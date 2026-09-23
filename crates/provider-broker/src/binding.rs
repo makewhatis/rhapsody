@@ -147,6 +147,14 @@ impl BoundCredentialLease {
     pub fn fingerprint(&self) -> BindingFingerprint {
         self.fingerprint
     }
+
+    /// Borrow the credential bytes for exactly one closure. Crate-internal on purpose: the only
+    /// scope that may see these bytes is the adapter constructing the one fixed upstream request and
+    /// the exact-secret redactor for its response (design §5.4, §6.3). There is no public key
+    /// accessor and no copy that outlives the closure.
+    pub(crate) fn expose_for_upstream<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(self.secret.as_slice())
+    }
 }
 
 impl fmt::Debug for BoundCredentialLease {

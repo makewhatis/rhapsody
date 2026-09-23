@@ -57,6 +57,7 @@ pub mod orchestrator;
 pub mod persist;
 pub mod prconditional;
 pub mod preflight;
+pub mod prepare;
 pub mod prlink;
 pub mod promote;
 pub mod prstate;
@@ -121,6 +122,11 @@ pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
 pub use preflight::{
     ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
+};
+pub use prepare::{
+    DEFAULT_PREPARATION_TIMEOUT, MAX_PREPARATION_CONCURRENCY, PreparationCompletion,
+    PreparationKey, PreparationOutcome, PreparationRequest, PreparationResolver, PreparationToken,
+    PreparedDispatch, RefusalGate, RefusalReason,
 };
 pub use quorum::{
     MAX_QUORUM_BACKOFF_MS, QUORUM_FANOUT_ATTEMPTS, QUORUM_REQUESTED_LABEL, QuorumDeps,
