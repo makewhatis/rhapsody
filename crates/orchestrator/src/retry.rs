@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Duration;
+use rhapsody_agent::PreparedHarnessSpec;
 use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store as store;
 use rhapsody_tracker::{Tracker, TrackerError};
@@ -303,6 +304,22 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
         stack_context: String,
     ) {
+        self.dispatch_issue_prepared(iss, attempt, route, stack_context, None);
+    }
+
+    /// The prepared-dispatch entry point (PB7, STUDIO-1002): identical to [`Self::dispatch_issue`]
+    /// except it may carry a move-only prepared harness spec (the broker custody an accepted
+    /// preparation produced). `None` is every legacy/retry/reopen/pool call site and is byte-identical
+    /// to `dispatch_issue`. A `Some` spec is consumed exactly once and reaches the worker; if any
+    /// guard below returns early, dropping it revokes the prepared broker session promptly.
+    pub(crate) fn dispatch_issue_prepared(
+        &mut self,
+        iss: Issue,
+        attempt: Option<i64>,
+        route: Option<DispatchRoute>,
+        stack_context: String,
+        prepared: Option<PreparedHarnessSpec>,
+    ) {
         // STUDIO-880, a backstop and NOT a gate. Every path that decides whether to dispatch refuses
         // or parks above this line — `on_tick`, `on_retry`, `dispatch_review` — because each of them
         // owns bookkeeping a refusal here would strand (a claim, a retry entry, a watch row recorded
@@ -419,6 +436,18 @@ impl Orchestrator {
             // The routed teammate's harness (STUDIO-902). Empty for every profile that names none,
             // so the worker keeps the configured backend's runner and the dispatch is unchanged.
             re.harness = td.harness.clone();
+        }
+        // PB7 (STUDIO-1002): a prepared dispatch runs on the harness/model the pure SELECTION
+        // resolved, not the routed profile's — the move-only spec owns the real adapter. Recording
+        // the selection here keeps the run's provenance (and the agent child's model env) describing
+        // what actually ran. `None` on every legacy dispatch, so nothing changes for one.
+        if let Some(spec) = &prepared {
+            re.harness = spec.harness.name().to_string();
+            if let Some(model) = spec.model.as_deref()
+                && !model.is_empty()
+            {
+                re.model_override.model = model.to_string();
+            }
         }
         // A review run's model/effort come from `review.model`/`review.effort` when the operator
         // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901) —
@@ -685,6 +714,7 @@ impl Orchestrator {
                 run_id,
                 started_at,
                 review_checkout,
+                prepared,
             );
         }
     }

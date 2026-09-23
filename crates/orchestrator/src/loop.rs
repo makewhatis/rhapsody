@@ -450,7 +450,19 @@ pub enum Event {
     DispatchPrepared {
         id: String,
         token: crate::prepare::PreparationToken,
-        completion: crate::prepare::PreparationCompletion,
+        /// Boxed: the completion carries the move-only [`crate::prepare::PreparedDispatch`], which is
+        /// much the largest payload any control event carries.
+        completion: Box<crate::prepare::PreparationCompletion>,
+    },
+    /// A worker's finalized broker usage for one run (PB7, STUDIO-1002; NEW beyond Go v0.4.0). The
+    /// worker's spawn closure sends this after the run future has fully dropped, BEFORE its
+    /// `WorkerExit`, so the control task still has the running entry to resolve the store run id.
+    /// `usage` is already summed from the run's finalized turn receipts; a cancelled turn's
+    /// zero-usage receipt is included rather than dropped.
+    BrokerUsage {
+        issue_id: String,
+        /// Boxed so this variant does not pad every other control event to the usage record's size.
+        usage: Box<rhapsody_store::RunUsage>,
     },
 }
 
@@ -547,6 +559,11 @@ fn worker_deps_for(
         // Per-dispatch: `spawn_worker` stamps a refusal when the routed profile names an
         // unimplemented harness; every other dispatch leaves `None`.
         harness_refusal: None,
+        // Per-dispatch and PB7-only: `spawn_worker` stamps the move-only prepared spec and the
+        // loop-external broker supervisor for an accepted brokered preparation; every other dispatch
+        // leaves both `None`, keeping the legacy path byte-identical.
+        prepared: None,
+        broker: None,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -661,6 +678,7 @@ impl Orchestrator {
                 self.on_tick().await;
             }
             Event::WorkerExit(e) => self.on_worker_exit(e),
+            Event::BrokerUsage { issue_id, usage } => self.on_broker_usage(&issue_id, &usage),
             Event::AgentUpdate(e) => self.on_agent_update(e),
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
@@ -671,7 +689,7 @@ impl Orchestrator {
                 id,
                 token,
                 completion,
-            } => self.handle_dispatch_prepared(id, token, completion).await,
+            } => self.handle_dispatch_prepared(id, token, *completion).await,
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
             }
@@ -1649,6 +1667,7 @@ impl Orchestrator {
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
+        prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
@@ -1717,6 +1736,34 @@ impl Orchestrator {
                 }
             }
         }
+        // PB7: a prepared (brokered) dispatch runs on the harness the SELECTION resolved, not the
+        // routed profile's. The shared runner is stamped only so the worker's capability validation
+        // reads the right harness's declaration; the move-only spec is what builds the real adapter
+        // and owns the broker custody. A prepared dispatch always has an implemented harness
+        // (unsupported selections were refused before registration), so the pool lookup cannot miss
+        // — but if it did, the run is refused rather than silently run on another harness.
+        if let Some(spec) = prepared {
+            let name = spec.harness.name();
+            let pool = eff
+                .project_by_slug(&project_slug)
+                .map_or(&eff.agents, |rp| &rp.agents);
+            match pool.get(name) {
+                Some(runner) => deps.agent = Arc::clone(runner),
+                None => {
+                    deps.harness_refusal =
+                        Some(rhapsody_agent::CapabilityRefusal::HarnessNotImplemented {
+                            name: name.to_string(),
+                        });
+                }
+            }
+            deps.prepared = Some(spec);
+            deps.broker = Some(Arc::new(std::sync::Mutex::new(
+                crate::worker::BrokerTurnSlots::default(),
+            )));
+        }
+        // The loop-external broker supervisor, retained by this closure across the run future so a
+        // cancelled turn's finalized receipt is still drained and persisted (design §10.3).
+        let broker_slots = deps.broker.clone();
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;
@@ -1750,8 +1797,9 @@ impl Orchestrator {
                     path: path.to_string(),
                 });
             };
+            let mut deps = deps;
             let run = run_agent_attempt(
-                &deps,
+                &mut deps,
                 iss.clone(),
                 attempt32,
                 mailbox.as_mut(),
@@ -1762,6 +1810,26 @@ impl Orchestrator {
                 res = run => res,
                 _ = cancel.cancelled() => (iss.state.clone(), crate::worker::WorkerDeclaration::default(), None),
             };
+            // Drain the broker supervisor after the run future is fully dropped. On a normal exit
+            // `run_turns` already drained each turn; on cancellation this is what takes the now
+            // finalized (zero-usage) receipt for the turn that was in flight. The summed usage is
+            // `None` for a non-brokered run, so no usage row is ever written for one.
+            let broker_usage = broker_slots.and_then(|slots| {
+                let mut guard = slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.finalize_armed();
+                guard.usage()
+            });
+            // Persist the finalized broker usage (PB7, STUDIO-1002) BEFORE the exit event, so the
+            // control task still has the running entry to resolve the store run id from. `None` for a
+            // non-brokered run writes nothing, keeping every legacy run byte-identical.
+            if let Some(usage) = broker_usage {
+                let _ = events_exit.send(Event::BrokerUsage {
+                    issue_id: issue_id.clone(),
+                    usage: Box::new(usage),
+                });
+            }
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.

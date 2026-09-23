@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rhapsody_agent::{HarnessId, PreparedHarnessSpec, PreparedProvider, ResolvedProviderPlan};
 use rhapsody_core::{Issue, normalize_state};
 
 use crate::control_loop::{CancelSignal, Event};
@@ -97,8 +98,15 @@ pub enum RefusalReason {
     OwnerUnavailable,
     /// The credential owner refused this daemon instance.
     OwnerUnauthorized,
+    /// The provider broker is unavailable (its serving task failed, or registration was refused
+    /// because the broker is down). A typed refusal, never a direct-key fallback.
+    ProviderBrokerUnavailable,
     /// The resolver exceeded the preparation timeout.
     ResolverTimedOut,
+    /// The pure harness/provider/model selection refused this candidate (an unsupported protocol, a
+    /// missing model, an unconfigured provider). Carries the selection refusal's actionable text;
+    /// never a fall back to another harness/provider/model/auth source.
+    SelectionRefused(String),
     /// The resolver failed for a reason it could not classify (already an actionable string).
     ResolverFailed(String),
 }
@@ -113,7 +121,9 @@ impl RefusalReason {
             RefusalReason::BindingMismatch => "binding_mismatch",
             RefusalReason::OwnerUnavailable => "owner_unavailable",
             RefusalReason::OwnerUnauthorized => "owner_unauthorized",
+            RefusalReason::ProviderBrokerUnavailable => "provider_broker_unavailable",
             RefusalReason::ResolverTimedOut => "resolver_timed_out",
+            RefusalReason::SelectionRefused(_) => "selection_refused",
             RefusalReason::ResolverFailed(_) => "resolver_failed",
         }
     }
@@ -137,9 +147,13 @@ impl RefusalReason {
             RefusalReason::OwnerUnauthorized => {
                 "the provider credential owner refused this daemon instance".to_string()
             }
+            RefusalReason::ProviderBrokerUnavailable => {
+                "the provider broker is unavailable".to_string()
+            }
             RefusalReason::ResolverTimedOut => {
                 "provider preparation did not answer before its timeout".to_string()
             }
+            RefusalReason::SelectionRefused(why) => why.clone(),
             RefusalReason::ResolverFailed(why) => why.clone(),
         }
     }
@@ -164,6 +178,15 @@ pub struct PreparedDispatch {
     pub provider: String,
     /// The opaque credential revision this preparation read; empty in P6's injected-resolver tests.
     pub credential_revision: String,
+    /// The move-only broker custody for an explicit-provider dispatch (PB7, STUDIO-1002). `None` on
+    /// the legacy/native-login branch. It is never cloned: dropping this dispatch drops the custody
+    /// and revokes the broker session immediately, which is what makes a stale/cancelled completion
+    /// release its credential promptly.
+    custody: Option<PreparedProvider>,
+    /// The pure, non-secret provider plan the custody was opened against, carried so the
+    /// dispatch-time factory can build the adapter's knob block without re-deriving it. `None` on the
+    /// legacy branch.
+    plan: Option<ResolvedProviderPlan>,
 }
 
 impl PreparedDispatch {
@@ -178,7 +201,63 @@ impl PreparedDispatch {
             model: model.into(),
             provider: provider.into(),
             credential_revision: credential_revision.into(),
+            custody: None,
+            plan: None,
         }
+    }
+
+    /// Attach move-only broker custody and the pure plan it was opened against (PB7). Consuming, so
+    /// a dispatch's custody is set exactly once and cannot be duplicated.
+    pub fn with_provider(mut self, custody: PreparedProvider, plan: ResolvedProviderPlan) -> Self {
+        self.custody = Some(custody);
+        self.plan = Some(plan);
+        self
+    }
+
+    /// The harness the selection resolved to, typed, or `None` when the recorded name is not one
+    /// this build implements (a resolver defect, never a fallback).
+    pub fn harness_id(&self) -> Option<HarnessId> {
+        rhapsody_agent::harness_id_for_name(&self.harness)
+    }
+
+    /// Whether this dispatch carries move-only broker custody (an explicit-provider run).
+    pub fn has_custody(&self) -> bool {
+        self.custody.is_some()
+    }
+
+    /// Build the dispatch-time `PreparedHarnessSpec` this completion will run on, consuming the
+    /// move-only custody exactly once. `Ok(None)` is the legacy/native-login branch: no custody, so
+    /// the caller keeps the ordinary shared runner and the dispatch is byte-identical to a daemon
+    /// built before this feature. `Some` is a brokered run whose factory will own the custody.
+    ///
+    /// `cfg` is the target project's materialized config (its knobs build the adapter). The model
+    /// comes from the pure plan the custody was opened against, falling back to the recorded model.
+    pub fn into_harness_spec(
+        mut self,
+        cfg: &rhapsody_config::Config,
+    ) -> Result<Option<PreparedHarnessSpec>, rhapsody_agent::DispatchRefusal> {
+        let Some(custody) = self.custody.take() else {
+            return Ok(None);
+        };
+        let Some(harness) = self.harness_id() else {
+            return Err(rhapsody_agent::DispatchRefusal::Broker(format!(
+                "prepared harness {:?} is not implemented by this build",
+                self.harness
+            )));
+        };
+        let model = self
+            .plan
+            .take()
+            .map(|p| p.model)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.model.clone());
+        let knobs = crate::effective::knobs_for_harness(cfg, harness);
+        Ok(Some(PreparedHarnessSpec {
+            harness,
+            model: (!model.is_empty()).then_some(model),
+            provider: Some(custody),
+            knobs,
+        }))
     }
 
     /// The selection half of the payload, without the move-only credential lease.
@@ -193,7 +272,14 @@ impl PreparedDispatch {
 
 /// A resolver's verdict: an accepted success carries the move-only prepared payload, an accepted
 /// refusal carries the typed reason.
+///
+/// `Ready` is much the larger variant (the move-only [`PreparedDispatch`] carries the resolved plan
+/// and, for an explicit provider, the opaque broker custody). Boxing it would add an allocation and
+/// an indirection to the ONE path that must stay allocation-light and move-only, so the size
+/// difference is accepted deliberately rather than laundered behind a `Box`;` the enum is created
+/// once per preparation and consumed immediately on the control task.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PreparationOutcome {
     Ready(PreparedDispatch),
     Refused(RefusalReason),
@@ -263,6 +349,19 @@ pub struct PreparationRequest {
     pub config_generation: u64,
     /// The credential revision the loop expects, empty in P6 (PB7 supplies it).
     pub expected_revision: String,
+    /// The candidate's raw labels, parsed by the resolver's pure selection call (the ticket tier).
+    pub labels: Vec<String>,
+    /// The pure harness/provider/model selection tiers the loop resolved for this candidate
+    /// (PB7, STUDIO-1002). The resolver runs [`crate::selection::resolve_ticket_labels`] off the
+    /// control task on these and derives the canonical provider plan from them, so no config read
+    /// and no credential work ever blocks the loop.
+    pub tiers: crate::selection::SelectionTiers,
+    /// The target project's effective provider registry (after the per-project overlay), keyed by
+    /// canonical provider id — the registry the pure resolver looks the selected provider up in.
+    pub providers: std::collections::BTreeMap<String, rhapsody_config::ProviderDefinition>,
+    /// The selected harness's effective turn deadline, used only to lower the provider's configured
+    /// broker limits into the plan's explicit values.
+    pub turn_deadline_ms: u64,
 }
 
 /// The deferred promote a REVIEW-REOPEN dispatch carries (STUDIO-988 review round 4, jimmy #3 /
@@ -805,6 +904,68 @@ impl Orchestrator {
         self.prepare_generation
     }
 
+    /// The pure selection inputs for one candidate: its raw labels, the six field-wise tiers, the
+    /// target project's provider registry, and the selected harness's turn deadline (PB7,
+    /// STUDIO-1002). Pure and local — the only I/O is the profile resolve `route_teams` already
+    /// performs on the dispatch path, so this adds no network or credential work to the control task.
+    fn selection_inputs(
+        &self,
+        target: &PreparedTarget,
+    ) -> (
+        Vec<String>,
+        crate::selection::SelectionTiers,
+        std::collections::BTreeMap<String, rhapsody_config::ProviderDefinition>,
+        u64,
+    ) {
+        use crate::selection::{FieldSelection, SelectionTiers};
+
+        let Some(eff) = self.eff.as_ref() else {
+            return (
+                Vec::new(),
+                SelectionTiers::default(),
+                std::collections::BTreeMap::new(),
+                0,
+            );
+        };
+        let (issue, route) = match target {
+            PreparedTarget::Ticket { issue, route, .. } => {
+                (issue, route.as_ref().map(|r| r.slug.as_str()))
+            }
+            PreparedTarget::Review { issue, route, .. } => (issue, Some(route.slug.as_str())),
+        };
+        let project = route.and_then(|slug| eff.project_by_slug(slug));
+        let project_cfg = project.map_or(&eff.cfg, |p| &p.mcfg);
+        // The project tier is only distinct from the global one on a multi-project install; on the
+        // legacy single-project path the global tier carries the whole configured default, exactly
+        // as `SelectionTiers`'s precedence chain intends.
+        let project_tier = project.map_or_else(FieldSelection::default, |p| {
+            FieldSelection::from_agent(&p.mcfg.agent)
+        });
+        // The routed teammate's resolved profile contributes the profile tier (harness/provider/
+        // model), from the SAME resolve the dispatch uses, so the two cannot disagree.
+        let profile_tier = self
+            .route_teams(issue)
+            .map_or_else(FieldSelection::default, |td| FieldSelection {
+                harness: td.harness,
+                provider: td.provider,
+                model: td.model_override.model,
+            });
+        let tiers = SelectionTiers {
+            ticket: FieldSelection::default(),
+            review: None,
+            profile: profile_tier,
+            identity: FieldSelection::default(),
+            project: project_tier,
+            global: FieldSelection::from_agent(&eff.cfg.agent),
+        };
+        let labels = issue.labels.clone().unwrap_or_default();
+        let providers = project_cfg.providers.clone();
+        let turn_deadline_ms = rhapsody_config::providers::provider_turn_deadline_ms(
+            project_cfg.opencode.turn_timeout_ms,
+        );
+        (labels, tiers, providers, turn_deadline_ms)
+    }
+
     /// Begins an asynchronous preparation for `target`, or reports why it should not dispatch. When
     /// no resolver is installed this returns [`BeginPreparation::NoResolver`] and the caller
     /// dispatches inline, which is what keeps the feature inert by default.
@@ -842,6 +1003,9 @@ impl Orchestrator {
             return BeginPreparation::AlreadyPreparing;
         }
         let selection = target.selection();
+        // The pure selection inputs the resolver consumes off the control task (PB7). Computed here,
+        // while `target` is still borrowed, and owned before the reservation moves it.
+        let (labels, tiers, providers, turn_deadline_ms) = self.selection_inputs(&target);
         let fingerprint = RefusalGate::key(key.kind(), &id, &selection);
         let now = (self.now)();
         if self.refusal_gate.suppressed(&fingerprint, now) {
@@ -887,8 +1051,13 @@ impl Orchestrator {
             key,
             selection,
             config_generation: token.generation,
-            // The revision the loop currently expects; empty in P6 (PB7 supplies it).
+            // The revision the loop currently expects; empty when no credential mutation has been
+            // installed (the resolver then reports the revision it actually read).
             expected_revision: self.prepare_expected_revision.clone().unwrap_or_default(),
+            labels,
+            tiers,
+            providers,
+            turn_deadline_ms,
         };
         tokio::spawn(async move {
             let _guard = wg;
@@ -935,7 +1104,7 @@ impl Orchestrator {
                 let _ = events.send(Event::DispatchPrepared {
                     id,
                     token,
-                    completion,
+                    completion: Box::new(completion),
                 });
             }
         });
@@ -1347,6 +1516,30 @@ impl Orchestrator {
     /// Runs the ordinary dispatch side effects for an accepted successful preparation. A pool pick
     /// runs its cross-daemon claim election HERE — after preparation, so a refusal never claims — and
     /// dispatches only if it won.
+    /// Build the dispatch-time [`PreparedHarnessSpec`] this accepted completion will run on, or
+    /// `Ok(None)` on the legacy branch. `Err(())` is a refusal: a completion that carries custody
+    /// but cannot produce a spec must NOT fall back to the shared runner, so the caller drops the
+    /// completion without dispatching (the custody is revoked by the drop).
+    fn prepared_spec(
+        &self,
+        prepared: PreparedDispatch,
+        slug: Option<&str>,
+    ) -> Result<Option<PreparedHarnessSpec>, ()> {
+        let Some(eff) = self.eff.as_ref() else {
+            return Ok(None);
+        };
+        let cfg = slug
+            .and_then(|s| eff.project_by_slug(s).map(|p| &p.mcfg))
+            .unwrap_or(&eff.cfg);
+        prepared.into_harness_spec(cfg).map_err(|e| {
+            tracing::error!(
+                err = %e,
+                "a prepared dispatch's spec could not be built; refusing the dispatch rather than \
+                 falling back to the shared runner"
+            );
+        })
+    }
+
     async fn finish_prepared(
         &mut self,
         _id: String,
@@ -1407,7 +1600,12 @@ impl Orchestrator {
                         promote_state = %promote.state,
                         "review-reopen: summoned ticket promoted and dispatched"
                     );
-                    self.dispatch_issue(iss, attempt, route, stack_context);
+                    let slug = route.as_ref().map(|r| r.slug.as_str());
+                    let spec = match self.prepared_spec(prepared, slug) {
+                        Ok(spec) => spec,
+                        Err(()) => return,
+                    };
+                    self.dispatch_issue_prepared(iss, attempt, route, stack_context, spec);
                     return;
                 }
                 if pool {
@@ -1416,13 +1614,36 @@ impl Orchestrator {
                         harness = %prepared.harness,
                         "preparation accepted; running the pool claim election"
                     );
+                    let pool_slug = pool_proj.and_then(|i| {
+                        self.eff
+                            .as_ref()
+                            .and_then(|e| e.projects.get(i))
+                            .map(|p| p.slug.clone())
+                    });
+                    let mut spec = match self.prepared_spec(prepared, pool_slug.as_deref()) {
+                        Ok(spec) => spec,
+                        Err(()) => return,
+                    };
                     let pick = crate::select::TaggedIssue {
                         iss: issue,
                         proj: pool_proj,
                     };
                     for winner in self.claim_winners(vec![pick]).await {
                         let winner_route = self.route_for(winner.proj);
-                        self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                        if spec.is_some() {
+                            // Custody is one-shot: only the elected winner may carry it. Any further
+                            // winner dispatches on the legacy runner, which cannot happen for a
+                            // brokered pool pick because there is exactly one custody to hand out.
+                            self.dispatch_issue_prepared(
+                                winner.iss,
+                                None,
+                                winner_route,
+                                String::new(),
+                                spec.take(),
+                            );
+                        } else {
+                            self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                        }
                     }
                     return;
                 }
@@ -1433,7 +1654,12 @@ impl Orchestrator {
                     provider = %prepared.provider,
                     "preparation accepted; dispatching"
                 );
-                self.dispatch_issue(issue, attempt, route, stack_context);
+                let slug = route.as_ref().map(|r| r.slug.as_str());
+                let spec = match self.prepared_spec(prepared, slug) {
+                    Ok(spec) => spec,
+                    Err(()) => return,
+                };
+                self.dispatch_issue_prepared(issue, attempt, route, stack_context, spec);
             }
             PreparedTarget::Review {
                 issue,
@@ -1446,8 +1672,12 @@ impl Orchestrator {
                     harness = %prepared.harness,
                     "review preparation accepted; dispatching"
                 );
+                let spec = match self.prepared_spec(prepared, Some(route.slug.as_str())) {
+                    Ok(spec) => spec,
+                    Err(()) => return,
+                };
                 let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
-                self.finish_review_dispatch(*run, route, issue);
+                self.finish_review_dispatch_prepared(*run, route, issue, spec);
                 // The watcher bookkeeping the synchronous arm applies in `reviewwatch`: a prepared
                 // review must charge the same churn budget and retire the same reassigned incumbent
                 // once its dispatch is accepted (STUDIO-988 review round 7, sol #1).
@@ -2350,7 +2580,7 @@ mod tests {
                     PreparationOutcome::Refused(RefusalReason::ResolverTimedOut) => {}
                     other => panic!("expected a typed timeout refusal, got {other:?}"),
                 }
-                o.handle_dispatch_prepared(id, token, completion).await;
+                o.handle_dispatch_prepared(id, token, *completion).await;
             }
             _ => panic!("expected DispatchPrepared"),
         }

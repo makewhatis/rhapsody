@@ -25,7 +25,7 @@
 //!     passes `None`.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rhapsody_agent::{
     self as agent, CapabilityRefusal, Event, Harness, Session, Transcript, WorkRequirements,
@@ -33,12 +33,101 @@ use rhapsody_agent::{
 };
 use rhapsody_config::WORKSPACE_MODE_CLONE;
 use rhapsody_core::{Issue, normalize_state};
+use rhapsody_provider_broker::{BrokerLedgerReceiver, TurnLedger, TurnMeta, TurnReceipt};
+use rhapsody_store as store;
 use rhapsody_tracker::Tracker;
 use rhapsody_workspace::{self as workspace, Manager, gtguard};
 use tokio::sync::mpsc;
 
 use crate::obslog;
 use crate::reviewfindings::{self, ReviewVerdictBlock};
+
+/// The broker turn supervisor (PB7, STUDIO-1002; design §10.3). It lives OUTSIDE the cancellable
+/// worker future — the spawn closure owns the `Arc` — so an armed receipt survives cancellation: the
+/// worker stores the armed receipt here before the turn's await, the awaited `BrokerTurnAttempt`
+/// inside `run_turn_brokered` is dropped when the run future is cancelled, and the supervisor then
+/// drains the now-finalized (zero-usage) receipt. The move-only `BrokerLedgerReceiver` never leaves
+/// this slot, so no custody handle is held inside the cancellable future.
+///
+/// `Default` is the legacy/native-login shape: no receiver, no armed turn, no ledgers — nothing the
+/// supervisor has to finalize, which is what leaves a no-provider dispatch byte-identical.
+#[derive(Default)]
+pub struct BrokerTurnSlots {
+    receiver: Option<BrokerLedgerReceiver>,
+    armed: Option<TurnReceipt>,
+    ledgers: Vec<TurnLedger>,
+}
+
+impl BrokerTurnSlots {
+    /// Store the receiver the started session handed back (called once, right after `start`).
+    pub fn install_receiver(&mut self, receiver: BrokerLedgerReceiver) {
+        self.receiver = Some(receiver);
+    }
+
+    /// Arm the next turn synchronously: take the session's single turn gate, store the receipt so it
+    /// outlives the await, and hand the paired attempt back for the adapter. `None` when no receiver
+    /// was installed (the legacy path); a typed error string when the broker refuses the turn.
+    fn arm_turn(&mut self) -> Result<Option<rhapsody_provider_broker::BrokerTurnAttempt>, String> {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return Ok(None);
+        };
+        let (attempt, receipt) = receiver
+            .arm_turn(TurnMeta::without_deadline())
+            .map_err(|e| e.to_string())?;
+        self.armed = Some(receipt);
+        Ok(Some(attempt))
+    }
+
+    /// Drain the armed receipt's finalized ledger, if any, into `ledgers`. Called after every turn
+    /// future returns AND by the supervisor after a cancelled future has dropped its attempt.
+    pub fn finalize_armed(&mut self) {
+        if let Some(receipt) = self.armed.take()
+            && let Some(ledger) = receipt.take()
+        {
+            self.ledgers.push(ledger);
+        }
+    }
+
+    /// The finalized turn ledgers drained so far.
+    pub fn ledgers(&self) -> &[TurnLedger] {
+        &self.ledgers
+    }
+
+    /// Sum the finalized turn ledgers into the run's broker usage record (design §7.3). `None` when
+    /// no turn ever armed a receipt — the legacy/native-login path — so no usage row is written for a
+    /// run that never used the broker. A run with only zero-usage cancellation receipts still yields
+    /// `Some`, so the cancellation is accounted rather than silently dropped.
+    pub fn usage(&self) -> Option<store::RunUsage> {
+        if self.ledgers.is_empty() {
+            return None;
+        }
+        let mut reported: Option<i64> = None;
+        let mut any_report = false;
+        let mut reserved: i64 = 0;
+        let mut unknown: i64 = 0;
+        let mut incomplete = false;
+        for ledger in &self.ledgers {
+            if let Some(tokens) = ledger.provider_reported_tokens() {
+                any_report = true;
+                reported = Some(reported.unwrap_or(0).saturating_add(tokens as i64));
+            }
+            reserved = reserved.saturating_add(ledger.reserved_tokens() as i64);
+            unknown = unknown.saturating_add(ledger.unknown_usage_requests() as i64);
+            incomplete |= ledger.usage_incomplete();
+        }
+        Some(store::RunUsage {
+            provider_reported_tokens: reported,
+            reserved_tokens: reserved,
+            usage_authority: if any_report {
+                store::USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.to_string()
+            } else {
+                String::new()
+            },
+            usage_incomplete: incomplete,
+            unknown_usage_requests: unknown,
+        })
+    }
+}
 
 /// What a worker attempt DECLARES on exit, beyond its last-known state (STUDIO-1008).
 ///
@@ -209,6 +298,17 @@ pub struct WorkerDeps {
     /// harness this build has no runner for. `Some` makes [`run_agent_attempt`] fail immediately
     /// with this reason and start NO session; it is never a fall back to another harness.
     pub harness_refusal: Option<CapabilityRefusal>,
+    /// The move-only prepared harness spec an accepted brokered preparation produced (PB7,
+    /// STUDIO-1002). `None` on every legacy/native-login dispatch — the worker keeps the shared
+    /// [`Self::agent`] runner and behaves byte-identically. `Some` makes [`run_agent_attempt`] build
+    /// a dispatch-time [`DispatchRunner`](rhapsody_agent::DispatchRunner) that OWNS the broker
+    /// custody and run each turn through [`Session::run_turn_brokered`]. Consumed exactly once; if
+    /// this attempt never starts a session, dropping the spec revokes the prepared broker session.
+    pub prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
+    /// The loop-external broker turn supervisor (PB7; design §10.3). `Some` only for a brokered run:
+    /// the same `Arc` the spawn closure retains, so a cancelled turn's finalized receipt is still
+    /// drained and persisted. `None` on every legacy dispatch.
+    pub broker: Option<Arc<Mutex<BrokerTurnSlots>>>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -357,13 +457,16 @@ pub(crate) fn has_handoff_marker(result_text: &str) -> bool {
 /// on a normal exit). `on_transcript` is invoked (best-effort) with the CONCRETE per-run transcript
 /// path the moment the transcript opens. Mirrors Go `runAgentAttempt`.
 pub async fn run_agent_attempt(
-    deps: &WorkerDeps,
+    deps: &mut WorkerDeps,
     mut issue: Issue,
     attempt: Option<i32>,
     messages: Option<&mut mpsc::Receiver<String>>,
     on_event: &(dyn Fn(Event) + Send + Sync),
     on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> (String, WorkerDeclaration, Option<WorkerError>) {
+    // The move-only prepared custody is taken exactly once, here. If this attempt never reaches
+    // `start`, it is dropped at return and revokes the prepared broker session (design §10.3).
+    let prepared = deps.prepared.take();
     // CAPABILITY VALIDATION, BEFORE ANYTHING IS SPAWNED (STUDIO-978; design §5).
     //
     // The ticket's mutation discipline is explicit: moving this check after the runner spawn must
@@ -624,40 +727,93 @@ pub async fn run_agent_attempt(
         }
     }
 
-    let sess = match deps
-        .agent
-        .start_session(&ws.path, issue.clone(), transcript)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            // best-effort cleanup (§9.4)
-            let _ = deps
-                .workspace
-                .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
-                .await;
-            return (
-                issue.state.clone(),
-                WorkerDeclaration::default(),
-                Some(e.into()),
-            );
+    // The dispatch-time start value (design §10.2). A prepared/brokered run builds an owned,
+    // non-Clone `DispatchRunner` that carries the broker custody; the launch context is frozen here
+    // so no late identity setter runs on that path. The legacy path keeps the shared runner and its
+    // three late setters — byte-identical to a daemon built before this feature.
+    let (sess, broker_turns): (Box<dyn Session>, Option<BrokerLedgerReceiver>) = match prepared {
+        Some(spec) => {
+            let runner = match rhapsody_agent::build_dispatch_runner(spec) {
+                Ok(runner) => runner,
+                Err(e) => {
+                    let _ = deps
+                        .workspace
+                        .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
+                        .await;
+                    return (
+                        issue.state.clone(),
+                        WorkerDeclaration::default(),
+                        Some(WorkerError::Agent(agent::AgentError::Other(e.to_string()))),
+                    );
+                }
+            };
+            let start = rhapsody_agent::SessionStart {
+                workspace_path: ws.path.clone(),
+                issue: issue.clone(),
+                transcript,
+                launch: rhapsody_agent::LaunchContext {
+                    run_id: deps.run_id,
+                    review_head: deps.review.as_ref().map(|r| r.head_sha.clone()),
+                },
+            };
+            match runner.start(start).await {
+                Ok(started) => (started.session, started.broker_turns),
+                Err(e) => {
+                    let _ = deps
+                        .workspace
+                        .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
+                        .await;
+                    return (
+                        issue.state.clone(),
+                        WorkerDeclaration::default(),
+                        Some(e.into()),
+                    );
+                }
+            }
+        }
+        None => {
+            match deps
+                .agent
+                .start_session(&ws.path, issue.clone(), transcript)
+                .await
+            {
+                Ok(s) => {
+                    // Thread the store run id onto the session (Go: the optional-interface `SetRunID`
+                    // right after `StartSession`, before the first turn) so the agent child's env
+                    // carries SYMPHONY_RUN_ID. A zero id is a no-op inside the setter's consumer.
+                    s.set_run_id(deps.run_id);
+                    // Pin the reviewed head into the agent's env (STUDIO-715, F-SHA). A no-op for
+                    // every non-review run.
+                    if let Some(rev) = &deps.review {
+                        s.set_review_head(&rev.head_sha);
+                    }
+                    // Run on the routed teammate's OWN model (STUDIO-868). An empty override changes
+                    // nothing.
+                    s.set_model_override(deps.model_override.clone());
+                    (s, None)
+                }
+                Err(e) => {
+                    // best-effort cleanup (§9.4)
+                    let _ = deps
+                        .workspace
+                        .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
+                        .await;
+                    return (
+                        issue.state.clone(),
+                        WorkerDeclaration::default(),
+                        Some(e.into()),
+                    );
+                }
+            }
         }
     };
-    // Thread the store run id onto the session (Go: the optional-interface `SetRunID` right after
-    // `StartSession`, before the first turn) so the agent child's env carries SYMPHONY_RUN_ID for
-    // the injected MCP server's "me" default. A zero id is a no-op inside the setter's consumer.
-    sess.set_run_id(deps.run_id);
-    // Pin the reviewed head into the agent's env (STUDIO-715, F-SHA): the SHA the worktree above was
-    // detached at, so the agent reports on the commit it is actually reading. A no-op for every
-    // non-review run, which sets nothing and emits nothing.
-    if let Some(rev) = &deps.review {
-        sess.set_review_head(&rev.head_sha);
+    // Hand the non-secret ledger receiver to the loop-external supervisor, so an armed receipt
+    // survives cancellation (design §10.3).
+    if let (Some(slots), Some(receiver)) = (deps.broker.as_ref(), broker_turns)
+        && let Ok(mut slots) = slots.lock()
+    {
+        slots.install_receiver(receiver);
     }
-    // Run this turn loop on the routed teammate's OWN model, not the installation-wide one
-    // (STUDIO-868). Unconditional because an empty override is defined to change nothing — the same
-    // shape `set_run_id` uses for a zero id — and because a REVIEW run reaches here by the same
-    // path, which is how a reviewer gets their own model rather than the reviewed run's.
-    sess.set_model_override(deps.model_override.clone());
 
     let (final_state, result_text, loop_err) = deps
         .run_turns(
@@ -759,6 +915,9 @@ impl WorkerDeps {
         mut messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
     ) -> (String, String, Option<WorkerError>) {
+        // The broker supervisor is carried on `self` (a per-dispatch field), so the turn loop reads
+        // it here rather than taking an eighth argument.
+        let broker = self.broker.clone();
         let mut turn: i64 = 1;
         let mut last_result = String::new();
         let mut issue = issue;
@@ -776,6 +935,27 @@ impl WorkerDeps {
                 Err(e) => return (issue.state.clone(), last_result, Some(e.into())),
             };
             let ident = issue.identifier.clone();
+            // Arm the turn receipt SYNCHRONOUSLY, before the cancellable adapter future (design
+            // §10.3). The receipt is stored in the loop-external supervisor so cancellation — which
+            // drops the run future, and with it the attempt inside `run_turn_brokered` — still
+            // leaves a finalized receipt the supervisor can drain. `None` on the legacy path, where
+            // no broker exists.
+            let broker_attempt = match &broker {
+                Some(slots) => {
+                    let mut guard = slots.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.arm_turn() {
+                        Ok(attempt) => attempt,
+                        Err(msg) => {
+                            return (
+                                issue.state.clone(),
+                                last_result,
+                                Some(WorkerError::Agent(agent::AgentError::Other(msg))),
+                            );
+                        }
+                    }
+                }
+                None => None,
+            };
             let (tr, terr) = {
                 // Emit the agent event as a (trace-correlated) log line and forward it. Scoped so the
                 // forwarding closure is dropped before `issue.state` is mutated below.
@@ -788,14 +968,23 @@ impl WorkerDeps {
                     );
                     on_event(e);
                 };
-                sess.run_turn(
+                sess.run_turn_brokered(
                     &p,
                     attempt.map(i64::from),
                     messages.as_deref_mut(),
                     &wrapped,
+                    broker_attempt,
                 )
                 .await
             };
+            // The attempt has finished or dropped by here, so the receipt is finalized: drain it
+            // exactly once. A pre-mint cancellation leaves a zero-usage receipt rather than an
+            // ambiguous empty slot.
+            if let Some(slots) = &broker
+                && let Ok(mut guard) = slots.lock()
+            {
+                guard.finalize_armed();
+            }
             if let Some(e) = terr {
                 return (issue.state.clone(), last_result, Some(e.into()));
             }
@@ -992,6 +1181,8 @@ mod tests {
             // honest default for the pre-978 tests, none of which exercises the refusal path.
             mcp_enabled: true,
             harness_refusal: None,
+            prepared: None,
+            broker: None,
         }
     }
 
@@ -1158,7 +1349,7 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, "inline (should be ignored)", 20);
         d.prompt_file = "PROMPT.md".to_string();
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(ag.last_prompt(), "from file MT-1", "file wins over inline");
     }
@@ -1175,7 +1366,7 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         d.run_id = 412;
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             ag.last_run_id(),
@@ -1199,10 +1390,10 @@ mod tests {
         let ag = Arc::new(fake);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
 
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             matches!(
                 err,
@@ -1236,15 +1427,15 @@ mod tests {
             (make_deps(ws, ag.clone(), tr, "p", max_turns), ag, root)
         };
 
-        let (single, ag, _root1) = mk(1);
+        let (mut single, ag, _root1) = mk(1);
         let (_l, _d, err) =
-            run_agent_attempt(&single, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut single, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "single-turn run must dispatch: {err:?}");
         assert_eq!(ag.start_calls(), 1);
 
-        let (multi, ag, _root2) = mk(20);
+        let (mut multi, ag, _root2) = mk(20);
         let (_l, _d, err) =
-            run_agent_attempt(&multi, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut multi, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             matches!(
                 err,
@@ -1278,7 +1469,7 @@ mod tests {
         });
 
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         let msg = format!("{err:?}");
         assert!(
             matches!(err, Some(WorkerError::CapabilityRefused(_))),
@@ -1302,10 +1493,10 @@ mod tests {
         let ag = Arc::new(fake);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
 
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "FinalTextOnly must be dispatchable: {err:?}");
         assert_eq!(ag.start_calls(), 1, "a degraded run still runs");
     }
@@ -1348,7 +1539,7 @@ mod tests {
         let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
 
         let (_last, declaration, err) =
-            run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
 
         let block = declaration
@@ -1468,7 +1659,7 @@ mod tests {
         });
 
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
             None,
             None,
@@ -1525,7 +1716,7 @@ mod tests {
         });
 
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
             None,
             None,
@@ -1575,7 +1766,7 @@ mod tests {
         });
 
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
             None,
             None,
@@ -1708,7 +1899,7 @@ mod tests {
         });
 
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
             None,
             None,
@@ -1764,7 +1955,7 @@ mod tests {
         });
 
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
             None,
             None,
@@ -1804,8 +1995,15 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, &implementer, 20);
         d.prompt_file = "/nonexistent/rhapsody/STUDIO-798/PROMPT.md".to_string();
 
-        let (_last, _declared, err) =
-            run_agent_attempt(&d, review_ticket_issue(), None, None, &noop_event(), None).await;
+        let (_last, _declared, err) = run_agent_attempt(
+            &mut d,
+            review_ticket_issue(),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
 
         let prompt = ag.last_prompt();
@@ -1844,7 +2042,7 @@ mod tests {
         d.prompt_file = "/nonexistent/rhapsody/STUDIO-798/PROMPT.md".to_string();
 
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             matches!(err, Some(WorkerError::PromptFile(_))),
             "an implementation run must still hard-fail on an unreadable absolute prompt_file, got {err:?}"
@@ -1870,10 +2068,10 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, &implementer, 20);
+        let mut d = make_deps(ws, ag.clone(), tr, &implementer, 20);
 
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
 
         let prompt = ag.last_prompt();
@@ -1941,9 +2139,9 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             ag.last_review_head(),
@@ -1966,7 +2164,7 @@ mod tests {
             effort: "xhigh".to_string(),
         };
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             ag.last_model_override(),
@@ -1986,9 +2184,9 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             ag.last_model_override(),
@@ -2004,9 +2202,9 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         let (_last, _declared, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(ag.last_run_id(), Some(0), "a zero id is still threaded");
     }
@@ -2022,7 +2220,7 @@ mod tests {
             let mut d = make_deps(ws, ag, tr, "inline", 20);
             d.git_flow = git_flow.to_string();
             let (_l, _h, err) =
-                run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
             assert!(err.is_none(), "expected normal exit, got {err:?}");
             root
         }
@@ -2062,7 +2260,7 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, "inline body {{ issue.identifier }}", 20);
         d.prompt_file = "does-not-exist.md".to_string();
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             err.is_none(),
             "a missing relative prompt_file must soft-fall-back: {err:?}"
@@ -2089,7 +2287,7 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, "inline body", 20);
         d.prompt_file = host.child("absent-host-prompt.md");
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         let err = err.expect("missing absolute prompt_file must fail the run");
         assert!(
             err.to_string().contains("absent-host-prompt.md"),
@@ -2205,7 +2403,7 @@ mod tests {
         let mut d = make_deps(ws, ag.clone(), tr, "do it", 20);
         d.transcripts = Some(Arc::new(obslog::Store::new(log_dir.path.clone())));
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "{err:?}");
         assert!(
             std::fs::metadata(log_dir.child("MT-1")).is_ok(),
@@ -2224,9 +2422,9 @@ mod tests {
         // After turn 1 the issue is no longer active → loop stops.
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "do {{ issue.identifier }}", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "do {{ issue.identifier }}", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(ag.start_calls(), 1);
     }
@@ -2246,9 +2444,9 @@ mod tests {
         }));
         let tr = Arc::new(tr);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2273,11 +2471,11 @@ mod tests {
             Ok(vec![issue("1", "MT-1", "In Progress")])
         }));
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
+        let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
         d.drain
             .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
         let (last, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             err.is_none(),
             "a drained wind-down is a NORMAL exit — an error here would classify the run \
@@ -2323,7 +2521,7 @@ mod tests {
             Ok(vec![issue("1", "MT-1", "In Progress")])
         }));
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
+        let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
         d.drain
             .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
         let turns = Arc::new(AtomicUsize::new(0));
@@ -2331,7 +2529,7 @@ mod tests {
         let count = move |_e: Event| {
             turns2.fetch_add(1, Ordering::SeqCst);
         };
-        let (_l, _h, err) = run_agent_attempt(&d, dispatched(), None, None, &count, None).await;
+        let (_l, _h, err) = run_agent_attempt(&mut d, dispatched(), None, None, &count, None).await;
         assert!(err.is_none(), "expected a normal exit, got {err:?}");
         assert_eq!(
             turns.load(Ordering::SeqCst),
@@ -2399,7 +2597,7 @@ mod tests {
             turns2.fetch_add(1, Ordering::SeqCst);
         };
         let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
-        let (_l, _h, err) = run_agent_attempt(&d, iss, None, None, &count, None).await;
+        let (_l, _h, err) = run_agent_attempt(&mut d, iss, None, None, &count, None).await;
         assert!(err.is_none(), "expected a normal exit, got {err:?}");
         assert_eq!(
             turns.load(Ordering::SeqCst),
@@ -2418,9 +2616,9 @@ mod tests {
         }));
         let tr = Arc::new(tr);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (last, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(last, "In Review");
     }
@@ -2457,7 +2655,7 @@ mod tests {
             ..issue("1", "MT-1", "In Progress")
         };
         let (last, handed_off, err) =
-            run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert!(
             handed_off.declared_handoff,
@@ -2486,9 +2684,9 @@ mod tests {
         }));
         let tr = Arc::new(tr);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 1); // exhaust the turn budget after turn 1
+        let mut d = make_deps(ws, ag, tr, "do it", 1); // exhaust the turn budget after turn 1
         let (last, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(last, "In Progress");
     }
@@ -2519,9 +2717,9 @@ mod tests {
             }));
             let tr = Arc::new(tr);
             let (ws, _root) = test_workspace(HookScripts::default());
-            let d = make_deps(ws, ag, tr, "do it", 20);
+            let mut d = make_deps(ws, ag, tr, "do it", 20);
             let (_l, declaration, err) =
-                run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
             assert!(err.is_none(), "expected normal exit, got {err:?}");
             assert_eq!(
                 declaration.declared_handoff, *want,
@@ -2562,9 +2760,9 @@ mod tests {
             ..Default::default()
         }]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "do it", 20); // generous budget — only the handoff ends it
+        let mut d = make_deps(ws, ag.clone(), tr, "do it", 20); // generous budget — only the handoff ends it
         let (last, declaration, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected a clean exit, got {err:?}");
         assert_eq!(
             refreshes.load(Ordering::SeqCst),
@@ -2831,9 +3029,9 @@ mod tests {
         }));
         let tr = Arc::new(tr);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 2);
+        let mut d = make_deps(ws, ag, tr, "do it", 2);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(
             err.is_none(),
             "expected normal exit at max turns, got {err:?}"
@@ -2850,9 +3048,9 @@ mod tests {
             before_run: "exit 1".to_string(),
             ..Default::default()
         });
-        let d = make_deps(ws, ag.clone(), tr, "do it", 20);
+        let mut d = make_deps(ws, ag.clone(), tr, "do it", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_some(), "before_run failure must abort the attempt");
         assert_eq!(
             ag.start_calls(),
@@ -2869,9 +3067,9 @@ mod tests {
         let ag = Arc::new(ag);
         let tr = Arc::new(trackerfake::Fake::new());
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_some(), "agent start failure must error");
     }
 
@@ -2888,9 +3086,9 @@ mod tests {
         }]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "In Progress")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_some(), "turn failure must error");
     }
 
@@ -2901,9 +3099,9 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = Arc::new(trackerfake::Fake::new());
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag.clone(), tr, "{{ unknown_var }}", 20); // strict render fails
+        let mut d = make_deps(ws, ag.clone(), tr, "{{ unknown_var }}", 20); // strict render fails
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_some(), "prompt render failure must error");
         assert_eq!(
             ag.start_calls(),
@@ -2935,12 +3133,13 @@ mod tests {
         }]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
 
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen2 = Arc::clone(&seen);
         let on_event = move |e: Event| seen2.lock().unwrap().push(e.event_type);
-        let (_l, _h, err) = run_agent_attempt(&d, dispatched(), None, None, &on_event, None).await;
+        let (_l, _h, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &on_event, None).await;
         assert!(err.is_none(), "{err:?}");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "events not forwarded: {seen:?}");
@@ -2954,10 +3153,10 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         assert_eq!(d.repo_url, "", "precondition: RepoURL must be empty");
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         // Plain per-issue dir was created by the legacy mkdir path.
         assert!(
@@ -2991,9 +3190,9 @@ mod tests {
         }));
         let tr = Arc::new(tr);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (_l, _h, err) =
-            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3045,9 +3244,9 @@ mod tests {
             let ag = notify_then_succeed();
             let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
             let (ws, _root) = test_workspace(HookScripts::default());
-            let warm = make_deps(ws, ag, tr, "do it", 20);
+            let mut warm = make_deps(ws, ag, tr, "do it", 20);
             let _ = run_agent_attempt(
-                &warm,
+                &mut warm,
                 issue("1", "MT-1", "In Progress"),
                 None,
                 None,
@@ -3062,9 +3261,9 @@ mod tests {
         let ag = notify_then_succeed();
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]); // leaves the active set after turn 1
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let (_last, _declared, err) = run_agent_attempt(
-            &d,
+            &mut d,
             issue("1", "MT-1", "In Progress"),
             None,
             None,
@@ -3144,9 +3343,9 @@ mod tests {
             let ag = notify_then_succeed();
             let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
             let (ws, _root) = test_workspace(HookScripts::default());
-            let warm = make_deps(ws, ag, tr, "do it", 20);
+            let mut warm = make_deps(ws, ag, tr, "do it", 20);
             let _ = run_agent_attempt(
-                &warm,
+                &mut warm,
                 issue("1", "MT-1", "In Progress"),
                 None,
                 None,
@@ -3161,9 +3360,9 @@ mod tests {
         let ag = notify_then_succeed();
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
         let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
         let _ = run_agent_attempt(
-            &d,
+            &mut d,
             issue("1", "MT-1", "In Progress"),
             None,
             None,
@@ -3181,6 +3380,102 @@ mod tests {
         assert!(
             agent_ev.1,
             "agent-event log must be emitted under the run/turn span for OTel trace correlation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod broker_slots_tests {
+    use std::sync::Arc;
+
+    use rhapsody_provider_broker::{
+        BoundCredentialLease, Broker, BrokerError, BrokerProtocol, BrokerRegistrationPlan,
+        OsRandom, SessionPolicy, SystemClock, TurnOutcome,
+    };
+
+    use super::BrokerTurnSlots;
+
+    fn broker() -> Broker {
+        Broker::new(
+            "http://127.0.0.1:0/v1",
+            Arc::new(SystemClock::new()),
+            Arc::new(OsRandom::new()),
+        )
+        .expect("broker")
+    }
+
+    fn register(broker: &Broker) -> rhapsody_provider_broker::BrokerRegistration {
+        let plan = BrokerRegistrationPlan::new(
+            "fireworks",
+            BrokerProtocol::OpenAiChatCompletions,
+            "https://api.fireworks.ai/inference/v1",
+            false,
+            "accounts/fireworks/models/x",
+            rhapsody_provider_broker::DEFAULT_BROKER_LIMITS,
+        )
+        .expect("plan");
+        let binding = plan.binding().expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let policy = SessionPolicy::new(*plan.limits()).expect("policy");
+        broker
+            .registrar()
+            .register_session(plan, lease, policy)
+            .expect("register")
+    }
+
+    /// A cancelled turn BEFORE capability mint is a finalized ZERO-usage receipt, not an ambiguous
+    /// empty slot. The mutation guard is dropping the attempt without finalizing: the ledger would
+    /// never appear and `usage()` would be `None`.
+    #[test]
+    fn cancellation_before_mint_yields_a_finalized_zero_usage_receipt() {
+        let broker = broker();
+        let registration = register(&broker);
+        let mut slots = BrokerTurnSlots::default();
+        slots.install_receiver(registration.ledgers);
+
+        let attempt = slots.arm_turn().expect("arm").expect("a brokered attempt");
+        // Cancellation: the attempt drops WITHOUT minting.
+        drop(attempt);
+        slots.finalize_armed();
+
+        assert_eq!(slots.ledgers().len(), 1, "exactly one receipt");
+        let ledger = &slots.ledgers()[0];
+        assert_eq!(ledger.outcome(), TurnOutcome::NoCapability);
+        assert!(!ledger.capability_issued());
+        assert_eq!(ledger.reserved_tokens(), 0);
+
+        let usage = slots.usage().expect("a cancellation still records a row");
+        assert_eq!(usage.reserved_tokens, 0);
+        assert_eq!(usage.provider_reported_tokens, None);
+        assert!(usage.usage_authority.is_empty());
+        assert_eq!(usage.unknown_usage_requests, 0);
+    }
+
+    /// The legacy shape: no receiver installed ⇒ no attempt armed and no usage row. This is what
+    /// keeps a no-provider dispatch from writing a `rhapsody_run_usage` row.
+    #[test]
+    fn legacy_slots_arm_nothing_and_record_no_usage() {
+        let mut slots = BrokerTurnSlots::default();
+        assert!(slots.arm_turn().expect("legacy is not an error").is_none());
+        slots.finalize_armed();
+        assert!(slots.ledgers().is_empty());
+        assert!(slots.usage().is_none());
+    }
+
+    /// A live attempt that never mints because the session was revoked finalizes too: arming a
+    /// REVOKED session is a typed refusal. The mutation guard is ignoring the receiver's error.
+    #[test]
+    fn arming_a_revoked_session_is_refused() {
+        let broker = broker();
+        let registration = register(&broker);
+        registration.session.revoke();
+        let mut slots = BrokerTurnSlots::default();
+        slots.install_receiver(registration.ledgers);
+        let err = slots.arm_turn().expect_err("revoked");
+        assert!(
+            err.contains("revoked") || err == BrokerError::SessionRevoked.to_string(),
+            "{err}"
         );
     }
 }

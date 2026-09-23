@@ -107,6 +107,18 @@ pub enum HarnessId {
     Opencode,
 }
 
+impl HarnessId {
+    /// The harness's config-facing name (`"claude"`/`"opencode"`), the same spelling
+    /// [`harness_id_for_name`] parses. Exhaustive, so a new harness must add its name rather than
+    /// inherit one.
+    pub const fn name(self) -> &'static str {
+        match self {
+            HarnessId::Claude => "claude",
+            HarnessId::Opencode => "opencode",
+        }
+    }
+}
+
 /// A provider protocol a harness adapter can consume. One variant in v1: OpenAI Chat Completions
 /// with Bearer API-key auth — the reviewed adapter `provider-auth-design.md` §3 means by the config
 /// value `openai-compatible`, NOT arbitrary auth headers or fields.

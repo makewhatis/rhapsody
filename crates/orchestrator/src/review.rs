@@ -570,9 +570,22 @@ impl Orchestrator {
     /// only after a successful completion, keeping every watch-set write behind the preparation gate.
     pub(crate) fn finish_review_dispatch(
         &mut self,
+        run: ReviewRun,
+        route: DispatchRoute,
+        iss: Issue,
+    ) {
+        self.finish_review_dispatch_prepared(run, route, iss, None);
+    }
+
+    /// The prepared-review tail (PB7, STUDIO-1002): identical to [`Self::finish_review_dispatch`]
+    /// except it may carry the move-only prepared harness spec an accepted review preparation
+    /// produced. `None` is every direct/legacy review dispatch and is byte-identical.
+    pub(crate) fn finish_review_dispatch_prepared(
+        &mut self,
         mut run: ReviewRun,
         route: DispatchRoute,
         iss: Issue,
+        prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
     ) {
         let id = run.key();
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
@@ -624,7 +637,7 @@ impl Orchestrator {
         // spawn happens INSIDE `dispatch_issue`, so the pinned head has to be in place before the
         // call rather than stamped onto the running entry after it.
         self.pending_review.insert(id, run);
-        self.dispatch_issue(iss, None, Some(route), String::new());
+        self.dispatch_issue_prepared(iss, None, Some(route), String::new(), prepared);
     }
 
     /// Resolves the dispatch routing for a pull request's repository: the enabled project whose

@@ -248,6 +248,29 @@ where
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
     let resolved = load_resolved(&flags.path);
+    // PB7 (STUDIO-1002): install the prepared-dispatch resolver, but ONLY when the workflow actually
+    // configures a provider. Without one, no resolver is installed and every dispatch is the
+    // original inline path byte-for-byte (the compatibility guarantee). The broker itself is still
+    // bound unconditionally above (§11.1). An explicit-provider dispatch then resolves its pure
+    // selection and, for `Present`, reads the bound credential through the daemon's authenticated
+    // owner adapter and registers it with the broker — all OFF the control task. The same credential
+    // boundary the provider-status runtime uses is shared, so one tracker observes every
+    // availability transition; with no bootstrap channel the owner is an `OwnerUnavailable` resolver,
+    // which is the honest refusal rather than a direct-key fallback.
+    if let Some(config) = resolved.as_ref()
+        && !config.providers.is_empty()
+    {
+        let prep_owner = credential_owner_boundary
+            .clone()
+            .unwrap_or_else(crate::providers::unavailable_owner);
+        let prep_source = Arc::new(crate::providers::DaemonProviderSource::new(
+            prep_owner,
+            broker_runtime.registrar(),
+        ));
+        o.set_preparation_resolver(Arc::new(
+            rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
+        ));
+    }
     // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
     // failed open. Only the one reader that would ACT on an absence uses it (the Teams
     // identity-label reconcile, STUDIO-672); everything else is guard-free by design.

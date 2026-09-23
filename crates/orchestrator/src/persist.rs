@@ -208,6 +208,27 @@ impl Orchestrator {
         }
     }
 
+    /// Persist a brokered run's finalized usage (PB7, STUDIO-1002; design §7.3). The worker sends
+    /// this BEFORE its exit event, so the run is still live and its store row id is resolvable here.
+    /// A missing entry (a run already reaped) or a zero run id (store off) is a no-op; a store
+    /// failure is logged, never fatal — accounting must never fail a run.
+    pub(crate) fn on_broker_usage(&self, issue_id: &str, usage: &store::RunUsage) {
+        let Some(run_id) = self.running.get(issue_id).map(|re| re.run_id) else {
+            return;
+        };
+        if run_id == 0 {
+            return;
+        }
+        if let Err(e) = self.store.set_run_usage(run_id, usage) {
+            tracing::warn!(
+                issue_id = %issue_id,
+                run_id,
+                err = %e,
+                "broker usage persistence failed; the run's own history is unaffected"
+            );
+        }
+    }
+
     // --- synchronous write-through helpers ----------------------------------------------------
 
     /// Inserts the run row (outcome `running`), records its id on `re` for later
@@ -872,5 +893,44 @@ mod tests {
             msgs[0].status, RUN_MESSAGE_EXPIRED,
             "pending message must expire at run end"
         );
+    }
+
+    // PB7 (STUDIO-1002): a brokered run's finalized usage lands in its own `rhapsody_run_usage` row,
+    // keyed by the store run id. The mutation guard is dropping the `set_run_usage` call (no row) or
+    // folding the values into the run's own token tallies (the run row stays at zero here).
+    #[test]
+    fn on_broker_usage_writes_a_separate_usage_row() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "In Progress");
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+        let usage = store::RunUsage {
+            provider_reported_tokens: Some(42),
+            reserved_tokens: 900,
+            usage_authority: store::USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.to_string(),
+            usage_incomplete: true,
+            unknown_usage_requests: 2,
+        };
+
+        o.on_broker_usage(&issue_id, &usage);
+
+        let got = st
+            .run_usage(run_id)
+            .expect("read usage")
+            .expect("a usage row");
+        assert_eq!(got, usage);
+        // The run's own token tallies are untouched — usage is never folded into them.
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        assert_eq!(runs[0].total_tokens, 0);
+    }
+
+    // An unknown issue (a run already reaped) is a no-op rather than a panic or a wrong-run write.
+    #[test]
+    fn on_broker_usage_ignores_an_unknown_issue() {
+        let (o, _st) = orch_with_store();
+        let usage = store::RunUsage::default();
+        o.on_broker_usage("ghost", &usage); // must not panic
     }
 }
