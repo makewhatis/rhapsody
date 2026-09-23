@@ -20,7 +20,12 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use rhapsody_credential_ipc::wire::BootstrapMessage;
 use tokio::sync::{oneshot, watch};
+
+use crate::credential_bootstrap::{
+    BootstrapListener, ChannelObservations, CredentialOwnerLookup, ListenerShutdown,
+};
 
 /// The supervised daemon's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +114,26 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
+/// The supervisor's credential-bootstrap wiring (STUDIO-1035, Rhapsody-only — no Go parity). When
+/// present, every daemon launch gets `--credential-bootstrap` plus the ONE bootstrap frame on a piped
+/// stdin (socket path + fresh per-launch token), and this process serves the authenticated channel the
+/// daemon connects back on. The listener answers `read_bound` from `lookup` and records every answered
+/// revision into `observations` — the shared, non-secret record the provider commands read to decide
+/// whether a committed mutation is daemon-observable.
+///
+/// `None` (the default) preserves the pre-provider launch exactly: no flag, stdin left as the parent's,
+/// and no listener — so a provider-less install behaves byte-for-byte as before.
+#[derive(Clone)]
+pub struct CredentialBootstrap {
+    /// Directory the per-launch Unix socket is bound under (production: `~/.rhapsody/run`).
+    pub socket_dir: PathBuf,
+    /// Account (`v1:<id>`) → owner routing. Shares the desktop command service's cached owners so a
+    /// revision the daemon observed and a revision a command committed are the same number line.
+    pub lookup: Arc<dyn CredentialOwnerLookup>,
+    /// The shared record of the newest revision the daemon has actually been served.
+    pub observations: Arc<ChannelObservations>,
+}
+
 /// Configures a [`Supervisor`]. Unset fields default in [`Supervisor::new`] (or via [`Default`]).
 pub struct Options {
     /// Path to rhapsodyd (required).
@@ -135,6 +160,8 @@ pub struct Options {
     pub max_restarts: i64,
     /// Delay before the Nth restart (default exponential, capped at 5s).
     pub backoff: Option<Arc<dyn Fn(i64) -> Duration + Send + Sync>>,
+    /// Credential-bootstrap wiring (STUDIO-1035); `None` by default. See [`CredentialBootstrap`].
+    pub credential_bootstrap: Option<CredentialBootstrap>,
 }
 
 impl Default for Options {
@@ -152,6 +179,7 @@ impl Default for Options {
             stop_grace: Duration::from_secs(5),
             max_restarts: 5,
             backoff: None,
+            credential_bootstrap: None,
         }
     }
 }
@@ -254,6 +282,7 @@ struct Inner {
     stop_grace: Duration,
     max_restarts: i64,
     backoff: Arc<dyn Fn(i64) -> Duration + Send + Sync>,
+    credential_bootstrap: Option<CredentialBootstrap>,
     state: Mutex<StateData>,
     http: reqwest::Client,
 }
@@ -298,6 +327,7 @@ impl Supervisor {
                     opts.max_restarts
                 },
                 backoff,
+                credential_bootstrap: opts.credential_bootstrap,
                 state: Mutex::new(StateData {
                     state: State::Stopped,
                     pid: 0,
@@ -491,11 +521,18 @@ impl Inner {
     }
 
     /// Constructs the daemon command with the known-good PATH/credential environment and its own
-    /// process group. Mirrors Go `buildCmd`.
-    fn build_command(&self) -> tokio::process::Command {
+    /// process group. Mirrors Go `buildCmd`, plus the Rhapsody-only `--credential-bootstrap` flag
+    /// (STUDIO-1035): when `credential_bootstrap` is true the child's stdin is PIPED so `run_once`
+    /// can write the ONE bootstrap frame and close it. Everything else about the launch is unchanged.
+    fn build_command(&self, credential_bootstrap: bool) -> tokio::process::Command {
         use std::os::unix::process::CommandExt;
 
-        let mut args: Vec<String> = vec!["--port".to_string(), self.port().to_string()];
+        let mut args: Vec<String> = Vec::new();
+        if credential_bootstrap {
+            args.push("--credential-bootstrap".to_string());
+        }
+        args.push("--port".to_string());
+        args.push(self.port().to_string());
         if let Some(wf) = &self.workflow_path {
             args.push(wf.to_string_lossy().into_owned());
         }
@@ -521,6 +558,11 @@ impl Inner {
                 std_cmd.stderr(Stdio::inherit());
             }
         }
+        // The bootstrap frame travels on the child's stdin, so it must be a pipe this process owns;
+        // without a credential bootstrap the stdin disposition is left exactly as before (inherited).
+        if credential_bootstrap {
+            std_cmd.stdin(Stdio::piped());
+        }
         // Run the daemon as its own process-group leader so `terminate` can signal the whole group
         // (the daemon plus any agent subprocesses it spawns), leaving nothing orphaned on quit.
         // SAFETY: `setpgid(0, 0)` is async-signal-safe, the only requirement for a `pre_exec` hook.
@@ -536,9 +578,29 @@ impl Inner {
     }
 
     /// Launches the daemon once and returns when it becomes unhealthy/exits or its run is asked to
-    /// stop. Transitions state to Starting then (on health) Running. Mirrors Go `runOnce`.
+    /// stop. Transitions state to Starting then (on health) Running. Mirrors Go `runOnce`, plus the
+    /// STUDIO-1035 credential-bootstrap wiring: bind the listener BEFORE spawn, hand the child its
+    /// frame, serve the channel for the launch's whole life, and shut the listener down before this
+    /// returns so a restart cannot leave the previous socket bound.
     async fn run_once(&self, run: &Arc<SupRun>) -> Outcome {
-        let mut child = match self.build_command().spawn() {
+        // Bind before spawning so the frame names a socket already being accepted on. A bind failure
+        // is logged and the launch proceeds WITHOUT the flag: the daemon then resolves
+        // `OwnerUnavailable`, which is the honest state, rather than waiting out BOOTSTRAP_TIMEOUT.
+        let (listener, bootstrap) = match &self.credential_bootstrap {
+            Some(cfg) => match BootstrapListener::bind(&cfg.socket_dir) {
+                Ok(listener) => (Some(listener), Some(cfg.clone())),
+                Err(e) => {
+                    self.set_last_err(format!(
+                        "credential listener bind {}: {e}",
+                        cfg.socket_dir.display()
+                    ));
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+
+        let mut child = match self.build_command(listener.is_some()).spawn() {
             Ok(c) => c,
             Err(e) => {
                 self.set_last_err(format!("launch {}: {e}", self.binary_path.display()));
@@ -548,6 +610,36 @@ impl Inner {
         let pid = child.id().map(|p| p as i32).unwrap_or(0);
         self.set_starting(pid);
 
+        // Serve the channel and write the child its ONE bootstrap frame, then close the pipe. The
+        // listener task is owned for the whole launch and torn down before this returns.
+        let serving = match (listener, bootstrap) {
+            (Some(listener), Some(cfg)) => {
+                let message = listener.bootstrap_message();
+                let (future, shutdown) =
+                    listener.accept_and_serve_registry(cfg.lookup, cfg.observations);
+                let handle = tokio::spawn(future);
+                write_bootstrap_frame(&mut child, &message).await;
+                Some(ServingListener { shutdown, handle })
+            }
+            _ => None,
+        };
+
+        let outcome = self.wait_once(run, &mut child, pid).await;
+        if let Some(serving) = serving {
+            serving.stop().await;
+        }
+        outcome
+    }
+
+    /// Waits for one launched child: first readiness (bounded by `startup_timeout`), then the steady
+    /// state, returning the same [`Outcome`] the pre-STUDIO-1035 `run_once` did. Split out so
+    /// `run_once` can hold the credential listener around this wait without duplicating every exit.
+    async fn wait_once(
+        &self,
+        run: &Arc<SupRun>,
+        child: &mut tokio::process::Child,
+        pid: i32,
+    ) -> Outcome {
         // Phase 1: poll for readiness, bounded by startup_timeout.
         let deadline = Instant::now() + self.startup_timeout;
         while !self.healthy().await {
@@ -557,13 +649,13 @@ impl Inner {
                     return if run.stop_requested() { Outcome::Stopped } else { Outcome::Failed };
                 }
                 _ = run.stopped() => {
-                    self.terminate(&mut child).await;
+                    self.terminate(child).await;
                     return Outcome::Stopped;
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {
                     if Instant::now() > deadline {
                         self.set_last_err(format!("not healthy within {:?}", self.startup_timeout));
-                        self.terminate(&mut child).await;
+                        self.terminate(child).await;
                         return Outcome::Failed;
                     }
                 }
@@ -579,7 +671,7 @@ impl Inner {
                 if run.stop_requested() { Outcome::Stopped } else { Outcome::Crashed }
             }
             _ = run.stopped() => {
-                self.terminate(&mut child).await;
+                self.terminate(child).await;
                 Outcome::Stopped
             }
         }
@@ -602,6 +694,62 @@ impl Inner {
             }
         }
     }
+}
+
+/// One launch's running credential listener: the shutdown handle plus the task serving it. Kept
+/// together so a launch's listener is shut down AND awaited before the supervisor starts its
+/// replacement — a lingering listener would keep the previous socket bound and could answer a
+/// `read_bound` against the previous launch's owner after the daemon it belonged to is gone.
+struct ServingListener {
+    shutdown: ListenerShutdown,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ServingListener {
+    async fn stop(self) {
+        self.shutdown.shutdown();
+        // Awaiting on the shutdown path is deliberate: it is the only combination that proves every
+        // connection has ended (see `ListenerShutdown`'s doc), and it bounds the wait to the
+        // listener's own teardown rather than the daemon's.
+        let _ = self.handle.await;
+    }
+}
+
+/// Writes the ONE bootstrap frame to the child's piped stdin, then drops the write end so the pipe
+/// closes (the daemon reads exactly one frame and never re-reads; a closed pipe is what tells it
+/// there will never be another). Errors are logged, not fatal: the child is already spawned and a
+/// frame that never arrives simply leaves it with no credential owner — the same honest outcome as a
+/// confused-deputy launch.
+async fn write_bootstrap_frame(child: &mut tokio::process::Child, message: &BootstrapMessage) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        eprintln!("rhapsody-desktop: supervisor: credential-bootstrap child has no piped stdin");
+        return;
+    };
+    let bytes = match serde_json::to_vec(message) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("rhapsody-desktop: supervisor: encode credential bootstrap frame: {e}");
+            return;
+        }
+    };
+    let len = match u32::try_from(bytes.len()) {
+        Ok(len) => len,
+        Err(_) => {
+            eprintln!("rhapsody-desktop: supervisor: credential bootstrap frame too large");
+            return;
+        }
+    };
+    let write = async {
+        stdin.write_all(&len.to_be_bytes()).await?;
+        stdin.write_all(&bytes).await?;
+        stdin.flush().await
+    };
+    if let Err(e) = write.await {
+        eprintln!("rhapsody-desktop: supervisor: write credential bootstrap frame: {e}");
+    }
+    // `stdin` drops here (or already did), closing the write end.
 }
 
 /// The long-running loop: launch → wait healthy → steady state → restart-on-crash with backoff, until
@@ -711,8 +859,26 @@ fn nonzero(d: Duration, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rhapsody_credential_ipc::owner::CredentialOwner;
 
-    // The State strings the UI/tray relies on (matches Go State.String()).
+    /// A lookup with no owners: enough to exercise the launch-argument plumbing without a Keychain.
+    struct NoOwners;
+
+    impl CredentialOwnerLookup for NoOwners {
+        fn owner_for(&self, _account: &str) -> Option<Arc<dyn CredentialOwner>> {
+            None
+        }
+    }
+
+    fn credential_bootstrap() -> CredentialBootstrap {
+        CredentialBootstrap {
+            socket_dir: PathBuf::from("/tmp"),
+            lookup: Arc::new(NoOwners),
+            observations: Arc::new(ChannelObservations::new()),
+        }
+    }
+
+    /// The State strings the UI/tray relies on (matches Go State.String()).
     #[test]
     fn state_strings() {
         assert_eq!(State::Stopped.as_str(), "stopped");
@@ -761,6 +927,30 @@ mod tests {
         assert!(
             !a.ptr_eq(&b),
             "two separate supervisors are distinct instances"
+        );
+    }
+
+    /// The credential-bootstrap flag (STUDIO-1035) is added to the daemon's argv exactly when the
+    /// supervisor was asked to bootstrap, and never otherwise. (The piped-stdin half is proven end to
+    /// end against a real child in `supervisor_lifecycle.rs`, since a `std::process::Command` does
+    /// not expose its stdin disposition for inspection.)
+    #[test]
+    fn build_command_includes_credential_bootstrap_only_when_asked() {
+        let sup = Supervisor::new(Options {
+            credential_bootstrap: Some(credential_bootstrap()),
+            ..Options::default()
+        });
+        let has_flag = |bootstrap: bool| {
+            sup.inner
+                .build_command(bootstrap)
+                .as_std()
+                .get_args()
+                .any(|a| a == "--credential-bootstrap")
+        };
+        assert!(has_flag(true), "a bootstrap launch must pass the flag");
+        assert!(
+            !has_flag(false),
+            "a non-bootstrap launch must be byte-identical to the pre-STUDIO-1035 argv"
         );
     }
 

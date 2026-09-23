@@ -166,6 +166,12 @@ where
                 }
                 None => match crate::credential_client::read_bootstrap(tokio::io::stdin()).await {
                     Some(msg) => {
+                        // Seed the shared boundary resolver with the frame WE just read: the
+                        // provider-status and dispatch paths read through that same resolver, and
+                        // without this they would see an uninitialized channel and never observe the
+                        // owner's revision (STUDIO-1035). The probe branch above seeds it through
+                        // `learn_bootstrap`; this branch consumes stdin itself, so it must adopt.
+                        task_resolver.adopt_bootstrap(Some(msg.clone()));
                         match crate::credential_client::CredentialClient::connect(&msg).await {
                             Ok(_client) => {
                                 // `connect` only establishes the stream and sends `Hello` — the
@@ -185,6 +191,9 @@ where
                         }
                     }
                     None => {
+                        // Record the negative outcome too, so every later read short-circuits to
+                        // `OwnerUnavailable` without re-reading stdin (which is impossible anyway).
+                        task_resolver.adopt_bootstrap(None);
                         tracing::info!(
                             "no provider-credential bootstrap frame received; running with no credential owner"
                         );
@@ -1321,14 +1330,12 @@ struct Flags {
     /// omits it and gets no credential owner, by construction.
     credential_bootstrap: bool,
     /// `--credential-probe-account` / `--credential-probe-binding` (STUDIO-981/P0c, Rhapsody-only):
-    /// only meaningful alongside `--credential-bootstrap`. The real desktop supervisor does not
-    /// wire the actual socket-server spawn call yet (see README's "Wiring the socket server into
-    /// the real supervisor spawn call" note), so there is no config-driven provider account for the
-    /// daemon to resolve at boot today — these two flags let `credential_bootstrap_e2e.rs` tell the
-    /// freshly spawned real daemon binary which account/binding to run one real
-    /// authenticate-then-`read_bound` round trip against, so the acceptance evidence is a genuine
-    /// read over a real signed binary, not merely a successful `connect`. PB7 replaces this with
-    /// per-dispatch resolution through the same `CredentialResolver` call.
+    /// only meaningful alongside `--credential-bootstrap`. The real supervisor wires the production
+    /// channel (STUDIO-1035), so a plain launch resolves configured providers over it; these two
+    /// flags let `credential_bootstrap_e2e.rs` drive the real daemon binary to run one real
+    /// authenticate-then-`read_bound` round trip against an account/binding it names, so the
+    /// acceptance evidence is a genuine read over a real signed binary, not merely a successful
+    /// `connect`.
     credential_probe: Option<CredentialProbe>,
     /// The positional WORKFLOW.md path (default `WORKFLOW.md`).
     path: PathBuf,

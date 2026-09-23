@@ -23,8 +23,8 @@ use tokio::sync::watch;
 
 use crate::menu::{MenuModel, menu_from_status};
 use crate::supervisor::{
-    DaemonOutput, Options, State, Status, Supervisor, is_executable_file, resolve_binary,
-    resources_dir_for,
+    CredentialBootstrap, DaemonOutput, Options, State, Status, Supervisor, is_executable_file,
+    resolve_binary, resources_dir_for,
 };
 use crate::tooldirs::agent_tool_dirs;
 use crate::{credential, linearoauth, linearprojects, onboarding, prefs, toolcheck};
@@ -90,6 +90,10 @@ struct Mutable {
     /// `Some` once shutdown is underway — collapses Go's `shuttingDown` bool + `stopDone` channel
     /// (always set together) into one field. The single stop task closes it when the drain completes.
     stop_done: Option<Arc<StopSignal>>,
+    /// The credential-bootstrap wiring every supervisor this app builds is launched with (STUDIO-1035).
+    /// `None` until the composition root installs it in [`App::set_credential_bootstrap`], so a
+    /// provider-less install (and every lifecycle test that never sets it) launches exactly as before.
+    credential_bootstrap: Option<CredentialBootstrap>,
 }
 
 struct AppInner {
@@ -252,6 +256,7 @@ impl App {
                     overrides: HashMap::new(),
                     cred: None,
                     stop_done: None,
+                    credential_bootstrap: None,
                 }),
                 save_mu: Mutex::new(()),
                 http,
@@ -315,6 +320,14 @@ impl App {
         lock(&self.inner.mu).sup = Some(s);
     }
 
+    /// Installs the credential-bootstrap wiring (STUDIO-1035) that every subsequent
+    /// [`App::make_supervisor`] launches its daemon with. Called by the composition root once both the
+    /// command service and the shared observations map exist; before that a supervisor launches with
+    /// no credential channel, exactly as it did before this feature.
+    pub fn set_credential_bootstrap(&self, config: CredentialBootstrap) {
+        lock(&self.inner.mu).credential_bootstrap = Some(config);
+    }
+
     /// A copy of the tool overrides under the lock. Mirrors `snapshotOverrides`.
     fn snapshot_overrides(&self) -> HashMap<String, String> {
         lock(&self.inner.mu).overrides.clone()
@@ -326,6 +339,9 @@ impl App {
     /// Mirrors `makeSupervisor`.
     pub fn make_supervisor(&self) -> Supervisor {
         let home = std::env::var("HOME").unwrap_or_default();
+        // Snapshot the bootstrap wiring before taking the other locks (each helper locks the same
+        // mutex; none of the acquisitions nests).
+        let credential_bootstrap = lock(&self.inner.mu).credential_bootstrap.clone();
         Supervisor::new(Options {
             binary_path: self.inner.binary_path.clone(),
             workflow_path: self.inner.workflow_path.clone(),
@@ -333,6 +349,7 @@ impl App {
             linear_api_key: self.linear_token(),
             // The Wails shell wires os.Stderr so the sidecar's logs reach the app's stderr.
             daemon_output: DaemonOutput::Inherit,
+            credential_bootstrap,
             ..Options::default()
         })
     }

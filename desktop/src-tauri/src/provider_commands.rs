@@ -416,6 +416,23 @@ impl ProviderCommandService {
         })
     }
 
+    /// The owner reached by a wire account string (`v1:<provider_id>`) — the routing the supervisor's
+    /// credential listener uses (STUDIO-1035). It resolves to the SAME cached [`ProviderCredentialOwner`]
+    /// the status/prepare/commit surface uses, which is what lets a revision the daemon observed over
+    /// the channel be compared against a mutation this service just committed: two owner instances over
+    /// one Keychain item would each keep their OWN in-memory revision counter, and the comparison would
+    /// silently never match. An unrecognized account (a bad prefix, a non-canonical id, or an id the
+    /// factory declines) yields `None`, never another provider's owner. A canonical id need not be in
+    /// the current workflow: it resolves to that id's own (empty) credential entry, never another
+    /// provider's, and only the token-holding daemon can ask.
+    pub fn owner_for_account(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+        let provider_id = account.strip_prefix("v1:")?;
+        // Re-validate the id exactly as the listener does before it calls this: a canonical id is the
+        // only spelling the factory accepts, so a malformed account can never route anywhere.
+        CredentialRef::for_provider(provider_id).ok()?;
+        self.owner(provider_id)
+    }
+
     /// The cached owner for `provider_id`, created on first use.
     fn owner(&self, provider_id: &str) -> Option<Arc<dyn CredentialOwner>> {
         let mut owners = lock(&self.owners);
@@ -796,6 +813,26 @@ pub fn production_owner_factory() -> OwnerFactory {
     })
 }
 
+/// The supervisor's account→owner routing (STUDIO-1035): the credential listener serves the daemon
+/// over the P0c channel through exactly the owners the desktop command surface mutates, so the
+/// revisions `ChannelObservations` records and the revisions `commit` compares are the same number
+/// line. See [`ProviderCommandService::owner_for_account`].
+pub struct ServiceOwnerLookup {
+    service: Arc<ProviderCommandService>,
+}
+
+impl ServiceOwnerLookup {
+    pub fn new(service: Arc<ProviderCommandService>) -> ServiceOwnerLookup {
+        ServiceOwnerLookup { service }
+    }
+}
+
+impl crate::credential_bootstrap::CredentialOwnerLookup for ServiceOwnerLookup {
+    fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+        self.service.owner_for_account(account)
+    }
+}
+
 /// Load, resolve, and provider-validate a WORKFLOW.md into its typed [`rhapsody_config::Config`].
 /// The pipeline is load → decode → resolve → [`rhapsody_config::validate_providers_only`]: the same
 /// stages the daemon runs, but only the PROVIDER half of the preflight. The daemon's full
@@ -937,6 +974,7 @@ impl ConnectionTester for HttpConnectionTester {
 mod tests {
     use super::*;
     use crate::credential::mock::MockKeyring;
+    use crate::credential_bootstrap::CredentialOwnerLookup;
 
     // ---- test doubles ---------------------------------------------------------------------------
 
@@ -1810,6 +1848,56 @@ mod tests {
             .unwrap();
         assert!(!result.mutated);
         assert_eq!(result.sync, "synchronized");
+    }
+
+    // ---- credential listener routing (STUDIO-1035) ----------------------------------------------
+
+    /// The supervisor's credential listener routes by wire account through the SAME cached owners the
+    /// command surface mutates, so the revision the daemon observed and the revision a commit
+    /// compares are one number line.
+    ///
+    /// MUTATION GUARD: give the lookup its own owner factory (a second instance per provider) and the
+    /// pointer-identity assertion reds — which is the exact defect that would make `synchronized`
+    /// silently unreachable.
+    #[test]
+    fn service_owner_lookup_routes_accounts_to_the_services_own_cached_owners() {
+        let fx = fixture_with_workflow(&workflow_with_provider("https://api.example/v1"));
+        let lookup = ServiceOwnerLookup::new(fx.service.clone());
+
+        let from_lookup = lookup
+            .owner_for("v1:fireworks")
+            .expect("a configured provider routes");
+        let from_service = fx
+            .service
+            .owner_for_account("v1:fireworks")
+            .expect("configured provider");
+        assert!(
+            Arc::ptr_eq(&from_lookup, &from_service),
+            "the listener must serve the service's own cached owner instance, not a fresh one"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &lookup.owner_for("v1:fireworks").expect("still configured"),
+                &from_lookup
+            ),
+            "repeated lookups must reuse the one cached instance"
+        );
+
+        // A non-canonical, prefix-only, or path-shaped account routes nowhere — never to another
+        // provider's owner.
+        for account in ["fireworks", "v1:", "v1:../etc", "v1:UPPER CASE"] {
+            assert!(
+                lookup.owner_for(account).is_none(),
+                "{account:?} must not route to any owner"
+            );
+        }
+        // A canonical but unconfigured id resolves to its OWN (empty) account, never the configured
+        // provider's owner.
+        let other = lookup.owner_for("v1:some-other").expect("canonical id");
+        assert!(
+            !Arc::ptr_eq(&other, &from_lookup),
+            "a different canonical id must not alias another provider's owner"
+        );
     }
 
     // ---- Test Connection ------------------------------------------------------------------------
