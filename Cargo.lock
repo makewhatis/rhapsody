@@ -1651,8 +1651,10 @@ name = "rhapsody-credential-ipc"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "rhapsody-provider-broker",
  "serde",
  "serde_json",
+ "static_assertions",
  "tokio",
  "zeroize",
 ]
@@ -1726,12 +1728,25 @@ dependencies = [
 name = "rhapsody-provider-broker"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64",
+ "bytes",
+ "futures-util",
  "getrandom 0.2.17",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "static_assertions",
  "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "url",
  "zeroize",
 ]
 

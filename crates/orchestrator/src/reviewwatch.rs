@@ -1083,6 +1083,43 @@ impl Orchestrator {
         .unwrap_or(i64::MAX)
     }
 
+    /// Running ticketless reviews PLUS the `preparing` reservations for one (STUDIO-988). A review
+    /// preparation draws the same pool a running review does, so it must be subtracted from the
+    /// implementation draw and counted against the review budget before its `RunningEntry` exists.
+    pub(crate) fn ticketless_review_holders(&self) -> i64 {
+        let preparing = i64::try_from(self.preparing.values().filter(|e| e.is_review()).count())
+            .unwrap_or(i64::MAX);
+        self.running_ticketless_reviews().saturating_add(preparing)
+    }
+
+    /// How many of `pr`'s review ROUNDS are in flight as `preparing` reservations — begun by this or
+    /// an earlier sweep and not yet accepted (so not yet charged to [`Orchestrator::review_rounds`]).
+    ///
+    /// The per-pull-request cap ([`REVIEW_ROUNDS_PER_PR_CAP`]) is charged on ACCEPTANCE (STUDIO-988
+    /// review round 7, sol #1), and every due row of one sweep reads the same uncharged counter — so
+    /// without this count a pull request could begin `reviewers` preparations against a budget one
+    /// short and, once all were accepted, overshoot the cap by up to `reviewers - 1`. Adding the
+    /// in-flight reservations to the charged count makes the N-th row's check see the `N - 1` the
+    /// earlier rows of the same sweep started, so the sweep stops at `budget` exactly as the
+    /// synchronous path does (STUDIO-988 review round 8, alice #2).
+    ///
+    /// Keyed by the same [`churn_key`] the counter is, so a case-variant spelling of one repository
+    /// cannot get a second budget. Ticket reservations are ignored — their dispatch does not touch
+    /// the review round budget.
+    pub(crate) fn review_preparations_for(&self, pr: &PrCoord) -> usize {
+        let key = churn_key(pr);
+        self.preparing
+            .values()
+            .filter_map(|e| match &e.target {
+                crate::prepare::PreparedTarget::Review { run, .. } => {
+                    Some((run.owner.as_str(), run.repo.as_str(), run.number))
+                }
+                crate::prepare::PreparedTarget::Ticket { .. } => None,
+            })
+            .filter(|(owner, repo, number)| churn_key(&PrCoord::new(owner, repo, *number)) == key)
+            .count()
+    }
+
     /// How many running entries currently SPEND the global pool the review watcher draws against
     /// (STUDIO-950). When `agent.max_concurrent_reviews` gives reviews their own pool that is the
     /// ticketless review runs alone; unset, it is EVERY running run on the shared
@@ -1092,10 +1129,12 @@ impl Orchestrator {
     /// what actually spent the pool instead of always the reviews — in shared mode the pool is held
     /// by implementations too, and `holding=0` while four implementations spend it is a lie the
     /// operator tuning the key cannot act on.
-    fn review_pool_holders(&self) -> i64 {
+    pub(crate) fn review_pool_holders(&self) -> i64 {
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
-            Some(_) => self.running_ticketless_reviews(),
-            None => i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+            // STUDIO-988: a review `preparing` reservation holds a review-pool slot before its run.
+            Some(_) => self.ticketless_review_holders(),
+            // Shared pool: every running entry AND every preparation spends it.
+            None => i64::try_from(self.running.len() + self.preparing.len()).unwrap_or(i64::MAX),
         }
     }
 
@@ -1187,14 +1226,25 @@ impl Orchestrator {
         // local read, so it is recorded here from the answer itself.
         for obs in observed {
             self.review_watch_unreadable.remove(&obs.pr);
+            // STUDIO-1005 (review round 1): the observed-head memo is written from the answer itself,
+            // "answered ⇒ memo reflects the answer". STUDIO-988 extends the recorded value with the
+            // open flag so a REVIEW preparation completion can be revalidated against the last
+            // observed head/open state before it reviews a commit the sweep has since seen move (or a
+            // pull request it has since seen close).
             match &obs.lookup {
                 // An OPEN or merged/closed `Found` with a head: the current head to compare an
-                // escalation against. (A retired pull request's entry is removed by
-                // `retire_review_pr` below; recording it here first is harmless and keeps the
-                // "answered ⇒ memo reflects the answer" rule unconditional.)
+                // escalation against (STUDIO-1005) and, for STUDIO-988, whether it is still open.
+                // (A retired pull request's entry is removed by `retire_review_pr` below; recording
+                // it here first is harmless and keeps the "answered ⇒ memo reflects the answer" rule
+                // unconditional.)
                 PrLookup::Found(snap) if !snap.head_sha.is_empty() => {
-                    self.review_observed_head
-                        .insert(obs.pr.clone(), snap.head_sha.clone());
+                    self.review_observed_head.insert(
+                        obs.pr.clone(),
+                        crate::prepare::ReviewHeadObservation {
+                            open: snap.status == PrStatus::Open,
+                            head: snap.head_sha.clone(),
+                        },
+                    );
                 }
                 // A `Found` naming no head, `Gone`, or `Untrusted`: the coordinate has no current
                 // head the sweep may compare against. Clear rather than keep an older head — an
@@ -1628,6 +1678,45 @@ impl Orchestrator {
                 pr = %key, err = %e,
                 "ticketless review: the round counter could not be persisted; this pull request's \
                  bound is per-boot until a later charge writes it"
+            );
+        }
+    }
+
+    /// Applies the watcher bookkeeping a ticketless review dispatch owns, at the moment its dispatch
+    /// is ACCEPTED. Called from `dispatch_review`'s synchronous path (via the `Dispatched` arm's
+    /// former home) and from `finish_prepared` once an asynchronous preparation is accepted, so a
+    /// prepared review is charged the same churn budget and retires the same reassigned incumbent
+    /// (STUDIO-988 review round 7, sol #1). A no-op on the reassignment half when the round was not
+    /// reassigned.
+    pub(crate) fn commit_review_watch(
+        &mut self,
+        pr: &PrCoord,
+        commit: &crate::review::ReviewWatchCommit,
+    ) {
+        if commit.reassigned {
+            tracing::info!(
+                pr = %pr, from = %commit.incumbent.reviewer,
+                "ticketless review: the round was reassigned — the incumbent was not eligible for it"
+            );
+            if let Err(e) = self.store().drop_review_watch(&commit.incumbent) {
+                tracing::warn!(
+                    pr = %pr, err = %e,
+                    "ticketless review: retiring the reassigned watch row failed"
+                );
+            }
+        }
+        let key = churn_key(pr);
+        let counter = self.review_rounds.entry(key.clone()).or_default();
+        *counter += 1;
+        let spent = *counter;
+        // Durable from the instant it is charged (STUDIO-956): a round the daemon spent and then
+        // forgot across a restart is how one pull request ran 46 of them.
+        self.persist_review_rounds(&key);
+        if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(self.reviewers_per_round()) {
+            tracing::warn!(
+                pr = %pr, rounds = spent,
+                "ticketless review: this pull request has now had its whole re-review budget; \
+                 further pushes will not be reviewed"
             );
         }
     }
@@ -2526,11 +2615,19 @@ impl Orchestrator {
             // The counter is in dispatches and the cap is in rounds, so the budget is scaled by the
             // required-reviewer count to make the two comparable (STUDIO-727). Without that, a
             // two-reviewer config would get four rounds and an eight-reviewer config exactly one.
-            let dispatched = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
+            //
+            // The in-flight reservations this pull request already holds are counted BESIDE the
+            // charged counter, because the counter is charged only on acceptance: every due row of
+            // one sweep would otherwise read the same uncharged number and the sweep could begin
+            // `reviewers` preparations against a budget one short, overshooting on acceptance
+            // (STUDIO-988 review round 8, alice #2).
+            let charged = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
+            let in_flight = self.review_preparations_for(pr);
+            let dispatched = charged.saturating_add(in_flight);
             let budget = REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round);
             if dispatched >= budget {
                 tracing::debug!(
-                    pr = %pr, dispatched, budget,
+                    pr = %pr, charged, in_flight, budget,
                     "ticketless review: the per-pull-request re-review cap is reached; no further \
                      round is dispatched until the daemon restarts or the pull request closes"
                 );
@@ -2600,48 +2697,23 @@ impl Orchestrator {
                 // (STUDIO-959). The watcher has no prior-round record to offer here.
                 prior_sha: String::new(),
             };
-            match self.dispatch_review(run) {
+            // The watcher bookkeeping travels WITH the dispatch, so an asynchronous preparation can
+            // apply it on acceptance exactly as the synchronous arm does here (STUDIO-988 review
+            // round 7, sol #1). `dispatch_review_watch` charges the churn budget and retires the
+            // reassigned incumbent for the no-resolver case; a prepared dispatch carries the same
+            // commit on its reservation and applies it in `finish_prepared`.
+            let commit = crate::review::ReviewWatchCommit {
+                incumbent: row.key.clone(),
+                reassigned,
+            };
+            match self.dispatch_review_watch(run, commit) {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
                     *slots -= 1;
                     assigned[idx] = picked;
-                    if reassigned {
-                        // The round moved to a substitute, so the incumbent's row leaves the watch
-                        // set rather than staying beside theirs: it is the SAME required review,
-                        // and two rows would make the pull request owe two of them forever —
-                        // `review_round_due` would go on answering true for the incumbent at every
-                        // head, for a reviewer nobody is waiting on.
-                        //
-                        // Retired only AFTER the dispatch succeeded. Doing it first would leave the
-                        // pull request with no row at all for this required review on any refusal,
-                        // and nothing would ever ask for it again.
-                        tracing::info!(
-                            pr = %pr, from = %row.key.reviewer,
-                            "ticketless review: the round was reassigned — the incumbent was not \
-                             eligible for it"
-                        );
-                        if let Err(e) = self.store().drop_review_watch(&row.key) {
-                            tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
-                        }
-                        // No capacity hold to drop here: this row's key was already removed at the
-                        // top of THIS call, and the only site that inserts a hold `continue`s before
-                        // reaching the reassignment, so the incumbent can never hold one by now
-                        // (STUDIO-950 round 11). The top-of-call removal is the guard for it.
-                    }
-                    let key = churn_key(pr);
-                    let counter = self.review_rounds.entry(key.clone()).or_default();
-                    *counter += 1;
-                    let spent = *counter;
-                    // Durable from the instant it is charged (STUDIO-956): a round the daemon spent
-                    // and then forgot across a restart is how one pull request ran 46 of them.
-                    self.persist_review_rounds(&key);
-                    if spent == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
-                        tracing::warn!(
-                            pr = %pr, rounds = spent,
-                            "ticketless review: this pull request has now had its whole re-review \
-                             budget; further pushes will not be reviewed"
-                        );
-                    }
+                    // The churn charge and the reassigned-incumbent retirement ran inside
+                    // `dispatch_review_watch` / `commit_review_watch`, so they cover the prepared
+                    // path too and are deliberately not repeated here.
                 }
                 // Not a failure: something claimed the key between the check above and here, which
                 // is precisely what the guard exists for. Next tick.
@@ -2664,6 +2736,37 @@ impl Orchestrator {
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
+                }
+                // STUDIO-988: preparation began (or the refusal gate suppressed an identical
+                // refusal). The watch row was NOT written, so this head is re-offered next sweep —
+                // a re-offer joins the existing reservation rather than spawning a second review.
+                //
+                // A reservation STARTED here draws the same review pool a running review does, so it
+                // spends this sweep's budget: without the decrement every due round in one sweep
+                // begins a preparation against a cap of one (STUDIO-988 review round 4, jimmy #1). A
+                // re-offer that joined an existing reservation, or a gate suppression, started
+                // nothing and must not decrement — `review_pool_holders` already counted it.
+                ReviewDispatchOutcome::Preparing { reserved } => {
+                    report.deferred += 1;
+                    if reserved {
+                        *slots -= 1;
+                    }
+                    // The chosen reviewer is committed by the reservation, so the later rows of THIS
+                    // sweep must treat that teammate as assigned — the same bookkeeping the
+                    // synchronous arm does, kept here because it is sweep-local state the
+                    // reservation cannot carry.
+                    //
+                    // Deliberately unconditional, INCLUDING a gate `Suppressed` `reserved: false`
+                    // (STUDIO-988 review round 8, alice #3). A re-offer that JOINED a reservation
+                    // obviously holds the substitute, and a suppression takes them out of the sweep
+                    // just as surely: the gate's fingerprint is keyed by the CHOSEN reviewer's
+                    // identity (plus the head and the route) and carries no incumbent, so any later
+                    // row that re-chose them would compute the IDENTICAL fingerprint and be
+                    // suppressed in turn. Marking them assigned here is therefore not an
+                    // over-reservation — it steers the rest of the sweep to a reviewer who can
+                    // actually be dispatched rather than into a second suppression.
+                    assigned[idx] = picked;
+                    tracing::debug!(pr = %pr, reserved, "ticketless review: preparation in flight");
                 }
             }
         }
@@ -4091,7 +4194,9 @@ mod tests {
 
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!(
-            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
             Some(HEAD_A),
             "the observed head is recorded"
         );
@@ -4099,7 +4204,9 @@ mod tests {
         // The author pushes: the memo follows the branch even though the loop may be stopped.
         o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!(
-            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
             Some(HEAD_B),
             "a later observation updates the memo"
         );
@@ -4136,20 +4243,36 @@ mod tests {
         );
 
         // Direction A -> B: the advance must be recorded even though the watch read fails.
-        o.review_observed_head.insert(coord(12), HEAD_A.to_string());
+        o.review_observed_head.insert(
+            coord(12),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
         o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!(
-            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
             Some(HEAD_B),
             "an answered observation must update the memo without the store read succeeding"
         );
 
         // Direction B -> A: the reverse move must be recorded too, or a fresh escalation is judged
         // against the stale head and can be falsely marked superseded.
-        o.review_observed_head.insert(coord(12), HEAD_B.to_string());
+        o.review_observed_head.insert(
+            coord(12),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_B.to_string(),
+            },
+        );
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!(
-            o.review_observed_head.get(&coord(12)).map(String::as_str),
+            o.review_observed_head
+                .get(&coord(12))
+                .map(|ob| ob.head.as_str()),
             Some(HEAD_A),
             "a reverse move must not leave a stale head standing"
         );
@@ -9811,6 +9934,245 @@ mod tests {
             o.running_ticketless_reviews(),
             2,
             "running review runs must never exceed agent.max_concurrent_reviews"
+        );
+    }
+
+    /// STUDIO-988 review round 4 (jimmy #1): a `Preparing` reservation that STARTED in this sweep
+    /// spends the sweep's budget. Without the decrement every due round in ONE sweep begins a
+    /// preparation, over-reserving `max_concurrent_reviews`; `review_pool_holders` only protects the
+    /// NEXT sweep. Mutation check: drop the `if reserved { *slots -= 1; }` and this reds
+    /// (`preparing.len() == 3`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_review_sweep_reserves_at_most_the_review_pool() {
+        use crate::testsupport::HangResolver;
+        let (mut o, _dispatched) = orch(ticketless(&["bob"]));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.max_concurrent = 10;
+            eff.max_concurrent_reviews = Some(1);
+        }
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        for n in 31..34 {
+            introduce(&o, row(n, "bob"));
+        }
+
+        let report = o.handle_review_sweep(&[
+            open_at(31, HEAD_A),
+            open_at(32, HEAD_A),
+            open_at(33, HEAD_A),
+        ]);
+
+        assert_eq!(
+            o.preparing.len(),
+            1,
+            "one sweep must not start more review preparations than the review pool holds"
+        );
+        assert_eq!(
+            report.dispatched, 0,
+            "nothing dispatches until a preparation is accepted"
+        );
+        assert_eq!(
+            report.deferred, 3,
+            "the two over-budget rounds are deferred, not prepared"
+        );
+    }
+
+    /// **An ACCEPTED prepared review charges the churn budget (STUDIO-988 review round 7, sol #1).**
+    /// The synchronous `Dispatched` arm is the only place a round used to be charged; a sweep that
+    /// returns through `Preparing` and is accepted later must charge exactly the same one —
+    /// otherwise prepared reviews are free against `REVIEW_ROUNDS_PER_PR_CAP`.
+    ///
+    /// MUTATION GUARD: drop the `commit_review_watch` call from `finish_prepared` and the round
+    /// stays 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_prepared_review_charges_one_round() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let (mut o, _dispatched) = orch(ticketless(&["bob"]));
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        introduce(&o, row(31, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.dispatched, 0, "nothing dispatches until acceptance");
+        assert_eq!(o.preparing.len(), 1, "the round began a preparation");
+        assert_eq!(
+            o.review_rounds
+                .get(&churn_key(&coord(31)))
+                .copied()
+                .unwrap_or(0),
+            0,
+            "a reservation alone charges nothing"
+        );
+
+        let key = review_key(OWNER, REPO, 31, "bob");
+        let token = o
+            .preparing
+            .get(&key)
+            .map(|e| e.token)
+            .expect("review reservation");
+        o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+            .await;
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(31))).copied(),
+            Some(1),
+            "an accepted prepared review must charge one round against the per-PR churn budget"
+        );
+    }
+
+    /// **An ACCEPTED prepared reassignment retires the incumbent row (STUDIO-988 review round 7,
+    /// sol #1).** The synchronous arm drops the incumbent's row only after the dispatch succeeds; the
+    /// accepted prepared path must do the same, or a reassigned review leaves the pull request owing
+    /// the review of a reviewer who has left the roster forever.
+    ///
+    /// MUTATION GUARD: drop the `commit_review_watch` call from `finish_prepared` and bob's row
+    /// stands beside carol's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_prepared_reassignment_retires_the_incumbent() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let (mut o, _dispatched) = orch(ticketless(&["alice", "carol"]));
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        // `bob` has left the roster, so the round is reassigned — and PREPARED, not dispatched.
+        introduce(&o, row(12, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "the round is prepared, not dispatched"
+        );
+        let key = review_key(OWNER, REPO, 12, "carol");
+        assert_eq!(
+            o.preparing.values().map(|e| e.id()).collect::<Vec<_>>(),
+            vec![key.as_str()],
+            "the reservation is keyed by the substitute's identity"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the incumbent is retired only once the dispatch is accepted"
+        );
+
+        let token = o
+            .preparing
+            .get(&key)
+            .map(|e| e.token)
+            .expect("review reservation");
+        o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+            .await;
+
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_DROPPED,
+            "the accepted reassignment must retire the incumbent's row"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "carol").requested_sha,
+            HEAD_A,
+            "and the substitute's row carries the round"
+        );
+    }
+
+    /// **An in-flight review PREPARATION counts against the per-pull-request round cap (STUDIO-988
+    /// review round 8, alice #2).** The cap is charged on ACCEPTANCE, so every due row of one sweep
+    /// reads the same uncharged counter; with two reviewers the sweep could begin two preparations
+    /// against a budget one short and, once both were accepted, overshoot to `budget + 1` — where the
+    /// synchronous path stops at `budget`.
+    ///
+    /// MUTATION GUARD: drop `review_preparations_for` from the cap check and both rows begin a
+    /// preparation, so the accepted pair charges `budget + 1`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_flight_review_preparation_counts_against_the_per_pr_round_cap() {
+        use crate::testsupport::{ReadyResolver, ready_preparation_completion};
+        let mut teams = ticketless(&["bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, _dispatched) = orch(teams);
+        o.prepare_resolver = Some(Arc::new(ReadyResolver));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "carol"));
+        // One dispatch short of the whole per-pull-request budget (`8 * 2`).
+        o.review_rounds
+            .insert(churn_key(&coord(12)), o.shared_round_budget() - 1);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 0, "prepared, not dispatched");
+        assert_eq!(
+            o.preparing.len(),
+            1,
+            "only the last free dispatch may begin a preparation; the second row must see the \
+             first's in-flight reservation"
+        );
+
+        let keys: Vec<String> = o.preparing.values().map(|e| e.id().to_string()).collect();
+        for key in keys {
+            let token = o
+                .preparing
+                .get(&key)
+                .map(|e| e.token)
+                .expect("review reservation");
+            o.handle_dispatch_prepared(key, token, ready_preparation_completion())
+                .await;
+        }
+
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))).copied(),
+            Some(o.shared_round_budget()),
+            "the accepted preparations must stop at the budget, never overshoot it"
+        );
+    }
+
+    /// **A PREPARED reassignment still reserves its substitute for this tick's other rows
+    /// (STUDIO-988 review round 8, alice #3).**
+    /// `two_reassignments_in_one_tick_do_not_land_on_the_same_substitute` pins the synchronous arm's
+    /// `assigned[idx] = picked`; the prepared arm dispatches nothing, so the reservation is the only
+    /// record, and without the same bookkeeping the second row re-chooses the first row's substitute
+    /// and its preparation is refused as `AlreadyPreparing` instead of taking the next eligible
+    /// reviewer.
+    ///
+    /// MUTATION GUARD: drop the `assigned[idx] = picked` update from the `Preparing` arm and only
+    /// carol's reservation exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prepared_reassignment_reserves_its_substitute_for_this_ticks_other_rows() {
+        use crate::testsupport::HangResolver;
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0), ident("carol", 0), ident("erin", 0)],
+        ));
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "dave"));
+        // `erin` carries a standing load so `carol` stays the least-loaded candidate even after the
+        // first row reserves her — without which the live load snapshot alone would separate the two
+        // and this test would pass with the bookkeeping it exists to pin absent.
+        for (n, who) in [("iss-3", "erin"), ("iss-4", "erin")] {
+            let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+                id: n.to_string(),
+                identifier: format!("STUDIO-{n}"),
+                ..Default::default()
+            });
+            busy.identity = who.to_string();
+            o.running.insert(n.to_string(), busy);
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "both rounds are prepared, not dispatched"
+        );
+        let mut picked: Vec<String> = o
+            .preparing
+            .values()
+            .filter_map(|e| match &e.target {
+                crate::prepare::PreparedTarget::Review { run, .. } => Some(run.reviewer.clone()),
+                crate::prepare::PreparedTarget::Ticket { .. } => None,
+            })
+            .collect();
+        picked.sort();
+        assert_eq!(
+            picked,
+            vec!["carol".to_string(), "erin".to_string()],
+            "one substitute must not take both of a pull request's required reviews"
         );
     }
 

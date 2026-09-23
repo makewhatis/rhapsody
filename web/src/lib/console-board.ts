@@ -225,6 +225,10 @@ export const BOARD_ACTIVE_OUTCOMES = [
   // run (the daemon halts the ticket and the sweep reports it), so without it here the card would
   // fall out of every active lane and vanish from the board while it waits for a human.
   "token_ceiling",
+  // STUDIO-988: a zero-turn preparation refusal. It is a non-terminal ticket's newest run (no agent
+  // ran, the daemon refused before any claim), so it too must stay visible rather than vanish while
+  // the operator fixes the credential.
+  "refused",
 ] as const;
 
 /**

@@ -284,6 +284,87 @@ impl CapabilityGrant {
         self.inner.session.policy.limits()
     }
 
+    /// Whether plaintext HTTP to the upstream is explicitly allowed for this grant.
+    pub fn allow_insecure_http(&self) -> bool {
+        self.inner.session.plan.allow_insecure_http()
+    }
+
+    /// Whether this grant may still admit work right now: neither it nor its session is revoked and
+    /// the capability has not expired. The streaming adapter polls this to cancel a live response
+    /// when the turn is revoked or expires (design §7.2).
+    pub fn is_live(&self) -> bool {
+        self.inner.check_live().is_ok()
+    }
+
+    /// The monotonic time remaining before the capability's absolute expiry, saturating at zero.
+    pub fn remaining_lifetime(&self) -> std::time::Duration {
+        let now = self.inner.session.broker.clock.now();
+        std::time::Duration::from_nanos(
+            self.inner
+                .not_after
+                .as_nanos()
+                .saturating_sub(now.as_nanos()),
+        )
+    }
+
+    /// Await cancellation of one admitted request (design §7.2): turn revocation, session
+    /// revocation, absolute capability expiry, or daemon shutdown (the caller's `shutdown` watch).
+    ///
+    /// The future completes only when the request must stop; the caller drops the outbound
+    /// request/response future rather than waiting for upstream progress. Revocation is signalled
+    /// synchronously through `Notify`, so a revocation during a stalled upstream read wakes this
+    /// immediately; expiry is bounded by a sleep over the remaining monotonic lifetime, so a
+    /// trickling provider cannot hold the request open past its deadline.
+    pub(crate) async fn wait_cancelled(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+        loop {
+            if !self.is_live() || *shutdown.borrow_and_update() {
+                return;
+            }
+            let turn = self.inner.cancellation.notified();
+            let session = self.inner.session.cancellation.notified();
+            tokio::pin!(turn, session);
+            // Register before the second liveness check so a revocation between the check and the
+            // wait cannot be missed (the `Notify` lost-wakeup race).
+            turn.as_mut().enable();
+            session.as_mut().enable();
+            if !self.is_live() {
+                return;
+            }
+            let remaining = self.remaining_lifetime();
+            tokio::select! {
+                biased;
+                _ = &mut turn => {}
+                _ = &mut session => {}
+                changed = shutdown.changed() => {
+                    // A *closed* channel means the listener exited without broadcasting (an
+                    // `accept()` error, an aborted serving task): treat it as shutdown rather than
+                    // re-looping on an immediately-ready `changed()` and never cancelling
+                    // (design §7.2).
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        }
+    }
+
+    /// Revoke this grant immediately: it is removed from the registry, so no further request can
+    /// authenticate against it, and any in-flight request waiting in [`CapabilityGrant::wait_cancelled`]
+    /// wakes. Called by the adapter when the authenticated-denial threshold is reached (design §8.2);
+    /// the turn's owner still finalizes the receipt when the access/attempt drops.
+    pub(crate) fn revoke(&self) {
+        self.inner.revoke_grant();
+    }
+
+    /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that
+    /// constructs the upstream `Authorization` header and its redactor. There is no key accessor on
+    /// any public type. `None` once custody has been released (session revoked).
+    pub(crate) fn with_credential<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let guard = crate::state::lock(&self.inner.session.credential);
+        guard.as_ref().map(|lease| lease.expose_for_upstream(f))
+    }
+
     /// The monotonic ordinal of this turn within its session.
     pub fn turn_ordinal(&self) -> u64 {
         self.inner.ordinal

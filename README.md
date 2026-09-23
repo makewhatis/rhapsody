@@ -1633,6 +1633,84 @@ preserved by `encode` (a console Save keeps it) but deliberately NOT rendered by
 whose response is byte-pinned to the Go config goldens.
 
 
+### Asynchronous prepared dispatch and zero-turn refusals (STUDIO-988)
+
+Go v0.4.0 resolves a run's credential inline on the control goroutine and has no concept of a
+refused-before-dispatch run. Rhapsody adds one generic off-loop preparation state ahead of every
+claim/workspace/active-run/mailbox/review-watch side effect. With no preparation resolver installed
+— the default until the provider/broker lane (PB7) lands — every dispatch path runs inline and is
+**byte-identical** to a daemon built before this change; the mechanism only engages when a resolver
+is injected.
+
+When it engages, the control task inserts a loop-owned `preparing` reservation (keyed by ticket or
+review identity) before spawning resolver work, so a preparation counts against every duplicate and
+concurrency gate exactly as a live run does — and the selection ladder skips a gate-suppressed
+candidate *before* spending a slot, on the review-reopen ladder as well as the ordinary one, so one
+refused ticket cannot starve the queue behind it. The resolver reports back over the control channel;
+a completion is accepted only for the current token **and** config generation and the loop's expected
+credential revision — a READY payload must carry that revision *and* agree with the envelope that
+delivered it, while a typed timeout or failure that never reached a credential is a refusal rather
+than a mismatch — after re-checking drain and
+revalidating the CURRENT board — the ticket's tracker state, labels, existence and selection
+fingerprint, or the review's last observed head/open state — so a state flap, a label change, a
+disappearance or a dismissed review cannot launch stale work. The SAME revalidation runs before a
+refusal is recorded, so a ticket that left the board while resolution was in flight gets neither a
+run nor a zero-turn row. A stale completion drops its move-only payload without touching loop state.
+A cancellation
+(reload/shutdown/a departed issue) re-parks a claim-held reservation exactly once, and the
+concurrency permit is owned by the resolver's own blocking work until it really exits — the loop
+hands the permit to the resolver rather than holding it, so a loop-side timeout that drops the
+`prepare` future cannot release a permit whose Keychain/IPC closure is still running and pile up
+unbounded resolver work. (Stop is not a cancellation path here: it is addressed by a live run id and
+a preparation has no run.)
+
+A typed preparation failure is a **refusal**, not a failed agent attempt: it writes exactly one
+zero-turn run row with the new Rhapsody-only outcome `refused` (distinct from `failed` and from
+queued work; the console renders it `blocked`, like a token-ceiling stop), carrying the resolved
+selection as provenance, and arms a bounded refusal gate. The gate is keyed by `(identity, selection
+fingerprint)` and REMEMBERS the opaque credential revision and reason code observed at the refusal:
+the pre-spawn check suppresses without knowing a revision a resolver has yet to observe, and a
+changed revision **or** reason code is a fresh episode (base backoff, a new history row). It re-probes
+on a bounded backoff or immediately when an input changes — a workflow reload, an explicit
+`POST /api/v1/refresh`, or a credential mutation — and repeating an *identical* refusal advances the
+backoff without appending a second history row. No claim, workspace, mailbox, or review-watch row is
+created for a refusal. A refused claim-held retry is RE-PARKED (claim and attempt kept, timer
+re-armed to the gate's next probe) rather than released: in pool mode the candidate query returns
+only unassigned tickets, so releasing a still-assigned ticket would strand it with nothing to
+re-select it. `on_retry` remains the single owner of release-on-gone. A preparation deferred by an
+armed drain, superseded by a reload, or hit by a stale generation re-parks the same way, never
+leaving a claim with nothing to fire it again. The multi-project candidate sweep that cancels
+preparations for issues that left the board runs only when the whole board was actually read, so one
+failed Linear fetch cannot cancel a project's live preparations.
+
+Pool-mode picks are prepared **before** the cross-daemon claim election: `claim_pool` assigns the
+ticket and may move its state, which is the very mutation a refusal must not leave behind, so the
+election runs only after an accepted preparation. The shared classification bullet still holds for
+the in-memory claim, workspace, active-run, mailbox, and review-watch rows.
+
+No credential value or bound lease appears in `Debug`/`Display`, telemetry, provenance, API JSON, or
+error strings: the completion carries the opaque revision only, and `PreparedDispatch` is move-only
+(never `Clone`), so no second consumer can retain it.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| credential resolution | inline on the control goroutine | off-loop, evented `preparing` reservation |
+| refused-before-dispatch | no such outcome | its own zero-turn `refused` run outcome |
+| duplicate/concurrency gate | running/claimed only | `preparing` participates too |
+| refusal re-arm | n/a | bounded backoff + reload/refresh/credential-mutation |
+
+The ticketless review path shares the same machinery: its watch-set writes move behind the
+preparation gate, and a review preparation or suppression returns `Preparing` without writing a row.
+A reservation STARTED by one sweep also spends that sweep's review budget, so a single sweep cannot
+prepare more rounds than `agent.max_concurrent_reviews` allows. The review-REOPEN path (a summoned
+review-state ticket) shares it too: the promote write (a Linear state move) and the summons are BOTH
+deferred until an accepted preparation, exactly as the pool claim election is — a refused, suppressed
+or stale reopen therefore leaves the ticket in its review state with its summons intact, so the
+reopen ladder re-offers it, and the dispatch (including the run's mailbox seed) happens only after
+acceptance. A dismissal cancels any in-flight preparation for its coordinate. No dispatch path
+bypasses the gate.
+
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it
@@ -2516,7 +2594,11 @@ execute an arbitrary on-disk binary as the same OS user.
   strictly-increasing-sequence state machine both sides drive. It is a normal root-workspace member
   (built with `rhapsodyd`) and ALSO a cross-workspace path dependency of `desktop/src-tauri` — it
   carries no Tauri dependency, so this does not reintroduce the heavy-dependency coupling the root
-  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid.
+  `Cargo.toml`'s workspace exclusion of `desktop/` exists to avoid. Since STUDIO-983 it also owns the
+  `CredentialOwner` abstraction the daemon and desktop build units both program against (the
+  Connect/Replace/Rebind/Remove compare-and-swap contract and its typed outcomes), the move-only
+  bound-credential lease with no ordinary string accessor, and the broker's size/syntax bounds
+  (re-used from `rhapsody-provider-broker`, not duplicated) that the owner enforces before storage.
 - **A one-shot bootstrap token**, delivered as the ONE frame the desktop writes to the freshly
   spawned daemon child's piped stdin (then never written to again), authenticates the daemon's
   connection to a Unix socket the desktop hosts — never HTTP, and the token never appears in argv,
