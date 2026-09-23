@@ -93,7 +93,7 @@ impl std::fmt::Display for EndpointError {
 pub struct NormalizedEndpoint {
     canonical: String,
     chat_completions: String,
-    /// The one exact `models` URL derived from the same canonical base. STADIO-990: the provider
+    /// The one exact `models` URL derived from the same canonical base. STUDIO-990: the provider
     /// model-catalog adapter reaches exactly this path, never an arbitrary one.
     models: String,
     insecure_http: bool,
