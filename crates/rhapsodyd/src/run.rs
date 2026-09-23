@@ -580,7 +580,6 @@ where
     // --- observability server (optional, upstream §13.7) ---
     let mut dashboard_url = String::new();
     let mut server_task = None;
-    let mut runtime_port_published = false;
     let mut runtime_heal_task = None;
     if let (eff_port, true) = resolve_server_port(flags.port, &flags.path) {
         // The enable flow (STUDIO-652) reads and writes the SAME `teams.yaml` the boot load above
@@ -653,7 +652,7 @@ where
                                 "another live daemon owns runtime.json; not publishing this daemon's port"
                             )
                         }
-                        Ok(_) => runtime_port_published = true,
+                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(err = %e, "could not write runtime port file (rhapsodyd mcp will fall back to config server.port)")
                         }
@@ -664,9 +663,12 @@ where
                 }
                 // Self-heal (STUDIO-1041): an off-loop check repairs the runtime file if it is
                 // deleted, corrupted, or left naming a dead PID, so `rhapsodyd mcp` does not fall
-                // back to a stale config port mid-run. `runtime_port_published` is the gate: if we
-                // never published (no file, or a live peer owns it) there is nothing of ours to keep.
-                if runtime_port_published && let Some(home) = runtime_home.clone() {
+                // back to a stale config port mid-run. The heal task is spawned whenever a runtime
+                // home exists — NOT only when the startup publish wrote the file. If the boot found
+                // another live daemon's file (`SkippedLiveDaemon`), that peer can later shut down,
+                // crash, or be `kill -9`'d, leaving the file stale; `ensure_in` re-checks liveness on
+                // every tick, so the loop repairs it then and never clobbers a still-live peer.
+                if let Some(home) = runtime_home.clone() {
                     let mut heal_ctx = shutdown.wait();
                     runtime_heal_task = Some(tokio::spawn(async move {
                         loop {
@@ -1382,9 +1384,12 @@ where
     if let Some(t) = server_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
-    // Remove the runtime port file we published (only ours; runtimeport guards the PID). Uses the
-    // SAME home we published into, so an in-process test removes only its own temp file (STUDIO-1041).
-    if runtime_port_published && let Some(home) = runtime_home.as_deref() {
+    // Remove the runtime port file on shutdown whenever a runtime home exists — NOT only when the
+    // startup publish wrote it. A boot that found another live daemon's file may have self-healed
+    // it after that peer died, and `remove_in` is PID-guarded, so this only ever deletes a file that
+    // names US. Uses the SAME home we published into, so an in-process test removes only its own temp
+    // file (STUDIO-1041).
+    if let Some(home) = runtime_home.as_deref() {
         let _ = runtimeport::remove_in(home);
     }
     // Flush + stop telemetry exporters (bounded internally so an unreachable collector can't stall).
@@ -2443,6 +2448,96 @@ mod tests {
                 .expect("read healed file")
                 .pid,
             std::process::id() as i32,
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+    }
+
+    /// STUDIO-1041 acceptance, run-level (alice's B2): the self-heal LOOP must leave a file owned by
+    /// another live daemon alone, and must repair it once that daemon dies — the loop-level guard that
+    /// `ensure_leaves_a_file_owned_by_another_live_process` only pins for the primitive. The daemon
+    /// boots against a runtime file naming a real live peer (`sleep 30`), so the file must stay
+    /// byte-identical across many 25ms heal ticks; after the peer is killed AND reaped its PID is
+    /// dead, so the loop must republish this daemon's port within the timeout.
+    ///
+    /// This also covers alice's B1: the boot's startup publish returns `SkippedLiveDaemon`, and the
+    /// second half turns RED unless the heal task is spawned whenever a runtime home exists rather
+    /// than only when the startup publish wrote the file.
+    ///
+    /// MUTATION GUARD: replace the loop's `runtimeport::ensure_in(&home, bound_port)` with an
+    /// unconditional `runtimeport::write_in(&home, bound_port)` and the "live peer is left alone"
+    /// assertion goes red; gate the heal-task spawn on the startup publish and the "peer died" half
+    /// times out red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_self_heal_leaves_a_live_peer_alone_then_repairs_after_it_dies() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "server:\n  port: 0\n");
+        let rt = dir.path.join(".rhapsody");
+        std::fs::create_dir_all(&rt).expect("mkdir .rhapsody");
+        // A real live child stands in for a concurrent daemon for a distinct config: it can never be
+        // this test process, so `ensure_in` must classify its file as another live daemon's.
+        let mut peer = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a live peer process");
+        let peer_pid = peer.id() as i32;
+        let body = format!(r#"{{"port":51074,"pid":{peer_pid}}}"#);
+        let file = rt.join(runtimeport::FILE_NAME);
+        std::fs::write(&file, &body).expect("seed the peer's runtime file");
+
+        let buf = SharedBuf::new();
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let seams = BootSeams {
+            home: Some(dir.path.clone()),
+            heal_interval: Some(Duration::from_millis(25)),
+            ..BootSeams::default()
+        };
+        let handle =
+            tokio::spawn(
+                async move { run_with_seam(wait, &argv, run_buf, false, false, seams).await },
+            );
+
+        // ~20 heal intervals. The peer is alive, so no tick may touch its file.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("the live peer's runtime.json must still exist"),
+            body,
+            "the heal loop must leave a file owned by another live daemon byte-identical; stderr={}",
+            buf.contents()
+        );
+
+        // Kill AND reap the peer: `kill(pid, 0)` now returns ESRCH, so its record is stale and the
+        // loop must republish ours.
+        peer.kill().expect("kill the peer process");
+        peer.wait().expect("reap the peer process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut healed = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(info) = runtimeport::read_in(&dir.path)
+                && info.pid == std::process::id() as i32
+            {
+                healed = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let info = healed.unwrap_or_else(|| {
+            panic!(
+                "self-heal must republish within a check interval after the peer dies; stderr={}",
+                buf.contents()
+            )
+        });
+        assert!(
+            info.port > 0,
+            "the republished record must carry a bound port"
         );
 
         signal.cancel();
