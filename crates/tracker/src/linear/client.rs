@@ -471,13 +471,15 @@ mod tests {
     // Mirrors Go TestDoGraphQLTransportError.
     #[tokio::test]
     async fn do_graphql_transport_error() {
-        // Bind then drop to obtain a loopback port with nothing listening → connection refused
-        // (Go points at 127.0.0.1:0, an unreachable endpoint).
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        drop(listener);
+        // The endpoint is `127.0.0.1:0` — exactly what Go points at. Port 0 is never a bindable
+        // destination: a listener that binds `:0` is handed a NONZERO ephemeral port, so no
+        // concurrent test's stub server can ever be listening there and answer this request. The
+        // earlier Rust form bound an ephemeral port and then DROPPED the listener, assuming the
+        // port stayed free — but the kernel could immediately reassign it to a sibling test's
+        // `MockServer`, whose reply turned this transport test green for the wrong reason and left
+        // a stray `query{}` in that sibling's request recorder (STUDIO-1042).
         let c = new(Config {
-            endpoint: format!("http://{addr}"),
+            endpoint: "http://127.0.0.1:0".into(),
             api_key: "k".into(),
             project_slug: "p".into(),
             ..Config::default()
@@ -490,6 +492,43 @@ mod tests {
             is_kind(&err, LinearErrorKind::ApiRequest),
             "got {err:?}, want ApiRequest"
         );
+    }
+
+    // The transport-error test above is only meaningful while `do_graphql` actually SURFACES a
+    // connection failure as `linear_api_request`. This pins both sides of that contract: the
+    // unreachable endpoint must fail with exactly that sentinel, and a live endpoint carrying the
+    // same query must succeed. If the client ever stopped surfacing the transport error — returning
+    // `Ok`, or classifying it as anything but `linear_api_request` — the first half reds; if it
+    // started failing every request, the second half reds. Neither half alone proves the test is
+    // still exercising a transport failure.
+    #[tokio::test]
+    async fn transport_error_is_surfaced_and_a_live_endpoint_is_not() {
+        let refused = new(Config {
+            endpoint: "http://127.0.0.1:0".into(),
+            api_key: "k".into(),
+            project_slug: "p".into(),
+            ..Config::default()
+        });
+        let err = refused
+            .do_graphql::<serde_json::Value>("query{}", None)
+            .await
+            .expect_err("a refused connection must surface as an error");
+        assert!(
+            is_kind(&err, LinearErrorKind::ApiRequest),
+            "got {err:?}, want ApiRequest"
+        );
+        assert!(
+            err.to_string().starts_with("linear_api_request"),
+            "the surfaced error must name the transport sentinel; got {err}"
+        );
+
+        let server = MockServer::start(|_req| MockResp::ok(r#"{"data":{"ok":true}}"#)).await;
+        let live = client_for(server.url());
+        let out: serde_json::Value = live
+            .do_graphql("query{}", None)
+            .await
+            .expect("a live endpoint must not surface a transport error");
+        assert_eq!(out["ok"], serde_json::json!(true));
     }
 
     // ─── viewer resolution (viewer_test.go / projects_test.go) ───────────────────────────────────
