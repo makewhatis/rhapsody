@@ -207,6 +207,64 @@ fn notarize_args_lib_contract() {
     );
 }
 
+// STUDIO-991: the provider-credential surface must load no remote script/content, and the whole
+// capability must stay scoped to the bundled `main` window. A `null` CSP, a remote-permitting
+// `script-src`, or a capability that admits another window would red this. (The per-invocation
+// window/origin check itself is unit-tested in `provider_commands::authorize_invocation`.)
+#[test]
+fn credential_surface_csp_is_restrictive_and_capability_is_main_window_only() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let conf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("tauri.conf.json")).expect("read tauri.conf.json"),
+    )
+    .expect("tauri.conf.json must be valid JSON");
+    let csp = conf["app"]["security"]["csp"]
+        .as_str()
+        .expect("app.security.csp must be a restrictive string, not null");
+    let script_src = csp
+        .split(';')
+        .map(str::trim)
+        .find(|directive| directive.starts_with("script-src"))
+        .expect("the CSP must declare a script-src directive");
+    assert_eq!(
+        script_src, "script-src 'self'",
+        "the credential surface must load only bundled scripts, never a remote or inline source"
+    );
+    assert!(!csp.contains("unsafe-eval"), "the CSP must not allow eval");
+    // The only permitted `http://` origins are Tauri's own local IPC/asset hosts; strip those and
+    // require that no remote http(s) origin survives.
+    let without_local = csp
+        .replace("http://ipc.localhost", "")
+        .replace("http://asset.localhost", "");
+    assert!(
+        !without_local.contains("http://") && !without_local.contains("https:"),
+        "the CSP must not permit a remote http(s) origin: {csp}"
+    );
+    assert!(
+        csp.contains("object-src 'none'"),
+        "objects must be disabled"
+    );
+
+    let caps: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("capabilities/default.json"))
+            .expect("read capabilities/default.json"),
+    )
+    .expect("capabilities/default.json must be valid JSON");
+    let windows = caps["windows"]
+        .as_array()
+        .expect("capabilities/default.json must list `windows`");
+    assert_eq!(
+        windows.len(),
+        1,
+        "the credential capability must be scoped to exactly one window: {windows:?}"
+    );
+    assert_eq!(
+        windows[0].as_str(),
+        Some("main"),
+        "the credential capability must be scoped to the bundled `main` window"
+    );
+}
+
 // The Homebrew cask renderer (`render-cask.sh`, TRA-241 + STUDIO-648): both channels' cask text — the
 // `rhapsody` stable body and the `rhapsody@rc` prerelease body, each pinned byte-for-byte by a golden —
 // plus version + sha256 substitution, the literal `#{version}` interpolation brew evaluates at install
