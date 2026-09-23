@@ -9,6 +9,7 @@
 //! * [`parse`] — one JSONL line → a normalized [`crate::Event`] ([`classify`]), plus per-step usage.
 //! * [`mcpinject`] — the daemon's MCP server, and the tool-name spelling the prompts need.
 //! * [`state`] — ⚠️ the per-run `XDG_DATA_HOME` isolation, without which concurrent turns are LOST.
+//! * [`resume`] — the retained-session record a retry of the same issue resumes (STUDIO-1043).
 //! * [`runner`] — the subprocess runner ([`Runner`]).
 //!
 //! ## Why this exists before the slices that were meant to precede it
@@ -58,6 +59,7 @@ pub mod brokered;
 pub mod mcpinject;
 pub mod parse;
 pub mod probe;
+pub mod resume;
 pub mod runner;
 pub mod state;
 
@@ -71,6 +73,7 @@ pub use mcpinject::{
 };
 pub use parse::{Classified, Failure, add_usage, classify};
 pub use probe::{CompatibilityRow, ProbeError, SUPPORTED, parse_probe_output, probe, resolve_row};
+pub use resume::{ResumeDecision, ResumeRecord};
 pub use runner::{Runner, start_brokered_session};
 pub use state::RunState;
 

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rhapsody_agent::opencode::{Config, start_brokered_session};
-use rhapsody_agent::{Event, Session, TURN_FAILED, TURN_SUCCEEDED};
+use rhapsody_agent::{Event, Session, TURN_FAILED, TURN_SUCCEEDED, TURN_TIMED_OUT};
 use rhapsody_core::Issue;
 use rhapsody_provider_broker::{
     BoundCredentialLease, Broker, BrokerLedgerReceiver, BrokerProtocol, BrokerRegistrationPlan,
@@ -480,6 +480,89 @@ async fn consecutive_turns_rotate_the_capability_and_resume() {
     assert_eq!(invocations.len(), 2, "{invocations:?}");
     assert!(!invocations[0].contains("-s "), "{}", invocations[0]);
     assert!(invocations[1].contains("-s ses_x"), "{}", invocations[1]);
+}
+
+/// STUDIO-1043 for the BROKERED path: a brokered turn cut off by its deadline keeps its
+/// credential-free state directory, and the next dispatch resumes it — carrying `-s <id>`, the same
+/// `XDG_DATA_HOME`, and a freshly rotated per-turn capability. Brokered sessions hold no reusable
+/// credential across the boundary, and the kept directory must not gain one.
+#[tokio::test]
+async fn a_cut_off_brokered_turn_is_resumed_with_a_rotated_capability() {
+    let _serial = serial().await;
+    let fx = Fixture::new("brokered-resume");
+    // A CLI that opens a session and then blocks past a short deadline — the cut-off shape.
+    let cut = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.30; exit 0; fi\n\
+         printf '%s\\n' \"$*\" >> \"{argv}\"\n\
+         printf '{{\"type\":\"step_start\",\"sessionID\":\"ses_cut\"}}\\n'\n\
+         sleep 3\n",
+        argv = fx.argv_log.display(),
+    );
+    write_executable(&fx.script, &cut);
+
+    let mut cfg = fx.cfg();
+    cfg.turn_timeout = std::time::Duration::from_secs(1);
+    let sess = start_brokered_session(
+        cfg,
+        &fx.workspace.to_string_lossy(),
+        issue("STUDIO-1001"),
+        None,
+    )
+    .await
+    .expect("brokered session");
+    let (tr, err, _ev, _ledger) = fx.run(sess.as_ref(), "cut off").await;
+    assert_eq!(tr.status, TURN_TIMED_OUT, "{err:?}");
+    assert_eq!(sess.thread_id(), "ses_cut");
+    sess.stop().await.expect("stop");
+
+    let kept: Vec<PathBuf> = std::fs::read_dir(&fx.state_root)
+        .expect("state root")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rhapsody-opencode-"))
+                && p.file_name().and_then(|n| n.to_str()) != Some("rhapsody-opencode-resume")
+        })
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "the brokered cut-off session must be retained: {kept:?}"
+    );
+
+    // The retry: a supported CLI, same fixture, same issue/model/workspace.
+    fx.restore_supported_script();
+    let sess2 = fx.start().await;
+    assert_eq!(
+        sess2.thread_id(),
+        "ses_cut",
+        "the brokered retry must adopt the recorded session"
+    );
+    let (tr2, err2, _ev2, ledger2) = fx.run(sess2.as_ref(), "resume").await;
+    assert_eq!(tr2.status, TURN_SUCCEEDED, "{err2:?}");
+    assert!(
+        ledger2.is_some_and(|l| l.capability_issued()),
+        "the resumed turn still mints a fresh capability"
+    );
+
+    // The resumed invocation is one logical line, but the prompt carries newlines, so a raw line
+    // split yields several fragments — join them back before asserting.
+    let invs = fx.argv_invocations().join("\n");
+    assert!(invs.contains("-s ses_cut"), "{invs}");
+    let env = fx.env_map();
+    assert_eq!(
+        env.get("XDG_DATA_HOME").map(String::as_str),
+        kept[0].to_str(),
+        "the resumed brokered turn must use the SAME private data root"
+    );
+    // No reusable credential entered the retained directory: brokered mode never writes auth.json.
+    assert!(
+        !kept[0].join("opencode").join("auth.json").exists(),
+        "a resumed brokered session must still hold no auth.json"
+    );
 }
 
 #[tokio::test]
