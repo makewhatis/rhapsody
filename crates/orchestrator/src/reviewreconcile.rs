@@ -3606,13 +3606,14 @@ mod store_tests {
     /// out from under the stale row, so before this fix the escalation was reported forever — the
     /// page-a-human-for-nothing this ticket exists to remove, one step later.
     ///
-    /// The `Escalate` arm now carries the same "some live row is unapproved" guard `Ship` has, so a
-    /// converged escalation falls to the merge gate's rules. This is a supersession that is NOT
-    /// reported, unlike `a_superseded_escalation_is_reported_with_both_heads` — there the row is
-    /// still `reviewed` (findings unaddressed), so the escalation is genuinely still open.
+    /// The `Escalate` arm now carries the same "some live row is unapproved" guard `Ship` has,
+    /// gated on adjudication being ON (this fixture sets the threshold), so a converged escalation
+    /// falls to the merge gate's rules. This is a supersession that is NOT reported, unlike
+    /// `a_superseded_escalation_is_reported_with_both_heads` — there the row is still `reviewed`
+    /// (findings unaddressed), so the escalation is genuinely still open.
     ///
-    /// MUTATION: drop the `any_unapproved` guard from the `Escalate` arm and this reds —
-    /// `review_escalated` is reported for a pull request every reviewer approved.
+    /// MUTATION: make the `Escalate` arm unconditional (drop `any_unapproved || !adjudicating`) and
+    /// this reds — `review_escalated` is reported for a pull request every reviewer approved.
     #[test]
     fn a_converged_escalation_is_not_reported_as_escalated() {
         let o = &mut orch(false, "2026-09-22T16:14:00Z");
