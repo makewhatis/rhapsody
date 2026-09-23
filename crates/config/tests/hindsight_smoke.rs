@@ -15,33 +15,50 @@
 //! `curl` — through retain → recall → invalidate → recall against a scratch
 //! bank, and prints what each step saw.
 //!
+//! # STUDIO-1036: the extractor is asynchronous, so recall must be polled
+//!
+//! Retain now sends `async: true` (Hindsight 0.10.1), so the call returns as soon
+//! as the service accepts the document while LLM fact extraction runs in the
+//! background — measured at roughly 30s. Recall immediately after retain therefore
+//! returns nothing *by design*, and this check polls every 5s for up to 90s until
+//! the marker fact appears before invalidating it. It also recalls both
+//! `experience` and `world` facts now, because on 0.10.1 the extractor files most
+//! of a teammate's own note as `world`.
+//!
 //! # It is deliberately NOT in CI
 //!
-//! `#[ignore]`, so `cargo test --workspace` skips it. It needs a tailnet, a live
-//! service and a credential; a CI job that depended on all three would fail for
-//! reasons that have nothing to do with the code under test, and the first fix
-//! anyone reached for would be to delete it. Run it by hand:
+//! `#[ignore]`, so `cargo test --workspace` skips it. It needs a live service;
+//! a CI job that depended on one would fail for reasons that have nothing to do
+//! with the code under test, and the first fix anyone reached for would be to
+//! delete it. Run it by hand:
 //!
 //! ```text
-//! HINDSIGHT_API_KEY=… make hindsight-smoke
+//! make hindsight-smoke
 //! ```
 //!
 //! # Knobs
 //!
 //! | env | default | why |
 //! | --- | --- | --- |
-//! | `HINDSIGHT_ENDPOINT` | `https://hindsight.yak-saturation.ts.net` | the tailnet service STUDIO-629 exposed |
-//! | `HINDSIGHT_API_KEY` | — | **required**; every `/v1/**` path 401s without it |
+//! | `HINDSIGHT_ENDPOINT` | `http://localhost:8888` | the operator's local Hindsight 0.10.1 |
+//! | `HINDSIGHT_API_KEY` | — | **optional**; empty sends no `Authorization` header, which an unauthenticated local deployment wants |
 //! | `HINDSIGHT_SMOKE_IDENTITY` | `smoke` | with the default `agent-` prefix this is bank `agent-smoke` |
 //!
 //! The identity is a **scratch** one on purpose: this writes a real fact into a
 //! real bank, and it must never be a teammate whose memory somebody relies on.
 
+use std::time::{Duration, Instant};
+
 use rhapsody_config::hindsight::HindsightBackend;
 use rhapsody_config::memory::{MemoryBackend, Query, Record};
 
-const DEFAULT_ENDPOINT: &str = "https://hindsight.yak-saturation.ts.net";
+const DEFAULT_ENDPOINT: &str = "http://localhost:8888";
 const DEFAULT_IDENTITY: &str = "smoke";
+
+/// How long to wait between recall polls while the extractor works.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to poll before giving up on the extracted fact appearing.
+const POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn env_or(name: &str, default: &str) -> String {
     match std::env::var(name) {
@@ -51,17 +68,13 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "live: needs the tailnet, the hindsight service and HINDSIGHT_API_KEY — run `make hindsight-smoke`"]
+#[ignore = "live: needs a running hindsight service — run `make hindsight-smoke`"]
 async fn hindsight_live_smoke() {
     let endpoint = env_or("HINDSIGHT_ENDPOINT", DEFAULT_ENDPOINT);
     let identity = env_or("HINDSIGHT_SMOKE_IDENTITY", DEFAULT_IDENTITY);
+    // Optional: an unauthenticated local deployment wants no Authorization
+    // header, and the client already sends none for an empty key.
     let api_key = std::env::var("HINDSIGHT_API_KEY").unwrap_or_default();
-    assert!(
-        !api_key.trim().is_empty(),
-        "HINDSIGHT_API_KEY is unset. Every /v1/** path on the deployed service answers 401 \
-         {{\"detail\":\"Authentication failed: Invalid API key\"}} without it, so this check \
-         cannot run. See `memory.api_key` in teams.yaml."
-    );
 
     let bank = HindsightBackend::new(&endpoint, "agent-", &api_key).expect("build the backend");
     println!("== hindsight live smoke ==");
@@ -80,50 +93,72 @@ async fn hindsight_live_smoke() {
     );
 
     // ── 1. retain ───────────────────────────────────────────────────────────────
+    //
+    // The extractor drops content-free text, so the note must be a concrete,
+    // realistic record with the marker as a real token — not a description of
+    // the check itself.
     let rec = Record {
         identity: identity.clone(),
         document_id: format!("run-{marker}"),
-        ticket: "STUDIO-660".to_string(),
+        ticket: "STUDIO-1036".to_string(),
         commit_sha: "0000000".to_string(),
         pr: "0".to_string(),
         run_id: marker.clone(),
         at: chrono::Utc::now(),
         content: format!(
-            "Smoke check {marker}: Rhapsody's own hindsight client retained this record while \
-             porting STUDIO-660. It exists only to prove the round trip and is invalidated \
-             moments later."
+            "On 2026-09-23 the Rhapsody hindsight smoke check retained a concrete record for \
+             STUDIO-1036 with the unique marker token {marker}. The marker identifies this exact \
+             retained note so the check can recall it once the background extractor has finished."
         ),
     };
     let doc = bank.retain(&rec).await.expect("retain");
-    println!("\n[1/4] retain    -> ok, document_id={doc}");
+    println!("\n[1/4] retain    -> ok (async, extraction pending), document_id={doc}");
 
-    // ── 2. recall ───────────────────────────────────────────────────────────────
+    // ── 2. recall — poll until the extractor finishes ───────────────────────────
+    //
+    // `async: true` means recall immediately after retain sees nothing, so poll
+    // every `POLL_INTERVAL` for up to `POLL_TIMEOUT` until a fact carries either
+    // the marker or the document id.
     let q = Query {
-        ticket: "STUDIO-660".to_string(),
+        ticket: "STUDIO-1036".to_string(),
         title: format!("smoke check {marker}"),
         top_k: 8,
         ..Query::default()
     };
-    let recalled = bank.recall(&identity, &q).await.expect("recall");
-    println!("[2/4] recall    -> {} fact(s)", recalled.facts.len());
-    for f in &recalled.facts {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut target = None;
+    loop {
+        let recalled = bank.recall(&identity, &q).await.expect("recall");
+        if let Some(f) = recalled
+            .facts
+            .iter()
+            .find(|f| f.content.contains(&marker) || f.document_id.contains(&marker))
+        {
+            target = Some(f.clone());
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         println!(
-            "        id={} ticket={:?} run_id={:?} state={}\n          {}",
-            f.id, f.ticket, f.run_id, f.state, f.content
+            "        recall    -> {} fact(s), marker not extracted yet; waiting {}s",
+            recalled.facts.len(),
+            POLL_INTERVAL.as_secs()
         );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    let target = recalled
-        .facts
-        .iter()
-        .find(|f| f.content.contains(&marker))
-        .or_else(|| recalled.facts.first())
-        .unwrap_or_else(|| {
-            panic!(
-                "recall returned nothing for a fact retained moments ago — the round trip is \
-                 broken, not merely slow"
-            )
-        })
-        .clone();
+    let target = target.unwrap_or_else(|| {
+        panic!(
+            "recall found no fact carrying {marker} or {doc} within {}s — the background retain \
+             never became recallable",
+            POLL_TIMEOUT.as_secs()
+        )
+    });
+    println!("[2/4] recall    -> extracted, marker fact id={}", target.id);
+    println!(
+        "        ticket={:?} run_id={:?} state={}\n          {}",
+        target.ticket, target.run_id, target.state, target.content
+    );
 
     // ── 3. invalidate, WITH a reason ────────────────────────────────────────────
     //
@@ -155,7 +190,8 @@ async fn hindsight_live_smoke() {
         target.id
     );
     println!(
-        "\n== all four steps passed: retain -> recall -> invalidate(reason) -> recall (gone) =="
+        "\n== all four steps passed: retain -> recall (extracted) -> invalidate(reason) -> recall \
+         (gone) =="
     );
     println!(
         "note: the record is invalidated, not deleted. `HindsightBackend::revalidate` restores it \

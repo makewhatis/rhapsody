@@ -53,7 +53,8 @@ rhapsody-credential-ipc = { path = "../credential-ipc" }
 # (the sync `LocalBank` methods need no runtime). Already in Cargo.lock workspace-wide.
 # `net` + `io-util` back the hand-rolled loopback hindsight stub the T8 tests answer from — the
 # same shape `rhapsody-tracker`'s `linear::testutil` mock server uses in place of Go's httptest.
-tokio = { version = "1", features = ["macros", "rt", "net", "io-util"] }
+# `time` backs the live smoke check's poll-until-extracted loop (STUDIO-1036).
+tokio = { version = "1", features = ["macros", "rt", "time", "net", "io-util"] }
 
 [lints]
 workspace = true
