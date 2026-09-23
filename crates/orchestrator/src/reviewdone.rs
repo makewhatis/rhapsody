@@ -71,22 +71,26 @@ use crate::stop::ControlHandle;
 /// How many times ONE merged pull request's terminal move is attempted before it is given up on
 /// and left to the reconciliation sweep to report (STUDIO-1007).
 ///
-/// Three, because the failure it exists for is a single tracker blip the next attempt rides out,
-/// and because each attempt after the first is separated by seconds-to-minutes of backoff rather
-/// than a hot loop — the whole budget is about ten minutes (see
-/// [`REVIEW_DONE_RETRY_DELAYS_SECS`]). A tracker that is down for longer than that is a fact an
-/// operator needs to see, not a reason to retry forever; that is what the report is for.
+/// Three, because the failure it exists for is a tracker blip the next attempt rides out — but the
+/// delays are sized so the whole schedule OUTLASTS a Linear hourly quota window (see
+/// [`REVIEW_DONE_RETRY_DELAYS_SECS`]). That matters because the failure STUDIO-1004 actually hit was
+/// not a blip: `linear_api_status: status 400 … "Rate limit exceeded. Only 2500 requests are
+/// allowed per 1 hour." … code RATELIMITED`, continuously for hours. A schedule that exhausted
+/// itself inside the quota window gave up without one attempt landing after the window reset. The
+/// horizon is still bounded: a tracker that is down for longer than the schedule is a fact an
+/// operator needs to see, not a reason to retry forever — that is what the report is for.
 pub const REVIEW_DONE_ATTEMPTS: u32 = 3;
 
 /// The delay before each attempt, in seconds, indexed by the number of attempts ALREADY made: a
 /// failure of attempt 1 waits `[1]`, a failure of attempt 2 waits `[2]`, and attempt 3 is the last.
 ///
-/// So the three attempts land at roughly +0s, +150s and +600s — about ten minutes end to end,
-/// which is the bound the ticket names. A fixed table rather than [`failure_backoff_ms`](crate::backoff::failure_backoff_ms)'s
-/// doubling: that helper is sized for the retry queue's much longer horizon and would put the
-/// third attempt hours out, well past the point where the operator's feed should already have the
-/// divergence.
-const REVIEW_DONE_RETRY_DELAYS_SECS: [i64; REVIEW_DONE_ATTEMPTS as usize] = [0, 150, 600];
+/// Each delay is measured from the PREVIOUS failure, so the attempts land cumulatively at roughly
+/// +0s, +15min and +70min — the last attempt deliberately beyond Linear's 1-hour quota window, so a
+/// rate-limited move gets one attempt after the window resets rather than all three inside it
+/// (round-2 review §2; the budget must outlast the failure it names). A fixed table rather than
+/// [`failure_backoff_ms`](crate::backoff::failure_backoff_ms)'s doubling: that helper is sized for
+/// the retry queue's much longer horizon and its first steps would not reach an hour.
+const REVIEW_DONE_RETRY_DELAYS_SECS: [i64; REVIEW_DONE_ATTEMPTS as usize] = [0, 900, 3300];
 
 /// One merged pull request's implementation ticket, and the terminal state it is going to.
 ///
@@ -811,6 +815,28 @@ mod tests {
 
         handle.retry_pending_review_done(far).await;
         assert_eq!(tr.move_calls().len(), 3, "a given-up row is never retried");
+    }
+
+    /// **STUDIO-1007 round 2 §2: the budget outlasts a Linear hourly quota window.** The failure
+    /// STUDIO-1004 actually hit was `RATELIMITED` continuously (400/404/328/195 lines per hour from
+    /// 20:00), so a schedule that spent itself inside the hour gave up without a single attempt
+    /// after the window reset. Each delay is measured from the PREVIOUS failure, so the last attempt
+    /// lands at the sum of every post-first delay.
+    ///
+    /// MUTATION: shrink the delays back inside the hour (e.g. `[0, 150, 600]`) and this reds.
+    #[test]
+    fn the_retry_horizon_outlasts_an_hourly_quota_window() {
+        assert_eq!(
+            REVIEW_DONE_RETRY_DELAYS_SECS.len(),
+            REVIEW_DONE_ATTEMPTS as usize,
+            "one delay per attempt after the first"
+        );
+        let last_attempt_at: i64 = REVIEW_DONE_RETRY_DELAYS_SECS[1..].iter().sum();
+        assert!(
+            last_attempt_at >= 3600,
+            "the last attempt must land after a Linear hourly window; the schedule lands at \
+             +{last_attempt_at}s"
+        );
     }
 
     /// The origin parser, over the spellings the three writers produce and the near-misses.

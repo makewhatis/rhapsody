@@ -535,11 +535,18 @@ impl ControlHandle {
     /// The pull request of the terminal move still owed to `identifier`, or `None` when nothing is
     /// owed. A store that cannot be read answers `None` (the guard then falls through to the fresh
     /// tracker read) and warns, exactly as every other un-actionable store failure here does.
+    ///
+    /// A `gave_up` row is NOT owed (STUDIO-1007 round 2 §3): its bounded retry is spent and the
+    /// reconciliation sweep owns surfacing it. Treating it as owed refused every later handoff for
+    /// that identifier forever — across restarts — without moving anything, so a human moving the
+    /// ticket by hand or reopening it for follow-up work left an author run that could never leave
+    /// the active set. The fresh tracker read below still refuses a genuinely TERMINAL ticket; only
+    /// the durable-merge arm is skipped, and only once the move has stopped being retried.
     fn owed_review_done_pr(&self, identifier: &str) -> Option<String> {
         match self.store.load_review_done() {
             Ok(rows) => rows
                 .into_iter()
-                .find(|r| r.identifier == identifier)
+                .find(|r| r.identifier == identifier && !r.gave_up)
                 .map(|r| r.pr),
             Err(e) => {
                 tracing::warn!(
@@ -1976,6 +1983,48 @@ mod tests {
 
         assert!(res.already_done, "the merged pull request wins: {res:?}");
         assert!(tr.move_calls().is_empty(), "{:?}", tr.move_calls());
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **STUDIO-1007 round 2 §3: an exhausted (`gave_up`) row does not refuse a handoff forever.**
+    /// Once the bounded retry is spent, the durable-merge arm stops firing — otherwise every later
+    /// handoff for that ticket returned `already_done` without moving anything, across restarts, so a
+    /// human moving the ticket by hand or reopening it left an author run that could never leave the
+    /// active set. The fresh tracker read still refuses a genuinely TERMINAL ticket; with no terminal
+    /// answer the handoff proceeds.
+    ///
+    /// MUTATION: drop the `!r.gave_up` filter from `owed_review_done_pr` and this refuses (no move).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_given_up_row_does_not_refuse_the_handoff() {
+        let (task, handle, run_id, signal, tr) = done_guard_harness(Fake::new(), None); // tracker answers nothing
+
+        handle
+            .store
+            .save_review_done(rhapsody_store::ReviewDoneRow {
+                identifier: "MT-1".to_string(),
+                pr: "o/r#7".to_string(),
+                issue_id: "ID-1".to_string(),
+                team_id: "TEAM-1".to_string(),
+                state: "Done".to_string(),
+                attempts: 3,
+                next_at: String::new(),
+                gave_up: true,
+            })
+            .expect("record the exhausted move");
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(
+            !res.already_done,
+            "an exhausted row is not owed any more: {res:?}"
+        );
+        assert_eq!(res.moved_to, "In Review", "the handoff proceeds: {res:?}");
+        assert_eq!(tr.move_calls().len(), 1, "{:?}", tr.move_calls());
 
         signal.cancel();
         let _ = task.await;
