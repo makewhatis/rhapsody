@@ -51,6 +51,12 @@ pub struct HandoffResult {
     pub moved_to: String,
     /// Non-empty when the review-state move was attempted but the tracker rejected it.
     pub move_err: String,
+    /// Set when the handoff REFUSED to move the ticket because it is already terminal or its pull
+    /// request has merged (STUDIO-1007). The ticket is already out of the active set, so this is a
+    /// success for the run — the caller treats it exactly like a landed move — but the review
+    /// quorum / ticketless introduction, which ride on a move this handoff did not make, do not
+    /// fire.
+    pub already_done: bool,
 }
 
 /// The control-task reply for `evHandoffRun`: whether a live run was found + the issue/team the
@@ -62,6 +68,15 @@ pub struct HandoffPlan {
     pub team_id: String,
     pub identifier: String,
     pub review_state: String,
+    /// The configured terminal state name (`teams.review.done_state`), non-empty only when the
+    /// merge→Done transition is configured (STUDIO-1007). **Empty is the whole gate for the
+    /// terminal/merged guard below**: an installation with no `done_state` has no auto-done for a
+    /// late handoff to race, so the guard is inert and the handoff is byte-identical to a daemon
+    /// built before this ticket — including the extra tracker read the guard would otherwise make.
+    pub done_state: String,
+    /// The run's owning project's terminal-state set, NORMALIZED (the form the tracker's state
+    /// names are compared in), so the off-loop guard can classify a freshly-read ticket state.
+    pub terminal_states: Vec<String>,
     /// The review-quorum fan-out to fire once the review-state move SUCCEEDS (STUDIO-659, T7;
     /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12). `None` whenever the
     /// quorum does not fire — which is every handoff on an installation that has not opted in, and
@@ -181,12 +196,17 @@ impl Orchestrator {
         // refusal travels to `handoff_run` rather than being recorded here — see
         // [`HandoffPlan::lost_review`].
         let quorum_plan = self.plan_quorum(re);
+        // The terminal/merged guard's inputs (STUDIO-1007), resolved per the run's owning project
+        // exactly as the review state above is. `done_state` empty ⇒ the guard is inert.
+        let (done_state, terminal_states) = self.handoff_done_guard(&re.project_slug);
         HandoffPlan {
             found: true,
             issue_id: id.clone(),
             team_id: re.issue.team_id.clone(),
             identifier: re.issue.identifier.clone(),
             review_state: self.review_handoff_state(&re.project_slug),
+            done_state,
+            terminal_states,
             // §0.12's trigger: "a teammate's handoff with a linked PR". This is that moment, and it
             // is the moment the daemon EXECUTES rather than merely infers, which is why the design
             // chose it over "PR opened" (the PR exists mid-run, long before it is reviewable) or
@@ -224,6 +244,96 @@ impl Orchestrator {
             .next()
             .unwrap_or_default()
     }
+
+    /// The terminal/merged guard's inputs for a run's owning project (STUDIO-1007): the configured
+    /// terminal state NAME (`teams.review.done_state`, empty ⇒ the transition is off) and the
+    /// project's NORMALIZED terminal-state set, for classifying a freshly-read ticket state.
+    ///
+    /// Read together and per-project for [`review_handoff_state`](Orchestrator::review_handoff_state)'s
+    /// reason: the guard must agree with the auto-done transition it exists to protect, and both are
+    /// resolved through the same `effective_for` overlay.
+    fn handoff_done_guard(&self, project_slug: &str) -> (String, Vec<String>) {
+        let done_state = self
+            .teams
+            .as_ref()
+            .and_then(|t| t.review_done_state())
+            .unwrap_or_default()
+            .to_string();
+        // The guard is inert without a `done_state`, so the terminal set is not even resolved —
+        // which is what keeps a default installation's plan byte-identical (no config clone, no
+        // tracker read, no terminal set).
+        if done_state.is_empty() {
+            return (done_state, Vec::new());
+        }
+        let Some(eff) = self.eff.as_ref() else {
+            return (done_state, Vec::new());
+        };
+        let project = if project_slug.is_empty() {
+            None
+        } else {
+            eff.cfg
+                .projects
+                .iter()
+                .find(|p| p.slugs.iter().any(|s| s == project_slug))
+        };
+        let terminal_states = rhapsody_config::effective_for(&eff.cfg, project)
+            .terminal_states
+            .into_iter()
+            .map(|s| rhapsody_core::normalize_state(&s))
+            .collect();
+        (done_state, terminal_states)
+    }
+}
+
+/// Why a handoff refused to move its ticket into the review state (STUDIO-1007): the ticket is
+/// already terminal, or the pull request it belongs to has merged and the terminal move is still
+/// owed. The auto-done move wins either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DoneRefusal {
+    /// The ticket's pull request merged and its terminal move is still owed — the durable ledger
+    /// named the pull request.
+    Merged { pr: String },
+    /// The ticket's CURRENT tracker state is already terminal.
+    Terminal { state: String },
+}
+
+impl DoneRefusal {
+    /// The refusal's log line, naming the ticket (always) and the pull request (when it is known).
+    fn log(&self, plan: &HandoffPlan) {
+        match self {
+            DoneRefusal::Merged { pr } => tracing::info!(
+                issue_identifier = %plan.identifier,
+                pr = %pr,
+                review_state = %plan.review_state,
+                "handoff: not moving {} to {} — its pull request {} merged and the terminal move \
+                 owns the ticket now (the auto-done move wins)",
+                plan.identifier,
+                plan.review_state,
+                pr
+            ),
+            DoneRefusal::Terminal { state } => tracing::info!(
+                issue_identifier = %plan.identifier,
+                current_state = %state,
+                review_state = %plan.review_state,
+                "handoff: not moving {} to {} — it is already in the terminal state {} (the \
+                 auto-done move wins)",
+                plan.identifier,
+                plan.review_state,
+                state
+            ),
+        }
+    }
+}
+
+/// Whether a freshly-read tracker state names a terminal state for this run's project.
+///
+/// A failure to READ the state is deliberately not terminal: the guard exists to stop a handoff
+/// moving a ticket back, and refusing every handoff on a tracker blip would be a worse trade than
+/// letting one through in the window before the next fresh read. See
+/// [`ControlHandle::done_refusal`].
+fn state_is_terminal(state: &str, terminal_states: &[String]) -> bool {
+    let normalized = rhapsody_core::normalize_state(state);
+    (!normalized.is_empty()) && terminal_states.contains(&normalized)
 }
 
 impl ControlHandle {
@@ -266,6 +376,20 @@ impl ControlHandle {
             return Ok(HandoffResult {
                 not_configured: true,
                 identifier: plan.identifier,
+                ..Default::default()
+            });
+        }
+        // A handoff never moves a terminal ticket back (STUDIO-1007). Only checked when the
+        // merge→Done transition is configured: with no `done_state` there is no auto-done for a
+        // late handoff to race, so the guard is inert (and makes no extra tracker read), which is
+        // what keeps an installation without it byte-identical to a daemon built before this ticket.
+        if !plan.done_state.is_empty()
+            && let Some(refusal) = self.done_refusal(&plan).await
+        {
+            refusal.log(&plan);
+            return Ok(HandoffResult {
+                identifier: plan.identifier,
+                already_done: true,
                 ..Default::default()
             });
         }
@@ -379,6 +503,89 @@ impl ControlHandle {
                 .copied()
                 .unwrap_or(250);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
+    /// The terminal/merged guard's decision for `plan` (STUDIO-1007): `Some` when the handoff must
+    /// NOT move the ticket into the review state, `None` when it may proceed.
+    ///
+    /// Two independent facts, checked in cheapest-first order:
+    ///
+    /// 1. **The durable merge.** A row in the terminal-move ledger for this ticket means its pull
+    ///    request MERGED and the auto-Done move is still owed. That row is written before the first
+    ///    move attempt and cleared only when the move lands, so it is the restart-surviving form of
+    ///    "the PR merged" — not a note that this process happened to run auto-done. No tracker call
+    ///    is needed to see it, and it names WHICH pull request for the log.
+    /// 2. **The ticket's own state**, read fresh from the tracker. This is what catches the case the
+    ///    ledger cannot: auto-done LANDED (so its row is gone) and a still-running author's turn
+    ///    finishes thirteen seconds later and calls handoff. The in-memory issue snapshot is stale
+    ///    by exactly that window, which is why the state is re-read here rather than trusted.
+    ///
+    /// A tracker read that FAILS is not terminal and not a refusal (see [`Self::fresh_ticket_state`]
+    /// and [`state_is_terminal`]): the guard fails OPEN, because blocking every handoff on a tracker
+    /// blip is a worse trade than one late move the next tick's auto-done re-does.
+    pub(crate) async fn done_refusal(&self, plan: &HandoffPlan) -> Option<DoneRefusal> {
+        if let Some(pr) = self.owed_review_done_pr(&plan.identifier) {
+            return Some(DoneRefusal::Merged { pr });
+        }
+        let state = self.fresh_ticket_state(&plan.issue_id).await?;
+        state_is_terminal(&state, &plan.terminal_states).then_some(DoneRefusal::Terminal { state })
+    }
+
+    /// The pull request of the terminal move still owed to `identifier`, or `None` when nothing is
+    /// owed. A store that cannot be read answers `None` (the guard then falls through to the fresh
+    /// tracker read) and warns, exactly as every other un-actionable store failure here does.
+    ///
+    /// A `gave_up` row is NOT owed (STUDIO-1007 round 2 §3): its bounded retry is spent and the
+    /// reconciliation sweep owns surfacing it. Treating it as owed refused every later handoff for
+    /// that identifier forever — across restarts — without moving anything, so a human moving the
+    /// ticket by hand or reopening it for follow-up work left an author run that could never leave
+    /// the active set. The fresh tracker read below still refuses a genuinely TERMINAL ticket; only
+    /// the durable-merge arm is skipped, and only once the move has stopped being retried.
+    fn owed_review_done_pr(&self, identifier: &str) -> Option<String> {
+        match self.store.load_review_done() {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|r| r.identifier == identifier && !r.gave_up)
+                .map(|r| r.pr),
+            Err(e) => {
+                tracing::warn!(
+                    issue_identifier = %identifier,
+                    err = %e,
+                    "handoff: the owed terminal moves could not be read; the merge guard falls \
+                     through to the ticket's own state"
+                );
+                None
+            }
+        }
+    }
+
+    /// The ticket's CURRENT tracker state, read off-loop, or `None` when the tracker cannot be
+    /// reached. Resolves the tracker exactly like [`Self::move_issue_state`] (the `control()`-time
+    /// snapshot, else the shared reads tracker) and never holds the reads guard across the await.
+    async fn fresh_ticket_state(&self, issue_id: &str) -> Option<String> {
+        let tracker = self.tracker.clone().or_else(|| {
+            self.reads
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tracker
+                .clone()
+        })?;
+        match tracker
+            .fetch_issue_states_by_ids(&[issue_id.to_string()])
+            .await
+        {
+            // Empty (the issue was not found) is "unknown", not terminal — never a refusal.
+            Ok(issues) => issues.into_iter().next().map(|i| i.state),
+            Err(e) => {
+                tracing::warn!(
+                    issue_id = %issue_id,
+                    err = %e,
+                    "handoff: the ticket's current state could not be read; the terminal guard \
+                     cannot refuse on it"
+                );
+                None
+            }
         }
     }
 
@@ -1667,6 +1874,205 @@ mod tests {
         );
 
         signal.cancel();
+        let _ = task.await;
+    }
+
+    // ── STUDIO-1007: a handoff never moves a terminal ticket back ────────────────────────────────
+
+    /// Teams on, ticketless review, a named `done_state` — the only shape the terminal/merged guard
+    /// is armed on.
+    fn done_guard_teams() -> rhapsody_config::teams::Teams {
+        rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                done_state: "Done".to_string(),
+                ..rhapsody_config::teams::Review::default()
+            },
+            ..rhapsody_config::teams::Teams::disabled()
+        }
+    }
+
+    /// Dispatches one live run and arms the guard: `done_state` configured, `Done` terminal, and
+    /// `by_id` (the fresh tracker read) answering the state the test wants. Returns the loop task,
+    /// the handle, the run id and the signal.
+    fn done_guard_harness(
+        fake: Fake,
+        by_id_state: Option<&str>,
+    ) -> (
+        tokio::task::JoinHandle<Orchestrator>,
+        ControlHandle,
+        i64,
+        CancelSignal,
+        Arc<Fake>,
+    ) {
+        let mut fake = fake;
+        if let Some(state) = by_id_state {
+            fake.by_id.insert(
+                "ID-1".to_string(),
+                issue_team("ID-1", "MT-1", state, "TEAM-1"),
+            );
+        }
+        let tr = Arc::new(fake);
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        o.teams = Some(done_guard_teams());
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.tracker.terminal_states = vec!["Done".to_string()];
+        }
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+        (task, handle, run_id, env.signal, tr)
+    }
+
+    /// **STUDIO-1007 acceptance: replay STUDIO-995.** Auto-done moved the ticket to `Done` thirteen
+    /// seconds ago, so its durable row is already gone; the still-running author's turn finishes and
+    /// calls handoff. The ticket must stay Done: the handoff REFUSES and makes no move at all.
+    ///
+    /// MUTATION (the ticket's ⚠️): drop the terminal read from `done_refusal` and the ticket is
+    /// moved back into review — the incident this ticket exists to close.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_leaves_an_auto_done_ticket_in_its_terminal_state() {
+        let (task, handle, run_id, signal, tr) = done_guard_harness(Fake::new(), Some("Done"));
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(res.already_done, "the handoff refused: {res:?}");
+        assert!(res.moved_to.is_empty(), "no review move was made: {res:?}");
+        assert!(
+            tr.move_calls().is_empty(),
+            "a terminal ticket is never moved back into review: {:?}",
+            tr.move_calls()
+        );
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **STUDIO-1007: the durable merge wins even before the ticket reads terminal.** The pull
+    /// request merged (the owed-move row exists) but the tracker's state has not caught up; a late
+    /// handoff must not move the ticket back while that move is owed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_leaves_a_ticket_whose_merged_pull_request_still_owes_its_move() {
+        let (task, handle, run_id, signal, tr) = done_guard_harness(Fake::new(), None); // the tracker answers nothing: the ROW is the fact
+
+        // The merge's own durable row — written by auto-done before its first move attempt.
+        handle
+            .store
+            .save_review_done(rhapsody_store::ReviewDoneRow {
+                identifier: "MT-1".to_string(),
+                pr: "o/r#7".to_string(),
+                issue_id: "ID-1".to_string(),
+                team_id: "TEAM-1".to_string(),
+                state: "Done".to_string(),
+                attempts: 1,
+                next_at: String::new(),
+                gave_up: false,
+            })
+            .expect("record the owed move");
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(res.already_done, "the merged pull request wins: {res:?}");
+        assert!(tr.move_calls().is_empty(), "{:?}", tr.move_calls());
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **STUDIO-1007 round 2 §3: an exhausted (`gave_up`) row does not refuse a handoff forever.**
+    /// Once the bounded retry is spent, the durable-merge arm stops firing — otherwise every later
+    /// handoff for that ticket returned `already_done` without moving anything, across restarts, so a
+    /// human moving the ticket by hand or reopening it left an author run that could never leave the
+    /// active set. The fresh tracker read still refuses a genuinely TERMINAL ticket; with no terminal
+    /// answer the handoff proceeds.
+    ///
+    /// MUTATION: drop the `!r.gave_up` filter from `owed_review_done_pr` and this refuses (no move).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_given_up_row_does_not_refuse_the_handoff() {
+        let (task, handle, run_id, signal, tr) = done_guard_harness(Fake::new(), None); // tracker answers nothing
+
+        handle
+            .store
+            .save_review_done(rhapsody_store::ReviewDoneRow {
+                identifier: "MT-1".to_string(),
+                pr: "o/r#7".to_string(),
+                issue_id: "ID-1".to_string(),
+                team_id: "TEAM-1".to_string(),
+                state: "Done".to_string(),
+                attempts: 3,
+                next_at: String::new(),
+                gave_up: true,
+            })
+            .expect("record the exhausted move");
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(
+            !res.already_done,
+            "an exhausted row is not owed any more: {res:?}"
+        );
+        assert_eq!(res.moved_to, "In Review", "the handoff proceeds: {res:?}");
+        assert_eq!(tr.move_calls().len(), 1, "{:?}", tr.move_calls());
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **The default installation is byte-identical.** With no `done_state` there is no auto-done
+    /// for a late handoff to race, so the guard is inert: a ticket that happens to read terminal is
+    /// still moved to review exactly as it was before STUDIO-1007, and no extra tracker read is
+    /// made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_no_done_state_the_handoff_is_unchanged() {
+        let mut fake = Fake::new();
+        fake.by_id.insert(
+            "ID-1".to_string(),
+            issue_team("ID-1", "MT-1", "Done", "TEAM-1"),
+        );
+        let tr = Arc::new(fake);
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        // Teams left OFF: `review_done_state()` is `None`, so the guard never runs.
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.tracker.terminal_states = vec!["Done".to_string()];
+        }
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(
+            !res.already_done,
+            "the guard is inert without done_state: {res:?}"
+        );
+        assert_eq!(
+            res.moved_to, "In Review",
+            "the move happens exactly as before"
+        );
+        assert_eq!(
+            tr.move_calls().len(),
+            1,
+            "and it is the only review-state move"
+        );
+
+        env.signal.cancel();
         let _ = task.await;
     }
 }

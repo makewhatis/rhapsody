@@ -146,6 +146,16 @@ pub struct WorkerDeps {
     /// the ticket here on the agent's behalf and ends the turn loop. Post-parity divergence from Go
     /// (TRA-240): Go relied on the agent/merge moving the ticket, which the review-gated flow can't.
     pub review_handoff_state: Option<String>,
+    /// The configured terminal state NAME (`teams.review.done_state`), non-empty only when the
+    /// merge→Done transition is configured (STUDIO-1007). It arms the auto-park's terminal guard:
+    /// with no `done_state` there is no auto-done for the park to race, so the guard is inert and
+    /// the park makes no extra tracker read — which is what keeps a default installation
+    /// byte-identical to a daemon built before this ticket.
+    ///
+    /// Stamped per-dispatch from the daemon's loaded teams config, exactly as the handoff's
+    /// terminal/merged guard reads its own `done_state` ([`crate::handoff`]): the two guards exist to
+    /// protect the SAME transition and must agree about whether it is configured.
+    pub review_done_state: Option<String>,
     /// Review-mode provisioning (STUDIO-715; design record
     /// `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`). `Some` makes this run a ticketless PR
     /// review: the workspace is a DETACHED worktree pinned to the carried head SHA rather than a
@@ -616,6 +626,34 @@ impl WorkerDeps {
         true
     }
 
+    /// The ticket's CURRENT tracker state, when a fresh read shows it has already LEFT the active
+    /// set — the guard the handoff auto-park refuses on (STUDIO-1007). `None` when the state is
+    /// still active, the issue is not found, or the read failed.
+    ///
+    /// A read that FAILS is deliberately not a refusal, exactly as the handoff's own terminal guard
+    /// ([`crate::handoff::ControlHandle`]'s `done_refusal`) never refuses on an unreadable state:
+    /// blocking the park on a tracker blip is a worse trade than one late move the next tick's
+    /// auto-done re-does. The `None` fail-open case is the only one that reaches the move.
+    async fn inactive_ticket_state(&self, issue_id: &str) -> Option<String> {
+        let ids = [issue_id.to_string()];
+        match self.tracker.fetch_issue_states_by_ids(&ids).await {
+            // Empty (the issue was not found) is "unknown", not inactive — never a refusal.
+            Ok(issues) => {
+                let state = issues.into_iter().next()?.state;
+                (!self.active_states.contains(&normalize_state(&state))).then_some(state)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    issue_id = %issue_id,
+                    error = %e,
+                    "handoff auto-park: the ticket's current state could not be read; the guard \
+                     cannot refuse on it, so the park proceeds"
+                );
+                None
+            }
+        }
+    }
+
     /// Drives the continuation-turn loop on a live session. `prompt_tmpl` is the resolved first-turn
     /// template. Returns the worker's last-known issue state (refreshed after every completed turn)
     /// alongside the freshest final result text and any abnormal-exit error. Mirrors Go
@@ -716,6 +754,31 @@ impl WorkerDeps {
                 && self.active_states.contains(&normalize_state(&issue.state))
                 && !issue.team_id.is_empty()
             {
+                // STUDIO-1007: the `issue.state` in the condition above is the dispatch-time /
+                // previous-turn snapshot, STALE for the whole final turn. Auto-done (the merge→Done
+                // transition) can land in exactly that window — the STUDIO-995 incident: auto-done
+                // at 17:27:42, the author's turn finished at 17:27:55 — and this park would then
+                // move a terminal ticket back into review. When that transition is configured,
+                // re-read the ticket's state and REFUSE the park if it has already left the active
+                // set; the auto-done move wins. Gated on `review_done_state` so an installation
+                // without the transition makes no extra tracker read and behaves exactly as before.
+                if self.review_done_state.is_some()
+                    && let Some(fresh) = self.inactive_ticket_state(&issue.id).await
+                {
+                    tracing::info!(
+                        issue_identifier = %issue.identifier,
+                        current_state = %fresh,
+                        review_state = %state,
+                        "handoff auto-park: not moving {} to {} — it has already left the active \
+                         set (the auto-done move wins)",
+                        issue.identifier,
+                        state
+                    );
+                    // Return the FRESH state, not the stale one: the caller classifies the exit on
+                    // this value, and a stale `In Progress` would schedule the very continuation
+                    // retry this guard exists to prevent.
+                    return (fresh, last_result, None);
+                }
                 match self
                     .tracker
                     .move_issue_state(&issue.id, &issue.team_id, state)
@@ -825,6 +888,10 @@ mod tests {
             model_override: agent::ModelOverride::default(),
             pr_label: String::new(),
             review_handoff_state: None,
+            // The auto-park's terminal guard is inert by default (STUDIO-1007): a daemon with no
+            // merge→Done transition makes no extra tracker read. Tests that exercise the guard set
+            // this explicitly.
+            review_done_state: None,
             review: None,
             review_delta: None,
             run_id: 0,
@@ -2340,6 +2407,105 @@ mod tests {
             1,
             "the auto-park still fires for a ticket run"
         );
+        assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    /// One declaring-HANDOFF turn whose dispatched ticket is `In Progress`.
+    fn handoff_agent() -> Arc<agentfake::Fake> {
+        fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "done\nHANDOFF: in-review".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }])
+    }
+
+    // STUDIO-1007 round 2 §1: the AUTO-PARK is the path that actually moved the ticket back in the
+    // 995/996/1005 incidents — not `symphony_handoff`. The in-memory `issue.state` the park gates on
+    // is the dispatch-time snapshot, stale for the WHOLE final turn, so an auto-done that lands
+    // mid-turn (STUDIO-995: Done at 17:27:42, turn finished 17:27:55) was moved straight back into
+    // review. With the merge→Done transition configured, the park re-reads the state and refuses
+    // when the ticket has already left the active set.
+    //
+    // MUTATION: drop the `inactive_ticket_state` read from the auto-park and `move_calls` is
+    // non-empty and `last` is the review state — the incident this ticket exists to close.
+    #[tokio::test]
+    async fn auto_park_does_not_move_a_ticket_that_already_left_the_active_set() {
+        let ag = handoff_agent();
+        // Auto-done landed mid-turn: a fresh read answers `Done` although the dispatched issue is
+        // still `In Progress` (the stale snapshot).
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "do it",
+            20,
+        );
+        d.review_handoff_state = Some("in review".to_string());
+        d.review_done_state = Some("Done".to_string());
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..dispatched() // still `In Progress`
+        };
+        let sess = ag
+            .start_session("", iss.clone(), None)
+            .await
+            .expect("session");
+        let (last, _result, err) = d
+            .run_turns(sess.as_ref(), "do it", iss, None, None, &noop_event())
+            .await;
+        assert!(err.is_none(), "expected a clean exit, got {err:?}");
+        assert!(
+            tr.move_calls().is_empty(),
+            "a ticket that already left the active set is never parked into review: {:?}",
+            tr.move_calls()
+        );
+        assert_eq!(
+            last, "Done",
+            "the FRESH terminal state is returned, so the caller does not schedule a continuation \
+             retry (a stale `In Progress` would re-dispatch the author)"
+        );
+    }
+
+    // The gate: without a `done_state` there is no auto-done for the park to race, so the park is
+    // byte-identical to before STUDIO-1007 — it makes no fresh read and moves the stale ticket
+    // exactly as it always did. This is the acceptance's "`review.done_state` unset: unchanged".
+    #[tokio::test]
+    async fn auto_park_is_unchanged_when_no_done_state_is_configured() {
+        let ag = handoff_agent();
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "do it",
+            20,
+        );
+        d.review_handoff_state = Some("in review".to_string());
+        // `review_done_state` deliberately left `None`.
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..dispatched()
+        };
+        let sess = ag
+            .start_session("", iss.clone(), None)
+            .await
+            .expect("session");
+        let (last, _result, err) = d
+            .run_turns(sess.as_ref(), "do it", iss, None, None, &noop_event())
+            .await;
+        assert!(err.is_none(), "expected a clean exit, got {err:?}");
+        assert_eq!(
+            tr.move_calls().len(),
+            1,
+            "with no done_state the park fires exactly as before"
+        );
+        assert_eq!(tr.by_id_calls(), 0, "and it makes no extra tracker read");
         assert_eq!(last, "in review", "returned state reflects the park");
     }
 

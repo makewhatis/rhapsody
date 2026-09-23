@@ -190,6 +190,11 @@ pub(crate) async fn handle_run_resume(
 ///   * `move_error`      ⇒ 502 (the tracker rejected the review-state move),
 ///   * clean move        ⇒ 200 `{identifier, moved_to}`.
 ///
+/// A handoff the daemon REFUSED because the ticket is already terminal or its pull request merged
+/// (STUDIO-1007) is a 200 with an empty `moved_to`: the ticket is already out of the active set,
+/// which is what the handoff exists to achieve, so the agent's terminal action succeeds rather than
+/// falling back to Linear to re-open a finished ticket.
+///
 /// Only a failed control round-trip is a 500 `handoff_failed`.
 pub(crate) async fn handle_run_handoff(
     method: Method,
