@@ -36,7 +36,9 @@ impl BrokerProtocol {
 pub struct BrokerLimits {
     /// Forwarded upstream requests allowed per outer turn.
     pub max_forwarded_requests: u32,
-    /// Locally denied authenticated requests before the turn token is revoked.
+    /// Locally denied authenticated requests before the turn token is revoked. A refusal caused by
+    /// broker-wide budget contention — another turn briefly exhausting the shared request-memory or
+    /// buffered-response budget — counts the same as one the child caused (see `listener::deny`).
     pub max_denied_requests: u32,
     /// Concurrent upstream requests allowed per turn.
     pub max_concurrent_requests: u32,
