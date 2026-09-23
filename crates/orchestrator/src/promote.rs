@@ -944,6 +944,37 @@ mod tests {
         ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
             self.0.load_review_verdicts(run_ids)
         }
+        fn count_completed_review_runs(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> Result<i64, StoreError> {
+            self.0.count_completed_review_runs(owner, repo, number)
+        }
+        fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
+            self.0.count_runs_for(identifier)
+        }
+        fn ticket_spend_by_provider(
+            &self,
+            ticket: &str,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
+            self.0.ticket_spend_by_provider(ticket, owner, repo, number)
+        }
+        fn save_breaker_crossing(
+            &self,
+            row: &rhapsody_store::BreakerCrossingRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_breaker_crossing(row)
+        }
+        fn load_breaker_crossings(
+            &self,
+        ) -> Result<Vec<rhapsody_store::BreakerCrossingRow>, StoreError> {
+            self.0.load_breaker_crossings()
+        }
         fn tokens_by_provider(
             &self,
             since: &str,
@@ -1054,6 +1085,34 @@ mod tests {
         }
         fn load_review_done(&self) -> Result<Vec<rhapsody_store::ReviewDoneRow>, StoreError> {
             self.0.load_review_done()
+        }
+        fn save_review_finding(
+            &self,
+            row: rhapsody_store::ReviewFindingRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_review_finding(row)
+        }
+        fn load_review_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rhapsody_store::ReviewFindingRow>, StoreError> {
+            self.0.load_review_findings(pr)
+        }
+        fn open_blocking_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rhapsody_store::ReviewFindingRow>, StoreError> {
+            self.0.open_blocking_findings(pr)
+        }
+        fn resolve_review_findings(
+            &self,
+            pr: &str,
+            generation: i64,
+            reviewer: &str,
+            resolved_by: &str,
+        ) -> Result<(), StoreError> {
+            self.0
+                .resolve_review_findings(pr, generation, reviewer, resolved_by)
         }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)

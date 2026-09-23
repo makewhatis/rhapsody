@@ -185,13 +185,67 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// The per-tool timeout every test here probes with. Generous on purpose: on a loaded runner a
+    /// stub can be starved past a tighter wall clock even though it answered correctly, which turned
+    /// a correct found/healthy verdict into a spurious `version probe timed out after 5s` on the
+    /// shared CI host (STUDIO-1030). The probe timeout is not what these tests check, so it sits far
+    /// above any plausible stall. Production's 5s [`DEFAULT_TIMEOUT`] is unchanged.
+    const GENEROUS_TIMEOUT: Duration = Duration::from_secs(60);
+
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_dir() -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("rhapsody-d4-tool-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).expect("create temp dir");
-        p
+    /// A unique scratch directory removed on drop (STUDIO-1031). `Deref`s to `Path`, so existing
+    /// `let dir = temp_dir(); dir.join(..)` call sites keep working while the directory is now
+    /// cleaned up at the end of the test.
+    ///
+    /// Uniqueness comes from pid + a nanosecond nonce + a per-process counter, so a **reused** pid —
+    /// two processes over time that happened to draw the same pid — can never reopen the previous
+    /// process's directory. `remove_dir_all` before `create_dir_all` is the belt to that braces:
+    /// even an exactly-reused name starts empty.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-d4-tool-{}-{n}-{nonce}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    fn temp_dir() -> TempDir {
+        TempDir::new()
     }
 
     /// Writes an executable shell stub that prints `output` and exits `code`. Mirror of `writeFakeTool`.
@@ -235,7 +289,7 @@ mod tests {
         Prober {
             search_dirs,
             overrides,
-            timeout: Duration::ZERO,
+            timeout: GENEROUS_TIMEOUT,
         }
     }
 
@@ -279,8 +333,6 @@ mod tests {
             !gt.detail.is_empty(),
             "gt.detail empty; want a failure detail for an unhealthy tool"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Mirrors TestProbeHonorsPerToolOverride: an explicit override path is used even when the tool is
@@ -301,31 +353,36 @@ mod tests {
             gh.found && gh.healthy && gh.path == gh_path.to_string_lossy(),
             "gh via override = {gh:?}; want found+healthy at {gh_path:?}"
         );
-
-        std::fs::remove_dir_all(&search_dir).ok();
-        std::fs::remove_dir_all(&other_dir).ok();
     }
 
-    // Mirrors TestProbeIndependentPerToolTimeout: a slow earlier tool that would exhaust a shared
-    // deadline must not starve a later, fast, healthy tool. (DefaultTools order is claude, gh, gt, git —
-    // claude runs first and sleeps; git is probed last and must stay healthy under its own fresh timeout.)
+    // Mirrors TestProbeIndependentPerToolTimeout: a slow earlier tool must not starve a later, fast,
+    // healthy tool of its own budget. (DefaultTools order is claude, gh, gt, git — claude runs first
+    // and sleeps; git is probed last.) The Rust port gives each probe its OWN fresh
+    // `tokio::time::timeout` by construction (there is no shared caller deadline to leak across
+    // tools, unlike Go's `context.WithoutCancel`), so this asserts a non-timeout outcome and uses
+    // [`GENEROUS_TIMEOUT`]: claude's finite sleep and git's instant answer both stay well inside it,
+    // and neither is decided by the machine's speed.
     #[tokio::test]
     async fn probe_independent_per_tool_timeout() {
         let dir = temp_dir();
-        write_sleeping_tool(&dir, "claude", "0.6", "1.0.0", 0); // sleeps, but under the 5s per-tool budget
+        write_sleeping_tool(&dir, "claude", "0.6", "1.0.0", 0); // slow, but under the budget
         write_fake_tool(&dir, "git", "git version 2.40.0", 0); // instant + healthy
         // gh and gt are intentionally absent (resolve to not-found instantly).
 
-        let p = prober(vec![dir.to_string_lossy().into_owned()], HashMap::new()); // 5s per-tool default
+        let p = prober(vec![dir.to_string_lossy().into_owned()], HashMap::new());
         let rs = p.probe(&default_tools()).await;
+
+        let claude = result_by_name(&rs, "claude");
+        assert!(
+            claude.found && claude.healthy,
+            "claude = {claude:?}; want found+healthy — its sleep is under the probe budget"
+        );
 
         let git = result_by_name(&rs, "git");
         assert!(
             git.found && git.healthy,
             "git = {git:?}; want found+healthy — a slow earlier tool must not starve it of its own timeout"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Mirrors TestDefaultToolsCoversTheFour: the daemon's four runtime CLIs are probed.

@@ -568,6 +568,18 @@ pub struct Orchestrator {
     /// [`Arc`] for [`human_holds`](Orchestrator::human_holds)'s reason — the gates take `&self` and
     /// the control task assembles the snapshot from the same cell. Rhapsody-only.
     pub(crate) budget_ledger: crate::budget::SharedBudgetLedger,
+    /// The runaway-loop breaker's off-loop inbox (STUDIO-1026). `None` whenever no task was spawned,
+    /// in which case a crossing is still detected and persisted but nobody is notified — the same
+    /// stance [`Self::review_notify_tx`] takes. Its only sender is
+    /// [`crate::breaker::Orchestrator::reconcile_breaker`] (and the escalation notify), both on the
+    /// control task.
+    pub(crate) breaker_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::breaker::BreakerPlan>>,
+    /// Escalation notify dedupe (STUDIO-1026), keyed `pr@head`. Loop-confined; a restart re-notifies
+    /// at worst once, which the module docs state.
+    pub(crate) escalation_notified: HashSet<String>,
+    /// Pending desktop notifications (STUDIO-1026), shared `Arc` with the off-loop breaker task's
+    /// macOS channel. The control task's snapshot reads it on `/api/v1/state`.
+    pub(crate) notifications: Arc<crate::breaker::NotificationsState>,
     /// Issue ids whose work has completed this process lifetime, a set.
     pub completed: HashSet<String>,
     /// Graphite-mode stacking facts carried from the auto-promote pass to the next tick's dispatch
@@ -629,6 +641,18 @@ pub struct Orchestrator {
     /// — the state that makes the poke once per head consecutively and the escalation once ever,
     /// rather than once per tick.
     pub(crate) draft_pokes: HashMap<String, crate::draftpoke::DraftPokeState>,
+    /// The round each watched pull request was DEFERRED behind a live author run (STUDIO-1025),
+    /// keyed by coordinate, holding the run's identifier and the head the branch stood at when the
+    /// deferral was recorded. Written and read only by the watcher's loop-side handler, and dropped
+    /// when the pull request leaves the watch set.
+    ///
+    /// It is not what KEEPS the round owed — `handle_review_head_advanced` has already re-armed the
+    /// row to `requested`, and that arm is what survives the run — but it is how the deferral and
+    /// its resolution are LOGGED (debug on the deferral, info on the arming) and how an operator can
+    /// see WHICH run a watched pull request is waiting on. A restart forgets it and can only lose a
+    /// log line: the row is re-read, the run is re-read, and the round is re-decided.
+    pub(crate) review_deferred_by_author:
+        HashMap<crate::prstate::PrCoord, crate::reviewwatch::AuthorDeferral>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
@@ -1046,6 +1070,9 @@ impl Orchestrator {
             held_for_capacity: HashMap::new(),
             human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),
             budget_ledger: Arc::new(crate::budget::BudgetLedger::default()),
+            breaker_tx: None,
+            escalation_notified: HashSet::new(),
+            notifications: Arc::new(crate::breaker::NotificationsState::default()),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
@@ -1054,6 +1081,7 @@ impl Orchestrator {
             auto_merge_announced: HashMap::new(),
             conflict_routed: HashMap::new(),
             draft_pokes: HashMap::new(),
+            review_deferred_by_author: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
             review_watch_swept: None,

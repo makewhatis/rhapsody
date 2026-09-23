@@ -983,6 +983,7 @@ mod tests {
                 labels: Vec::new(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             }],
             ..Teams::disabled()
         });

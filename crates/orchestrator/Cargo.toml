@@ -61,6 +61,11 @@ serde_json = "1"
 # Already in Cargo.lock (config/tracker/mcp depend on it) with the same feature set the tracker uses,
 # so no new crate enters the tree.
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+# sha2: the structured-findings contract (STUDIO-1008) stores a DIGEST of a reviewer's normalized
+# summary, never the summary text, and the reopen rule (§6.3) compares those digests. The same crate
+# the workspace's `repo_key` and the provider broker's fingerprints already use, so no new crate
+# enters Cargo.lock.
+sha2 = "0.10"
 
 [dev-dependencies]
 # harness-fixtures (test-only): the O4 snapshot-shape cross-check renders a snapshot through

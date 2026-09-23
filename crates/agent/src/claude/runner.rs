@@ -883,8 +883,14 @@ mod tests {
         fn new() -> TempDir {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("rhapsody-runner-{}-{seq}", std::process::id()));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir().join(format!(
+                "rhapsody-runner-{}-{seq}-{nonce}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&dir).expect("create temp dir");
             TempDir { dir }
         }
@@ -898,7 +904,9 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
         }
     }
 
@@ -1281,15 +1289,15 @@ mod tests {
     // Mirrors Go `claude.TestStartSessionInvalidCommand`.
     #[tokio::test]
     async fn start_session_invalid_command() {
+        let root = TempDir::new();
+        let ws = TempDir::new();
         let r = Runner::new(Config {
             command: "   ".to_string(),
-            workspace_root: TempDir::new().path(),
+            workspace_root: root.path(),
             turn_timeout: Duration::from_secs(1),
             ..Default::default()
         });
-        let got = r
-            .start_session(&TempDir::new().path(), Issue::default(), None)
-            .await;
+        let got = r.start_session(&ws.path(), Issue::default(), None).await;
         assert!(
             matches!(got.err(), Some(AgentError::InvalidCommand)),
             "want InvalidCommand"

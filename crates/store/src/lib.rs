@@ -467,6 +467,87 @@ pub trait Store {
     /// never pays a query per round.
     fn load_review_verdicts(&self, run_ids: &[i64]) -> Result<HashMap<i64, String>, StoreError>;
 
+    // --- runaway-loop breaker crossings (STUDIO-1026; no Go counterpart — see
+    // [`BreakerCrossingRow`]) ------------------------------------------------------------------
+
+    /// How many COMPLETED review runs this daemon has recorded for one pull request — every `runs`
+    /// row whose `issue_identifier` is `pr:<owner>/<repo>#<number>@<any reviewer>` with
+    /// `outcome = completed`.
+    ///
+    /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
+    /// an operator's `clear` resets it. The breaker bounds SPEND, so it counts the runs that
+    /// actually HAPPENED. Reads with the caller's explicit empty/whitespace identifiers truncated by
+    /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
+    fn count_completed_review_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<i64, StoreError>;
+
+    /// How many runs this daemon has recorded for one exact `issue_identifier` — a ticket's
+    /// "attempts" for the breaker's notification, counting every author run whatever its outcome.
+    /// `0` for an identifier with no runs.
+    fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError>;
+
+    /// A ticket's lifetime token spend per provider, covering BOTH its author runs
+    /// (`runs.issue_identifier = ticket`) AND the review runs on its pull request
+    /// (`pr:<owner>/<repo>#<number>@*`), joined through `rhapsody_run_provenance.provider`
+    /// (STUDIO-1026).
+    ///
+    /// The per-ticket cap's input. A run with no recorded provider lands in the empty-provider
+    /// bucket exactly as [`Store::tokens_by_provider`] reports it, so the figure is never silently
+    /// short by the rows a pre-STUDIO-909 daemon wrote.
+    fn ticket_spend_by_provider(
+        &self,
+        ticket: &str,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<ProviderTokens>, StoreError>;
+
+    /// Records one ticket's breaker crossings, upserting on the ticket identifier. The caller
+    /// passes the whole row, so a crossing is persisted as an absolute fact (the highest notified
+    /// round count and the providers already notified) rather than an increment.
+    fn save_breaker_crossing(&self, row: &BreakerCrossingRow) -> Result<(), StoreError>;
+
+    /// Every persisted breaker crossing, in ticket order — the boot snapshot the crossing ledger is
+    /// rehydrated from, so a restart never re-notifies a crossing.
+    fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError>;
+
+    // --- structured review findings (STUDIO-1008; no Go counterpart) -----------------------------
+    // One row per finding REVISION a reviewer raised on a pull request (design record
+    // `manager-agent-design.md` §5.3). The review path writes a revision at each completed round; a
+    // later approving review by the same reviewer resolves that reviewer's open revisions. Nothing
+    // writes `dismissed` yet — the manager (a later ticket) is its only writer — but the reopen rule
+    // (§6.3) is already defined against it. Backed by `rhapsody_review_finding` (see the README
+    // "Divergences" entry).
+
+    /// Records one finding revision. A revision row is IMMUTABLE once written — a duplicate write is
+    /// a no-op rather than a rewrite — so the row stays the record of what one completed review said.
+    fn save_review_finding(&self, row: ReviewFindingRow) -> Result<(), StoreError>;
+
+    /// Every finding revision recorded for `pr`, in `(reviewer, finding_id, revision)` order. The
+    /// writer's read: it folds these to find the latest revision of each scoped finding id before
+    /// appending the next one.
+    fn load_review_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError>;
+
+    /// The revisions that are still `open` AND `blocking` for `pr` — the read the manager and the
+    /// later tickets consume. Resolved, dismissed and settled revisions, and non-blocking ones, are
+    /// filtered in SQL.
+    fn open_blocking_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError>;
+
+    /// Resolves every `open` revision of `reviewer`'s on `pr`/`generation`, recording the approving
+    /// review's run id in `resolved_by`. Part of §5.3's resolution rule; a no-op when the reviewer
+    /// has nothing open.
+    fn resolve_review_findings(
+        &self,
+        pr: &str,
+        generation: i64,
+        reviewer: &str,
+        resolved_by: &str,
+    ) -> Result<(), StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

@@ -391,8 +391,12 @@ pub enum Event {
     },
     /// The operator taking a pull request out of the watch set from the authenticated console
     /// (STUDIO-722; NEW beyond Go v0.4.0). The same terminal a merge or a close reaches.
+    ///
+    /// `reviewer` narrows the dismissal to one row (STUDIO-1022); `None` drops every row of the
+    /// pull request, exactly as before that lever existed.
     ReviewDismiss {
         pr: crate::prstate::PrCoord,
+        reviewer: Option<String>,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
     /// The operator clearing a pull request's shared review↔author round budget from the
@@ -740,8 +744,12 @@ impl Orchestrator {
             Event::ReviewRerun { pr, reply } => {
                 let _ = reply.send(self.handle_review_rerun(&pr));
             }
-            Event::ReviewDismiss { pr, reply } => {
-                let _ = reply.send(self.handle_review_dismiss(&pr));
+            Event::ReviewDismiss {
+                pr,
+                reviewer,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_review_dismiss(&pr, reviewer.as_deref()));
             }
             Event::ReviewClear { pr, reply } => {
                 let _ = reply.send(self.handle_review_clear(&pr));
@@ -846,6 +854,12 @@ impl Orchestrator {
         // has quietly stopped, and that is when this report is worth the most. It also runs before
         // the publish so the snapshot below carries the same tick's verdict.
         self.reconcile_review_divergence();
+        // STUDIO-1026: the runaway-loop breaker — hold a ticket and notify the operator when its
+        // completed-review-round count or its per-ticket spend crosses a configured limit. Beside the
+        // sweep and above the same early returns, for the same reason: a daemon whose dispatch is
+        // gated is exactly one whose loop may be quietly burning budget. Local reads only (the watch
+        // set + the `runs` ledger); the hold and the notifications happen off-loop.
+        self.reconcile_breaker();
         // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
         // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
         // to finish (STUDIO-551).
@@ -1723,7 +1737,7 @@ impl Orchestrator {
             );
             let (final_state, declared, err) = tokio::select! {
                 res = run => res,
-                _ = cancel.cancelled() => (iss.state.clone(), false, None),
+                _ = cancel.cancelled() => (iss.state.clone(), crate::worker::WorkerDeclaration::default(), None),
             };
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
@@ -1735,7 +1749,8 @@ impl Orchestrator {
                 started_at,
                 err_msg: err.map(|e| e.to_string()).unwrap_or_default(),
                 last_state: final_state,
-                declared_handoff: declared,
+                declared_handoff: declared.declared_handoff,
+                review_verdict: declared.review_verdict,
                 refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
@@ -2025,6 +2040,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: String::new(),
                 declared_handoff: false,
+                review_verdict: None,
                 refused: false,
             }));
         }));

@@ -143,8 +143,12 @@ pub(crate) mod testutil {
     impl TempDir {
         pub(crate) fn new() -> TempDir {
             let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let path = std::env::temp_dir().join(format!(
-                "rhapsody-workspace-{}-{}",
+                "rhapsody-workspace-{}-{}-{nonce}",
                 std::process::id(),
                 n
             ));
@@ -162,20 +166,32 @@ pub(crate) mod testutil {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
+    }
+
+    /// The hook `env_overlay` a workspace test installs so a hook's `bash -lc` never sources the
+    /// runner host's login dotfiles (STUDIO-1028). It hands the hook a scratch `HOME` under `root`.
+    /// Production Managers leave the overlay empty and inherit the daemon's real environment.
+    pub(crate) fn hook_home_overlay(root: &str) -> Vec<(String, String)> {
+        let home = join(&[root, ".hook-home"]);
+        std::fs::create_dir_all(&home).unwrap();
+        vec![("HOME".to_string(), home)]
     }
 
     /// Builds a Manager over a fresh temp root with the given hooks (mirror of `repoTestManager`).
     /// The returned [`TempDir`] must be kept alive for the root to persist.
     pub(crate) fn repo_test_manager(hooks: HookScripts) -> (Manager, TempDir) {
         let root = TempDir::new();
-        let m = Manager::new(Config {
+        let mut m = Manager::new(Config {
             root: root.path.clone(),
             hooks,
             hook_timeout: Duration::from_secs(30),
         })
         .unwrap();
+        m.runner.env_overlay = hook_home_overlay(&root.path);
         (m, root)
     }
 

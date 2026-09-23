@@ -34,6 +34,7 @@
 pub mod agentupdate;
 pub mod automerge;
 pub mod backoff;
+pub mod breaker;
 pub mod budget;
 pub mod claim;
 pub mod concurrency;
@@ -74,6 +75,7 @@ pub mod reviewadopt;
 pub mod reviewchanges;
 pub mod reviewconsole;
 pub mod reviewdone;
+pub mod reviewfindings;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;

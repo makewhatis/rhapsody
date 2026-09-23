@@ -103,6 +103,20 @@ outright rather than degrading gracefully — every review assigned to that team
 few reviewers configured a required verdict can become unobtainable. This is exactly why
 `review.model`/`review.effort` below are scoped per harness rather than a single string.
 
+**`provider:` names the credential-backed inference provider a run uses.** It is the same shape on a
+profile, a roster identity, and the `manager:` block: an operator-chosen canonical provider id
+(`fireworks`, `openrouter`, …) declared in `WORKFLOW.md`'s `providers:`. It is **never a
+credential** — the value is a plain id, and anything that is not a canonical id is refused, so a
+secret has no field to travel in. Empty inherits (profile → identity → the daemon's configured
+selection). A provider reference the config does not define, or an explicit provider on the
+`claude` harness, is a dispatch **refusal** — never a silent fallback to another provider or to
+`agent.backend`.
+
+The **manager** carries its own tuple (`manager.harness` / `manager.provider` / `manager.model`)
+and never borrows a teammate's. An absent `manager.harness` means `claude` (independent of
+`agent.backend`), and an explicit non-Claude manager harness must name both its provider and its
+model.
+
 ## The room
 
 An append-only JSONL log (`~/.rhapsody/teams/room/YYYY-MM-DD.jsonl`), single-writer (the
@@ -248,6 +262,12 @@ configured `agent.backend`. ⚠️ If a model is configured for some harness but
 reviewer's runs actually use, the review is **refused** rather than sent to the wrong provider or
 silently downgraded to a cheaper model — this is the trap above, closed by config. `review.effort`
 in the same situation just inherits, since an effort value can't make a provider reject a model.
+
+**A review run can also use its own provider, scoped per harness the same way.** `review.provider`
+(`review.provider: { opencode: fireworks }`, or a legacy bare scalar) selects the provider a review
+run uses, overriding the routed reviewer's own selection — unset means inherit. Like `review.model`,
+a provider configured for a harness the routed reviewer does **not** use is **refused** rather than
+applied to the wrong run, and every value must be a canonical provider id.
 
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI

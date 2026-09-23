@@ -60,16 +60,46 @@ fn assert_golden(body: Value, fixture: &str, home: &str) {
     assert_eq!(got, want, "served body drifts from {fixture}");
 }
 
-/// A unique scratch directory under the OS temp dir (mirrors the store crate's `scratch_dir`).
-fn scratch_dir() -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "rhapsody-httpapi-golden-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A unique scratch directory under the OS temp dir, removed on drop (mirrors the store crate's
+/// `scratch_dir`). Uniqueness is the pid + a per-process atomic counter + a nanosecond nonce, so a
+/// recycled pid can never adopt an earlier run's leftover. Bind the guard — an unbound
+/// `scratch_dir().join(..)` drops it at the end of the statement and removes the directory early.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> TempDir {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "rhapsody-httpapi-golden-{}-{}-{nonce}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        TempDir { path }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Kept only when a debugging run asks for it; a normal run never accumulates scratch dirs.
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn scratch_dir() -> TempDir {
+    TempDir::new()
 }
 
 /// Open the committed Go-daemon DB on a writable COPY (`Sqlite::open` sets `journal_mode=WAL`, which
@@ -77,9 +107,10 @@ fn scratch_dir() -> PathBuf {
 /// tree). Returns the store + the capture-home prefix recovered from the run's `transcript_path` (the
 /// SAME substitution `normalize.sh` applied when it wrote the committed fixtures), so `history.json`
 /// (which carries a `<HOME>/.symphony/logs/…` transcript path) compares byte-for-byte.
-fn open_go_daemon_store() -> (Arc<Sqlite>, String) {
+fn open_go_daemon_store() -> (TempDir, Arc<Sqlite>, String) {
     let src = harness_fixtures::fixtures_dir().join("db/go-daemon.db");
-    let db = scratch_dir().join("go-daemon.db");
+    let scratch = scratch_dir();
+    let db = scratch.join("go-daemon.db");
     std::fs::copy(&src, &db).expect("copy fixture db");
     let store = Arc::new(Sqlite::open(StorePath::Disk(db)).expect("open go-daemon.db"));
     let runs = store.list_runs(RunFilter::default()).expect("list_runs");
@@ -88,7 +119,7 @@ fn open_go_daemon_store() -> (Arc<Sqlite>, String) {
         .and_then(|r| r.transcript_path.split("/.symphony/logs/").next())
         .unwrap_or("")
         .to_string();
-    (store, home)
+    (scratch, store, home)
 }
 
 async fn spawn(provider: FakeProvider) -> String {
@@ -114,7 +145,7 @@ const CONFIG_STUB_PORT: &str = "51234";
 /// Materialize a committed capture workflow (with the three placeholders substituted) as a real
 /// WORKFLOW.md under a scratch dir, returning its path — the served config handler loads it. Mirrors
 /// the config crate golden's `load_substituted`, but keeps the file on disk for the HTTP GET.
-fn materialize_capture_workflow(name: &str) -> PathBuf {
+fn materialize_capture_workflow(name: &str) -> (TempDir, PathBuf) {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../../harness/capture/workflows/{name}.md"));
     let raw = std::fs::read_to_string(&src)
@@ -129,9 +160,10 @@ fn materialize_capture_workflow(name: &str) -> PathBuf {
             "__STORE_PATH__",
             &format!("{CONFIG_CAPTURE_HOME}/symphony.db"),
         );
-    let path = scratch_dir().join("WORKFLOW.md");
+    let scratch = scratch_dir();
+    let path = scratch.join("WORKFLOW.md");
     std::fs::write(&path, substituted).expect("write workflow");
-    path
+    (scratch, path)
 }
 
 /// The H3 config gate: the served `GET /api/v1/config` body, normalized, is byte-identical to the
@@ -140,7 +172,7 @@ fn materialize_capture_workflow(name: &str) -> PathBuf {
 /// handler REUSES `effective_json::render`, so this closes the loop that the served view matches too.
 #[tokio::test]
 async fn config_endpoint_matches_config_golden() {
-    let path = materialize_capture_workflow("minimal");
+    let (_scratch, path) = materialize_capture_workflow("minimal");
     let provider = FakeProvider::ok(empty_snapshot()).with_workflow_path(path.to_string_lossy());
     let base = spawn(provider).await;
     let (status, body) = get_json(&format!("{base}/api/v1/config")).await;
@@ -205,7 +237,7 @@ fn seed_failed_run(
 
 #[tokio::test]
 async fn history_matches_golden() {
-    let (store, home) = open_go_daemon_store();
+    let (_scratch, store, home) = open_go_daemon_store();
     let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(store)).await;
     let (status, body) = get_json(&format!("{base}/api/v1/history")).await;
     assert_eq!(status, 200);
@@ -214,7 +246,7 @@ async fn history_matches_golden() {
 
 #[tokio::test]
 async fn run_detail_matches_golden() {
-    let (store, home) = open_go_daemon_store();
+    let (_scratch, store, home) = open_go_daemon_store();
     let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(store)).await;
     let (status, body) = get_json(&format!("{base}/api/v1/runs/1")).await;
     assert_eq!(status, 200);
@@ -223,7 +255,7 @@ async fn run_detail_matches_golden() {
 
 #[tokio::test]
 async fn event_search_matches_golden() {
-    let (store, home) = open_go_daemon_store();
+    let (_scratch, store, home) = open_go_daemon_store();
     let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(store)).await;
     let (status, body) = get_json(&format!("{base}/api/v1/events")).await;
     assert_eq!(status, 200);
@@ -234,7 +266,7 @@ async fn event_search_matches_golden() {
 async fn metrics_matches_golden() {
     // days=0 (all-time) is time-STABLE against the frozen db and yields the identical single-day rollup
     // the capture's default (days=30, relative to capture wall-clock) produced — the db holds one run.
-    let (store, home) = open_go_daemon_store();
+    let (_scratch, store, home) = open_go_daemon_store();
     let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(store)).await;
     let (status, body) = get_json(&format!("{base}/api/v1/metrics?days=0")).await;
     assert_eq!(status, 200);
@@ -243,7 +275,7 @@ async fn metrics_matches_golden() {
 
 #[tokio::test]
 async fn run_events_success_matches_golden() {
-    let (store, home) = open_go_daemon_store();
+    let (_scratch, store, home) = open_go_daemon_store();
     let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(store)).await;
     let (status, body) = get_json(&format!("{base}/api/v1/runs/1/events")).await;
     assert_eq!(status, 200);

@@ -139,8 +139,17 @@ the `Orchestrator` struct itself. Concretely:
     This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
     both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
 
+  - `breaker.rs`'s `NotificationsState` (`Orchestrator::notifications: Arc<NotificationsState>`,
+    STUDIO-1026) — a `Mutex`-guarded bounded queue of pending desktop notifications. The off-loop
+    breaker task's `MacosChannel` is the only writer; the control task's `build_snapshot` is its only
+    reader (for the conditional `notifications` key on `/api/v1/state`). A ninth seam of the
+    `BudgetLedger` shape: both sides genuinely touch it, neither can wait for the other, and the
+    lock is never held across an `.await`. The breaker's other two pieces are NOT seams — `breaker_tx`
+    is written only from the control task's `reconcile_breaker`, and `escalation_notified` is
+    loop-confined.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  eight seams; if none fits, that's a real design decision — don't reach for a ninth ad hoc
+  nine seams; if none fits, that's a real design decision — don't reach for a tenth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
@@ -189,6 +198,11 @@ the `Orchestrator` struct itself. Concretely:
   is a pure function (`reconcile_pr`) so each of the six incidents it exists for is a table fixture;
   if you add a divergence shape, mutation-check it, and keep the default for an unrecognised status
   SILENT.
+  `reviewfindings.rs` (STUDIO-1008; Rhapsody-only) owns the REVIEWER OUTPUT CONTRACT: the
+  `rhapsody-review-verdict` fenced block, the finding revisions it produces and §6.3's mechanical
+  reopen rule. It is pure — the worker parses the block and carries it on `EvWorkerExit`
+  (`review_verdict`), and `review.rs::on_review_exit` applies the plan to the store. `generation` is
+  a documented `0` and `raised_at_patch_id` empty until M2 tracks them; don't invent either here.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
   Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still
