@@ -404,6 +404,44 @@ async fn consecutive_turns_rotate_the_capability_and_resume() {
 }
 
 #[tokio::test]
+async fn transcript_teeing_is_redacted_before_it_is_written() {
+    let _serial = serial().await;
+    let fx = Fixture::new("transcript");
+    let out_path = fx._scratch.path().join("transcript-out.log");
+    let err_path = fx._scratch.path().join("transcript-err.log");
+    let transcript = rhapsody_agent::Transcript {
+        stdout: Some(Box::new(
+            std::fs::File::create(&out_path).expect("stdout transcript"),
+        )),
+        stderr: Some(Box::new(
+            std::fs::File::create(&err_path).expect("stderr transcript"),
+        )),
+    };
+    let sess = start_brokered_session(
+        fx.cfg(),
+        &fx.workspace.to_string_lossy(),
+        issue("STUDIO-1001"),
+        Some(transcript),
+    )
+    .await
+    .expect("brokered session");
+    let (tr, err, _) = fx.run(sess.as_ref(), "do it").await;
+    assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+    let env = fx.env_map();
+    let capability = capability_from_auth(env.get("OPENCODE_AUTH_CONTENT").expect("auth"));
+    // The fixture emitted the capability on both streams; the transcript must not have it.
+    let stdout_tee = std::fs::read_to_string(&out_path).expect("stdout transcript");
+    let stderr_tee = std::fs::read_to_string(&err_path).expect("stderr transcript");
+    assert!(!stdout_tee.contains(&capability), "{stdout_tee}");
+    assert!(!stdout_tee.contains(&fx.base_url), "{stdout_tee}");
+    assert!(!stderr_tee.contains(&capability), "{stderr_tee}");
+    assert!(!stderr_tee.contains(&fx.base_url), "{stderr_tee}");
+    assert!(stdout_tee.contains("[redacted-capability]"), "{stdout_tee}");
+    assert!(stderr_tee.contains("[redacted-broker-url]"), "{stderr_tee}");
+}
+
+#[tokio::test]
 async fn capability_and_broker_url_are_redacted_from_events_and_stderr() {
     let _serial = serial().await;
     let fx = Fixture::new("redact");
