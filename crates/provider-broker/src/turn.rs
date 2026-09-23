@@ -15,10 +15,10 @@ use crate::metrics::BrokerMetrics;
 use crate::policy::{BrokerLimits, BrokerProtocol};
 use crate::reservations::{ConcurrencyPermit, ReserveRequest};
 use crate::secret::CapabilityToken;
-use crate::sse::UsageObservation;
 use crate::state::{
     MAX_TOKEN_RETRIES, TOKEN_BYTES, TokenDigest, TurnGateGuard, TurnInner, encode_token, lock,
 };
+use crate::usage::UsageObservation;
 
 /// Adapter-supplied metadata for one outer turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -317,6 +317,7 @@ impl CapabilityGrant {
     /// synchronously through `Notify`, so a revocation during a stalled upstream read wakes this
     /// immediately; expiry is bounded by a sleep over the remaining monotonic lifetime, so a
     /// trickling provider cannot hold the request open past its deadline.
+    #[cfg(feature = "loopback")]
     pub(crate) async fn wait_cancelled(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
         loop {
             if !self.is_live() || *shutdown.borrow_and_update() {
@@ -355,6 +356,7 @@ impl CapabilityGrant {
     /// authenticate against it, and any in-flight request waiting in [`CapabilityGrant::wait_cancelled`]
     /// wakes. Called by the adapter when the authenticated-denial threshold is reached (design §8.2);
     /// the turn's owner still finalizes the receipt when the access/attempt drops.
+    #[cfg(feature = "loopback")]
     pub(crate) fn revoke(&self) {
         self.inner.revoke_grant();
     }
@@ -362,6 +364,7 @@ impl CapabilityGrant {
     /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that
     /// constructs the upstream `Authorization` header and its redactor. There is no key accessor on
     /// any public type. `None` once custody has been released (session revoked).
+    #[cfg(feature = "loopback")]
     pub(crate) fn with_credential<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let guard = crate::state::lock(&self.inner.session.credential);
         guard.as_ref().map(|lease| lease.expose_for_upstream(f))
@@ -419,6 +422,12 @@ impl CapabilityGrant {
     /// Begin settling one admitted request's provider usage. The returned handle records exactly one
     /// settlement into the turn ledger — the explicit [`RequestSettlement::observe`] call, or a
     /// conservative unknown on drop.
+    ///
+    /// This explicit-settlement entry point is driven by the `loopback` adapter (it is the only
+    /// caller), so a `loopback`-off build — `rhapsody-credential-ipc`'s — has no user for it and
+    /// would otherwise warn. The settlement *type* and its accounting stay in the always-compiled
+    /// core; only the call site is adapter-specific.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
     pub(crate) fn begin_request_settlement(&self) -> RequestSettlement {
         RequestSettlement {
             inner: Arc::clone(&self.inner),
@@ -445,6 +454,7 @@ impl CapabilityGrant {
 /// This is what makes finalization exactly once across parser, stream EOF, cancellation, and Drop
 /// (design §7.3, §4.3): a request that is admitted but never settles is automatically charged and
 /// counted unknown rather than silently dropped.
+#[cfg_attr(not(feature = "loopback"), allow(dead_code))]
 pub(crate) struct RequestSettlement {
     inner: Arc<TurnInner>,
     metrics: Arc<BrokerMetrics>,
@@ -462,6 +472,7 @@ impl fmt::Debug for RequestSettlement {
     }
 }
 
+#[cfg_attr(not(feature = "loopback"), allow(dead_code))]
 impl RequestSettlement {
     /// Settle this request exactly once. `forwarded_bytes` is `Some(n)` only for a successfully
     /// forwarded response, whose response-byte reservation settles down to `n`; an aborted,

@@ -23,48 +23,76 @@ getrandom = "0.2"
 thiserror = "1"
 
 # ---- PB2: the private loopback listener and the fixed outbound client (design §2.1, §5, §6) ----
-# The PB1 crate deliberately carried no HTTP stack; PB2 owns the one loopback listener, so the
-# dependency direction guard is relaxed for exactly these crates. Every crate below is already in
-# Cargo.lock (axum/hyper/hyper-util/reqwest are the versions the rest of the workspace and the
-# `linear-stub` already use) — no new external crate enters.
+# This is the crate's ONE HTTP stack and it is gated behind the `loopback` feature (default-on; see
+# [features] below). A consumer that needs only PB1's custody types — `rhapsody-credential-ipc`, and
+# through it the bundled GUI application — builds the crate with `default-features = false` and
+# therefore never links axum/hyper/reqwest (nor a second reqwest major) just to reach
+# `validate_api_key_value`. Each crate below is already in Cargo.lock (axum/hyper/hyper-util/reqwest
+# are the versions the rest of the workspace and the `linear-stub` already use) — no new external
+# crate enters.
 #
 # axum/hyper/hyper-util: the loopback server is built on hyper's HTTP/1 builder directly (not
 # `axum::serve`) so HTTP/1-only serving, the header-read timeout, the header ceiling and the
 # connection/request ceilings can be enforced as §5.1 requires; axum is only the router.
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-axum = "0.8"
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+axum = { version = "0.8", optional = true }
 # tokio: the async runtime the listener serves on (`net`/`time`), plus the sync primitives the
-# connection ceiling needs. Already in Cargo.lock.
-tokio = { version = "1", features = ["net", "time", "sync"] }
+# connection ceiling needs. PB1's move-only turn handles also use `sync`/`time` and the
+# `tokio::select!` macro (hence `macros`), so tokio is deliberately NOT behind the feature and
+# `macros` is named here rather than relying on a PB2 dependency to unify it in. Already in
+# Cargo.lock.
+tokio = { version = "1", features = ["net", "time", "sync", "macros"] }
 # http / http-body / http-body-util / bytes: the request/response types the handler and the fixed
 # outbound adapter construct without copying the incoming header map (§5.4).
-http = "1"
-http-body = "1"
-http-body-util = "0.1"
-bytes = "1"
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
 # futures-util: `StreamExt::next` + `stream::unfold` shape the backpressured, redacted, bounded
 # response body (§7.1) without a detached forwarding task.
-futures-util = "0.3"
+futures-util = { version = "0.3", optional = true }
 # tower: the `Service`/`service_fn` glue between hyper's connection driver and the axum router.
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 # serde_json: the bounded parser produces `serde_json::Value` for outbound re-serialization, and the
 # response redactor/observer walk provider JSON. Already in Cargo.lock.
-serde_json = "1"
+serde_json = { version = "1", optional = true }
 # serde (derive): `NonStreamingBody` deserializes a non-streaming provider response once, validating
 # it as a JSON object and reading `usage` while skipping (and not allocating) every other field. A
 # whole-body `serde_json::Value` tree would amplify a bounded response into far more memory than its
 # byte budget charges. serde/serde_derive are already in Cargo.lock; only the derive feature is newly
 # enabled here.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"], optional = true }
 # url: the one normalized upstream base URL and its exact round-trip validation (§6.1). Already in
 # Cargo.lock.
-url = "2"
+url = { version = "2", optional = true }
 # reqwest: the fixed outbound HTTP client (§6.2). `default-tls` = platform trust roots with hostname
 # validation (native-tls), never inherited CA env. `default-features = false` drops decompression, so
 # only `identity` is accepted; the response body is pulled via `Response::chunk` (no `stream` feature
 # needed, so no extra lock entries).
-reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"], optional = true }
+
+[features]
+# `loopback` = the PB2 adapter (private loopback listener + fixed upstream client + the bounded
+# schema/usage/redaction pipeline). Default-ON so the crate's own tests and any daemon that takes
+# defaults keep PB2; `rhapsody-credential-ipc` opts OUT with `default-features = false` so the
+# bundled GUI application never links the HTTP stack it has no use for.
+default = ["loopback"]
+loopback = [
+    "dep:axum",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:reqwest",
+    "dep:tower",
+    "dep:futures-util",
+    "dep:url",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dev-dependencies]
 # static_assertions: `assert_not_impl_any!` is the standard stable-Rust negative-impl guard
@@ -74,6 +102,17 @@ static_assertions = "1"
 # tokio test runtime extras: `#[tokio::test]` with a real multi-threaded runtime for the loopback
 # listener + fake upstream tests. Already in Cargo.lock.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# serde: `compile_guards.rs` names `serde::Serialize` in a negative-impl assertion for PB1's custody
+# handles. `serde` is an optional PB2 dependency, so it is named here too; otherwise the guard cannot
+# compile when `loopback` is off (a PB1-only build). Already in Cargo.lock.
+serde = "1"
+
+# The PB2 loopback integration test exercises the adapter, so it is gated on the feature: a
+# `--no-default-features` build (as credential-ipc's) skips it instead of failing to compile.
+[[test]]
+name = "loopback"
+path = "tests/loopback.rs"
+required-features = ["loopback"]
 
 [lints]
 workspace = true

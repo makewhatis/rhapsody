@@ -26,9 +26,10 @@
 //!   revoke the grant and finalize the ledger receipt synchronously.
 //! * [`TurnReceipt`] is retained by the worker outside the cancellable future and can be taken once
 //!   the attempt/access has finished or dropped.
-//! * [`BrokerListener`] is the one private listener: it binds `127.0.0.1:0`, authenticates every
+//! * `BrokerListener` is the one private listener: it binds `127.0.0.1:0`, authenticates every
 //!   request with the bearer capability, validates the closed schema, forwards exactly once to the
-//!   normalized upstream endpoint, and streams the redacted response back (PB2).
+//!   normalized upstream endpoint, and streams the redacted response back (PB2, behind the
+//!   `loopback` feature).
 //!
 //! Secret hygiene is structural: [`CapabilityToken`] and [`BoundCredentialLease`] are non-`Clone`,
 //! non-`Serialize`, redact their `Debug`, expose no unrestricted string accessor, and zeroize their
@@ -42,22 +43,33 @@
 pub mod authority;
 pub mod binding;
 pub mod broker;
-pub mod budget;
 pub mod clock;
 pub mod error;
 pub mod ledger;
-pub mod listener;
 pub mod metrics;
 pub mod policy;
 pub mod random;
-pub mod refusal;
-pub mod schema;
 pub mod secret;
 pub mod session;
-pub mod sse;
 pub mod turn;
+pub mod usage;
+
+// PB2 — the private loopback adapter (listener, upstream client, bounded schema/usage/redaction
+// pipeline). Gated behind the `loopback` feature so a PB1-only consumer does not link the HTTP stack.
+#[cfg(feature = "loopback")]
+pub mod budget;
+#[cfg(feature = "loopback")]
+pub mod listener;
+#[cfg(feature = "loopback")]
+pub mod refusal;
+#[cfg(feature = "loopback")]
+pub mod schema;
+#[cfg(feature = "loopback")]
+pub mod sse;
+#[cfg(feature = "loopback")]
 pub mod upstream;
 
+#[cfg(feature = "loopback")]
 mod redact;
 mod reservations;
 mod state;
@@ -68,29 +80,38 @@ pub use binding::{
     MAX_CREDENTIAL_ENVELOPE_BYTES, validate_api_key_value,
 };
 pub use broker::{Broker, BrokerRegistration, BrokerRegistrationPlan};
-pub use budget::{WeightedBudget, WeightedGuard};
 pub use clock::{Clock, ManualClock, MonotonicTime, SystemClock};
 pub use error::{BrokerError, CredentialRejection, LimitViolation};
 pub use ledger::{TurnLedger, TurnOutcome, UsageAuthority};
-pub use listener::{
-    BrokerListener, HEADER_READ_TIMEOUT, MAX_CONNECTIONS, MAX_REQUESTS_PER_CONNECTION,
-};
 pub use metrics::{BrokerMetrics, BrokerMetricsSnapshot};
 pub use policy::{
     BrokerLimits, BrokerProtocol, DEFAULT_BROKER_LIMITS, HARD_BROKER_LIMITS, SessionPolicy,
 };
 pub use random::{OsRandom, RandomError, RandomSource, ScriptedRandom};
-pub use redact::{REDACTION_MARKER, StreamingRedactor};
-pub use refusal::PolicyRefusal;
 pub use reservations::ConcurrencyPermit;
+pub use secret::{CapabilityToken, ZeroizingBytes};
+pub use session::{BrokerLedgerReceiver, BrokerSession};
+pub use turn::{BrokerTurnAttempt, CapabilityGrant, TurnAccess, TurnMeta, TurnReceipt};
+pub use usage::UsageObservation;
+
+#[cfg(feature = "loopback")]
+pub use budget::{WeightedBudget, WeightedGuard};
+#[cfg(feature = "loopback")]
+pub use listener::{
+    BrokerListener, HEADER_READ_TIMEOUT, MAX_CONNECTIONS, MAX_REQUESTS_PER_CONNECTION,
+};
+#[cfg(feature = "loopback")]
+pub use redact::{REDACTION_MARKER, StreamingRedactor};
+#[cfg(feature = "loopback")]
+pub use refusal::PolicyRefusal;
+#[cfg(feature = "loopback")]
 pub use schema::{
     ChatRequest, ChatRequestPolicy, RequestRejection, SchemaError, top_level_field_allowed,
     validate_chat_request,
 };
-pub use secret::{CapabilityToken, ZeroizingBytes};
-pub use session::{BrokerLedgerReceiver, BrokerSession};
-pub use sse::{SseUsageObserver, UsageObservation};
-pub use turn::{BrokerTurnAttempt, CapabilityGrant, TurnAccess, TurnMeta, TurnReceipt};
+#[cfg(feature = "loopback")]
+pub use sse::{MAX_USAGE_JSON_BYTES, SseUsageObserver};
+#[cfg(feature = "loopback")]
 pub use upstream::{
     EndpointError, NormalizedEndpoint, RHAPSODY_USER_AGENT, UpstreamClient, UpstreamError,
 };

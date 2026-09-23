@@ -51,12 +51,13 @@ use crate::refusal::{PolicyRefusal, refusal_response};
 use crate::reservations::ConcurrencyPermit;
 use crate::schema::{ChatRequestPolicy, RequestRejection, validate_chat_request};
 use crate::secret::ZeroizingBytes;
-use crate::sse::{SseUsageObserver, UsageObservation};
+use crate::sse::SseUsageObserver;
 use crate::turn::{CapabilityGrant, RequestSettlement};
 use crate::upstream::{
     NormalizedEndpoint, UpstreamClient, canonical_content_type, contains_secret, parse_retry_after,
     parse_retry_after_ms,
 };
+use crate::usage::UsageObservation;
 
 /// Broker-wide ceiling on accepted connections / active handlers (design §5.1).
 pub const MAX_CONNECTIONS: usize = 256;
@@ -932,6 +933,13 @@ async fn read_body_frames(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyR
 /// Refuse an authenticated request and count the local denial against the turn's bounded abuse
 /// counter (design §5.2, §8.2). The denial that *reaches* the configured threshold revokes the turn
 /// token here, so a subsequent request cannot authenticate at all.
+///
+/// The counter is deliberately not limited to refusals the child itself caused. A request refused
+/// because a **broker-wide** budget (`request_budget` / `response_budget`) is momentarily exhausted
+/// by another turn's traffic is counted here too, so ordinary contention with a concurrent turn can
+/// on its own accumulate denials and revoke this capability at `max_denied_requests`. That is the
+/// accepted fail-closed behaviour: the broker refuses rather than over-spend daemon memory, and a
+/// revoked capability is the bounded way to stop a child that keeps retrying into contention.
 fn deny(state: &BrokerState, grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
     state.metrics.record_denied();
     if matches!(

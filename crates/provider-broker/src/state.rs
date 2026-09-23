@@ -24,7 +24,7 @@ use crate::reservations::{
     ConcurrencyPermit, ReservationSnapshot, Reservations, ReserveRequest, SessionReservations,
     UsageSnapshot,
 };
-use crate::sse::UsageObservation;
+use crate::usage::UsageObservation;
 
 /// Recover a poisoned lock instead of propagating: no broker method panics while holding one.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -388,13 +388,17 @@ impl TurnInner {
     }
 
     /// Settle one admitted request's provider usage into the turn ledger, exactly once per request
-    /// (design §7.3). Never releases a token reservation.
+    /// (design §7.3). Never releases a token reservation. Driven only by the `loopback` adapter, so a
+    /// `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
     pub(crate) fn settle_usage(&self, observation: &UsageObservation) {
         self.reservations.settle_usage(observation);
     }
 
     /// Settle a forwarded response's byte reservation down to the bytes actually forwarded (design
-    /// §8.2). Token reservations never settle downward in the generic adapter.
+    /// §8.2). Token reservations never settle downward in the generic adapter. Driven only by the
+    /// `loopback` adapter, so a `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
     pub(crate) fn settle_response_bytes(&self, reserved: u64, forwarded: u64) {
         self.reservations.settle_response_bytes(reserved, forwarded);
     }

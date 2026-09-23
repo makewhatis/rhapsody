@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use crate::authority::CumulativeBudgetAuthority;
 use crate::error::BrokerError;
 use crate::policy::BrokerLimits;
-use crate::sse::UsageObservation;
 use crate::state::lock;
+use crate::usage::UsageObservation;
 
 /// The per-session/run reserved-token cap, shared across that session's turns. Token reservations
 /// are charged atomically and never released by the generic adapter.
@@ -245,6 +245,9 @@ impl Reservations {
     /// §8.2). Only a *successfully* forwarded response calls this; an aborted or malformed response
     /// keeps the full reservation so repeated early disconnects cannot bypass the turn aggregate.
     /// Ignored once the turn has closed (the finalized ledger already kept the full reservation).
+    ///
+    /// Driven only by the `loopback` adapter, so a `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
     pub(crate) fn settle_response_bytes(&self, reserved: u64, forwarded: u64) {
         let mut guard = lock(&self.state);
         if guard.closed {
@@ -258,6 +261,9 @@ impl Reservations {
     /// report is recorded as `provider_reported_unverified` measurement; it never releases the token
     /// reservation. A malformed/missing report is counted unknown. A settlement after the turn has
     /// closed is ignored — the outstanding request was already counted unknown at close.
+    ///
+    /// Driven only by the `loopback` adapter, so a `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
     pub(crate) fn settle_usage(&self, observation: &UsageObservation) {
         let mut guard = lock(&self.state);
         if guard.closed {
