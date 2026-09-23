@@ -407,6 +407,13 @@ fn project_from_json(base: &Config, pj: &ProjectReq) -> Project {
     if let Some(bp) = base_project {
         p.promote_from_states = bp.promote_from_states.clone();
     }
+    // Per-project provider definitions (STUDIO-984) are likewise not surfaced in the typed
+    // `projects[]` view, so carry them forward from the base project exactly as `promote_from_states`
+    // (STUDIO-948) is. Without this a Settings save rebuilds every project from `Project::default()`
+    // and silently DELETES each project's providers — data loss on an unrelated edit.
+    if let Some(bp) = base_project {
+        p.providers = bp.providers.clone();
+    }
     // Seed the override from the base project's claude block (preserving unmanaged knobs), then
     // overwrite ONLY the managed knobs from the DTO (a None clears that managed knob).
     let mut ov = base_project
