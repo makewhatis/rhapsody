@@ -49,7 +49,13 @@ use crate::workflow::{Definition, YamlMap};
 /// the front matter decodes — the typed `global` + `projects[]` view.
 pub fn render(def: &Definition) -> Value {
     let mut out = Map::new();
-    out.insert("config".to_string(), yaml_map_to_json(&def.config));
+    // The verbatim `config` echo is secret-safe by construction: the provider subtrees are filtered
+    // to the schema's known keys, so an unknown `credential.value`/`api_key` spelling can never be
+    // published by `GET /api/v1/config` even though `decode` already refuses it (STUDIO-984 review,
+    // sol). Every non-provider key is echoed unchanged, so provider-less configs stay byte-identical.
+    let mut config = yaml_map_to_json(&def.config);
+    sanitize_provider_blocks(&mut config);
+    out.insert("config".to_string(), config);
     out.insert(
         "prompt_body".to_string(),
         Value::String(def.prompt_template.clone()),
@@ -90,6 +96,14 @@ fn build_global(c: &Config) -> Value {
         "max_retry_backoff_ms".into(),
         num(c.agent.max_retry_backoff_ms),
     );
+    // STUDIO-984 (Rhapsody-only): the normalized provider/model selection, emitted only when set so
+    // a provider-less config keeps the byte-pinned Go `agent` object unchanged.
+    if !c.agent.provider.is_empty() {
+        agent.insert("provider".into(), s(&c.agent.provider));
+    }
+    if !c.agent.model.is_empty() {
+        agent.insert("model".into(), s(&c.agent.model));
+    }
     // max_concurrent_agents_by_state is `omitempty`: emitted only when non-empty.
     if !c.agent.max_concurrent_agents_by_state.is_empty() {
         let mut m = Map::new();
@@ -134,7 +148,7 @@ fn build_global(c: &Config) -> Value {
         otel.insert("headers".into(), Value::Object(m));
     }
 
-    obj(vec![
+    let mut global = obj(vec![
         (
             "tracker",
             obj(vec![
@@ -193,6 +207,99 @@ fn build_global(c: &Config) -> Value {
         ("dependency_mode", s(&c.tracker.dependency_mode)),
         ("dep_mode_prompt_file", s(&c.tracker.dep_mode_prompt_file)),
         ("claim_mode", s(&c.tracker.claim_mode)),
+    ]);
+    // STUDIO-984 (Rhapsody-only): providers are emitted ONLY when configured, so a provider-less
+    // config keeps the byte-pinned Go global view unchanged. The block is non-secret metadata plus
+    // the validated broker limits (the "visible in effective provider status" acceptance bullet).
+    if !c.providers.is_empty()
+        && let Value::Object(m) = &mut global
+    {
+        let mut providers = Map::new();
+        let deadline = crate::providers::provider_turn_deadline_ms(c.opencode.turn_timeout_ms);
+        for (id, def) in &c.providers {
+            providers.insert(id.clone(), provider_json(def, deadline));
+        }
+        m.insert("providers".into(), Value::Object(providers));
+    }
+    global
+}
+
+/// The non-secret view of one provider definition (STUDIO-984). Carries no key, token, envelope, or
+/// binding fingerprint — only what an operator wrote plus the derived normalized endpoint and the
+/// validated limits. `turn_deadline_ms` is OpenCode's effective deadline, used to report the
+/// capability lifetime's effective value when the operator did not set one.
+fn provider_json(def: &crate::providers::ProviderDefinition, turn_deadline_ms: u64) -> Value {
+    let l = &def.broker_limits;
+    let mut limits = Map::new();
+    limits.insert(
+        "forwarded_requests_per_turn".into(),
+        num(i64::from(l.forwarded_requests_per_turn)),
+    );
+    limits.insert(
+        "denied_requests_before_revocation".into(),
+        num(i64::from(l.denied_requests_before_revocation)),
+    );
+    limits.insert(
+        "concurrent_upstream_requests_per_turn".into(),
+        num(i64::from(l.concurrent_upstream_requests_per_turn)),
+    );
+    limits.insert(
+        "json_request_bytes".into(),
+        num(l.json_request_bytes as i64),
+    );
+    limits.insert(
+        "aggregate_request_bytes_per_turn".into(),
+        num(l.aggregate_request_bytes_per_turn as i64),
+    );
+    limits.insert(
+        "response_bytes_per_request".into(),
+        num(l.response_bytes_per_request as i64),
+    );
+    limits.insert(
+        "aggregate_response_bytes_per_turn".into(),
+        num(l.aggregate_response_bytes_per_turn as i64),
+    );
+    limits.insert(
+        "requested_output_tokens_per_request".into(),
+        num(l.requested_output_tokens_per_request as i64),
+    );
+    limits.insert(
+        "reserved_token_units_per_turn".into(),
+        num(l.reserved_token_units_per_turn as i64),
+    );
+    limits.insert(
+        "reserved_token_units_per_session".into(),
+        num(l.reserved_token_units_per_session as i64),
+    );
+    limits.insert(
+        "capability_lifetime_ms".into(),
+        num(l.effective_capability_lifetime_ms(turn_deadline_ms) as i64),
+    );
+    limits.insert(
+        "max_reserved_token_units_per_utc_day".into(),
+        // The daily cap is an unbounded checked `u64` (it has no hard ceiling), so emit it as a u64
+        // rather than a lossy `as i64` cast that would show a huge-but-valid value as negative.
+        l.max_reserved_token_units_per_utc_day
+            .map(|v| Value::Number(serde_json::Number::from(v)))
+            .unwrap_or(Value::Null),
+    );
+    obj(vec![
+        ("id", s(&def.id)),
+        ("protocol", s(&def.protocol)),
+        ("display_name", s(&def.display_name)),
+        // The normalized endpoint when derivable, else an EMPTY string (never the verbatim value —
+        // echoing a malformed URL could publish a smuggled secret to an operator-facing surface; a
+        // config with a secret-bearing base_url is refused by `validate` before this view is built).
+        (
+            "base_url",
+            s(&def.normalized_base_url().unwrap_or_default()),
+        ),
+        ("allow_insecure_http", Value::Bool(def.allow_insecure_http)),
+        (
+            "credential",
+            obj(vec![("source", s(&def.credential.source))]),
+        ),
+        ("broker_limits", Value::Object(limits)),
     ])
 }
 
@@ -455,6 +562,137 @@ fn yaml_map_to_json(m: &YamlMap) -> Value {
     Value::Object(out)
 }
 
+/// The keys a `providers.<id>` block may legally carry (`RawProviderDefinition`). Anything else is
+/// dropped from the echoed `config` — in particular a secret-bearing `value`/`key`/`token` spelling.
+const ALLOWED_PROVIDER_KEYS: &[&str] = &[
+    "protocol",
+    "display_name",
+    "base_url",
+    "allow_insecure_http",
+    "credential",
+    "broker_limits",
+];
+/// The provider keys whose value is a scalar on the schema. A non-scalar value here is a shape
+/// violation that must not be echoed.
+const ALLOWED_PROVIDER_SCALAR_KEYS: &[&str] = &[
+    "protocol",
+    "display_name",
+    "base_url",
+    "allow_insecure_http",
+];
+const ALLOWED_CREDENTIAL_KEYS: &[&str] = &["source"];
+const ALLOWED_BROKER_LIMIT_KEYS: &[&str] = &[
+    "forwarded_requests_per_turn",
+    "denied_requests_before_revocation",
+    "concurrent_upstream_requests_per_turn",
+    "json_request_bytes",
+    "aggregate_request_bytes_per_turn",
+    "response_bytes_per_request",
+    "aggregate_response_bytes_per_turn",
+    "requested_output_tokens_per_request",
+    "reserved_token_units_per_turn",
+    "reserved_token_units_per_session",
+    "capability_lifetime_ms",
+    "max_reserved_token_units_per_utc_day",
+];
+
+/// Filters every `providers:` block in the echoed JSON `config` (global and per-project) down to the
+/// provider schema's known keys. Defense in depth: `decode` already refuses an unknown provider key
+/// (`deny_unknown_fields`), but the GET handler renders the parsed front matter WITHOUT decoding it
+/// first, so this is the boundary that keeps a secret-shaped key out of the response.
+fn sanitize_provider_blocks(root: &mut Value) {
+    let Value::Object(map) = root else {
+        return;
+    };
+    if let Some(Value::Object(providers)) = map.get_mut("providers") {
+        sanitize_provider_map(providers);
+    }
+    if let Some(Value::Array(projects)) = map.get_mut("projects") {
+        for project in projects.iter_mut() {
+            let Value::Object(pmap) = project else {
+                continue;
+            };
+            if let Some(Value::Object(providers)) = pmap.get_mut("providers") {
+                sanitize_provider_map(providers);
+            }
+        }
+    }
+}
+
+/// Drops every provider entry whose value is not a mapping, then filters each survivor. A key-only
+/// filter would echo `providers: {fireworks: sk-…}` verbatim (jimmy's B1), so the shape itself is
+/// rejected here rather than left to `decode`.
+fn sanitize_provider_map(providers: &mut Map<String, Value>) {
+    let non_mappings: Vec<String> = providers
+        .iter()
+        .filter(|(_, def)| !matches!(def, Value::Object(_)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in non_mappings {
+        providers.remove(&k);
+    }
+    for def in providers.values_mut() {
+        sanitize_one_provider(def);
+    }
+}
+
+/// Filters one provider object: unknown keys are dropped, the scalar fields are reduced to scalars, and
+/// its `credential`/`broker_limits` sub-blocks are filtered. A secret can be smuggled in not only as an
+/// unknown KEY but as a scalar/list value where a mapping belongs (`credential: sk-…` is the natural
+/// way an operator pastes a key), so every shape is normalized to the schema before echoing.
+fn sanitize_one_provider(def: &mut Value) {
+    let Value::Object(obj) = def else {
+        return;
+    };
+    retain_keys(obj, ALLOWED_PROVIDER_KEYS);
+    drop_non_scalars(obj, ALLOWED_PROVIDER_SCALAR_KEYS);
+    sanitize_nested_block(obj, "credential", ALLOWED_CREDENTIAL_KEYS);
+    sanitize_nested_block(obj, "broker_limits", ALLOWED_BROKER_LIMIT_KEYS);
+}
+
+/// Removes every named key whose value is an object or array. The named keys are scalar on the schema,
+/// so an object value is a shape violation that could otherwise carry a nested secret.
+fn drop_non_scalars(obj: &mut Map<String, Value>, keys: &[&str]) {
+    let non_scalars: Vec<String> = obj
+        .iter()
+        .filter(|(k, v)| {
+            keys.contains(&k.as_str()) && matches!(v, Value::Object(_) | Value::Array(_))
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in non_scalars {
+        obj.remove(&k);
+    }
+}
+
+/// Filters one nested provider block. A value that is not a mapping at all (`credential: sk-…` or a
+/// list) is dropped outright; inside a mapping, unknown keys and non-scalar values are dropped too.
+fn sanitize_nested_block(obj: &mut Map<String, Value>, key: &str, allowed: &[&str]) {
+    match obj.get_mut(key) {
+        Some(Value::Object(sub)) => {
+            retain_keys(sub, allowed);
+            drop_non_scalars(sub, allowed);
+        }
+        Some(_) => {
+            obj.remove(key);
+        }
+        None => {}
+    }
+}
+
+/// Removes every key of `obj` not named in `allowed` (serde_json's `Map::retain` is not guaranteed
+/// available on the pinned version, so this collects then removes).
+fn retain_keys(obj: &mut Map<String, Value>, allowed: &[&str]) {
+    let dropped: Vec<String> = obj
+        .keys()
+        .filter(|k| !allowed.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for k in dropped {
+        obj.remove(&k);
+    }
+}
+
 /// Convert one YAML value to its JSON equivalent, preserving integer-ness (Go's yaml.v3 →
 /// `map[string]any` → `encoding/json` keeps `int` as an integer, `bool` as a bool, etc.).
 fn yaml_value_to_json(v: &serde_yaml_ng::Value) -> Value {
@@ -592,5 +830,140 @@ mod tests {
         assert!(v.get("config").is_some(), "verbatim config still present");
         assert!(v.get("global").is_some(), "typed global still present");
         assert_eq!(v["prompt_body"], "body");
+    }
+
+    // STUDIO-984 (Rhapsody-only, ADDITIVE): providers and the normalized selection are surfaced only
+    // when configured, so the byte-pinned Go global view is unchanged for a provider-less config.
+    #[test]
+    fn providers_are_surfaced_only_when_configured() {
+        let without = render_front(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "body",
+        );
+        assert!(
+            without["global"].get("providers").is_none(),
+            "an unset providers: block must not add a key to the global view"
+        );
+        assert!(without["global"]["agent"].get("provider").is_none());
+        assert!(without["global"]["agent"].get("model").is_none());
+
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            // A deliberately UN-normalized base (no `/v1`): the view must show the derived endpoint,
+            // so emitting the verbatim value reds this assertion.
+            "    base_url: https://api.fireworks.ai/inference\n",
+            "    credential:\n      source: keychain\n",
+        );
+        let v = render_front(front, "body");
+        assert_eq!(v["global"]["agent"]["provider"], "fireworks");
+        assert_eq!(
+            v["global"]["agent"]["model"],
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        let p = &v["global"]["providers"]["fireworks"];
+        assert_eq!(p["protocol"], "openai-compatible");
+        assert_eq!(p["display_name"], "Fireworks");
+        assert_eq!(
+            p["base_url"], "https://api.fireworks.ai/inference/v1",
+            "the view must carry the NORMALIZED endpoint, not the verbatim configured value"
+        );
+        assert_eq!(p["credential"]["source"], "keychain");
+        assert_eq!(
+            p["broker_limits"]["reserved_token_units_per_session"],
+            20_000_000
+        );
+        assert_eq!(
+            p["broker_limits"]["max_reserved_token_units_per_utc_day"],
+            serde_json::Value::Null,
+            "an absent daily cap is reported as null, never a permissive implicit value"
+        );
+        // No secret-bearing key appears anywhere in the provider view.
+        let rendered = p.to_string();
+        for forbidden in ["value", "api_key", "token\"", "secret", "envelope"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "provider view leaked {forbidden:?}: {rendered}"
+            );
+        }
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, sol): a provider containing a secret-shaped unknown key must
+    // not appear in `GET /api/v1/config`. `decode` refuses it, but the GET handler renders the parsed
+    // front matter WITHOUT decoding it first, so `render` itself must drop it. Removing
+    // `sanitize_provider_blocks` from `render` reds this.
+    #[test]
+    fn rendered_config_never_publishes_a_provider_secret_key() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n",
+            "    credential:\n      source: keychain\n      value: sk-review-probe\n",
+        );
+        let v = render_front(front, "body");
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("sk-review-probe"),
+            "credential value leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"value\""),
+            "unknown credential key leaked: {rendered}"
+        );
+        assert_eq!(
+            v["config"]["providers"]["fireworks"]["credential"]["source"], "keychain",
+            "the known credential key must survive the filter"
+        );
+        // An unknown provider-level key and an unknown broker-limits key are dropped too.
+        let front2 = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n",
+            "    api_key: sk-review-probe\n    broker_limits:\n      token: sk-review-probe\n",
+        );
+        let rendered2 = render_front(front2, "body").to_string();
+        assert!(
+            !rendered2.contains("sk-review-probe"),
+            "secret leaked through an unknown provider/limits key: {rendered2}"
+        );
+        // MUTATION GUARD (jimmy round-6, B1): a key-only filter still echoes a secret pasted where a
+        // MAPPING belongs. A scalar `credential`, a scalar provider value, a scalar `broker_limits`, and
+        // a list `credential` must each be dropped by the shape normalization, not just by key removal.
+        for (label, body) in [
+            (
+                "credential-scalar",
+                "providers:\n  fireworks:\n    credential: sk-review-probe\n",
+            ),
+            (
+                "provider-scalar",
+                "providers:\n  fireworks: sk-review-probe\n",
+            ),
+            (
+                "limits-scalar",
+                "providers:\n  fireworks:\n    broker_limits: sk-review-probe\n",
+            ),
+            (
+                "credential-list",
+                "providers:\n  fireworks:\n    credential: [sk-review-probe]\n",
+            ),
+        ] {
+            let front = format!("tracker:\n  kind: linear\n  api_key: $X\n{body}");
+            let leaked = render_front(&front, "body").to_string();
+            assert!(
+                !leaked.contains("sk-review-probe"),
+                "{label} leaked through the render filter: {leaked}"
+            );
+        }
+        // The per-project branch of the filter (jimmy round-6, N2a): a project-level provider must be
+        // normalized too, so deleting the `projects` lookup leaves this secret echoed and reds here.
+        let front3 = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "projects:\n  - name: Infra\n    slugs: [infra]\n",
+            "    providers:\n      projp:\n        credential:\n          value: sk-review-probe\n",
+        );
+        let rendered3 = render_front(front3, "body").to_string();
+        assert!(
+            !rendered3.contains("sk-review-probe"),
+            "per-project provider secret leaked: {rendered3}"
+        );
     }
 }

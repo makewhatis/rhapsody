@@ -75,6 +75,9 @@ pub struct EffectiveConfig {
     pub promote_from_states: Vec<String>,
     /// Resolved ticket-claim policy: always non-empty after resolve (`"assignee"` default).
     pub claim_mode: String,
+    /// The resolved provider set for this scope (STUDIO-984): the top-level providers overlaid with
+    /// this project's own definitions (a project entry with the same id wins). Ordered by id.
+    pub providers: std::collections::BTreeMap<String, crate::providers::ProviderDefinition>,
 }
 
 /// One routing target: a single Linear slug → repo + effective config (Go `ResolvedProject`). A
@@ -190,6 +193,8 @@ fn effective_of(config: &Config, project: Option<&Project>) -> EffectiveConfig {
         // Unset ⇒ empty ⇒ the pre-948 "promote every backlog-type state" default. No materialization.
         promote_from_states: config.tracker.promote_from_states.clone(),
         claim_mode: config.tracker.claim_mode.clone(),
+        // Seed from the top-level provider set; a project's own entries overlay it below.
+        providers: config.providers.clone(),
     };
     if let Some(p) = project {
         apply_project_overrides(&mut eff, config, p);
@@ -271,6 +276,12 @@ fn apply_project_overrides(eff: &mut EffectiveConfig, config: &Config, p: &Proje
     }
     if !p.claim_mode.is_empty() {
         eff.claim_mode = p.claim_mode.clone();
+    }
+    // STUDIO-984: a project's provider definitions overlay the top-level set entry-by-entry (same
+    // id wins). An absent project entry inherits the global one; an empty project map changes
+    // nothing, so a provider-less install stays byte-identical.
+    for (id, def) in &p.providers {
+        eff.providers.insert(id.clone(), def.clone());
     }
     if let Some(ov) = &p.claude {
         eff.claude = apply_claude_override(config.claude.clone(), ov);
@@ -1034,5 +1045,41 @@ mod tests {
             "any",
             "overriding project resolves its own git_flow"
         );
+    }
+
+    // ---- STUDIO-984 provider overlay (Rhapsody-only) ----
+
+    // A project's own provider definitions overlay the top-level set entry-by-entry (same id wins),
+    // following the existing pipeline; an unset project map inherits the global set unchanged.
+    #[test]
+    fn effective_providers_inherit_and_override() {
+        let c = cfg_from(
+            concat!(
+                "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+                "repo: \"git@github.com:o/r.git\"\n",
+                "providers:\n",
+                "  fireworks:\n    protocol: openai-compatible\n    base_url: https://global.example/v1\n    credential:\n      source: keychain\n",
+                "  other:\n    protocol: openai-compatible\n    base_url: https://other.example/v1\n    credential:\n      source: keychain\n",
+                "projects:\n",
+                "  - slugs: [a-1]\n    providers:\n      fireworks:\n        protocol: openai-compatible\n        base_url: https://project.example/v1\n        credential:\n          source: keychain\n",
+                "  - slugs: [b-1]\n",
+            ),
+            "body",
+        );
+        let a = effective_for(&c, Some(&c.projects[0]));
+        assert_eq!(
+            a.providers["fireworks"].base_url, "https://project.example/v1",
+            "project entry wins over the global one"
+        );
+        assert_eq!(
+            a.providers["other"].base_url, "https://other.example/v1",
+            "an untouched global entry is inherited"
+        );
+        let b = effective_for(&c, Some(&c.projects[1]));
+        assert_eq!(
+            b.providers["fireworks"].base_url,
+            "https://global.example/v1"
+        );
+        assert_eq!(effective_for(&c, None).providers.len(), 2);
     }
 }
