@@ -176,19 +176,40 @@ pub fn crossing_body(plan: &BreakerPlan) -> String {
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(" and ");
-    let mut body = format!(
-        "**{ticket}** crossed its {crossed} limit on `{pr}` — the ticket is now held \
-         (`rhapsody:human`), so no new run or review round will start. Remove the label to resume.\n",
-        ticket = plan.ticket,
-        pr = plan.pr(),
-    );
+    // Only a ROUND or SPEND crossing applies the hold (see `perform_crossing`); a manager
+    // ESCALATION notifies without holding. The headline must match, or every channel and the room
+    // tell the operator a `rhapsody:human` label exists that was never applied and never will be.
+    let held = plan
+        .kinds
+        .iter()
+        .any(|k| matches!(k, CrossingKind::Rounds | CrossingKind::Spend));
+    let mut body = if held {
+        format!(
+            "**{ticket}** crossed its {crossed} limit on `{pr}` — the ticket is now held \
+             (`rhapsody:human`), so no new run or review round will start. Remove the label to \
+             resume.\n",
+            ticket = plan.ticket,
+            pr = plan.pr(),
+        )
+    } else {
+        format!(
+            "**{ticket}** — the manager escalated the review loop on `{pr}`; a person needs to \
+             decide how to proceed.\n",
+            ticket = plan.ticket,
+            pr = plan.pr(),
+        )
+    };
     if plan.kinds.contains(&CrossingKind::Rounds) {
         body.push_str(&format!(
             "Rounds: **{}** completed review run(s) (threshold {}). ",
             plan.rounds, plan.threshold
         ));
     }
-    body.push_str(&format!("Author attempts: **{}**. ", plan.attempts));
+    // Omit the line entirely when the count is unknown (an unreadable store reports 0, and a
+    // false "0 attempts" reads as a fact the daemon does not have).
+    if plan.attempts > 0 {
+        body.push_str(&format!("Author attempts: **{}**. ", plan.attempts));
+    }
     let spend = plan
         .spend
         .iter()
@@ -906,6 +927,9 @@ impl Orchestrator {
             .and_then(|runs| runs.into_iter().next())
             .map(|r| (r.issue_id, r.team_id))
             .unwrap_or_default();
+        // The real author-run count, not a hard-coded zero: the escalation body is read by the
+        // operator and the room, and a false "0 attempts" is worse than omitting the line.
+        let attempts = self.store().count_runs_for(&div.ticket).unwrap_or(0);
         let plan = BreakerPlan {
             kinds: vec![CrossingKind::Escalation],
             ticket: div.ticket.clone(),
@@ -916,7 +940,7 @@ impl Orchestrator {
             number,
             rounds: i64::try_from(div.rounds).unwrap_or(0),
             threshold: 0,
-            attempts: 0,
+            attempts,
             spend: Vec::new(),
             latest_review: div.findings.join("; "),
             reason: div.reason.clone(),
@@ -1456,7 +1480,25 @@ mod tests {
             hold.0.lock().expect("lock").is_empty(),
             "an escalation must not apply the human hold"
         );
-        assert_eq!(channel.0.lock().expect("lock").len(), 1);
+        let sent = channel.0.lock().expect("lock");
+        assert_eq!(sent.len(), 1);
+        // The delivered body must not claim a hold that was never applied: no other channel and no
+        // room line can be checked here, so this pins the shared body.
+        assert!(
+            !sent[0].contains("rhapsody:human"),
+            "an escalation must not tell the operator a hold exists: {}",
+            sent[0]
+        );
+        assert!(
+            !sent[0].contains("Remove the label"),
+            "an escalation must not ask the operator to remove a label: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("escalated the review loop"),
+            "an escalation needs its own headline: {}",
+            sent[0]
+        );
     }
 
     /// The macOS channel pushes onto the shared cell, and `NotificationsState` bounds its queue.
