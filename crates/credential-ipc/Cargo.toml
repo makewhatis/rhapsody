@@ -26,9 +26,11 @@ zeroize = "1"
 # size/syntax bound and independently-capped envelope size *before* storage (P1 acceptance), and the
 # owner's lease is convertible into PB1's move-only `BoundCredentialLease` without an intermediate
 # string accessor. Reusing the broker's validator/constants keeps the two call sites in lockstep
-# instead of duplicating the rule. PB1 carries no Tauri/desktop dependency, so this adds no coupling
-# to the desktop build. Path dependency; no new external crate enters Cargo.lock.
-rhapsody-provider-broker = { path = "../provider-broker" }
+# instead of duplicating the rule. This crate needs only PB1's custody types, never PB2's loopback
+# adapter, so `default-features = false` turns off the broker's `loopback` feature: without it the
+# desktop app (which reaches the broker only through this crate) would link axum, hyper and a second
+# reqwest major for code it never runs. Path dependency.
+rhapsody-provider-broker = { path = "../provider-broker", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
