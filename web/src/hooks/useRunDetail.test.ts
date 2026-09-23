@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { RunDetail } from "@/lib/api";
-import { runDetailPollInterval } from "@/hooks/useRunDetail";
+import type { IssueHistoryResponse, RunDetail, RunSummary } from "@/lib/api";
+import { historyPollInterval, runDetailPollInterval } from "@/hooks/useRunDetail";
 
 function detail(outcome: string): RunDetail {
   return {
@@ -42,5 +42,49 @@ describe("runDetailPollInterval", () => {
 
   it("does not poll before the first payload arrives", () => {
     expect(runDetailPollInterval(undefined)).toBe(false);
+  });
+});
+
+// A minimal review row — only the field the rule reads is meaningful.
+function review(endedAt: string): RunSummary {
+  return {
+    id: 1,
+    issue_id: "id",
+    issue_identifier: "pr:makewhatis/rhapsody#224@jimmy",
+    title: "",
+    attempt: 0,
+    session_uuid: "s",
+    branch: "",
+    project_slug: "",
+    repo: "",
+    started_at: "2026-09-01T17:00:00Z",
+    ended_at: endedAt,
+    outcome: endedAt === "" ? "running" : "completed",
+    turns: 1,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    usage_estimated: false,
+    error: "",
+    transcript_path: "",
+  };
+}
+
+function history(reviews: RunSummary[]): IssueHistoryResponse {
+  return { issue_identifier: "STUDIO-1020", runs: [], reviews };
+}
+
+describe("historyPollInterval", () => {
+  it("polls while a review round is still running", () => {
+    expect(historyPollInterval(history([review("2026-09-01T17:20:00Z"), review("")]))).toBe(2000);
+  });
+
+  it("freezes once every review round has ended", () => {
+    expect(historyPollInterval(history([review("2026-09-01T17:20:00Z")]))).toBe(false);
+    expect(historyPollInterval(history([]))).toBe(false);
+  });
+
+  it("does not poll before the first payload arrives", () => {
+    expect(historyPollInterval(undefined)).toBe(false);
   });
 });

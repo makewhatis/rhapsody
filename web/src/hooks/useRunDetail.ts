@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { LIVE_POLL_MS } from "@/hooks/useStateQuery";
 import {
   fetchIssueHistory,
   fetchRunDetail,
@@ -110,14 +111,33 @@ export function useRunMessages(runId: number, inFlight: boolean, enabled = true)
 
 // useIssueHistory fetches a run's per-attempt history (GET /api/v1/issues/{id}/history) for the
 // Run history panel. Disabled until an identifier is known.
+//
+// `refetchInterval` is conditional (STUDIO-1020): the strip paints a still-running review round
+// violet "reviewing" from that row alone, and nothing else on the detail refreshes it — the 10s
+// `staleTime` with no interval would leave the chip asserting a live review for as long as the
+// operator kept the page open, long after the review's own header pill had moved on. So the query
+// rides the live cadence while any review round in its payload is still going, and freezes the
+// moment none is.
 export function useIssueHistory(identifier: string, enabled = true) {
   return useQuery<IssueHistoryResponse>({
     queryKey: ["issue-history", identifier],
     queryFn: () => fetchIssueHistory(identifier),
     enabled: enabled && identifier !== "",
     staleTime: 10_000,
+    refetchInterval: (query) => historyPollInterval(query.state.data),
     refetchOnWindowFocus: false,
   });
+}
+
+// historyPollInterval encodes the review strip's liveness rule (STUDIO-1020): poll WHILE any review
+// round in the payload has not ended, and stop once none has. Keyed on the review's OWN `ended_at`
+// — the very fact `reviewState` reads to paint the chip (`lib/console-trace-view`) — rather than on
+// `outcome`, so the chip and its refresh can never disagree about which rounds are live. An absent
+// payload (and a ticket with no reviews at all) is `false`: nothing is claimed yet, so nothing has
+// to be refreshed. Exported for unit testing, in the shape `runDetailPollInterval` set.
+export function historyPollInterval(data: IssueHistoryResponse | undefined): number | false {
+  const live = (data?.reviews ?? []).some((review) => review.ended_at.trim() === "");
+  return live ? LIVE_POLL_MS : false;
 }
 
 // useRunIdentityEvents fetches one ticket's durable routing rows (STUDIO-746) — the per-run

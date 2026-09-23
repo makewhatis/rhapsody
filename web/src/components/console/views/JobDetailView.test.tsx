@@ -854,6 +854,48 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(screen.getByText("This ticket has no recorded runs.")).toBeTruthy());
     expect(document.querySelector(".trsplit")).toBeNull();
   });
+
+  // STUDIO-1020's opening bugbot finding. `.trreviews .trrev[data-verdict="…"]` carries an extra
+  // specificity token, so it beat the bare `.trrev.on`: a selected chip with a verdict lost its
+  // selection, and once every finished round has a verdict that is most of the strip — picking a
+  // round was the whole job of the STUDIO-976 strip. Asserted through the real cascade, because the
+  // defect was a CASCADE one and a rule-shaped assertion would have read the declaration and missed
+  // that it lost.
+  describe("through the whole theme cascade", () => {
+    beforeAll(mountThemeCascade);
+    afterAll(unmountThemeCascade);
+
+    it("keeps the selected chip's selection even when it carries a verdict", async () => {
+      const changes = run({
+        id: 802,
+        issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+        started_at: "2026-09-01T17:30:00Z",
+        verdict: "changes_requested",
+      });
+      const approved = run({
+        id: 801,
+        issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+        started_at: "2026-09-01T17:00:00Z",
+        verdict: "approved",
+      });
+      // No author runs, so the newest review is the default selection.
+      mountDetail([], vi.fn(), [changes, approved]);
+      await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(2));
+      const [selected, other] = [...document.querySelectorAll<HTMLElement>(".trrev")];
+
+      // The UNselected chip keeps its verdict colour on both text and border: the fix must not
+      // repaint the strip, only give selection its own sign.
+      expect(getComputedStyle(other).color).toBe("var(--ok)");
+      expect(getComputedStyle(other).borderColor).toBe("var(--ok)");
+
+      // The SELECTED chip marks the selection with the solid rust border it always had, and the
+      // verdict colour stays on its text. Drop the scoped `.trreviews .trrev.on` rule and this
+      // reds: the verdict rule wins again and the border goes amber-on-amber.
+      expect(getComputedStyle(selected).borderStyle).toBe("solid");
+      expect(getComputedStyle(selected).borderColor).toBe("var(--rust-text)");
+      expect(getComputedStyle(selected).color).toBe("var(--warn)");
+    });
+  });
 });
 
 describe("zone A — the header's actions are real or dependency-named, never fake", () => {

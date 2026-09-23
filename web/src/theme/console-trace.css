@@ -266,6 +266,16 @@
 .rh-console .trreviews .trrev[data-verdict="changes_requested"]::before { content: "!"; }
 .rh-console .trreviews .trrev[data-verdict="approved"]::before { content: "✓"; }
 
+/* Selection and hover must win over the verdict rules above, and they are written HERE for that:
+   `[data-verdict="…"]` carries one more specificity token than a bare `.trrev.on` or `.trrev:hover`
+   (0,4,0 against 0,3,0), so the bare rules earlier in this file would lose and a chip with a verdict
+   would show no selection at all once every finished round has one. Equal specificity is decided by
+   source order, so these come after. A verdict chip keeps its verdict TEXT colour (never restated
+   here) and marks the selection with the solid rust border instead; a neutral chip renders exactly
+   as it did before this feature, since it entered with the same rust border already. */
+.rh-console .trreviews .trrev:hover { border-color: var(--line-strong); }
+.rh-console .trreviews .trrev.on { border-style: solid; border-color: var(--rust-text); }
+
 .rh-console .trtitle { margin: 0 0 10px; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 
 .rh-console .trmode { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
