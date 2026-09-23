@@ -3626,7 +3626,10 @@ mod store_tests {
         // The author pushed past the escalated head and the resumed round approved it.
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD_PUSHED.to_string(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
         );
 
         o.reconcile_review_divergence();
@@ -3656,7 +3659,10 @@ mod store_tests {
         escalated_at(o, HEAD);
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD_PUSHED.to_string(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
         );
 
         o.reconcile_review_divergence();
