@@ -2061,11 +2061,7 @@ mod tests {
     #[test]
     fn open_creates_missing_parent_dir() {
         let scratch = scratch_dir();
-        let dir = scratch
-            .join("does")
-            .join("not")
-            .join("exist")
-            .join("yet");
+        let dir = scratch.join("does").join("not").join("exist").join("yet");
         let st = Sqlite::open(StorePath::Disk(dir.join("symphony.db")))
             .expect("Open must create the missing parent dir");
         st.close().expect("close");

@@ -1318,18 +1318,26 @@ mod tests {
             .unwrap()
             .broker_limits
             .reserved_token_units_per_session = 1;
-        assert!(ProviderReload::from_providers(&d, TURN_DEADLINE_MS).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&d, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
 
         // A metadata-only change (TLS policy, protocol, credential source) is a change too.
         let mut e = a.clone();
         e.get_mut("fireworks").unwrap().allow_insecure_http = true;
-        assert!(ProviderReload::from_providers(&e, TURN_DEADLINE_MS).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&e, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
         let mut f = a.clone();
         f.get_mut("fireworks").unwrap().protocol = "anthropic-messages".to_string();
-        assert!(ProviderReload::from_providers(&f, TURN_DEADLINE_MS).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&f, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
         let mut g = a.clone();
         g.get_mut("fireworks").unwrap().credential.source = "env-file".to_string();
-        assert!(ProviderReload::from_providers(&g, TURN_DEADLINE_MS).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&g, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
 
         // R1 (jimmy): a block-less provider (`capability_lifetime_ms: None`) derives its lifetime
         // from the deadline, so halving `opencode.turn_timeout_ms` halves the effective lifetime and
