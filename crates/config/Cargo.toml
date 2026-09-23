@@ -45,6 +45,10 @@ harness-fixtures = { path = "../harness-fixtures" }
 # tempfile: scratch dirs for the capabilities load_or_seed round-trip tests. Pinned to the
 # version already locked in the workspace (transitively via native-tls).
 tempfile = "3.27.0"
+# rhapsody-credential-ipc (test-only, STUDIO-984 review): `canonical_provider_id` and the derived
+# `v1:<id>` Keychain account must agree with the credential-owner crate's own `CredentialRef`
+# derivation, so the two parsers cannot drift. Workspace-internal path dep — no new external crate.
+rhapsody-credential-ipc = { path = "../credential-ipc" }
 # tokio: drives the handful of `#[tokio::test]`s that exercise the async `MemoryBackend` surface
 # (the sync `LocalBank` methods need no runtime). Already in Cargo.lock workspace-wide.
 # `net` + `io-util` back the hand-rolled loopback hindsight stub the T8 tests answer from — the
