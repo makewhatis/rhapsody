@@ -72,13 +72,23 @@ use serde::{Deserialize, Serialize};
 /// `teams_recall` args. Both carry no `omitempty` analog: `identity` is required
 /// by the daemon and an empty `query` is a legitimate "everything you remember,
 /// bounded by `recall_top_k`".
+///
+/// `scope: "team"` (STUDIO-1040) reads the SHARED team bank instead, and takes no
+/// identity: the shared bank belongs to the team, not to a teammate, so no roster
+/// name (least of all `team`) is reused for it.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct RecallArgs {
-    /// the teammate whose memory to read (a name from `teams_roster`).
+    /// the teammate whose memory to read (a name from `teams_roster`). Omit when
+    /// `scope` is `team`.
+    #[serde(default)]
     identity: String,
     /// what to look for — a ticket identifier, a subject, or a few keywords.
     #[serde(default)]
     query: String,
+    /// `team` reads the shared team bank; omit (or `identity`/`own`) to read a
+    /// teammate's own bank.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `teams_invalidate` args (§5.3). `reason` is REQUIRED, and deliberately so:
@@ -86,22 +96,30 @@ pub(crate) struct RecallArgs {
 /// `studiomemory.Invalidate` client's measured 400 came from omitting it.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct InvalidateArgs {
-    /// the teammate whose bank holds the record.
+    /// the teammate whose bank holds the record. Omit when `scope` is `team`.
+    #[serde(default)]
     identity: String,
     /// the record id, as `teams_recall` reports it in each fact's `id`.
     fact_id: String,
     /// why this fact is no longer true. Stored with the record and reversible.
     reason: String,
+    /// `team` corrects a fact in the shared team bank; omit for a teammate's own.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `teams_reinstate` args (§5.3's reversal, STUDIO-689). There is deliberately no `reason`: a
 /// correction has to be justified, undoing one restores the original and justifies nothing new.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct ReinstateArgs {
-    /// the teammate whose bank holds the record.
+    /// the teammate whose bank holds the record. Omit when `scope` is `team`.
+    #[serde(default)]
     identity: String,
     /// the record id, as `teams_recall` reports it in each fact's `id`.
     fact_id: String,
+    /// `team` reinstates a fact in the shared team bank; omit for a teammate's own.
+    #[serde(default)]
+    scope: String,
 }
 
 /// `teams_room_read` args. `limit` is optional and can only ever NARROW: the daemon clamps it to
@@ -130,11 +148,17 @@ pub(crate) struct PostArgs {
     refs: Vec<String>,
 }
 
-/// `teams_retain` args — `content` and nothing else, by design (module docs).
+/// `teams_retain` args — `content` plus the deliberate `shared` flag (STUDIO-1040), by design
+/// (module docs). There is still no `identity`/`run_id`: provenance stays host-stamped.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct RetainArgs {
     /// what you learned, in your own words: observations and outcomes only.
     content: String,
+    /// `true` writes to the SHARED team bank for durable repo knowledge (conventions, gotchas,
+    /// CI/test behaviour), attributed to you. Omit for your own memory. Never use it for PR or
+    /// round status, which expires.
+    #[serde(default)]
+    shared: bool,
 }
 
 /// The `POST /api/v1/teams/invalidate` body.
@@ -143,6 +167,9 @@ struct InvalidateBody<'a> {
     identity: &'a str,
     fact_id: &'a str,
     reason: &'a str,
+    /// Omitted when empty, so a pre-STUDIO-1040 caller's body is byte-identical.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    scope: &'a str,
 }
 
 /// The `POST /api/v1/teams/reinstate` body.
@@ -150,12 +177,23 @@ struct InvalidateBody<'a> {
 struct ReinstateBody<'a> {
     identity: &'a str,
     fact_id: &'a str,
+    /// Omitted when empty, so a pre-STUDIO-1040 caller's body is byte-identical.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    scope: &'a str,
 }
 
 /// The `POST /api/v1/runs/{id}/retain` body.
 #[derive(Serialize)]
 struct RetainBody<'a> {
     content: &'a str,
+    /// Omitted when `false`, so a pre-STUDIO-1040 caller's body is byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    shared: bool,
+}
+
+/// serde `skip_serializing_if` helper for a `bool` that is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The `POST /api/v1/runs/{id}/post` body. Carries exactly the three declared
@@ -183,20 +221,37 @@ impl Facade {
 
     #[tool(
         name = "teams_recall",
-        description = "Read a teammate's retained memory: past observations and outcomes matching your query, bounded by memory.recall_top_k. Each fact carries the ticket, run and commit it came from, so you can re-ground it yourself. Costs no model turn. Proxies GET /api/v1/teams/recall."
+        description = "Read retained memory: past observations and outcomes matching your query, bounded by memory.recall_top_k. With `scope: \"team\"` you read the SHARED team bank instead of a teammate's, and omit `identity`. Each fact carries the ticket, run and commit it came from, so you can re-ground it yourself. Costs no model turn. Proxies GET /api/v1/teams/recall."
     )]
     async fn teams_recall(&self, Parameters(args): Parameters<RecallArgs>) -> CallToolResult {
-        if args.identity.is_empty() {
+        let team = args.scope.trim() == "team";
+        if !matches!(args.scope.trim(), "" | "identity" | "own" | "team") {
             return err_result(&FacadeError::new(
                 "bad_request",
-                "identity is required (see teams_roster for the names)",
+                "scope must be `team` (shared bank) or omitted (a teammate's own bank)",
             ));
         }
-        let path = format!(
-            "/api/v1/teams/recall?identity={}&query={}",
-            query_escape(&args.identity),
-            query_escape(&args.query)
-        );
+        if !team && args.identity.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity is required (see teams_roster for the names), or pass scope: \"team\" \
+                 to read the shared team bank",
+            ));
+        }
+        // The shared-bank read carries NO identity: the bank belongs to the team,
+        // so no roster name is reused for it (STUDIO-1040).
+        let path = if team {
+            format!(
+                "/api/v1/teams/recall?scope=team&query={}",
+                query_escape(&args.query)
+            )
+        } else {
+            format!(
+                "/api/v1/teams/recall?identity={}&query={}",
+                query_escape(&args.identity),
+                query_escape(&args.query)
+            )
+        };
         match self.client.get(&path).await {
             Ok(body) => text_result(&body),
             Err(e) => err_result(&e),
@@ -211,10 +266,24 @@ impl Facade {
         &self,
         Parameters(args): Parameters<InvalidateArgs>,
     ) -> CallToolResult {
-        if args.identity.is_empty() || args.fact_id.is_empty() {
+        let team = args.scope.trim() == "team";
+        if !matches!(args.scope.trim(), "" | "identity" | "own" | "team") {
             return err_result(&FacadeError::new(
                 "bad_request",
-                "identity and fact_id are required (see teams_recall for a fact's id)",
+                "scope must be `team` (shared bank) or omitted (a teammate's own bank)",
+            ));
+        }
+        if !team && args.identity.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity and fact_id are required (see teams_recall for a fact's id), or pass \
+                 scope: \"team\" to correct a shared fact",
+            ));
+        }
+        if args.fact_id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "fact_id is required (see teams_recall for a fact's id)",
             ));
         }
         if args.reason.trim().is_empty() {
@@ -227,6 +296,7 @@ impl Facade {
             identity: &args.identity,
             fact_id: &args.fact_id,
             reason: &args.reason,
+            scope: if team { "team" } else { "" },
         }) {
             Ok(p) => p,
             Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
@@ -246,15 +316,30 @@ impl Facade {
         description = "Undo an invalidation: put one corrected fact back into recall, exactly as it was. Nothing was ever deleted, so this restores the record and drops the reason it was invalidated for. Use it when the correction itself turns out to be the wrong call. Proxies POST /api/v1/teams/reinstate."
     )]
     async fn teams_reinstate(&self, Parameters(args): Parameters<ReinstateArgs>) -> CallToolResult {
-        if args.identity.is_empty() || args.fact_id.is_empty() {
+        let team = args.scope.trim() == "team";
+        if !matches!(args.scope.trim(), "" | "identity" | "own" | "team") {
             return err_result(&FacadeError::new(
                 "bad_request",
-                "identity and fact_id are required (see teams_recall for a fact's id)",
+                "scope must be `team` (shared bank) or omitted (a teammate's own bank)",
+            ));
+        }
+        if !team && (args.identity.is_empty() || args.fact_id.is_empty()) {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity and fact_id are required (see teams_recall for a fact's id), or pass \
+                 scope: \"team\" to reinstate a shared fact",
+            ));
+        }
+        if args.fact_id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "fact_id is required (see teams_recall for a fact's id)",
             ));
         }
         let payload = match serde_json::to_vec(&ReinstateBody {
             identity: &args.identity,
             fact_id: &args.fact_id,
+            scope: if team { "team" } else { "" },
         }) {
             Ok(p) => p,
             Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
@@ -283,12 +368,13 @@ impl Facade {
 
     #[tool(
         name = "teams_retain",
-        description = "Record what THIS run learned, in your own words, into your teammate memory — observations and outcomes only, never a transcript and never a conclusion you did not verify. Rhapsody stamps the identity, ticket, run and commit itself from your run, so you supply only the prose. Best-effort: a failure never fails the run. Proxies POST /api/v1/runs/{id}/retain for SYMPHONY_RUN_ID."
+        description = "Record what THIS run learned, in your own words: observations and outcomes only, never a transcript and never a conclusion you did not verify. Set `shared: true` for durable repo knowledge the whole team should keep (conventions, gotchas, how tests and CI behave, \"the source of truth for X is Y\") — never for PR or round status, which expires. Rhapsody stamps the identity, ticket, run and commit itself from your run, so you supply only the prose and the choice. Best-effort: a failure never fails the run. Proxies POST /api/v1/runs/{id}/retain for SYMPHONY_RUN_ID."
     )]
     async fn teams_retain(&self, Parameters(args): Parameters<RetainArgs>) -> CallToolResult {
         // There is no `run_id` argument: the run is the one the daemon injected
         // into this worker's env, which is what makes the provenance the daemon
-        // stamps unforgeable (module docs, §5.1).
+        // stamps unforgeable (module docs, §5.1). `shared` names no bank and no
+        // author either — it only chooses the team bank over the caller's own.
         let id = or_default("", &self.opts.default_run_id);
         if id.is_empty() {
             return err_result(&FacadeError::new(
@@ -304,6 +390,7 @@ impl Facade {
         }
         let payload = match serde_json::to_vec(&RetainBody {
             content: &args.content,
+            shared: args.shared,
         }) {
             Ok(p) => p,
             Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
@@ -519,11 +606,13 @@ mod tests {
         }
     }
 
-    /// `teams_retain` declares `content` and NOTHING else. The input schema is
-    /// the contract an agent reads, so this is where "the agent cannot forge
-    /// provenance" is checkable rather than merely intended (§5.1, §0.11.4).
+    /// `teams_retain` declares `content` and the deliberate `shared` choice — and
+    /// NOTHING else. The input schema is the contract an agent reads, so this is
+    /// where "the agent cannot forge provenance" is checkable rather than merely
+    /// intended (§5.1, §0.11.4): `shared` (STUDIO-1040) names no bank and no
+    /// author, so it cannot place a shared fact as anyone else.
     #[tokio::test]
-    async fn retain_declares_only_content() {
+    async fn retain_declares_only_content_and_the_shared_choice() {
         let client = connect(facade(teams_on(), 0)).await;
         let tools = client.list_all_tools().await.expect("list tools");
         let retain = tools
@@ -539,7 +628,7 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["content"],
+            vec!["content", "shared"],
             "teams_retain must expose no provenance argument"
         );
         let _ = client.cancel().await;
@@ -657,6 +746,93 @@ mod tests {
                 "GET".to_string(),
                 "/api/v1/teams/recall?identity=alice&query=a%26b+c".to_string()
             )]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// **`scope: "team"` reads the shared bank and names no identity** (STUDIO-1040): the shared
+    /// bank belongs to the team, so no roster name (least of all `team`) is reused for it. An
+    /// identity is not required on this path.
+    #[tokio::test]
+    async fn recall_team_scope_omits_identity() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(
+            &client,
+            "teams_recall",
+            serde_json::json!({"scope": "team", "query": "goldens"}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![(
+                "GET".to_string(),
+                "/api/v1/teams/recall?scope=team&query=goldens".to_string()
+            )]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// An unrecognized `scope` never leaves the facade: a typo served from the wrong bank would
+    /// read as a bank with nothing in it, so it is refused.
+    #[tokio::test]
+    async fn an_unknown_recall_scope_never_leaves_the_facade() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(
+            &client,
+            "teams_recall",
+            serde_json::json!({"identity": "alice", "scope": "shared"}),
+        )
+        .await;
+        assert!(out.contains("bad_request"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "an unknown scope must not reach the daemon"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// `teams_retain {shared: true}` still posts to the run named by SYMPHONY_RUN_ID — `shared`
+    /// names no bank and no author, so it cannot forge either.
+    #[tokio::test]
+    async fn a_shared_retain_posts_to_the_run_from_the_env() {
+        let (port, seen) = stub_daemon().await;
+        let opts = Options {
+            default_run_id: "412".to_string(),
+            ..teams_on()
+        };
+        let client = connect(facade(opts, port)).await;
+        let out = call_text(
+            &client,
+            "teams_retain",
+            serde_json::json!({"content": "goldens are recaptured only", "shared": true}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("POST".to_string(), "/api/v1/runs/412/retain".to_string())]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// A shared invalidation needs only `fact_id` and `reason` — it names no identity.
+    #[tokio::test]
+    async fn invalidating_a_shared_fact_needs_no_identity() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(
+            &client,
+            "teams_invalidate",
+            serde_json::json!({"scope": "team", "fact_id": "f1", "reason": "measured otherwise"}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("POST".to_string(), "/api/v1/teams/invalidate".to_string())]
         );
         let _ = client.cancel().await;
     }

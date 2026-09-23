@@ -331,6 +331,33 @@ function TeamsEditor({
           <Field label="Recall size" inline hint="How many remembered facts a recall returns. 0 ⇒ the daemon's default (8).">
             <Stepper value={draft.recallTopK} onChange={(v) => set("recallTopK", v)} min={0} max={200} />
           </Field>
+          <Field
+            label="Shared team bank"
+            inline
+            hint="A bank every teammate both reads and can write to for durable repo knowledge. Blank ⇒ off. Must not collide with a teammate's own bank."
+          >
+            <TextInput
+              mono
+              value={draft.teamBank}
+              aria-label="Shared team bank"
+              placeholder="agent-team"
+              onChange={(e) => set("teamBank", e.target.value)}
+            />
+          </Field>
+          {draft.teamBank.trim() ? (
+            <Field
+              label="Shared recall size"
+              inline
+              hint="How many shared facts a recall adds beside a teammate's own. 0 ⇒ the daemon's default (3)."
+            >
+              <Stepper
+                value={draft.teamRecallTopK}
+                onChange={(v) => set("teamRecallTopK", v)}
+                min={0}
+                max={200}
+              />
+            </Field>
+          ) : null}
           {draft.backend === "local" ? (
             <Collapsible label="Advanced" icon={Sliders}>
               <Field label="Bank directory" inline hint="Blank ⇒ `~/.rhapsody/teams/banks/`.">

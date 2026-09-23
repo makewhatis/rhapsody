@@ -50,7 +50,7 @@ use rhapsody_store as store;
 
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
 use crate::quorum::ReviewerExclusions;
-use crate::teamscompose::{Prepend, catch_up, compose, recall_facts};
+use crate::teamscompose::{Prepend, catch_up, compose, recall_facts, recall_team_facts};
 
 /// The Tier-0 label prefix: `rhapsody:@alice` names an identity outright (§3.2).
 ///
@@ -1130,6 +1130,15 @@ impl Orchestrator {
             // exactly as it did before T8.
             None => self.prefetched_facts(identity, iss),
         };
+        // The shared team bank is recalled the same way and from the same place
+        // as the identity's own memory (STUDIO-1040): local file reads when
+        // there is a concrete `LocalBank`, and the prefetch cache's team half for
+        // `hindsight`. Empty `team_bank` ⇒ an empty vector here and no section,
+        // which is what keeps an install that never wrote the key byte-identical.
+        let team_facts = match self.teams_bank.as_ref() {
+            Some(bank) => recall_team_facts(bank, teams, iss),
+            None => self.prefetched_team_facts(identity, iss),
+        };
         let caught = match (self.teams_room.as_ref(), self.teams_cursors.as_ref()) {
             (Some(room), Some(cursors)) => catch_up(room, cursors, identity, MAX_ROOM_WINDOW),
             _ => Default::default(),
@@ -1138,6 +1147,7 @@ impl Orchestrator {
             &header,
             &caught.messages,
             &facts,
+            &team_facts,
             &self.issue_states,
             teams.effective_prompt_budget(),
         );
@@ -1190,6 +1200,19 @@ impl Orchestrator {
                 Vec::new()
             }
         }
+    }
+
+    /// [`prefetched_facts`](Self::prefetched_facts) for the SHARED team bank
+    /// (STUDIO-1040). Same non-blocking read of the same off-loop cache, through
+    /// its team half; a miss, a stale entry or a held lock is an empty vector and
+    /// no team section, exactly as a missing prefetch is for own facts.
+    fn prefetched_team_facts(&self, identity: &str, iss: &Issue) -> Vec<Fact> {
+        let Some(cache) = self.teams_prefetch.as_ref() else {
+            return Vec::new();
+        };
+        cache
+            .try_get_team(identity, &iss.identifier, (self.now)())
+            .unwrap_or_default()
     }
 
     /// Binds a just-dispatched run to the provenance a later `teams_retain` is
@@ -2361,6 +2384,115 @@ mod tests {
         assert_eq!(
             with.running["1"].teammate_section, baseline,
             "a bank with no matching fact must not change one byte of the section"
+        );
+    }
+
+    /// **STUDIO-1040's off guarantee at dispatch.** With `memory.team_bank` empty the composed
+    /// section is byte-identical even when a shared bank on disk holds a perfectly matching record:
+    /// the gate is the config key, not the presence of a bank, so an install that never wrote it
+    /// renders exactly as it did before the feature.
+    #[test]
+    fn an_absent_team_bank_leaves_the_section_byte_identical() {
+        let dir = TempDir::new();
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+
+        let (mut without, _s1) = orch_with_teams(teams.clone());
+        let bank = attach_bank(&mut without, &dir);
+        bank.retain(&stamped(
+            "alice",
+            "MT-1",
+            "7",
+            "the rust parser lives in decode.rs",
+        ))
+        .expect("retain");
+        without.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let baseline = without.running["1"].teammate_section.clone();
+        assert!(baseline.contains("decode.rs"), "{baseline}");
+
+        // The same config, but the shared bank ON DISK holds a matching record — which the empty
+        // `team_bank` must not read.
+        let (mut with, _s2) = orch_with_teams(teams);
+        let bank2 = attach_bank(&mut with, &dir);
+        bank2
+            .retain_shared(
+                "agent-team",
+                &stamped("bob", "MT-1", "7", "the rust parser lives in decode.rs"),
+            )
+            .expect("shared retain");
+        with.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        assert_eq!(
+            with.running["1"].teammate_section, baseline,
+            "an empty team_bank must not change one byte of the section"
+        );
+    }
+
+    /// **A configured `team_bank` renders in its own attributed section.** The shared fact is
+    /// recalled beside the identity's own, attributed to its author (`bob`), and the author's own
+    /// bank is untouched.
+    #[test]
+    fn a_dispatch_recalls_the_shared_team_bank_when_configured() {
+        let dir = TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.memory.team_bank = "agent-team".to_string();
+        let (mut o, _s) = orch_with_teams(teams);
+        let bank = attach_bank(&mut o, &dir);
+        bank.retain_shared(
+            "agent-team",
+            &stamped("bob", "MT-1", "7", "the rust goldens are recaptured only"),
+        )
+        .expect("shared retain");
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(
+            section.contains(crate::teamscompose::TEAM_MEMORY_HEADER),
+            "the shared bank gets its own section: {section}"
+        );
+        assert!(
+            section.contains("the rust goldens are recaptured only"),
+            "{section}"
+        );
+        assert!(
+            section.contains("bob"),
+            "the shared fact is attributed to its author, not the reader: {section}"
+        );
+    }
+
+    /// **The turn-1 team recall is capped at `team_recall_top_k`, not the identity's own
+    /// `recall_top_k`.** More shared facts are retained than the team cap, and the cap is set
+    /// deliberately below the own-bank one; exactly the team cap must render. This is the local
+    /// twin of the hindsight prefetch assertion in `teamsprefetch`, so the `team_recall_query`
+    /// wiring is pinned on both backends.
+    #[test]
+    fn a_dispatch_caps_shared_facts_at_team_recall_top_k() {
+        let dir = TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.memory.team_bank = "agent-team".to_string();
+        teams.memory.team_recall_top_k = 2;
+        teams.memory.recall_top_k = 8; // the identity's own cap, deliberately different
+        let (mut o, _s) = orch_with_teams(teams);
+        let bank = attach_bank(&mut o, &dir);
+        for i in 0..5 {
+            bank.retain_shared(
+                "agent-team",
+                &stamped(
+                    "bob",
+                    "MT-1",
+                    &i.to_string(),
+                    &format!("shared-fact-{i} the rust goldens are recaptured only"),
+                ),
+            )
+            .expect("shared retain");
+        }
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert_eq!(
+            section.matches("shared-fact-").count(),
+            2,
+            "the team section must carry exactly team_recall_top_k (2) shared facts, not the \
+             identity's own recall_top_k (8): {section}"
         );
     }
 

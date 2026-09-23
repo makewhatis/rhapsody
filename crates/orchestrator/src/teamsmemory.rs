@@ -127,6 +127,13 @@ pub struct TeamsView {
     pub default_identity: String,
     /// `none` | `local` | `hindsight`.
     pub backend: String,
+    /// The configured SHARED team bank id (STUDIO-1040); empty ⇒ the feature is
+    /// off, exactly as `memory.team_bank` empty means in `teams.yaml`. **Omitted
+    /// entirely when empty**, so an install that never wrote the key serves
+    /// byte-identical JSON to one built before this field existed — the
+    /// "no extra API field" half of the off guarantee.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub team_bank: String,
     pub roster: Vec<RosterRow>,
 }
 
@@ -134,6 +141,15 @@ pub struct TeamsView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RecallView {
     pub identity: String,
+    /// Which bank this answer came from: `identity` (the default, and what every
+    /// pre-STUDIO-1040 caller gets) or `team` for the shared bank. It is echoed so
+    /// a reader can tell the two apart when the `identity` field carries a bank
+    /// name rather than a teammate — and **omitted when it is `identity`**, the
+    /// only case where it says nothing a reader does not already know, so a
+    /// personal recall's JSON is byte-identical to before this field existed (the
+    /// "no extra API field" half of the off guarantee).
+    #[serde(skip_serializing_if = "is_identity_scope")]
+    pub scope: String,
     /// Which states this answer was allowed to contain: `valid` (the default and
     /// what an agent asks for), `invalidated`, or `all` (STUDIO-689). Echoed
     /// back so a reader can tell "this bank holds no corrections" from "you did
@@ -623,8 +639,31 @@ impl TeamsMemory {
             manager_mode: manager_mode_name(&self.teams),
             default_identity: self.teams.manager.default_identity.clone(),
             backend: roster.backend,
+            team_bank: self.teams.memory.team_bank.clone(),
             roster: roster.roster,
         })
+    }
+
+    /// The configured shared team bank id (STUDIO-1040), or the empty string when
+    /// the feature is off. Every shared-bank entry point resolves through this, so
+    /// "team_bank empty ⇒ off" is one predicate.
+    pub fn team_bank(&self) -> &str {
+        self.teams.memory.team_bank.as_str()
+    }
+
+    /// Refuses a shared-bank request on an install that has no `memory.team_bank`.
+    ///
+    /// Loud rather than lenient: silently falling back to a personal bank would
+    /// write a shared fact into one teammate's memory, which is precisely the
+    /// leak the shared bank exists to avoid.
+    fn require_team_bank(&self) -> Result<&str, TeamsMemoryError> {
+        if self.teams.memory.team_bank.is_empty() {
+            return Err(TeamsMemoryError::Invalid(
+                "memory.team_bank is not configured on this daemon, so there is no shared team bank"
+                    .to_string(),
+            ));
+        }
+        Ok(self.teams.memory.team_bank.as_str())
     }
 
     /// Recalls an identity's memory for a free-text `query` (§6.7's
@@ -692,6 +731,58 @@ impl TeamsMemory {
         }
         Ok(RecallView {
             identity: identity.to_string(),
+            scope: "identity".to_string(),
+            state: state.as_str().to_string(),
+            facts: recalled.facts,
+            skipped: recalled.skipped.into_iter().map(|(f, _)| f).collect(),
+        })
+    }
+
+    /// Recalls the SHARED team bank for a free-text `query` (STUDIO-1040) — the
+    /// `scope: "team"` path.
+    ///
+    /// The shared bank's twin of [`recall`](TeamsMemory::recall): the same query
+    /// handling and state filter, bounded by `memory.team_recall_top_k` rather
+    /// than `recall_top_k`, and reporting the bank id in `identity` with
+    /// `scope: "team"` so a reader can tell a bank from a teammate. An install
+    /// with no `memory.team_bank` refuses loudly rather than answering an empty
+    /// bank that would read as "the team remembers nothing".
+    pub async fn recall_team(
+        &self,
+        query: &str,
+        state: &str,
+    ) -> Result<RecallView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let bank = self.require_team_bank()?;
+        let Some(state) = RecallState::parse(state) else {
+            return Err(TeamsMemoryError::Invalid(format!(
+                "state {state:?} is not one of valid, invalidated, all"
+            )));
+        };
+        let q = Query {
+            ticket: query.trim().to_string(),
+            labels: Vec::new(),
+            title: query.to_string(),
+            top_k: self.teams.memory.effective_team_recall_top_k(),
+            // An empty query browses the shared bank, exactly as it browses an
+            // identity's — the question the dashboard's team-memory listing asks.
+            browse: query.trim().is_empty(),
+            state,
+        };
+        let recalled = self.backend.recall_shared(bank, &q).await?;
+        for (file, why) in &recalled.skipped {
+            tracing::warn!(
+                bank = %bank,
+                file = %file,
+                reason = %why,
+                "teams memory: skipping an unreadable team-bank record (recall continues without it)"
+            );
+        }
+        Ok(RecallView {
+            identity: bank.to_string(),
+            scope: "team".to_string(),
             state: state.as_str().to_string(),
             facts: recalled.facts,
             skipped: recalled.skipped.into_iter().map(|(f, _)| f).collect(),
@@ -760,12 +851,85 @@ impl TeamsMemory {
         })
     }
 
+    /// [`invalidate`](TeamsMemory::invalidate) against the SHARED team bank
+    /// (STUDIO-1040) — identical rules, including the required reason.
+    pub async fn invalidate_team(
+        &self,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<InvalidateView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let bank = self.require_team_bank()?;
+        let (fact_id, reason) = (fact_id.trim(), reason.trim());
+        if fact_id.is_empty() {
+            return Err(TeamsMemoryError::Invalid("fact_id is required".to_string()));
+        }
+        if reason.is_empty() {
+            return Err(TeamsMemoryError::Invalid("reason is required".to_string()));
+        }
+        let invalidated = self
+            .backend
+            .invalidate_shared(bank, fact_id, reason)
+            .await?;
+        Ok(InvalidateView {
+            identity: bank.to_string(),
+            fact_id: fact_id.to_string(),
+            invalidated,
+            reason: reason.to_string(),
+        })
+    }
+
+    /// [`reinstate`](TeamsMemory::reinstate) against the SHARED team bank
+    /// (STUDIO-1040).
+    pub async fn reinstate_team(&self, fact_id: &str) -> Result<ReinstateView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let bank = self.require_team_bank()?;
+        let fact_id = fact_id.trim();
+        if fact_id.is_empty() {
+            return Err(TeamsMemoryError::Invalid("fact_id is required".to_string()));
+        }
+        let reinstated = self.backend.revalidate_shared(bank, fact_id).await?;
+        Ok(ReinstateView {
+            identity: bank.to_string(),
+            fact_id: fact_id.to_string(),
+            reinstated,
+        })
+    }
+
     /// Retains a record for a live run, stamping every provenance field itself
     /// (§5.1). The agent supplies `content` and nothing else.
+    ///
+    /// Writes to the caller's OWN bank. [`retain_for_run_scoped`] is the
+    /// `shared: true` path (STUDIO-1040), kept separate so every pre-existing
+    /// caller keeps writing only to its own bank by construction.
+    ///
+    /// [`retain_for_run_scoped`]: TeamsMemory::retain_for_run_scoped
     pub async fn retain_for_run(
         &self,
         run_id: i64,
         content: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RetainView, TeamsMemoryError> {
+        self.retain_for_run_scoped(run_id, content, false, now)
+            .await
+    }
+
+    /// [`retain_for_run`](TeamsMemory::retain_for_run) with the shared-bank
+    /// choice (STUDIO-1040). `shared` writes to `memory.team_bank` instead of the
+    /// caller's own bank; the caller's host-stamped `identity` is still the
+    /// record's author, so a shared fact is attributed to whoever wrote it.
+    ///
+    /// The automatic end-of-run record uses `retain_for_run` (personal), so
+    /// PR-status chatter never floods the shared bank — sharing is deliberate.
+    pub async fn retain_for_run_scoped(
+        &self,
+        run_id: i64,
+        content: &str,
+        shared: bool,
         now: DateTime<Utc>,
     ) -> Result<RetainView, TeamsMemoryError> {
         if !self.enabled() {
@@ -775,6 +939,14 @@ impl TeamsMemory {
         if content.is_empty() {
             return Err(TeamsMemoryError::Invalid("content is required".to_string()));
         }
+        // Resolve the shared bank BEFORE the run binding, so a shared retain on an
+        // install that has none is refused as a config problem rather than as a
+        // not-running one.
+        let shared_bank = if shared {
+            Some(self.require_team_bank()?.to_string())
+        } else {
+            None
+        };
         // Copy the binding out and drop the guard: the commit read and the
         // backend write below are `.await`s, and this lock is also taken by the
         // control task on the dispatch path.
@@ -794,7 +966,10 @@ impl TeamsMemory {
             at: now,
             content: content.to_string(),
         };
-        let id = self.backend.retain(&rec).await?;
+        let id = match shared_bank.as_deref() {
+            Some(bank) => self.backend.retain_shared(bank, &rec).await?,
+            None => self.backend.retain(&rec).await?,
+        };
         Ok(RetainView {
             id,
             identity: rec.identity,
@@ -828,6 +1003,13 @@ impl TeamsMemory {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether a recall's `scope` names an identity's own bank (STUDIO-1040). The
+/// `RecallView` field skips serializing on this, so a personal recall's JSON has
+/// no `scope` key at all and matches a build from before the shared bank existed.
+fn is_identity_scope(scope: &str) -> bool {
+    scope == "identity"
 }
 
 /// The configured manager mode's name, for the overview view — the `teams.yaml` wire spelling,
@@ -1552,5 +1734,160 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ── the shared team bank (STUDIO-1040) ───────────────────────────────
+
+    fn teams_with_team_bank(roster: Vec<Identity>) -> Arc<Teams> {
+        let mut t = Teams {
+            enabled: true,
+            roster,
+            ..Teams::disabled()
+        };
+        t.memory.team_bank = "agent-team".to_string();
+        Arc::new(t)
+    }
+
+    /// A `shared: true` retain writes to the team bank, attributed to the CALLER,
+    /// and a plain retain keeps writing to the caller's own bank — so PR-status
+    /// chatter never reaches the shared bank.
+    #[tokio::test]
+    async fn shared_retain_goes_to_the_team_bank_and_plain_retain_stays_personal() {
+        let dir = TempDir::new();
+        let mem = local(
+            &dir,
+            teams_with_team_bank(vec![ident("alice"), ident("bob")]),
+        );
+        mem.bind_run(7, bound("alice", "MT-1"));
+        mem.bind_run(8, bound("bob", "MT-2"));
+
+        let shared = mem
+            .retain_for_run_scoped(7, "goldens are recaptured only", true, now())
+            .await
+            .expect("shared retain");
+        assert_eq!(
+            shared.identity, "alice",
+            "the shared record is attributed to the caller"
+        );
+        mem.retain_for_run(7, "PR round 4 is green", now())
+            .await
+            .expect("personal retain");
+
+        let team = mem.recall_team("", "all").await.expect("team recall");
+        assert_eq!(team.scope, "team");
+        assert_eq!(team.identity, "agent-team");
+        assert_eq!(
+            team.facts.len(),
+            1,
+            "only the shared retain is in the team bank"
+        );
+        assert_eq!(team.facts[0].identity, "alice");
+        assert!(
+            !team.facts.iter().any(|f| f.content.contains("round 4")),
+            "PR-status prose must never reach the team bank"
+        );
+
+        let own = mem.recall("alice", "", "all").await.expect("own recall");
+        assert_eq!(own.facts.len(), 1, "the plain retain stayed personal");
+        assert_eq!(own.facts[0].content, "PR round 4 is green");
+    }
+
+    /// **The anti-forgery property for the shared bank.** The tool takes no
+    /// `identity`; the author is the run the caller is, so a run dispatched as
+    /// `bob` cannot write a shared fact as `alice`.
+    #[tokio::test]
+    async fn a_caller_cannot_forge_the_author_of_a_shared_fact() {
+        let dir = TempDir::new();
+        let mem = local(
+            &dir,
+            teams_with_team_bank(vec![ident("alice"), ident("bob")]),
+        );
+        mem.bind_run(7, bound("bob", "MT-1"));
+
+        mem.retain_for_run_scoped(7, "the mirror lock is per-repo", true, now())
+            .await
+            .expect("shared retain");
+        let team = mem
+            .recall_team("mirror lock", "")
+            .await
+            .expect("team recall");
+        assert_eq!(
+            team.facts[0].identity, "bob",
+            "the author is the run's identity, never a caller-supplied one"
+        );
+    }
+
+    /// Invalidating a shared fact removes it from the team bank for everyone —
+    /// there is one shared bank, not one per reader.
+    #[tokio::test]
+    async fn invalidating_a_team_fact_removes_it_from_every_recall() {
+        let dir = TempDir::new();
+        let mem = local(
+            &dir,
+            teams_with_team_bank(vec![ident("alice"), ident("bob")]),
+        );
+        mem.bind_run(7, bound("alice", "MT-1"));
+        let view = mem
+            .retain_for_run_scoped(7, "CI skips the macos job on drafts", true, now())
+            .await
+            .expect("shared retain");
+        let id = view.id;
+
+        assert_eq!(
+            mem.recall_team("CI", "").await.expect("recall").facts.len(),
+            1
+        );
+        let inv = mem
+            .invalidate_team(&id, "measured otherwise")
+            .await
+            .expect("invalidate team");
+        assert!(inv.invalidated);
+        assert_eq!(inv.identity, "agent-team");
+        assert!(
+            mem.recall_team("CI", "")
+                .await
+                .expect("recall")
+                .facts
+                .is_empty(),
+            "the invalidated shared fact leaves every reader's recall"
+        );
+        // And a reinstate brings it back.
+        assert!(
+            mem.reinstate_team(&id)
+                .await
+                .expect("reinstate team")
+                .reinstated
+        );
+        assert_eq!(
+            mem.recall_team("CI", "").await.expect("recall").facts.len(),
+            1
+        );
+    }
+
+    /// Every shared operation is refused loudly when `memory.team_bank` is unset,
+    /// rather than silently falling back to a personal bank.
+    #[tokio::test]
+    async fn shared_operations_are_refused_without_a_team_bank() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        mem.bind_run(7, bound("alice", "MT-1"));
+
+        assert!(matches!(
+            mem.retain_for_run_scoped(7, "x", true, now()).await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            mem.recall_team("", "").await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            mem.invalidate_team("id", "why").await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            mem.reinstate_team("id").await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
+        assert_eq!(mem.team_bank(), "");
     }
 }

@@ -318,6 +318,53 @@ pub trait MemoryBackend: Send + Sync {
     /// which is what makes the record identical to one that was never
     /// invalidated.
     async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError>;
+
+    /// **The shared team bank's four operations (STUDIO-1040).** `bank` is a
+    /// BANK ID (`agent-team`), never a roster identity: the shared bank belongs
+    /// to no teammate, so resolving it through an identity would both let one
+    /// teammate name another's bank and make `team` a roster-name collision.
+    ///
+    /// The record's own [`identity`](Record::identity) is still the host-stamped
+    /// author — that is what the turn-1 renderer attributes a shared fact to —
+    /// but it names the WRITER, not the bank.
+    ///
+    /// Defaulted to a named refusal rather than to an identity-derived
+    /// delegation: a backend that has not implemented the shared bank must say
+    /// so loudly, never silently write a shared fact into somebody's personal
+    /// bank. `None` and the two shipped backends override all four.
+    async fn retain_shared(&self, bank: &str, _rec: &Record) -> Result<String, MemoryError> {
+        Err(MemoryError::Invalid(format!(
+            "backend does not support the shared bank {bank:?}"
+        )))
+    }
+
+    /// Read the shared `bank` for `q`. Same bounds and attribution rules as
+    /// [`recall`](MemoryBackend::recall); the facts carry the author's
+    /// `identity` in their metadata.
+    async fn recall_shared(&self, bank: &str, _q: &Query) -> Result<Recalled, MemoryError> {
+        Err(MemoryError::Invalid(format!(
+            "backend does not support the shared bank {bank:?}"
+        )))
+    }
+
+    /// Mark one record in the shared `bank` non-valid, storing `reason`.
+    async fn invalidate_shared(
+        &self,
+        bank: &str,
+        _fact_id: &str,
+        _reason: &str,
+    ) -> Result<bool, MemoryError> {
+        Err(MemoryError::Invalid(format!(
+            "backend does not support the shared bank {bank:?}"
+        )))
+    }
+
+    /// Put one invalidated record in the shared `bank` back into recall.
+    async fn revalidate_shared(&self, bank: &str, _fact_id: &str) -> Result<bool, MemoryError> {
+        Err(MemoryError::Invalid(format!(
+            "backend does not support the shared bank {bank:?}"
+        )))
+    }
 }
 
 /// `memory.backend: none` — routing and profiles with no memory at all (§5.4).
@@ -345,6 +392,27 @@ impl MemoryBackend for NoneBackend {
     }
 
     async fn revalidate(&self, _identity: &str, _fact_id: &str) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
+    async fn retain_shared(&self, _bank: &str, _rec: &Record) -> Result<String, MemoryError> {
+        Ok(String::new())
+    }
+
+    async fn recall_shared(&self, _bank: &str, _q: &Query) -> Result<Recalled, MemoryError> {
+        Ok(Recalled::default())
+    }
+
+    async fn invalidate_shared(
+        &self,
+        _bank: &str,
+        _fact_id: &str,
+        _reason: &str,
+    ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
+    async fn revalidate_shared(&self, _bank: &str, _fact_id: &str) -> Result<bool, MemoryError> {
         Ok(false)
     }
 }
@@ -445,10 +513,28 @@ impl LocalBank {
         }
         // The roster's `bank:` override wins; every entry in the map was already
         // charset-checked by `with_bank_overrides`.
-        Ok(match self.banks.get(identity) {
-            Some(bank) => self.root.join(bank),
-            None => self.root.join(format!("{}{identity}", self.bank_prefix)),
-        })
+        let bank = match self.banks.get(identity) {
+            Some(bank) => bank.clone(),
+            None => format!("{}{identity}", self.bank_prefix),
+        };
+        self.dir_for_bank(&bank)
+    }
+
+    /// The directory of an explicit **bank id** — the shared team bank's home
+    /// (STUDIO-1040). `bank` is not an identity: it is joined to the root
+    /// verbatim, so the shared bank is never re-prefixed or resolved through the
+    /// roster's `bank:` overrides.
+    ///
+    /// Checked for the same reason [`bank_dir`](LocalBank::bank_dir) is: a bank id
+    /// becomes a directory name, so a `..` or a separator must be refused rather
+    /// than joined.
+    pub fn dir_for_bank(&self, bank: &str) -> Result<PathBuf, MemoryError> {
+        if !crate::teams::is_label_safe(bank) {
+            return Err(MemoryError::Invalid(format!(
+                "bank {bank:?} is not label-safe (must match ^[a-z][a-z0-9-]*$)"
+            )));
+        }
+        Ok(self.root.join(bank))
     }
 
     /// The bank id `identity`'s records live under — the override when the
@@ -458,7 +544,7 @@ impl LocalBank {
         bank_id_for(&self.bank_prefix, &self.banks, identity)
     }
 
-    /// Appends one host-stamped record and returns its id.
+    /// Appends one host-stamped record to `identity`'s bank.
     ///
     /// **This is the only method in the module that creates anything**, and it
     /// creates the bank directory (and the root above it) on the way. Record ids
@@ -467,11 +553,22 @@ impl LocalBank {
     /// second gets a `-2`, `-3`, … suffix rather than overwriting a record,
     /// because the store is append-only.
     pub fn retain(&self, rec: &Record) -> Result<String, MemoryError> {
-        let dir = self.bank_dir(&rec.identity)?;
-        std::fs::create_dir_all(&dir)
+        self.retain_in_dir(&self.bank_dir(&rec.identity)?, rec)
+    }
+
+    /// Appends one host-stamped record to the shared `bank` (STUDIO-1040).
+    /// `rec.identity` is still the AUTHOR, stamped into the front matter; the
+    /// bank it lands in is `bank`, not a bank derived from the author.
+    pub fn retain_shared(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
+        self.retain_in_dir(&self.dir_for_bank(bank)?, rec)
+    }
+
+    /// The one writer: creates `dir`, picks a free id and writes the record.
+    fn retain_in_dir(&self, dir: &Path, rec: &Record) -> Result<String, MemoryError> {
+        std::fs::create_dir_all(dir)
             .map_err(|e| MemoryError::Io(format!("create bank {}: {e}", dir.display())))?;
         let stem = record_stem(rec);
-        let (id, path) = self.unique_path(&dir, &stem)?;
+        let (id, path) = self.unique_path(dir, &stem)?;
         let front = FrontMatter {
             identity: rec.identity.clone(),
             document_id: rec.document_id.clone(),
@@ -501,9 +598,20 @@ impl LocalBank {
     /// or parsed is skipped and reported in [`Recalled::skipped`] — one bad file
     /// never costs the caller the rest of the bank.
     pub fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError> {
-        let dir = self.bank_dir(identity)?;
+        self.recall_in_dir(&self.bank_dir(identity)?, q)
+    }
+
+    /// The shared `bank`'s records matching `q` (STUDIO-1040) — same rules as
+    /// [`recall`](LocalBank::recall), and the facts carry their author's
+    /// `identity` from the front matter.
+    pub fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        self.recall_in_dir(&self.dir_for_bank(bank)?, q)
+    }
+
+    /// The one reader: scores and bounds the records in `dir`, creating nothing.
+    fn recall_in_dir(&self, dir: &Path, q: &Query) -> Result<Recalled, MemoryError> {
         let mut out = Recalled::default();
-        let entries = match std::fs::read_dir(&dir) {
+        let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             // The bank has never been written. Not an error, and emphatically
             // not a reason to create it.
@@ -597,6 +705,27 @@ impl LocalBank {
         self.set_state(identity, fact_id, STATE_VALID, "")
     }
 
+    /// [`invalidate`](LocalBank::invalidate) against an explicit bank id — the
+    /// shared team bank's correction (STUDIO-1040).
+    pub fn invalidate_shared(
+        &self,
+        bank: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        self.set_state_in_dir(
+            &self.dir_for_bank(bank)?,
+            fact_id,
+            STATE_INVALIDATED,
+            reason,
+        )
+    }
+
+    /// [`revalidate`](LocalBank::revalidate) against an explicit bank id.
+    pub fn revalidate_shared(&self, bank: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        self.set_state_in_dir(&self.dir_for_bank(bank)?, fact_id, STATE_VALID, "")
+    }
+
     /// Rewrites one record's `state` + `reason` front matter, preserving its
     /// body verbatim.
     pub fn set_state(
@@ -606,11 +735,21 @@ impl LocalBank {
         state: &str,
         reason: &str,
     ) -> Result<bool, MemoryError> {
-        let dir = self.bank_dir(identity)?;
-        let path = record_path(&dir, fact_id)?;
+        self.set_state_in_dir(&self.bank_dir(identity)?, fact_id, state, reason)
+    }
+
+    /// The one state writer: `set_state` resolved to a directory.
+    fn set_state_in_dir(
+        &self,
+        dir: &Path,
+        fact_id: &str,
+        state: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        let path = record_path(dir, fact_id)?;
         let text = std::fs::read_to_string(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                MemoryError::NotFound(format!("no record {fact_id:?} for identity {identity:?}"))
+                MemoryError::NotFound(format!("no record {fact_id:?} in bank {}", dir.display()))
             } else {
                 MemoryError::Io(format!("read record {}: {e}", path.display()))
             }
@@ -668,6 +807,27 @@ impl MemoryBackend for LocalBank {
 
     async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
         LocalBank::revalidate(self, identity, fact_id)
+    }
+
+    async fn retain_shared(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
+        LocalBank::retain_shared(self, bank, rec)
+    }
+
+    async fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        LocalBank::recall_shared(self, bank, q)
+    }
+
+    async fn invalidate_shared(
+        &self,
+        bank: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        LocalBank::invalidate_shared(self, bank, fact_id, reason)
+    }
+
+    async fn revalidate_shared(&self, bank: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        LocalBank::revalidate_shared(self, bank, fact_id)
     }
 }
 
@@ -1631,5 +1791,101 @@ STUDIO-1 hand-written
         assert!(cut.len() <= 10, "cut = {} bytes", cut.len());
         assert!(cut.ends_with('…'));
         assert_eq!(truncate_bytes("short", 100), "short");
+    }
+
+    // ── the shared team bank (STUDIO-1040) ───────────────────────────────
+
+    /// **The shared bank is not a teammate's bank.** A shared retain lands in
+    /// `<root>/<team_bank>/` — not under `bank_prefix`, and not in the author's
+    /// own bank — while the record still carries the author as its metadata, so
+    /// the turn-1 renderer can attribute it.
+    #[test]
+    fn a_shared_retain_lands_in_the_team_bank_and_keeps_the_author() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        let id = b
+            .retain_shared(
+                "agent-team",
+                &record("alice", "STUDIO-1040", "7", "goldens are recaptured only"),
+            )
+            .expect("shared retain");
+
+        let team_dir = b.dir_for_bank("agent-team").expect("team dir");
+        assert!(
+            team_dir.join(format!("{id}.{RECORD_EXT}")).exists(),
+            "the record must land in the team bank dir"
+        );
+        assert!(
+            !b.bank_dir("alice").expect("alice dir").exists(),
+            "a shared retain must not touch the author's own bank"
+        );
+
+        let got = b
+            .recall_shared("agent-team", &ticket_query("STUDIO-1040"))
+            .expect("shared recall");
+        assert_eq!(got.facts.len(), 1);
+        assert_eq!(
+            got.facts[0].identity, "alice",
+            "the shared fact is attributed to its author"
+        );
+        // And the author's own bank still knows nothing about it.
+        assert!(
+            b.recall("alice", &ticket_query("STUDIO-1040"))
+                .expect("personal recall")
+                .facts
+                .is_empty(),
+            "a shared fact must not appear in the author's own bank"
+        );
+    }
+
+    /// Invalidating a shared fact removes it from the shared bank for EVERY
+    /// reader — the whole point of one team bank — and is reversible.
+    #[test]
+    fn invalidating_a_shared_fact_removes_it_and_is_reversible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        let id = b
+            .retain_shared(
+                "agent-team",
+                &record("bob", "STUDIO-1040", "9", "the team bank is shared"),
+            )
+            .expect("shared retain");
+
+        assert!(
+            b.invalidate_shared("agent-team", &id, "measured otherwise")
+                .expect("invalidate"),
+            "the first shared invalidate changes state"
+        );
+        assert!(
+            b.recall_shared("agent-team", &ticket_query("STUDIO-1040"))
+                .expect("recall")
+                .facts
+                .is_empty(),
+            "an invalidated shared fact leaves recall"
+        );
+        assert!(b.revalidate_shared("agent-team", &id).expect("reinstate"));
+        assert_eq!(
+            b.recall_shared("agent-team", &ticket_query("STUDIO-1040"))
+                .expect("recall")
+                .facts
+                .len(),
+            1,
+            "a shared invalidation is reversible"
+        );
+    }
+
+    /// A shared retain against a bank id that is not label-safe is refused, so a
+    /// bank id can never escape the root.
+    #[test]
+    fn a_shared_bank_id_is_charset_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        for bad in ["../etc", "Agent-Team", "", "a/b"] {
+            assert!(
+                b.retain_shared(bad, &record("alice", "STUDIO-1", "1", "x"))
+                    .is_err(),
+                "bank {bad:?} must be refused"
+            );
+        }
     }
 }

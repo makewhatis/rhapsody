@@ -190,6 +190,17 @@ describe("filter options", () => {
     expect(teammateOptions([JIMMY, ALICE])).toEqual(["jimmy", "alice"]);
   });
 
+  /// The SHARED team bank's `identity` is a bank id, not a teammate (STUDIO-1040): offering it in
+  /// the teammate filter would give an option no fact's author can match.
+  it("leaves the shared team bank out of the teammate filter", () => {
+    const team: MemoryBank = {
+      identity: "agent-team",
+      scope: "team",
+      facts: [fact({ id: "t1", identity: "alice" })],
+    };
+    expect(teammateOptions([ALICE, team])).toEqual(["alice"]);
+  });
+
   it("lists each ticket once, sorted, ignoring records stamped with none", () => {
     const facts = [...bankFacts(BANKS), fact({ id: "x", identity: "alice", ticket: "" })];
     expect(ticketOptions(facts)).toEqual(["STUDIO-654", "STUDIO-673", "STUDIO-676"]);
