@@ -1071,7 +1071,33 @@ pub const MAX_COMPARE_FILES: usize = 300;
 /// Deliberately not `git patch-id` itself: the watcher holds no checkout and must not, and shelling
 /// `git` per comparison would need a mirror of a repository the daemon may not have and a second
 /// process per poll. The comparison here is over data already fetched.
+///
+/// The return value is a **fixed-size** identifier — the lowercase-hex SHA-256 of the normalized
+/// fingerprint — not the normalized text itself (STUDIO-1010, the M2 review's first follow-up). The
+/// normalized text is a whole diff; storing it on every watch row and finding row carried ~100KB per
+/// row, and `record_review_evidence` re-read it on every sweep tick. The digest is order- and
+/// content-identical to the text it replaces for every comparison this crate makes (§5.4's predicate
+/// and `same_change` both compare two ids for equality), so only the storage size and the read cost
+/// change. [`normalized_patch`] keeps the text form available for tests that need to see what is
+/// hashed.
 pub fn stable_patch_id(fingerprint: &str) -> String {
+    let normalized = normalized_patch(fingerprint);
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The normalized form of a [`merge_base_patch`] fingerprint, before it is hashed by
+/// [`stable_patch_id`] (STUDIO-1010). Exposed so a test can assert what the digest is taken over;
+/// production always goes through [`stable_patch_id`].
+pub fn normalized_patch(fingerprint: &str) -> String {
     let mut out = String::with_capacity(fingerprint.len());
     // `merge_base_patch` emits exactly three NUL-separated fields per file and a trailing NUL, so
     // the flat list is `[filename, status, patch, filename, status, patch, ""]`. No field may
@@ -4341,6 +4367,19 @@ mod tests {
         assert!(
             !same_change(old, &extra),
             "a different file set is a different patch-id"
+        );
+        // STUDIO-1010: the id is a fixed-size digest, not the whole normalized diff. The diff here
+        // is small, so a length assertion alone would not catch a regression to the text form; the
+        // content assertion does (the normalized text contains the filename, the digest cannot).
+        let id = stable_patch_id(old);
+        assert_eq!(id.len(), 64, "the patch-id is a sha256 hex digest");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "the patch-id is lowercase hex, not diff text: {id}"
+        );
+        assert!(
+            !id.contains("src/lib.rs") && !id.contains("@@"),
+            "the patch-id must not carry any of the normalized diff text"
         );
     }
 

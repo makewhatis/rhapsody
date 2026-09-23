@@ -1882,11 +1882,23 @@ impl Orchestrator {
                 .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()))
         });
         let human_hold = primed.then_some(held_origin);
-        let watch_rows: Vec<crate::reviewevidence::EvidenceWatchRow> = rows
-            .iter()
-            .filter(|r| row_is(r, pr))
-            .map(crate::reviewevidence::EvidenceWatchRow::of)
-            .collect();
+        // Each row's last COMPLETED review is part of the evidence (§5.2, STUDIO-1010), so it is read
+        // beside the row that carries it. A failed read fails the whole observation closed rather
+        // than rendering a spurious "no completion", which would look like evidence moving.
+        let mut watch_rows: Vec<crate::reviewevidence::EvidenceWatchRow> = Vec::new();
+        for row in rows.iter().filter(|r| row_is(r, pr)) {
+            let completed = match self.store().review_completed(&row.key) {
+                Ok(completed) => completed,
+                Err(e) => {
+                    tracing::warn!(pr = %pr, err = %e, "ticketless review: a row's completed review could not be read; the evidence revision is left alone");
+                    return;
+                }
+            };
+            watch_rows.push(crate::reviewevidence::EvidenceWatchRow::of(
+                row,
+                completed.as_ref(),
+            ));
+        }
         let finding_tokens: Vec<String> = findings
             .iter()
             .map(|f| {
@@ -3335,6 +3347,10 @@ impl Orchestrator {
                 // comparison to reuse (STUDIO-1009); empty when it did not, which the completion
                 // path records as unknown and the approval predicate fails closed on.
                 head_patch_id: head_patch_id.to_string(),
+                // Stamped at dispatch by `finish_review_dispatch` (STUDIO-1010), not here: the
+                // watcher does not read the store's bound, and the dispatch tail is the one place
+                // that already has the watch key and the generation in hand.
+                generation: 0,
             };
             // The watcher bookkeeping travels WITH the dispatch, so an asynchronous preparation can
             // apply it on acceptance exactly as the synchronous arm does here (STUDIO-988 review
@@ -4829,6 +4845,15 @@ mod tests {
         }
     }
 
+    /// One observation of an OPEN pull request at `head` carrying the head's computed patch-id, as
+    /// the off-loop watcher hands it over (STUDIO-1009; STUDIO-1010).
+    fn open_at_patch(number: i64, head: &str, patch_id: &str) -> PrObservation {
+        PrObservation {
+            head_patch_id: patch_id.to_string(),
+            ..open_at(number, head)
+        }
+    }
+
     /// One observation of a MERGED pull request at `head`. The timestamp is fixed rather than
     /// `now()` and is never asserted on: the transition keys on the STATUS, and a merged pull
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
@@ -4936,6 +4961,29 @@ mod tests {
             assert_eq!(again.dispatched, 0, "a live review was dispatched again");
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// **STUDIO-1010 (the M2 review's second follow-up).** The patch-id the watcher computed for an
+    /// observation reaches the dispatched review run, so the completion path can record it on the
+    /// finding revisions and the completed-review columns. MUTATION: empty `head_patch_id` at the
+    /// `ReviewRun` construction (reviewwatch.rs ~3337) and this reds.
+    #[test]
+    fn a_dispatched_review_carries_the_observations_patch_id() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at_patch(12, HEAD_A, "pid-A")]);
+
+        assert_eq!(report.dispatched, 1, "{report:?}");
+        let run = o
+            .running
+            .values()
+            .find_map(|re| re.review.clone())
+            .expect("the dispatched review is stamped onto the running entry");
+        assert_eq!(
+            run.head_patch_id, "pid-A",
+            "the observation's computed patch-id must reach the dispatched run"
+        );
     }
 
     /// Acceptance: a head advance fires EXACTLY ONE re-review — not one per tick.
@@ -12655,6 +12703,11 @@ mod tests {
                 old_patch: Ok("diff".to_string()),
             }
         }
+        /// The head fingerprint [`FakeDiffSource::same`] serves, so a test can compute the patch-id
+        /// it yields without hard-coding the digest (STUDIO-1010).
+        fn same_patch() -> &'static str {
+            "diff"
+        }
         fn changed() -> FakeDiffSource {
             FakeDiffSource {
                 base: Ok("main".to_string()),
@@ -13020,6 +13073,18 @@ mod tests {
             handed[0].unchanged_from,
             vec![HEAD_A.to_string()],
             "the reviewed head whose diff is identical must be handed over as proof"
+        );
+        // STUDIO-1010: the SAME comparison yields the head's patch-id, handed over with the proof.
+        // MUTATION: drop the `fresh.head_patch_id = head_patch_id` assignment and this reds.
+        assert_eq!(
+            handed[0].head_patch_id,
+            crate::ghsummons::stable_patch_id(FakeDiffSource::same_patch()),
+            "the computed patch-id must be stored on the observation"
+        );
+        assert_eq!(
+            handed[0].head_patch_id.len(),
+            64,
+            "a fixed-size digest, not a diff"
         );
     }
 

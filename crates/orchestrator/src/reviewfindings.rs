@@ -193,7 +193,10 @@ struct FindingJson {
 /// fences). Handles both the backtick and tilde fence styles, because a reviewer's message may use
 /// either. A non-matching opening fence is ignored; its closing fence then looks like a bare fence
 /// and is likewise ignored, so a stray fence cannot swallow a real block.
-fn fenced_blocks(text: &str, tag: &str) -> Vec<String> {
+///
+/// `pub(crate)` because the manager's decision block (STUDIO-1010, `managerdecision`) is the same
+/// fence shape under a different tag; two scanners would be free to drift.
+pub(crate) fn fenced_blocks(text: &str, tag: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
