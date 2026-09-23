@@ -96,6 +96,13 @@ pub const FACT_TYPE_EXPERIENCE: &str = "experience";
 /// `enable_observations: false`: quoting and re-grounding are unchanged.
 pub const FACT_TYPE_WORLD: &str = "world";
 
+/// The extractor's third classification, and the one every read excludes.
+///
+/// Banks keep `enable_observations: false` (§5's backend table), but
+/// `memories/list` can still carry an `observation` row, so browse drops them by
+/// name rather than trusting the bank setting.
+pub const FACT_TYPE_OBSERVATION: &str = "observation";
+
 /// `RecallRequest.max_tokens`. The API's own default, restated so the request
 /// shape is pinned by this crate's tests rather than by a server default that
 /// could move underneath a released daemon. The answer is bounded again by
@@ -364,15 +371,28 @@ impl HindsightBackend {
     ///
     /// [`Query::browse`] with no terms has no query to score against, and
     /// hindsight's recall *requires* a query string, so a browse cannot go
-    /// through search: it goes through the list endpoint, filtered to the
-    /// requested states and bounded by `top_k`. [`RecallState::All`] sends no
-    /// `state` filter at all, which is how the endpoint spells "every state".
+    /// through search: it goes through the list endpoint, bounded by `top_k`.
+    /// [`RecallState::All`] sends no `state` filter at all, which is how the
+    /// endpoint spells "every state".
     ///
-    /// `ListMemoryUnitsResponse.items` is the one shape the OpenAPI leaves
-    /// untyped (`object` with `additionalProperties: true`), so the mapping reads
-    /// the same field names `RecallResult` uses and treats every one of them as
-    /// optional — an item that names no text is skipped rather than rendered
-    /// blank.
+    /// **The list carries `experience` and `world` alike (STUDIO-1037), and never
+    /// `observation`.** The 0.10.1 endpoint takes a single `type` string, so
+    /// rather than issuing one request per type — which would split the answer
+    /// into two sets and let either crowd the other out of `top_k` — browse sends
+    /// no `type` filter and drops `observation` rows on the client. One request,
+    /// so the endpoint's own newest-first order survives and the listing is what
+    /// `local`'s browse is: everything, bounded. This mirrors recall, which asks
+    /// for `["experience", "world"]` for the same reason: against Hindsight
+    /// 0.10.1 the extractor files most of a teammate's own note as `world`, so an
+    /// experience-only list showed almost nothing (STUDIO-1036 measured 0
+    /// `experience` facts against 4–5 `world` ones for one real record).
+    ///
+    /// Each list item carries `fact_type` (`world`, `experience` or
+    /// `observation` in 0.10.1); the rest of the mapping still reads the same
+    /// field names `RecallResult` uses and treats every one of them as optional —
+    /// an item that names no text is skipped rather than rendered blank, and an
+    /// item whose `fact_type` is `observation` is dropped before it can be
+    /// rendered at all.
     async fn browse(
         &self,
         bank: &str,
@@ -381,10 +401,7 @@ impl HindsightBackend {
         state: RecallState,
     ) -> Result<Recalled, MemoryError> {
         let url = format!("{}/memories/list", self.bank_url(bank));
-        let mut params = vec![
-            ("type", FACT_TYPE_EXPERIENCE.to_string()),
-            ("limit", top_k.to_string()),
-        ];
+        let mut params = vec![("limit", top_k.to_string())];
         match state {
             RecallState::Valid => params.push(("state", STATE_VALID.to_string())),
             RecallState::Invalidated => params.push(("state", STATE_INVALIDATED.to_string())),
@@ -398,6 +415,9 @@ impl HindsightBackend {
         let listed: ListResponse = decode_json(&resp, "browse")?;
         let mut out = Recalled::default();
         for item in listed.items.into_iter().take(top_k) {
+            if item.get("fact_type").and_then(Value::as_str) == Some(FACT_TYPE_OBSERVATION) {
+                continue;
+            }
             match fact_from_value(&item, identity) {
                 Some(f) => out.facts.push(f),
                 None => out
@@ -1602,15 +1622,34 @@ mod tests {
 
     /// "Show me what this teammate remembers" has no query to score against, and
     /// hindsight's recall requires one — so a browse goes to the list endpoint,
-    /// filtered to valid experience facts and bounded by `top_k`.
+    /// bounded by `top_k`.
+    ///
+    /// **STUDIO-1037:** the list must carry BOTH `experience` and `world`, not
+    /// experience alone, and never `observation`. The 0.10.1 endpoint takes a
+    /// single `type` string, so browse sends none and drops `observation` rows on
+    /// the client — one request, so the endpoint's own newest-first order survives
+    /// exactly as `local`'s browse lists it. A revert to `type=experience` fails
+    /// this test twice over: the `type=` assertion below, and the missing world
+    /// fact (the stub, like the deployed service, filters on the type it is given).
     #[tokio::test]
-    async fn a_browse_lists_valid_experience_facts() {
-        let stub = Stub::start(|_| {
-            Reply::ok(
-                r#"{"items":[{"id":"f1","text":"one","metadata":{"ticket":"STUDIO-1"}},
-                             {"id":"f2","text":"two"},
-                             {"nonsense":true}],"total":3,"limit":100,"offset":0}"#,
-            )
+    async fn a_browse_lists_experience_and_world_facts_but_never_observation() {
+        let stub = Stub::start(|req| {
+            let experience =
+                r#"{"id":"f1","text":"one","fact_type":"experience","metadata":{"ticket":"STUDIO-1"}}"#;
+            let world = r#"{"id":"f2","text":"two","fact_type":"world"}"#;
+            let observation = r#"{"id":"f3","text":"three","fact_type":"observation"}"#;
+            let items: Vec<&str> = if req.query.contains("type=experience") {
+                vec![experience]
+            } else if req.query.contains("type=world") {
+                vec![world]
+            } else {
+                vec![experience, world, observation, r#"{"nonsense":true}"#]
+            };
+            Reply::ok(&format!(
+                r#"{{"items":[{}],"total":{},"limit":100,"offset":0}}"#,
+                items.join(","),
+                items.len()
+            ))
         })
         .await;
         let got = backend(&stub)
@@ -1625,10 +1664,27 @@ mod tests {
             .await
             .expect("browse");
         let req = stub.request("GET", "/memories/list");
-        assert!(req.query.contains("type=experience"), "{}", req.query);
+        assert!(
+            !req.query.contains("type="),
+            "browse must not narrow to one fact type: {}",
+            req.query
+        );
         assert!(req.query.contains("state=valid"), "{}", req.query);
         assert!(req.query.contains("limit=5"), "{}", req.query);
-        assert_eq!(got.facts.len(), 2, "the item that names no text is skipped");
+        assert_eq!(
+            got.facts.len(),
+            2,
+            "experience and world are listed; observation and the textless item are not"
+        );
+        let contents: Vec<&str> = got.facts.iter().map(|f| f.content.as_str()).collect();
+        assert!(
+            contents.contains(&"two"),
+            "a world fact reaches the browse listing: {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"three"),
+            "an observation never reaches the browse listing: {contents:?}"
+        );
         assert_eq!(got.facts[0].ticket, "STUDIO-1");
         assert_eq!(
             got.facts[1].identity, "alice",
@@ -1699,7 +1755,11 @@ mod tests {
             .expect("list");
         let req = stub.request("GET", "/memories/list");
         assert!(!req.query.contains("state="), "{}", req.query);
-        assert!(req.query.contains("type=experience"), "{}", req.query);
+        assert!(
+            !req.query.contains("type="),
+            "the fact-type filter is dropped too, so every experience/world fact is listed: {}",
+            req.query
+        );
     }
 
     /// Reinstating a record that is already valid changes nothing and sends no
