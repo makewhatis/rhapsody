@@ -21,22 +21,20 @@ fixtures:
 	harness/capture/capture.sh
 
 # The LIVE hindsight memory smoke check (STUDIO-660, Teams T8; design record §5.3). Operator machine
-# only — it needs the tailnet, the deployed service and a credential — and deliberately NOT in CI:
-# it is `#[ignore]`d, so `make test` skips it.
+# only — it needs a running service — and deliberately NOT in CI: it is `#[ignore]`d, so `make test`
+# skips it.
 #
 # Drives the daemon's OWN client (`rhapsody_config::hindsight::HindsightBackend`) through
 # retain -> recall -> invalidate(with a reason) -> recall against a SCRATCH bank, printing what each
 # step saw. §5.3 makes exactly this an acceptance criterion: STUDIO-569 confirmed the correction
 # path from a probe script, and "confirmed from a probe script" is not "confirmed from Rhapsody's
-# client".
+# client". Retain is asynchronous on Hindsight 0.10.1, so the check polls recall until the extractor
+# finishes (about 30s).
 #
-#   HINDSIGHT_API_KEY=…            required — every /v1/** path 401s without it
-#   HINDSIGHT_ENDPOINT=…           default https://hindsight.yak-saturation.ts.net
+#   HINDSIGHT_ENDPOINT=…           default http://localhost:8888
+#   HINDSIGHT_API_KEY=…            optional; unset means no Authorization header (local deployment)
 #   HINDSIGHT_SMOKE_IDENTITY=…     default `smoke`, i.e. bank `agent-smoke`
 hindsight-smoke:
-	@test -n "$$HINDSIGHT_API_KEY" || { \
-		echo "HINDSIGHT_API_KEY is unset — the deployed service answers 401 without it."; \
-		echo "usage: HINDSIGHT_API_KEY=... make hindsight-smoke"; exit 2; }
 	cargo test -p rhapsody-config --test hindsight_smoke -- --ignored --nocapture
 
 # --- macOS desktop app (P7-D5, desktop/) — parity port of $REF/Makefile's app/dmg/sign targets ---
