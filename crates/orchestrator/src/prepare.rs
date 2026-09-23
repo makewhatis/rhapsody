@@ -276,7 +276,7 @@ impl PreparedDispatch {
 /// `Ready` is much the larger variant (the move-only [`PreparedDispatch`] carries the resolved plan
 /// and, for an explicit provider, the opaque broker custody). Boxing it would add an allocation and
 /// an indirection to the ONE path that must stay allocation-light and move-only, so the size
-/// difference is accepted deliberately rather than laundered behind a `Box`;` the enum is created
+/// difference is accepted deliberately rather than laundered behind a `Box`; the enum is created
 /// once per preparation and consumed immediately on the control task.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
