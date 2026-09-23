@@ -304,7 +304,7 @@ fn finish_dispatch_runner(
 /// the knobs' own model field so it is a live construction input. Exhaustive on [`HarnessKnobs`] with
 /// no wildcard arm: a new harness must stop this compiling rather than silently resolve to claude.
 fn harness_from_knobs(spec: &PreparedHarnessSpec) -> Result<Arc<dyn Harness>, DispatchRefusal> {
-    let knobs = apply_model(spec.knobs.clone(), spec.model.clone());
+    let knobs = resolved_knobs(spec);
     let (id, harness): (HarnessId, Arc<dyn Harness>) = match knobs {
         HarnessKnobs::Claude(config) => (
             HarnessId::Claude,
@@ -322,6 +322,14 @@ fn harness_from_knobs(spec: &PreparedHarnessSpec) -> Result<Arc<dyn Harness>, Di
         });
     }
     Ok(harness)
+}
+
+/// The construction inputs the factory builds the adapter from: the prepared spec's knobs with its
+/// resolved model applied as a live construction input. [`harness_from_knobs`] routes through exactly
+/// this function, so a test that asserts its result observes the block the harness is actually built
+/// from — the argv source — rather than a value stored separately on the runner.
+fn resolved_knobs(spec: &PreparedHarnessSpec) -> HarnessKnobs {
+    apply_model(spec.knobs.clone(), spec.model.clone())
 }
 
 /// Apply a resolved model to a harness's own knob block (the argv construction input). `None`
@@ -986,8 +994,10 @@ mod tests {
     }
 
     /// The factory preserves the resolved model AND makes it a live construction input: the resolved
-    /// model is written into the harness's own knob block (the argv source). The mutation guards are
-    /// dropping `model` in `finish_dispatch_runner` or in `apply_model`.
+    /// model is written into the harness's own knob block (the argv source). The mutation guard is
+    /// dropping the model at the factory's construction-input call site — replacing the body of
+    /// `resolved_knobs` with `spec.knobs.clone()` must red this, because `harness_from_knobs` builds
+    /// the adapter from exactly this block.
     #[test]
     fn factory_applies_the_resolved_model_to_the_knobs() {
         let spec = PreparedHarnessSpec {
@@ -999,8 +1009,9 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let applied = apply_model(spec.knobs.clone(), spec.model.clone());
-        let HarnessKnobs::Opencode(config) = applied else {
+        // The exact block the factory builds the adapter from: under the mutation this still reads
+        // "model-from-config", so a brokered run would run the config's model with no test noise.
+        let HarnessKnobs::Opencode(config) = resolved_knobs(&spec) else {
             panic!("opencode spec must stay opencode");
         };
         assert_eq!(
@@ -1012,11 +1023,38 @@ mod tests {
         assert_eq!(runner.resolved_model(), Some("accounts/fireworks/models/x"));
     }
 
-    /// A start failure returns no session; the prepared custody is dropped on the same path the
-    /// unstarted-drop guard above pins (no session escapes).
+    /// A start failure returns no session AND revokes the prepared custody: the not-yet-consumed
+    /// `DispatchRunner` is dropped by the `?` on the failed `start_session`, so its `BrokerSession`
+    /// drops with it. The mutation guard is leaking that custody on the error path (e.g.
+    /// `std::mem::forget(self.provider.take())` before returning the error): the separately retained
+    /// ledger receiver would still arm, and this assertion would not see `SessionRevoked`.
     #[tokio::test]
-    async fn start_failure_returns_no_session() {
-        let (provider, _broker) = prepare(&plan());
+    async fn start_failure_revokes_the_prepared_custody() {
+        // Split the registration so the ledger receiver survives the failed start — that is the only
+        // way to observe whether revocation happened.
+        let broker = Broker::new(
+            "http://127.0.0.1:0/v1",
+            Arc::new(SystemClock::new()),
+            Arc::new(OsRandom::new()),
+        )
+        .expect("broker");
+        let registration_plan = lower_provider_plan(&plan()).expect("lowered");
+        let binding = registration_plan.binding().expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let policy = SessionPolicy::new(*registration_plan.limits()).expect("policy");
+        let registration = broker
+            .registrar()
+            .register_session(registration_plan, lease, policy)
+            .expect("register");
+        let BrokerRegistration { session, ledgers } = registration;
+        let provider = PreparedProvider {
+            stable_id: "fireworks".to_string(),
+            protocol: ProviderProtocol::OpenAiCompatible,
+            access: Some(session),
+            ledgers: None,
+        };
+
         let mut fake = OpencodeFake::new();
         fake.inner.start_err = Some(AgentError::Other("boom".to_string()));
         let runner = bridge_dispatch_runner(Arc::new(fake), spec(Some(provider))).expect("runner");
@@ -1025,6 +1063,13 @@ mod tests {
             .await
             .expect_err("start must fail");
         assert_eq!(err, AgentError::Other("boom".to_string()));
+
+        let mut receiver = ledgers;
+        assert_eq!(
+            receiver.arm_turn(TurnMeta::without_deadline()).unwrap_err(),
+            rhapsody_provider_broker::BrokerError::SessionRevoked,
+            "a failed start must revoke the prepared broker session, not leak its custody"
+        );
     }
 
     /// SURFACE SCAN: the raw reusable-key representation this slice replaces must not reappear as a
