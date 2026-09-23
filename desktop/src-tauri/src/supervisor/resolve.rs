@@ -107,17 +107,11 @@ pub fn resources_dir_for(executable_path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A unique, freshly-created temp dir for a test (no `tempfile` dep in the desktop workspace).
-    fn temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p =
-            std::env::temp_dir().join(format!("rhapsody-d2-resolve-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).expect("create temp dir");
-        p
+    /// A unique, freshly-created temp dir for a test (no `tempfile` dep in the desktop workspace),
+    /// removed on drop.
+    fn temp_dir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("rhapsody-d2-resolve")
     }
 
     /// Writes an executable (0755) file at `path`, creating parent dirs. Mirror of `mkExec`.

@@ -11,12 +11,13 @@
 //! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
 //! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909),
 //! step 11 (`rhapsody_review_bound`, STUDIO-956), step 12 (`rhapsody_review_verdicts`,
-//! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007) and step 14
-//! (`rhapsody_review_finding`, STUDIO-1008) have no Go counterpart: they are
+//! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007), step 14
+//! (`rhapsody_review_finding`, STUDIO-1008) and step 15
+//! (`rhapsody_breaker_crossings`, STUDIO-1026) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
-//! ledger and the structured review-finding revisions, none of which the frozen
+//! ledger, the structured review-finding revisions and the runaway-loop breaker's crossings, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -44,12 +45,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 14 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 15 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
-/// ledger, then the structured review findings) and are the one documented reason this number is
-/// ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 14;
+/// ledger, then the structured review findings, then the breaker's persisted crossings) and are
+/// the one documented reason this number is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 15;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -308,6 +309,24 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_finding (
   resolved_by        TEXT    NOT NULL DEFAULT '',
   dismissed_by       TEXT    NOT NULL DEFAULT '',
   PRIMARY KEY (pr, generation, reviewer, finding_id, revision)
+);
+"#,
+    // v14 -> v15: the runaway-loop breaker's persisted CROSSINGS (STUDIO-1026). Rhapsody-only, so
+    // the `rhapsody_` prefix gates it out of the Go-recaptured schema golden by name exactly as
+    // steps 7-14 are.
+    //
+    // One row per TICKET: the highest round count at which a round-crossing notified, and the
+    // providers whose per-ticket cap has already notified. Persisting them is what makes a crossing
+    // notify ONCE across a restart — the maintainer asked to be told when a loop crosses a limit,
+    // not reminded every tick and not re-told after a restart. `ticket TEXT PRIMARY KEY` on a rowid
+    // table gets SQLite's implicit auto-index, whose `sqlite_master.sql IS NULL`, so no explicit
+    // index reaches the golden comparison. `notified_providers` is newline-joined in one column,
+    // exactly as `rhapsody_review_bound.findings` is.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_breaker_crossings (
+  ticket             TEXT    NOT NULL PRIMARY KEY,
+  notified_rounds    INTEGER NOT NULL DEFAULT 0,
+  notified_providers TEXT    NOT NULL DEFAULT ''
 );
 "#,
 ];
@@ -640,6 +659,20 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// The LIKE pattern matching every REVIEW run of one pull request's coordinate — the
+/// `pr:<owner>/<repo>#<n>@<reviewer>` identifier the ticketless watcher stores on a review run
+/// (STUDIO-1026). The trailing `@%` matches any reviewer; the owner/repo are `escape_like`d and the
+/// caller's query carries `ESCAPE '\'`, so a repo name containing `_` (a legal GitHub character)
+/// matches literally rather than as a wildcard.
+fn review_run_pattern(owner: &str, repo: &str, number: i64) -> String {
+    format!(
+        "pr:{}/{}#{}@%",
+        escape_like(owner),
+        escape_like(repo),
+        number
+    )
 }
 
 /// The non-empty `transcript_path` values of every ended run older than `cutoff` (the same
@@ -1206,6 +1239,122 @@ impl Store for Sqlite {
                 let (id, verdict) = r?;
                 out.insert(id, verdict);
             }
+        }
+        Ok(out)
+    }
+
+    fn count_completed_review_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. `outcome =
+        // completed` is the whole point: the breaker bounds spend that HAPPENED, so a run that
+        // failed or was truncated never counts.
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs \
+              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2",
+            params![review_run_pattern(owner, repo, number), OUTCOME_COMPLETED],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE issue_identifier = ?1",
+            params![identifier],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    fn ticket_spend_by_provider(
+        &self,
+        ticket: &str,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<ProviderTokens>, StoreError> {
+        let conn = self.lock();
+        // LEFT JOIN like `run_costs`: a run with no provenance row still spent tokens and must land
+        // in the empty-provider bucket rather than vanish. The author runs (`= ticket`) and the
+        // review runs (`LIKE pr:…@%`) are one bucket each per provider; `escape_like` keeps a ticket
+        // identifier containing `_` literal.
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(p.provider, ''),
+                    COUNT(*),
+                    COALESCE(SUM(r.input_tokens), 0),
+                    COALESCE(SUM(r.output_tokens), 0),
+                    COALESCE(SUM(r.total_tokens), 0)
+               FROM runs r
+               LEFT JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.issue_identifier = ?1
+                 OR r.issue_identifier LIKE ?2 ESCAPE '\\'
+              GROUP BY COALESCE(p.provider, '')
+              ORDER BY COALESCE(SUM(r.total_tokens), 0) DESC, COALESCE(p.provider, '') ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![ticket, review_run_pattern(owner, repo, number)],
+            |row| {
+                Ok(ProviderTokens {
+                    provider: row.get(0)?,
+                    runs: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn save_breaker_crossing(&self, row: &BreakerCrossingRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_breaker_crossings (ticket, notified_rounds, notified_providers)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ticket) DO UPDATE SET
+               notified_rounds    = excluded.notified_rounds,
+               notified_providers = excluded.notified_providers",
+            params![
+                row.ticket,
+                row.notified_rounds,
+                row.notified_providers.join("\n"),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_breaker_crossings(&self) -> Result<Vec<BreakerCrossingRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ticket, notified_rounds, notified_providers \
+               FROM rhapsody_breaker_crossings ORDER BY ticket",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let providers: String = row.get(2)?;
+            Ok(BreakerCrossingRow {
+                ticket: row.get(0)?,
+                notified_rounds: row.get(1)?,
+                // An empty column is no providers, not one empty provider.
+                notified_providers: if providers.is_empty() {
+                    Vec::new()
+                } else {
+                    providers.split('\n').map(str::to_string).collect()
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
@@ -2064,17 +2213,58 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique, freshly-created scratch directory under the system temp dir. Avoids a
-    /// tempfile dependency; uniqueness comes from the pid + a per-process atomic counter.
-    fn scratch_dir() -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rhapsody-store-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    /// A unique scratch directory under the system temp dir, removed on drop. Avoids a tempfile
+    /// dependency; uniqueness comes from the pid + a per-process atomic counter + a nanosecond
+    /// nonce, so a recycled pid can never adopt an earlier run's leftover (STUDIO-1027's store
+    /// rule). [`scratch_dir`] hands back the guard: keep it alive for the test's lifetime or the
+    /// directory is removed the moment the temporary drops.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-store-test-{}-{}-{nonce}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            TempDir { path }
+        }
+
+        /// Joins `name` under the scratch dir, returning the (not-yet-created) path.
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // A failing test's directory is kept for debugging only when asked for; by default it
+            // is removed like every other, so a run can never accumulate scratch dirs.
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    /// A freshly-created scratch directory guard. Bind it (`let dir = scratch_dir();`) — an
+    /// unbound `scratch_dir().join(..)` drops the guard at the end of the statement and removes
+    /// the directory before the test has used it.
+    fn scratch_dir() -> TempDir {
+        TempDir::new()
     }
 
     /// Reassemble the live schema the way `sqlite3 .schema` (which produced the fixture) does.
@@ -2198,10 +2388,13 @@ mod tests {
     }
 
     /// Fresh file-backed store under a scratch dir (Go `openTemp`) so WAL behavior — and sharing
-    /// one store across threads — can be exercised against a real on-disk database.
-    fn open_temp() -> Sqlite {
+    /// one store across threads — can be exercised against a real on-disk database. Returns the
+    /// guard with the store: the caller must hold it, or the directory is removed while the store
+    /// still has the file open.
+    fn open_temp() -> (TempDir, Sqlite) {
         let dir = scratch_dir();
-        Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp")
+        let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp");
+        (dir, store)
     }
 
     /// Create a transcript fixture file (Go `writeFileForTest`).
@@ -2218,11 +2411,8 @@ mod tests {
     // returns CANTOPEN and the daemon silently loses persistence.
     #[test]
     fn open_creates_missing_parent_dir() {
-        let dir = scratch_dir()
-            .join("does")
-            .join("not")
-            .join("exist")
-            .join("yet");
+        let scratch = scratch_dir();
+        let dir = scratch.join("does").join("not").join("exist").join("yet");
         let st = Sqlite::open(StorePath::Disk(dir.join("symphony.db")))
             .expect("Open must create the missing parent dir");
         st.close().expect("close");
@@ -2276,7 +2466,7 @@ mod tests {
     // Mirror TestWALEnabled: journal_mode=WAL is active on a file-backed handle.
     #[test]
     fn wal_enabled() {
-        let st = open_temp();
+        let (_dir, st) = open_temp();
         let mode: String = st
             .lock()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -2289,7 +2479,7 @@ mod tests {
     // lands and no read errors out.
     #[test]
     fn concurrent_read_during_write() {
-        let st = open_temp();
+        let (_dir, st) = open_temp();
         let id = st
             .start_run(RunStart {
                 issue_identifier: "MT-1".into(),
@@ -2338,7 +2528,8 @@ mod tests {
     // store is an idempotent no-op.
     #[test]
     fn open_migrates_to_schema_version() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         let s1 = Sqlite::open(StorePath::Disk(path.clone())).expect("open file");
         s1.close().expect("close");
         let s2 = Sqlite::open(StorePath::Disk(path)).expect("re-open file"); // migrate is a no-op
@@ -2357,7 +2548,8 @@ mod tests {
     // stalled/timed_out->failed; failed/interrupted/running are left untouched.
     #[test]
     fn migrate_outcomes_v5() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         // Build a v4 database by applying the first four migration steps directly, then stamping
         // user_version=4 so Open() runs ONLY the new v4->v5 (and v5->v6) steps.
         {
@@ -5359,6 +5551,7 @@ mod tests {
                 "rhapsody_review_verdicts".to_string(),
                 "rhapsody_review_done".to_string(),
                 "rhapsody_review_finding".to_string(),
+                "rhapsody_breaker_crossings".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -5505,6 +5698,172 @@ mod tests {
         let later = crate::format_summon_at(precise + chrono::Duration::days(400));
         assert_eq!(later.len(), once.len());
         assert!(once < later, "lexicographic order is chronological order");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Runaway-loop breaker (STUDIO-1026)
+    // ---------------------------------------------------------------------------------------------
+
+    fn start_run_at(store: &Sqlite, key: &str, at: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_identifier: key.into(),
+                started_at: at.into(),
+                ..Default::default()
+            })
+            .expect("start_run")
+    }
+
+    fn end_run_with(store: &Sqlite, id: i64, outcome: &str, tokens: i64, at: &str) {
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: outcome.into(),
+                    total_tokens: tokens,
+                    ended_at: at.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end_run");
+    }
+
+    fn set_provider(store: &Sqlite, id: i64, provider: &str) {
+        store
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: provider.into(),
+                    harness: "claude".into(),
+                    model: "m".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+    }
+
+    /// The breaker's round counter: COMPLETED review runs of the coordinate only — its sibling
+    /// PR's runs, other reviewers' non-completed runs, and non-review runs never count.
+    ///
+    /// Mutation: drop `outcome = completed` and the failed review is counted (3).
+    #[test]
+    fn breaker_counts_only_completed_review_runs_of_the_coordinate() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let a = start_run_at(&store, "pr:makewhatis/rhapsody#12@alice", at);
+        let b = start_run_at(&store, "pr:makewhatis/rhapsody#12@bob", at);
+        let failed = start_run_at(&store, "pr:makewhatis/rhapsody#12@carol", at);
+        let other_pr = start_run_at(&store, "pr:makewhatis/rhapsody#13@alice", at);
+        let author = start_run_at(&store, "STUDIO-988", at);
+        end_run_with(&store, a, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, b, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, failed, OUTCOME_FAILED, 10, at);
+        end_run_with(&store, other_pr, OUTCOME_COMPLETED, 10, at);
+        end_run_with(&store, author, OUTCOME_COMPLETED, 10, at);
+
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            2,
+            "two completed review runs of #12"
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 99)
+                .expect("count"),
+            0,
+            "a coordinate with no runs is zero, not an error"
+        );
+    }
+
+    /// The pattern escapes LIKE wildcards: a repo name containing `_` must not match a different
+    /// repo whose name merely fits the wildcard.
+    ///
+    /// Mutation: drop `escape_like` from `review_run_pattern` and the `a_b` query also counts the
+    /// `axb` run (2).
+    #[test]
+    fn breaker_pattern_treats_a_repo_underscore_literally() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let underscore = start_run_at(&store, "pr:o/a_b#1@alice", at);
+        let wildcard_lookalike = start_run_at(&store, "pr:o/axb#1@alice", at);
+        end_run_with(&store, underscore, OUTCOME_COMPLETED, 1, at);
+        end_run_with(&store, wildcard_lookalike, OUTCOME_COMPLETED, 1, at);
+
+        assert_eq!(
+            store
+                .count_completed_review_runs("o", "a_b", 1)
+                .expect("count"),
+            1,
+            "the underscore is literal, so only the matching repo counts"
+        );
+    }
+
+    /// The per-ticket spend sums the author runs AND the review runs of the PR, split by provider
+    /// through the provenance join. A run with no provenance lands in the empty bucket rather than
+    /// vanishing, exactly as `tokens_by_provider` reports it.
+    ///
+    /// Mutation: drop the `OR ... LIKE` half and the review runs disappear from the author's total.
+    #[test]
+    fn breaker_ticket_spend_covers_author_and_review_runs_by_provider() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let at = "2026-09-20T00:00:00Z";
+        let author1 = start_run_at(&store, "STUDIO-988", at);
+        let author2 = start_run_at(&store, "STUDIO-988", at);
+        let review = start_run_at(&store, "pr:o/r#12@alice", at);
+        let other = start_run_at(&store, "STUDIO-999", at);
+        end_run_with(&store, author1, OUTCOME_COMPLETED, 100, at);
+        end_run_with(&store, author2, OUTCOME_COMPLETED, 50, at);
+        end_run_with(&store, review, OUTCOME_COMPLETED, 25, at);
+        end_run_with(&store, other, OUTCOME_COMPLETED, 9999, at);
+        set_provider(&store, author1, "anthropic");
+        set_provider(&store, author2, "anthropic");
+        set_provider(&store, review, "fireworks-ai");
+        set_provider(&store, other, "anthropic");
+
+        let mut spend = store
+            .ticket_spend_by_provider("STUDIO-988", "o", "r", 12)
+            .expect("spend");
+        spend.sort_by(|a, b| a.provider.cmp(&b.provider));
+        assert_eq!(spend.len(), 2, "two providers: {spend:?}");
+        assert_eq!(spend[0].provider, "anthropic");
+        assert_eq!(spend[0].total_tokens, 150, "both author runs");
+        assert_eq!(spend[1].provider, "fireworks-ai");
+        assert_eq!(spend[1].total_tokens, 25, "the review run on the PR");
+        assert!(
+            spend.iter().all(|s| s.total_tokens != 9999),
+            "another ticket's spend must not leak in"
+        );
+    }
+
+    /// Crossings round-trip, and a second save UPSERTS rather than duplicating — the property that
+    /// makes a restart never re-notify while a later crossing still can.
+    #[test]
+    fn breaker_crossings_round_trip_and_upsert() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let first = BreakerCrossingRow {
+            ticket: "STUDIO-988".into(),
+            notified_rounds: 5,
+            notified_providers: vec!["anthropic".into()],
+        };
+        store.save_breaker_crossing(&first).expect("save");
+        assert_eq!(
+            store.load_breaker_crossings().expect("load"),
+            vec![first.clone()]
+        );
+
+        let later = BreakerCrossingRow {
+            ticket: "STUDIO-988".into(),
+            notified_rounds: 10,
+            notified_providers: vec!["anthropic".into(), "fireworks-ai".into()],
+        };
+        store.save_breaker_crossing(&later).expect("re-save");
+        assert_eq!(
+            store.load_breaker_crossings().expect("load"),
+            vec![later],
+            "one row per ticket, upserted on the identifier"
+        );
     }
 
     // --- structured review findings (STUDIO-1008) ---------------------------------------------

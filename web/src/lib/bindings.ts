@@ -12,6 +12,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 import type { LinearProject } from "@/lib/api";
 
 export interface StatusDTO {
@@ -207,6 +212,29 @@ function normalizePickResult(result: string | string[] | null): string {
 // a no-op; the caller re-probes afterwards either way.
 export async function installTool(_name: string): Promise<void> {
   return;
+}
+
+// notifyNative shows one native notification through tauri-plugin-notification (STUDIO-1026). The
+// daemon's runaway-loop breaker queues a notification on `/api/v1/state`; `useNotifications` calls
+// this once per new entry so the operator sees the hold without watching the console.
+//
+// Best-effort and desktop-only: a plain browser (no Tauri bridge) is a no-op, and a denied or failed
+// permission is swallowed rather than thrown into a polling effect. The macOS permission prompt is
+// requested LAZILY, on the first real notification rather than at mount, so a daemon that never
+// crosses a limit never asks the operator for anything.
+export async function notifyNative(title: string, body: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  try {
+    let granted = await isPermissionGranted();
+    if (!granted) {
+      const permission = await requestPermission();
+      granted = permission === "granted";
+    }
+    if (granted) sendNotification({ title, body });
+  } catch {
+    // A failed native notification is not worth surfacing: the crossing is already recorded, the
+    // room line and the other channels still went out. Swallow so a poll never rejects.
+  }
 }
 
 // openExternal opens a URL in the user's default browser (the embedded webview must not navigate

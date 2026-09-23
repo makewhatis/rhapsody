@@ -47,6 +47,10 @@ jobs:
       # scan reds on it — the first, case-sensitive version reported clean on a lower-case name and
       # on the `linear.app/<slug>/` of a pasted ticket link, which is how both would have shipped.
       - run: .github/scripts/check-plugin_test.sh
+      # STUDIO-1031: the temp-dir leak scan is pinned the same way — a mutation check reintroduces
+      # a leaked `rhapsody-*` scratch dir into a scratch root and asserts the scan reds on it (and
+      # stays green on an older entry and a non-`rhapsody-` one). Bash-only, so it rides `lint`.
+      - run: harness/ci/check-tmp-leaks_test.sh
 
   test:
     if: >-
@@ -67,16 +71,24 @@ jobs:
       # crates/* failure hides every later crate's result. The full set must surface in one run —
       # a Linux portability failure is the signal this matrix exists to give, and iterating one
       # crate per push against the queued pool is the cost it removes.
-      - run: cargo test --workspace --no-fail-fast
+      # STUDIO-1031: run the tests with a JOB-PRIVATE temp dir, then fail if any `rhapsody-*`
+      # scratch dir survives them. A private `$TMPDIR` makes the scan exact: the shared Mac temp
+      # dir carries other worktrees' entries, which would otherwise false-fail this gate. A guard
+      # nobody removed (or a reverted one) leaves a directory the scan then names.
+      - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --workspace --no-fail-fast
       # STUDIO-1032: `ensure_from_repo_hook_runs_unlocked` now proves the two same-repo after_create
       # hooks run concurrently with a cross-process barrier instead of inferring it from wall-clock
       # [start,end] interval overlap. The flake it replaces was a Linux-only timing artifact (the
       # second task's prehook git work outlasted the first hook's sleep), so a single run is not
-      # evidence of determinism — this loop pins 50 consecutive passes. `runner.os != 'macOS'` keeps
-      # the repetition off the shared Macs (the push-to-main leg runs there); the workspace test run
-      # above has already compiled everything, so each iteration only re-runs the one test.
+      # evidence of determinism — this loop pins 50 consecutive passes. It runs under the same
+      # job-private TMPDIR, before the STUDIO-1031 leak scan, so the scan still covers it, and
+      # `runner.os != 'macOS'` keeps the repetition off the shared Macs (the push-to-main leg runs
+      # there); the workspace run above has already compiled everything, so each iteration only
+      # re-runs the one test.
       - if: runner.os != 'macOS'
-        run: for i in $(seq 1 50); do cargo test -p rhapsody-workspace ensure_from_repo_hook_runs_unlocked || exit 1; done
+        run: for i in $(seq 1 50); do TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace ensure_from_repo_hook_runs_unlocked || exit 1; done
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
 
   web:
     if: >-
@@ -152,7 +164,11 @@ jobs:
       # `--locked` (STUDIO-1024) on every resolve step: the desktop workspace is excluded from the
       # root lock, so a manifest change here that is not matched by `desktop/Cargo.lock` used to be
       # silently re-resolved and go green. With `--locked` a stale lock fails CI instead.
-      - run: cargo test --locked
+      # STUDIO-1031: same temp-dir leak gate as the root `test` job — the desktop tests rolled
+      # their own un-guarded `rhapsody-d2-sup-*` / `rhapsody-d4-*` helpers. A job-private
+      # `$TMPDIR` keeps the scan exact (see the `test` job).
+      - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked
         working-directory: desktop
       # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app. The CLI
       # install is idempotent and persists on the self-hosted runner. `make app` (run from the repo
@@ -167,9 +183,12 @@ jobs:
       # bundle (Contents/MacOS -> Contents/Resources/rhapsodyd), never the `.dmg`, so `make app` is the
       # correct, collision-free PR gate.
       - run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
-      - run: make app
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" make app
       # P7-D5 parity e2e: the app's supervisor drives the packaged rhapsodyd through
       # start -> healthy -> dashboard -> stop (against the R3 linear-stub + fake-claude harness). Gated
       # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make app` built).
-      - run: RHAPSODY_PARITY_E2E=1 cargo test --locked -p rhapsody-desktop --test parity_e2e -- --nocapture
+      - run: RHAPSODY_PARITY_E2E=1 TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked -p rhapsody-desktop --test parity_e2e -- --nocapture
         working-directory: desktop
+      # The gate runs at the END so it sees the whole job: cargo test, `make app`, and the parity
+      # e2e (which drives the real rhapsodyd through a scratch `$TMPDIR` of its own).
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"

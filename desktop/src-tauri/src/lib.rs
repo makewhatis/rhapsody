@@ -29,6 +29,8 @@ pub mod onboarding;
 pub mod prefs;
 pub mod provider_credential;
 pub mod supervisor;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod toolcheck;
 pub mod tooldirs;
 pub mod update;

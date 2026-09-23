@@ -58,7 +58,6 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
     // 2. Build + launch linear-stub (the scripted Linear GraphQL double), same as boot.sh.
     let stub_bin = build_linear_stub(&root);
     let work = unique_tmp("rhapsody-d5-e2e");
-    std::fs::create_dir_all(&work).expect("mkdir work");
     let stub_log = work.join("stub.log");
     let stub = Command::new(&stub_bin)
         .arg("--scenario")
@@ -268,15 +267,53 @@ fn wait_for_listening(log: &Path) -> u16 {
     }
 }
 
-/// A unique temp dir path (not yet created) for one test run.
-fn unique_tmp(prefix: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ))
+/// A unique temp dir for one test run, created here and removed on drop (STUDIO-1031), so an
+/// e2e run leaves no `rhapsody-d5-e2e-*` entry in `$TMPDIR`. `Deref`s to `Path`.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(prefix: &str) -> TempDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{nonce}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir { path }
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn unique_tmp(prefix: &str) -> TempDir {
+    TempDir::new(prefix)
 }
 
 /// Marks `p` executable (0755) — the daemon execs the copied fake-claude by absolute path.
