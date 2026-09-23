@@ -109,6 +109,9 @@ pub(crate) struct FakeProvider {
     review_outcome: Option<ReviewControlOutcome>,
     review_rerun_pr: Mutex<Option<PrCoord>>,
     review_dismiss_pr: Mutex<Option<PrCoord>>,
+    /// The `reviewer` the last dismiss carried, so a test can assert the optional per-reviewer
+    /// lever reached the provider (STUDIO-1022).
+    review_dismiss_reviewer: Mutex<Option<Option<String>>>,
     review_clear_pr: Mutex<Option<PrCoord>>,
     /// The canned outcome `merge_run` returns, and what the last call was asked — how a test
     /// asserts the handler forwarded only the run id and the confirmation (STUDIO-767).
@@ -174,6 +177,7 @@ impl FakeProvider {
             review_outcome: None,
             review_rerun_pr: Mutex::new(None),
             review_dismiss_pr: Mutex::new(None),
+            review_dismiss_reviewer: Mutex::new(None),
             review_clear_pr: Mutex::new(None),
             merge_outcome: None,
             merge_asked: Mutex::new(None),
@@ -389,6 +393,15 @@ impl FakeProvider {
 
     pub(crate) fn review_dismiss_pr(&self) -> Option<PrCoord> {
         self.review_dismiss_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The `reviewer` the last dismiss carried: `None` when dismiss was never called,
+    /// `Some(None)` for a whole-pull-request dismissal, `Some(Some(name))` for a named one.
+    pub(crate) fn review_dismiss_reviewer(&self) -> Option<Option<String>> {
+        self.review_dismiss_reviewer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -671,12 +684,16 @@ impl StateProvider for FakeProvider {
             .unwrap_or(ReviewControlOutcome::Dormant)
     }
 
-    async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
+    async fn review_dismiss(&self, pr: PrCoord, reviewer: Option<String>) -> ReviewControlOutcome {
         self.touch();
         *self
             .review_dismiss_pr
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pr);
+        *self
+            .review_dismiss_reviewer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reviewer);
         self.review_outcome
             .clone()
             .unwrap_or(ReviewControlOutcome::Dormant)

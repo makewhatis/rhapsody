@@ -54,11 +54,13 @@ use crate::server::StateProvider;
 /// is not one.
 const MAX_CONTROL_BODY: usize = 8 << 10;
 
-/// The body every control route takes: the pull request, and nothing else.
+/// The body every control route takes: the pull request, and — for dismiss alone — an optional
+/// reviewer to narrow it to (STUDIO-1022).
 ///
-/// There is no `reviewer` field, deliberately. A review is a property of the pull request — a
-/// two-reviewer round is one round — so both controls act on every row of the coordinate rather
-/// than letting a caller steer one reviewer's half of it.
+/// `reviewer` is optional and ignored by `rerun` and `clear`, whose subject is always the whole
+/// pull request. For `dismiss` it names one watch row, which is the lever the incident had no answer
+/// for: dropping every row of a pull request also stops the reviews somebody is still waiting on,
+/// so an operator who only wants to retire one departed reviewer's slot can now say `sol`.
 #[derive(Debug, Default, Deserialize)]
 struct ReviewControlReq {
     #[serde(default)]
@@ -70,6 +72,26 @@ struct ReviewControlReq {
     /// rejected by serde with a different error envelope.
     #[serde(default)]
     number: i64,
+    /// The reviewer to act on, or `None` for the whole pull request. Trimmed at the door so a
+    /// pasted name with whitespace still selects the row; an empty string reads as absent.
+    #[serde(default)]
+    reviewer: Option<String>,
+}
+
+impl ReviewControlReq {
+    fn coord(&self) -> PrCoord {
+        PrCoord::new(self.owner.trim(), self.repo.trim(), self.number)
+    }
+
+    /// The named reviewer, trimmed, with an empty/whitespace-only value reading as absent rather
+    /// than as a name no roster could hold.
+    fn reviewer(&self) -> Option<String> {
+        self.reviewer
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// The 200 body for every control route: how many watch-set rows the action changed.
@@ -109,26 +131,29 @@ pub(crate) async fn handle_review_rerun(
     State(provider): State<Arc<dyn StateProvider>>,
     body: Bytes,
 ) -> Response {
-    let pr = match parse_control(&method, &body, "use POST to re-run a review") {
-        Ok(pr) => pr,
+    let req = match parse_control(&method, &body, "use POST to re-run a review") {
+        Ok(req) => req,
         Err(resp) => return *resp,
     };
+    let pr = req.coord();
     let label = pr.to_string();
     render(provider.review_rerun(pr).await, label)
 }
 
-/// `POST /api/v1/reviews/dismiss` — take a pull request out of the watch set (§15-e).
+/// `POST /api/v1/reviews/dismiss` — take a pull request out of the watch set (§15-e), or one
+/// reviewer's row of it when the body names one (STUDIO-1022).
 pub(crate) async fn handle_review_dismiss(
     method: Method,
     State(provider): State<Arc<dyn StateProvider>>,
     body: Bytes,
 ) -> Response {
-    let pr = match parse_control(&method, &body, "use POST to dismiss a review") {
-        Ok(pr) => pr,
+    let req = match parse_control(&method, &body, "use POST to dismiss a review") {
+        Ok(req) => req,
         Err(resp) => return *resp,
     };
+    let pr = req.coord();
     let label = pr.to_string();
-    render(provider.review_dismiss(pr).await, label)
+    render(provider.review_dismiss(pr, req.reviewer()).await, label)
 }
 
 /// `POST /api/v1/reviews/clear` — clear a pull request's shared review↔author round budget
@@ -138,10 +163,11 @@ pub(crate) async fn handle_review_clear(
     State(provider): State<Arc<dyn StateProvider>>,
     body: Bytes,
 ) -> Response {
-    let pr = match parse_control(&method, &body, "use POST to clear a review budget") {
-        Ok(pr) => pr,
+    let req = match parse_control(&method, &body, "use POST to clear a review budget") {
+        Ok(req) => req,
         Err(resp) => return *resp,
     };
+    let pr = req.coord();
     let label = pr.to_string();
     render(provider.review_clear(pr).await, label)
 }
@@ -156,7 +182,7 @@ fn parse_control(
     method: &Method,
     body: &Bytes,
     verb: &'static str,
-) -> Result<PrCoord, Box<Response>> {
+) -> Result<ReviewControlReq, Box<Response>> {
     if let Some(resp) = require_post(method, verb) {
         return Err(Box::new(resp));
     }
@@ -176,7 +202,7 @@ fn parse_control(
             None,
         ))
     })?;
-    Ok(PrCoord::new(req.owner.trim(), req.repo.trim(), req.number))
+    Ok(req)
 }
 
 /// Maps the daemon's four-way outcome onto the response envelope.
@@ -355,6 +381,51 @@ mod tests {
                 "{path} must forward the body's own coordinate"
             );
         }
+    }
+
+    /// **STUDIO-1022: the optional `reviewer` reaches the provider on dismiss.** With it the
+    /// dismissal is the per-reviewer lever; without it (or blank) it is the original
+    /// whole-pull-request dismissal. The other two controls take no reviewer and are unaffected.
+    #[tokio::test]
+    async fn a_dismiss_forwards_an_optional_reviewer() {
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_review_outcome(ReviewControlOutcome::Applied(1)),
+        );
+        let url = spawn(Arc::clone(&provider)).await;
+
+        post(
+            &format!("{url}/api/v1/reviews/dismiss"),
+            r#"{"owner":"makewhatis","repo":"rhapsody","number":12,"reviewer":" sol "}"#,
+        )
+        .await;
+        assert_eq!(
+            provider.review_dismiss_reviewer(),
+            Some(Some("sol".to_string())),
+            "the named reviewer is trimmed at the door and forwarded"
+        );
+
+        post(
+            &format!("{url}/api/v1/reviews/dismiss"),
+            r#"{"owner":"makewhatis","repo":"rhapsody","number":12}"#,
+        )
+        .await;
+        assert_eq!(
+            provider.review_dismiss_reviewer(),
+            Some(None),
+            "an absent reviewer is the whole-pull-request dismissal"
+        );
+
+        post(
+            &format!("{url}/api/v1/reviews/dismiss"),
+            r#"{"owner":"makewhatis","repo":"rhapsody","number":12,"reviewer":"  "}"#,
+        )
+        .await;
+        assert_eq!(
+            provider.review_dismiss_reviewer(),
+            Some(None),
+            "a whitespace-only reviewer reads as absent"
+        );
     }
 
     /// Surrounding whitespace is trimmed off the coordinate before it leaves the door — an operator
