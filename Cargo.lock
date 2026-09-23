@@ -1676,6 +1676,7 @@ dependencies = [
  "rhapsody-config",
  "rhapsody-core",
  "rhapsody-orchestrator",
+ "rhapsody-provider-status",
  "rhapsody-store",
  "rust-embed",
  "serde",
@@ -1757,6 +1758,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhapsody-provider-status"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rhapsody-credential-ipc",
+ "rhapsody-provider-broker",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rhapsody-store"
 version = "0.1.0"
 dependencies = [
@@ -1829,6 +1842,7 @@ dependencies = [
  "rhapsody-mcp",
  "rhapsody-orchestrator",
  "rhapsody-provider-broker",
+ "rhapsody-provider-status",
  "rhapsody-store",
  "rhapsody-telemetry",
  "rhapsody-tracker",

@@ -64,6 +64,7 @@ pub mod preflight;
 pub mod prepare;
 pub mod prlink;
 pub mod promote;
+pub mod providerreload;
 pub mod prstate;
 pub mod quorum;
 pub mod reads;
@@ -135,6 +136,7 @@ pub use prepare::{
     PreparationKey, PreparationOutcome, PreparationRequest, PreparationResolver, PreparationToken,
     PreparedDispatch, RefusalGate, RefusalReason,
 };
+pub use providerreload::ProviderReloadSink;
 pub use quorum::{
     MAX_QUORUM_BACKOFF_MS, QUORUM_FANOUT_ATTEMPTS, QUORUM_REQUESTED_LABEL, QuorumDeps,
     QuorumRequest, QuorumTarget, REVIEW_TICKET_LABEL, run_quorum_task,

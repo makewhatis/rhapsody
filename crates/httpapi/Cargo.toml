@@ -76,6 +76,11 @@ chrono = "0.4"
 # loop. `wrappers::ReceiverStream` only (default features). NEW workspace dependency; tokio-family,
 # tracks the existing `tokio` version, minimal surface.
 tokio-stream = "0.1"
+# rhapsody-provider-status (STUDIO-990, P9): the non-secret provider status/catalog views the new
+# read routes serve and the explicit refresh POST returns. Default features (NOT `discovery`) so this
+# crate never links the broker's HTTP stack through it; the real adapter is wired only in `rhapsodyd`.
+# Workspace crate; no new external crate enters Cargo.lock.
+rhapsody-provider-status = { path = "../provider-status" }
 
 [dev-dependencies]
 # harness-fixtures (test-only): the H1 state golden — the served `GET /api/v1/state` body,

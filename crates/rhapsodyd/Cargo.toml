@@ -65,6 +65,10 @@ rhapsody-credential-ipc = { path = "../credential-ipc" }
 # loopback broker and injects its registration handle into the orchestrator (design §11). Default
 # features on: the daemon needs PB2's loopback listener. No Go parity (Rhapsody-only).
 rhapsody-provider-broker = { path = "../provider-broker" }
+# rhapsody-provider-status (STUDIO-990, P9): the non-secret status/catalog caches + off-loop
+# coordinator, and (via the `discovery` feature) the fixed-endpoint `/models` adapter that reuses the
+# broker's PB2 egress stack. No Go parity (Rhapsody-only).
+rhapsody-provider-status = { path = "../provider-status", features = ["discovery"] }
 # serde_json (STUDIO-981/P0c): decodes `--credential-probe-binding`'s JSON `Binding` value. Already
 # in Cargo.lock at this exact version (rhapsody-credential-ipc and others already depend on it).
 serde_json = "1"
