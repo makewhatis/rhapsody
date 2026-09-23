@@ -150,6 +150,9 @@ pub struct BuiltinProfile {
     /// The `agent.backend` name this teammate's runs use; empty ⇒ inherit the daemon's configured
     /// backend (STUDIO-902). Every built-in ships empty.
     pub harness: &'static str,
+    /// The provider for this teammate's runs (STUDIO-985); empty ⇒ inherit. Every built-in ships
+    /// empty, so a built-in keeps whatever default login it had.
+    pub provider: &'static str,
     /// Names from the BO-11 registry ([`crate::capabilities`]) — referenced
     /// here, resolved by whoever renders them.
     pub capabilities: &'static [&'static str],
@@ -171,6 +174,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -186,6 +190,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v1.md"),
@@ -196,6 +201,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v1.md"),
@@ -211,6 +217,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -226,6 +233,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v2.md"),
@@ -236,6 +244,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         model: "",
         effort: "",
         harness: "",
+        provider: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v2.md"),
@@ -260,6 +269,21 @@ pub enum ProfileError {
     Invalid(String),
     #[error("profile_unknown: {0}")]
     Unknown(String),
+    /// A routing field (harness/provider/model) the profile explicitly set is invalid
+    /// (STUDIO-985). **Deliberately a class of its own**: unreadable prompt prose may degrade to
+    /// "run without the teammate section", but a bad routing field must be refused rather than
+    /// silently dropped — dropping it is exactly the wrong-runner fallback the design forbids. The
+    /// later resolver (P4) reads this variant to refuse the run; nothing here resolves or degrades.
+    #[error("profile_routing_error: {0}")]
+    Routing(String),
+}
+
+/// Whether `err` is the degradable class (unreadable prose, an unknown base, a parse failure) as
+/// opposed to a [`ProfileError::Routing`] refusal (STUDIO-985). Callers that keep the historical
+/// "a broken profile must not block work" degradation use this to hold the line: prose may degrade,
+/// routing may not.
+pub fn is_degradable(err: &ProfileError) -> bool {
+    !matches!(err, ProfileError::Routing(_))
 }
 
 /// The front matter of a profile file, before defaulting (§2.2).
@@ -278,6 +302,8 @@ struct RawProfile {
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
     capabilities: Option<Vec<String>>,
     #[serde(default)]
     tools: Option<Vec<String>>,
@@ -290,6 +316,7 @@ pub struct ProfileFile {
     pub model: String,
     pub effort: String,
     pub harness: String,
+    pub provider: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -350,6 +377,7 @@ pub struct Provenance {
     pub model: Origin,
     pub effort: Origin,
     pub harness: Origin,
+    pub provider: Origin,
     pub capabilities: Origin,
     pub tools: Origin,
     pub body: BodyOrigin,
@@ -378,6 +406,13 @@ pub struct ResolvedProfile {
     /// dispatch, with a warning naming the teammate — refusing the run instead would let one
     /// mistyped profile field strand every ticket routed to that teammate.
     pub harness: String,
+    /// The `provider` this teammate's runs use, resolved exactly as [`ResolvedProfile::model`] and
+    /// [`ResolvedProfile::harness`] are; empty ⇒ inherit the daemon's configured selection
+    /// (STUDIO-985). Unlike `harness`, a NON-EMPTY provider is validated: it must be a canonical
+    /// provider id (§2.2), and a value that is not is a [`ProfileError::Routing`] refusal — a
+    /// provider names an operator-chosen key, never a credential, and an unresolvable one is the
+    /// wrong-provider fallback the design forbids.
+    pub provider: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -407,6 +442,7 @@ fn parse_definition(def: Definition) -> Result<ProfileFile, ProfileError> {
         model: raw.model.unwrap_or_default(),
         effort: raw.effort.unwrap_or_default(),
         harness: raw.harness.unwrap_or_default(),
+        provider: raw.provider.unwrap_or_default(),
         capabilities: raw.capabilities.unwrap_or_default(),
         tools: raw.tools.unwrap_or_default(),
         body: def.prompt_template,
@@ -567,6 +603,16 @@ fn resolve_with(
     let (model, model_origin) = pick_str(&file.model, base_profile.map_or("", |b| b.model));
     let (effort, effort_origin) = pick_str(&file.effort, base_profile.map_or("", |b| b.effort));
     let (harness, harness_origin) = pick_str(&file.harness, base_profile.map_or("", |b| b.harness));
+    let (provider, provider_origin) =
+        pick_str(&file.provider, base_profile.map_or("", |b| b.provider));
+    // A NON-EMPTY provider is a routing field, and a routing field cannot degrade: an invalid one
+    // is refused here rather than dropped at dispatch into the wrong-provider fallback the design
+    // forbids. Empty inherits, exactly like `model`/`effort`/`harness`. Harness and model are left
+    // to their existing paths (an unknown harness is refused at spawn, STUDIO-978).
+    if !provider.is_empty() {
+        crate::routing::validate_routing_fields("", &provider, "")
+            .map_err(|reason| ProfileError::Routing(format!("profile {:?}: {reason}", name)))?;
+    }
     let (capabilities, capabilities_origin) = pick_list(
         &file.capabilities,
         base_profile.map_or(&[][..], |b| b.capabilities),
@@ -578,6 +624,7 @@ fn resolve_with(
         model,
         effort,
         harness,
+        provider,
         capabilities,
         tools,
         prompt,
@@ -592,6 +639,7 @@ fn resolve_with(
             model: model_origin,
             effort: effort_origin,
             harness: harness_origin,
+            provider: provider_origin,
             capabilities: capabilities_origin,
             tools: tools_origin,
             body,
@@ -620,6 +668,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
         model: base.model.to_string(),
         effort: base.effort.to_string(),
         harness: base.harness.to_string(),
+        provider: base.provider.to_string(),
         capabilities: base.capabilities.iter().map(|s| (*s).to_string()).collect(),
         tools: base.tools.iter().map(|s| (*s).to_string()).collect(),
         prompt: base.body.trim().to_string(),
@@ -634,6 +683,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
             model: str_origin(base.model),
             effort: str_origin(base.effort),
             harness: str_origin(base.harness),
+            provider: str_origin(base.provider),
             capabilities: list_origin(base.capabilities),
             tools: list_origin(base.tools),
             body: BodyOrigin::Base,
@@ -657,6 +707,12 @@ pub enum RosterIssue {
         profile: String,
         drift: Drift,
     },
+    /// A roster identity's own routing fields (STUDIO-985) — or the profile it names — set a
+    /// harness/provider/model that is syntactically invalid. **A distinct class from
+    /// [`Unresolvable`](Self::Unresolvable)**: prose that could not be read degrades to no
+    /// teammate section, but a bad routing field must be refused, and the two must never be
+    /// conflated. One bad teammate is reported here rather than disabling Teams.
+    Routing { identity: String, reason: String },
 }
 
 impl std::fmt::Display for RosterIssue {
@@ -676,19 +732,41 @@ impl std::fmt::Display for RosterIssue {
                 "{identity}'s profile {profile:?} overlays {}@{}; the built-in is now {}@{}",
                 drift.name, drift.pinned, drift.name, drift.latest
             ),
+            RosterIssue::Routing { identity, reason } => {
+                write!(f, "{identity} has an invalid routing field: {reason}")
+            }
         }
     }
 }
 
+/// The routing fields a roster identity sets EXPLICITLY (STUDIO-985), validated the way a profile's
+/// are: a non-empty provider must be a canonical id, a non-empty model must satisfy the transport
+/// bounds, and a non-empty harness must be a recognized name. Empty fields inherit and are not
+/// checked. Returns the first reason, or `None`.
+pub fn identity_routing_error(identity: &crate::teams::Identity) -> Option<String> {
+    crate::routing::validate_routing_fields(&identity.harness, &identity.provider, &identity.model)
+        .err()
+}
+
 /// Resolves every roster entry's profile and reports what an operator needs to
-/// know — unknown profiles and pin drift (§4). Read-only, like everything else
-/// here: it never creates `dir`.
+/// know — unknown profiles, pin drift, and invalid routing fields (§4, STUDIO-985).
+/// Read-only, like everything else here: it never creates `dir`.
 ///
-/// A roster entry with an EMPTY `profile` is skipped rather than reported: it
-/// names no profile, so there is no unknown one to complain about.
+/// A roster entry with an EMPTY `profile` is skipped for profile resolution, but its own routing
+/// fields are still validated: an identity may set `harness`/`provider`/`model` with no profile at
+/// all. A routing fault is reported as [`RosterIssue::Routing`], kept distinct from the degradable
+/// [`RosterIssue::Unresolvable`] prose failure so nobody conflates "unreadable prompt" with
+/// "must be refused".
 pub fn check_roster(teams: &Teams, dir: &Path) -> Vec<RosterIssue> {
     let mut issues = Vec::new();
     for identity in &teams.roster {
+        // The identity's OWN routing fields are checked first and independently of its profile.
+        if let Some(reason) = identity_routing_error(identity) {
+            issues.push(RosterIssue::Routing {
+                identity: identity.name.clone(),
+                reason,
+            });
+        }
         if identity.profile.is_empty() {
             continue;
         }
@@ -702,6 +780,11 @@ pub fn check_roster(teams: &Teams, dir: &Path) -> Vec<RosterIssue> {
                     });
                 }
             }
+            // A routing fault inside the profile is REFUSED, not degraded — its own class.
+            Err(ProfileError::Routing(reason)) => issues.push(RosterIssue::Routing {
+                identity: identity.name.clone(),
+                reason,
+            }),
             Err(e) => issues.push(RosterIssue::Unresolvable {
                 identity: identity.name.clone(),
                 profile: identity.profile.clone(),
@@ -726,6 +809,10 @@ pub fn fork_definition(resolved: &ResolvedProfile) -> Definition {
     config.insert(Value::from("extends"), Value::from("none"));
     config.insert(Value::from("model"), Value::from(resolved.model.clone()));
     config.insert(Value::from("effort"), Value::from(resolved.effort.clone()));
+    config.insert(
+        Value::from("provider"),
+        Value::from(resolved.provider.clone()),
+    );
     config.insert(
         Value::from("capabilities"),
         Value::Sequence(
@@ -774,6 +861,7 @@ mod tests {
             model: "sonnet",
             effort: "medium",
             harness: "claude",
+            provider: "",
             capabilities: &["code-review"],
             tools: &["read"],
             body: "v1 body",
@@ -784,6 +872,7 @@ mod tests {
             model: "opus",
             effort: "high",
             harness: "opencode",
+            provider: "openrouter",
             capabilities: &["code-review", "test-coverage"],
             tools: &["read", "write"],
             body: "v2 body",
@@ -1082,6 +1171,7 @@ mod tests {
         assert_eq!(r.prompt, "Mine alone.");
         assert_eq!(r.model, "", "a fork inherits no model");
         assert_eq!(r.effort, "");
+        assert_eq!(r.provider, "", "a fork inherits no provider");
         assert!(r.capabilities.is_empty(), "a fork inherits no capabilities");
         assert!(r.tools.is_empty());
         assert_eq!(r.provenance.base, None);
@@ -1153,6 +1243,110 @@ mod tests {
             "empty means inherit, never a hardcoded default"
         );
         assert_eq!(r.provenance.harness, Origin::Unset);
+    }
+
+    // ── provider (STUDIO-985) ───────────────────────────────────────────────
+
+    /// The additive guarantee: every SHIPPED built-in names no provider, so an installation that
+    /// never writes one is byte-identical to before this field existed.
+    #[test]
+    fn every_shipped_builtin_inherits_the_provider() {
+        for b in BUILTINS {
+            assert_eq!(
+                b.provider, "",
+                "built-in {}@{} ships a provider, which would change what an existing \
+                 installation dispatches",
+                b.name, b.version
+            );
+        }
+    }
+
+    /// An overlay naming a provider wins over its base's and records itself as the overlay's —
+    /// resolved by the same `pick_str` as `harness`/`model`/`effort`.
+    #[test]
+    fn an_overlay_provider_overrides_the_base_and_records_its_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(
+            p,
+            "swe",
+            "---\nextends: swe@1\nprovider: fireworks\n---\nBody.\n",
+        );
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(r.provider, "fireworks", "the overlay's provider wins");
+        assert_eq!(r.provenance.provider, Origin::Overlay);
+    }
+
+    /// An overlay silent about the provider inherits its base's, and says so.
+    #[test]
+    fn an_unset_provider_inherits_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(p, "swe", "---\nextends: swe@2\n---\nBody.\n");
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(r.provider, "openrouter", "swe@2's provider");
+        assert_eq!(r.provenance.provider, Origin::Base);
+    }
+
+    /// **A routing field cannot degrade.** A profile that explicitly sets a non-canonical provider
+    /// (which is what a credential looks like in a provider slot) is refused with
+    /// [`ProfileError::Routing`], and is NOT the degradable class — prose that could not be read
+    /// still degrades, but this must not be silently dropped into the wrong-provider fallback.
+    #[test]
+    fn an_invalid_profile_provider_is_a_routing_error_not_degradable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(
+            p,
+            "alice",
+            "---\nextends: swe@1\nprovider: sk-live:ABC/1\n---\nBody.\n",
+        );
+        let err = resolve_with(p, "alice", TWO_VERSIONS).expect_err("must refuse");
+        assert!(
+            matches!(err, ProfileError::Routing(_)),
+            "expected a routing error, got {err}"
+        );
+        assert!(err.to_string().starts_with("profile_routing_error:"));
+        assert!(!is_degradable(&err), "a routing error must never degrade");
+
+        // A prose/IO failure IS degradable.
+        let missing = resolve_with(p, "nobody", TWO_VERSIONS).expect_err("unknown profile");
+        assert!(is_degradable(&missing), "an unknown profile degrades");
+    }
+
+    /// A roster identity's own routing field is reported as [`RosterIssue::Routing`], kept distinct
+    /// from the degradable [`RosterIssue::Unresolvable`] prose failure — so one bad teammate is
+    /// reported, never conflated with unreadable prompt text, and never disables Teams.
+    #[test]
+    fn check_roster_separates_identity_routing_errors_from_broken_prose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let teams = Teams {
+            enabled: true,
+            roster: vec![
+                crate::teams::Identity {
+                    name: "badroute".to_string(),
+                    provider: "sk-live:ABC/1".to_string(),
+                    ..crate::teams::Identity::default()
+                },
+                crate::teams::Identity {
+                    name: "brokenprose".to_string(),
+                    profile: "nosuchprofile".to_string(),
+                    ..crate::teams::Identity::default()
+                },
+            ],
+            ..Teams::disabled()
+        };
+        let issues = check_roster(&teams, dir.path());
+        assert!(
+            issues.iter().any(
+                |i| matches!(i, RosterIssue::Routing { identity, .. } if identity == "badroute")
+            ),
+            "an invalid identity routing field must be a Routing issue: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| matches!(i, RosterIssue::Unresolvable { identity, .. } if identity == "brokenprose")),
+            "an unresolvable profile must stay a distinct Unresolvable issue: {issues:?}"
+        );
     }
 
     /// An ABSENT `extends:` is a fork, not an implicit overlay of the same-named

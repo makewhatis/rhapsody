@@ -349,10 +349,14 @@ impl Orchestrator {
                     .map(|e| e.capabilities.clone())
                     .unwrap_or_default(),
             };
-            for l in iss.labels.iter().flatten() {
-                if let Some(name) = l.strip_prefix("rhapsody:")
-                    && !names.iter().any(|n| n == name)
-                {
+            // Routing labels are excluded (STUDIO-985): `rhapsody:@<name>` is an ASSIGNMENT and
+            // `rhapsody:harness|provider|model/…` is routing metadata — none of them is a
+            // practice an agent should be told to follow. `capability_label_names` is the single
+            // filter, shared with the label parser, so the two cannot drift.
+            for name in rhapsody_config::routing::capability_label_names(
+                iss.labels.iter().flatten().map(String::as_str),
+            ) {
+                if !names.iter().any(|n| n == name) {
                     names.push(name.to_string());
                 }
             }
@@ -1676,12 +1680,17 @@ mod tests {
         }
         o.capabilities_registry = Some(rhapsody_config::capabilities::default_capabilities());
         // The ticket adds `rhapsody:code-review` (unioned), a non-`rhapsody:` label (ignored), and an
-        // unknown `rhapsody:bogus` (rendered to nothing).
+        // unknown `rhapsody:bogus` (rendered to nothing). STUDIO-985: assignment and routing labels
+        // (`rhapsody:@alice`, the three routing namespaces) must also contribute nothing.
         let iss = Issue {
             labels: Some(vec![
                 "rhapsody:code-review".to_string(),
                 "backend".to_string(),
                 "rhapsody:bogus".to_string(),
+                "rhapsody:@alice".to_string(),
+                "rhapsody:harness/opencode".to_string(),
+                "rhapsody:provider/fireworks".to_string(),
+                "rhapsody:model/accounts/fireworks/models/deepseek-v4p1-flash".to_string(),
             ]),
             ..issue("1", "MT-1", "Todo")
         };
