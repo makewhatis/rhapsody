@@ -1613,6 +1613,7 @@ dependencies = [
  "rhapsody-workspace",
  "serde",
  "serde_json",
+ "static_assertions",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

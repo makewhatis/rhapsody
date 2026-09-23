@@ -19,12 +19,18 @@
 //!   `time.Time` used as unset-able) become `Option<…>`.
 
 pub mod claude;
+pub mod dispatch;
 pub mod fake;
 pub mod harness;
 pub mod humanize;
 pub mod opencode;
 pub mod proctree;
 
+pub use dispatch::{
+    DispatchRefusal, DispatchRunner, LaunchContext, PreparedHarnessSpec, PreparedProvider,
+    SessionStart, StartedSession, build_dispatch_runner, lower_provider_limits,
+    lower_provider_plan, prepare_provider,
+};
 pub use harness::{
     BrokeredOpenCodeRefusal, CapabilityRefusal, CredentialTransport, Degradation, DispatchVerdict,
     EventFidelity, HARNESS_REGISTRY, Harness, HarnessCapabilities, HarnessId, HarnessKnobs,

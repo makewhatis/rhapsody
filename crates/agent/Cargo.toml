@@ -64,6 +64,14 @@ libc = "0.2"
 # `slog`; the workspace convention is `tracing`, as `rhapsody-tracker` records). Behavior is
 # unchanged whether the warn fires; it is observability only. Already in Cargo.lock.
 tracing = "0.1"
+# rhapsody-provider-broker (PB5, STUDIO-1000): the dispatch-time runner transfers broker custody
+# (`BrokerSession`/`BrokerLedgerReceiver`) into the adapter session and hands the non-secret ledger
+# receiver back to the worker, and lowers a config-owned `ResolvedProviderPlan` once into the
+# broker-owned `BrokerRegistrationPlan`. `default-features = false` so the agent links only PB1's
+# protocol-neutral custody types, never the loopback HTTP stack (which belongs to rhapsodyd). The
+# broker crate has no reverse dependency on agent (its `tests/dependency_guard.rs` pins that), so
+# no cycle exists. Already in Cargo.lock.
+rhapsody-provider-broker = { path = "../provider-broker", default-features = false }
 
 [dev-dependencies]
 # tokio (test-only): the current-thread runtime + timer + I/O the `#[tokio::test]` runner tests and
@@ -80,15 +88,11 @@ harness-fixtures = { path = "../harness-fixtures" }
 # `src/harness.rs` that assert the two declarations cannot drift. Workspace-internal path dep — no
 # new external crate enters Cargo.lock.
 rhapsody-config = { path = "../config" }
-# rhapsody-provider-broker (test-only, STUDIO-984 review): the canonical credential-binding adapter
-# identity is ONE value across config, agent and broker registration, so
-# `canonical_adapter_identity_agrees_across_config_agent_and_broker` compares all three. Separately,
-# `provider_limits_agree_with_the_config_crate` pins the plan's mirrored limits field-for-field to
-# config's V1 default column — the broker has no matching operator-limits type yet (PB5 lowers the
-# plan into its own policy types), so that pin is agent↔config only. The broker crate cannot depend on
-# this one (its dependency guard), so both pins live here. Workspace-internal path dep — no new
-# external crate enters Cargo.lock.
-rhapsody-provider-broker = { path = "../provider-broker" }
+# static_assertions: `assert_not_impl_any!` is the standard stable-Rust negative-impl guard. PB5's
+# move-only dispatch types (`DispatchRunner`/`PreparedProvider`/`PreparedHarnessSpec`) must never
+# become `Clone`: cloning one would silently extend credential custody past cancellation. Already in
+# the lock as a transitive; test-only here.
+static_assertions = "1"
 
 [lints]
 workspace = true
