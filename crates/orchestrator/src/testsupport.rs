@@ -826,11 +826,18 @@ pub(crate) struct TempDir {
 
 impl TempDir {
     pub(crate) fn new() -> TempDir {
+        // A nanosecond nonce beside the pid, so a recycled pid cannot land on a name an earlier
+        // run used (the store's STUDIO-1027 rule). `claim_in` still refuses an occupied name, so
+        // the nonce is belt-and-braces rather than the only guard.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
         TempDir {
             path: claim_in(
                 &std::env::temp_dir(),
                 &TEST_DIR_COUNTER,
-                &format!("rhapsody-orchestrator-{}", std::process::id()),
+                &format!("rhapsody-orchestrator-{}-{nonce}", std::process::id()),
             ),
         }
     }
@@ -846,7 +853,11 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // A failing test's directory is kept for debugging only when asked for; a normal run
+        // never accumulates scratch dirs.
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 

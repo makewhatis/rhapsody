@@ -350,17 +350,12 @@ mod tests {
     use rhapsody_credential_ipc::domain::{Binding, CredentialStateTag, Revision};
     use rhapsody_credential_ipc::session::ClientSession;
 
-    fn temp_dir() -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
+    fn temp_dir() -> crate::testutil::TempDir {
         // Unix socket paths are capped at ~104 bytes (`sun_path`). `std::env::temp_dir()` on macOS
         // resolves to a long per-session `$TMPDIR` (often 60-80 bytes on its own), so this uses
         // `/tmp` directly with a short name — the same reason `sign.sh`-style scripts elsewhere in
         // this crate avoid nesting deeply under it for socket/pipe paths.
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = PathBuf::from("/tmp").join(format!("rd-cb-{}-{n}", std::process::id() % 100_000));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::testutil::TempDir::new_in(std::path::Path::new("/tmp"), "rd-cb")
     }
 
     fn owner_with_secret() -> Arc<ProviderCredentialOwner> {

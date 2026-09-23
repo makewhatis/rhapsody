@@ -187,11 +187,52 @@ mod tests {
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_dir() -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("rhapsody-d4-tool-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).expect("create temp dir");
-        p
+    /// A unique scratch directory removed on drop (STUDIO-1031). `Deref`s to `Path`, so existing
+    /// `let dir = temp_dir(); dir.join(..)` call sites keep working while the directory is now
+    /// cleaned up at the end of the test.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-d4-tool-{}-{n}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    fn temp_dir() -> TempDir {
+        TempDir::new()
     }
 
     /// Writes an executable shell stub that prints `output` and exits `code`. Mirror of `writeFakeTool`.

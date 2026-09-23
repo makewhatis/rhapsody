@@ -2213,17 +2213,58 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique, freshly-created scratch directory under the system temp dir. Avoids a
-    /// tempfile dependency; uniqueness comes from the pid + a per-process atomic counter.
-    fn scratch_dir() -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rhapsody-store-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    /// A unique scratch directory under the system temp dir, removed on drop. Avoids a tempfile
+    /// dependency; uniqueness comes from the pid + a per-process atomic counter + a nanosecond
+    /// nonce, so a recycled pid can never adopt an earlier run's leftover (STUDIO-1027's store
+    /// rule). [`scratch_dir`] hands back the guard: keep it alive for the test's lifetime or the
+    /// directory is removed the moment the temporary drops.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-store-test-{}-{}-{nonce}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            TempDir { path }
+        }
+
+        /// Joins `name` under the scratch dir, returning the (not-yet-created) path.
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // A failing test's directory is kept for debugging only when asked for; by default it
+            // is removed like every other, so a run can never accumulate scratch dirs.
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    /// A freshly-created scratch directory guard. Bind it (`let dir = scratch_dir();`) — an
+    /// unbound `scratch_dir().join(..)` drops the guard at the end of the statement and removes
+    /// the directory before the test has used it.
+    fn scratch_dir() -> TempDir {
+        TempDir::new()
     }
 
     /// Reassemble the live schema the way `sqlite3 .schema` (which produced the fixture) does.
@@ -2347,10 +2388,13 @@ mod tests {
     }
 
     /// Fresh file-backed store under a scratch dir (Go `openTemp`) so WAL behavior — and sharing
-    /// one store across threads — can be exercised against a real on-disk database.
-    fn open_temp() -> Sqlite {
+    /// one store across threads — can be exercised against a real on-disk database. Returns the
+    /// guard with the store: the caller must hold it, or the directory is removed while the store
+    /// still has the file open.
+    fn open_temp() -> (TempDir, Sqlite) {
         let dir = scratch_dir();
-        Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp")
+        let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp");
+        (dir, store)
     }
 
     /// Create a transcript fixture file (Go `writeFileForTest`).
@@ -2367,11 +2411,8 @@ mod tests {
     // returns CANTOPEN and the daemon silently loses persistence.
     #[test]
     fn open_creates_missing_parent_dir() {
-        let dir = scratch_dir()
-            .join("does")
-            .join("not")
-            .join("exist")
-            .join("yet");
+        let scratch = scratch_dir();
+        let dir = scratch.join("does").join("not").join("exist").join("yet");
         let st = Sqlite::open(StorePath::Disk(dir.join("symphony.db")))
             .expect("Open must create the missing parent dir");
         st.close().expect("close");
@@ -2425,7 +2466,7 @@ mod tests {
     // Mirror TestWALEnabled: journal_mode=WAL is active on a file-backed handle.
     #[test]
     fn wal_enabled() {
-        let st = open_temp();
+        let (_dir, st) = open_temp();
         let mode: String = st
             .lock()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -2438,7 +2479,7 @@ mod tests {
     // lands and no read errors out.
     #[test]
     fn concurrent_read_during_write() {
-        let st = open_temp();
+        let (_dir, st) = open_temp();
         let id = st
             .start_run(RunStart {
                 issue_identifier: "MT-1".into(),
@@ -2487,7 +2528,8 @@ mod tests {
     // store is an idempotent no-op.
     #[test]
     fn open_migrates_to_schema_version() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         let s1 = Sqlite::open(StorePath::Disk(path.clone())).expect("open file");
         s1.close().expect("close");
         let s2 = Sqlite::open(StorePath::Disk(path)).expect("re-open file"); // migrate is a no-op
@@ -2506,7 +2548,8 @@ mod tests {
     // stalled/timed_out->failed; failed/interrupted/running are left untouched.
     #[test]
     fn migrate_outcomes_v5() {
-        let path = scratch_dir().join("symphony.db");
+        let scratch = scratch_dir();
+        let path = scratch.join("symphony.db");
         // Build a v4 database by applying the first four migration steps directly, then stamping
         // user_version=4 so Open() runs ONLY the new v4->v5 (and v5->v6) steps.
         {

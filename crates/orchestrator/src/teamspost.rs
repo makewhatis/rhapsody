@@ -348,7 +348,7 @@ mod tests {
     /// run id it looked up a moment earlier could belong to a different run by the time this lands.
     #[tokio::test]
     async fn a_room_relay_reaches_the_live_run_on_that_ticket_without_the_operator_wrap() {
-        let Harness { mut o, .. } = post_harness(&["alice"]);
+        let Harness { mut o, _dir, .. } = post_harness(&["alice"]);
         dispatch_as(&mut o, "ID-A", "MT-1", "alice");
 
         let wrapped = crate::teamsears::room_operator_wrap("try the other lock ordering");
@@ -403,7 +403,11 @@ mod tests {
     #[tokio::test]
     async fn a_direct_post_reaches_a_live_teammates_mailbox_with_the_teammate_wrap() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         dispatch_as(&mut o, "ID-A", "MT-1", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
@@ -454,6 +458,7 @@ mod tests {
             room,
             mem,
             tracker,
+            _dir,
             ..
         } = post_harness(&["alice", "bob"]);
 
@@ -508,7 +513,11 @@ mod tests {
     #[tokio::test]
     async fn a_full_mailbox_degrades_to_catch_up() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
@@ -541,7 +550,11 @@ mod tests {
     #[tokio::test]
     async fn a_post_writes_one_teams_message_row_on_the_posters_run() {
         let Harness {
-            mut o, store, mem, ..
+            mut o,
+            store,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
@@ -611,6 +624,7 @@ mod tests {
             room,
             mem,
             tracker,
+            _dir,
             ..
         } = post_harness(&["alice", "bob"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
@@ -670,7 +684,11 @@ mod tests {
     #[tokio::test]
     async fn a_teammate_delivery_does_not_steal_the_next_operator_messages_turn() {
         let Harness {
-            mut o, store, mem, ..
+            mut o,
+            store,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
@@ -715,6 +733,7 @@ mod tests {
             store,
             room,
             mem,
+            _dir,
             ..
         } = post_harness(&["alice", "bob"]);
         dispatch_as(&mut o, "ID-A", "MT-1", "alice");
@@ -757,7 +776,11 @@ mod tests {
     #[tokio::test]
     async fn a_direct_post_is_invisible_to_a_third_teammate() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob", "carol"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
 
@@ -785,7 +808,9 @@ mod tests {
     /// teammate, not to one of that teammate's tickets.
     #[tokio::test]
     async fn a_direct_post_reaches_every_live_run_of_that_identity() {
-        let Harness { mut o, mem, .. } = post_harness(&["alice", "bob"]);
+        let Harness {
+            mut o, mem, _dir, ..
+        } = post_harness(&["alice", "bob"]);
         dispatch_as(&mut o, "ID-A1", "MT-1", "alice");
         dispatch_as(&mut o, "ID-A2", "MT-2", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-3", "bob");
@@ -808,7 +833,11 @@ mod tests {
     #[tokio::test]
     async fn a_run_does_not_deliver_a_post_back_into_its_own_mailbox() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice"]);
         let a1 = dispatch_as(&mut o, "ID-A1", "MT-1", "alice");
         dispatch_as(&mut o, "ID-A2", "MT-2", "alice");
@@ -842,7 +871,11 @@ mod tests {
     #[tokio::test]
     async fn from_is_the_runs_identity_and_nothing_the_caller_says() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
 
@@ -869,7 +902,9 @@ mod tests {
     /// enforces for a record's provenance (§0.11.4: "a run wearing no identity cannot post").
     #[tokio::test]
     async fn an_unrouted_run_cannot_post() {
-        let Harness { mut o, mem, .. } = post_harness(&["alice"]);
+        let Harness {
+            mut o, mem, _dir, ..
+        } = post_harness(&["alice"]);
         // No `rhapsody:@` label, no roster-label overlap and no default identity ⇒ the run wears
         // no identity at all, so `bind_teams_run` never binds it.
         o.dispatch_issue(
@@ -895,7 +930,11 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_recipient_is_refused_and_never_posted_to_the_room() {
         let Harness {
-            mut o, room, mem, ..
+            mut o,
+            room,
+            mem,
+            _dir,
+            ..
         } = post_harness(&["alice", "bob"]);
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
 

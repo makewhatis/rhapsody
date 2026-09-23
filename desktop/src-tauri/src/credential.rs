@@ -275,15 +275,9 @@ pub(crate) mod mock {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("rhapsody-d4-cred-{}-{n}", std::process::id()));
-        fs::create_dir_all(&p).expect("create temp dir");
-        p
+    fn temp_dir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("rhapsody-d4-cred")
     }
 
     // Mirrors TestFileStoreRoundTrip: an absent token reads as empty, Set persists 0600, Delete clears

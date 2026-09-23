@@ -46,7 +46,14 @@ impl TempDir {
     fn new() -> TempDir {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("rhapsody-gate-{}-{seq}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rhapsody-gate-{}-{seq}-{nonce}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir { dir }
     }
@@ -57,7 +64,9 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 

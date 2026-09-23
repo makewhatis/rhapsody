@@ -1191,17 +1191,19 @@ mod tests {
             fake.capabilities.resume = rhapsody_agent::Resume::None;
             let ag = Arc::new(fake);
             let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
-            let (ws, _root) = test_workspace(HookScripts::default());
-            (make_deps(ws, ag.clone(), tr, "p", max_turns), ag)
+            let (ws, root) = test_workspace(HookScripts::default());
+            // The guard must outlive the closure: returned with the deps so the temp root is not
+            // removed while `run_agent_attempt` is still provisioning <root>/MT-1 under it.
+            (make_deps(ws, ag.clone(), tr, "p", max_turns), ag, root)
         };
 
-        let (single, ag) = mk(1);
+        let (single, ag, _root1) = mk(1);
         let (_l, _d, err) =
             run_agent_attempt(&single, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "single-turn run must dispatch: {err:?}");
         assert_eq!(ag.start_calls(), 1);
 
-        let (multi, ag) = mk(20);
+        let (multi, ag, _root2) = mk(20);
         let (_l, _d, err) =
             run_agent_attempt(&multi, dispatched(), None, None, &noop_event(), None).await;
         assert!(
