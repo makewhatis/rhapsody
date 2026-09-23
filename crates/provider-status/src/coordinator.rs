@@ -204,6 +204,11 @@ impl RefreshCoordinator {
         Self::lock(&self.status).begin_refresh(provider_id, false)
     }
 
+    /// Whether `provider_id` is one of the currently configured providers.
+    pub fn knows(&self, provider_id: &str) -> bool {
+        Self::lock(&self.providers).contains_key(provider_id)
+    }
+
     /// The pure, cache-only status read.
     pub fn status_view(
         &self,

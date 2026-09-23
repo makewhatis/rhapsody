@@ -46,6 +46,8 @@ pub use catalog::{CatalogCache, CatalogErrorCode, CatalogSnapshot, ModelEntry};
 pub use coordinator::{
     CredentialReadSource, ObservedRead, ObservedState, ProviderConfig, RefreshCoordinator,
 };
+#[cfg(feature = "discovery")]
+pub use discovery::OpenAiCompatibleDiscovery;
 pub use discovery::{DiscoveredCatalog, DiscoveryRequest, ModelDiscovery};
 pub use error::CatalogError;
 pub use status::{

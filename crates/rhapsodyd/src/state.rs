@@ -137,6 +137,10 @@ pub struct DaemonState {
     /// threading it through the orchestrator would give the control task a field only the HTTP task
     /// ever reads.
     teams_config_path: String,
+    /// The provider status/catalog runtime (STUDIO-990, P9). `None` ⇒ the trait's empty/dormant
+    /// answers, exactly what a daemon with no `providers:` block serves. The two `GET` routes read
+    /// this cache only; the one credentialed operation is the operator-guarded refresh POST.
+    provider: Option<Arc<crate::providers::ProviderRuntime>>,
 }
 
 impl DaemonState {
@@ -148,7 +152,18 @@ impl DaemonState {
             handle,
             history,
             teams_config_path: String::new(),
+            provider: None,
         }
+    }
+
+    /// Attach the provider status/catalog runtime (STUDIO-990, P9). Without it the provider routes
+    /// answer exactly what a daemon with no `providers:` block serves.
+    pub fn with_provider_runtime(
+        mut self,
+        runtime: Arc<crate::providers::ProviderRuntime>,
+    ) -> Self {
+        self.provider = Some(runtime);
+        self
     }
 
     /// Names the `teams.yaml` the enable flow reads and writes (STUDIO-652) — the same path
@@ -287,6 +302,48 @@ impl StateProvider for DaemonState {
         // task (BO-12). Until then the endpoint honestly serves `[]` rather than re-reading + seeding
         // the file from an HTTP read handler; wiring here becomes a one-line delegate to the handle.
         None
+    }
+
+    // --- the provider status + model catalog surface (STUDIO-990, P9) ---
+    //
+    // The two reads serve the non-secret cache the runtime applied at boot; neither touches the
+    // credential owner or a provider. The refresh is the ONE credentialed operation and is reached
+    // only through the operator-guarded POST.
+
+    fn provider_statuses(&self) -> Vec<rhapsody_provider_status::ProviderStatusView> {
+        self.provider
+            .as_ref()
+            .map(|runtime| runtime.statuses())
+            .unwrap_or_default()
+    }
+
+    fn provider_status(
+        &self,
+        provider_id: &str,
+    ) -> Option<rhapsody_provider_status::ProviderStatusView> {
+        self.provider
+            .as_ref()
+            .and_then(|runtime| runtime.status(provider_id))
+    }
+
+    fn provider_catalog(
+        &self,
+        provider_id: &str,
+    ) -> Option<rhapsody_provider_status::CatalogSnapshot> {
+        self.provider
+            .as_ref()
+            .and_then(|runtime| runtime.catalog(provider_id))
+    }
+
+    async fn refresh_provider_catalog(
+        &self,
+        provider_id: &str,
+    ) -> Result<rhapsody_provider_status::CatalogSnapshot, rhapsody_provider_status::CatalogError>
+    {
+        match self.provider.as_ref() {
+            Some(runtime) => runtime.refresh_catalog(provider_id).await,
+            None => Err(rhapsody_provider_status::CatalogError::Unsupported),
+        }
     }
 
     /// The four Rhapsody Teams memory surfaces (STUDIO-645, T4). Each delegates straight to the

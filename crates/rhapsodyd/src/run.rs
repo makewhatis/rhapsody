@@ -36,6 +36,7 @@ use crate::bootcfg::{
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
+use crate::providers::ProviderRuntime;
 use crate::state::DaemonState;
 
 /// Bounds the observability server drain at daemon shutdown (Go's `srv.Shutdown` 5s ctx).
@@ -138,7 +139,7 @@ where
     // transition, which is exactly the defect sol's review of rhapsody#221 found. The detached task
     // below performs the first read; PB7's prepared dispatch is expected to read through this same
     // `Arc`. The binding is intentionally underscore-named: it is held, not otherwise consulted yet.
-    let _credential_owner_boundary: Option<
+    let credential_owner_boundary: Option<
         std::sync::Arc<crate::credential_client::CredentialResolver>,
     > = if flags.credential_bootstrap {
         let probe = flags.credential_probe.clone();
@@ -534,8 +535,26 @@ where
         let teams_config_path = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let provider =
-            Arc::new(DaemonState::new(handle.clone()).with_teams_config_path(teams_config_path));
+        // Provider status + catalog (STUDIO-990, P9): build the runtime from the daemon's credential
+        // owner (or a no-owner resolver, which honestly reports `owner_unavailable`) and the live
+        // broker handle, then apply the resolved workflow's `providers:` block. Applying marks each
+        // provider unknown/refreshing and schedules one bounded off-loop status refresh; the GET
+        // routes only ever read the resulting cache.
+        let credential_owner = credential_owner_boundary
+            .clone()
+            .unwrap_or_else(crate::providers::unavailable_owner);
+        let provider_runtime = ProviderRuntime::new(credential_owner, broker_runtime.registrar());
+        if let Some(config) = resolved.as_ref() {
+            let scheduled = provider_runtime.apply_config(config);
+            if scheduled > 0 {
+                tracing::info!(providers = scheduled, "scheduled provider status refreshes");
+            }
+        }
+        let provider = Arc::new(
+            DaemonState::new(handle.clone())
+                .with_teams_config_path(teams_config_path)
+                .with_provider_runtime(provider_runtime),
+        );
         let logs = Arc::new(LogBufferSource::new(tel.logs.clone()));
         match rhapsody_httpapi::Server::bind(provider, Some(logs), &format!("127.0.0.1:{eff_port}"))
             .await
