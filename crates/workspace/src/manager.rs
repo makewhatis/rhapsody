@@ -450,12 +450,13 @@ mod tests {
     async fn remove_runs_before_remove_then_deletes() {
         let root = TempDir::new();
         let marker = join(&[&root.path, "removed.flag"]);
-        let m = Manager::new(Config {
+        let mut m = Manager::new(Config {
             root: root.path.clone(),
             hooks: scripts("", "", "", &format!("echo 1 > {marker}")),
             hook_timeout: Duration::from_secs(5),
         })
         .unwrap();
+        m.runner.env_overlay = crate::testutil::hook_home_overlay(&root.path);
         let ws = m.create_for_issue("", "MT-8").await.unwrap();
         m.remove("", "MT-8").await.unwrap();
         assert!(

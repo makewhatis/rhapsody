@@ -484,15 +484,63 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::opencode::testdir::TempDir::new();
         let path = dir.path().join("fake-opencode.sh");
-        let mut file = std::fs::File::create(&path).expect("create script");
-        writeln!(file, "#!/bin/sh").expect("write shebang");
-        write!(file, "{body}").expect("write body");
-        drop(file);
+        // Write the body to a scratch name, flush it to disk, close it, then rename it into place
+        // and chmod it. The write handle must be gone before any exec: on Linux a concurrently
+        // forked child of a sibling test can inherit an open-for-write fd, and `execve` of the same
+        // inode then fails with `ETXTBSY` ("Text file busy"). Rename alone cannot close that window
+        // (the check is inode-scoped, not path-scoped), so the exec-side retry below is the actual
+        // guarantee; this ordering just removes the write handle long before the spawn.
+        let tmp = dir.path().join("fake-opencode.sh.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp).expect("create script");
+            writeln!(file, "#!/bin/sh").expect("write shebang");
+            write!(file, "{body}").expect("write body");
+            file.sync_all().expect("flush script");
+        }
+        std::fs::rename(&tmp, &path).expect("publish script");
         let mut perms = std::fs::metadata(&path).expect("stat script").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("mark script executable");
         let rendered = path.to_string_lossy().into_owned();
         (dir, rendered)
+    }
+
+    /// Runs `probe`, retrying the Linux `ETXTBSY` race a bounded number of times. A test that writes
+    /// a script and immediately execs it races every other test binary thread: a sibling `fork()`
+    /// between our write and our `execve` inherits the write fd (Rust sets `O_CLOEXEC`, so it is
+    /// released at the sibling's next exec, not at fork), and our `execve` then fails with
+    /// `ETXTBSY` (os error 26). The window is the sibling's `fork`→`exec`, so a short sleep clears
+    /// it. Production never probes a file the same process just wrote, so this stays test-only.
+    fn probe_retrying_etxtbsy(command: &str) -> Result<&'static CompatibilityRow, ProbeError> {
+        retry_etxtbsy(|| probe(command))
+    }
+
+    /// [`probe_retrying_etxtbsy`]'s timeout-taking twin, for the process-tree fixtures.
+    fn probe_with_timeout_retrying_etxtbsy(
+        command: &str,
+        timeout: Duration,
+    ) -> Result<&'static CompatibilityRow, ProbeError> {
+        retry_etxtbsy(|| probe_with_timeout(command, timeout))
+    }
+
+    /// Bounded retry of `attempt` while it fails with the Linux `ETXTBSY` spawn race (see
+    /// [`probe_retrying_etxtbsy`]). Any other outcome — success or a real refusal — returns at once.
+    fn retry_etxtbsy<T>(
+        mut attempt: impl FnMut() -> Result<T, ProbeError>,
+    ) -> Result<T, ProbeError> {
+        let mut last = ProbeError::Spawn {
+            message: "ETXTBSY retries exhausted".to_string(),
+        };
+        for _ in 0..50 {
+            match attempt() {
+                Err(ProbeError::Spawn { message }) if message.contains("Text file busy") => {
+                    last = ProbeError::Spawn { message };
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        Err(last)
     }
 
     #[test]
@@ -566,7 +614,7 @@ mod tests {
     #[test]
     fn probe_accepts_the_pinned_binary() {
         let (_dir, command) = script("echo 1.18.30\n");
-        let row = probe(&command).expect("pinned binary accepted");
+        let row = probe_retrying_etxtbsy(&command).expect("pinned binary accepted");
         assert_eq!(row.opencode_version, "1.18.30");
         assert_eq!(row.adapter_version, "2.0.41");
     }
@@ -574,14 +622,14 @@ mod tests {
     #[test]
     fn probe_refuses_an_unknown_version() {
         let (_dir, command) = script("echo 9.9.9\n");
-        let err = probe(&command).unwrap_err();
+        let err = probe_retrying_etxtbsy(&command).unwrap_err();
         assert_eq!(err.reason(), UNSUPPORTED_HARNESS_VERSION);
     }
 
     #[test]
     fn probe_refuses_unparseable_output() {
         let (_dir, command) = script("echo 'version: unknown'\n");
-        let err = probe(&command).unwrap_err();
+        let err = probe_retrying_etxtbsy(&command).unwrap_err();
         assert_eq!(err.reason(), UNSUPPORTED_HARNESS_VERSION);
     }
 
@@ -598,7 +646,7 @@ mod tests {
     #[test]
     fn probe_refuses_a_command_that_exits_unsuccessfully() {
         let (_dir, command) = script("echo 1.18.30\nexit 42\n");
-        let err = probe(&command).unwrap_err();
+        let err = probe_retrying_etxtbsy(&command).unwrap_err();
         assert_eq!(err.reason(), PROBE_FAILED);
         assert!(
             matches!(err, ProbeError::NonZeroExit { .. }),
@@ -611,7 +659,8 @@ mod tests {
     fn probe_enforces_a_process_tree_timeout() {
         let (_dir, command) = script("sleep 5\n");
         let start = Instant::now();
-        let err = probe_with_timeout(&command, Duration::from_millis(150)).unwrap_err();
+        let err =
+            probe_with_timeout_retrying_etxtbsy(&command, Duration::from_millis(150)).unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err.reason(), PROBE_FAILED);
         assert_eq!(err, ProbeError::TimedOut);
@@ -636,7 +685,7 @@ mod tests {
         let (_script_dir, command) = script(&body);
 
         let start = Instant::now();
-        let err = probe_with_timeout(&command, FIXTURE_TIMEOUT).unwrap_err();
+        let err = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT).unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err, ProbeError::TimedOut);
         // Without the tree kill, `sleep 30` outlives the probe's deadline by a wide margin.
@@ -667,7 +716,7 @@ mod tests {
         );
         let (_script_dir, command) = script(&body);
         let start = Instant::now();
-        let row = probe_with_timeout(&command, FIXTURE_TIMEOUT)
+        let row = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT)
             .expect("the version line is still read from the bounded pipe");
         let elapsed = start.elapsed();
         assert_eq!(row.opencode_version, "1.18.30");
@@ -704,7 +753,7 @@ mod tests {
         let (_script_dir, command) = script(&body);
 
         let start = Instant::now();
-        let result = probe_with_timeout(&command, FIXTURE_TIMEOUT);
+        let result = probe_with_timeout_retrying_etxtbsy(&command, FIXTURE_TIMEOUT);
         let elapsed = start.elapsed();
         // The survivor is the wrapper's leaked process, not something the probe can reach; reap it
         // FIRST, so a failing assertion below cannot leave a sleeper behind.
@@ -732,7 +781,8 @@ mod tests {
     fn probe_drains_output_larger_than_the_pipe_buffer() {
         let (_dir, command) = script("yes 1.18.30 | head -c 200000\n");
         let start = Instant::now();
-        let err = probe_with_timeout(&command, Duration::from_secs(5)).unwrap_err();
+        let err =
+            probe_with_timeout_retrying_etxtbsy(&command, Duration::from_secs(5)).unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err, ProbeError::UnparseableOutput);
         assert!(
@@ -754,7 +804,7 @@ mod tests {
         let (_dir, command) = script(
             "if [ -n \"${PB0_AMBIENT_CREDENTIAL:-}\" ]; then echo leaked; else echo 1.18.30; fi\n",
         );
-        let result = probe(&command);
+        let result = probe_retrying_etxtbsy(&command);
         unsafe {
             std::env::remove_var("PB0_AMBIENT_CREDENTIAL");
         }
