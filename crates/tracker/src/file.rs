@@ -947,8 +947,12 @@ mod tests {
         fn new(content: &str) -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let dir = std::env::temp_dir().join(format!(
-                "rhapsody-file-tracker-{}-{seq}",
+                "rhapsody-file-tracker-{}-{seq}-{nonce}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -964,7 +968,9 @@ mod tests {
 
     impl Drop for TempSource {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
         }
     }
 

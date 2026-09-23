@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.rhapsody.tmp-prune (STUDIO-1031) — a TEMPLATE, not an installed job.
+
+  A daily launchd job that runs harness/ci/prune-tmp-rhapsody.sh to clear `rhapsody-*` scratch dirs
+  older than a day from the runner's `$TMPDIR`. The CI leak gate catches a fresh leak; this keeps a
+  long-lived shared `/private/var/folders/.../T` from ever accumulating one again.
+
+  Replace __REPO__ with this checkout's absolute path, then install (see harness/ci/README.md):
+
+      sed "s#__REPO__#$PWD#g" harness/ci/com.rhapsody.tmp-prune.plist \
+        > ~/Library/LaunchAgents/com.rhapsody.tmp-prune.plist
+      launchctl load -w ~/Library/LaunchAgents/com.rhapsody.tmp-prune.plist
+
+  Do this on the Mac CI runners and on any shared dev Mac. Do not add it to a shell profile.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rhapsody.tmp-prune</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/harness/ci/prune-tmp-rhapsody.sh</string>
+    </array>
+    <!-- 04:15 daily. StartCalendarInterval uses LOCAL time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

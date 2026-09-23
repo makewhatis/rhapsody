@@ -3559,7 +3559,8 @@ mod tests {
         tr.open_by_labels = vec![labelled("old", &["rhapsody:@alice"])];
         let tr = Arc::new(tr);
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_room(
             teams,
             Arc::clone(&tr),
@@ -3598,7 +3599,8 @@ mod tests {
         tr.candidates = vec![labelled("i1", &["docs"])];
         let tr = Arc::new(tr);
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_room(
             teams_model(vec![ident("alice", &["rust"])]),
             Arc::clone(&tr),
@@ -3632,7 +3634,8 @@ mod tests {
         tr.candidates = vec![labelled("i1", &["docs"]), labelled("i2", &["docs"])];
         let tr = Arc::new(tr);
         let arbiter = FakeArbiter::answering(vec![Err("model exploded".to_string())]);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_room(
             teams_model(vec![ident("alice", &["rust"])]),
             Arc::clone(&tr),
@@ -3796,7 +3799,8 @@ mod tests {
         let mut tr = Fake::new();
         tr.candidates = vec![in_review("i1", &["docs"]), in_review("i2", &[])];
         let tr = Arc::new(tr);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let mut teams = teams_model(vec![ident("alice", &[]), ident("bob", &[])]);
         teams.manager.mode = ManagerMode::Labels;
         let d = deps_with_room(
@@ -4025,7 +4029,8 @@ mod tests {
         ];
         let tr = Arc::new(tr);
         let history = FakeHistory::new(&[("STUDIO-670", &["alice"])]);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[]), ident("bob", &[])]),
             Arc::clone(&tr),
@@ -4071,7 +4076,8 @@ mod tests {
             in_review("STUDIO-500", &["rhapsody:@alice"]),
         ];
         let tr = Arc::new(tr);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[])]),
             Arc::clone(&tr),
@@ -4099,7 +4105,8 @@ mod tests {
         let mut tr = Fake::new();
         tr.candidates = vec![in_review("STUDIO-572", &["rhapsody:@alice"])];
         let tr = Arc::new(tr);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[])]),
             Arc::clone(&tr),
@@ -4144,7 +4151,8 @@ mod tests {
         let mut tr = Fake::new();
         tr.candidates_err = Some(rhapsody_tracker::TrackerError::Other("linear down".into()));
         let tr = Arc::new(tr);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[])]),
             Arc::clone(&tr),
@@ -4165,7 +4173,8 @@ mod tests {
         tr.candidates = vec![in_review("STUDIO-572", &["rhapsody:@alice"])];
         let tr = Arc::new(tr);
         let history = FakeHistory::new(&[]);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         // The daemon has a config and trackers, but no review state is named — the shape a read
         // that straddled the reload's two writes used to be able to produce.
         let d = deps_with_history_states(
@@ -4230,7 +4239,8 @@ mod tests {
         ];
         let tr = Arc::new(tr);
         let history = FakeHistory::reaching_back(&[], 30);
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[])]),
             Arc::clone(&tr),
@@ -4273,7 +4283,8 @@ mod tests {
         ];
         let tr = Arc::new(tr);
         let history = FakeHistory::horizonless();
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = deps_with_history(
             teams_model(vec![ident("alice", &[])]),
             Arc::clone(&tr),
@@ -4533,7 +4544,8 @@ mod tests {
         tr.add_label_fail_first = 1;
         let tr = Arc::new(tr);
         let handle = Arc::new(TriageHandle::new());
-        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let room_dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(room_dir.child("room")));
         let d = TriageDeps {
             room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
             ..deps_with_handle(

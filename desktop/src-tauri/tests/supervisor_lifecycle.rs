@@ -44,17 +44,49 @@ fn env(kvs: &[&str]) -> Vec<String> {
     kvs.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// A unique temp path (parent exists) that a test may create a file under.
-fn temp_path(name: &str) -> PathBuf {
-    use std::sync::atomic::AtomicU64;
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "rhapsody-d2-sup-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir.join(name)
+/// A unique scratch directory removed on drop (STUDIO-1031), so a lifecycle run leaves no
+/// `rhapsody-d2-sup-*` entry in `$TMPDIR`. `Deref`s to `Path` for `dir.join(..)` call sites.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> TempDir {
+        use std::sync::atomic::AtomicU64;
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "rhapsody-d2-sup-{}-{}-{nonce}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir { path }
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 // TestStartBecomesHealthyThenStop: Start launches the daemon, waits for /healthz to go green, reports
@@ -88,7 +120,8 @@ async fn start_becomes_healthy_then_stop() {
 #[tokio::test]
 async fn restarts_on_crash() {
     let bin = fake_daemon();
-    let marker = temp_path("crash.marker");
+    let dir = TempDir::new();
+    let marker = dir.join("crash.marker");
     let sup = Supervisor::new(fast_options(
         bin,
         &env(&[&format!("FAKE_CRASH_MARKER={}", marker.display())]),
@@ -321,7 +354,8 @@ async fn start_fails_fast_when_binary_missing() {
 #[tokio::test]
 async fn start_fails_fast_when_binary_not_executable() {
     use std::os::unix::fs::PermissionsExt;
-    let p = temp_path("rhapsodyd");
+    let dir = TempDir::new();
+    let p = dir.join("rhapsodyd");
     std::fs::write(&p, b"not an executable").expect("write");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("chmod"); // no exec bit
     let sup = Supervisor::new(fast_options(p.to_str().unwrap(), &[]));

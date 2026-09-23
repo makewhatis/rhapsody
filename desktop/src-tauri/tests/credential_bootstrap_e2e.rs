@@ -114,11 +114,54 @@ async fn wait_healthy(port: u16) -> bool {
 /// workspace/logging roots inside this test's own temp dir, so a real daemon boots cleanly and
 /// reaches its control loop instead of exiting on config validation before this test's actual
 /// subject (the credential bootstrap) is ever exercised.
-fn temp_workflow_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rd-cbe2e-{name}-{}", std::process::id()));
+/// A scratch dir removed on drop (STUDIO-1031). `Deref`s to `Path`, so `dir.join(..)` keeps working.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(prefix: &str) -> TempDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{nonce}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn temp_workflow_dir(name: &str) -> TempDir {
+    let dir = TempDir::new(&format!("rd-cbe2e-{name}"));
     let ws = dir.join("ws");
     let logs = dir.join("logs");
-    std::fs::create_dir_all(&dir).unwrap();
     let body = format!(
         "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\nlogging:\n  dir: {logs}\nstorage:\n  path: \"off\"\n---\nWork the issue.\n",
         ws = ws.display(),

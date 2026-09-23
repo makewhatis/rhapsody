@@ -369,8 +369,12 @@ mod tests {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let path = std::env::temp_dir().join(format!(
-                "rhapsody-telemetry-{tag}-{}-{n}",
+                "rhapsody-telemetry-{tag}-{}-{n}-{nonce}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).expect("create temp dir");
@@ -380,7 +384,9 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
     }
 
