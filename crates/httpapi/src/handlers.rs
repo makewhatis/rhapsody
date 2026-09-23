@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_method_not_allowed() {
         let base = spawn(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .post(format!("{base}/healthz"))
             .send()
             .await
@@ -225,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_head_allowed() {
         let base = spawn(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .head(format!("{base}/healthz"))
             .send()
             .await
@@ -267,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn version_method_not_allowed() {
         let base = spawn(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .post(format!("{base}/api/v1/version"))
             .send()
             .await
@@ -329,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn state_method_not_allowed() {
         let base = spawn(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .post(format!("{base}/api/v1/state"))
             .send()
             .await
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn state_head_allowed() {
         let base = spawn(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .head(format!("{base}/api/v1/state"))
             .send()
             .await
@@ -371,7 +371,7 @@ mod tests {
             operations: vec!["poll".to_string(), "reconcile".to_string()],
         });
         let base = spawn(provider).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .post(format!("{base}/api/v1/refresh"))
             .send()
             .await

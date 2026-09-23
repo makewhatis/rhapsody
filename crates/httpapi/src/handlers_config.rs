@@ -260,7 +260,7 @@ Default prompt for {{ issue.identifier }}.\n";
     }
 
     async fn post_config(base: &str, payload: &Value) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::testutil::operator_client()
             .post(format!("{base}/api/v1/config"))
             .header("content-type", "application/json")
             .body(payload.to_string())
@@ -346,7 +346,7 @@ Default prompt for {{ issue.identifier }}.\n";
     async fn config_method_not_allowed() {
         let wf = TempWorkflow::new(SAMPLE_WORKFLOW_MD);
         let base = spawn(&wf.path()).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .delete(format!("{base}/api/v1/config"))
             .send()
             .await
@@ -960,7 +960,7 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    capabilities:\n  
     #[tokio::test]
     async fn capabilities_method_not_allowed() {
         let base = spawn_provider(FakeProvider::ok(empty_snapshot())).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::testutil::operator_client()
             .post(format!("{base}/api/v1/capabilities"))
             .send()
             .await
