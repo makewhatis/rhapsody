@@ -619,6 +619,44 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(title).not.toMatch(/run 804.*run 804/);
   });
 
+  // The WIRING half of the round-6 fix: `historyPollInterval` is unit-tested, but the rule only
+  // reaches the strip through `useIssueHistory`'s `refetchInterval`. Nothing else on the detail
+  // invalidates `["issue-history", …]`, `staleTime` is 10s and window-focus refetch is off, so
+  // dropping that one wiring line brings the round-6 bug back in full — a violet "reviewing" chip
+  // that never leaves while the page stays open — and every other test in this file stays green.
+  // So this drives a real poll tick, the way the ledger test below does, and pins the flip.
+  it("flips a live review's chip to its verdict while the page stays open", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const author = run({ id: 700, started_at: "2026-08-30T20:21:00Z" });
+    const live = run({
+      id: 802,
+      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "",
+      outcome: "running",
+    });
+    mountDetail([author], vi.fn(), [live]);
+    await waitFor(() =>
+      expect(document.querySelector(".trrev")?.getAttribute("data-verdict")).toBe("reviewing"),
+    );
+
+    // The review ends between polls: the next payload carries its verdict, and only the strip's
+    // own refresh can bring it in.
+    h.fetchIssueHistory.mockResolvedValue({
+      issue_identifier: "STUDIO-654",
+      runs: [author],
+      reviews: [
+        { ...live, ended_at: "2026-09-01T18:00:00Z", outcome: "completed", verdict: "approved" },
+      ],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 1);
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".trrev")?.getAttribute("data-verdict")).toBe("approved"),
+    );
+  });
+
   // Acceptance — "A review entry opens its own run trace". A review is a real run with a real id,
   // so selecting it drives the same detail fetch and the same header pill as an attempt.
   it("opens a review run's own trace from the review strip", async () => {

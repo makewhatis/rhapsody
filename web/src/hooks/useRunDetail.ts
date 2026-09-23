@@ -144,10 +144,11 @@ export function historyPollInterval(data: IssueHistoryResponse | undefined): num
 // record of who each attempt was dispatched as, which is what keeps a FINISHED run attributed
 // once its teammate has dropped off the live roster.
 //
-// It rides the attempt list's own cadence (`useIssueHistory`, 10s) rather than the run poll's,
-// because it answers the same question that list does: which runs exist and whose they were. A
-// routing row is written once at dispatch and never rewritten, so nothing here has to keep up
-// with a run in flight — only with a ticket that gains one.
+// It shares the attempt list's own 10s cadence (the `staleTime` `useIssueHistory` keeps when no
+// review round is live) rather than the run poll's, because it answers the same question that list
+// does: which runs exist and whose they were. A routing row is written once at dispatch and never
+// rewritten, so nothing here has to keep up with a run in flight — only with a ticket that gains
+// one.
 export function useRunIdentityEvents(identifier: string, enabled = true) {
   return useQuery<EventHit[]>({
     queryKey: ["run-identities", identifier],
