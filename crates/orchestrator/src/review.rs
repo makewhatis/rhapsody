@@ -96,6 +96,13 @@ pub struct ReviewRun {
     /// the flag that makes that first round full. Read from the store BEFORE this dispatch
     /// overwrites the row, so it is the prior round's, never this one's.
     pub prior_sha: String,
+    /// The patch-id of `head_sha` against the pull request's base (STUDIO-1009; STUDIO-977's stable
+    /// patch-id). Computed OFF the control task by the watcher, which is the only place that can
+    /// spend the `gh` comparison, and carried here so the completion path can record it on the watch
+    /// row's `last_completed_patch_id` without a `gh` call on the control task. Empty when the watcher
+    /// had no comparison to reuse (a first round, or a head it did not need to fingerprint), which the
+    /// approval predicate reads as "unknown" and fails closed on.
+    pub head_patch_id: String,
 }
 
 /// The two coordinates the WORKER needs to provision a review checkout: which pull request's head
@@ -747,11 +754,51 @@ impl Orchestrator {
             );
             return;
         };
+        // The generation is read from the durable bound (STUDIO-1009; §5.4): this completion is
+        // recorded in whatever generation the pull request is on NOW, so a later `/clear` (which
+        // bumps it) invalidates this approval. A missing bound row reads as generation 0, which no
+        // real generation can be — a completion recorded before the pull request's generation was
+        // established can never satisfy the predicate.
+        let generation = self.review_generation(&run.watch_key());
+        let completed = crate::reviewevidence::completion_record(
+            status,
+            generation,
+            &run.head_sha,
+            &run.head_patch_id,
+        );
+        let Some(completed) = completed else {
+            // Unreachable for the closed status domain above, but kept as a value rather than a
+            // panic: the record is what the four columns hold, and no non-verdict status has one.
+            tracing::error!(
+                review = %run.key(),
+                status = %status,
+                "no completed-review record for a status the closed domain accepted"
+            );
+            return;
+        };
         if let Err(e) = self
             .store()
-            .mark_review_completed(&run.watch_key(), &run.head_sha, status)
+            .record_review_completion(&run.watch_key(), status, &completed)
         {
             tracing::warn!(review = %run.key(), err = %e, "recording the reviewed head failed");
+        }
+    }
+
+    /// The loop generation of the pull request behind `key` (STUDIO-1009; §5.1), read from the
+    /// durable bound. `0` when the daemon holds no bound row for it, which fails the approval
+    /// predicate closed rather than treating an unknown generation as current.
+    pub(crate) fn review_generation(&self, key: &ReviewWatchKey) -> i64 {
+        let pr = crate::prstate::PrCoord::new(&key.owner, &key.repo, key.number);
+        match self
+            .store()
+            .review_bound(&crate::reviewwatch::churn_key(&pr))
+        {
+            Ok(Some(bound)) => bound.generation,
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!(pr = %pr, err = %e, "reading the pull request's review generation failed; treating it as unknown");
+                0
+            }
         }
     }
 
@@ -794,10 +841,11 @@ impl Orchestrator {
         let plan =
             crate::reviewfindings::plan_review_findings(&crate::reviewfindings::CompletionInputs {
                 pr: &pr,
-                generation: crate::reviewfindings::FINDING_GENERATION_PLACEHOLDER,
+                generation: self.review_generation(&run.watch_key()),
                 reviewer: &run.reviewer,
                 run_id,
                 head_sha: &run.head_sha,
+                head_patch_id: &run.head_patch_id,
                 approved: status == REVIEW_STATUS_APPROVED,
                 block,
                 prior: &prior,
@@ -814,7 +862,7 @@ impl Orchestrator {
         if plan.resolve_open
             && let Err(e) = self.store().resolve_review_findings(
                 &pr,
-                crate::reviewfindings::FINDING_GENERATION_PLACEHOLDER,
+                self.review_generation(&run.watch_key()),
                 &run.reviewer,
                 &run_id.to_string(),
             )
@@ -1002,6 +1050,7 @@ mod tests {
             head_sha: head.to_string(),
             introduced_by: "handoff".to_string(),
             prior_sha: String::new(),
+            head_patch_id: String::new(),
         }
     }
 
@@ -2999,6 +3048,51 @@ mod tests {
             assert_eq!(row.status, good);
             assert_eq!(row.last_reviewed_sha, HEAD_A);
         }
+    }
+
+    /// STUDIO-1009: a completed review records the loop generation and the reviewed change's
+    /// patch-id; a later truncated round leaves the four `last_completed_*` columns untouched.
+    #[test]
+    fn a_completion_records_generation_and_patch_id_but_a_truncation_does_not() {
+        use rhapsody_store::{REVIEW_COMPLETION_APPROVE, ReviewCompleted};
+        let (mut o, _d) = orch_with_review(true);
+        let mut run = review_run("alice", HEAD_A);
+        run.head_patch_id = "pid-A".to_string();
+        o.dispatch_review(run.clone());
+        o.store()
+            .ensure_review_generation(&crate::reviewwatch::churn_key(
+                &crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number),
+            ))
+            .expect("generation");
+
+        o.record_review_completed(&run, REVIEW_STATUS_APPROVED);
+        assert_eq!(
+            o.store()
+                .review_completed(&run.watch_key())
+                .expect("read")
+                .expect("record"),
+            ReviewCompleted {
+                generation: 1,
+                sha: HEAD_A.to_string(),
+                patch_id: "pid-A".to_string(),
+                verdict: REVIEW_COMPLETION_APPROVE.to_string(),
+            }
+        );
+
+        o.record_review_truncated(&run);
+        assert_eq!(
+            o.store()
+                .review_completed(&run.watch_key())
+                .expect("read")
+                .expect("record"),
+            ReviewCompleted {
+                generation: 1,
+                sha: HEAD_A.to_string(),
+                patch_id: "pid-A".to_string(),
+                verdict: REVIEW_COMPLETION_APPROVE.to_string(),
+            },
+            "a truncated round must not touch the completed record"
+        );
     }
 
     /// A FAILED review run is recorded failed and, like a clean one, schedules no retry: a `pr:`

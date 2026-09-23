@@ -117,6 +117,11 @@ pub struct PrObservation {
     /// round exactly as before. A `gh` read that failed, timed out or could not fingerprint the
     /// whole diff leaves this empty on purpose.
     pub unchanged_from: Vec<String>,
+    /// The current head's patch-id, when the off-loop watcher computed one (STUDIO-1009; STUDIO-977's
+    /// stable patch-id). Filled only when the watcher already read the head's diff against the base,
+    /// so no `gh` call is spent for this field alone; empty means "not computed", which the review
+    /// completion records as an unknown patch-id and the approval predicate fails closed on.
+    pub head_patch_id: String,
 }
 
 /// What one tick learned. `deferred` and `failed` are reported rather than logged-and-forgotten so
@@ -170,6 +175,7 @@ pub async fn sweep_pr_states(
                 // The diff comparison is the off-loop watcher's, not this sweep's: it needs the
                 // watch rows' reviewed SHAs, which live on the control task (STUDIO-960).
                 unchanged_from: Vec::new(),
+                head_patch_id: String::new(),
             }),
             Err(e) => {
                 sweep.failed.push(pr.clone());

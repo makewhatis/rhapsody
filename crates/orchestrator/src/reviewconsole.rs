@@ -303,9 +303,11 @@ impl Orchestrator {
     /// (its own test pins that), which is the right size for a pull request the cap merely reached;
     /// this is for the one an operator has decided the budget itself was wrong about.
     ///
-    /// It clears the COUNTER and touches no row: unlike re-run it does not re-arm anything, so
-    /// nothing is dispatched that was not already due. Dropping the entry is the whole of it, so a
-    /// cleared pull request starts its next round from zero exactly as a re-introduced one does.
+    /// It clears the COUNTER and touches no WATCH row: unlike re-run it does not re-arm anything, so
+    /// nothing is dispatched that was not already due. Zeroing the counter is the whole of the budget
+    /// reset, and the durable bound row is KEPT (with its generation bumped, STUDIO-1009) rather than
+    /// deleted, so a cleared pull request starts its next round from zero exactly as a re-introduced
+    /// one does while the generation records that the clear happened.
     ///
     /// Deliberately NOT allowlist-gated, for [`Self::handle_review_dismiss`]'s reason: it performs
     /// no checkout and no dispatch (dispatch re-checks the allowlist itself), and gating it would
@@ -337,13 +339,24 @@ impl Orchestrator {
         // where both halves may run, and an un-answered author round left behind would charge a
         // round against the fresh budget the moment some queued review finally landed.
         self.author_rounds_pending.remove(&churn_key(pr));
-        // Durably, and unconditionally: the deliberate clear is the documented way to lift a bound
-        // now that a restart no longer does it (STUDIO-956), so it must leave nothing behind for a
-        // later boot to rehydrate — including a row this process never saw.
-        self.forget_review_bound(pr);
-        if !cleared_counter && !cleared_decision {
+        // A refusal writes nothing at all — not even a generation. A clear that clears nothing is a
+        // different fact from a clear that happened, and creating a bound row for a pull request the
+        // daemon has never watched would be a phantom.
+        let watched = self.review_pr_is_watched(pr);
+        if !cleared_counter && !cleared_decision && !watched {
             return ReviewControlOutcome::Refused(
                 "no review budget to clear for that pull request",
+            );
+        }
+        // STUDIO-1009 (§7.4): the operator's clear is the ONE event that bumps the loop generation,
+        // and it does so on the same write that zeroes the counter and the decision. The row is NOT
+        // deleted (the old `forget_review_bound` did): a deleted row would lose the generation, so a
+        // later round could read the pull request as never cleared. `increment_review_generation`
+        // upserts, so a watched pull request with no counter still leaves a generation behind.
+        if let Err(e) = self.store().increment_review_generation(&churn_key(pr)) {
+            tracing::warn!(
+                pr = %pr, err = %e,
+                "ticketless review: clearing the pull request's review bound failed"
             );
         }
         tracing::info!(

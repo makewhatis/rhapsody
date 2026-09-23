@@ -12,8 +12,10 @@
 //! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909),
 //! step 11 (`rhapsody_review_bound`, STUDIO-956), step 12 (`rhapsody_review_verdicts`,
 //! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007), step 14
-//! (`rhapsody_review_finding`, STUDIO-1008) and step 15
-//! (`rhapsody_breaker_crossings`, STUDIO-1026) have no Go counterpart: they are
+//! (`rhapsody_review_finding`, STUDIO-1008), step 15
+//! (`rhapsody_breaker_crossings`, STUDIO-1026) and step 16 (the review evidence ledger's
+//! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009)
+//! have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
@@ -45,12 +47,13 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 15 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 16 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
-/// ledger, then the structured review findings, then the breaker's persisted crossings) and are
+/// ledger, then the structured review findings, then the breaker's persisted crossings, then the
+/// review evidence ledger) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -328,6 +331,32 @@ CREATE TABLE IF NOT EXISTS rhapsody_breaker_crossings (
   notified_rounds    INTEGER NOT NULL DEFAULT 0,
   notified_providers TEXT    NOT NULL DEFAULT ''
 );
+"#,
+    // v15 -> v16: the review EVIDENCE LEDGER (STUDIO-1009, design record
+    // `manager-agent-design.md` §5.1, §5.2, §5.4). Rhapsody-only, on Rhapsody-only tables, so the
+    // `rhapsody_` prefix gates every column out of the Go-recaptured schema golden by name exactly
+    // as steps 7-15 are.
+    //
+    // `rhapsody_review_bound` gains the per-pull-request `generation` (§5.1) and `evidence_rev`
+    // (§5.2). `rhapsody_review_watch` gains the four `last_completed_*` columns (§5.4), which
+    // describe the last review that COMPLETED with a verdict — the durable half of "approved at the
+    // current patch", independent of the transient `status` column a re-introduction resets.
+    //
+    // Every existing row is brought onto generation 1 rather than left at the 0 default: a pull
+    // request the daemon was already watching or counting at this migration is one whose FIRST
+    // introduction has already happened, and a real generation of 1 can never be confused with the
+    // M1 finding rows' placeholder 0. The finding rows (STUDIO-1008) are backfilled onto the same
+    // value in the same step, so the `(pr, generation, …)` finding key matches the bound row the
+    // moment M2 starts writing real generations. On a fresh database the UPDATEs match nothing.
+    r#"
+ALTER TABLE rhapsody_review_bound ADD COLUMN generation   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_bound ADD COLUMN evidence_rev INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_sha        TEXT    NOT NULL DEFAULT '';
+ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_patch_id   TEXT    NOT NULL DEFAULT '';
+ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_verdict    TEXT    NOT NULL DEFAULT '';
+UPDATE rhapsody_review_bound   SET generation = 1;
+UPDATE rhapsody_review_finding SET generation = 1;
 "#,
 ];
 
@@ -1944,7 +1973,7 @@ impl Store for Sqlite {
     fn load_review_bounds(&self) -> Result<Vec<ReviewBoundRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT pr, dispatches, decision, head, rounds, findings, reason \
+            "SELECT pr, dispatches, decision, head, rounds, findings, reason, generation, evidence_rev \
              FROM rhapsody_review_bound ORDER BY pr",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1968,6 +1997,8 @@ impl Store for Sqlite {
                         })
                     })
                     .transpose()?,
+                generation: row.get(7)?,
+                evidence_rev: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1975,6 +2006,140 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn ensure_review_generation(&self, pr: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // DO NOTHING on conflict: a re-introduction must not bump the generation (§5.1, the F9
+        // rule), so the only write this method ever makes is the FIRST one for a pull request.
+        conn.execute(
+            "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1)
+             ON CONFLICT(pr) DO NOTHING",
+            params![pr],
+        )?;
+        Ok(())
+    }
+
+    fn increment_review_generation(&self, pr: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // The operator's `/clear`: generation +1 AND the counter/decision zeroed, in one statement so
+        // the two halves of the reset can never come apart. A row that does not exist is created at
+        // generation 1 — a clear on a watched pull request the daemon never charged still leaves a
+        // generation behind, which is what makes "a clear increments the generation" true for it too.
+        conn.execute(
+            "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1)
+             ON CONFLICT(pr) DO UPDATE SET
+               generation = generation + 1,
+               dispatches = 0,
+               decision   = '',
+               head       = '',
+               rounds     = 0,
+               findings   = '',
+               reason     = ''",
+            params![pr],
+        )?;
+        Ok(())
+    }
+
+    fn set_review_evidence_rev(&self, pr: &str, evidence_rev: i64) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_review_bound (pr, evidence_rev) VALUES (?1, ?2)
+             ON CONFLICT(pr) DO UPDATE SET evidence_rev = excluded.evidence_rev",
+            params![pr, evidence_rev],
+        )?;
+        Ok(())
+    }
+
+    fn review_bound(&self, pr: &str) -> Result<Option<ReviewBoundRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT pr, dispatches, decision, head, rounds, findings, reason, generation, evidence_rev \
+             FROM rhapsody_review_bound WHERE pr = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![pr], |row| {
+            let decision: String = row.get(2)?;
+            let findings: String = row.get(5)?;
+            Ok(ReviewBoundRow {
+                pr: row.get(0)?,
+                dispatches: row.get(1)?,
+                adjudication: (decision == REVIEW_ADJUDICATION_SHIP
+                    || decision == REVIEW_ADJUDICATION_ESCALATE)
+                    .then(|| {
+                        Ok::<_, rusqlite::Error>(ReviewAdjudication {
+                            decision,
+                            head: row.get(3)?,
+                            rounds: row.get(4)?,
+                            findings: split_findings(&findings),
+                            reason: row.get(6)?,
+                        })
+                    })
+                    .transpose()?,
+                generation: row.get(7)?,
+                evidence_rev: row.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn record_review_completion(
+        &self,
+        key: &ReviewWatchKey,
+        status: &str,
+        completed: &ReviewCompleted,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // `last_reviewed_sha` and `last_completed_sha` are written together because they describe the
+        // same completed round; the four `last_completed_*` columns are this method's alone.
+        conn.execute(
+            &format!(
+                "UPDATE rhapsody_review_watch \
+                    SET last_reviewed_sha = ?5, status = ?6, \
+                        last_completed_generation = ?7, last_completed_sha = ?8, \
+                        last_completed_patch_id = ?9, last_completed_verdict = ?10 \
+                  WHERE {REVIEW_WATCH_KEY_WHERE}"
+            ),
+            params![
+                key.owner,
+                key.repo,
+                key.number,
+                key.reviewer,
+                completed.sha,
+                status,
+                completed.generation,
+                completed.sha,
+                completed.patch_id,
+                completed.verdict,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn review_completed(
+        &self,
+        key: &ReviewWatchKey,
+    ) -> Result<Option<ReviewCompleted>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT last_completed_generation, last_completed_sha, last_completed_patch_id, \
+                    last_completed_verdict \
+               FROM rhapsody_review_watch WHERE {REVIEW_WATCH_KEY_WHERE}"
+        ))?;
+        let mut rows = stmt.query_map(&review_watch_key_params(key)[..], |row| {
+            Ok(ReviewCompleted {
+                generation: row.get(0)?,
+                sha: row.get(1)?,
+                patch_id: row.get(2)?,
+                verdict: row.get(3)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     fn save_review_done(&self, row: ReviewDoneRow) -> Result<(), StoreError> {
@@ -4445,11 +4610,15 @@ mod tests {
                         findings: vec!["alice asked for changes at aaa111".into()],
                         reason: "the two reviewers disagree about the schema".into(),
                     }),
+                    generation: 0,
+                    evidence_rev: 0,
                 },
                 ReviewBoundRow {
                     pr: "makewhat/rhapsody#85".into(),
                     dispatches: 2,
                     adjudication: None,
+                    generation: 0,
+                    evidence_rev: 0,
                 },
             ],
             "both halves of the bound, and a counter-only row, must survive the restart"
@@ -4570,6 +4739,8 @@ mod tests {
                 pr: pr.into(),
                 dispatches: 8,
                 adjudication: None,
+                generation: 0,
+                evidence_rev: 0,
             }],
             "the re-run's override drops the decision and keeps the budget"
         );
