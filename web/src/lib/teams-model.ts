@@ -92,6 +92,10 @@ export interface TeamsDraft {
   apiKeyStored: boolean;
   bankPrefix: string;
   recallTopK: number;
+  /** The SHARED team bank id (STUDIO-1040); "" ⇒ off. */
+  teamBank: string;
+  /** How many shared facts a recall adds; the daemon's default is `DEFAULT_TEAM_RECALL_TOP_K`. */
+  teamRecallTopK: number;
   promptBudgetBytes: number;
   roster: RosterDraft[];
 }
@@ -115,6 +119,8 @@ export const DEFAULT_TIMEOUT_MS = 60000;
 export const MIN_MODEL_TIMEOUT_MS = 15000;
 export const DEFAULT_BANK_PREFIX = "agent-";
 export const DEFAULT_RECALL_TOP_K = 8;
+/** `memory.team_recall_top_k` (STUDIO-1040). */
+export const DEFAULT_TEAM_RECALL_TOP_K = 3;
 export const DEFAULT_PROMPT_BUDGET_BYTES = 16000;
 export const DEFAULT_QUORUM_REVIEWERS = 2;
 /** `MIN_QUORUM_REVIEWERS` — a quorum of zero is not a quorum, it is `enabled: false`. */
@@ -141,6 +147,8 @@ export function emptyDraft(): TeamsDraft {
     apiKeyStored: false,
     bankPrefix: DEFAULT_BANK_PREFIX,
     recallTopK: DEFAULT_RECALL_TOP_K,
+    teamBank: "",
+    teamRecallTopK: DEFAULT_TEAM_RECALL_TOP_K,
     promptBudgetBytes: DEFAULT_PROMPT_BUDGET_BYTES,
     roster: [emptyRow()],
   };
@@ -197,6 +205,8 @@ export function toDraft(config: TeamsConfig | undefined, present: boolean): Team
     apiKeyStored: secret,
     bankPrefix: config.memory?.bank_prefix ?? DEFAULT_BANK_PREFIX,
     recallTopK: config.memory?.recall_top_k ?? DEFAULT_RECALL_TOP_K,
+    teamBank: config.memory?.team_bank ?? "",
+    teamRecallTopK: config.memory?.team_recall_top_k ?? DEFAULT_TEAM_RECALL_TOP_K,
     promptBudgetBytes: config.prompt_budget_bytes ?? DEFAULT_PROMPT_BUDGET_BYTES,
     roster:
       config.roster?.length > 0
@@ -352,6 +362,11 @@ export function toConfig(draft: TeamsDraft, base?: TeamsConfig): Partial<TeamsCo
       // teammate at a bank nobody else resolves.
       bank_prefix: draft.bankPrefix.trim(),
       recall_top_k: draft.recallTopK,
+      // STUDIO-1040. Trimmed like `bank_prefix`: it is joined to the banks root and becomes a
+      // directory name (or a URL segment), so whitespace would point the team at a bank nobody
+      // resolves.
+      team_bank: draft.teamBank.trim(),
+      team_recall_top_k: draft.teamRecallTopK,
     },
     quorum: { ...(base?.quorum ?? {}), enabled: draft.quorumEnabled, reviewers: draft.quorumReviewers },
     roster,
@@ -395,6 +410,14 @@ export function teamsYamlSnippet(draft: TeamsDraft): string {
   if (draft.backend !== "none") {
     if (draft.bankPrefix !== DEFAULT_BANK_PREFIX) lines.push(`  bank_prefix: ${draft.bankPrefix}`);
     if (draft.recallTopK !== DEFAULT_RECALL_TOP_K) lines.push(`  recall_top_k: ${draft.recallTopK}`);
+  }
+  // The shared team bank is independent of the backend: it is meaningful for `local` and
+  // `hindsight` alike (STUDIO-1040).
+  if (draft.backend !== "none" && draft.teamBank.trim()) {
+    lines.push(`  team_bank: ${draft.teamBank.trim()}`);
+    if (draft.teamRecallTopK !== DEFAULT_TEAM_RECALL_TOP_K) {
+      lines.push(`  team_recall_top_k: ${draft.teamRecallTopK}`);
+    }
   }
 
   if (draft.promptBudgetBytes !== DEFAULT_PROMPT_BUDGET_BYTES) {

@@ -70,6 +70,28 @@ pub fn inject_daemon_mcp(
         return Ok(None);
     }
 
+    let server = daemon_mcp_server(daemon_bin, workflow_path);
+    let doc = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": { SERVER_KEY: server },
+    });
+
+    let out = serde_json::to_string_pretty(&doc).map_err(|e| AgentError::Other(e.to_string()))?;
+    let dst = state_dir.join(INJECTED_CONFIG_NAME);
+    std::fs::write(&dst, out)
+        .map_err(|e| AgentError::Other(format!("write opencode mcp config: {e}")))?;
+    Ok(Some(dst))
+}
+
+/// The `symphony` MCP server definition in opencode's config shape: ONE `command` array (argv0
+/// first), not claude's `{command, args}` pair. Taken from the config that produced every committed
+/// opencode capture, `harness/harness-spike/opencode/opencode.json`.
+///
+/// Shared by [`inject_daemon_mcp`] (the legacy `OPENCODE_CONFIG` file path) and brokered mode's
+/// authoritative generated `OPENCODE_CONFIG_CONTENT`, so the two can never name a different server
+/// (`provider-broker-design.md` §9.2's "the daemon MCP definition … is part of the authoritative
+/// generated config").
+pub fn daemon_mcp_server(daemon_bin: &str, workflow_path: &str) -> serde_json::Value {
     let mut args = vec![serde_json::Value::from("mcp")];
     if !workflow_path.is_empty() {
         // Lexical absolutization, no existence check — the same `filepath.Abs` behaviour the claude
@@ -79,21 +101,9 @@ pub fn inject_daemon_mcp(
             .unwrap_or_else(|_| workflow_path.to_string());
         args.push(serde_json::Value::from(abs));
     }
-    // opencode's own shape for a local server: ONE `command` array (argv0 first), not claude's
-    // `{command, args}` pair. Taken from the config that produced every committed opencode capture,
-    // `harness/harness-spike/opencode/opencode.json`.
     let mut command = vec![serde_json::Value::from(daemon_bin)];
     command.extend(args);
-    let doc = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": { SERVER_KEY: { "type": "local", "enabled": true, "command": command } },
-    });
-
-    let out = serde_json::to_string_pretty(&doc).map_err(|e| AgentError::Other(e.to_string()))?;
-    let dst = state_dir.join(INJECTED_CONFIG_NAME);
-    std::fs::write(&dst, out)
-        .map_err(|e| AgentError::Other(format!("write opencode mcp config: {e}")))?;
-    Ok(Some(dst))
+    serde_json::json!({ "type": "local", "enabled": true, "command": command })
 }
 
 /// Whether the workspace's own `opencode.json` already defines a `symphony` MCP server. Any read or

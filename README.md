@@ -539,19 +539,24 @@ payload changes shape and no golden moves. Each answers `409 teams_disabled` whe
 | Endpoint | Serves |
 | --- | --- |
 | `GET /api/v1/teams/roster` | the roster, each identity's profile, and its live runs |
-| `GET /api/v1/teams/recall?identity=&query=&state=` | one identity's retained memory, bounded. `state` is `valid` (the default, and all an agent ever sees), `invalidated` or `all` (STUDIO-689) |
-| `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
-| `POST /api/v1/teams/reinstate` | undo one invalidation: the record returns to recall and the stored reason is dropped (STUDIO-689) |
-| `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
+| `GET /api/v1/teams/recall?identity=&query=&state=` | one identity's retained memory, bounded. `state` is `valid` (the default, and all an agent ever sees), `invalidated` or `all` (STUDIO-689). `scope=team` reads the SHARED team bank instead (STUDIO-1040) |
+| `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible. `scope: "team"` targets the shared bank |
+| `POST /api/v1/teams/reinstate` | undo one invalidation: the record returns to recall and the stored reason is dropped (STUDIO-689). `scope: "team"` targets the shared bank |
+| `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host. `shared: true` writes to the shared team bank |
 | `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
 | `POST /api/v1/teams/room` | the OPERATOR's own post to the room, `from` stamped `operator` (STUDIO-661) |
 | `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
 | `GET /api/v1/teams` | the dashboard's one view: the roster with derived status, the manager mode and the memory backend (STUDIO-652) |
 
 The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_reinstate`,
-`teams_retain`, `teams_room_read` and `teams_post`. `teams_retain` takes `content` and nothing else on purpose: the
+`teams_retain`, `teams_room_read` and `teams_post`. `teams_retain` takes `content` and an optional
+`shared` flag and nothing else on purpose: the
 identity, ticket, run and commit are resolved by the daemon from the run id it injected into that
-worker, so a run dispatched as one identity cannot write into another's memory bank.
+worker, so a run dispatched as one identity cannot write into another's memory bank — and `shared:
+true` chooses the shared team bank without naming a bank or an author, so it cannot forge either.
+`teams_recall` takes an optional `scope: "team"` to read that shared bank, and then names no
+identity: the shared bank belongs to the team, so no roster name (least of all `team`) is reused for
+it.
 `teams_room_read` takes only an optional `limit`, which can narrow the window but never widen it,
 and reading it never advances any teammate's catch-up watermark. `teams_post` follows retain's rule
 exactly: it takes `body`, an optional `to` and optional `refs`, and **no author argument at all** —
@@ -616,6 +621,17 @@ that was actually resolved, so the view always names the directory the daemon re
 `hindsight` is the shared remote bank instead: point `memory.endpoint` at a deployment and give it
 `memory.api_key` — optional for an unauthenticated local one. A retained memory becomes recallable
 after the service's own extraction finishes, about 30s later.
+
+**The shared team bank** (STUDIO-1040) is a second bank the whole roster both reads and writes on
+purpose, for durable repo knowledge rather than per-PR status. Set `memory.team_bank` to a bank id
+(off when empty, which is the shipped state and byte-identical to before) and every teammate's
+turn-1 recall adds up to `memory.team_recall_top_k` shared facts in their own attributed section,
+beside their own memory; `teams_retain {shared: true}` writes it, and `teams_recall {scope: "team"}`,
+`teams_invalidate` and `teams_reinstate` read and correct it. On `local` it is
+`banks/<team_bank>/`; on `hindsight` it is a bank with `enable_observations: false`, exactly like a
+personal one. Only deliberate retains reach it — the automatic end-of-run record stays personal, so
+PR-status chatter never floods the shared bank — and each shared fact is attributed to the teammate
+who wrote it from the host-stamped identity, which the caller cannot forge.
 
 **The team room** is an append-only log read at hydration, not a message bus: identities are durable
 state rather than processes, so nobody receives and everybody catches up. It is JSONL under

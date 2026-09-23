@@ -199,3 +199,119 @@ async fn hindsight_live_smoke() {
         target.id
     );
 }
+
+/// The SHARED team bank's live smoke check (STUDIO-1040): retain → recall → invalidate → recall
+/// against a **scratch** bank id, never `agent-team` or a teammate's.
+///
+/// The shared bank is a bank ID (not an identity) and takes an explicit bank on every call, so this
+/// exercises `retain_shared`/`recall_shared`/`invalidate_shared` — the four operations the team
+/// bank actually uses — against the same local service.
+///
+/// ```text
+/// HINDSIGHT_SMOKE_TEAM_BANK=agent-smoke-team \
+///   cargo test -p rhapsody-config --test hindsight_smoke -- --ignored shared_team_bank_live_smoke --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "live: needs a running hindsight service — a scratch team bank, never agent-team"]
+async fn shared_team_bank_live_smoke() {
+    let endpoint = env_or("HINDSIGHT_ENDPOINT", DEFAULT_ENDPOINT);
+    let api_key = std::env::var("HINDSIGHT_API_KEY").unwrap_or_default();
+    // A SCRATCH id on purpose: this writes a real fact into a real bank, and the
+    // ticket is explicit that it must never be `agent-team` or a teammate's bank.
+    let bank_id = env_or("HINDSIGHT_SMOKE_TEAM_BANK", "agent-smoke-team");
+
+    let bank = HindsightBackend::new(&endpoint, "agent-", &api_key).expect("build the backend");
+    println!("== shared team bank live smoke ==");
+    println!("endpoint : {}", bank.base());
+    println!("bank     : {bank_id}");
+
+    let marker = format!(
+        "rhapsody-team-smoke-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    );
+
+    let rec = Record {
+        identity: "smoke".to_string(),
+        document_id: format!("run-{marker}"),
+        ticket: "STUDIO-1040".to_string(),
+        commit_sha: "0000000".to_string(),
+        pr: "0".to_string(),
+        run_id: marker.clone(),
+        at: chrono::Utc::now(),
+        content: format!(
+            "On 2026-09-23 the Rhapsody shared team bank smoke check retained a concrete record for \
+             STUDIO-1040 with the unique marker token {marker}. The marker identifies this exact \
+             retained note so the check can recall it once the background extractor has finished."
+        ),
+    };
+    let doc = bank
+        .retain_shared(&bank_id, &rec)
+        .await
+        .expect("shared retain");
+    println!("\n[1/4] retain_shared    -> ok (async), document_id={doc}");
+
+    let q = Query {
+        ticket: "STUDIO-1040".to_string(),
+        title: format!("team smoke {marker}"),
+        top_k: 8,
+        ..Query::default()
+    };
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut target = None;
+    loop {
+        let recalled = bank
+            .recall_shared(&bank_id, &q)
+            .await
+            .expect("shared recall");
+        if let Some(f) = recalled
+            .facts
+            .iter()
+            .find(|f| f.content.contains(&marker) || f.document_id.contains(&marker))
+        {
+            target = Some(f.clone());
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        println!(
+            "        recall_shared  -> {} fact(s), marker not extracted yet; waiting {}s",
+            recalled.facts.len(),
+            POLL_INTERVAL.as_secs()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let target = target.unwrap_or_else(|| {
+        panic!(
+            "shared recall found no fact carrying {marker} or {doc} within {}s",
+            POLL_TIMEOUT.as_secs()
+        )
+    });
+    println!("[2/4] recall_shared    -> extracted, id={}", target.id);
+
+    let reason = format!("team smoke {marker}: retiring the scratch record");
+    let changed = bank
+        .invalidate_shared(&bank_id, &target.id, &reason)
+        .await
+        .expect("shared invalidate");
+    println!("[3/4] invalidate_shared-> ok, changed={changed}");
+    assert!(
+        changed,
+        "a freshly retained shared fact was already invalidated"
+    );
+
+    let after = bank
+        .recall_shared(&bank_id, &q)
+        .await
+        .expect("shared recall");
+    println!("[4/4] recall_shared    -> {} fact(s)", after.facts.len());
+    assert!(
+        !after.facts.iter().any(|f| f.id == target.id),
+        "the invalidated shared fact {} is still recalled",
+        target.id
+    );
+    println!("\n== shared team bank: retain -> recall -> invalidate -> recall (gone) ==");
+}

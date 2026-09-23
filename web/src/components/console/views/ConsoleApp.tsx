@@ -173,8 +173,12 @@ function MemoryPage({ go }: { go: (name: ConsoleRouteName, key?: string) => void
   return (
     <MemoryView
       onNavigate={(to, key) => go(to, key)}
-      onReinstate={async (fact) => {
-        await reinstate.mutateAsync({ identity: fact.identity, factID: fact.id });
+      onReinstate={async (fact, scope) => {
+        await reinstate.mutateAsync({
+          identity: fact.identity,
+          factID: fact.id,
+          scope,
+        });
       }}
     />
   );
