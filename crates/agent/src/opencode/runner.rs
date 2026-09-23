@@ -33,6 +33,7 @@
 //! value, exactly as for claude (design §15.5): withholding the Linear key from the agent is not a
 //! billing decision.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
@@ -61,12 +62,13 @@ use crate::opencode::mcpinject::{
 };
 use crate::opencode::parse::{Failure, add_usage, classify};
 use crate::opencode::probe;
+use crate::opencode::resume::{self, ResumeDecision, ResumeRecord};
 use crate::opencode::state::RunState;
 use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
-    AgentError, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED, EVENT_TURN_COMPLETED,
-    EVENT_TURN_FAILED, Event, Session, TURN_FAILED, TURN_SUCCEEDED, TURN_TIMED_OUT, Transcript,
-    TurnResult, Usage,
+    AgentError, EVENT_NOTIFICATION, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
+    EVENT_TURN_COMPLETED, EVENT_TURN_FAILED, Event, Session, TURN_FAILED, TURN_SUCCEEDED,
+    TURN_TIMED_OUT, Transcript, TurnResult, Usage,
 };
 
 /// Mirrors the claude runner's bounds so a pathological stream is capped the same way on both.
@@ -76,6 +78,14 @@ const READ_CHUNK: usize = 64 * 1024;
 const MAX_STDERR_MESSAGE: usize = 2048;
 /// Bounds the final result text (the `HANDOFF:` marker is at the END, so the TAIL is kept).
 const MAX_RESULT_TEXT: usize = 4096;
+
+/// Prepended to the FIRST turn's prompt when the session was resumed from a retained directory
+/// (STUDIO-1043), so the agent knows its prior investigation is intact and continues rather than
+/// restarting. The session history itself is already open to it.
+const RESUME_NOTE: &str = "[Resuming a cut-off attempt: this continues the same OpenCode session \
+from a previous interrupted run of this ticket. Your earlier work and the session history are \
+intact — continue from where you left off rather than starting over. If you had completed an \
+investigation and recorded findings, act on them now.]";
 
 /// Builds opencode sessions.
 pub struct Runner {
@@ -102,6 +112,53 @@ impl Runner {
             cfg.turn_timeout = Duration::from_secs(3600);
         }
         Runner { cfg }
+    }
+
+    /// Resolves the private state directory for a dispatch of `issue`, preferring a session
+    /// retained by a cut-off earlier attempt (STUDIO-1043).
+    ///
+    /// A matching record is adopted, and its opencode session id returned so the first turn can
+    /// continue it (`-s <id>`). Otherwise `provision` makes a fresh directory — the cold start
+    /// this backend has always done — and the reason a record was rejected is logged exactly once.
+    ///
+    /// The resume key is the harness-config model (`self.cfg.model`). A per-teammate `--model`
+    /// override (`Session::set_model_override`, applied after this call) is deliberately NOT part
+    /// of the key: the override changes the `-m` of the resumed turn, but opencode continues the
+    /// session regardless, and folding an override in would make a teammate's own retry unable to
+    /// resume itself.
+    fn resolve_state(
+        &self,
+        workspace_path: &str,
+        issue: &Issue,
+        provision: impl FnOnce() -> Result<RunState, AgentError>,
+    ) -> Result<(RunState, String, bool), AgentError> {
+        let now = Utc::now().timestamp_millis();
+        match resume::select(
+            &self.cfg.state_root,
+            &issue.identifier,
+            resume::HARNESS,
+            &self.cfg.model,
+            workspace_path,
+            now,
+        ) {
+            ResumeDecision::Resume(rec) => {
+                let state = RunState::adopt(PathBuf::from(&rec.dir))?;
+                tracing::info!(
+                    issue = %issue.identifier, session = %rec.session_id, dir = %rec.dir,
+                    "opencode: resuming the retained session of a cut-off attempt"
+                );
+                Ok((state, rec.session_id, true))
+            }
+            ResumeDecision::Cold(reason) => {
+                if !reason.is_empty() {
+                    tracing::info!(
+                        issue = %issue.identifier, reason = %reason,
+                        "opencode: not resuming a previous attempt; starting a cold session"
+                    );
+                }
+                provision().map(|state| (state, String::new(), false))
+            }
+        }
     }
 
     /// The brokered preparation sequence (see [`start_brokered_session`]). Every refusal here is
@@ -146,12 +203,19 @@ impl Runner {
         probe::probe(&self.cfg.command)
             .map_err(|e| AgentError::Other(format!("{}: {}", e.reason(), e.message())))?;
 
-        // A credential-FREE private state directory: no auth.json is created or copied.
-        let state = RunState::provision_brokered(
-            &self.cfg.state_root,
-            &issue.identifier,
-            &self.cfg.workspace_root,
-        )?;
+        // A credential-FREE private state directory: no auth.json is created or copied. A retained
+        // brokered session is resumed from its kept directory (STUDIO-1043), which likewise holds
+        // no reusable credential — only what the per-turn capabilities left behind.
+        let (state, resume_session, adopted) =
+            self.resolve_state(workspace_path, &issue, || {
+                RunState::provision_brokered(
+                    &self.cfg.state_root,
+                    &issue.identifier,
+                    &self.cfg.workspace_root,
+                )
+            })?;
+        // A fresh brokered provision creates it; an adopted one may predate it.
+        state.ensure_config_dir()?;
         let provider_id = InternalProviderId::generate()?;
 
         Ok(Box::new(OpencodeSession {
@@ -167,7 +231,7 @@ impl Runner {
                 model: self.cfg.model.clone(),
                 command: self.cfg.command.clone(),
             }),
-            session_id: Mutex::new(String::new()),
+            session_id: Mutex::new(resume_session),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
@@ -175,6 +239,8 @@ impl Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             poisoned: AtomicBool::new(false),
+            adopted,
+            last_turn_failed: AtomicBool::new(false),
         }))
     }
 }
@@ -336,12 +402,18 @@ impl crate::Runner for Runner {
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError> {
         let (name, base_args) = split_command(&self.cfg.command)?;
-        let state = RunState::provision_legacy(
-            &self.cfg.state_root,
-            &self.cfg.auth_source,
-            &issue.identifier,
-            &self.cfg.workspace_root,
-        )?;
+        // A retained session is resumed from its kept directory (which already holds the seeded
+        // credential); otherwise a fresh one is provisioned, refusing a missing credential before
+        // anything is spawned.
+        let (state, resume_session, adopted) =
+            self.resolve_state(workspace_path, &issue, || {
+                RunState::provision_legacy(
+                    &self.cfg.state_root,
+                    &self.cfg.auth_source,
+                    &issue.identifier,
+                    &self.cfg.workspace_root,
+                )
+            })?;
 
         // MCP injection is best-effort, exactly as it is for claude: on any failure the run
         // proceeds without the daemon's server rather than not running at all.
@@ -374,7 +446,7 @@ impl crate::Runner for Runner {
             state,
             config_path,
             brokered: None,
-            session_id: Mutex::new(String::new()),
+            session_id: Mutex::new(resume_session),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
@@ -382,6 +454,8 @@ impl crate::Runner for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             poisoned: AtomicBool::new(false),
+            adopted,
+            last_turn_failed: AtomicBool::new(false),
         }))
     }
 }
@@ -412,6 +486,15 @@ struct OpencodeSession {
     /// Set when a re-probe between turns finds the command changed: the already prepared session is
     /// dropped (its state removed) and every later turn refuses before minting or spawning (`§9.1`).
     poisoned: AtomicBool,
+    /// Whether this session was adopted from a retained record (`resolve_state`). An adopted session
+    /// that ends BEFORE its first turn leaves the retained directory and record untouched rather than
+    /// deleting the very session the resume feature exists to keep (STUDIO-1043).
+    adopted: bool,
+    /// Whether the most recent turn ended in a retryable failure (STUDIO-1043). Set `true` as a
+    /// turn begins and cleared only on the successful return, so every early return and a cancelled
+    /// future leave it set. [`OpencodeSession::end_of_run`] retains the state directory and writes
+    /// the resume record when it is set, and cleans up when it is not.
+    last_turn_failed: AtomicBool,
 }
 
 impl OpencodeSession {
@@ -502,6 +585,69 @@ impl OpencodeSession {
             );
         }
     }
+
+    /// The end-of-run disposition of the private state directory (STUDIO-1043).
+    ///
+    /// A run whose last turn FAILED (or that was cancelled) retains its directory and records the
+    /// session for the next dispatch; a run whose last turn succeeded — or a FRESH run that never ran
+    /// a turn — removes the directory and clears any record, exactly as before. An ADOPTED session
+    /// that ends before its first turn (a launch refusal, a daemon shutdown between dispatch and the
+    /// first turn) is the one case that does neither: it keeps the retained directory and the record
+    /// exactly as they were, because deleting them would throw away the session this feature exists
+    /// to keep. Called from [`Session::stop`] on the normal path and from [`Drop`] on cancellation.
+    fn end_of_run(&self) {
+        let ran_a_turn = self.turn_n.load(Ordering::SeqCst) > 0;
+        if ran_a_turn && self.last_turn_failed.load(Ordering::SeqCst) {
+            self.persist_resume();
+        } else if self.adopted && !ran_a_turn {
+            // `adopt` does not mark the directory kept, so mark it here or `Drop` (which also runs
+            // this method) would remove it after this returns.
+            self.state.keep();
+        } else {
+            self.state.cleanup();
+            resume::clear(&self.cfg.state_root, &self.issue.identifier);
+        }
+    }
+
+    /// Writes the resume record for this issue and marks the state directory retained. Best-effort:
+    /// a write failure logs and lets the directory be removed rather than leaking one that nothing
+    /// can find. Idempotent, so the `stop` path and the `Drop` path can both reach it.
+    fn persist_resume(&self) {
+        if self.state.is_kept() {
+            return;
+        }
+        let session_id = self.locked_session_id().clone();
+        let dir = self.state.xdg_data_home().to_path_buf();
+        if session_id.is_empty() || !dir.is_dir() {
+            return;
+        }
+        let rec = ResumeRecord {
+            harness: resume::HARNESS.to_string(),
+            model: self.cfg.model.clone(),
+            workspace: self.ws_path.clone(),
+            session_id,
+            dir: dir.to_string_lossy().into_owned(),
+            saved_at_ms: Utc::now().timestamp_millis(),
+        };
+        match resume::save(&self.cfg.state_root, &self.issue.identifier, &rec) {
+            Ok(()) => self.state.keep(),
+            Err(e) => tracing::warn!(
+                issue = %self.issue.identifier, err = %e,
+                "opencode: could not record the session for resume; its state directory will be \
+                 removed rather than left unreachable"
+            ),
+        }
+    }
+}
+
+impl Drop for OpencodeSession {
+    fn drop(&mut self) {
+        // A cancelled run (an operator Stop, or a daemon shutdown dropping the worker future) never
+        // reaches `stop`, so the retention decision is repeated here (STUDIO-1043). A run that
+        // completed a successful turn already cleaned up in `stop`; `persist_resume`'s idempotence
+        // and `cleanup`'s make the second pass a no-op for it.
+        self.end_of_run();
+    }
 }
 
 #[async_trait]
@@ -530,10 +676,13 @@ impl Session for OpencodeSession {
         *self.locked_model_override() = over;
     }
 
-    /// Removes the session's private state directory. Unlike claude's no-op `stop`, this backend
-    /// really does hold a resource past the turn.
+    /// Releases the session's private state directory. Unlike claude's no-op `stop`, this backend
+    /// really does hold a resource past the turn — but a run that ended in a retryable failure
+    /// KEEPS it and records the session, so the next dispatch of the same issue resumes rather than
+    /// starting cold (STUDIO-1043). A run whose last turn succeeded (including one that resumed)
+    /// cleans up as before.
     async fn stop(&self) -> Result<(), AgentError> {
-        self.state.cleanup();
+        self.end_of_run();
         Ok(())
     }
 
@@ -588,6 +737,10 @@ impl OpencodeSession {
         }
         let turn_n = self.turn_n.fetch_add(1, Ordering::SeqCst) + 1;
         let resume = self.thread_id();
+        // Assume failure until the successful return below: an early refusal, a deadline, an
+        // in-band error, or a cancelled future must all leave the state directory retained for the
+        // next dispatch to resume (STUDIO-1043).
+        self.last_turn_failed.store(true, Ordering::SeqCst);
         tracing::info!(
             issue = %self.issue.identifier,
             turn = turn_n,
@@ -595,10 +748,26 @@ impl OpencodeSession {
             resume = !resume.is_empty(),
             "opencode turn start"
         );
+        // A session adopted from a retained record (STUDIO-1043) seeds `session_id`, so turn 1
+        // carries the recorded id as its `-s` continuation AND is told it is resuming.
+        let resumed_first_turn = turn_n == 1 && !resume.is_empty();
 
         // ⚠️ The prompt is rewritten into opencode's tool-name spelling before it is sent. Rhapsody's
         // prompts name tools literally, including the one that ends the run.
         let prompt = rewrite_tool_names(prompt);
+        let prompt = if resumed_first_turn {
+            // A daemon-authored notice on the run's own event stream, so the attempt records that it
+            // continued the previous one (the console's run detail reads these events).
+            on_event(Event {
+                event_type: EVENT_NOTIFICATION.to_string(),
+                timestamp: Some(Utc::now()),
+                message: format!("resumed the cut-off opencode session {resume}"),
+                ..Default::default()
+            });
+            format!("{RESUME_NOTE}\n\n{prompt}")
+        } else {
+            prompt
+        };
         let cfg = self.turn_cfg();
 
         // Resolve the brokered inputs for THIS turn. A brokered session without its per-turn attempt
@@ -1075,6 +1244,9 @@ impl OpencodeSession {
         // why `terminal_seen` is checked before `timed_out` — the same precedence the claude runner
         // gives a captured result.
         if terminal_seen && failure.is_none() {
+            // A clean turn: the run may keep going (a continuation) or end, but it is no longer a
+            // cut-off one — `end_of_run` cleans up unless a LATER turn fails (STUDIO-1043).
+            self.last_turn_failed.store(false, Ordering::SeqCst);
             let tr = TurnResult {
                 status: TURN_SUCCEEDED.to_string(),
                 usage,
@@ -2145,5 +2317,380 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
             vec!["revoke", "kill-tree"],
             "the turn capability must be revoked before the process-tree kill can block"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // STUDIO-1043: a cut-off run keeps its session and the retry resumes it.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A fake opencode that begins a session (`ses_cut`) and then blocks past the turn deadline —
+    /// the shape of the STUDIO-1002 attempt 1 that burned an hour and was killed by `turn_timeout`.
+    const FAKE_CUT_OFF: &str = r#"
+printf '{"type":"step_start","sessionID":"ses_cut","part":{"type":"step-start"}}\n'
+sleep 30
+"#;
+
+    fn record_file(state_root: &str, issue: &str) -> std::path::PathBuf {
+        crate::opencode::resume::record_path(state_root, issue).expect("record path")
+    }
+
+    /// The per-session state directories under `state_root` (excluding the resume-record dir).
+    fn session_dirs(state_root: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(state_root)
+            .expect("read state root")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("rhapsody-opencode-") && n != "rhapsody-opencode-resume")
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn runner_with(
+        script: &str,
+        root: &TempDir,
+        auth: &str,
+        state_root: &str,
+        model: &str,
+        timeout_secs: u64,
+    ) -> Runner {
+        Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(root),
+            turn_timeout: std::time::Duration::from_secs(timeout_secs),
+            auth_source: auth.to_string(),
+            state_root: state_root.to_string(),
+            model: model.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1043. A turn killed by `turn_timeout` must keep its private
+    /// state directory, and the next dispatch of the SAME issue must resume it: the OpenCode
+    /// invocation carries `-s <sessionID>` and the SAME `XDG_DATA_HOME`, and the agent is told it is
+    /// resuming. It turns red if the directory is deleted or `resume` stays false.
+    #[tokio::test]
+    async fn a_turn_timeout_retains_the_session_and_the_retry_resumes_it() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        // --- Attempt 1: cut off by the deadline. ---
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("first attempt", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_TIMED_OUT, "{err:?}");
+        assert_eq!(sess.thread_id(), "ses_cut");
+        sess.stop().await.expect("stop");
+
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(
+            dirs.len(),
+            1,
+            "the cut-off session's state directory must survive: {dirs:?}"
+        );
+        let kept_dir = state_root.path().join(&dirs[0]);
+        let rec = record_file(&sr, "STUDIO-1043");
+        assert!(rec.is_file(), "the session must be recorded for resume");
+
+        // --- Attempt 2: the retry resumes the recorded session. ---
+        let argv_log = scripts.path().join("argv.txt");
+        let env_log = scripts.path().join("env.txt");
+        const RESUME: &str = r#"
+printf '%s\n' "$*" > "ARGV"
+env > "ENV"
+printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
+"#;
+        let body = RESUME
+            .replace("ARGV", &argv_log.display().to_string())
+            .replace("ENV", &env_log.display().to_string());
+        let clean = write_script(&scripts, "clean.sh", &body);
+        let retry = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("retry session");
+        assert_eq!(
+            sess2.thread_id(),
+            "ses_cut",
+            "the retry must adopt the recorded session id"
+        );
+
+        let (seen2, on2) = collector();
+        let (tr2, err2) = sess2.run_turn("second attempt", None, None, &on2).await;
+        assert_eq!(tr2.status, TURN_SUCCEEDED, "{err2:?}");
+        assert!(
+            events_of(&seen2)
+                .iter()
+                .any(|e| e.event_type == EVENT_NOTIFICATION
+                    && e.message.contains("resumed the cut-off opencode session")),
+            "the run's event stream must record that the attempt resumed: {:#?}",
+            events_of(&seen2)
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            argv.contains("-s ses_cut"),
+            "the retry must carry the resume/session argument: {argv}"
+        );
+        assert!(
+            argv.contains("Resuming a cut-off attempt"),
+            "the agent must be told it is resuming: {argv}"
+        );
+        assert!(
+            argv.trim_end().ends_with("second attempt"),
+            "the resume note must not displace the prompt as the final positional: {argv}"
+        );
+        let env = std::fs::read_to_string(&env_log).expect("env log");
+        let xdg = env
+            .lines()
+            .find_map(|l| l.strip_prefix("XDG_DATA_HOME="))
+            .expect("XDG_DATA_HOME");
+        assert_eq!(
+            std::path::Path::new(xdg),
+            kept_dir,
+            "the retry must use the SAME private data root"
+        );
+
+        // A successful run releases the retained session.
+        sess2.stop().await.expect("stop");
+        assert!(
+            session_dirs(state_root.path()).is_empty(),
+            "a completed run must remove the retained directory"
+        );
+        assert!(!rec.exists(), "a completed run must clear the record");
+    }
+
+    /// A cancelled run — an operator Stop, or a daemon shutdown dropping the worker future — never
+    /// reaches `stop`, so `Drop` must make the same retention decision. Dropping the session future
+    /// mid-turn must leave the directory and the record behind (STUDIO-1043 review F1).
+    #[tokio::test]
+    async fn a_cancelled_run_keeps_the_session_without_calling_stop() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        // A turn deadline long enough that only the outer timeout can end the turn, so the drop is
+        // the cancellation path and not a `turn_timeout` return.
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 30);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            sess.run_turn("cut off mid-turn", None, None, &on),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the outer timeout must cut the turn off"
+        );
+        // The worker future is dropped without `stop()` — exactly the operator-Stop shape.
+        drop(sess);
+
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(
+            dirs.len(),
+            1,
+            "a cancelled run must keep its state directory: {dirs:?}"
+        );
+        assert!(
+            record_file(&sr, "STUDIO-1043").is_file(),
+            "a cancelled run must be recorded for the next dispatch"
+        );
+    }
+
+    /// An adopted session that ends before its first turn (a launch refusal, a shutdown between
+    /// dispatch and turn 1) must not delete the session it was resuming (STUDIO-1043 review F2).
+    #[tokio::test]
+    async fn an_adopted_session_that_ends_before_its_first_turn_keeps_the_session() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        // Attempt 1 is cut off and retained.
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (_tr, _e) = sess.run_turn("p", None, None, &on).await;
+        sess.stop().await.expect("stop");
+        let kept = session_dirs(state_root.path());
+        assert_eq!(kept.len(), 1);
+        let rec = record_file(&sr, "STUDIO-1043");
+        assert!(rec.is_file());
+
+        // Attempt 2 adopts the session, then ends without ever running a turn.
+        let retry = runner_with(&cut, &root, &auth, &sr, "m", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("adopting session");
+        assert_eq!(sess2.thread_id(), "ses_cut", "attempt 2 adopts the session");
+        sess2.stop().await.expect("stop");
+        drop(sess2);
+
+        assert_eq!(
+            session_dirs(state_root.path()),
+            kept,
+            "the adopted session's directory must survive a pre-turn ending"
+        );
+        assert!(
+            rec.is_file(),
+            "the record must survive a pre-turn ending so a later dispatch can resume"
+        );
+    }
+
+    /// A model mismatch falls back to a cold start with its own directory and no `-s`.
+    #[tokio::test]
+    async fn a_model_mismatch_starts_cold() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let runner = runner_with(&cut, &root, &auth, &sr, "model-one", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (_tr, _e) = sess.run_turn("p", None, None, &on).await;
+        sess.stop().await.expect("stop");
+        let kept = session_dirs(state_root.path());
+        assert_eq!(kept.len(), 1);
+
+        let argv_log = scripts.path().join("argv.txt");
+        const CLEAN: &str = r#"
+printf '%s\n' "$*" > "ARGV"
+printf '{"type":"step_finish","sessionID":"ses_new","part":{"reason":"stop"}}\n'
+"#;
+        let body = CLEAN.replace("ARGV", &argv_log.display().to_string());
+        let clean = write_script(&scripts, "clean.sh", &body);
+        let retry = runner_with(&clean, &root, &auth, &sr, "model-two", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("cold session");
+        assert!(
+            sess2.thread_id().is_empty(),
+            "a model mismatch must start cold, got {}",
+            sess2.thread_id()
+        );
+        let (_s2, on2) = collector();
+        let (tr, err) = sess2.run_turn("p", None, None, &on2).await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            !argv.contains(" -s "),
+            "a cold start must carry no resume argument: {argv}"
+        );
+        // The rejected session's directory was discarded, not kept alongside the new one.
+        assert_eq!(
+            session_dirs(state_root.path()).len(),
+            1,
+            "only the new session may remain"
+        );
+    }
+
+    /// A missing directory falls back to a cold start.
+    #[tokio::test]
+    async fn a_missing_directory_starts_cold() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (_tr, _e) = sess.run_turn("p", None, None, &on).await;
+        sess.stop().await.expect("stop");
+
+        for d in session_dirs(state_root.path()) {
+            std::fs::remove_dir_all(state_root.path().join(d)).expect("remove kept dir");
+        }
+        let clean = write_script(
+            &scripts,
+            "clean.sh",
+            "printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n'\n",
+        );
+        let retry = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("cold session");
+        assert!(
+            sess2.thread_id().is_empty(),
+            "a missing directory must start cold"
+        );
+    }
+
+    /// A successful cold run removes its directory and leaves no record — the legacy cleanup the
+    /// ticket requires to be unchanged.
+    #[tokio::test]
+    async fn a_successful_run_leaves_no_session_and_no_record() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let clean = write_script(
+            &scripts,
+            "clean.sh",
+            "printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n'\n",
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let runner = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1043"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on).await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+        sess.stop().await.expect("stop");
+        assert!(
+            session_dirs(state_root.path()).is_empty(),
+            "a successful run cleans its state directory up, as before"
+        );
+        assert!(!record_file(&sr, "STUDIO-1043").exists());
     }
 }

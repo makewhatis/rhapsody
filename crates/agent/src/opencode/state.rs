@@ -35,7 +35,7 @@
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::AgentError;
 
@@ -62,6 +62,11 @@ const CONFIG_DIR_NAME: &str = "opencode-config";
 #[derive(Debug)]
 pub struct RunState {
     dir: PathBuf,
+    /// Set for a directory that is deliberately retained past the run — a cut-off session the next
+    /// dispatch may resume (STUDIO-1043, [`super::resume`]). [`RunState::cleanup`] still removes it
+    /// on request; this only suppresses the `Drop` cleanup so a cancelled run (the operator's Stop,
+    /// or a daemon shutdown dropping the worker future) leaves the directory behind.
+    kept: AtomicBool,
 }
 
 impl RunState {
@@ -190,7 +195,62 @@ impl RunState {
             .mode(0o700)
             .create(&dir)
             .map_err(|e| AgentError::Other(format!("opencode state dir {}: {e}", dir.display())))?;
-        Ok(RunState { dir })
+        Ok(RunState {
+            dir,
+            kept: AtomicBool::new(false),
+        })
+    }
+
+    /// Adopts an EXISTING private state directory instead of provisioning a new one. This is the
+    /// resume half of STUDIO-1043: a cut-off session's directory was retained, and the retry hands
+    /// it back here so the child sees the same `XDG_DATA_HOME` (and, for legacy mode, the same
+    /// seeded credential) it had before.
+    ///
+    /// Nothing is created or seeded — the directory must already exist, which the caller has
+    /// validated ([`super::resume::select`]), and a missing one is a typed error rather than a
+    /// silent fresh directory.
+    pub fn adopt(dir: PathBuf) -> Result<RunState, AgentError> {
+        if !dir.is_dir() {
+            return Err(AgentError::Other(format!(
+                "opencode_state_missing: the retained session directory {} no longer exists",
+                dir.display()
+            )));
+        }
+        Ok(RunState {
+            dir,
+            kept: AtomicBool::new(false),
+        })
+    }
+
+    /// Marks the directory as retained past this run, so `Drop` will not remove it. The caller
+    /// (the runner) records the session in [`super::resume`] at the same time; a kept directory
+    /// with no record is a leak, so keep and record happen together.
+    pub fn keep(&self) {
+        self.kept.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this directory is marked retained.
+    pub fn is_kept(&self) -> bool {
+        self.kept.load(Ordering::SeqCst)
+    }
+
+    /// Creates the private `OPENCODE_CONFIG_DIR` inside the state directory if it is absent. Used
+    /// when a BROKERED session is RESUMED (its kept directory may predate the config dir, and
+    /// [`RunState::provision_brokered`] only creates it on fresh provisioning).
+    pub fn ensure_config_dir(&self) -> Result<(), AgentError> {
+        let config_dir = self.dir.join(CONFIG_DIR_NAME);
+        if config_dir.is_dir() {
+            return Ok(());
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&config_dir)
+            .map_err(|e| {
+                AgentError::Other(format!(
+                    "opencode state config dir {}: {e}",
+                    config_dir.display()
+                ))
+            })
     }
 
     /// The value to set `XDG_DATA_HOME` to for this session's children.
@@ -221,7 +281,10 @@ impl RunState {
 
 impl Drop for RunState {
     fn drop(&mut self) {
-        self.cleanup();
+        // A retained directory (a cut-off session awaiting resume, STUDIO-1043) outlives the run.
+        if !self.kept.load(Ordering::SeqCst) {
+            self.cleanup();
+        }
     }
 }
 

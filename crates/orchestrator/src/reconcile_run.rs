@@ -178,6 +178,10 @@ impl Orchestrator {
                                 &re.issue.identifier,
                             )
                             .await;
+                        // AFTER the worktree removal: the terminated worker's future is dropped
+                        // during that await, and its session `Drop` would otherwise re-record the
+                        // retained session after this discard removed it (STUDIO-1043 review B1).
+                        self.discard_retained_opencode_session(&re.issue.identifier);
                         self.claimed.remove(&act.issue_id);
                         self.completed.remove(&act.issue_id);
                         self.persist_end_run(&re, outcome, reason);
@@ -407,6 +411,30 @@ mod tests {
             std::fs::metadata(&ws.path).is_err(),
             "workspace should be removed"
         );
+    }
+
+    // STUDIO-1043: a ticket that goes terminal while it is running has its retained opencode session
+    // discarded when reconcile terminates and cleans it (review B1).
+    #[tokio::test]
+    async fn reconcile_terminal_discards_a_retained_opencode_session() {
+        let mut f = Fake::new();
+        f.states_by_ids_func = Some(states_ok(vec![issue("1", "MT-1", "Done")]));
+        let tr = Arc::new(f);
+        let (mut o, _dir) = orch_for_reconcile(Arc::clone(&tr), std::time::Duration::ZERO);
+        let state_root = TempDir::new();
+        o.eff.as_mut().expect("eff").cfg.opencode.state_root = state_root.path.clone();
+        let (kept_dir, rec) =
+            seed_opencode_session(std::path::Path::new(&state_root.path), "MT-1", 1_000_000);
+        add_running(&mut o, "1", "MT-1", "In Progress", Utc::now());
+
+        o.reconcile().await;
+
+        assert!(!o.running.contains_key("1"), "terminal issue terminated");
+        assert!(
+            !kept_dir.exists(),
+            "a terminal issue's retained opencode session directory must be discarded"
+        );
+        assert!(!rec.exists(), "and its record removed");
     }
 
     // Mirrors Go `TestReconcileActiveUpdatesState`.
