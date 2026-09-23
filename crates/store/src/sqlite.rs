@@ -2384,11 +2384,37 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// The scratch directory's name. `nonce` distinguishes otherwise-identical `(pid, seq)` pairs,
+    /// so a name never depends on pid + counter alone — the reused-pid collision (STUDIO-1027): two
+    /// processes that over time draw the same pid and counter would otherwise reopen each other's
+    /// `symphony.db`.
+    fn scratch_dir_name(pid: u32, seq: u32, nonce: u128) -> String {
+        format!("rhapsody-store-test-{pid}-{seq}-{nonce}")
+    }
+
+    /// The current-time nanosecond nonce used in a scratch directory name.
+    fn scratch_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// Clear anything already at `dir`, then create it, and return the path. `create_dir_all` alone
+    /// would leave a stale `symphony.db` in place — the old plain-create scheme that produced
+    /// `duplicate column name: project_slug` when a newer schema opened it.
+    fn clear_scratch_dir(dir: &Path) -> PathBuf {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("create scratch dir");
+        dir.to_path_buf()
+    }
+
     /// A unique scratch directory under the system temp dir, removed on drop. Avoids a tempfile
     /// dependency; uniqueness comes from the pid + a per-process atomic counter + a nanosecond
     /// nonce, so a recycled pid can never adopt an earlier run's leftover (STUDIO-1027's store
-    /// rule). [`scratch_dir`] hands back the guard: keep it alive for the test's lifetime or the
-    /// directory is removed the moment the temporary drops.
+    /// rule). The directory is cleared before create as well, so even a nonce collision (or an
+    /// exactly-reused name) starts empty. [`scratch_dir`] hands back the guard: keep it alive for
+    /// the test's lifetime or the directory is removed the moment the temporary drops.
     struct TempDir {
         path: PathBuf,
     }
@@ -2396,17 +2422,14 @@ mod tests {
     impl TempDir {
         fn new() -> TempDir {
             static N: AtomicU32 = AtomicU32::new(0);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!(
-                "rhapsody-store-test-{}-{}-{nonce}",
+            let path = std::env::temp_dir().join(scratch_dir_name(
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed),
+                scratch_nonce(),
             ));
-            std::fs::create_dir_all(&path).expect("create scratch dir");
-            TempDir { path }
+            TempDir {
+                path: clear_scratch_dir(&path),
+            }
         }
 
         /// Joins `name` under the scratch dir, returning the (not-yet-created) path.
@@ -2436,6 +2459,39 @@ mod tests {
     /// the directory before the test has used it.
     fn scratch_dir() -> TempDir {
         TempDir::new()
+    }
+
+    // A REUSED pid must not reopen the previous process's database. Two processes that draw the same
+    // pid and the same counter produce the same name under the old scheme and collide; the nanosecond
+    // nonce makes them distinct. Dropping the nonce from the name (the old pid+counter scheme) reds
+    // this.
+    #[test]
+    fn scratch_dir_names_do_not_collide_when_a_pid_is_reused() {
+        assert_ne!(
+            scratch_dir_name(4242, 0, 111),
+            scratch_dir_name(4242, 0, 222),
+            "a reused pid at the same counter must not reuse a scratch directory"
+        );
+    }
+
+    // Creating a scratch directory over a stale one must START EMPTY, so a leftover `symphony.db`
+    // can never be reopened against a newer schema (`duplicate column name: project_slug`). Dropping
+    // the `remove_dir_all` from `clear_scratch_dir` — the old plain `create_dir_all` — reds this.
+    #[test]
+    fn a_reused_scratch_dir_is_cleared_before_use() {
+        let dir =
+            std::env::temp_dir().join(scratch_dir_name(std::process::id(), 0, scratch_nonce()));
+        std::fs::create_dir_all(&dir).expect("seed stale dir");
+        std::fs::write(dir.join("symphony.db"), b"stale schema").expect("seed stale db");
+
+        let fresh = clear_scratch_dir(&dir);
+        assert_eq!(
+            std::fs::read_dir(&fresh).expect("read fresh dir").count(),
+            0,
+            "a reused scratch directory must be cleared, not reopened"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Reassemble the live schema the way `sqlite3 .schema` (which produced the fixture) does.

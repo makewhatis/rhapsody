@@ -767,10 +767,20 @@ pub struct ProviderReload {
 }
 
 impl ProviderReload {
-    /// Derives the reload signal from an effective provider map. A provider whose binding cannot be
+    /// Derives the reload signal from an effective provider map and the consuming harness's
+    /// effective turn deadline (`provider_turn_deadline_ms`). A provider whose binding cannot be
     /// derived (malformed base URL) contributes its raw id and an empty endpoint, so a config that
     /// would fail validation still produces a deterministic revision rather than panicking.
-    pub fn from_providers(providers: &BTreeMap<String, ProviderDefinition>) -> Self {
+    ///
+    /// The deadline is hashed through each provider's **effective** capability lifetime
+    /// ([`BrokerLimits::effective_capability_lifetime_ms`]), not the raw `Option`. A block-less
+    /// provider derives that lifetime from the deadline (`min(1h, deadline)`), so changing
+    /// `opencode.turn_timeout_ms` moves the revision exactly as writing an explicit limit would —
+    /// otherwise the derived lifetime would halve while the signal stayed put (jimmy's R1).
+    pub fn from_providers(
+        providers: &BTreeMap<String, ProviderDefinition>,
+        turn_deadline_ms: u64,
+    ) -> Self {
         let mut bindings: Vec<CredentialBinding> = Vec::with_capacity(providers.len());
         let mut hash = FNV_OFFSET;
         for (id, def) in providers {
@@ -806,7 +816,7 @@ impl ProviderReload {
                 l.requested_output_tokens_per_request,
                 l.reserved_token_units_per_turn,
                 l.reserved_token_units_per_session,
-                l.capability_lifetime_ms.unwrap_or(0),
+                l.effective_capability_lifetime_ms(turn_deadline_ms),
                 l.max_reserved_token_units_per_utc_day.unwrap_or(0),
             ] {
                 hash = fnv1a(hash, &value.to_le_bytes());
@@ -852,6 +862,9 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The effective OpenCode turn deadline the reload tests hash through — the V1 1-hour default.
+    const TURN_DEADLINE_MS: u64 = DEFAULT_CAPABILITY_LIFETIME_MS;
 
     /// A provider definition builder for table tests; every field is explicit so a row isolates the
     /// ONE field it flips.
@@ -1271,8 +1284,8 @@ mod tests {
             "fireworks".to_string(),
             provider("fireworks", "https://api.fireworks.ai/inference/v1", false),
         );
-        let r1 = ProviderReload::from_providers(&a);
-        let r2 = ProviderReload::from_providers(&a);
+        let r1 = ProviderReload::from_providers(&a, TURN_DEADLINE_MS);
+        let r2 = ProviderReload::from_providers(&a, TURN_DEADLINE_MS);
         assert_eq!(r1.revision(), r2.revision());
         assert!(!r1.changed_from(Some(r1.revision())));
         assert!(r1.changed_from(None), "first reload is always a change");
@@ -1282,7 +1295,7 @@ mod tests {
         let mut b = a.clone();
         b.get_mut("fireworks").unwrap().base_url = "https://api.fireworks.ai/inference/v1/".into();
         assert!(
-            !ProviderReload::from_providers(&b).changed_from(Some(r1.revision())),
+            !ProviderReload::from_providers(&b, TURN_DEADLINE_MS).changed_from(Some(r1.revision())),
             "a trailing slash normalizes away, so this is NOT a change"
         );
 
@@ -1292,7 +1305,7 @@ mod tests {
             "other".to_string(),
             provider("other", "https://other.example/v1", false),
         );
-        let r3 = ProviderReload::from_providers(&c);
+        let r3 = ProviderReload::from_providers(&c, TURN_DEADLINE_MS);
         assert!(
             r3.changed_from(Some(r1.revision())),
             "adding a provider is a change"
@@ -1305,18 +1318,36 @@ mod tests {
             .unwrap()
             .broker_limits
             .reserved_token_units_per_session = 1;
-        assert!(ProviderReload::from_providers(&d).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&d, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
 
         // A metadata-only change (TLS policy, protocol, credential source) is a change too.
         let mut e = a.clone();
         e.get_mut("fireworks").unwrap().allow_insecure_http = true;
-        assert!(ProviderReload::from_providers(&e).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&e, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
         let mut f = a.clone();
         f.get_mut("fireworks").unwrap().protocol = "anthropic-messages".to_string();
-        assert!(ProviderReload::from_providers(&f).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&f, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
         let mut g = a.clone();
         g.get_mut("fireworks").unwrap().credential.source = "env-file".to_string();
-        assert!(ProviderReload::from_providers(&g).changed_from(Some(r1.revision())));
+        assert!(
+            ProviderReload::from_providers(&g, TURN_DEADLINE_MS).changed_from(Some(r1.revision()))
+        );
+
+        // R1 (jimmy): a block-less provider (`capability_lifetime_ms: None`) derives its lifetime
+        // from the deadline, so halving `opencode.turn_timeout_ms` halves the effective lifetime and
+        // MUST move the revision even though no `broker_limits` field changed. Hashing the raw
+        // `Option` (`unwrap_or(0)`) leaves the revision put and reds this assertion.
+        let half_deadline = provider_turn_deadline_ms(TURN_DEADLINE_MS as i64 / 2);
+        assert!(
+            ProviderReload::from_providers(&a, half_deadline).changed_from(Some(r1.revision())),
+            "a shorter turn deadline shortens the derived lifetime, so it is a change"
+        );
     }
 
     // A malformed base URL must not panic the pure signal; it contributes an empty endpoint.
@@ -1324,7 +1355,7 @@ mod tests {
     fn provider_reload_tolerates_a_malformed_base_url() {
         let mut a = BTreeMap::new();
         a.insert("bad".to_string(), provider("bad", "not a url", false));
-        let reload = ProviderReload::from_providers(&a);
+        let reload = ProviderReload::from_providers(&a, TURN_DEADLINE_MS);
         assert_eq!(reload.bindings().len(), 1);
         assert_eq!(reload.bindings()[0].base_url, "");
     }
