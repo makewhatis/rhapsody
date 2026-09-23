@@ -1525,6 +1525,50 @@ mod tests {
         );
     }
 
+    // STUDIO-1045: an ignored self-summons is reported ONCE at `info` — naming the run window — so
+    // an operator can tell "ignored by design" from "the summons was lost", and a long wait on an
+    // unchanged polling ticket does not re-log it every tick.
+    #[test]
+    fn an_ignored_self_summons_is_logged_once() {
+        let (o, st) = orch_with_store();
+        let win_start = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        seed_run(
+            st.as_ref(),
+            "ID-1",
+            "MT-1",
+            win_start + ChronoDuration::minutes(1),
+        );
+
+        let mut review = base_issue();
+        review.id = "ID-1".into();
+        review.identifier = "MT-1".into();
+        review.state = "In Review".into();
+        review.team_id = "team-1".into();
+        review.latest_summon_at = Some(win_start + ChronoDuration::seconds(30));
+
+        let (eligible, events) =
+            capture_events(|| o.review_reopen_eligible(&review, &HashSet::new()));
+        assert!(!eligible);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.level == "INFO" && e.message.contains("ignoring a summons"))
+                .count(),
+            1,
+            "an ignored self-summons must be logged exactly once at info, got {events:?}"
+        );
+
+        // A repeat poll carrying the SAME comment does not re-log it.
+        let (_again, events) =
+            capture_events(|| o.review_reopen_eligible(&review, &HashSet::new()));
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.contains("ignoring a summons")),
+            "the same summon instant must not be reported twice, got {events:?}"
+        );
+    }
+
     // Mirrors Go `TestPRSuppressedStoreDisabled` (Noop store → PR-activity fallback).
     #[test]
     fn pr_suppressed_store_disabled() {
