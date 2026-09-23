@@ -225,6 +225,22 @@ query IssueLabelsByIDs($ids: [ID!], $first: Int!) {
   }
 }"#;
 
+/// `queryIssueDescriptionByIdentifier` — one issue's DESCRIPTION by its human identifier
+/// (e.g. `STUDIO-1034`). Rhapsody-only (no Go v0.4.0 counterpart), additive, and deliberately NOT
+/// a widening of [`QUERY_BY_IDS`]: that one is the every-tick reconciliation read and must keep
+/// asking for exactly the fields it asks for today.
+///
+/// It backs STUDIO-1034: a ticketless review has no Linear access, so the daemon reads the origin
+/// ticket's acceptance criteria here, off the control task, and quotes them into the review prompt.
+/// Unpaginated like the other by-identifier/by-id reads: a single identifier matches at most one
+/// issue, so `first: 1` is enough.
+pub const QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER: &str = r#"
+query IssueDescriptionByIdentifier($identifier: String!, $first: Int!) {
+  issues(first: $first, filter: { identifier: { eq: $identifier } }) {
+    nodes { identifier description }
+  }
+}"#;
+
 /// `queryTeamWorkflowStates` — all workflow states (id + name + type + position) for a team; the
 /// caller matches the target NAME case-insensitively client-side. `$teamID` is typed `ID!`.
 pub const QUERY_TEAM_WORKFLOW_STATES: &str = r#"

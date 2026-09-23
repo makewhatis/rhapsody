@@ -553,6 +553,28 @@ impl crate::Tracker for Tracker {
             .collect())
     }
 
+    /// Reloads the file and returns the DESCRIPTION of the issue whose human identifier matches
+    /// `identifier` (case-insensitively), or `None` when no such issue carries one. Rhapsody-only
+    /// (STUDIO-1034); an empty identifier returns `None` without reading the file. An empty or
+    /// whitespace description is `None` too, so "no ticket" and "a ticket that says nothing" reach
+    /// the review prompt as the same honest statement.
+    async fn fetch_issue_description_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<String>, TrackerError> {
+        if identifier.trim().is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.lock();
+        let doc = self.load_locked()?;
+        Ok(doc
+            .issues
+            .iter()
+            .find(|j| j.identifier.eq_ignore_ascii_case(identifier.trim()))
+            .and_then(|j| j.description.clone())
+            .filter(|d| !d.trim().is_empty()))
+    }
+
     /// Reloads the file and returns issues whose state matches the Backlog state TYPE (resolved via
     /// the file's `state_types` map, defaulting to "Backlog" when the section is absent — mirroring
     /// `move_issue_to_type`). `blocked_by` edges are populated by [`to_core_issue`]. INF-318.

@@ -84,6 +84,48 @@ pub(super) async fn fetch_issue_labels_by_ids(
     .await
 }
 
+/// The DESCRIPTION of the issue with the given human identifier (e.g. `STUDIO-1034`), or `None`
+/// when no such issue is readable (STUDIO-1034).
+///
+/// A single-purpose read, Rhapsody-only: a ticketless review has no Linear access, so the daemon
+/// reads the origin ticket's acceptance criteria here, off the control task, and quotes them into
+/// the review prompt. `identifier` compares case-insensitively — Linear stores it uppercase, but a
+/// caller naming a ticket from prose should not have to match its casing. An empty or whitespace
+/// identifier returns `None` with no API call, mirroring the other by-id reads' empty shortcut. An
+/// empty or whitespace DESCRIPTION is `None` too: "the ticket says nothing" and "there is no
+/// ticket" reach the prompt as the same honest statement.
+pub(super) async fn fetch_issue_description_by_identifier(
+    c: &Client,
+    identifier: &str,
+) -> Result<Option<String>, TrackerError> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Ok(None);
+    }
+    super::client::traced(
+        crate::tracker_span!("fetch_issue_description"),
+        async move {
+            let vars = serde_json::json!({ "identifier": identifier, "first": 1 });
+            let page: IdsPage = c
+                .do_graphql(query::QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER, Some(vars))
+                .await?;
+            page.issues
+                .nodes
+                .warn_dropped("fetch issue description by identifier");
+            Ok(page
+                .issues
+                .nodes
+                .kept
+                .into_iter()
+                .map(|n| c.normalize_issue(n))
+                .find(|iss| iss.identifier.eq_ignore_ascii_case(identifier))
+                .and_then(|iss| iss.description)
+                .filter(|d| !d.trim().is_empty()))
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Tracker;
@@ -201,6 +243,103 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "empty ids should make no API call"
+        );
+    }
+
+    // ── STUDIO-1034: description by identifier ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_description_by_identifier_returns_the_body() {
+        let seen = Arc::new(Mutex::new(Option::<(String, String)>::None));
+        let seen_h = Arc::clone(&seen);
+        let (c, _server) = new_test_client(move |req| {
+            let id = req
+                .var("identifier")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            *seen_h.lock().expect("seen") = Some((req.query.clone(), id));
+            MockResp::ok(
+                r#"{"data":{"issues":{"nodes":[
+                    {"identifier":"STUDIO-1034","description":"the acceptance text"}
+                ]}}}"#,
+            )
+        })
+        .await;
+
+        // Lower-case input must still match: the identifier is compared case-insensitively.
+        let got = c
+            .fetch_issue_description_by_identifier("studio-1034")
+            .await
+            .expect("description");
+
+        let (query, id) = seen.lock().expect("seen").clone().expect("request seen");
+        assert!(
+            query.contains("identifier: { eq: $identifier }"),
+            "the query must filter by identifier: {query}"
+        );
+        assert_eq!(id, "studio-1034");
+        assert_eq!(got.as_deref(), Some("the acceptance text"));
+    }
+
+    #[tokio::test]
+    async fn fetch_description_by_identifier_empty_or_missing_is_none() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_h = Arc::clone(&called);
+        let (c, _server) = new_test_client(move |_req| {
+            called_h.store(true, Ordering::SeqCst);
+            // A null description, and an empty one, are both "the ticket says nothing".
+            MockResp::ok(
+                r#"{"data":{"issues":{"nodes":[
+                    {"identifier":"STUDIO-1","description":null},
+                    {"identifier":"STUDIO-2","description":"   "}
+                ]}}}"#,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            c.fetch_issue_description_by_identifier("STUDIO-1")
+                .await
+                .expect("null"),
+            None
+        );
+        assert_eq!(
+            c.fetch_issue_description_by_identifier("STUDIO-2")
+                .await
+                .expect("blank"),
+            None
+        );
+        assert_eq!(
+            c.fetch_issue_description_by_identifier("STUDIO-404")
+                .await
+                .expect("absent"),
+            None
+        );
+        assert!(
+            called.load(Ordering::SeqCst),
+            "a non-empty identifier must reach the API"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_description_by_identifier_empty_identifier_makes_no_call() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_h = Arc::clone(&called);
+        let (c, _server) = new_test_client(move |_req| {
+            called_h.store(true, Ordering::SeqCst);
+            MockResp::ok(r#"{"data":{"issues":{"nodes":[]}}}"#)
+        })
+        .await;
+
+        let got = c
+            .fetch_issue_description_by_identifier("  ")
+            .await
+            .expect("blank identifier");
+
+        assert_eq!(got, None);
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a blank identifier should make no API call"
         );
     }
 }

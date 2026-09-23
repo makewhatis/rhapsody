@@ -129,6 +129,15 @@ pub struct ReviewCheckout {
     /// prior commit to diff from — a first round — which is also the whole of the full-review
     /// decision the worker can make without asking GitHub anything.
     pub delta: Option<ReviewDeltaRequest>,
+    /// The origin ticket this pull request implements, resolved at DISPATCH from the watch row's
+    /// `introduced_by` through [`crate::reviewdone::origin_ticket`] (STUDIO-1034). `None` for an
+    /// adopted or human pull request, and for any origin naming no ticket.
+    ///
+    /// The worker reads this ticket's description OFF the control loop — the reviewer has no Linear
+    /// access, so without it the acceptance criteria reach the review prompt only as the author's
+    /// summary in the pull request body. Only the synthetic KEY travels here; the description is a
+    /// network read the worker makes on its own task, which is why dispatch adds no call.
+    pub origin_ticket: Option<String>,
 }
 
 /// One delta-round's inputs: the pull request, the commit the reviewer last read, and the head
@@ -157,6 +166,10 @@ impl ReviewRun {
                 prior_sha: self.prior_sha.clone(),
                 head_sha: self.head_sha.clone(),
             }),
+            // The ticket-bearing origin, resolved once here (STUDIO-1034): the worker reads the
+            // description off the ticket this names, off the control loop.
+            origin_ticket: crate::reviewdone::origin_ticket(&self.introduced_by)
+                .map(str::to_string),
         }
     }
 

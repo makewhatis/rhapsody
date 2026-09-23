@@ -2234,6 +2234,37 @@ point: the prohibition stays on the trusted side of the line the quorum design d
 implementation run reads its configured `prompt_file` exactly as before — including this
 repository's Phase 6 merge instruction, which a test asserts is still rendered.
 
+### A ticketless reviewer is handed the origin ticket's acceptance criteria (STUDIO-1034)
+
+Go v0.4.0 has no review runs, so this is Rhapsody-only surface. A headless reviewer has no tracker
+access of its own, so a ticketless review used to check acceptance against the pull request body's
+own summary — which the AUTHOR wrote. A criterion the author left out of that summary was a
+criterion nobody checked, and two approvals on the reference installation shipped a ticket-required
+item the summary had omitted. The daemon has the tracker, so it now reads the origin ticket's
+description and quotes it into the prompt under
+*"The ticket this pull request implements (the acceptance source of truth)"*.
+
+| A ticketless review run | before | now |
+| --- | --- | --- |
+| acceptance source | the pull request body's own coverage list | the origin ticket's description, quoted as data |
+| no origin ticket, or an unreadable one | silent — no section | an explicit `No ticket available.` line |
+| an oversized description | — | truncated with a host-written cut marker |
+| the read | n/a | a tracker read OFF the control task (the worker's own), never at dispatch |
+
+**How the ticket is found, and why the read is off-loop.** The origin is resolved by the daemon's
+one origin-ticket join (`reviewdone::origin_ticket`, the reader the watch row's `introduced_by`
+already feeds); dispatch carries only that ticket KEY. The description itself is a network read the
+worker makes on its own task, so dispatch adds no call and a slow tracker parks one review rather
+than the control loop. A read that fails, or an origin that names no ticket (an adopted or human
+pull request), degrades to the explicit line rather than omitting the section — the reviewer always
+knows whether it is checking against a ticket or the pull request body.
+
+It adds one additive, Rhapsody-only tracker read (`fetch_issue_description_by_identifier`, a
+single-purpose query like STUDIO-735's labels-by-ids) and nothing to any ported operation. With
+Teams off or `review.mode: tickets`, no ticketless review runs and every prompt is byte-identical:
+quorum review tickets still carry their host-written description, which already names the
+acceptance it was minted for.
+
 ### An abandoned review round becomes a project advisory (STUDIO-822)
 
 Go v0.4.0 has no review quorum at all, so its `projectWarningsFor` has exactly two producers — the
