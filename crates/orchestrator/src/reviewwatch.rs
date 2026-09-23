@@ -2291,16 +2291,19 @@ impl Orchestrator {
     /// request needs. It holds the whole rule in one place so it can be mutation-checked without a
     /// store write.
     ///
-    /// Two rules per pull request, applied in order:
+    /// Three rules per pull request, applied in order:
     ///
-    /// 1. **A row whose reviewer is off the roster or `unselectable`** is reassigned to an eligible
+    /// 1. **A row whose review is running or claimed is left alone**, whatever the roster says
+    ///    about its reviewer: its completion must still land, and the rules below re-consider it
+    ///    once it has.
+    /// 2. **A row whose reviewer is off the roster or `unselectable`** is reassigned to an eligible
     ///    substitute *when a substitute exists and the pull request would still be within
     ///    `review.reviewers` without this row* — i.e. when the review still has room for it.
     ///    Otherwise it is retired.
     ///    Retiring rather than reassigning when the pull request is already at or over its count is
     ///    what keeps a lowered `review.reviewers` from re-inflating the set: the surplus rule below
     ///    would only trim the substitute straight back off.
-    /// 2. **More live rows than `review.reviewers`** are trimmed to that count, keeping, in order:
+    /// 3. **More live rows than `review.reviewers`** are trimmed to that count, keeping, in order:
     ///    rows whose review is running or claimed (**never retired** — their completion must still
     ///    land), `review.required` members, the reviewer whose completed review is most recent (they
     ///    have the most context), then roster order. A running row beyond the count is kept rather
@@ -2350,6 +2353,14 @@ impl Orchestrator {
             // Rule 1 — off-roster or unselectable rows.
             for row in &mine {
                 let name = row.key.reviewer.as_str();
+                // A review that is RUNNING right now must be allowed to finish, whatever the roster
+                // or the exclusions say about its reviewer (STUDIO-1022's first ⚠️): retiring the
+                // row would close it out from under a completion that still has to land. It is
+                // re-considered — and only then retired or reassigned — once it has completed.
+                let id = review_key(&row.key.owner, &row.key.repo, row.key.number, name);
+                if self.running.contains_key(&id) || self.claimed.contains(&id) {
+                    continue;
+                }
                 let on_roster = roster_index.contains_key(name);
                 if on_roster && !exclusions.excludes(name) {
                     continue;
@@ -6068,6 +6079,37 @@ mod tests {
             vec!["jimmy".to_string()],
             "the still-running review survives"
         );
+    }
+
+    /// **Acceptance: a running review is never retired — including one whose reviewer has LEFT the
+    /// roster while it was in flight.** Rule 2 would retire the departed reviewer's row, but the
+    /// run's completion has to land first; only the sweep AFTER it completes retires the row.
+    ///
+    /// MUTATION: drop the running check from rule 2 (the off-roster branch) and this reds — the
+    /// in-flight row is retired out from under its own completion.
+    #[test]
+    fn a_running_review_of_a_departed_reviewer_is_left_to_finish() {
+        // `alice` is the author and the whole roster, so once the row is off-roster there is no
+        // substitute and the only outcomes are retire or leave it running.
+        let (mut o, _d) = orch(ticketless(&["alice"]));
+        introduce(&o, row(76, "sol"));
+        o.claimed.insert(review_key(OWNER, REPO, 76, "sol"));
+
+        let first = o.handle_review_sweep(&[open_at(76, HEAD_A)]);
+        assert_eq!(
+            first.retired, 0,
+            "a running review must not be retired, even with its reviewer off the roster"
+        );
+        assert_eq!(live_reviewers(&o, 76), vec!["sol".to_string()]);
+
+        // The review finishes; the off-roster row is retired on the next sweep.
+        o.claimed.remove(&review_key(OWNER, REPO, 76, "sol"));
+        let second = o.handle_review_sweep(&[open_at(76, HEAD_A)]);
+        assert_eq!(
+            second.retired, 1,
+            "once it completes, the off-roster row is retired"
+        );
+        assert!(live_reviewers(&o, 76).is_empty());
     }
 
     /// **Acceptance: `review.required` outranks recency when picking survivors.** Bob completed the
