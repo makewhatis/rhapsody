@@ -184,7 +184,27 @@ where
         );
     }
 
+    // --- provider broker bind (STUDIO-999, PB4; design §11.1 steps 2-3) ---
+    //
+    // Bind the ONE private IPv4 loopback broker BEFORE any provider preparation can run, and
+    // unconditionally: a startup workflow with no explicit provider can hot-reload one later, and a
+    // later reload must not discover that the required listener was never started. The bind is
+    // security-critical and uses no configured/public port. A bind failure is a fatal startup
+    // error — explicit-provider dispatch must never continue with a direct-key fallback.
+    let mut broker_runtime = match crate::broker::BrokerRuntime::bind() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(stderr.make_writer(), "symphony: provider broker: {error}");
+            return 1;
+        }
+    };
+
     let mut o = Orchestrator::new(flags.path.to_string_lossy().into_owned());
+    // Inject the broker registration handle before `o.control()` snapshots the off-loop handle and
+    // moves the orchestrator into the control task (design §11.1 step 3). The handle is create-only:
+    // PB7's prepared dispatch consumes it, and it refuses with the typed `provider_broker_unavailable`
+    // once the serving task has failed.
+    o.set_provider_broker(broker_runtime.registrar());
     // Open the durable store from the resolved config + --db / --no-store, and inject it before Run
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
@@ -444,6 +464,27 @@ where
     // `defer srv.Shutdown`, so they stop on a normal ctx-cancel AND on a fast-fail exit (a bad config
     // where `o.run` returns before the top-level ctx is ever cancelled), never hanging the drain.
     let shutdown = CancelSignal::new();
+
+    // --- provider broker serving + supervision (STUDIO-999, PB4; design §11.1 step 4) ---
+    //
+    // Spawn serving under the SAME daemon-lifetime signal the observability server uses, then
+    // supervise the task. The supervisor is what makes an unexpected exit loud: it flips the broker
+    // unavailable and revokes every grant rather than letting the task die silently and be noticed
+    // only at shutdown.
+    let broker_supervisor = broker_runtime.take_listener().map(|listener| {
+        let mut serve_shutdown = shutdown.wait();
+        let serve = tokio::spawn(async move {
+            listener
+                .run_with_shutdown(async move { serve_shutdown.cancelled().await })
+                .await
+        });
+        tokio::spawn(crate::broker::supervise(
+            serve,
+            broker_runtime.broker_handle(),
+            shutdown.wait(),
+            SHUTDOWN_DRAIN,
+        ))
+    });
 
     // --- observability server (optional, upstream §13.7) ---
     let mut dashboard_url = String::new();
@@ -1107,6 +1148,13 @@ where
 
     // The control loop has returned (ctx cancel OR a fatal reload error) — now stop the server + prune
     // regardless of why (Go's `pruneCancel` + `defer srv.Shutdown`).
+    //
+    // Shutdown ordering (design §11.3): the control loop has already stopped/cancelled every worker,
+    // and dropping their sessions revoked the turn/session grants. Revoke any remaining registry
+    // entries BEFORE signalling shutdown, so no request can authenticate against a grant that
+    // outlived its worker; the same signal then stops the broker accepting and cancels in-flight
+    // upstream calls via the listener's shutdown broadcast.
+    broker_runtime.revoke_all();
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
@@ -1146,6 +1194,12 @@ where
     // well as between candidates, so the wait is bounded by one remote recall — itself capped by
     // `rhapsody_config::hindsight::REQUEST_TIMEOUT`.
     if let Some(t) = prefetch_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // Drain the provider broker BEFORE the observability server (design §11.3). The supervisor
+    // bounded the serving task's join when the shutdown signal fired; awaiting it here is the
+    // broker's place in the shutdown order, and the wait is bounded again as a backstop.
+    if let Some(t) = broker_supervisor {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
@@ -2012,6 +2066,49 @@ mod tests {
             code,
             0,
             "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
+        );
+    }
+
+    /// STUDIO-999 (PB4): the broker's ephemeral port is private implementation state (design §2.1,
+    /// §13). It can only be observed through `BrokerListener::local_addr`, and the composition root
+    /// must never read it — so it cannot reach `runtime.json`, the banner, `/api/v1/version`, the
+    /// dashboard, or the desktop proxy.
+    ///
+    /// The needle is assembled at run time so this test's own source is not an occurrence of the
+    /// string it forbids (the same idiom as `the_triage_target_is_built_by_the_shared_snapshot_conversion`).
+    #[test]
+    fn run_never_reads_the_broker_address() {
+        let src = include_str!("run.rs");
+        let needle: String = ["local", "_addr()"].concat();
+        for line in src.lines().filter(|line| line.contains(&needle)) {
+            // Exactly one legitimate call site: the observability server's own bound address, which
+            // is published as `runtime.json`'s port. Any other receiver would be the broker's
+            // private address leaking toward a publication surface.
+            assert!(
+                line.contains("server"),
+                "run.rs may only read the observability server's address; found: {line}"
+            );
+        }
+    }
+
+    /// STUDIO-999 (PB4): booting the broker publishes no broker base URL on any daemon surface. The
+    /// broker's only public form is `http://127.0.0.1:<ephemeral>/v1`; the observability dashboard
+    /// URL has no `/v1` path, so a `/v1` on stderr would mean the broker leaked into the banner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broker_boot_publishes_no_broker_base_url() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(&[&wf.to_string_lossy()], &buf).await,
+            0,
+            "daemon should exit 0; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            !buf.contents().contains("/v1"),
+            "no broker base URL may appear on stderr: {}",
             buf.contents()
         );
     }
