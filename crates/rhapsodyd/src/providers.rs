@@ -22,7 +22,8 @@ use rhapsody_config::{
 };
 use rhapsody_credential_ipc::domain::{Binding, CredentialRef, CredentialState};
 use rhapsody_orchestrator::{
-    OpenedProvider, PreparedProviderSource, ProviderRefusal, ProviderReloadSink, RefusalReason,
+    CredentialRevisionSource, OpenedProvider, PreparedProviderSource, ProviderRefusal,
+    ProviderReloadSink, RefusalReason,
 };
 use rhapsody_provider_broker::{BrokerError, BrokerRegistrar, SessionPolicy};
 use rhapsody_provider_status::{
@@ -234,6 +235,29 @@ impl ProviderReloadSink for ProviderRuntime {
 /// `--credential-bootstrap` was not passed. It resolves `OwnerUnavailable` consistently.
 pub fn unavailable_owner() -> Arc<CredentialResolver> {
     Arc::new(CredentialResolver::new())
+}
+
+/// Adapts the daemon's authenticated [`CredentialResolver`] to the orchestrator's per-credential
+/// revision watermark (PB7, STUDIO-1002; design §12). The resolver is the ONE credential boundary —
+/// the provider-status runtime and the prepared dispatch both read through it — so its per-account
+/// high-water is exactly "the newest owner revision this daemon has observed" for that credential.
+/// A provider id maps to the resolver's versioned account (`v1:<id>`); an invalid provider id has no
+/// observable revision.
+pub struct ResolverRevisionSource {
+    resolver: Arc<CredentialResolver>,
+}
+
+impl ResolverRevisionSource {
+    pub fn new(resolver: Arc<CredentialResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+impl CredentialRevisionSource for ResolverRevisionSource {
+    fn high_water(&self, provider: &str) -> Option<u64> {
+        let account = CredentialRef::for_provider(provider).ok()?;
+        self.resolver.high_water(account.account()).map(|r| r.0)
+    }
 }
 
 /// The daemon's prepared-provider source (PB7, STUDIO-1002): the off-loop operation that reads the
@@ -544,6 +568,20 @@ mod tests {
             model: "m".to_string(),
             origins: rhapsody_agent::ProviderOrigins::default(),
         }
+    }
+
+    /// PB7 (STUDIO-1002 review B1): the orchestrator's revision watermark is the daemon's resolver
+    /// keyed by the provider's versioned account. A provider with no answered read has no opinion,
+    /// and an invalid provider id maps to no account at all.
+    #[test]
+    fn revision_source_maps_a_provider_to_its_account_watermark() {
+        let source = ResolverRevisionSource::new(std::sync::Arc::new(CredentialResolver::new()));
+        assert_eq!(source.high_water("fireworks"), None);
+        assert_eq!(
+            source.high_water("Not A Valid Id"),
+            None,
+            "an invalid provider id maps to no account"
+        );
     }
 
     /// PB7: with no credential owner channel, the prepared-provider source refuses with the typed

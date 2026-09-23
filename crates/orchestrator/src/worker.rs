@@ -67,7 +67,9 @@ impl BrokerTurnSlots {
     /// Arm the next turn synchronously: take the session's single turn gate, store the receipt so it
     /// outlives the await, and hand the paired attempt back for the adapter. `None` when no receiver
     /// was installed (the legacy path); a typed error string when the broker refuses the turn.
-    fn arm_turn(&mut self) -> Result<Option<rhapsody_provider_broker::BrokerTurnAttempt>, String> {
+    pub(crate) fn arm_turn(
+        &mut self,
+    ) -> Result<Option<rhapsody_provider_broker::BrokerTurnAttempt>, String> {
         let Some(receiver) = self.receiver.as_mut() else {
             return Ok(None);
         };
@@ -309,6 +311,12 @@ pub struct WorkerDeps {
     /// the same `Arc` the spawn closure retains, so a cancelled turn's finalized receipt is still
     /// drained and persisted. `None` on every legacy dispatch.
     pub broker: Option<Arc<Mutex<BrokerTurnSlots>>>,
+    /// TEST SEAM (PB7, STUDIO-1002): a prebuilt harness to bridge a prepared dispatch through, so an
+    /// orchestrator test can drive a brokered run with a fake session instead of a real CLI.
+    /// Production leaves it `None`, so the factory builds the adapter from the prepared knobs —
+    /// `build_dispatch_runner` remains the only production path. The custody is still moved into the
+    /// non-`Clone` `DispatchRunner`; the shared harness owns no `BrokerSession`.
+    pub prepared_harness: Option<Arc<dyn Harness>>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -733,7 +741,11 @@ pub async fn run_agent_attempt(
     // three late setters — byte-identical to a daemon built before this feature.
     let (sess, broker_turns): (Box<dyn Session>, Option<BrokerLedgerReceiver>) = match prepared {
         Some(spec) => {
-            let runner = match rhapsody_agent::build_dispatch_runner(spec) {
+            let built = match deps.prepared_harness.clone() {
+                Some(harness) => rhapsody_agent::bridge_dispatch_runner(harness, spec),
+                None => rhapsody_agent::build_dispatch_runner(spec),
+            };
+            let runner = match built {
                 Ok(runner) => runner,
                 Err(e) => {
                     let _ = deps
@@ -1183,6 +1195,7 @@ mod tests {
             harness_refusal: None,
             prepared: None,
             broker: None,
+            prepared_harness: None,
         }
     }
 
@@ -3381,6 +3394,219 @@ mod tests {
             agent_ev.1,
             "agent-event log must be emitted under the run/turn span for OTel trace correlation"
         );
+    }
+
+    // --- PB7 (STUDIO-1002 review B2): the receipt wiring through the REAL worker path ------------
+    //
+    // Before this, `BrokerTurnSlots` was only ever exercised in isolation, so removing the arm in
+    // `run_turns` (or the post-run finalize) left every orchestrator test green. These drive
+    // `run_agent_attempt` with a real broker registration and a fake harness.
+
+    /// A harness that reports Opencode and starts a recording brokered session. The session consumes
+    /// (drops) the `BrokerTurnAttempt` without minting a capability, which is the shape a brokered
+    /// turn produces when the adapter future is dropped before mint — so the armed receipt must
+    /// finalize as a zero-usage `NoCapability` ledger. It also records whether an attempt was handed
+    /// to it at all, which pins the "pass the paired attempt" half of the wiring.
+    struct ReceiptFakeHarness {
+        inner: agentfake::Fake,
+        caps: rhapsody_agent::harness::HarnessCapabilities,
+        saw_attempt: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ReceiptFakeHarness {
+        fn new() -> Self {
+            Self {
+                inner: agentfake::Fake::new(),
+                caps: rhapsody_agent::harness::declared_capabilities(
+                    rhapsody_agent::HarnessId::Opencode,
+                ),
+                saw_attempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    /// A session whose brokered turn records the attempt's presence and drops it unminted.
+    struct ReceiptFakeSession {
+        saw_attempt: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for ReceiptFakeSession {
+        fn id(&self) -> String {
+            "receipt-fake".to_string()
+        }
+
+        fn thread_id(&self) -> String {
+            "receipt-thread".to_string()
+        }
+
+        async fn run_turn(
+            &self,
+            _prompt: &str,
+            _attempt: Option<i64>,
+            _messages: Option<&mut mpsc::Receiver<String>>,
+            _on_event: &(dyn Fn(Event) + Send + Sync),
+        ) -> (TurnResult, Option<AgentError>) {
+            (
+                TurnResult {
+                    status: TURN_SUCCEEDED.to_string(),
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+
+        async fn run_turn_brokered(
+            &self,
+            prompt: &str,
+            attempt: Option<i64>,
+            messages: Option<&mut mpsc::Receiver<String>>,
+            on_event: &(dyn Fn(Event) + Send + Sync),
+            broker: Option<rhapsody_provider_broker::BrokerTurnAttempt>,
+        ) -> (TurnResult, Option<AgentError>) {
+            self.saw_attempt
+                .store(broker.is_some(), std::sync::atomic::Ordering::SeqCst);
+            // The cancellation shape: drop the attempt un-minted.
+            drop(broker);
+            self.run_turn(prompt, attempt, messages, on_event).await
+        }
+
+        async fn stop(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rhapsody_agent::Runner for ReceiptFakeHarness {
+        async fn start_session(
+            &self,
+            workspace_path: &str,
+            issue: Issue,
+            transcript: Option<Transcript>,
+        ) -> Result<Box<dyn Session>, AgentError> {
+            self.inner
+                .start_session(workspace_path, issue, transcript)
+                .await
+        }
+    }
+
+    impl Harness for ReceiptFakeHarness {
+        fn id(&self) -> rhapsody_agent::HarnessId {
+            rhapsody_agent::HarnessId::Opencode
+        }
+
+        fn capabilities(&self) -> &rhapsody_agent::harness::HarnessCapabilities {
+            &self.caps
+        }
+
+        fn start_brokered_session(
+            &self,
+            _workspace_path: &str,
+            _issue: Issue,
+            _transcript: Option<Transcript>,
+        ) -> Result<Box<dyn Session>, AgentError> {
+            Ok(Box::new(ReceiptFakeSession {
+                saw_attempt: Arc::clone(&self.saw_attempt),
+            }))
+        }
+    }
+
+    /// One registered broker custody with the plan above, as the prepared dispatch carries it.
+    fn brokered_provider() -> (
+        rhapsody_agent::PreparedProvider,
+        rhapsody_provider_broker::Broker,
+    ) {
+        use rhapsody_provider_broker::{
+            BoundCredentialLease, Broker, BrokerProtocol, BrokerRegistrationPlan, OsRandom,
+            SessionPolicy, SystemClock,
+        };
+        let broker = Broker::new(
+            "http://127.0.0.1:0/v1",
+            Arc::new(SystemClock::new()),
+            Arc::new(OsRandom::new()),
+        )
+        .expect("broker");
+        let plan = BrokerRegistrationPlan::new(
+            "fireworks",
+            BrokerProtocol::OpenAiChatCompletions,
+            "https://api.fireworks.ai/inference/v1",
+            false,
+            "accounts/fireworks/models/x",
+            rhapsody_provider_broker::DEFAULT_BROKER_LIMITS,
+        )
+        .expect("plan");
+        let binding = plan.binding().expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let policy = SessionPolicy::new(*plan.limits()).expect("policy");
+        let registration = broker
+            .registrar()
+            .register_session(plan, lease, policy)
+            .expect("register");
+        let provider = rhapsody_agent::PreparedProvider::from_registration(
+            "fireworks".to_string(),
+            rhapsody_agent::ProviderProtocol::OpenAiCompatible,
+            registration,
+        );
+        (provider, broker)
+    }
+
+    /// MUTATION GUARD (B2, M1): remove the synchronous `arm_turn` in `WorkerDeps::run_turns` and no
+    /// receipt is ever stored, so `finalize_armed` drains nothing and the count assertion goes to 0.
+    /// A receipt must exist for a brokered turn, and its finalized ledger must be a zero-usage
+    /// `NoCapability` (the pre-mint cancellation shape).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brokered_turn_arms_and_finalizes_exactly_one_receipt() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let harness = Arc::new(ReceiptFakeHarness::new());
+        let saw_attempt = Arc::clone(&harness.saw_attempt);
+        let agent: Arc<dyn Harness> = harness.clone();
+        let mut deps = make_deps(
+            ws,
+            agent,
+            fake_tracker_by_id(&[("1", "MT-1", "In Progress")]),
+            "Do {{ issue.identifier }}",
+            1,
+        );
+        let (provider, _broker) = brokered_provider();
+        deps.prepared_harness = Some(harness);
+        deps.prepared = Some(rhapsody_agent::PreparedHarnessSpec {
+            harness: rhapsody_agent::HarnessId::Opencode,
+            model: Some("accounts/fireworks/models/x".to_string()),
+            provider: Some(provider),
+            knobs: rhapsody_agent::HarnessKnobs::Opencode(Default::default()),
+        });
+        deps.broker = Some(Arc::new(Mutex::new(BrokerTurnSlots::default())));
+
+        let (_state, _declared, err) =
+            run_agent_attempt(&mut deps, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "the brokered attempt must not fail: {err:?}");
+        assert!(
+            saw_attempt.load(std::sync::atomic::Ordering::SeqCst),
+            "the paired BrokerTurnAttempt must be handed to the adapter's turn"
+        );
+
+        let slots = deps.broker.as_ref().expect("broker slots");
+        let guard = slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            guard.ledgers().len(),
+            1,
+            "exactly one receipt must be finalized for a brokered turn"
+        );
+        let ledger = &guard.ledgers()[0];
+        assert_eq!(
+            ledger.outcome(),
+            rhapsody_provider_broker::TurnOutcome::NoCapability
+        );
+        assert!(!ledger.capability_issued());
+        let usage = guard
+            .usage()
+            .expect("a finalized receipt still records a usage row");
+        assert_eq!(usage.reserved_tokens, 0);
+        assert_eq!(usage.provider_reported_tokens, None);
+        assert!(usage.usage_authority.is_empty());
     }
 }
 

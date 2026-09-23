@@ -133,9 +133,9 @@ pub use preflight::{
     ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
 };
 pub use prepare::{
-    DEFAULT_PREPARATION_TIMEOUT, MAX_PREPARATION_CONCURRENCY, PreparationCompletion,
-    PreparationKey, PreparationOutcome, PreparationRequest, PreparationResolver, PreparationToken,
-    PreparedDispatch, RefusalGate, RefusalReason,
+    CredentialRevisionSource, DEFAULT_PREPARATION_TIMEOUT, MAX_PREPARATION_CONCURRENCY,
+    PreparationCompletion, PreparationKey, PreparationOutcome, PreparationRequest,
+    PreparationResolver, PreparationToken, PreparedDispatch, RefusalGate, RefusalReason,
 };
 pub use providerprep::{
     OpenedProvider, PreparedProviderSource, ProviderPreparationResolver, ProviderRefusal,

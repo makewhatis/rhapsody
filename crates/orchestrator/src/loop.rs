@@ -564,6 +564,8 @@ fn worker_deps_for(
         // leaves both `None`, keeping the legacy path byte-identical.
         prepared: None,
         broker: None,
+        // Test seam only; production always builds the dispatch runner from the prepared knobs.
+        prepared_harness: None,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1810,26 +1812,10 @@ impl Orchestrator {
                 res = run => res,
                 _ = cancel.cancelled() => (iss.state.clone(), crate::worker::WorkerDeclaration::default(), None),
             };
-            // Drain the broker supervisor after the run future is fully dropped. On a normal exit
-            // `run_turns` already drained each turn; on cancellation this is what takes the now
-            // finalized (zero-usage) receipt for the turn that was in flight. The summed usage is
-            // `None` for a non-brokered run, so no usage row is ever written for one.
-            let broker_usage = broker_slots.and_then(|slots| {
-                let mut guard = slots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.finalize_armed();
-                guard.usage()
-            });
-            // Persist the finalized broker usage (PB7, STUDIO-1002) BEFORE the exit event, so the
-            // control task still has the running entry to resolve the store run id from. `None` for a
-            // non-brokered run writes nothing, keeping every legacy run byte-identical.
-            if let Some(usage) = broker_usage {
-                let _ = events_exit.send(Event::BrokerUsage {
-                    issue_id: issue_id.clone(),
-                    usage: Box::new(usage),
-                });
-            }
+            // Drain the broker supervisor after the run future is fully dropped and report the usage
+            // (PB7, STUDIO-1002; design §10.3). BEFORE the exit event, so the control task still has
+            // the running entry to resolve the store run id from.
+            finalize_broker_usage(broker_slots.as_ref(), &events_exit, &issue_id);
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
@@ -1847,6 +1833,33 @@ impl Orchestrator {
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
     }
+}
+
+/// Drain the loop-external broker supervisor once the worker's run future has fully dropped, and
+/// report the finalized usage on the control channel (PB7, STUDIO-1002; design §10.3).
+///
+/// On a normal exit `run_turns` already drained each turn; on cancellation the run future is dropped
+/// first (taking the in-flight `BrokerTurnAttempt` with it), and this then takes the now-finalized
+/// zero-usage receipt — so a cancelled brokered turn is accounted rather than silently lost. `None`
+/// for a non-brokered run, so no usage row or event is ever produced for a legacy dispatch.
+pub(crate) fn finalize_broker_usage(
+    slots: Option<&Arc<std::sync::Mutex<crate::worker::BrokerTurnSlots>>>,
+    events: &tokio::sync::mpsc::UnboundedSender<Event>,
+    issue_id: &str,
+) {
+    let Some(usage) = slots.and_then(|slots| {
+        let mut guard = slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.finalize_armed();
+        guard.usage()
+    }) else {
+        return;
+    };
+    let _ = events.send(Event::BrokerUsage {
+        issue_id: issue_id.to_string(),
+        usage: Box::new(usage),
+    });
 }
 
 impl ControlHandle {
@@ -3295,6 +3308,67 @@ mod tests {
             msg.contains("please reopen this ticket"),
             "the summon body reaches the fresh run: {msg}"
         );
+    }
+
+    // PB7 (STUDIO-1002 review B2, M2): the loop-external drain after the run future is dropped. An
+    // armed receipt survives a cancellation (the run future's attempt is dropped with it), and this
+    // is the code the spawn closure runs afterwards. MUTATION GUARDS: dropping `finalize_armed` here
+    // loses the cancelled turn's accounting, and dropping the `Event::BrokerUsage` send hides the
+    // usage row from the control task — both red this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_brokered_turn_is_drained_and_reported_as_usage() {
+        use rhapsody_provider_broker::{
+            BoundCredentialLease, Broker, BrokerProtocol, BrokerRegistrationPlan, OsRandom,
+            SessionPolicy, SystemClock,
+        };
+        let broker = Broker::new(
+            "http://127.0.0.1:0/v1",
+            std::sync::Arc::new(SystemClock::new()),
+            std::sync::Arc::new(OsRandom::new()),
+        )
+        .expect("broker");
+        let plan = BrokerRegistrationPlan::new(
+            "fireworks",
+            BrokerProtocol::OpenAiChatCompletions,
+            "https://api.fireworks.ai/inference/v1",
+            false,
+            "accounts/fireworks/models/x",
+            rhapsody_provider_broker::DEFAULT_BROKER_LIMITS,
+        )
+        .expect("plan");
+        let binding = plan.binding().expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let policy = SessionPolicy::new(*plan.limits()).expect("policy");
+        let registration = broker
+            .registrar()
+            .register_session(plan, lease, policy)
+            .expect("register");
+
+        // The supervisor the spawn closure holds: install the receiver, arm a turn, and drop the
+        // attempt un-minted — exactly what a cancelled run future leaves behind.
+        let slots = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::worker::BrokerTurnSlots::default(),
+        ));
+        {
+            let mut guard = slots.lock().expect("slots");
+            guard.install_receiver(registration.ledgers);
+            // Arm synchronously, then drop the attempt un-minted: the cancelled-turn shape.
+            let attempt = guard.arm_turn().expect("arm").expect("a brokered attempt");
+            drop(attempt);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        finalize_broker_usage(Some(&slots), &tx, "1");
+        match rx.try_recv().expect("a BrokerUsage event must be emitted") {
+            Event::BrokerUsage { issue_id, usage } => {
+                assert_eq!(issue_id, "1");
+                assert_eq!(usage.reserved_tokens, 0);
+                assert_eq!(usage.provider_reported_tokens, None);
+                assert!(usage.usage_authority.is_empty());
+            }
+            _ => panic!("expected a BrokerUsage event"),
+        }
     }
 }
 

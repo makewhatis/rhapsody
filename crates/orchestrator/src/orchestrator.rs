@@ -991,10 +991,17 @@ pub struct Orchestrator {
     /// The bounded refusal gate: suppresses the identical `(identity, selection, credential
     /// revision)` refusal until an input changes or its next-probe time arrives.
     pub(crate) refusal_gate: crate::prepare::RefusalGate,
-    /// The credential revision the loop currently expects, or `None` when it has no opinion (the P6
-    /// default — no provider subsystem). A completion whose observed revision differs is stale and
-    /// its move-only payload is dropped; PB7 advances this on a credential mutation.
-    pub(crate) prepare_expected_revision: Option<String>,
+    /// The credential revision the loop currently expects, PER PROVIDER (PB7, STUDIO-1002; design
+    /// §12). Keyed by the non-secret provider stable id a prepared completion carries, so two
+    /// providers never cross-drop each other's completions. An entry whose observed revision differs
+    /// is stale and its move-only payload is dropped; the map is empty (no opinion) for a daemon
+    /// with no provider subsystem.
+    pub(crate) prepare_expected_revisions: HashMap<String, u64>,
+    /// The daemon's per-credential observed-revision watermark (PB7, STUDIO-1002; design §12).
+    /// `None` by default, so the check is inert for tests; the composition root installs the adapter
+    /// over the shared `CredentialResolver`, so a completion whose read observed an OLDER owner
+    /// revision than a later read on the same provider is dropped before it can become a session.
+    pub credential_revisions: Option<Arc<dyn crate::prepare::CredentialRevisionSource>>,
     /// A reopening ticket's captured summons, held from `promote_and_dispatch` until
     /// `dispatch_issue` makes the run live and seeds it (STUDIO-988). Needed because the run does not
     /// exist until an asynchronous preparation is accepted, which can be several events later. Empty
@@ -1163,7 +1170,8 @@ impl Orchestrator {
                 crate::prepare::MAX_PREPARATION_CONCURRENCY,
             )),
             refusal_gate: crate::prepare::RefusalGate::default(),
-            prepare_expected_revision: None,
+            prepare_expected_revisions: HashMap::new(),
+            credential_revisions: None,
             pending_reopen_summons: HashMap::new(),
             // STUDIO-999 (PB4): no broker handle by default. The daemon injects the real one after
             // construction and before `control()`; tests leave it `None`.

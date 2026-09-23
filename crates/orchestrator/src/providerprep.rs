@@ -241,7 +241,6 @@ mod tests {
             },
             selection: "ticket|1".to_string(),
             config_generation: 0,
-            expected_revision: String::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             tiers: crate::selection::SelectionTiers {
                 global: crate::selection::FieldSelection {

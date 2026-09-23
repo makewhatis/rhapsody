@@ -232,8 +232,13 @@ impl GateData {
 /// A minimal resolved [`Config`] for the `cfg` field of a test [`Effective`] (never read by the O2
 /// selection/claim tests). Decoded from a tiny WORKFLOW front matter, mirroring `effective_test.go`.
 fn minimal_config() -> Config {
+    // A configured provider is deliberate (STUDIO-1002 review B3): `begin_preparation` returns
+    // `NoResolver` while the effective config defines no provider, so a fixture that installs a
+    // resolver to exercise the preparation machinery must also declare one. It is never SELECTED by
+    // these fixtures (no `rhapsody:provider/…` label and no injected selection), so it only opens
+    // the gate; the resolver under test is the injected fake.
     let front: YamlMap = serde_yaml_ng::from_str(
-        "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\nagent:\n  backend: claude\nclaude:\n  command: claude\n",
+        "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\nagent:\n  backend: claude\nclaude:\n  command: claude\nproviders:\n  testprovider:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
     )
     .expect("front matter parses");
     let def = Definition {
