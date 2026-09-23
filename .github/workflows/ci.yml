@@ -68,6 +68,15 @@ jobs:
       # a Linux portability failure is the signal this matrix exists to give, and iterating one
       # crate per push against the queued pool is the cost it removes.
       - run: cargo test --workspace --no-fail-fast
+      # STUDIO-1032: `ensure_from_repo_hook_runs_unlocked` now proves the two same-repo after_create
+      # hooks run concurrently with a cross-process barrier instead of inferring it from wall-clock
+      # [start,end] interval overlap. The flake it replaces was a Linux-only timing artifact (the
+      # second task's prehook git work outlasted the first hook's sleep), so a single run is not
+      # evidence of determinism — this loop pins 50 consecutive passes. `runner.os != 'macOS'` keeps
+      # the repetition off the shared Macs (the push-to-main leg runs there); the workspace test run
+      # above has already compiled everything, so each iteration only re-runs the one test.
+      - if: runner.os != 'macOS'
+        run: for i in $(seq 1 50); do cargo test -p rhapsody-workspace ensure_from_repo_hook_runs_unlocked || exit 1; done
 
   web:
     if: >-
