@@ -1012,6 +1012,11 @@ pub struct Orchestrator {
     /// unavailable, `register_session` on the handle returns the typed `provider_broker_unavailable`
     /// refusal rather than any direct-key fallback.
     pub provider_broker: Option<rhapsody_provider_broker::BrokerRegistrar>,
+
+    /// The daemon's provider-set reload sink (STUDIO-990, P9, Rhapsody-only). `None` by default, so
+    /// the reload path is byte-identical for tests and any embedding with no provider runtime; the
+    /// composition root installs the real one before `Run`. See [`crate::providerreload`].
+    pub provider_reload: Option<Arc<dyn crate::providerreload::ProviderReloadSink>>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -1163,6 +1168,9 @@ impl Orchestrator {
             // STUDIO-999 (PB4): no broker handle by default. The daemon injects the real one after
             // construction and before `control()`; tests leave it `None`.
             provider_broker: None,
+            // STUDIO-990 (P9): no provider-reload sink by default. The daemon injects the real one
+            // before `Run`; tests leave it `None`.
+            provider_reload: None,
         }
     }
 

@@ -59,7 +59,7 @@ pub async fn run<W>(
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
-    run_with_seam(ctx, args, stderr, is_terminal, install_probe, None).await
+    run_with_seam(ctx, args, stderr, is_terminal, install_probe, None, None).await
 }
 
 /// [`run`] with the daemon's broker-wiring seam (STUDIO-999, PB4). Production passes `None`; the
@@ -73,6 +73,7 @@ async fn run_with_seam<W>(
     is_terminal: bool,
     install_probe: bool,
     seam: Option<crate::broker::BrokerSeam>,
+    provider_seam: Option<crate::providers::ProviderSeam>,
 ) -> i32
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
@@ -545,11 +546,28 @@ where
             .clone()
             .unwrap_or_else(crate::providers::unavailable_owner);
         let provider_runtime = ProviderRuntime::new(credential_owner, broker_runtime.registrar());
+        // Apply the boot provider set immediately, so the two GET routes answer for a configured
+        // provider before the control loop's own initial reload lands.
         if let Some(config) = resolved.as_ref() {
             let scheduled = provider_runtime.apply_config(config);
             if scheduled > 0 {
                 tracing::info!(providers = scheduled, "scheduled provider status refreshes");
             }
+        }
+        // STUDIO-990 (P9), B1: install the runtime as the orchestrator's reload sink, so a WORKFLOW.md
+        // hot-reload reaches the SAME cache the boot apply populated. Without this the daemon keeps
+        // the boot-time provider map forever (an added provider 404s, a removed one still lists, a
+        // moved endpoint never converges to `binding_mismatch`). Both paths call `apply_providers`,
+        // so boot and reload can never disagree about the provider map.
+        let provider_sink: Arc<dyn rhapsody_orchestrator::ProviderReloadSink> =
+            provider_runtime.clone();
+        o.set_provider_reload_sink(provider_sink);
+        if let Some(seam) = provider_seam
+            && let Some(observe) = seam.observe
+        {
+            observe(crate::providers::ProviderObservation {
+                runtime: Arc::clone(&provider_runtime),
+            });
         }
         let provider = Arc::new(
             DaemonState::new(handle.clone())
@@ -2222,7 +2240,7 @@ mod tests {
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
         let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
         });
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
@@ -2295,7 +2313,15 @@ mod tests {
         let argv = vec![wf.to_string_lossy().into_owned()];
         let code = tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_seam(signal.wait(), &argv, buf.clone(), false, false, Some(seam)),
+            run_with_seam(
+                signal.wait(),
+                &argv,
+                buf.clone(),
+                false,
+                false,
+                Some(seam),
+                None,
+            ),
         )
         .await
         .expect("a bind failure must be fatal, not a daemon that boots on with no broker");
@@ -2337,7 +2363,7 @@ mod tests {
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
         let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
         });
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
@@ -2412,7 +2438,7 @@ mod tests {
         let argv = vec![wf.to_string_lossy().into_owned()];
         let run_buf = buf.clone();
         let handle = tokio::spawn(async move {
-            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam), None).await
         });
 
         let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
@@ -3497,5 +3523,176 @@ mod tests {
              would degrade to a debug line, and the board would go back to reading the review \
              state while the author is implementing (STUDIO-839)"
         );
+    }
+
+    // --- STUDIO-990 (P9), B1: the daemon wiring of the provider status cache. ---
+
+    /// A provider-carrying workflow with the observability server on an ephemeral port, so the
+    /// provider runtime is built. `providers` is a top-level YAML block; `providers` and `server`
+    /// both ride in `extra_block`.
+    const ONE_PROVIDER: &str = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\nserver:\n  port: 0\n";
+    const TWO_PROVIDERS: &str = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n  second:\n    protocol: openai-compatible\n    base_url: https://api.example/v2\n    credential:\n      source: keychain\nserver:\n  port: 0\n";
+
+    /// Polls the live cache until `id` has a published (non-refreshing) status, or panics after 20s.
+    /// The reload path is gated by the ≤1s mtime watcher, so the budget is generous on purpose: under
+    /// a fully parallel `cargo test --workspace` the watcher tick plus the off-loop read can take
+    /// several seconds.
+    async fn wait_for_status(
+        runtime: &Arc<crate::providers::ProviderRuntime>,
+        id: &str,
+    ) -> rhapsody_provider_status::ProviderStatusView {
+        for _ in 0..2000 {
+            if let Some(view) = runtime.status(id)
+                && !view.refreshing
+                && view.cache_age_ms.is_some()
+            {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "provider {id:?} status did not converge; statuses={:?}",
+            runtime.statuses()
+        );
+    }
+
+    /// The daemon boot wiring is real: a configured provider reaches the status cache through the
+    /// runtime `run` builds and its scheduled off-loop read publishes the honest `owner_unavailable`
+    /// (no bootstrap channel in a hermetic test). The provider map is applied by the boot
+    /// `apply_config` and by the control loop's own initial reload through the same sink, so this
+    /// pins the composition end to end rather than either call site alone.
+    ///
+    /// MUTATION GUARD: make `apply_providers` schedule no refresh (replace `spawn_status_refresh`
+    /// with a no-op) and the entry stays `unknown_refreshing` with no age, so `wait_for_status`
+    /// never returns and this reds. (Verified.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_applies_the_boot_provider_set_to_the_status_cache() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, ONE_PROVIDER);
+        let buf = SharedBuf::new();
+        let (obs_tx, obs_rx) = tokio::sync::oneshot::channel();
+        let provider_seam = crate::providers::ProviderSeam {
+            observe: Some(Box::new(move |observation| {
+                let _ = obs_tx.send(observation);
+            })),
+        };
+
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let handle = tokio::spawn(async move {
+            run_with_seam(
+                wait,
+                &argv,
+                run_buf,
+                false,
+                false,
+                None,
+                Some(provider_seam),
+            )
+            .await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
+            .await
+            .expect("the seam must observe the provider runtime once it is built")
+            .expect("observation");
+        let view = wait_for_status(&observation.runtime, "fireworks").await;
+        assert_eq!(view.provider_id, "fireworks");
+        assert_eq!(
+            view.status, "owner_unavailable",
+            "no credential owner ⇒ the honest state, and the read is off-loop"
+        );
+        assert!(
+            view.broker_available,
+            "the broker is serving, so the status must report it available"
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+    }
+
+    /// A WORKFLOW.md hot-reload reaches the SAME cache the boot apply populated: adding a provider
+    /// makes it appear without a restart.
+    ///
+    /// MUTATION GUARD: omit `o.set_provider_reload_sink(...)` in `run` (or never call the sink from
+    /// `reload_from_disk`) and the added provider never appears, so this times out and reds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_applies_a_workflow_reload_to_the_status_cache() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, ONE_PROVIDER);
+        let buf = SharedBuf::new();
+        let (obs_tx, obs_rx) = tokio::sync::oneshot::channel();
+        let provider_seam = crate::providers::ProviderSeam {
+            observe: Some(Box::new(move |observation| {
+                let _ = obs_tx.send(observation);
+            })),
+        };
+
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let handle = tokio::spawn(async move {
+            run_with_seam(
+                wait,
+                &argv,
+                run_buf,
+                false,
+                false,
+                None,
+                Some(provider_seam),
+            )
+            .await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
+            .await
+            .expect("the seam must observe the provider runtime")
+            .expect("observation");
+        let booted = wait_for_status(&observation.runtime, "fireworks").await;
+        assert_eq!(booted.status, "owner_unavailable");
+
+        // A hot-reload test cannot assume the mtime watcher has STARTED when the rewrite lands: the
+        // boot status above converges on the pre-control-loop apply, so a single write could become
+        // the watcher's own baseline (a missed change). Rewrite until the watcher observes it — every
+        // write moves the mtime, so one lands after the watcher's first tick regardless of startup
+        // timing.
+        let mut added = None;
+        for _ in 0..20 {
+            let _ = write_wf(&dir, OFF_STORAGE, TWO_PROVIDERS);
+            for _ in 0..200 {
+                if let Some(view) = observation.runtime.status("second")
+                    && !view.refreshing
+                    && view.cache_age_ms.is_some()
+                {
+                    added = Some(view);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if added.is_some() {
+                break;
+            }
+        }
+        let added = added.expect("the workflow reload must reach the runtime's status cache");
+        assert_eq!(added.status, "owner_unavailable");
+        assert_eq!(
+            observation.runtime.statuses().len(),
+            2,
+            "the reload must reach the runtime's provider map, not only its status cache"
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
     }
 }

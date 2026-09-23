@@ -264,7 +264,9 @@ impl RefreshCoordinator {
 
     /// Run one catalog refresh for `provider_id`. Calls `read_bound` for the CURRENT canonical
     /// endpoint first; on a binding mismatch it performs NO provider I/O. Updates the catalog cache
-    /// (or its bounded error) under the cache key.
+    /// (or its bounded error) under the cache key. The global concurrency semaphore is acquired HERE,
+    /// so both the explicit operator POST (which calls this directly) and the spawned path are
+    /// bounded by [`MAX_CONCURRENT_REFRESHES`].
     pub async fn refresh_catalog(
         &self,
         provider_id: &str,
@@ -276,6 +278,7 @@ impl RefreshCoordinator {
         let Some(guard) = self.begin_catalog_in_flight(provider_id) else {
             return Err(CatalogError::InFlight);
         };
+        let _permit = self.permits.acquire().await;
         let account = CredentialRef::for_provider(provider_id)
             .map(|r| r.account().to_string())
             .unwrap_or_default();
@@ -322,11 +325,12 @@ impl RefreshCoordinator {
         Ok(snapshot)
     }
 
-    /// Spawn a bounded catalog refresh (the explicit operator POST path).
+    /// Spawn a catalog refresh off-loop. There is no production caller today (the POST awaits
+    /// [`RefreshCoordinator::refresh_catalog`] directly), but it exists for a future off-loop caller
+    /// and is bounded by the same permit that call acquires.
     pub fn spawn_catalog_refresh(self: &Arc<Self>, provider_id: String) {
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
-            let _permit = coordinator.permits.acquire().await;
             let _ = coordinator.refresh_catalog(&provider_id).await;
         });
     }
@@ -621,5 +625,99 @@ mod tests {
         drop(guard);
         // Once released, a refresh proceeds.
         assert!(coordinator.refresh_catalog("fireworks").await.is_ok());
+    }
+
+    /// A credential read that always answers `Present` with a fresh lease — the concurrency test
+    /// needs every provider to reach discovery, and the scripted [`FakeSource`] consumes its state on
+    /// the first call.
+    struct AlwaysPresent;
+
+    #[async_trait]
+    impl CredentialReadSource for AlwaysPresent {
+        async fn read_bound(&self, _account: String, binding: Binding) -> ObservedRead {
+            ObservedRead {
+                state: ObservedState::Present(BoundCredentialLease::new(binding, "sk-fake".into())),
+                owner_revision: Revision(1),
+                availability_generation: Revision::INITIAL,
+            }
+        }
+    }
+
+    /// A discovery that records the peak number of concurrent in-flight calls, so a test can prove
+    /// the coordinator's global semaphore actually bounds cross-provider concurrency.
+    #[derive(Default)]
+    struct CountingDiscovery {
+        active: AtomicU64,
+        max_active: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ModelDiscovery for CountingDiscovery {
+        async fn list_models(
+            &self,
+            _request: DiscoveryRequest,
+        ) -> Result<DiscoveredCatalog, CatalogError> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(DiscoveredCatalog {
+                entries: vec![ModelEntry {
+                    id: "m".into(),
+                    display_name: None,
+                    capabilities: Vec::new(),
+                }],
+                truncated: false,
+            })
+        }
+    }
+
+    // MUTATION GUARD (concurrent refreshes are bounded): the global semaphore must bound the POST
+    // path too, not only the spawned one. Removing the permit acquisition from `refresh_catalog`
+    // lets all 8 providers reach discovery at once and this reds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_semaphore_bounds_cross_provider_catalog_refreshes() {
+        let discovery = Arc::new(CountingDiscovery::default());
+        let coordinator = RefreshCoordinator::with_now(
+            Arc::new(AlwaysPresent),
+            Arc::clone(&discovery) as Arc<dyn ModelDiscovery>,
+            fixed_now(0),
+        );
+        let providers: Vec<ProviderConfig> = (0..8)
+            .map(|i| {
+                let id = format!("p{i}");
+                ProviderConfig {
+                    provider_id: id.clone(),
+                    binding: Binding {
+                        provider_id: id,
+                        adapter: OPENAI_CHAT_COMPLETIONS_BEARER_V1.into(),
+                        base_url: format!("https://api{i}.example/v1"),
+                    },
+                    allow_insecure_http: false,
+                }
+            })
+            .collect();
+        let _ = coordinator.apply_reload(1, &providers);
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let c = Arc::clone(&coordinator);
+            tasks.push(tokio::spawn(async move {
+                c.refresh_catalog(&format!("p{i}")).await
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join").expect("snapshot");
+        }
+
+        let peak = discovery.max_active.load(Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONCURRENT_REFRESHES as u64,
+            "at most {MAX_CONCURRENT_REFRESHES} refreshes may run at once, saw {peak}"
+        );
+        assert!(
+            peak >= 2,
+            "the test must observe real overlap, otherwise it proves nothing (saw {peak})"
+        );
     }
 }

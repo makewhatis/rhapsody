@@ -240,11 +240,12 @@ identity encoding, Bearer-only, exact-secret redaction) and never mints an agent
 `providers:` block every route serves an empty/unknown answer, so legacy Claude and native-login
 OpenCode behavior is byte-identical.
 
-The provider set is applied from the resolved workflow at boot. Hot-reload re-application (the
-design's "a provider reload marks affected status unknown/refreshing and schedules one bounded
-off-loop refresh") is implemented and tested in the cache/coordinator domain but not yet wired to
-the orchestrator's internal reload event, which exposes no notification seam; that wiring is a
-follow-up.
+The provider set is applied from the resolved workflow at boot, and a `WORKFLOW.md` hot-reload
+re-applies it: the orchestrator's reload path hands the new set to the runtime through a
+Rhapsody-only `ProviderReloadSink`, so a reload marks the affected status `unknown/refreshing` and
+schedules the same bounded off-loop refresh against the new canonical binding (converging a
+moved endpoint to `binding_mismatch` without waiting for a dispatch). A reload that fails keeps the
+last-good config and therefore invalidates nothing.
 
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 

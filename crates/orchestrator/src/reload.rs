@@ -232,6 +232,17 @@ impl Orchestrator {
             rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS
         };
         self.pr_state_interval_ms.store(interval, Ordering::Relaxed);
+        // STUDIO-990 (P9): hand the resolved provider set to the daemon's provider-status runtime.
+        // The provider caches live in `rhapsodyd`/`rhapsody-provider-status`, never in this crate, so
+        // the reload path reaches them through the injected sink — the one seam a provider-set change
+        // can cross. The sink must do NO I/O on the control task; the daemon's implementation only
+        // invalidates an in-memory cache and spawns the bounded off-loop credential read. Absent for
+        // tests and any embedding with no provider runtime, which keeps the path byte-identical.
+        if let Some(sink) = self.provider_reload.as_ref() {
+            let deadline =
+                rhapsody_config::providers::provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms);
+            sink.provider_reload(&cfg.providers, deadline);
+        }
         Ok(())
     }
 
