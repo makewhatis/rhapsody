@@ -67,7 +67,7 @@ pub struct TicketSelection {
 /// Why a ticket's routing labels were refused. Every variant is a dispatch refusal — a routing
 /// field can never degrade to "run without it" the way unreadable profile prose can, because a
 /// silently-dropped harness or provider is exactly the wrong-runner fallback the design forbids.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum RoutingLabelError {
     /// A label longer than the tracker can hold. Silently truncating would route to the wrong
     /// value, so the whole selection refuses.
