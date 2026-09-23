@@ -4,13 +4,17 @@ on:
   push:
     branches: [main]
 
-# Self-hosted runners (STUDIO-1028): repo-scoped, like the tally/booch runners. PR-time jobs run on
-# the Linux pool (`rhapsody-linux`: djohansen-fedora-desktop-1-rhapsody-{1,2,3}, each with its own
-# warm `_work`), while the two jobs whose output must match what ships (`test`, `boot-e2e`) fall back
-# to the macOS pool (`mac-arm-{1..4}`) on a push to main, and `desktop` (the Tauri `.app`) is macOS
-# everywhere. The Macs were the only runners until 2026-09-23, when they saturated (queued runs,
-# "not acquired by Runner of type self-hosted", boot-e2e timeouts); moving PR traffic to Linux keeps
-# the Macs for the desktop and main gates.
+# Self-hosted runners (STUDIO-1028): repo-scoped, like the tally/booch runners. `lint`, `web` and
+# `pr-title` moved off the saturated Macs onto the Linux pool (`rhapsody-linux`:
+# djohansen-fedora-desktop-1-rhapsody-{1,2,3}, each with its own warm `_work`), and `boot-e2e` runs
+# there at PR time too — it was the job timing out on the busy Macs and it passes on Linux. `test`
+# stays on the macOS pool (`mac-arm-{1..4}`) because the Linux trial found one real Linux-only
+# classification difference in `rhapsodyd` that this ticket does not fix (see the `test` job), and
+# `desktop` (the Tauri `.app`) is macOS everywhere. `boot-e2e` falls back to macOS on a push to main
+# so the assembled daemon is still exercised on the platform that ships. The Macs were the only
+# runners until 2026-09-23, when they saturated (queued runs, "not acquired by Runner of type
+# self-hosted", boot-e2e timeouts); moving the PR traffic that can run on Linux keeps the Macs for
+# `test` and the desktop gate.
 # rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
 jobs:
   lint:
@@ -48,16 +52,24 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # PR-time proves the tree on Linux; a push to main re-runs it on macOS, which is what ships.
-    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","macOS","ARM64"]') || fromJSON('["self-hosted","Linux","rhapsody-linux"]') }}
+    # STAYS ON macOS (STUDIO-1028 step 3): the Linux trial surfaced one Linux-only failure the
+    # fix is not this ticket's to make — `rhapsodyd`'s
+    # `credential_client::resolve_credential_reports_owner_unauthorized_when_the_real_owner_rejects_the_token`
+    # reads a rejected owner as `OwnerUnavailable` instead of `OwnerUnauthorized`, because a unix
+    # socket closed with an unread inbound frame yields `ECONNRESET` on Linux where macOS still
+    # delivers a clean EOF. That is a real client-classification difference, not a flake, so gating
+    # or weakening the test would hide it; `test` stays on the Macs and the operator files the
+    # portability follow-up. `--no-fail-fast` stays: it is what let the ONE failing crate be seen
+    # without a per-crate push, and it still surfaces every failure when this job is re-pointed.
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
-      # `--no-fail-fast` (STUDIO-1028): cargo stops at the first failing CRATE by default, so a
-      # Linux portability failure in `rhapsody-workspace` hid every crates/* failure after it. The
-      # full set must surface in one run — a PR-time Linux failure is the signal this matrix exists
-      # to give, and iterating one crate per push against the queued pool is the cost it removes.
+      # `--no-fail-fast` (STUDIO-1028): cargo stops at the first failing CRATE by default, so one
+      # crates/* failure hides every later crate's result. The full set must surface in one run —
+      # a Linux portability failure is the signal this matrix exists to give, and iterating one
+      # crate per push against the queued pool is the cost it removes.
       - run: cargo test --workspace --no-fail-fast
 
   web:
@@ -91,7 +103,8 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # Same split as `test`: the assembled daemon is exercised on Linux at PR time, on macOS on main.
+    # The assembled daemon is exercised on Linux at PR time (this job passed there on the trial and
+    # was the one timing out on the busy Macs), and on macOS on a push to main — what ships.
     runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","macOS","ARM64"]') || fromJSON('["self-hosted","Linux","rhapsody-linux"]') }}
     steps:
       - uses: actions/checkout@v4
