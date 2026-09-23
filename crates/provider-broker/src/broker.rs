@@ -255,8 +255,12 @@ impl Broker {
             return Err(BrokerError::Unauthorized);
         }
         if inner.is_expired(self.inner.clock.now()) {
-            // Observe expiry deterministically: revoke the grant and finalize its receipt now.
-            inner.revoke_and_finalize(TurnOutcome::Expired);
+            // Observe expiry deterministically: revoke the grant and finalize its receipt now. The
+            // metric is recorded only by the call that actually finalizes, so a concurrent lookup
+            // cannot double-count the same expiry.
+            if inner.revoke_and_finalize(TurnOutcome::Expired).is_some() {
+                self.inner.metrics.record_revocation();
+            }
             return Err(BrokerError::Unauthorized);
         }
         Ok(CapabilityGrant::new(inner))

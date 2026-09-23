@@ -55,7 +55,7 @@ pub struct BrokerMetricsSnapshot {
     pub reserved_tokens: u64,
     /// Conservative provider-reported token total.
     pub provider_reported_tokens: u64,
-    /// Turn/denial-threshold revocations.
+    /// Abuse-threshold and capability-expiry revocations.
     pub revocations: u64,
     /// Requests currently admitted and in flight.
     pub active_requests: i64,
