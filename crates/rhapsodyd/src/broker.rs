@@ -16,10 +16,34 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use rhapsody_orchestrator::CancelWait;
 use rhapsody_provider_broker::{Broker, BrokerListener, BrokerRegistrar, OsRandom, SystemClock};
+
+/// Test seam over the daemon's broker wiring (STUDIO-999, PB4). Production passes `None`; the
+/// `run.rs` integration tests inject a `bind` that can fail and an `observe` that captures the live
+/// handles, so the composition — bind → inject → serve → supervise → shutdown — is directly
+/// exercised rather than only the pieces it calls.
+pub(crate) struct BrokerSeam {
+    /// How the composition root binds the broker. Production uses [`BrokerRuntime::bind`].
+    pub bind: Box<dyn Fn() -> std::io::Result<BrokerRuntime> + Send + Sync>,
+    /// Called once, immediately after the serving task is spawned. `None` in production.
+    pub observe: Option<Box<dyn FnOnce(BrokerObservation) + Send>>,
+}
+
+/// The live handles a [`BrokerSeam`] observer receives once the broker is serving (STUDIO-999,
+/// PB4): the shared broker, the create-only handle `run` injected into the orchestrator, and the
+/// serving task's abort handle (so a test can inject an unexpected exit).
+///
+/// Only the integration tests read these fields, so the non-test lib target has no reader:
+/// `allow(dead_code)` is scoped to exactly that build.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BrokerObservation {
+    pub broker: Broker,
+    pub registrar: BrokerRegistrar,
+    pub serve_abort: AbortHandle,
+}
 
 /// The daemon-side composition of the one private broker: its shared handle, the cloneable
 /// registration handle injected into preparation, and the bound listener until it is handed to the
@@ -66,6 +90,14 @@ impl BrokerRuntime {
     /// Take the bound listener to hand to the serving task. `None` once taken.
     pub fn take_listener(&mut self) -> Option<BrokerListener> {
         self.listener.take()
+    }
+
+    /// The bound listener's address, in-process only. Never a publication surface: the daemon
+    /// integration tests read it to connect to the private broker; no production path calls it, so
+    /// the non-test lib target has no caller (`allow(dead_code)` scoped to that build).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn bound_addr(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().map(BrokerListener::local_addr)
     }
 
     /// Revoke every registry entry still live (design §11.3). Called after the control loop has
@@ -119,62 +151,67 @@ pub async fn supervise(
     }
 }
 
+/// Test-only: a valid registration plan for `provider`, matching [`test_lease`]'s fingerprint.
+#[cfg(test)]
+pub(crate) fn test_plan(provider: &str) -> rhapsody_provider_broker::BrokerRegistrationPlan {
+    use rhapsody_provider_broker::{BrokerProtocol, BrokerRegistrationPlan, DEFAULT_BROKER_LIMITS};
+    BrokerRegistrationPlan::new(
+        provider,
+        BrokerProtocol::OpenAiChatCompletions,
+        "https://api.example.com/v1",
+        false,
+        "model-x",
+        DEFAULT_BROKER_LIMITS,
+    )
+    .expect("test plan")
+}
+
+/// Test-only: a bound credential lease for `provider`, matching [`test_plan`]'s binding.
+#[cfg(test)]
+pub(crate) fn test_lease(provider: &str) -> rhapsody_provider_broker::BoundCredentialLease {
+    use rhapsody_provider_broker::{BoundCredentialLease, BrokerProtocol, CredentialBinding};
+    let binding = CredentialBinding::new(
+        provider,
+        BrokerProtocol::OpenAiChatCompletions,
+        "https://api.example.com/v1",
+    )
+    .expect("test binding");
+    BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("test lease")
+}
+
+/// Test-only: register a session through `registrar` and mint one live capability; returns the
+/// token and the handles that must be kept alive for the grant to stay registered.
+#[cfg(test)]
+pub(crate) fn mint_live(
+    registrar: &BrokerRegistrar,
+) -> (
+    String,
+    rhapsody_provider_broker::TurnAccess,
+    rhapsody_provider_broker::TurnReceipt,
+    rhapsody_provider_broker::BrokerSession,
+) {
+    use rhapsody_provider_broker::{SessionPolicy, TurnMeta};
+    let mut registration = registrar
+        .register_session(
+            test_plan("provider-a"),
+            test_lease("provider-a"),
+            SessionPolicy::default(),
+        )
+        .expect("registration");
+    let (attempt, receipt) = registration
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm");
+    let access = attempt.mint_access().expect("mint");
+    let token = access.api_key.expose_for_child(str::to_owned);
+    (token, access, receipt, registration.session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rhapsody_orchestrator::CancelSignal;
-    use rhapsody_provider_broker::{
-        BoundCredentialLease, BrokerError, BrokerProtocol, BrokerRegistrationPlan,
-        CredentialBinding, DEFAULT_BROKER_LIMITS, SessionPolicy, TurnMeta,
-    };
-
-    const ENDPOINT: &str = "https://api.example.com/v1";
-
-    fn plan(provider: &str) -> BrokerRegistrationPlan {
-        BrokerRegistrationPlan::new(
-            provider,
-            BrokerProtocol::OpenAiChatCompletions,
-            ENDPOINT,
-            false,
-            "model-x",
-            DEFAULT_BROKER_LIMITS,
-        )
-        .expect("plan")
-    }
-
-    fn lease(provider: &str) -> BoundCredentialLease {
-        let binding =
-            CredentialBinding::new(provider, BrokerProtocol::OpenAiChatCompletions, ENDPOINT)
-                .expect("binding");
-        BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease")
-    }
-
-    /// Register a session and mint a live capability; returns the token and the handles that must be
-    /// kept alive for the grant to stay registered.
-    fn mint_live(
-        runtime: &BrokerRuntime,
-    ) -> (
-        String,
-        rhapsody_provider_broker::TurnAccess,
-        rhapsody_provider_broker::TurnReceipt,
-        rhapsody_provider_broker::BrokerSession,
-    ) {
-        let mut registration = runtime
-            .registrar()
-            .register_session(
-                plan("provider-a"),
-                lease("provider-a"),
-                SessionPolicy::default(),
-            )
-            .expect("registration");
-        let (attempt, receipt) = registration
-            .ledgers
-            .arm_turn(TurnMeta::without_deadline())
-            .expect("arm");
-        let access = attempt.mint_access().expect("mint");
-        let token = access.api_key.expose_for_child(str::to_owned);
-        (token, access, receipt, registration.session)
-    }
+    use rhapsody_provider_broker::BrokerError;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn binding_an_occupied_port_is_an_explicit_error() {
@@ -191,7 +228,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unexpected_serve_exit_marks_unavailable_and_revokes_grants() {
         let runtime = BrokerRuntime::bind().expect("bind");
-        let (token, access, receipt, session) = mint_live(&runtime);
+        let (token, access, receipt, session) = mint_live(&runtime.registrar());
         assert!(
             runtime.broker_handle().lookup_capability(&token).is_ok(),
             "the minted capability must be live before the failure"

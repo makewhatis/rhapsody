@@ -58,6 +58,24 @@ pub async fn run<W>(
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
+    run_with_seam(ctx, args, stderr, is_terminal, install_probe, None).await
+}
+
+/// [`run`] with the daemon's broker-wiring seam (STUDIO-999, PB4). Production passes `None`; the
+/// integration tests inject a binder that can fail and an observer that captures the live broker
+/// handles, so the composition — bind → inject → serve → supervise → shutdown — is directly
+/// exercised rather than only the pieces it calls.
+async fn run_with_seam<W>(
+    ctx: CancelWait,
+    args: &[String],
+    stderr: W,
+    is_terminal: bool,
+    install_probe: bool,
+    seam: Option<crate::broker::BrokerSeam>,
+) -> i32
+where
+    W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
+{
     // `rhapsodyd mcp [WORKFLOW.md]` runs the local MCP facade over stdio instead of the daemon
     // (INF-473). Dispatched at the very top so the daemon's run-lock / flag parsing is untouched and
     // `rhapsodyd <workflow>` behaves identically. Mirrors Go `run`'s `args[0] == "mcp"` branch.
@@ -191,7 +209,16 @@ where
     // later reload must not discover that the required listener was never started. The bind is
     // security-critical and uses no configured/public port. A bind failure is a fatal startup
     // error — explicit-provider dispatch must never continue with a direct-key fallback.
-    let mut broker_runtime = match crate::broker::BrokerRuntime::bind() {
+    // The test seam replaces the bind only; production always takes the `None` arm (`bind()`).
+    let (binder, mut observer) = match seam {
+        Some(seam) => (Some(seam.bind), seam.observe),
+        None => (None, None),
+    };
+    let bind_result = match binder.as_ref() {
+        Some(bind) => bind(),
+        None => crate::broker::BrokerRuntime::bind(),
+    };
+    let mut broker_runtime = match bind_result {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = writeln!(stderr.make_writer(), "symphony: provider broker: {error}");
@@ -478,6 +505,15 @@ where
                 .run_with_shutdown(async move { serve_shutdown.cancelled().await })
                 .await
         });
+        // Test seam: hand the live serving handles to the injected observer, if any. `None` in
+        // production, so this is a no-op on every real boot.
+        if let Some(observe) = observer.take() {
+            observe(crate::broker::BrokerObservation {
+                broker: broker_runtime.broker_handle(),
+                registrar: broker_runtime.registrar(),
+                serve_abort: serve.abort_handle(),
+            });
+        }
         tokio::spawn(crate::broker::supervise(
             serve,
             broker_runtime.broker_handle(),
@@ -1970,6 +2006,10 @@ mod tests {
     use super::*;
     use crate::testutil::{SharedBuf, TempDir};
     use rhapsody_orchestrator::CancelSignal;
+    use rhapsody_provider_broker::BrokerError;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // A minimal valid workflow, HERMETIC: the tracker points at a dead loopback address (fetches fail
     // fast, non-fatal), and workspace.root + logging.dir + storage stay inside the temp dir so a test
@@ -2080,21 +2120,31 @@ mod tests {
     #[test]
     fn run_never_reads_the_broker_address() {
         let src = include_str!("run.rs");
-        let needle: String = ["local", "_addr()"].concat();
-        for line in src.lines().filter(|line| line.contains(&needle)) {
-            // Exactly one legitimate call site: the observability server's own bound address, which
-            // is published as `runtime.json`'s port. Any other receiver would be the broker's
-            // private address leaking toward a publication surface.
-            assert!(
-                line.contains("server"),
-                "run.rs may only read the observability server's address; found: {line}"
-            );
+        // Two spellings would expose the ephemeral port: `BrokerListener::local_addr` returns it
+        // directly, and `Broker::base_url` embeds it — so a `tracing::info!(broker = %…base_url,
+        // …)` would leak it to the daemon log. Both needles are assembled at run time so this test's
+        // own source is not an occurrence of the strings it forbids.
+        let needles = [["local", "_addr()"].concat(), [".base", "_url("].concat()];
+        for line in src.lines() {
+            for needle in &needles {
+                if line.contains(needle.as_str()) {
+                    // Exactly one legitimate call site: the observability server's own bound
+                    // address, which is published as `runtime.json`'s port. Any other receiver would
+                    // be the broker's private address leaking toward a publication surface.
+                    assert!(
+                        line.contains("server"),
+                        "run.rs may only read the observability server's address; found: {line}"
+                    );
+                }
+            }
         }
     }
 
     /// STUDIO-999 (PB4): booting the broker publishes no broker base URL on any daemon surface. The
-    /// broker's only public form is `http://127.0.0.1:<ephemeral>/v1`; the observability dashboard
-    /// URL has no `/v1` path, so a `/v1` on stderr would mean the broker leaked into the banner.
+    /// broker's only public form is `http://127.0.0.1:<ephemeral>/v1` — a line naming BOTH the
+    /// loopback host and a `/v1` path. The bare `/v1` check the first cut used was wrong: the
+    /// telemetry subscriber logs the OTLP endpoint (`http://localhost:4318/v1/logs`) through the
+    /// captured `stderr` writer, so a `/v1` can legitimately appear and the check flaked red.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_broker_boot_publishes_no_broker_base_url() {
         let dir = TempDir::new();
@@ -2106,9 +2156,204 @@ mod tests {
             "daemon should exit 0; stderr={}",
             buf.contents()
         );
+        for line in buf.contents().lines() {
+            assert!(
+                !(line.contains("127.0.0.1") && line.contains("/v1")),
+                "no broker base URL may appear on stderr; found: {line}"
+            );
+        }
+    }
+
+    /// STUDIO-999 (PB4), named mutation 1: "skip bind when no providers exist." A boot whose
+    /// workflow configures no explicit provider must still bind and serve one IPv4 loopback
+    /// ephemeral listener, so a later hot reload finds it ready.
+    ///
+    /// MUTATION GUARD: bind only when providers are configured (or drop the injection/serving) and
+    /// the seam is never observed (or the connect/401 below fails).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_binds_and_serves_the_broker_with_no_providers() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "");
+        let buf = SharedBuf::new();
+
+        let bound: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let bound_writer = Arc::clone(&bound);
+        let (obs_tx, obs_rx) = tokio::sync::oneshot::channel();
+        let seam = crate::broker::BrokerSeam {
+            bind: Box::new(move || {
+                let runtime = crate::broker::BrokerRuntime::bind()?;
+                *bound_writer.lock().expect("bound addr lock") = runtime.bound_addr();
+                Ok(runtime)
+            }),
+            observe: Some(Box::new(move |observation| {
+                let _ = obs_tx.send(observation);
+            })),
+        };
+
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let handle = tokio::spawn(async move {
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
+            .await
+            .expect("the seam must observe the broker once serving starts")
+            .expect("observation");
         assert!(
-            !buf.contents().contains("/v1"),
-            "no broker base URL may appear on stderr: {}",
+            observation.broker.is_available(),
+            "a no-provider boot must still bind and serve the broker; stderr={}",
+            buf.contents()
+        );
+
+        // The listener accepts a connection and answers as the broker while the daemon is up: the
+        // exact `Host` the generated base URL expects, and no `Authorization` → the broker's 401.
+        let addr = bound
+            .lock()
+            .expect("bound addr lock")
+            .expect("the binder must capture the bound address");
+        assert!(
+            addr.ip().is_loopback() && addr.ip().is_ipv4(),
+            "the broker must bind an IPv4 loopback address, got {addr}"
+        );
+        assert_ne!(addr.port(), 0, "the broker must bind a real ephemeral port");
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the broker listener");
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            addr.port()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write the probe request");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the broker must answer within the bounded window")
+            .expect("read the broker response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "an unauthenticated request must get the broker's 401; got: {response}"
+        );
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(code, 0, "daemon should exit 0; stderr={}", buf.contents());
+    }
+
+    /// STUDIO-999 (PB4), named mutation 4: "fallback on bind failure." A bind failure must be
+    /// explicit and fatal — the daemon exits 1 with the `symphony: provider broker:` line and never
+    /// continues with a direct-key fallback.
+    ///
+    /// MUTATION GUARD: `bind().ok()` (boot on with no broker) makes this test hang in the control
+    /// loop until the 5s timeout instead of returning `1`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broker_bind_failure_is_a_fatal_startup_error() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "");
+        let buf = SharedBuf::new();
+        let seam = crate::broker::BrokerSeam {
+            bind: Box::new(|| Err(std::io::Error::other("injected bind failure"))),
+            observe: None,
+        };
+        let signal = CancelSignal::new();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_seam(signal.wait(), &argv, buf.clone(), false, false, Some(seam)),
+        )
+        .await
+        .expect("a bind failure must be fatal, not a daemon that boots on with no broker");
+        assert_eq!(
+            code,
+            1,
+            "a broker bind failure must exit 1; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            buf.contents().contains("symphony: provider broker:"),
+            "the bind failure must be explicit on stderr; stderr={}",
+            buf.contents()
+        );
+    }
+
+    /// STUDIO-999 (PB4), wiring half of named mutation 3: an unexpected serving exit *through
+    /// `run`'s composition* must mark the broker unavailable and revoke a live grant — not just the
+    /// same behavior inside `supervise`.
+    ///
+    /// MUTATION GUARD: spawn serving unsupervised (`tokio::spawn(async move { let _ = serve.await;
+    /// })`) and aborting it below leaves availability `true` and the minted grant live → red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unexpected_serve_exit_through_run_revokes_grants_and_marks_unavailable() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, "");
+        let buf = SharedBuf::new();
+
+        let (obs_tx, obs_rx) = tokio::sync::oneshot::channel();
+        let seam = crate::broker::BrokerSeam {
+            bind: Box::new(crate::broker::BrokerRuntime::bind),
+            observe: Some(Box::new(move |observation| {
+                let _ = obs_tx.send(observation);
+            })),
+        };
+
+        let signal = CancelSignal::new();
+        let wait = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let run_buf = buf.clone();
+        let handle = tokio::spawn(async move {
+            run_with_seam(wait, &argv, run_buf, false, false, Some(seam)).await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), obs_rx)
+            .await
+            .expect("the seam must observe the serving broker")
+            .expect("observation");
+
+        // Mint a live grant through the handle `run` actually injected into the orchestrator.
+        let (token, access, receipt, session) = crate::broker::mint_live(&observation.registrar);
+        assert!(
+            observation.broker.lookup_capability(&token).is_ok(),
+            "the minted capability must be live through the run wiring"
+        );
+
+        // Inject the unexpected serving exit: abort the serving task `run` spawned.
+        observation.serve_abort.abort();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while observation.broker.is_available() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !observation.broker.is_available(),
+            "an unexpected serve exit through `run` must mark the broker unavailable"
+        );
+        assert_eq!(
+            observation.broker.lookup_capability(&token).unwrap_err(),
+            BrokerError::Unauthorized,
+            "an unexpected serve exit through `run` must revoke the live grant"
+        );
+        drop(access);
+        drop(receipt);
+        drop(session);
+
+        signal.cancel();
+        let code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("daemon did not exit within 5s of cancel")
+            .expect("run task join");
+        assert_eq!(
+            code,
+            0,
+            "a daemon whose broker failed must still shut down cleanly; stderr={}",
             buf.contents()
         );
     }
