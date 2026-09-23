@@ -49,10 +49,10 @@ use sha2::{Digest, Sha256};
 /// sibling.
 pub const REVIEW_VERDICT_TAG: &str = "rhapsody-review-verdict";
 
-/// The generation written onto every finding revision until M2 introduces the real value (§5.1).
-/// `0` is a deliberate constant, not an accident: the column exists now so the later ticket that
-/// computes generations does not have to migrate rows, and a real generation starting at 1 can never
-/// be confused with these.
+/// The generation M1 wrote onto every finding revision, before M2 introduced the real value
+/// (STUDIO-1009; §5.1). It is retained as the value the migration's backfill replaces and as a
+/// documented constant, not as a value any production path writes any more: the completion path
+/// records the pull request's real generation, read from `rhapsody_review_bound`.
 pub const FINDING_GENERATION_PLACEHOLDER: i64 = 0;
 
 /// The synthetic summary an unstructured review carries into [`summary_hash`]. It is a fixed literal
@@ -128,6 +128,21 @@ pub fn parse_verdict_block(result_text: &str) -> Option<ReviewVerdictBlock> {
         .findings
         .iter()
         .any(|f| f.id.trim().is_empty() || f.summary.trim().is_empty())
+    {
+        return None;
+    }
+    // DUPLICATE IDS WITHIN ONE VERDICT BLOCK are malformed, not two findings (STUDIO-1009).
+    // [`plan_review_findings`] plans each declared finding against the SAME `prior` snapshot, so two
+    // entries sharing an id would both compute the same `revision` and the second would collide with
+    // the first on the finding table's primary key — one silently dropped, or a nondeterministic
+    // winner. Rejecting the whole block is the conservative reading [`parse_verdict_block`] already
+    // takes for an ambiguous block: the reviewer's output is not machine-readable, which becomes the
+    // blocking unstructured fallback rather than a guessed split.
+    let mut ids = std::collections::HashSet::with_capacity(json.findings.len());
+    if json
+        .findings
+        .iter()
+        .any(|f| !ids.insert(f.id.trim().to_string()))
     {
         return None;
     }
@@ -296,7 +311,8 @@ pub fn reopen_decision(inputs: &ReopenInputs<'_>) -> FindingReopen {
 pub struct CompletionInputs<'a> {
     /// `owner/repo#number`.
     pub pr: &'a str,
-    /// The review generation ([`FINDING_GENERATION_PLACEHOLDER`] at M1).
+    /// The review generation, read from the pull request's bound (STUDIO-1009; the M1 placeholder
+    /// was `0`).
     pub generation: i64,
     /// The reviewing teammate's identity.
     pub reviewer: &'a str,
@@ -304,6 +320,10 @@ pub struct CompletionInputs<'a> {
     pub run_id: i64,
     /// The head SHA the round was pinned to.
     pub head_sha: &'a str,
+    /// The patch-id of `head_sha` against the pull request's base (STUDIO-977's stable patch-id,
+    /// STUDIO-1009). Empty when the change could not be fingerprinted, which is the same value M1
+    /// wrote and is the safe reading: an empty patch-id never matches a recorded one.
+    pub head_patch_id: &'a str,
     /// The EFFECTIVE verdict (the reconciler has already reconciled the hand-off with the block).
     pub approved: bool,
     /// The parsed structured block, or `None` for an unstructured review.
@@ -334,6 +354,7 @@ pub fn plan_review_findings(inputs: &CompletionInputs<'_>) -> FindingsPlan {
         reviewer,
         run_id,
         head_sha,
+        head_patch_id,
         approved,
         block,
         prior,
@@ -355,7 +376,7 @@ pub fn plan_review_findings(inputs: &CompletionInputs<'_>) -> FindingsPlan {
                 revision: 1,
                 review_run_id: run_id,
                 raised_at_sha: head_sha.to_string(),
-                raised_at_patch_id: String::new(),
+                raised_at_patch_id: head_patch_id.to_string(),
                 paths: Vec::new(),
                 summary_hash: summary_hash(UNSTRUCTURED_SUMMARY),
                 blocking: true,
@@ -393,7 +414,7 @@ pub fn plan_review_findings(inputs: &CompletionInputs<'_>) -> FindingsPlan {
                         dismissed_at_patch_id: &prev.raised_at_patch_id,
                         dismissed_summary_hash: &prev.summary_hash,
                         paths: &prev.paths,
-                        new_patch_id: "",
+                        new_patch_id: head_patch_id,
                         new_summary_hash: &new_summary_hash,
                         new_evidence: f.new_evidence,
                         regression: f.regression,
@@ -413,7 +434,7 @@ pub fn plan_review_findings(inputs: &CompletionInputs<'_>) -> FindingsPlan {
                 revision,
                 review_run_id: run_id,
                 raised_at_sha: head_sha.to_string(),
-                raised_at_patch_id: String::new(),
+                raised_at_patch_id: head_patch_id.to_string(),
                 paths: f.paths.clone(),
                 summary_hash: new_summary_hash,
                 blocking: f.blocking,
@@ -485,6 +506,30 @@ mod tests {
             parse_verdict_block(&two).is_none(),
             "two blocks are ambiguous"
         );
+    }
+
+    /// **Duplicate ids within one verdict block (STUDIO-1009).** Two entries sharing an `id` would be
+    /// planned against the same `prior` and collide on the finding table's key, so the block is
+    /// rejected as malformed rather than split or silently deduplicated.
+    #[test]
+    fn rejects_a_block_listing_the_same_id_twice() {
+        let dup = block_json(
+            false,
+            "{\"id\":\"B8\",\"blocking\":true,\"summary\":\"first\"},\
+             {\"id\":\"B8\",\"blocking\":true,\"summary\":\"second\"}",
+        );
+        assert!(
+            parse_verdict_block(&dup).is_none(),
+            "a duplicated id is a malformed block, not two findings"
+        );
+        // Control: two DISTINCT ids parse.
+        let distinct = block_json(
+            false,
+            "{\"id\":\"B8\",\"blocking\":true,\"summary\":\"first\"},\
+             {\"id\":\"B9\",\"blocking\":true,\"summary\":\"second\"}",
+        );
+        let block = parse_verdict_block(&distinct).expect("distinct ids parse");
+        assert_eq!(block.findings.len(), 2);
     }
 
     #[test]
@@ -679,6 +724,63 @@ mod tests {
         };
         let plan = plan_review_findings(&inputs(8, Some(&block), &prior));
         assert_eq!(plan.rows[0].status, REVIEW_FINDING_SETTLED);
+    }
+
+    /// The reviewed head's patch-id is what the reopen rule compares (STUDIO-1009, carrying STUDIO-977
+    /// into the finding revisions). An UNCHANGED patch-id settles a dismissed re-raise; a CHANGED one
+    /// reopens it.
+    #[test]
+    fn a_re_raise_reopens_on_a_changed_patch_and_settles_on_the_same_one() {
+        let dismissed = |patch: &str| {
+            vec![ReviewFindingRow {
+                pr: "o/r#1".into(),
+                generation: 0,
+                reviewer: "sol".into(),
+                finding_id: "sol:B8".into(),
+                revision: 1,
+                status: REVIEW_FINDING_DISMISSED.into(),
+                summary_hash: summary_hash("same"),
+                raised_at_patch_id: patch.into(),
+                ..Default::default()
+            }]
+        };
+        let block = ReviewVerdictBlock {
+            approve: false,
+            findings: vec![finding("B8", "same")],
+        };
+        let base = CompletionInputs {
+            pr: "o/r#1",
+            generation: 0,
+            reviewer: "sol",
+            run_id: 8,
+            head_sha: "sha",
+            block: Some(&block),
+            ..Default::default()
+        };
+        let same = dismissed("p1");
+        let plan = plan_review_findings(&CompletionInputs {
+            head_patch_id: "p1",
+            prior: &same,
+            ..base
+        });
+        assert_eq!(
+            plan.rows[0].status, REVIEW_FINDING_SETTLED,
+            "the same patch-id is a repeat of an objection already decided"
+        );
+        let changed = dismissed("p1");
+        let plan = plan_review_findings(&CompletionInputs {
+            head_patch_id: "p2",
+            prior: &changed,
+            ..base
+        });
+        assert_eq!(
+            plan.rows[0].status, REVIEW_FINDING_OPEN,
+            "a changed patch-id reopens an unscoped dismissed finding"
+        );
+        assert_eq!(
+            plan.rows[0].raised_at_patch_id, "p2",
+            "the revision records the patch it was raised at"
+        );
     }
 
     #[test]

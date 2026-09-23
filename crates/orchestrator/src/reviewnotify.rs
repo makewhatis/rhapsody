@@ -872,6 +872,7 @@ mod tests {
             head_sha: HEAD.to_string(),
             introduced_by: "handoff".to_string(),
             prior_sha: String::new(),
+            head_patch_id: String::new(),
         }
     }
 

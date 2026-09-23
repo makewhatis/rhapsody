@@ -664,6 +664,20 @@ impl Orchestrator {
                 }
             }
         }
+        // STUDIO-1009 (§5.1): the pull request's FIRST introduction into the watch set establishes
+        // its loop generation at 1. A re-introduction (the F9 handoff path) is a no-op — the store's
+        // `ensure_review_generation` is INSERT-DO-NOTHING — so this cannot reset a budget or
+        // invalidate an approval the way bumping it would. Best-effort like every other store write
+        // on this path.
+        if let Err(e) = self
+            .store()
+            .ensure_review_generation(&crate::reviewwatch::churn_key(&pr.pr))
+        {
+            tracing::warn!(
+                pr = %pr.pr, err = %e,
+                "ticketless review: establishing the pull request's review generation failed"
+            );
+        }
         ReviewIntroOutcome::Introduced(written)
     }
 
@@ -830,7 +844,7 @@ impl Orchestrator {
     /// knowing what is already there — the failure mode is a duplicate reviewer on a real pull
     /// request — and the repair is the caller that can afford to wait: the sweep runs again next
     /// tick.
-    fn review_pr_is_watched(&self, pr: &PrCoord) -> bool {
+    pub(crate) fn review_pr_is_watched(&self, pr: &PrCoord) -> bool {
         match self.store().load_review_watch() {
             Ok(rows) => rows.iter().any(|row| {
                 row.key.number == pr.number
@@ -2167,5 +2181,194 @@ mod tests {
         drop(tx);
         task.await.expect("task");
         assert!(sink.seen().is_empty());
+    }
+
+    // ── STUDIO-1009: the review evidence ledger ─────────────────────────────────────────────────
+
+    fn gen_of(o: &Orchestrator, reviewer: &str) -> i64 {
+        o.review_generation(&watch_key(reviewer))
+    }
+
+    /// A `/clear` bumps the generation; a handoff re-introduction, a head change and a restart do
+    /// not (design §5.1, §7.4).
+    #[test]
+    fn only_a_clear_bumps_the_generation() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        // First introduction establishes generation 1.
+        o.handle_review_introduce(&pr);
+        assert_eq!(gen_of(&o, "bob"), 1, "first introduction establishes 1");
+
+        // A head change is NOT a generation event.
+        o.store()
+            .mark_review_requested(&watch_key("bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        assert_eq!(gen_of(&o, "bob"), 1, "a head change does not bump it");
+
+        // A handoff re-introduction is NOT a generation event (the F9 path).
+        o.handle_review_introduce(&pr);
+        assert_eq!(gen_of(&o, "bob"), 1, "a re-introduction does not bump it");
+
+        // A restart (a fresh boot read) is NOT a generation event: the durable value is what it is.
+        assert_eq!(
+            o.store()
+                .review_bound(&crate::reviewwatch::churn_key(&pr.pr))
+                .expect("read")
+                .expect("bound")
+                .generation,
+            1
+        );
+
+        // The operator's clear DOES bump it.
+        let outcome = o.handle_review_clear(&pr.pr);
+        assert!(
+            matches!(
+                outcome,
+                crate::reviewconsole::ReviewControlOutcome::Applied(_)
+            ),
+            "the clear applied, got {outcome:?}"
+        );
+        assert_eq!(gen_of(&o, "bob"), 2, "the operator's /clear bumps it");
+    }
+
+    /// **The F9 replay at the predicate (STUDIO-1009).** A completed approval survives a
+    /// re-introduction that resets the row's `status` to `requested`, because the predicate reads
+    /// the COMPLETED review's verdict and generation, never `status`.
+    ///
+    /// MUTATION: read `row.status` (or bump the generation on re-introduction, or take
+    /// `current_generation` from anywhere but the bound) and this test fails.
+    #[test]
+    fn an_approval_survives_an_f9_reintroduction_at_the_predicate() {
+        use crate::reviewevidence::{RowEvidence, row_approved_at_current_patch};
+        use rhapsody_store::{REVIEW_COMPLETION_APPROVE, ReviewCompleted};
+
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        let generation = gen_of(&o, "bob");
+        // The completed, approving review at HEAD_A carrying the head's patch-id.
+        o.store()
+            .record_review_completion(
+                &watch_key("bob"),
+                REVIEW_STATUS_APPROVED,
+                &ReviewCompleted {
+                    generation,
+                    sha: HEAD_A.to_string(),
+                    patch_id: "pid-A".to_string(),
+                    verdict: REVIEW_COMPLETION_APPROVE.to_string(),
+                },
+            )
+            .expect("completion");
+
+        // The F9 reset: the row's transient status goes back to `requested` (which is what the old
+        // unconditional re-arm did), while the recorded completion is untouched.
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: watch_key("bob"),
+                author: "alice".to_string(),
+                introduced_by: "handoff".to_string(),
+                status: REVIEW_STATUS_REQUESTED.to_string(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("reset");
+        let row = o
+            .store()
+            .get_review_watch(&watch_key("bob"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.status, REVIEW_STATUS_REQUESTED,
+            "the reset put the transient status back to requested"
+        );
+        let completed = o
+            .store()
+            .review_completed(&watch_key("bob"))
+            .expect("read completion");
+        let ev = RowEvidence {
+            row: &row,
+            completed: completed.as_ref(),
+        };
+        assert!(
+            row_approved_at_current_patch(&ev, gen_of(&o, "bob"), "pid-A"),
+            "the recorded approval still satisfies the predicate at the same patch and generation"
+        );
+    }
+
+    /// **A truncated review leaves `last_completed_*` untouched.** Only a run that completed with a
+    /// verdict writes the four columns; a round parked `truncated` writes none of them.
+    #[test]
+    fn a_truncated_review_leaves_the_completed_record_empty() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        o.store()
+            .mark_review_requested(&watch_key("bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_truncated(&watch_key("bob"))
+            .expect("truncated");
+        let completed = o.store().review_completed(&watch_key("bob")).expect("read");
+        assert!(
+            completed.is_none(),
+            "a truncated round records no completed review, got {completed:?}"
+        );
+    }
+
+    /// The evidence revision moves when the HEAD moves, and the first observation after a restart is
+    /// a baseline (not a change). In-memory only — no `gh`.
+    #[test]
+    fn the_evidence_revision_moves_on_a_head_change_and_baselines_after_a_restart() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        let rows = o.store().load_live_review_watch().expect("read");
+        let key = crate::reviewwatch::churn_key(&pr.pr);
+
+        o.record_review_evidence(&pr.pr, &rows, HEAD_A, Some(false), Some(false));
+        let after_first = o
+            .store()
+            .review_bound(&key)
+            .expect("read")
+            .expect("bound")
+            .evidence_rev;
+        // Same inputs: no change.
+        o.record_review_evidence(&pr.pr, &rows, HEAD_A, Some(false), Some(false));
+        assert_eq!(
+            o.store()
+                .review_bound(&key)
+                .expect("read")
+                .expect("bound")
+                .evidence_rev,
+            after_first,
+            "an unchanged observation does not move the revision"
+        );
+        // A moved head: increments.
+        o.record_review_evidence(&pr.pr, &rows, HEAD_B, Some(false), Some(false));
+        assert_eq!(
+            o.store()
+                .review_bound(&key)
+                .expect("read")
+                .expect("bound")
+                .evidence_rev,
+            after_first + 1,
+            "a head change moves the revision"
+        );
+        // A restart: the in-memory fingerprint is gone, so the first observation is a baseline.
+        let rev_before = after_first + 1;
+        o.review_evidence.clear();
+        o.record_review_evidence(&pr.pr, &rows, HEAD_B, Some(false), Some(false));
+        assert_eq!(
+            o.store()
+                .review_bound(&key)
+                .expect("read")
+                .expect("bound")
+                .evidence_rev,
+            rev_before,
+            "a restart re-baselines rather than treating everything as changed"
+        );
     }
 }
