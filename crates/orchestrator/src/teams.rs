@@ -2459,6 +2459,43 @@ mod tests {
         );
     }
 
+    /// **The turn-1 team recall is capped at `team_recall_top_k`, not the identity's own
+    /// `recall_top_k`.** More shared facts are retained than the team cap, and the cap is set
+    /// deliberately below the own-bank one; exactly the team cap must render. This is the local
+    /// twin of the hindsight prefetch assertion in `teamsprefetch`, so the `team_recall_query`
+    /// wiring is pinned on both backends.
+    #[test]
+    fn a_dispatch_caps_shared_facts_at_team_recall_top_k() {
+        let dir = TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.memory.team_bank = "agent-team".to_string();
+        teams.memory.team_recall_top_k = 2;
+        teams.memory.recall_top_k = 8; // the identity's own cap, deliberately different
+        let (mut o, _s) = orch_with_teams(teams);
+        let bank = attach_bank(&mut o, &dir);
+        for i in 0..5 {
+            bank.retain_shared(
+                "agent-team",
+                &stamped(
+                    "bob",
+                    "MT-1",
+                    &i.to_string(),
+                    &format!("shared-fact-{i} the rust goldens are recaptured only"),
+                ),
+            )
+            .expect("shared retain");
+        }
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert_eq!(
+            section.matches("shared-fact-").count(),
+            2,
+            "the team section must carry exactly team_recall_top_k (2) shared facts, not the \
+             identity's own recall_top_k (8): {section}"
+        );
+    }
+
     /// **The bank directory appears on the first RETAIN and at no other time.**
     /// A dispatch that recalls from a bank that was never written creates
     /// nothing — the T1/T2 rule, carried into T4.

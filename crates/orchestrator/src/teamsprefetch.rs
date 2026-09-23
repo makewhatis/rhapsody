@@ -739,8 +739,11 @@ mod tests {
         team_facts: Vec<Fact>,
         fail: bool,
         asked: Mutex<Vec<(String, String)>>,
-        /// `(bank, ticket)` for each shared-bank recall.
-        asked_shared: Mutex<Vec<(String, String)>>,
+        /// `(bank, ticket, top_k)` for each shared-bank recall. The cap is
+        /// recorded, not just the target, so a test can pin that the request
+        /// honours `memory.team_recall_top_k` rather than the identity's own
+        /// `recall_top_k`.
+        asked_shared: Mutex<Vec<(String, String, usize)>>,
     }
 
     #[async_trait]
@@ -764,10 +767,11 @@ mod tests {
         }
 
         async fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
-            self.asked_shared
-                .lock()
-                .expect("asked_shared")
-                .push((bank.to_string(), q.ticket.clone()));
+            self.asked_shared.lock().expect("asked_shared").push((
+                bank.to_string(),
+                q.ticket.clone(),
+                q.top_k,
+            ));
             if self.fail {
                 return Err(MemoryError::Io("the tailnet is down".to_string()));
             }
@@ -1416,8 +1420,9 @@ mod tests {
         let shared = bank.asked_shared.lock().expect("asked_shared").clone();
         assert_eq!(
             shared,
-            vec![("agent-team".to_string(), "MT-1".to_string())],
-            "the team bank must be queried with the candidate's ticket"
+            vec![("agent-team".to_string(), "MT-1".to_string(), 2)],
+            "the team bank must be queried with the candidate's ticket and capped at \
+             team_recall_top_k (2 here), not the identity's own recall_top_k"
         );
         let own = cache.try_get("alice", "MT-1", at(1)).expect("own hit");
         assert_eq!(own[0].id, "own");
