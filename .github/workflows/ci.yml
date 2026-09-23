@@ -54,6 +54,21 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
+      - name: DIAGNOSTIC (temporary, STUDIO-1028)
+        run: |
+          nproc; uptime; date +%s.%N
+          echo "TMPDIR=$TMPDIR"
+          echo "--- bash -lc latency ---"
+          for i in 1 2 3; do
+            /usr/bin/time -f "echo: %e s" bash -lc 'echo boom-output; exit 3' || true
+            /usr/bin/time -f "printf: %e s" bash -lc 'printf "%s|%s" a b > /tmp/diag.txt' || true
+            /usr/bin/time -f "pipe: %e s" bash -lc 'head -c 10000 /dev/zero | tr "\0" "a"; exit 1' || true
+          done
+          echo "--- BASH_ENV/profile ---"
+          echo "BASH_ENV=${BASH_ENV:-unset}"
+          ls -la /etc/profile.d/ 2>/dev/null | head -20
+          echo "--- isolated hook test ---"
+          /usr/bin/time -f "hooktest: %e s" cargo test -p rhapsody-workspace --lib -- hook_failure_returns_err_hook_failed --nocapture || true
       - run: cargo test --workspace
 
   web:
