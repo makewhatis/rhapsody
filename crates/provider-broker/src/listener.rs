@@ -869,6 +869,13 @@ async fn read_body_frames(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyR
 /// Refuse an authenticated request and count the local denial against the turn's bounded abuse
 /// counter (design §5.2, §8.2). The denial that *reaches* the configured threshold revokes the turn
 /// token here, so a subsequent request cannot authenticate at all.
+///
+/// The counter is deliberately not limited to refusals the child itself caused. A request refused
+/// because a **broker-wide** budget (`request_budget` / `response_budget`) is momentarily exhausted
+/// by another turn's traffic is counted here too, so ordinary contention with a concurrent turn can
+/// on its own accumulate denials and revoke this capability at `max_denied_requests`. That is the
+/// accepted fail-closed behaviour: the broker refuses rather than over-spend daemon memory, and a
+/// revoked capability is the bounded way to stop a child that keeps retrying into contention.
 fn deny(grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
     if matches!(
         grant.record_denied(),

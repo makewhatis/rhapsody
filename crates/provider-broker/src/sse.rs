@@ -64,13 +64,20 @@ impl UsageObservation {
     }
 }
 
+/// The maximum bytes of the raw `usage` member a non-streaming body may carry before the observer
+/// treats it as malformed. A usage object is a handful of integers; refusing to parse anything
+/// larger keeps a bounded body from amplifying into a much larger `serde_json::Value` tree (a 16 MiB
+/// `{"usage":[0,0,…]}` body would otherwise peak at hundreds of MiB of RSS).
+pub const MAX_USAGE_JSON_BYTES: usize = 4 * 1024;
+
 /// The one field read from a non-streaming JSON response body. Deserializing into this typed
-/// envelope both validates the body as a JSON object and extracts `usage` in a single pass, skipping
-/// (and not allocating) every other choice/message field.
+/// envelope extracts the raw `usage` member without copying the body and skips (and does not
+/// allocate) every other choice/message field, so the parse itself cannot amplify a bounded body.
+/// The raw member is only parsed into a map once it is within [`MAX_USAGE_JSON_BYTES`].
 #[derive(serde::Deserialize)]
-struct NonStreamingBody {
-    #[serde(default)]
-    usage: Option<serde_json::Value>,
+struct NonStreamingBody<'a> {
+    #[serde(default, borrow)]
+    usage: Option<&'a serde_json::value::RawValue>,
 }
 
 /// A bounded SSE line observer.
@@ -137,16 +144,25 @@ impl SseUsageObserver {
     }
 
     /// Parse a non-streaming response body once: return whether it is a JSON object at all, and read
-    /// its top-level `usage` object (design §7.3). Deserializing into a typed envelope skips every
-    /// unknown field without building a `serde_json::Value` tree, so a bounded body cannot amplify
-    /// into far more memory than its byte budget charges (a 16 MiB `[0,0,...]` body would otherwise
-    /// allocate hundreds of MiB as a `Value`).
+    /// its top-level `usage` object (design §7.3). The typed envelope borrows the raw `usage` member
+    /// and skips every unknown field without building a `serde_json::Value` tree; the member is
+    /// parsed only within [`MAX_USAGE_JSON_BYTES`], so a bounded body cannot amplify into far more
+    /// memory than its byte budget charges (a 16 MiB `{"usage":[0,0,...]}` body would otherwise
+    /// allocate hundreds of MiB as a `Value`). The top-level object check is explicit, because serde
+    /// would otherwise accept a top-level array as a struct.
     ///
     /// A body that is not a JSON object returns `false` (a successful non-streaming response must be
     /// a JSON object); a valid object whose `usage` is present but not an object still returns
     /// `true`, marking only the usage observation malformed. `"usage": null` means "no usage", not
     /// malformed.
     pub fn observe_json(&mut self, body: &[u8]) -> bool {
+        // A successful non-streaming response must be a JSON *object*. The derived struct would also
+        // accept a top-level array (serde treats a sequence as a struct), so the object-only check
+        // is explicit: an array must not reach the child as a 200.
+        if trim_ascii_whitespace(body).first() != Some(&b'{') {
+            self.mark_malformed();
+            return false;
+        }
         let parsed: NonStreamingBody = match serde_json::from_slice(body) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -157,13 +173,24 @@ impl SseUsageObserver {
         let Some(usage) = parsed.usage else {
             return true;
         };
-        if usage.is_null() {
+        let usage = usage.get();
+        if usage.trim() == "null" {
             return true;
         }
-        match usage.as_object() {
-            Some(usage) => self.apply_usage(usage),
-            None => self.mark_malformed(),
+        // The raw member is borrowed from the bounded body (no copy). Only a member within the cap
+        // is parsed into a tree, so an adversarial body cannot amplify its byte budget.
+        if usage.len() > MAX_USAGE_JSON_BYTES {
+            self.mark_malformed();
+            return true;
         }
+        let usage: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(usage) {
+            Ok(usage) => usage,
+            Err(_) => {
+                self.mark_malformed();
+                return true;
+            }
+        };
+        self.apply_usage(&usage);
         true
     }
 
@@ -429,6 +456,43 @@ mod tests {
         let mut observer = SseUsageObserver::new();
         observer.observe_json(br#"{"choices":[],"usage":5}"#);
         assert!(observer.observation().malformed_events >= 1);
+    }
+
+    #[test]
+    fn a_non_streaming_top_level_array_is_not_a_json_object() {
+        // serde would deserialize a top-level sequence into a struct, so an empty array (and any
+        // other array) must be refused explicitly: it is not a JSON object and must not reach the
+        // child as a 200.
+        for body in [&b"[]"[..], &b"[null]"[..], &br#"[{"prompt_tokens":1}]"#[..]] {
+            let mut observer = SseUsageObserver::new();
+            assert!(
+                !observer.observe_json(body),
+                "a top-level array must not be observed as a JSON object: {}",
+                String::from_utf8_lossy(body)
+            );
+            assert!(observer.observation().malformed_events >= 1);
+        }
+    }
+
+    #[test]
+    fn an_oversized_usage_member_is_malformed_without_being_parsed() {
+        // A syntactically valid usage object (with a complete set of token fields) that nonetheless
+        // exceeds the cap. Without the cap this parses and the observation is complete; with it the
+        // member is refused as malformed and no value is read from it.
+        let mut usage = String::from("{");
+        for i in 0..2000 {
+            usage.push_str(&format!("\"k{i}\":0,"));
+        }
+        usage.push_str("\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}");
+        assert!(usage.len() > MAX_USAGE_JSON_BYTES);
+        let body = format!("{{\"choices\":[],\"usage\":{usage}}}");
+
+        let mut observer = SseUsageObserver::new();
+        assert!(observer.observe_json(body.as_bytes()));
+        let observation = observer.observation();
+        assert!(!observation.complete, "oversized usage must not be parsed");
+        assert_eq!(observation.input_tokens, None);
+        assert!(observation.malformed_events >= 1);
     }
 
     #[test]
