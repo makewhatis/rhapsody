@@ -938,9 +938,10 @@ therefore has to survive a restart, so the daemon records it durably before the 
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **13** |
-| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts` and `rhapsody_review_done` |
+| `PRAGMA user_version` | 6 | **15** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done`, `rhapsody_review_finding` and `rhapsody_breaker_crossings` |
 | the owed terminal move | — | `rhapsody_review_done` (`identifier`, `pr`, `state`, `attempts`, `next_at`, `gave_up`), one row per ticket |
+| a ticket's breaker crossings | — | `rhapsody_breaker_crossings` (`notified_rounds`, `notified_providers`), keyed by the ticket identifier |
 
 One row per TICKET identifies the pull request that merged and the terminal state its ticket is
 going to. It is written before the first move attempt and deleted only when the move lands, so three
@@ -962,8 +963,8 @@ the same thing again. The reviewer output contract now ends with one machine-rea
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **14** |
-| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done` and `rhapsody_review_finding` |
+| `PRAGMA user_version` | 6 | **15** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done`, `rhapsody_review_finding` and `rhapsody_breaker_crossings` |
 | a reviewer's findings | — | `rhapsody_review_finding`, one row per finding REVISION, keyed by `(pr, generation, reviewer, finding_id, revision)` |
 
 One row per revision, not per finding: a repeat raise increments `revision`, which is what lets the
@@ -975,6 +976,23 @@ dismissal cannot silence a reviewer's later, unrelated objection. `generation` i
 until the manager's next slice introduces the real value. `divergent_objects_are_gated_by_name_only`
 pins the seventh name. **Off is still off:** `storage.path: off` records nothing, and every non-
 ticketless install takes no part of this path.
+
+### An eighth schema table with no Go counterpart — `rhapsody_breaker_crossings` (STUDIO-1026)
+
+The runaway-loop circuit breaker holds a ticket and notifies the operator when its completed review
+rounds, or its per-ticket spend, crosses a configured limit. It must notify **once per crossing**,
+survive a restart without repeating, and leave the default install byte-identical. The persisted row
+is what buys the first two: the highest round count at which a round-crossing fired, and the
+providers whose per-ticket cap has fired.
+
+The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
+(`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
+(`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs from the `runs` ledger**
+(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter — an operator
+`clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
+author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
+`rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` pins the eighth name.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 

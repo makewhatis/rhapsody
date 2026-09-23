@@ -56,6 +56,12 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
     // tracker.api_key: $VAR only.
     config.tracker.api_key = resolve_var(&config.tracker.api_key);
 
+    // notify.webhook / notify.ntfy (STUDIO-1026): $VAR only, the same indirection `api_key` uses so
+    // an operator keeps a webhook secret or topic out of the file. Deliberately NOT path-resolved —
+    // these are URLs, not filesystem paths. Rhapsody-only; an unset channel stays empty.
+    config.notify.webhook = resolve_var(&config.notify.webhook);
+    config.notify.ntfy = resolve_var(&config.notify.ntfy);
+
     // workspace.root: $VAR + ~ + relative-to-workflow-dir + absolute. Default
     // ~/.rhapsody/workspaces (a DURABLE location alongside the DB + logs, NOT $TMPDIR). Rhapsody's
     // runtime home is ~/.rhapsody — an INTENTIONAL divergence from Go v0.4.0's ~/.symphony

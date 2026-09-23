@@ -214,6 +214,19 @@ pub fn render(s: &Snapshot) -> Value {
             ),
         );
     }
+    // STUDIO-1026: pending desktop notifications for the runaway-loop breaker, emitted ONLY while
+    // there is at least one — for the `held_for_human` key's reason and under the same guard. The
+    // queue only fills when `notify.macos: true`, so a daemon that never configured it serves a
+    // payload byte-identical to the Go capture's. Clients read `state.notifications?.length` and
+    // de-dupe on `id`.
+    if !s.notifications.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "notifications".to_string(),
+            serde_json::to_value(&s.notifications).unwrap_or(Value::Array(Vec::new())),
+        );
+    }
     out
 }
 
@@ -419,6 +432,39 @@ mod tests {
             rendered.get("review_divergence").is_none(),
             "a healthy daemon must serve the Go-identical payload, got: {rendered}"
         );
+    }
+
+    // STUDIO-1026: the same parity guard for the macOS notification key. It only fills when
+    // `notify.macos: true`, so a daemon that never configured a channel must emit NO `notifications`
+    // key — otherwise it would be a Rhapsody-only key on every Go-pinned payload.
+    #[test]
+    fn a_daemon_with_no_notifications_emits_no_notifications_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("notifications").is_none(),
+            "a daemon with no pending notification must serve the Go-identical payload, got: {rendered}"
+        );
+
+        // And the other half: a pending one reaches the surface with the fields the desktop needs.
+        o.notifications.push(
+            now,
+            "Review loop held: STUDIO-988".to_string(),
+            "body".to_string(),
+            "STUDIO-988".to_string(),
+            "makewhatis/rhapsody#218".to_string(),
+        );
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["notifications"]
+            .as_array()
+            .expect("notifications is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["ticket"], "STUDIO-988");
+        assert_eq!(rows[0]["pr"], "makewhatis/rhapsody#218");
+        assert_eq!(rows[0]["body"], "body");
+        assert_eq!(rows[0]["id"], 1);
     }
 
     // And the other half: a reported divergence reaches `/api/v1/state` with enough to act on —

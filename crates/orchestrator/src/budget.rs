@@ -543,6 +543,7 @@ mod tests {
                 (*provider).to_string(),
                 ProviderBudget {
                     daily_tokens: *limit,
+                    per_ticket: 0,
                 },
             );
         }
