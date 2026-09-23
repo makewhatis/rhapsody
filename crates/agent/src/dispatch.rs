@@ -232,19 +232,40 @@ pub enum DispatchRefusal {
     CustodyAlreadyTaken,
 }
 
-/// The dispatch-time factory: consume a frozen [`PreparedHarnessSpec`] and the harness it names, and
-/// return an owned, non-`Clone` [`DispatchRunner`].
+/// The dispatch-time factory: consume a frozen [`PreparedHarnessSpec`] and return an owned,
+/// non-`Clone` [`DispatchRunner`], building the harness from the spec's resolved [`HarnessKnobs`] and
+/// applying the resolved model to them (design §10.2's "model/provider are live construction
+/// inputs").
 ///
 /// It is the one place that:
+/// * builds the adapter from the resolved knobs, so the resolved model reaches the construction
+///   inputs (argv) rather than being discarded;
 /// * re-checks harness↔protocol compatibility, refusing rather than falling back;
 /// * requires an exact model on the explicit-provider branch; and
 /// * moves the prepared provider custody into the returned runner (never into a shared `Arc`).
+pub fn build_dispatch_runner(spec: PreparedHarnessSpec) -> Result<DispatchRunner, DispatchRefusal> {
+    let harness = harness_from_knobs(&spec)?;
+    finish_dispatch_runner(harness, spec)
+}
+
+/// The shared-runner bridge constructor: use an already-built (possibly shared) legacy `Arc<dyn
+/// Harness>` for a prepared spec instead of building one from its knobs. This is the migration seam
+/// (design §10.2: "a shared legacy runner may remain behind that bridge") and the test seam.
 ///
-/// The harness is supplied by the caller (built fresh from the spec's knobs, or a shared legacy
-/// runner) so this crate carries no config→knobs mapping — that stays in `effective.rs`.
-pub fn build_dispatch_runner(
-    spec: PreparedHarnessSpec,
+/// Custody is unaffected: the bridge owns no [`BrokerSession`]; it lives only in the non-`Clone`
+/// [`DispatchRunner`] this returns.
+pub fn bridge_dispatch_runner(
     harness: Arc<dyn Harness>,
+    spec: PreparedHarnessSpec,
+) -> Result<DispatchRunner, DispatchRefusal> {
+    finish_dispatch_runner(harness, spec)
+}
+
+/// Validate the prepared spec against the harness it will run on and move its custody into a
+/// [`DispatchRunner`]. Shared by the factory and the bridge so the two cannot disagree.
+fn finish_dispatch_runner(
+    harness: Arc<dyn Harness>,
+    spec: PreparedHarnessSpec,
 ) -> Result<DispatchRunner, DispatchRefusal> {
     if harness.id() != spec.harness {
         return Err(DispatchRefusal::HarnessMismatch {
@@ -277,6 +298,50 @@ pub fn build_dispatch_runner(
         model,
         provider,
     })
+}
+
+/// Build the adapter a prepared spec names from its resolved knobs, applying the resolved model to
+/// the knobs' own model field so it is a live construction input. Exhaustive on [`HarnessKnobs`] with
+/// no wildcard arm: a new harness must stop this compiling rather than silently resolve to claude.
+fn harness_from_knobs(spec: &PreparedHarnessSpec) -> Result<Arc<dyn Harness>, DispatchRefusal> {
+    let knobs = apply_model(spec.knobs.clone(), spec.model.clone());
+    let (id, harness): (HarnessId, Arc<dyn Harness>) = match knobs {
+        HarnessKnobs::Claude(config) => (
+            HarnessId::Claude,
+            Arc::new(crate::claude::Runner::new(config)),
+        ),
+        HarnessKnobs::Opencode(config) => (
+            HarnessId::Opencode,
+            Arc::new(crate::opencode::Runner::new(config)),
+        ),
+    };
+    if id != spec.harness {
+        return Err(DispatchRefusal::HarnessMismatch {
+            configured: id,
+            expected: spec.harness,
+        });
+    }
+    Ok(harness)
+}
+
+/// Apply a resolved model to a harness's own knob block (the argv construction input). `None`
+/// preserves the block's configured model, which is what keeps the legacy/native-login path's model
+/// handling unchanged. Exhaustive on [`HarnessKnobs`] with no wildcard arm.
+fn apply_model(knobs: HarnessKnobs, model: Option<String>) -> HarnessKnobs {
+    match knobs {
+        HarnessKnobs::Claude(mut config) => {
+            if let Some(model) = model {
+                config.model = model;
+            }
+            HarnessKnobs::Claude(config)
+        }
+        HarnessKnobs::Opencode(mut config) => {
+            if let Some(model) = model {
+                config.model = model;
+            }
+            HarnessKnobs::Opencode(config)
+        }
+    }
 }
 
 /// The lowered session/capability limits a prepared plan's provider will enforce, built from the
@@ -714,7 +779,8 @@ mod tests {
             knobs: HarnessKnobs::Claude(crate::claude::Config::default()),
         };
         let harness: Arc<dyn Harness> = Arc::new(Fake::new()); // Fake reports Claude
-        let err = build_dispatch_runner(spec, harness).expect_err("claude has no provider adapter");
+        let err =
+            bridge_dispatch_runner(harness, spec).expect_err("claude has no provider adapter");
         assert_eq!(
             err,
             DispatchRefusal::UnsupportedProtocol {
@@ -730,7 +796,7 @@ mod tests {
     fn harness_mismatch_refuses() {
         let spec = spec(None);
         let harness: Arc<dyn Harness> = Arc::new(Fake::new()); // Claude, spec says Opencode
-        let err = build_dispatch_runner(spec, harness).expect_err("mismatch");
+        let err = bridge_dispatch_runner(harness, spec).expect_err("mismatch");
         assert_eq!(
             err,
             DispatchRefusal::HarnessMismatch {
@@ -747,7 +813,7 @@ mod tests {
         let mut spec = spec(Some(provider));
         spec.model = None;
         let harness: Arc<dyn Harness> = Arc::new(OpencodeFake::new());
-        let err = build_dispatch_runner(spec, harness).expect_err("no model");
+        let err = bridge_dispatch_runner(harness, spec).expect_err("no model");
         assert_eq!(
             err,
             DispatchRefusal::MissingModel {
@@ -763,7 +829,7 @@ mod tests {
     async fn legacy_branch_applies_launch_context_and_holds_no_custody() {
         let fake = Arc::new(Fake::new());
         let spec = legacy_spec();
-        let runner = build_dispatch_runner(spec, fake.clone()).expect("runner");
+        let runner = bridge_dispatch_runner(fake.clone(), spec).expect("runner");
         assert!(!runner.is_brokered());
 
         let started = runner
@@ -790,7 +856,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_branch_zero_id_and_no_review_are_noops() {
         let fake = Arc::new(Fake::new());
-        let runner = build_dispatch_runner(legacy_spec(), fake.clone()).expect("runner");
+        let runner = bridge_dispatch_runner(fake.clone(), legacy_spec()).expect("runner");
         let _ = runner
             .start(start(LaunchContext {
                 run_id: 0,
@@ -809,7 +875,7 @@ mod tests {
     async fn brokered_start_splits_session_and_ledger_and_uses_no_late_setter() {
         let (provider, _broker) = prepare(&plan());
         let fake = Arc::new(OpencodeFake::new());
-        let runner = build_dispatch_runner(spec(Some(provider)), fake.clone()).expect("runner");
+        let runner = bridge_dispatch_runner(fake.clone(), spec(Some(provider))).expect("runner");
         assert!(runner.is_brokered());
 
         let started = runner
@@ -841,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_started_session_revokes_custody() {
         let (provider, _broker) = prepare(&plan());
-        let runner = build_dispatch_runner(spec(Some(provider)), Arc::new(OpencodeFake::new()))
+        let runner = bridge_dispatch_runner(Arc::new(OpencodeFake::new()), spec(Some(provider)))
             .expect("runner");
         let started = runner
             .start(start(LaunchContext::default()))
@@ -919,17 +985,31 @@ mod tests {
         assert!(!rendered.contains("sk-fake-provider-key"), "{rendered}");
     }
 
-    /// The factory preserves the resolved model verbatim (mutation guard: dropping it in
-    /// `build_dispatch_runner` reddens this).
+    /// The factory preserves the resolved model AND makes it a live construction input: the resolved
+    /// model is written into the harness's own knob block (the argv source). The mutation guards are
+    /// dropping `model` in `finish_dispatch_runner` or in `apply_model`.
     #[test]
-    fn factory_preserves_the_resolved_model() {
-        let runner =
-            build_dispatch_runner(spec(None), Arc::new(OpencodeFake::new())).expect("runner");
+    fn factory_applies_the_resolved_model_to_the_knobs() {
+        let spec = PreparedHarnessSpec {
+            harness: HarnessId::Opencode,
+            model: Some("accounts/fireworks/models/x".to_string()),
+            provider: None,
+            knobs: HarnessKnobs::Opencode(crate::opencode::Config {
+                model: "model-from-config".to_string(),
+                ..Default::default()
+            }),
+        };
+        let applied = apply_model(spec.knobs.clone(), spec.model.clone());
+        let HarnessKnobs::Opencode(config) = applied else {
+            panic!("opencode spec must stay opencode");
+        };
         assert_eq!(
-            runner.resolved_model(),
-            Some("accounts/fireworks/models/x"),
-            "the resolved model is a live construction input and must survive the factory"
+            config.model, "accounts/fireworks/models/x",
+            "the resolved model must reach the argv construction input"
         );
+
+        let runner = build_dispatch_runner(spec).expect("factory builds from knobs");
+        assert_eq!(runner.resolved_model(), Some("accounts/fireworks/models/x"));
     }
 
     /// A start failure returns no session; the prepared custody is dropped on the same path the
@@ -939,7 +1019,7 @@ mod tests {
         let (provider, _broker) = prepare(&plan());
         let mut fake = OpencodeFake::new();
         fake.inner.start_err = Some(AgentError::Other("boom".to_string()));
-        let runner = build_dispatch_runner(spec(Some(provider)), Arc::new(fake)).expect("runner");
+        let runner = bridge_dispatch_runner(Arc::new(fake), spec(Some(provider))).expect("runner");
         let err = runner
             .start(start(LaunchContext::default()))
             .await

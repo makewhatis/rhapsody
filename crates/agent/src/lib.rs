@@ -28,8 +28,8 @@ pub mod proctree;
 
 pub use dispatch::{
     DispatchRefusal, DispatchRunner, LaunchContext, PreparedHarnessSpec, PreparedProvider,
-    SessionStart, StartedSession, build_dispatch_runner, lower_provider_limits,
-    lower_provider_plan, prepare_provider,
+    SessionStart, StartedSession, bridge_dispatch_runner, build_dispatch_runner,
+    lower_provider_limits, lower_provider_plan, prepare_provider,
 };
 pub use harness::{
     BrokeredOpenCodeRefusal, CapabilityRefusal, CredentialTransport, Degradation, DispatchVerdict,
