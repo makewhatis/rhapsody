@@ -3023,9 +3023,13 @@ changes for callers:
 - **`rhapsodyd mcp`** sends the header and a JSON body (`{}` for stop/resume/handoff) on every
   write tool.
 - **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` and
-  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
-  header, but only for requests carrying exactly one `Origin: rhapsody://localhost`, the bundled
-  origin. A request with no `Origin` gets no header. Its native drain request sends the header too.
+  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly
+  one operator header for a request that arrived through the app's own custom-protocol handler,
+  unless it carries a `Cookie` or an `Origin` that is not exactly `rhapsody://localhost`. Only that
+  handler can reach the proxy, so this vouches for the app's own window whatever origin evidence
+  WebKit attaches — observed on macOS, WebKit sends **no** `Origin` for a same-origin fetch from
+  `rhapsody://localhost/` (it sends `Referer` instead), which is why the original exact-`Origin` rule
+  refused every console write (STUDIO-1044). Its native drain request sends the header too.
 - **Hand-written clients** (`curl`, scripts) must do the same:
   `curl -X POST http://127.0.0.1:$PORT/api/v1/refresh -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'`.
   The plugin skill's `operating.md` documents this.

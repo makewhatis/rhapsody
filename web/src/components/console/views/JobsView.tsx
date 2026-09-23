@@ -37,6 +37,7 @@ import { currentStepLabel } from "@/lib/console-trace-view";
 import { buildTrace } from "@/lib/trace-model";
 import { formatTokens } from "@/lib/format";
 import { mergeJobs } from "@/lib/runs-model";
+import { errText } from "@/lib/teams-model";
 import { useLinearProjects, useTypedConfigQuery } from "@/hooks/useConfig";
 import { useJobsFeed } from "@/hooks/useJobsFeed";
 import { useBoardActive } from "@/hooks/useBoardActive";
@@ -170,6 +171,9 @@ export function JobsView({
         <Chip onClick={() => refresh.mutate()} disabled={refresh.isPending}>
           ↻ Refresh
         </Chip>
+        {refresh.isError ? (
+          <span style={{ color: "var(--red)", fontSize: 12 }}>{errText(refresh.error)}</span>
+        ) : null}
         <DisplayOptions
           view={view}
           onView={setView}

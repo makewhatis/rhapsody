@@ -17,8 +17,13 @@
 //! origin ([`BUNDLED_ORIGIN`]), which the daemon would refuse. So the proxy never forwards what the
 //! webview sent for those headers. It drops any `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` or
 //! operator header, sets `Host` to the daemon target itself, and injects exactly one operator
-//! header, but only when the request came from the bundled origin ([`from_bundled_origin`]). Any
-//! other request is forwarded without the header, so the daemon refuses its writes.
+//! header when the request came through the app's own custom-protocol handler ([`may_vouch_for`]).
+//! Any other request is forwarded without the header, so the daemon refuses its writes.
+//!
+//! STUDIO-1044: the original rule vouched only for a literal `Origin: rhapsody://localhost`, and
+//! that vouched for NOTHING in the real app — observed on macOS, WebKit sends no `Origin` for a
+//! same-origin `fetch` from the `rhapsody://localhost/` document, so every console write was
+//! refused as `operator_header`. [`may_vouch_for`] carries the observed evidence and its rationale.
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, header};
@@ -63,15 +68,31 @@ pub const BUNDLED_ORIGIN: &str = "rhapsody://localhost";
 pub const OPERATOR_HEADER: &str = "x-rhapsody-operator";
 pub const OPERATOR_HEADER_VALUE: &str = "1";
 
-/// Reports whether a window request came from the bundled origin: it carries exactly one `Origin`,
-/// equal to [`BUNDLED_ORIGIN`]. A missing `Origin` is not evidence of the bundled origin, so it is
-/// refused like `null`, a repeated `Origin`, or any other origin. WebKit attaches `Origin` to every
-/// fetch whose method is not GET or HEAD, same-origin included, so the window's own writes carry it.
-pub fn from_bundled_origin(headers: &HeaderMap) -> bool {
+/// Whether the proxy should vouch for a request that arrived through the app's own custom-protocol
+/// handler by injecting the operator header.
+///
+/// The scheme handler is registered on the app's own `WKWebView` (wry's `setURLSchemeHandler`), and
+/// no page in any other origin can address it — so the handler itself is the origin evidence. The
+/// only thing that could still be judged is what the webview claims about its own origin:
+///
+///   - **No `Origin`** is vouched for. This is the real app's shape: observed on macOS (STUDIO-1044),
+///     WebKit sends NO `Origin` for a same-origin `fetch` from the `rhapsody://localhost/` document
+///     (it sends `Referer: rhapsody://localhost/` instead), so the old exact-`Origin` rule vouched
+///     for nothing and every console write was refused.
+///   - **Exactly one `Origin: `[`BUNDLED_ORIGIN`]** is vouched for, should WebKit ever send it.
+///   - **A foreign or repeated `Origin`** is not: a page somewhere else in this webview, or a forged
+///     duplicate, is refused by the daemon's guard.
+///   - **A `Cookie`** is not: the app's own writes are cookie-free (`credentials: "omit"`), and a
+///     cookie is exactly what the guard refuses (cookies are scoped by host, not by port).
+pub fn may_vouch_for(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::COOKIE) {
+        return false;
+    }
     let mut origins = headers.get_all(header::ORIGIN).iter();
     match (origins.next(), origins.next()) {
+        (None, _) => true,
         (Some(origin), None) => origin.as_bytes() == BUNDLED_ORIGIN.as_bytes(),
-        _ => false,
+        (Some(_), Some(_)) => false,
     }
 }
 
@@ -165,8 +186,27 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
         };
         builder = builder.header(header::HOST, authority);
     }
-    if from_bundled_origin(&req.headers) {
+    if may_vouch_for(&req.headers) {
         builder = builder.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
+    } else {
+        // STUDIO-1044: say WHY the proxy declined to vouch. `Origin` is the only evidence a caller
+        // could be judged on, so record it (or that none was present) — the marker that showed the
+        // real webview sends none. It is logged, never trusted, and never forwarded.
+        let origins: Vec<String> = req
+            .headers
+            .get_all(header::ORIGIN)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
+        let origin = if origins.is_empty() {
+            "absent".to_string()
+        } else {
+            origins.join(", ")
+        };
+        eprintln!(
+            "rhapsody-desktop: apiproxy: declined to vouch for {} {} (Origin: {origin})",
+            req.method, req.path
+        );
     }
     if !req.body.is_empty() {
         builder = builder.body(req.body.clone());
@@ -446,8 +486,40 @@ mod tests {
         assert_eq!(usable_base_url(State::Running, "not a url"), None);
     }
 
+    /// The exact headers the real macOS webview was observed to send for a same-origin console
+    /// write (STUDIO-1044): NO `Origin` at all, a `Referer` of the bundled document, and the
+    /// console's own single operator header. The old exact-`Origin` rule vouched for nothing here.
+    fn observed_webview_post() -> ProxyRequest {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            header::REFERER,
+            http::HeaderValue::from_static("rhapsody://localhost/"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            http::HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
+        );
+        headers.insert(OPERATOR_HEADER, http::HeaderValue::from_static("1"));
+        ProxyRequest {
+            method: Method::POST,
+            path: "/api/v1/runs/2508/stop".to_string(),
+            query: None,
+            headers,
+            body: Bytes::from_static(b"{}"),
+        }
+    }
+
     /// A window POST carrying every header the daemon's operator-write guard judges, forged or
-    /// duplicated, plus a body and a content type that must survive.
+    /// duplicated, plus a body and a content type that must survive. `origin` is what the webview
+    /// claimed. No cookie: the tests that exercise the cookie rule add their own.
     fn hostile_post(origin: Option<&'static str>) -> ProxyRequest {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -457,7 +529,6 @@ mod tests {
         if let Some(origin) = origin {
             headers.insert(header::ORIGIN, http::HeaderValue::from_static(origin));
         }
-        headers.insert(header::COOKIE, http::HeaderValue::from_static("session=x"));
         headers.insert(
             "sec-fetch-site",
             http::HeaderValue::from_static("cross-site"),
@@ -502,14 +573,15 @@ mod tests {
             .collect()
     }
 
-    // STUDIO-982: a window write from the bundled origin reaches the daemon with the daemon's own
-    // Host, exactly one operator header, and no Origin or Cookie. Every forged or duplicated copy
-    // the webview sent is dropped. The body and content type pass through.
+    // STUDIO-1044: the request the REAL macOS webview sends (no `Origin`; see observed_webview_post)
+    // reaches the daemon with its own Host and exactly one operator header, so the daemon accepts
+    // the write. Restoring the old exact-`Origin` rule — which vouched only for a literal
+    // `Origin: rhapsody://localhost` — turns this red.
     #[tokio::test]
-    async fn a_bundled_origin_write_gets_exactly_one_operator_header_and_the_daemon_host() {
+    async fn the_observed_webview_write_is_vouched_for_with_exactly_one_operator_header() {
         let backend = start_backend().await;
         let authority = backend.url.trim_start_matches("http://").to_string();
-        let (headers, body) = forwarded(&backend, hostile_post(Some(BUNDLED_ORIGIN))).await;
+        let (headers, body) = forwarded(&backend, observed_webview_post()).await;
         assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
         assert_eq!(values(&headers, OPERATOR_HEADER), ["1"]);
         assert!(values(&headers, "origin").is_empty());
@@ -519,24 +591,27 @@ mod tests {
         assert_eq!(&body[..], b"{}");
     }
 
-    // A request with no `Origin` carries no evidence of the bundled origin, so it gets no operator
-    // header and the daemon refuses its write. The forged copies it sent are still dropped.
+    // STUDIO-982: a window write from the bundled origin reaches the daemon with the daemon's own
+    // Host, exactly one operator header, and no Origin. Every forged or duplicated copy the webview
+    // sent is dropped. The body and content type pass through. (A cookie would stop the proxy
+    // vouching at all — see `a_cookie_bearing_write_is_never_vouched_for`.)
     #[tokio::test]
-    async fn a_write_without_an_origin_never_gets_the_operator_header() {
+    async fn a_bundled_origin_write_gets_exactly_one_operator_header_and_the_daemon_host() {
         let backend = start_backend().await;
         let authority = backend.url.trim_start_matches("http://").to_string();
-        let (headers, body) = forwarded(&backend, hostile_post(None)).await;
-        assert!(values(&headers, OPERATOR_HEADER).is_empty());
+        let (headers, body) = forwarded(&backend, hostile_post(Some(BUNDLED_ORIGIN))).await;
         assert_eq!(values(&headers, "host"), std::slice::from_ref(&authority));
-        assert!(values(&headers, "cookie").is_empty());
+        assert_eq!(values(&headers, OPERATOR_HEADER), ["1"]);
+        assert!(values(&headers, "origin").is_empty());
         assert!(values(&headers, "sec-fetch-site").is_empty());
+        assert_eq!(values(&headers, "content-type"), ["application/json"]);
         assert_eq!(&body[..], b"{}");
     }
 
-    // Any other origin gets no operator header, even a forged one of its own, so the daemon's
-    // guard refuses its write.
+    // A foreign origin — `null`, another scheme, a look-alike host — is never vouched for, even a
+    // forged one of its own, so the daemon's guard refuses its write. The dropped copies are gone.
     #[tokio::test]
-    async fn a_foreign_origin_never_gets_the_operator_header() {
+    async fn a_foreign_origin_is_never_vouched_for() {
         let backend = start_backend().await;
         for origin in [
             "null",
@@ -547,17 +622,36 @@ mod tests {
             let (headers, _) = forwarded(&backend, hostile_post(Some(origin))).await;
             assert!(values(&headers, OPERATOR_HEADER).is_empty(), "{origin}");
             assert!(values(&headers, "origin").is_empty(), "{origin}");
-            assert!(values(&headers, "cookie").is_empty(), "{origin}");
         }
-        let mut twice = hostile_post(Some(BUNDLED_ORIGIN));
-        twice.headers.append(
+    }
+
+    // A repeated `Origin` is not one `Origin`: never vouched for.
+    #[tokio::test]
+    async fn a_repeated_origin_is_never_vouched_for() {
+        let backend = start_backend().await;
+        let mut req = hostile_post(Some(BUNDLED_ORIGIN));
+        req.headers.append(
             header::ORIGIN,
             http::HeaderValue::from_static(BUNDLED_ORIGIN),
         );
-        let (headers, _) = forwarded(&backend, twice).await;
+        let (headers, _) = forwarded(&backend, req).await;
         assert!(
             values(&headers, OPERATOR_HEADER).is_empty(),
             "a repeated Origin is not the bundled origin"
         );
+    }
+
+    // A request carrying a `Cookie` is never vouched for, even with no `Origin`: the app's own
+    // writes are cookie-free (`credentials: "omit"`), and a cookie is exactly what the guard
+    // refuses. The cookie is dropped in any case.
+    #[tokio::test]
+    async fn a_cookie_bearing_write_is_never_vouched_for() {
+        let backend = start_backend().await;
+        let mut req = observed_webview_post();
+        req.headers
+            .insert(header::COOKIE, http::HeaderValue::from_static("session=x"));
+        let (headers, _) = forwarded(&backend, req).await;
+        assert!(values(&headers, OPERATOR_HEADER).is_empty());
+        assert!(values(&headers, "cookie").is_empty());
     }
 }

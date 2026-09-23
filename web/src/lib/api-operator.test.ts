@@ -91,7 +91,7 @@ describe("operator-write guard contract (STUDIO-982)", () => {
     expect(OPERATOR_HEADER).toBe("X-Rhapsody-Operator");
   });
 
-  it("surfaces the daemon's refusal instead of swallowing it", async () => {
+  it("surfaces the daemon's refusal — including the guard's own reason — instead of swallowing it", async () => {
     const refusal = { error: { code: "operator_write_forbidden", message: "refused by the guard" } };
     vi.stubGlobal(
       "fetch",
@@ -99,7 +99,19 @@ describe("operator-write guard contract (STUDIO-982)", () => {
     );
     await expect(postTeamsRoom("hello")).rejects.toThrow("refused by the guard");
     await expect(stopRun(7)).rejects.toThrow("refused by the guard");
+    // STUDIO-1044: setDrain and postRefresh only knew the status before; a refused write must show
+    // the guard's own sentence, not a bare number.
+    await expect(setDrain(true, "operator")).rejects.toThrow("refused by the guard");
+    await expect(postRefresh()).rejects.toThrow("refused by the guard");
+  });
+
+  it("falls back to the status when a refusal carries no JSON envelope", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json", { status: 403 })),
+    );
     await expect(postRefresh()).rejects.toThrow("refresh failed: 403");
+    await expect(setDrain(false)).rejects.toThrow("drain cancel failed: 403");
   });
 
   // The inventory: no dashboard source sends a mutating method except through operatorPost, so a
