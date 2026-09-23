@@ -89,6 +89,8 @@ fn issue(identifier: &str) -> Issue {
 struct Fixture {
     _scratch: Scratch,
     script: PathBuf,
+    /// The supported fake CLI body, so a test can restore it after swapping in an unsupported one.
+    body: String,
     argv_log: PathBuf,
     env_log: PathBuf,
     stderr_log: PathBuf,
@@ -159,6 +161,7 @@ impl Fixture {
         Self {
             _scratch: scratch,
             script,
+            body,
             argv_log,
             env_log,
             stderr_log,
@@ -192,7 +195,14 @@ impl Fixture {
         .expect("brokered session")
     }
 
-    /// Arm a turn and run it through the brokered entry point.
+    /// Rewrites the fake CLI back to its supported form (after a test replaced it with an
+    /// unsupported one).
+    fn restore_supported_script(&self) {
+        write_executable(&self.script, &self.body);
+    }
+
+    /// Arm a turn and run it through the brokered entry point, returning the finalized ledger so a
+    /// caller can assert whether a capability was minted.
     async fn run(
         &self,
         sess: &dyn Session,
@@ -201,6 +211,7 @@ impl Fixture {
         rhapsody_agent::TurnResult,
         Option<rhapsody_agent::AgentError>,
         Vec<Event>,
+        Option<rhapsody_provider_broker::TurnLedger>,
     ) {
         let (attempt, receipt) = {
             let mut receiver = self.receiver.lock().expect("receiver lock");
@@ -217,9 +228,9 @@ impl Fixture {
             .run_turn_brokered(prompt, None, None, &on_event, Some(attempt))
             .await;
         // Mirror the worker: the receipt is finalized by the access/attempt drop.
-        let _ = receipt.take();
+        let ledger = receipt.take();
         let events = events.lock().expect("events lock").clone();
-        (tr, err, events)
+        (tr, err, events, ledger)
     }
 
     fn argv_invocations(&self) -> Vec<String> {
@@ -266,13 +277,45 @@ fn provider_id_from_auth(auth: &str) -> String {
         .to_string()
 }
 
+/// Every regular file under `dir`, recursively. A missing directory yields nothing.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Asserts no regular file under `dir` contains `needle`.
+fn assert_not_persisted(dir: &Path, needle: &str) {
+    for file in files_under(dir) {
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(needle),
+            "{needle:?} was persisted in {}",
+            file.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn brokered_turn_materializes_managed_controls_and_no_auth_json() {
     let _serial = serial().await;
     let fx = Fixture::new("managed");
     let sess = fx.start().await;
 
-    let (tr, err, _events) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, _events, _ledger) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
 
     // Exactly one child invocation (the version probes are not logged as turns).
@@ -359,12 +402,48 @@ async fn brokered_turn_materializes_managed_controls_and_no_auth_json() {
     );
 }
 
+// ⚠️ Mutation target (§14.4 / "Ways to get this wrong"): write `auth.json`, or any other file
+// holding the capability or the reusable upstream key, into the private state tree, and this reds.
+// A brokered session persists no credential: the child holds only the per-turn capability in its
+// environment, and the reusable upstream key never leaves the daemon's broker. The check is a
+// recursive scan, so a canary planted anywhere under `XDG_DATA_HOME`/`OPENCODE_CONFIG_DIR` is seen.
+#[tokio::test]
+async fn no_reusable_key_or_capability_is_persisted_in_the_child_boundary() {
+    let _serial = serial().await;
+    let fx = Fixture::new("canary");
+    let sess = fx.start().await;
+    let (tr, err, _, _) = fx.run(sess.as_ref(), "do it").await;
+    assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+    let env = fx.env_map();
+    let capability = capability_from_auth(env.get("OPENCODE_AUTH_CONTENT").expect("auth"));
+    let upstream = "sk-fake-upstream-key";
+
+    // The private state tree carries neither the capability nor the reusable upstream key.
+    assert_not_persisted(&fx.state_root, &capability);
+    assert_not_persisted(&fx.state_root, upstream);
+
+    // The child environment carries no reusable upstream key either (the capability is expected —
+    // it is the per-turn credential the child is meant to use).
+    let env_dump = std::fs::read_to_string(&fx.env_log).unwrap_or_default();
+    assert!(
+        !env_dump.contains(upstream),
+        "the reusable upstream key entered the child environment:\n{env_dump}"
+    );
+    // Guard the guard: the capability really is in the child's env, so the state-tree scan above is
+    // not passing merely because nothing was materialized at all.
+    assert!(
+        env_dump.contains(&capability),
+        "the fixture must have materialized the capability for the canary to mean anything"
+    );
+}
+
 #[tokio::test]
 async fn consecutive_turns_rotate_the_capability_and_resume() {
     let _serial = serial().await;
     let fx = Fixture::new("rotate");
     let sess = fx.start().await;
-    let (tr1, err1, _) = fx.run(sess.as_ref(), "first").await;
+    let (tr1, err1, _, _) = fx.run(sess.as_ref(), "first").await;
     assert_eq!(tr1.status, TURN_SUCCEEDED, "{err1:?}");
     let cap1 = capability_from_auth(
         fx.env_map()
@@ -377,7 +456,7 @@ async fn consecutive_turns_rotate_the_capability_and_resume() {
             .expect("auth after turn 1"),
     );
 
-    let (tr2, err2, _) = fx.run(sess.as_ref(), "second").await;
+    let (tr2, err2, _, _) = fx.run(sess.as_ref(), "second").await;
     assert_eq!(tr2.status, TURN_SUCCEEDED, "{err2:?}");
     let cap2 = capability_from_auth(
         fx.env_map()
@@ -425,7 +504,7 @@ async fn transcript_teeing_is_redacted_before_it_is_written() {
     )
     .await
     .expect("brokered session");
-    let (tr, err, _) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, _, _) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
 
     let env = fx.env_map();
@@ -446,7 +525,7 @@ async fn capability_and_broker_url_are_redacted_from_events_and_stderr() {
     let _serial = serial().await;
     let fx = Fixture::new("redact");
     let sess = fx.start().await;
-    let (tr, err, events) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, events, _) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
 
     let env = fx.env_map();
@@ -495,10 +574,19 @@ async fn a_command_changed_after_preparation_refuses_before_mint_or_spawn() {
     let fx = Fixture::new("changed");
     let sess = fx.start().await;
 
-    // Rewrite the command to report an unsupported version, logging nothing.
-    write_executable(&fx.script, "#!/bin/sh\necho 9.9.9\nexit 0\n");
+    // Rewrite the command to report an unsupported version. It logs any NON-`--version` invocation,
+    // so a mutation that let the changed session reach a turn would show up in the argv log (the
+    // version re-probe itself passes `--version` and is therefore not counted).
+    write_executable(
+        &fx.script,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 9.9.9; exit 0; fi\n\
+             printf '%s\\n' \"$*\" >> \"{argv}\"\necho 9.9.9\nexit 0\n",
+            argv = fx.argv_log.display()
+        ),
+    );
 
-    let (tr, err, events) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, events, ledger) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_FAILED);
     let msg = err.expect("a changed command must refuse").to_string();
     assert!(msg.contains("unsupported_harness_version"), "{msg}");
@@ -506,18 +594,46 @@ async fn a_command_changed_after_preparation_refuses_before_mint_or_spawn() {
         events.iter().any(|e| e.event_type == "startup_failed"),
         "the refusal must be observable as a startup failure: {events:#?}"
     );
-    // ⚠️ No capability was minted and no child was spawned: the specific argv log the fake writes
-    // for a TURN is empty (the version re-probe logs nothing).
+    // ⚠️ No capability was minted for the refused turn.
+    assert!(
+        !ledger
+            .expect("the attempt must finalize its receipt")
+            .capability_issued(),
+        "a turn refused at the re-probe must not mint a capability"
+    );
+    // ⚠️ And no child was spawned: the argv log (written only for a non-`--version` invocation) is
+    // empty.
     assert!(
         fx.argv_invocations().is_empty(),
         "a changed command must not reach the child: {:?}",
         fx.argv_invocations()
     );
 
-    // And the already prepared session is dropped: a later turn refuses too.
-    let (tr2, err2, _) = fx.run(sess.as_ref(), "again").await;
+    // ⚠️ The already prepared session is dropped: its private state directory is gone.
+    assert_eq!(
+        std::fs::read_dir(&fx.state_root)
+            .expect("read state root")
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "a changed command must drop the already prepared session's state"
+    );
+
+    // ⚠️ And the drop is sticky: restoring a SUPPORTED command must not revive the poisoned session
+    // — a later turn still refuses with no new capability.
+    fx.restore_supported_script();
+    let (tr2, err2, _, ledger2) = fx.run(sess.as_ref(), "again").await;
     assert_eq!(tr2.status, TURN_FAILED);
-    assert!(err2.is_some(), "the poisoned session must keep refusing");
+    let msg2 = err2
+        .expect("the poisoned session must keep refusing")
+        .to_string();
+    assert!(msg2.contains("opencode_command_changed"), "{msg2}");
+    assert!(
+        !ledger2
+            .expect("the second attempt must finalize its receipt")
+            .capability_issued(),
+        "a poisoned session must not mint a capability on a later turn"
+    );
 }
 
 #[tokio::test]
@@ -561,7 +677,7 @@ async fn a_hostile_project_config_cannot_retarget_the_generated_provider() {
     std::fs::write(&hostile, hostile_body).expect("write hostile project config");
 
     let sess = fx.start().await;
-    let (tr, err, _) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, _, _) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
 
     let env = fx.env_map();
@@ -608,7 +724,7 @@ async fn a_teams_run_embeds_the_daemon_mcp_in_the_authoritative_config() {
     )
     .await
     .expect("brokered session");
-    let (tr, err, _) = fx.run(sess.as_ref(), "do it").await;
+    let (tr, err, _, _) = fx.run(sess.as_ref(), "do it").await;
     assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
 
     let config: Value = serde_json::from_str(

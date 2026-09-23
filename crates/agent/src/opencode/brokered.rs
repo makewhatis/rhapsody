@@ -29,7 +29,6 @@ use rhapsody_provider_broker::{OsRandom, RandomSource};
 use serde_json::Value;
 
 use crate::AgentError;
-use crate::opencode::args::Config;
 
 /// The slash-free prefix every managed internal provider id carries.
 pub const INTERNAL_PROVIDER_PREFIX: &str = "rhapsody-";
@@ -234,7 +233,6 @@ fn check_json_size(label: &str, text: &str) -> Result<(), AgentError> {
 /// `--agent build` and `--pure` are owned, and no `--variant`/`extra_args` can appear because brokered
 /// v1 refuses them upstream.
 pub fn build_brokered_args(
-    _cfg: &Config,
     ws_path: &str,
     resume_id: &str,
     prompt: &str,
@@ -404,14 +402,36 @@ impl CapabilityRedactor {
         self.drain()
     }
 
-    /// End the stream. The retained tail is a proper prefix of a secret, never a complete one, so it
-    /// is emitted unchanged.
+    /// End the stream. Nothing further can arrive, so the retained tail is flushed through one last
+    /// pass that redacts every COMPLETE secret still in it. The tail is a proper prefix of the
+    /// longest secret it was held for, but that does not make it secret-free: when the stream ends
+    /// inside the base URL, the tail can wholly contain the shorter broker AUTHORITY, and emitting it
+    /// unchanged would leak the exact `host:port` (`§9.4`). A trailing PARTIAL secret is emitted —
+    /// no later byte can complete it, so it is not the exact secret being redacted.
     pub fn finish(&mut self) -> Vec<u8> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        std::mem::take(&mut self.pending)
+        let pending = std::mem::take(&mut self.pending);
+        let mut out = Vec::with_capacity(pending.len());
+        let mut i = 0usize;
+        while i < pending.len() {
+            let rest = &pending[i..];
+            match self.entries.iter().find(|(secret, _)| {
+                rest.len() >= secret.len() && rest[..secret.len()] == secret[..]
+            }) {
+                Some((secret, marker)) => {
+                    out.extend_from_slice(marker);
+                    i += secret.len();
+                }
+                None => {
+                    out.push(pending[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
     }
 
     fn drain(&mut self) -> Vec<u8> {
@@ -706,7 +726,7 @@ mod tests {
     #[test]
     fn brokered_argv_matches_the_pb0_capture_shape() {
         let id = pid("rhapsody-AAAAAAAAAAAAAAAAAAAAAA");
-        let got = build_brokered_args(&Config::default(), "/ws", "", "do it", &id, "probe-model");
+        let got = build_brokered_args("/ws", "", "do it", &id, "probe-model");
         assert_eq!(
             got,
             vec![
@@ -729,7 +749,7 @@ mod tests {
     #[test]
     fn brokered_argv_adds_resume_but_keeps_the_prompt_last() {
         let id = pid("rhapsody-AAAAAAAAAAAAAAAAAAAAAA");
-        let got = build_brokered_args(&Config::default(), "/ws", "ses_1", "p", &id, "m");
+        let got = build_brokered_args("/ws", "ses_1", "p", &id, "m");
         let pos = got.iter().position(|a| a == "-s").expect("-s");
         assert_eq!(got[pos + 1], "ses_1");
         assert_eq!(got.last().map(String::as_str), Some("p"));
@@ -776,6 +796,44 @@ mod tests {
         let chunks: Vec<&[u8]> = b"xrhp-secrety".chunks(1).collect();
         let out = redact(("rhp-secret", "http://127.0.0.1:9/v1"), &chunks);
         assert_eq!(out, b"x[redacted-capability]y");
+    }
+
+    // ⚠️ Mutation target (§9.4): `finish` must not emit a retained tail just because it is a proper
+    // prefix of the LONGEST secret it was held for. When the stream ends inside the base URL, the
+    // tail can wholly contain the shorter broker AUTHORITY, and a `finish` that returns the tail
+    // unchanged leaks the exact `host:port`. The tail below is `http://127.0.0.1:41234` — a proper
+    // prefix of the base URL, and a complete authority at its offset 7.
+    #[test]
+    fn finish_redacts_an_authority_wholly_contained_in_the_retained_tail() {
+        let base_url = "http://127.0.0.1:41234/v1";
+        let capability = "rhp-abcdefghijklmnopqrstuvwxyz0123456789abc";
+        let mut r = CapabilityRedactor::new(capability, base_url);
+        let mut out = r.push(b"connect ECONNREFUSED http://127.0.0.1:41234");
+        out.extend(r.finish());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("127.0.0.1:41234"),
+            "the authority leaked through finish(): {text}"
+        );
+        assert!(text.contains("[redacted-broker-url]"), "{text}");
+    }
+
+    // A trailing PARTIAL secret cannot be completed by a later byte, so emitting it is not a leak of
+    // the exact secret; the complete authority BEFORE it is still redacted.
+    #[test]
+    fn finish_redacts_a_complete_authority_and_emits_only_a_partial_trailer() {
+        let base_url = "http://127.0.0.1:41234/v1";
+        let capability = "rhp-abcdefghijklmnopqrstuvwxyz0123456789abc";
+        let mut r = CapabilityRedactor::new(capability, base_url);
+        let mut out = r.push(b"error at http://127.0.0.1:41234/v");
+        out.extend(r.finish());
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("127.0.0.1:41234"), "{text}");
+        assert!(text.contains("[redacted-broker-url]"), "{text}");
+        assert!(
+            text.ends_with("/v"),
+            "only the incomplete trailer remains: {text}"
+        );
     }
 
     #[test]

@@ -217,6 +217,52 @@ impl Drop for BrokerTurnGuard {
     }
 }
 
+/// One turn's teardown, owning its capability guard and its process-tree guard. Its [`Drop`]
+/// delegates to [`teardown_turn`], which revokes the capability BEFORE the process-tree kill can
+/// block (`§9.4`) — a property pinned by a unit test, not by the field declaration order a comment
+/// used to describe (the old code's two `let` bindings could be reordered with every test green).
+struct TurnTeardown {
+    access: BrokerTurnGuard,
+    tree: KillTreeOnDrop,
+}
+
+impl TurnTeardown {
+    /// Declare normal completion. The following drop finalizes the receipt as `completed`.
+    fn finish(&mut self) {
+        self.access.finish();
+    }
+
+    /// Revoke the capability now (turn error, timeout, or Stop) rather than waiting for drop.
+    fn revoke(&mut self) {
+        self.access.revoke();
+    }
+
+    /// Stand the process-tree kill down once the child has been reaped (the normal path).
+    fn disarm_tree(&mut self) {
+        self.tree.disarm();
+    }
+}
+
+impl Drop for TurnTeardown {
+    fn drop(&mut self) {
+        // Take both guards out and run them through the one ordering function, so the
+        // revoke-then-kill order is a tested property rather than an implicit field-drop order.
+        let access = std::mem::replace(&mut self.access, BrokerTurnGuard { access: None });
+        let tree = std::mem::replace(&mut self.tree, KillTreeOnDrop::new(0));
+        teardown_turn(|| drop(access), || drop(tree));
+    }
+}
+
+/// Runs the two teardown actions in the pinned order (`§9.4`): revoke the turn capability FIRST,
+/// then tear down the process tree. [`KillTreeOnDrop`]'s kill shells out to `ps` and can block for
+/// the sweep's whole bounded budget; a capability left live across that window is replayable. Kept a
+/// pure function so a unit test can pin the order with two recording closures — swapping the two
+/// lines reds the test and flips the production order, because [`TurnTeardown::drop`] delegates here.
+fn teardown_turn(revoke: impl FnOnce(), kill_tree: impl FnOnce()) {
+    revoke();
+    kill_tree();
+}
+
 /// Prepares a BROKERED OpenCode session (STUDIO-1001 / PB6).
 ///
 /// Fail-closed ordering, all before any credential contact: unsupported brokered knobs refuse, then
@@ -654,7 +700,6 @@ impl OpencodeSession {
             brokered_access = Some(access);
             brokered_material = Some(material);
             build_brokered_args(
-                &cfg,
                 &self.ws_path,
                 &resume,
                 &prompt,
@@ -761,13 +806,15 @@ impl OpencodeSession {
         // held-open stdin is claude's mailbox, not this harness's contract.
         drop(stdin);
 
-        let mut tree_kill = KillTreeOnDrop::new(pid);
-        // ⚠️ §9.4 ordering: this guard is declared AFTER `tree_kill`, so on a cancelled turn the
-        // access drops (revoking the grant) BEFORE `KillTreeOnDrop` can block walking the process
-        // tree. Declaration order is the ordering mechanism; the explicit `finish`/drop below pins
-        // the normal, non-cancellation path too.
-        let mut access_guard = BrokerTurnGuard {
-            access: brokered_access.take(),
+        // ⚠️ §9.4 ordering: one composite owns both guards and revokes the capability BEFORE the
+        // process-tree kill can block (see [`TurnTeardown`]). Before this point the access lives in
+        // `brokered_access`; there is no await between its mint and this construction, so a
+        // cancelled future can only drop it here or later, through this composite.
+        let mut teardown = TurnTeardown {
+            access: BrokerTurnGuard {
+                access: brokered_access.take(),
+            },
+            tree: KillTreeOnDrop::new(pid),
         };
 
         let mut usage = Usage::default();
@@ -976,9 +1023,9 @@ impl OpencodeSession {
         // the grant and records the turn as revoked. Either way no capability remains valid between
         // outer turns.
         if terminal_seen && failure.is_none() {
-            access_guard.finish();
+            teardown.finish();
         } else {
-            access_guard.revoke();
+            teardown.revoke();
         }
 
         let drain_out = async {
@@ -1015,7 +1062,7 @@ impl OpencodeSession {
         };
         tokio::join!(drain_out, drain_err);
         let wait_res = child.wait().await;
-        tree_kill.disarm();
+        teardown.disarm_tree();
 
         if dropped_messages > 0 {
             tracing::warn!(
@@ -2079,5 +2126,24 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         // stdin: ClosedAtStart is the measured difference from claude; the runner test
         // `the_prompt_is_a_positional_...` asserts the child observes it closed.
         assert_eq!(caps.stdin, StdinPolicy::ClosedAtStart);
+    }
+
+    // ⚠️ §9.4 mutation target: the turn must revoke its capability BEFORE the process-tree kill can
+    // block. The production `TurnTeardown::drop` delegates to `teardown_turn`, so swapping the two
+    // calls there — the exact reordering that used to leave every test green — reds this.
+    #[test]
+    fn teardown_revokes_the_capability_before_it_kills_the_process_tree() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let revoke_sink = Arc::clone(&log);
+        let kill_sink = Arc::clone(&log);
+        teardown_turn(
+            || revoke_sink.lock().expect("log").push("revoke"),
+            || kill_sink.lock().expect("log").push("kill-tree"),
+        );
+        assert_eq!(
+            *log.lock().expect("log"),
+            vec!["revoke", "kill-tree"],
+            "the turn capability must be revoked before the process-tree kill can block"
+        );
     }
 }
