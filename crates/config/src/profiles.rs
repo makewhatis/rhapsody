@@ -249,6 +249,21 @@ const BUILTINS: &[BuiltinProfile] = &[
         tools: &[],
         body: include_str!("profiles/builtin/sre.v2.md"),
     },
+    // v3 (STUDIO-1034): the reviewer gains its acceptance-checklist section — the prompt now
+    // carries the origin ticket's description, so the reviewer is told to cite THAT, not the pull
+    // request's own coverage list. Shipped as an ADDED file, per §4: `reviewer@2` still resolves
+    // byte-for-byte for anyone who pinned it, and `extends: reviewer` picks it up on upgrade.
+    BuiltinProfile {
+        name: "reviewer",
+        version: 3,
+        model: "",
+        effort: "",
+        harness: "",
+        provider: "",
+        capabilities: &["code-review", "security-review", "simplify"],
+        tools: &[],
+        body: include_str!("profiles/builtin/reviewer.v3.md"),
+    },
 ];
 
 /// The bundled default profiles, newest version last for any given name.
@@ -891,9 +906,10 @@ mod tests {
     /// (`extends: swe`) and the versions are the thing pins name.
     ///
     /// T4 bumped every role to v2 (the "retain what the next run will need"
-    /// section, §5.1). **v1 is still listed, unedited**: §4's upgrade story is
-    /// that a bump is an ADDED file, so anyone who wrote `extends: swe@1` keeps
-    /// exactly the bytes they pinned.
+    /// section, §5.1). STUDIO-1034 bumped the reviewer to v3 (the acceptance
+    /// checklist). **Every earlier version is still listed, unedited**: §4's
+    /// upgrade story is that a bump is an ADDED file, so anyone who wrote
+    /// `extends: reviewer@2` keeps exactly the bytes they pinned.
     #[test]
     fn builtins_ship_v1_and_v2_of_swe_reviewer_sre() {
         let got: Vec<(&str, u32)> = builtin_profiles()
@@ -908,7 +924,8 @@ mod tests {
                 ("sre", 1),
                 ("swe", 2),
                 ("reviewer", 2),
-                ("sre", 2)
+                ("sre", 2),
+                ("reviewer", 3)
             ]
         );
         // Every v2 teaches the retain half of §5.1, and every v1 predates it.
@@ -937,6 +954,32 @@ mod tests {
                 b.version
             );
         }
+    }
+
+    /// STUDIO-1034: the newest reviewer profile tells the reviewer to cite the TICKET's acceptance
+    /// items, not the pull request's own summary, and to say so when the prompt reports no ticket.
+    /// The prompt side of the feature is what supplies those items; this pins that the shipped
+    /// profile actually points at them.
+    #[test]
+    fn the_newest_reviewer_profile_cites_the_ticket_not_the_pull_request() {
+        let newest = builtin_profiles()
+            .iter()
+            .filter(|b| b.name == "reviewer")
+            .max_by_key(|b| b.version)
+            .expect("a reviewer built-in ships");
+        assert_eq!(newest.version, 3);
+        assert!(
+            newest.body.contains("acceptance source of truth"),
+            "the reviewer must be pointed at the prompt's acceptance source"
+        );
+        assert!(
+            newest.body.contains("not the pull request's summary"),
+            "the reviewer must be told NOT to trust the pull request's own list"
+        );
+        assert!(
+            newest.body.contains("no ticket is available"),
+            "the reviewer must be told how to read the no-ticket case"
+        );
     }
 
     /// A built-in resolves with no file on disk at all — the shipped state —

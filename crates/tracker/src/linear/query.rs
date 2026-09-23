@@ -225,6 +225,25 @@ query IssueLabelsByIDs($ids: [ID!], $first: Int!) {
   }
 }"#;
 
+/// `queryIssueDescriptionByIdentifier` — one issue's DESCRIPTION by its human identifier
+/// (e.g. `STUDIO-1034`). Rhapsody-only (no Go v0.4.0 counterpart), additive, and deliberately NOT
+/// a widening of [`QUERY_BY_IDS`]: that one is the every-tick reconciliation read and must keep
+/// asking for exactly the fields it asks for today.
+///
+/// It backs STUDIO-1034: a ticketless review has no Linear access, so the daemon reads the origin
+/// ticket's acceptance criteria here, off the control task, and quotes them into the review prompt.
+///
+/// It resolves the issue by `issue(id:)` rather than by an `issues(filter:)`, because Linear's
+/// `IssueFilter` has no `identifier` field — a `filter: { identifier: { eq: … } }` is rejected at
+/// GraphQL validation before any data is read. `issue(id: String!)` accepts a human identifier like
+/// `STUDIO-1034` as well as a UUID, and returns `null` (not an error) for one that matches nothing.
+/// The returned issue's own `identifier` is still compared client-side so a resolution we did not
+/// ask for is never mistaken for the ticket.
+pub const QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER: &str = r#"
+query IssueDescriptionByIdentifier($id: String!) {
+  issue(id: $id) { identifier description }
+}"#;
+
 /// `queryTeamWorkflowStates` — all workflow states (id + name + type + position) for a team; the
 /// caller matches the target NAME case-insensitively client-side. `$teamID` is typed `ID!`.
 pub const QUERY_TEAM_WORKFLOW_STATES: &str = r#"

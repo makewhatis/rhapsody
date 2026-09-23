@@ -146,6 +146,20 @@ pub trait Tracker: Any + Send + Sync {
     /// separate read rather than more fields on the every-tick reconciliation query.
     async fn fetch_issue_labels_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError>;
 
+    /// FetchIssueDescriptionByIdentifier returns the DESCRIPTION of the issue with the given human
+    /// identifier (e.g. `STUDIO-1034`), or `None` when no such issue is readable. Rhapsody-only
+    /// (no Go v0.4.0 counterpart), additive, for [`Tracker::fetch_issue_labels_by_ids`]'s reason:
+    /// it is a single-purpose read rather than a widening of the every-tick reconciliation query.
+    ///
+    /// It exists because a headless ticketless review has no Linear access, so the daemon must
+    /// quote the origin ticket's acceptance criteria into the review prompt (STUDIO-1034). CALLED
+    /// OFF THE CONTROL TASK only: the read is network I/O and the review prompt is rendered on the
+    /// worker's own task.
+    async fn fetch_issue_description_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<String>, TrackerError>;
+
     /// FetchBlockedBacklogIssues returns FULLY-normalized Backlog-state issues (BlockedBy
     /// populated) for the configured project, assigned to the API key owner. It backs the DAG
     /// auto-promote pass (orchestrator.promoteUnblocked), which needs Backlog tickets WITH their
