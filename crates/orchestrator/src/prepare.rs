@@ -1792,7 +1792,9 @@ impl Orchestrator {
 pub struct ReviewHeadObservation {
     /// Whether the pull request was observed open at its registered head.
     pub open: bool,
-    /// The observed head SHA (empty when the pull request was not observed open).
+    /// The observed head SHA. Empty only when the watcher had no head for the coordinate — a
+    /// `Found` naming no head, `Gone`, or `Untrusted`. A merged or closed pull request still carries
+    /// its real head; `open` carries the open/closed bit beside it.
     pub head: String,
 }
 
