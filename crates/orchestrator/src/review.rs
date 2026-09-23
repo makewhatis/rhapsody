@@ -55,6 +55,13 @@ pub(crate) struct ReviewWatchCommit {
     /// Whether the round moved to a substitute. Only then is the incumbent retired — retiring on a
     /// non-reassigned round would drop the very row that owes this review.
     pub reassigned: bool,
+    /// The head this round is pinned to — carried so the STUDIO-1012 manager exchange
+    /// authorization can be CONSUMED at ACCEPTANCE, exactly as the round budget is charged there,
+    /// rather than at the arm attempt where a later refusal would burn it.
+    pub head: String,
+    /// That head's patch-id (empty when unknown), so a `review_round` authorization granted for a
+    /// different change is not consumed by this one.
+    pub head_patch_id: String,
 }
 
 /// The dispatch-time coordinates of one ticketless review run: WHICH pull request, at WHICH head,

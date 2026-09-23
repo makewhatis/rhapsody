@@ -64,6 +64,46 @@ pub enum ManagerMode {
     LabelsModel,
 }
 
+/// How much authority the manager has over the ticketless review loop's EXCHANGES (STUDIO-1012,
+/// design record `manager-agent-design.md` §7.8/§9/§12). Config only in M5 — the review-side gates
+/// read it; M6 owns the operator-facing rollout, validation and self-test.
+///
+/// - [`Off`](Self::Off) — the default — adds no gating at all: the loop behaves exactly as it did
+///   before this key existed.
+/// - [`Advise`](Self::Advise) — reserved for M6's shadow runs. For the gates THIS ticket adds it is
+///   byte-identical to `off`: nothing is gated.
+/// - [`Act`](Self::Act) — after a pull request's round threshold, the review-side arming paths
+///   require an active manager exchange authorization (§7.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewAuthority {
+    /// No gating. The default; byte-identical to a daemon built before this key existed.
+    #[default]
+    Off,
+    /// Shadow only; the M5 gates treat it exactly as `off`.
+    Advise,
+    /// The manager's authorization gates post-threshold exchanges.
+    Act,
+}
+
+/// Serde is hand-written rather than derived so an unrecognised or misspelled value reads as `off`
+/// rather than failing the whole `teams.yaml` (which would silently disable Teams). M6 adds the
+/// validation that refuses a bad value loudly; until then "treat it as off" is the safe direction,
+/// and it keeps an install that never wrote the key byte-identical to one built before it existed.
+impl<'de> Deserialize<'de> for ReviewAuthority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.trim() {
+            "act" => ReviewAuthority::Act,
+            "advise" => ReviewAuthority::Advise,
+            _ => ReviewAuthority::Off,
+        })
+    }
+}
+
 /// Where a teammate's memory bank lives (§2.2, §5.4). Config only in T1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MemoryBackend {
@@ -187,6 +227,12 @@ pub struct Manager {
     pub max_tokens: i64,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: i64,
+    /// How much authority the manager has over the review loop's post-threshold EXCHANGES
+    /// (STUDIO-1012, §7.8). Default [`ReviewAuthority::Off`], so an installation that never wrote
+    /// the key is byte-identical to one built before it existed. Read through
+    /// [`Teams::manager_review_authority`], never raw — the accessor folds in the ticketless gate.
+    #[serde(default)]
+    pub review_authority: ReviewAuthority,
 }
 
 impl Default for Manager {
@@ -199,6 +245,7 @@ impl Default for Manager {
             provider: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            review_authority: ReviewAuthority::Off,
         }
     }
 }
@@ -969,6 +1016,21 @@ impl Teams {
         }
         let n = self.review.adjudicate_after_rounds;
         (n > 0).then(|| usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// How much authority the manager has over the review loop's post-threshold exchanges
+    /// (STUDIO-1012, §7.8), or [`ReviewAuthority::Off`] on any installation the gate cannot apply
+    /// to.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: the exchange authorizations this
+    /// reads are written and consumed only by the ticketless watcher, so on any other installation
+    /// the key is dead config and must read as `off` rather than promise a gate that can never fire.
+    pub fn manager_review_authority(&self) -> ReviewAuthority {
+        if !self.review_ticketless() {
+            return ReviewAuthority::Off;
+        }
+        self.manager.review_authority
     }
 
     /// The number of COMPLETED review runs on a pull request that trips the runaway-loop breaker
@@ -1945,6 +2007,46 @@ mod tests {
                 "{bad:?} should be a parse error"
             );
         }
+    }
+
+    /// STUDIO-1012: `manager.review_authority` parses `act`/`advise`, and an unrecognised value
+    /// reads as `off` rather than failing the whole file. M6 owns the loud validation; until then
+    /// "treat it as off" is the safe direction, and it keeps an install that never wrote the key
+    /// byte-identical to one built before it existed. The accessor folds in the ticketless gate.
+    #[test]
+    fn review_authority_parses_and_reads_off_until_ticketless() {
+        let parse = |text: &str| {
+            Teams::parse(text)
+                .expect("a review authority value must never fail the file")
+                .manager
+                .review_authority
+        };
+        assert_eq!(parse(""), ReviewAuthority::Off);
+        assert_eq!(
+            parse("manager:\n  review_authority: off\n"),
+            ReviewAuthority::Off
+        );
+        assert_eq!(
+            parse("manager:\n  review_authority: advise\n"),
+            ReviewAuthority::Advise
+        );
+        assert_eq!(
+            parse("manager:\n  review_authority: act\n"),
+            ReviewAuthority::Act
+        );
+        assert_eq!(
+            parse("manager:\n  review_authority: bogus\n"),
+            ReviewAuthority::Off,
+            "an unknown value reads as off, not a rejected file"
+        );
+
+        // The accessor is gated on the ticketless path: a Teams-off or non-ticketless install reads
+        // off whatever the raw field says.
+        let mut t = Teams::parse("manager:\n  review_authority: act\n").expect("parse");
+        assert_eq!(t.manager_review_authority(), ReviewAuthority::Off);
+        t.enabled = true;
+        t.review.mode = ReviewMode::Ticketless;
+        assert_eq!(t.manager_review_authority(), ReviewAuthority::Act);
     }
 
     /// A malformed file disables Teams — it never propagates a failure that
@@ -3372,6 +3474,7 @@ mod tests {
                 provider: "fireworks".to_string(),
                 max_tokens: 1,
                 timeout_ms: 2,
+                review_authority: ReviewAuthority::Act,
             },
             memory: Memory {
                 backend: MemoryBackend::None,
