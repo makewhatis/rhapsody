@@ -420,6 +420,16 @@ pub trait ReviewWatchSink: Send + Sync {
     /// failed turn is logged and the decision is re-asked on a later sweep, and there is no caller
     /// to return to.
     async fn adjudicate(&self, plan: crate::reviewadjudicate::ReviewAdjudicationPlan);
+
+    /// Retries the terminal moves still owed to merged pull requests (STUDIO-1007). Called once per
+    /// watcher tick, BEFORE anything decides whether the watch set has work: a merged pull request's
+    /// rows are retired, so on a daemon whose only watched pull request just merged the tick
+    /// continues past the sweep entirely — and on that tick the owed move would otherwise never be
+    /// retried at all, which is precisely the stall this ticket closes.
+    ///
+    /// A DEFAULT no-op so the many test doubles need no change; the production
+    /// [`ControlWatchSink`] reaches the control handle's off-loop retry.
+    async fn retry_pending(&self) {}
 }
 
 /// The production [`ReviewWatchSink`]: the control channel, through the same [`ControlHandle`] seam
@@ -553,6 +563,11 @@ impl ReviewWatchSink for ControlWatchSink {
         // Infallible by contract: `perform_adjudication` logs every failure and records what it
         // decided, so there is nothing here to propagate.
         crate::reviewadjudicate::perform_adjudication(&plan, deps, chrono::Utc::now()).await;
+    }
+    async fn retry_pending(&self) {
+        self.control
+            .retry_pending_review_done(chrono::Utc::now())
+            .await
     }
 }
 
@@ -782,6 +797,12 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
             _ = ctx.cancelled() => return,
             () = tokio::time::sleep(std::time::Duration::from_millis(interval_ms as u64)) => {}
         }
+        // The owed terminal moves (STUDIO-1007), retried on every tick and BEFORE anything decides
+        // whether this tick has watch-set work: a merged pull request's rows are retired, so on a
+        // daemon whose only watched pull request just merged, the `prs.is_empty()` continue below
+        // runs every tick — and the owed move has no watch row left to ride. The control handle's
+        // retry is where the tracker write happens; nothing here decides anything.
+        deps.sink.retry_pending().await;
         let prs = deps.sink.watched().await;
         if prs.is_empty() {
             cursor = 0;
@@ -4387,6 +4408,15 @@ mod tests {
         }
         fn load_review_bounds(&self) -> Result<Vec<rs::ReviewBoundRow>, rs::StoreError> {
             self.0.load_review_bounds()
+        }
+        fn save_review_done(&self, row: rs::ReviewDoneRow) -> Result<(), rs::StoreError> {
+            self.0.save_review_done(row)
+        }
+        fn clear_review_done(&self, identifier: &str) -> Result<(), rs::StoreError> {
+            self.0.clear_review_done(identifier)
+        }
+        fn load_review_done(&self) -> Result<Vec<rs::ReviewDoneRow>, rs::StoreError> {
+            self.0.load_review_done()
         }
         fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
             self.0.prune(retention_days)
