@@ -1362,6 +1362,17 @@ shipped pull request whose rows are not all approved is therefore reported as `r
 gate still holds it, and no round will ever arm), while one whose rows are all approved either
 merges or falls to the ordinary `approved_still_open` report after the staleness threshold.
 
+**Past the threshold each new head buys exactly ONE round, and the manager is asked only about a
+head a reviewer has READ (STUDIO-971, STUDIO-1021).** A decision — ship OR escalate — is a statement
+about the head it was made at, never about the pull request for ever: a content-changing push after
+it buys one round (a patch-id-identical move buys nothing, STUDIO-960), and a round that comes back
+with findings buys a FRESH decision at the new head. An `escalate` is head-scoped exactly like a
+`ship`; it used to govern however far the head moved, which paged a human for every fix pushed after
+one. Symmetrically, a head no live reviewer has completed a review of is never handed to the
+manager: a threshold crossed by such a head arms the one round instead, and the manager is asked only
+once that round returns findings. At `REVIEW_ROUNDS_PER_PR_CAP` no round can arm, so the unread head
+is the manager's there. A `rhapsody:human` hold still stops all of it.
+
 **Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
 assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot
 silently inherit that mode. It is gated by this key alone, runs through the daemon's one model-turn
