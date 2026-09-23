@@ -74,6 +74,7 @@ pub mod reviewadopt;
 pub mod reviewchanges;
 pub mod reviewconsole;
 pub mod reviewdone;
+pub mod reviewfindings;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;
