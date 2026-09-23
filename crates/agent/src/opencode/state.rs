@@ -47,6 +47,13 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// The directory name prefix, so an operator can recognize (and an admin can sweep) what these are.
 const PREFIX: &str = "rhapsody-opencode";
 
+/// The private config directory name created inside the per-session state directory for brokered
+/// runs (`OPENCODE_CONFIG_DIR`, `provider-broker-design.md` §9.2). It is a separate 0700 directory
+/// from the state root `XDG_DATA_HOME` names, and deliberately empty: brokered mode supplies its
+/// provider config inline via `OPENCODE_CONFIG_CONTENT`, and this directory exists only so OpenCode
+/// has an adapter-owned, non-project directory to consult.
+const CONFIG_DIR_NAME: &str = "opencode-config";
+
 /// A provisioned, private opencode state directory for ONE session.
 ///
 /// Removed by [`RunState::cleanup`] (called from `Session::stop`) and again by `Drop`, because an
@@ -58,15 +65,17 @@ pub struct RunState {
 }
 
 impl RunState {
-    /// Creates a private state directory and seeds it with the operator's `auth.json`.
+    /// Creates a private state directory for a LEGACY native-login session, seeding it with a copy
+    /// of the operator's own `auth.json`.
     ///
-    /// `state_root` empty ⇒ the system temp dir. `auth_source` empty ⇒ [`default_auth_source`].
-    /// `workspace_root` is the daemon's own worktree root (`crate::opencode::Config::workspace_root`);
-    /// empty skips the workspace-containment check (a test convenience — production always has one).
-    /// Returns an error — before anything is spawned — when the credential is missing or empty, or
-    /// when `state_root` resolves inside a worktree/repository, through a symlink, or under unsafe
+    /// This is the explicit `LegacyLogin` mode (`provider-broker-design.md` §9.1). `state_root`
+    /// empty ⇒ the system temp dir; `auth_source` empty ⇒ [`default_auth_source`]. `workspace_root`
+    /// is the daemon's own worktree root (`crate::opencode::Config::workspace_root`); empty skips
+    /// the workspace-containment check (a test convenience — production always has one). Returns an
+    /// error — before anything is spawned — when the credential is missing or empty, or when
+    /// `state_root` resolves inside a worktree/repository, through a symlink, or under unsafe
     /// ownership (STUDIO-980).
-    pub fn provision(
+    pub fn provision_legacy(
         state_root: &str,
         auth_source: &str,
         issue_identifier: &str,
@@ -95,6 +104,59 @@ impl RunState {
             )));
         }
 
+        let state = Self::provision_dir(state_root, issue_identifier, workspace_root)?;
+        let dst_dir = state.dir.join("opencode");
+        let seed = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dst_dir)?;
+            std::fs::copy(&src, dst_dir.join("auth.json"))?;
+            Ok(())
+        };
+        if let Err(e) = seed() {
+            // The half-built directory is removed here rather than left for `Drop`, so the error
+            // path leaves nothing behind either.
+            state.cleanup();
+            return Err(AgentError::Other(format!(
+                "opencode_auth_missing: could not seed {} from {}: {e}",
+                dst_dir.display(),
+                src.display()
+            )));
+        }
+        Ok(state)
+    }
+
+    /// Creates a private state directory for a BROKERED session: a `Brokered` `RunState` holds **no
+    /// reusable credential file at all** (`provider-broker-design.md` §9.1). The child receives only
+    /// the per-turn capability in its environment; there is no `auth.json`, and none is created or
+    /// copied. The private `OPENCODE_CONFIG_DIR` is created 0700 alongside it.
+    ///
+    /// It performs no credential read — the refusal ordering that a brokered dispatch needs (probe
+    /// first, then prepare) is the caller's to enforce — but it does enforce every state-root
+    /// containment/ownership rule the legacy path does.
+    pub fn provision_brokered(
+        state_root: &str,
+        issue_identifier: &str,
+        workspace_root: &str,
+    ) -> Result<RunState, AgentError> {
+        let state = Self::provision_dir(state_root, issue_identifier, workspace_root)?;
+        let config_dir = state.dir.join(CONFIG_DIR_NAME);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&config_dir) {
+            state.cleanup();
+            return Err(AgentError::Other(format!(
+                "opencode state config dir {}: {e}",
+                config_dir.display()
+            )));
+        }
+        Ok(state)
+    }
+
+    /// Creates the private 0700 per-session directory under a validated `state_root`, shared by both
+    /// provisioning modes. Creates no credential file of any kind; the caller decides what (if
+    /// anything) is seeded into it.
+    fn provision_dir(
+        state_root: &str,
+        issue_identifier: &str,
+        workspace_root: &str,
+    ) -> Result<RunState, AgentError> {
         let root = if state_root.is_empty() {
             // Canonicalized up front, unlike the operator-configured case below: macOS's own
             // `/tmp`/`/var/folders` are themselves reached through a `/var` -> `/private/var`
@@ -128,30 +190,18 @@ impl RunState {
             .mode(0o700)
             .create(&dir)
             .map_err(|e| AgentError::Other(format!("opencode state dir {}: {e}", dir.display())))?;
-        let state = RunState { dir };
-
-        let dst_dir = state.dir.join("opencode");
-        let seed = || -> std::io::Result<()> {
-            std::fs::create_dir_all(&dst_dir)?;
-            std::fs::copy(&src, dst_dir.join("auth.json"))?;
-            Ok(())
-        };
-        if let Err(e) = seed() {
-            // The half-built directory is removed here rather than left for `Drop`, so the error
-            // path leaves nothing behind either.
-            state.cleanup();
-            return Err(AgentError::Other(format!(
-                "opencode_auth_missing: could not seed {} from {}: {e}",
-                dst_dir.display(),
-                src.display()
-            )));
-        }
-        Ok(state)
+        Ok(RunState { dir })
     }
 
     /// The value to set `XDG_DATA_HOME` to for this session's children.
     pub fn xdg_data_home(&self) -> &Path {
         &self.dir
+    }
+
+    /// The value to set `OPENCODE_CONFIG_DIR` to for a brokered session's children: a private 0700
+    /// directory inside the state root, created empty by [`RunState::provision_brokered`].
+    pub fn config_dir(&self) -> PathBuf {
+        self.dir.join(CONFIG_DIR_NAME)
     }
 
     /// Removes the state directory. Idempotent, best-effort, and never fails a run: by the time
@@ -366,7 +416,7 @@ mod tests {
         let auth = seeded_auth(tmp.path());
         let root = tmp.path().join("root");
 
-        let st = RunState::provision(&root.to_string_lossy(), &auth, "STUDIO-902", "")
+        let st = RunState::provision_legacy(&root.to_string_lossy(), &auth, "STUDIO-902", "")
             .expect("provision");
         let seeded = st.xdg_data_home().join("opencode").join("auth.json");
         assert!(seeded.is_file(), "auth.json seeded at {}", seeded.display());
@@ -390,7 +440,7 @@ mod tests {
         let root = tmp.path().join("root").to_string_lossy().into_owned();
 
         let states: Vec<RunState> = (0..16)
-            .map(|_| RunState::provision(&root, &auth, "STUDIO-902", "").expect("provision"))
+            .map(|_| RunState::provision_legacy(&root, &auth, "STUDIO-902", "").expect("provision"))
             .collect();
         let dirs: std::collections::BTreeSet<PathBuf> = states
             .iter()
@@ -417,7 +467,7 @@ mod tests {
         let root = tmp.path().join("root");
         let missing = tmp.path().join("nope").join("auth.json");
 
-        let err = RunState::provision(
+        let err = RunState::provision_legacy(
             &root.to_string_lossy(),
             &missing.to_string_lossy(),
             "STUDIO-902",
@@ -438,7 +488,7 @@ mod tests {
         let tmp = TempDir::new();
         let auth = tmp.path().join("auth.json");
         std::fs::write(&auth, b"").expect("write");
-        let err = RunState::provision(
+        let err = RunState::provision_legacy(
             &tmp.path().join("root").to_string_lossy(),
             &auth.to_string_lossy(),
             "X-1",
@@ -457,7 +507,7 @@ mod tests {
         let root = tmp.path().join("root").to_string_lossy().into_owned();
 
         let path = {
-            let st = RunState::provision(&root, &auth, "X-1", "").expect("provision");
+            let st = RunState::provision_legacy(&root, &auth, "X-1", "").expect("provision");
             let p = st.xdg_data_home().to_path_buf();
             assert!(p.is_dir());
             st.cleanup();
@@ -467,7 +517,7 @@ mod tests {
         };
         assert!(!path.exists());
 
-        let st = RunState::provision(&root, &auth, "X-2", "").expect("provision");
+        let st = RunState::provision_legacy(&root, &auth, "X-2", "").expect("provision");
         let p = st.xdg_data_home().to_path_buf();
         drop(st);
         assert!(!p.exists(), "Drop removed the directory of a cancelled run");
@@ -491,7 +541,7 @@ mod tests {
         let auth = seeded_auth(tmp.path());
         let root = tmp.path().join("root");
 
-        let st = RunState::provision(&root.to_string_lossy(), &auth, "STUDIO-980", "")
+        let st = RunState::provision_legacy(&root.to_string_lossy(), &auth, "STUDIO-980", "")
             .expect("provision");
         let mode = std::fs::metadata(st.xdg_data_home())
             .expect("stat outer dir")
@@ -515,7 +565,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("mkdir workspace root");
         let bad_state_root = workspace_root.join("opencode-state");
 
-        let err = RunState::provision(
+        let err = RunState::provision_legacy(
             &bad_state_root.to_string_lossy(),
             &auth,
             "STUDIO-980",
@@ -552,7 +602,7 @@ mod tests {
             .join("workspaces")
             .join("opencode-state");
 
-        let err = RunState::provision(
+        let err = RunState::provision_legacy(
             &bad_state_root.to_string_lossy(),
             &auth,
             "STUDIO-980",
@@ -591,8 +641,9 @@ mod tests {
             .join("repo")
             .join("opencode-state");
 
-        let err = RunState::provision(&bad_state_root.to_string_lossy(), &auth, "STUDIO-980", "")
-            .expect_err("a '..' traversal that lands inside a git repository must be refused");
+        let err =
+            RunState::provision_legacy(&bad_state_root.to_string_lossy(), &auth, "STUDIO-980", "")
+                .expect_err("a '..' traversal that lands inside a git repository must be refused");
         assert!(
             err.to_string().starts_with("opencode_state_unsafe:"),
             "{err}"
@@ -614,7 +665,7 @@ mod tests {
         let link = outside.join("state-link");
         std::os::unix::fs::symlink(&workspace_root, &link).expect("symlink");
 
-        let err = RunState::provision(
+        let err = RunState::provision_legacy(
             &link.to_string_lossy(),
             &auth,
             "STUDIO-980",
@@ -644,8 +695,9 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
         let bad_state_root = repo.join("opencode-state");
 
-        let err = RunState::provision(&bad_state_root.to_string_lossy(), &auth, "STUDIO-980", "")
-            .expect_err("a state root inside a git repository must be refused");
+        let err =
+            RunState::provision_legacy(&bad_state_root.to_string_lossy(), &auth, "STUDIO-980", "")
+                .expect_err("a state root inside a git repository must be refused");
         assert!(
             err.to_string().starts_with("opencode_state_unsafe:"),
             "{err}"
@@ -664,7 +716,7 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        let err = RunState::provision(&link.to_string_lossy(), &auth, "STUDIO-980", "")
+        let err = RunState::provision_legacy(&link.to_string_lossy(), &auth, "STUDIO-980", "")
             .expect_err("any symlink component in a configured state_root must be refused");
         assert!(
             err.to_string().starts_with("opencode_state_unsafe:"),
@@ -685,8 +737,8 @@ mod tests {
         let tmp = TempDir::new();
         let auth = seeded_auth(tmp.path());
 
-        let st =
-            RunState::provision("", &auth, "STUDIO-980", "").expect("the default root must work");
+        let st = RunState::provision_legacy("", &auth, "STUDIO-980", "")
+            .expect("the default root must work");
         assert!(
             st.xdg_data_home()
                 .join("opencode")
@@ -710,7 +762,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).expect("chmod");
 
-        let err = RunState::provision(&root.to_string_lossy(), &auth, "STUDIO-980", "")
+        let err = RunState::provision_legacy(&root.to_string_lossy(), &auth, "STUDIO-980", "")
             .expect_err("a self-owned, world-writable, non-sticky root must be refused");
         assert!(
             err.to_string().starts_with("opencode_state_unsafe:"),
@@ -755,5 +807,73 @@ mod tests {
             "a directory owned by a DIFFERENT non-root user is never safe, however tight its mode \
              reads right now — that owner can chmod it at any time"
         );
+    }
+
+    // ⚠️ Mutation target: make `Brokered` seed an auth.json (or fall back to the legacy path when
+    // the credential is absent) and this fails. A brokered state directory must contain NO reusable
+    // credential file at all (`provider-broker-design.md` §9.1) — the child receives only a per-turn
+    // capability in its environment.
+    #[test]
+    fn brokered_provision_creates_no_auth_json_and_a_private_config_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new();
+        let root = tmp.path().join("root");
+
+        let st = RunState::provision_brokered(&root.to_string_lossy(), "STUDIO-1001", "")
+            .expect("brokered provision");
+        let auth = st.xdg_data_home().join("opencode").join("auth.json");
+        assert!(
+            !auth.exists(),
+            "a brokered session must never create or copy auth.json: {}",
+            auth.display()
+        );
+        // And nothing else under the state root carries a credential file either.
+        assert!(
+            !st.xdg_data_home().join("opencode").exists(),
+            "brokered mode must create no opencode credential directory"
+        );
+
+        let cfg = st.config_dir();
+        assert!(
+            cfg.is_dir(),
+            "OPENCODE_CONFIG_DIR is created: {}",
+            cfg.display()
+        );
+        let mode = std::fs::metadata(&cfg)
+            .expect("stat config dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the config dir must be created 0700");
+
+        // The config dir is empty: brokered config is supplied inline, never as a project file.
+        assert_eq!(
+            std::fs::read_dir(&cfg).expect("read config dir").count(),
+            0,
+            "the brokered config dir must start empty"
+        );
+    }
+
+    // The brokered mode still enforces every containment/ownership rule the legacy mode does: the
+    // two modes differ ONLY in whether a credential file is seeded.
+    #[test]
+    fn brokered_provision_refuses_a_state_root_inside_the_workspace() {
+        let tmp = TempDir::new();
+        let workspace_root = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&workspace_root).expect("mkdir workspace root");
+        let bad = workspace_root.join("opencode-state");
+
+        let err = RunState::provision_brokered(
+            &bad.to_string_lossy(),
+            "STUDIO-1001",
+            &workspace_root.to_string_lossy(),
+        )
+        .expect_err("a brokered state root inside the workspace must be refused");
+        assert!(
+            err.to_string().starts_with("opencode_state_unsafe:"),
+            "{err}"
+        );
+        assert!(!bad.exists(), "a refused brokered provision writes nothing");
     }
 }

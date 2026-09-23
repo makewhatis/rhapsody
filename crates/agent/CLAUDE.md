@@ -20,7 +20,7 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/claude/mcpinject.rs` | `mcpinject.go` | per-workspace `.symphony-mcp.json` merge + "me" identity env |
 | `src/claude/parse.rs` | `parse.go` | one stream-json line → normalized `Event`/`TurnResult` |
 | `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above; also implements `harness::Harness` for `Runner` (STUDIO-900) — its declared `HarnessCapabilities` live next to the behavior they describe |
-| `src/opencode/*` | — | the SECOND backend (STUDIO-902); no Go counterpart. The same module split as `claude/` (`args`/`parse`/`mcpinject`/`runner`) plus `state` (the per-run `XDG_DATA_HOME`) and `probe` (the STUDIO-995 managed-version probe against the committed broker fixtures), built against the committed captures in `harness/harness-spike/opencode/`. Read its `mod.rs` first: it tabulates every spike finding against the module that implements it |
+| `src/opencode/*` | — | the SECOND backend (STUDIO-902); no Go counterpart. The same module split as `claude/` (`args`/`parse`/`mcpinject`/`runner`) plus `state` (the per-run `XDG_DATA_HOME`, now with explicit legacy/brokered modes), `probe` (the STUDIO-995 managed-version probe against the committed broker fixtures), and `brokered` (PB6/STUDIO-1001: the internal provider id, generated config/auth, managed env, pinned brokered argv, and the capability/broker-URL streaming redactor), built against the committed captures in `harness/harness-spike/opencode/`. Read its `mod.rs` first: it tabulates every spike finding against the module that implements it |
 | `tests/fake_claude_gate.rs` | — | P4 phase gate: runs the real Claude `Runner` against the committed `harness/stubs/fake-claude*` and diffs the humanized output against `harness/fixtures/runs/*.jsonl` |
 | `tests/opencode_broker_fixture.rs` | — | PB0 phase gate (STUDIO-995): pins the committed managed-OpenCode broker request fixtures under `harness/harness-spike/opencode/broker/requests/` — request counts, route/auth/model/`max_tokens`/SSE shape, the closed schema, and a secret/machine-path sanitization scan |
 
@@ -60,6 +60,15 @@ to understand the crate's actual behavior, not any single module in isolation:
   own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result
   observed with `guard_on` but no init ever seen is *also* refused (`billing_guard_failed: no system/init
   observed`) — a result can't be trusted to be guard-compliant without positive confirmation.
+- **Brokered OpenCode is a separate entry point (PB6, STUDIO-1001).** `opencode::start_brokered_session`
+  probes the pinned version, provisions a credential-FREE `RunState::provision_brokered` (no
+  `auth.json`), and mints a per-session `rhapsody-<22 base64url chars>` internal provider id. Its
+  turns run through `Session::run_turn_brokered`, which re-probes the command BEFORE the worker's
+  `BrokerTurnAttempt` is minted, generates the per-turn `OPENCODE_CONFIG_CONTENT`/`OPENCODE_AUTH_CONTENT`
+  (only the internal provider), strips inherited `OPENCODE_*`/`XDG_DATA_HOME` before appending the
+  managed allow-list, and redacts the capability plus broker base URL/authority from raw child chunks
+  before parse/tee/event/error. The `Session` trait's defaulted `run_turn_brokered` drops any attempt
+  and runs the ordinary turn, so every legacy backend is byte-identical.
 - **Env scrub is re-applied every turn**, including resumes: `TRACKER_ENV_VARS` (`LINEAR_API_KEY`,
   by name *and* by the configured credential's value) are always stripped; `BILLING_ENV_VARS`
   (`ANTHROPIC_*`, `CLAUDE_CODE_USE_*`) are stripped only when the guard is on. `append_me_env` runs

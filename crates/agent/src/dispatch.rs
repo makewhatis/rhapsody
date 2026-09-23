@@ -557,6 +557,22 @@ impl Session for BrokeredSession {
             .await
     }
 
+    /// A brokered dispatch forwards the per-turn attempt to the inner adapter, which (for OpenCode)
+    /// re-probes its command and mints the capability itself. The wrapper owns only the session
+    /// custody; it does not mint or inspect the capability.
+    async fn run_turn_brokered(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        messages: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(crate::Event) + Send + Sync),
+        broker: Option<rhapsody_provider_broker::BrokerTurnAttempt>,
+    ) -> (crate::TurnResult, Option<AgentError>) {
+        self.inner
+            .run_turn_brokered(prompt, attempt, messages, on_event, broker)
+            .await
+    }
+
     async fn stop(&self) -> Result<(), AgentError> {
         self.inner.stop().await
     }
