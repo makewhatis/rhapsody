@@ -144,10 +144,11 @@ pub struct ReviewIntroRequest {
     pub link: Option<crate::prlink::PrLinkTarget>,
     /// Introduce this pull request ONLY if the watch set holds no row for it at all (STUDIO-838).
     ///
-    /// `false` — every handoff and every console introduction — is the RE-ARMING introduction the
+    /// `false` — every handoff and every console introduction — is the ARMING introduction the
     /// subsystem was built on: a second handoff of the same ticket puts its row back to `requested`
-    /// while preserving both recorded heads, which is how a re-run gets re-reviewed. `true` is the
-    /// ADOPTION sweep's, and it is what makes a repair a repair: it may create the row that is
+    /// while preserving both recorded heads, which is how a re-run gets re-reviewed — except for a
+    /// row that has already approved the current head, which is left alone (STUDIO-1006). `true` is
+    /// the ADOPTION sweep's, and it is what makes a repair a repair: it may create the row that is
     /// missing and may never disturb one that is not.
     pub only_if_unwatched: bool,
 }
@@ -188,7 +189,8 @@ pub struct IntroducedPr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewIntroOutcome {
     /// `n` (PR, reviewer) rows entered or re-armed the watch set. `0` means every candidate row was
-    /// skipped because a review of it is already in flight.
+    /// skipped — a review of it is already in flight, or it has already approved the current head
+    /// (STUDIO-1006) — so the watch set already says what needs saying.
     Introduced(usize),
     /// Teams is off or the mode is not `ticketless`, so the subsystem is dormant (§16). Nothing was
     /// read and nothing was written.
@@ -336,11 +338,12 @@ pub async fn run_review_intro_task(
             .await;
         match outcome {
             // `Introduced(0)` is not a failure and not an introduction: every candidate row had a
-            // review already in flight, so the watch set already says what needs saying.
+            // review already in flight or already carried an approval at the current head, so the
+            // watch set already says what needs saying.
             ReviewIntroOutcome::Introduced(0) => tracing::debug!(
                 pr = %pr,
-                "ticketless review: every reviewer of this pull request is already mid-review; its \
-                 watch rows were left as they are"
+                "ticketless review: every reviewer of this pull request is already mid-review or \
+                 has already approved the current head; its watch rows were left as they are"
             ),
             ReviewIntroOutcome::Introduced(n) => tracing::info!(
                 pr = %pr, rows = n, origin = %req.introduced_by,
@@ -507,9 +510,11 @@ impl Orchestrator {
             author: re.identity.clone(),
             introduced_by: format!("{REVIEW_ORIGIN_HANDOFF}:{}", re.issue.identifier),
             link,
-            // A handoff RE-ARMS (STUDIO-838): a second handoff of the same ticket must put its row
-            // back to `requested`, which is how a re-run gets re-reviewed. Only the adoption sweep
-            // refuses to touch a row that already exists.
+            // A handoff ARMS the rows that still need a review (STUDIO-838): a second handoff of the
+            // same ticket puts a row back to `requested`, which is how a re-run gets re-reviewed —
+            // except for a row that has already approved the current head, which
+            // `handle_review_introduce` leaves alone (STUDIO-1006). Only the adoption sweep refuses
+            // to touch a row that already exists.
             only_if_unwatched: false,
         })
     }
@@ -527,6 +532,14 @@ impl Orchestrator {
     /// slice 5). The allowlist check in particular is duplicated from
     /// [`plan_review_intro`](Orchestrator::plan_review_intro) on purpose: a guard that lives only
     /// at the far end of a channel is a guard the next sender can forget.
+    ///
+    /// **It is a no-op for a row that has already approved the change at the current head**
+    /// (STUDIO-1006, the F9 defect). A handoff puts a pull request back into the watch set, and
+    /// today's unconditional re-arm reset every reviewer's row to `requested` — so three reviewers
+    /// who had approved an UNCHANGED head were sent back over code nobody had touched, and
+    /// `auto_merge_verdict` refused `RoundInFlight` until an operator cleared the pull request by
+    /// hand. A row still OWING a round, or one that has never approved this head, is armed exactly
+    /// as before; only a settled approval at the current change is left alone.
     pub(crate) fn handle_review_introduce(&mut self, pr: &IntroducedPr) -> ReviewIntroOutcome {
         if !self.review_ticketless_enabled() {
             return ReviewIntroOutcome::Dormant;
@@ -552,8 +565,19 @@ impl Orchestrator {
         if pr.only_if_unwatched && self.review_pr_is_watched(&pr.pr) {
             return ReviewIntroOutcome::AlreadyWatched;
         }
+        // The daemon's last observation of this pull request's head (STUDIO-1005's memo, written on
+        // the control task by the review sweep). It is what tells an approval of the CURRENT head
+        // from one the author has since pushed past; `None` means the watcher has not observed this
+        // coordinate yet, and the loop below then treats a recorded approval as still current.
+        let observed_head = self.review_observed_head.get(&pr.pr).map(String::as_str);
         let mut written = 0usize;
         for reviewer in pr.reviewers.iter().filter(|r| !r.trim().is_empty()) {
+            let key = ReviewWatchKey {
+                owner: pr.pr.owner.clone(),
+                repo: pr.pr.repo.clone(),
+                number: pr.pr.number,
+                reviewer: reviewer.clone(),
+            };
             let id = review_key(&pr.pr.owner, &pr.pr.repo, pr.pr.number, reviewer);
             // A review of this exact (PR, reviewer) is live. Re-arming its row to `requested` would
             // overwrite the `in_flight` marker the F-DUP edge-trigger reads, so the watcher would
@@ -567,14 +591,54 @@ impl Orchestrator {
                 );
                 continue;
             }
+            // STUDIO-1006 (the F9 defect): a re-introduction must NOT reset a row whose last
+            // COMPLETED review already approved the change at the current head. The write below
+            // would put such a row back to `requested`, the watcher would dispatch a second review
+            // of code nobody has changed, and `auto_merge_verdict` would refuse `RoundInFlight`
+            // until an operator cleared the pull request by hand. Leave the settled row exactly as
+            // it is and arm only the rows that have not approved this head.
+            //
+            // The verdict is read off the STORED row — the recorded completed review (its
+            // `status` and the `last_reviewed_sha` it was recorded against) — and never off the
+            // `requested` status this call is about to write, which is exactly the value the bug
+            // overwrote the verdict with. `last_reviewed_sha` is non-empty only after a review
+            // actually completed (F-SHA), so an `approved` row with no recorded SHA is not a
+            // verdict and is still armed.
+            //
+            // The comparison is exact-SHA and needs no second patch-id implementation: STUDIO-977's
+            // carry-over already advances `last_reviewed_sha` to the new head on a patch-preserving
+            // move and keeps the terminal status, so an approval that survives a base-branch merge
+            // arrives here with `last_reviewed_sha == observed_head` and is left alone. A move that
+            // CHANGED the patch re-arms the row through `handle_review_head_advanced` first, so by
+            // the time a re-introduction reads it the status is no longer `approved`.
+            let stored = match self.store().get_review_watch(&key) {
+                Ok(row) => row,
+                Err(e) => {
+                    // Fail CLOSED: a row that cannot be read might carry a live approval, and
+                    // arming it is the one direction that discards a review that already happened.
+                    tracing::warn!(
+                        review = %id, err = %e,
+                        "ticketless review: a watch row could not be read, so it is left as it is"
+                    );
+                    continue;
+                }
+            };
+            let approved_at_current_head = stored.as_ref().is_some_and(|row| {
+                row.status == REVIEW_STATUS_APPROVED
+                    && !row.last_reviewed_sha.is_empty()
+                    && observed_head.is_none_or(|head| head == row.last_reviewed_sha)
+            });
+            if approved_at_current_head {
+                tracing::debug!(
+                    review = %id,
+                    "ticketless review: this reviewer already approved the current head; the \
+                     re-introduction leaves its watch row as it is"
+                );
+                continue;
+            }
             let row = ReviewWatchRow {
                 author: pr.author.clone(),
-                key: ReviewWatchKey {
-                    owner: pr.pr.owner.clone(),
-                    repo: pr.pr.repo.clone(),
-                    number: pr.pr.number,
-                    reviewer: reviewer.clone(),
-                },
+                key,
                 introduced_by: pr.introduced_by.clone(),
                 // Both empty, and only meaningful on a row this call CREATES: `save_review_watch`
                 // preserves an existing row's two SHAs, so re-introducing a pull request cannot
@@ -1314,6 +1378,213 @@ mod tests {
             .expect("row");
         assert_eq!(row.status, REVIEW_STATUS_IN_FLIGHT);
         assert_eq!(row.requested_sha, HEAD_A);
+    }
+
+    // ── STUDIO-1006 (F9): a re-introduction does not reset an approval at the current head ───────
+
+    /// Record a COMPLETED approval for `reviewer`'s row of PR 12 at `sha` — the recorded verdict the
+    /// re-introduction reads, stamped exactly as `mark_review_completed` stamps a real one.
+    fn approve_row(o: &Orchestrator, reviewer: &str, sha: &str) {
+        o.store()
+            .mark_review_requested(&watch_key(reviewer), sha)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&watch_key(reviewer), sha, REVIEW_STATUS_APPROVED)
+            .expect("completed");
+    }
+
+    /// **The incident replay (`makewhatis/rhapsody#216`, F9).** Three reviewers approved the
+    /// CURRENT, unchanged head; two handoff re-introductions followed at that same head. Before
+    /// this fix each re-introduction reset every row to `requested`, so the auto-merge gate refused
+    /// `RoundInFlight` on every poll and the pull request deadlocked behind an operator
+    /// `POST /api/v1/reviews/clear`. After it, all three stay approved and the gate clears with no
+    /// operator action.
+    ///
+    /// MUTATION: restore the unconditional re-arm in `handle_review_introduce` and this reds twice —
+    /// the rows come back `requested`, and `auto_merge_verdict_with_proof` refuses.
+    #[test]
+    fn a_re_introduction_leaves_rows_approved_at_the_current_head_alone() {
+        let mut o = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob", "carol"],
+        ));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["alice", "bob", "carol"]);
+        o.handle_review_introduce(&pr);
+        for reviewer in ["alice", "bob", "carol"] {
+            approve_row(&o, reviewer, HEAD_A);
+        }
+        // The watcher has observed the head these approvals were recorded at.
+        o.review_observed_head
+            .insert(pr.pr.clone(), HEAD_A.to_string());
+
+        // Both re-introductions at this unchanged head write nothing.
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(0)
+        );
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(0)
+        );
+
+        let rows = o.store().load_live_review_watch().expect("read");
+        assert_eq!(rows.len(), 3, "no row was added or removed");
+        for row in &rows {
+            assert_eq!(
+                row.status, REVIEW_STATUS_APPROVED,
+                "{} was reset by a re-introduction at the head it approved",
+                row.key.reviewer
+            );
+        }
+        let mine: Vec<&ReviewWatchRow> = rows.iter().collect();
+        assert_eq!(
+            crate::automerge::auto_merge_verdict_with_proof(&mine, HEAD_A, &[HEAD_A]),
+            Ok(vec![
+                "alice".to_string(),
+                "bob".to_string(),
+                "carol".to_string()
+            ]),
+            "auto-merge proceeds with no operator action"
+        );
+    }
+
+    /// A handoff after a REAL push still arms every row that has NOT approved the new head. The
+    /// approvals are at `HEAD_A`; the daemon has since observed `HEAD_B`, so the approval is about a
+    /// change nobody read and the row is armed exactly as it always was.
+    ///
+    /// MUTATION: skip every non-approved row, or decide the skip from the approval's status alone
+    /// (ignoring the head it was recorded against), and this reds — the rows come back unarmed while
+    /// a review is genuinely owed.
+    #[test]
+    fn a_re_introduction_after_a_real_head_move_still_arms_every_row() {
+        let mut o = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob", "carol"],
+        ));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["alice", "bob", "carol"]);
+        o.handle_review_introduce(&pr);
+        for reviewer in ["alice", "bob", "carol"] {
+            approve_row(&o, reviewer, HEAD_A);
+        }
+        o.review_observed_head
+            .insert(pr.pr.clone(), HEAD_B.to_string());
+
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(3),
+            "an approval of a head the author has pushed past is not an approval of the new head"
+        );
+        for row in o.store().load_live_review_watch().expect("read") {
+            assert_eq!(
+                row.status, REVIEW_STATUS_REQUESTED,
+                "{} must be armed for the new head",
+                row.key.reviewer
+            );
+        }
+    }
+
+    /// Only an APPROVAL at the current head is left alone. A `reviewed` row (findings) has not
+    /// approved the head and is armed exactly as before, so the fix cannot quietly swallow a round
+    /// a reviewer asked for. This is the ticket's "a row that hasn't approved it must still be
+    /// armed".
+    ///
+    /// MUTATION: widen the skip to any terminal row and this reds.
+    #[test]
+    fn a_reviewed_row_at_the_current_head_is_still_armed() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        o.store()
+            .mark_review_requested(&watch_key("bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+        o.review_observed_head
+            .insert(pr.pr.clone(), HEAD_A.to_string());
+
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(1),
+            "findings are not an approval"
+        );
+        let row = o
+            .store()
+            .get_review_watch(&watch_key("bob"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, REVIEW_STATUS_REQUESTED);
+    }
+
+    /// The observed-head memo is in-memory (STUDIO-1005), so a restart leaves it empty while the
+    /// approvals persist. With no observation to contradict a recorded approval the re-introduction
+    /// leaves it alone — the failure direction that never discards a review that already happened.
+    /// A later sweep that sees a moved head arms the row through the head-advance path regardless,
+    /// so no review of a real push is lost.
+    #[test]
+    fn an_approval_with_no_observed_head_is_still_left_alone() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        approve_row(&o, "bob", HEAD_A);
+        assert!(
+            !o.review_observed_head.contains_key(&pr.pr),
+            "the fixture must model a daemon that has not observed this coordinate"
+        );
+
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(0)
+        );
+        let row = o
+            .store()
+            .get_review_watch(&watch_key("bob"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, REVIEW_STATUS_APPROVED, "the approval survived");
+    }
+
+    /// §16 on the new path, and the ticket's "passes on old and new code" guard: with Teams off — or
+    /// on any mode but `ticketless` — the handler is dormant BEFORE it reads or writes anything, so
+    /// a re-introduction that would have reset an approved row on a ticketless install cannot touch
+    /// it here. Nothing about a non-ticketless or Teams-off installation changed.
+    #[test]
+    fn a_dormant_daemon_never_resets_an_approved_row() {
+        for (enabled, mode) in [
+            (false, ReviewMode::Ticketless),
+            (true, ReviewMode::Off),
+            (true, ReviewMode::Tickets),
+        ] {
+            let mut o = orch(teams_with(enabled, mode, &["alice", "bob"]));
+            o.store()
+                .save_review_watch(ReviewWatchRow {
+                    key: watch_key("bob"),
+                    author: "alice".to_string(),
+                    introduced_by: "handoff:STUDIO-720".to_string(),
+                    requested_sha: HEAD_A.to_string(),
+                    last_reviewed_sha: HEAD_A.to_string(),
+                    status: REVIEW_STATUS_APPROVED.to_string(),
+                    open: true,
+                })
+                .expect("seed an approved row");
+
+            assert_eq!(
+                o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"])),
+                ReviewIntroOutcome::Dormant,
+                "enabled={enabled} mode={mode:?}"
+            );
+            let row = o
+                .store()
+                .get_review_watch(&watch_key("bob"))
+                .expect("read")
+                .expect("row");
+            assert_eq!(
+                row.status, REVIEW_STATUS_APPROVED,
+                "enabled={enabled} mode={mode:?}"
+            );
+        }
     }
 
     // ── adoption: introducing a pull request nothing is watching (STUDIO-838) ────────────────────
