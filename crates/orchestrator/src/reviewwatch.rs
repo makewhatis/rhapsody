@@ -203,6 +203,14 @@ use crate::teams::LoadSnapshot;
 /// rebuilt pull request never inherits a spent budget.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
+/// Whether `manager.review_authority` is `act` (STUDIO-1011; design record §9).
+///
+/// **Always `false` until M6 adds the key**, so no manager approval can ever become `effective`
+/// yet — the design's explicit "treat it as always `off`". It is a named input rather than a
+/// hard-coded `false` inside the recheck so M6 changes exactly one place, and because the pure
+/// rules ([`crate::managerapproval`]) already take it as a parameter and are tested both ways.
+pub(crate) const MANAGER_REVIEW_AUTHORITY_ACT: bool = false;
+
 /// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
 /// that as ordinary back-pressure and calls it stalled (STUDIO-891).
 ///
@@ -1702,7 +1710,10 @@ impl Orchestrator {
     /// [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit, so the configured threshold and the hard cap are the
     /// same number of rounds. Under the threshold both sides charge this counter; unset, only
     /// reviews do.
-    fn rounds_used(&self, pr: &PrCoord) -> usize {
+    ///
+    /// `pub(crate)` for [`crate::managerexchange`]'s §7.8 gate, which reads the same answered-
+    /// exchange count to classify "after the threshold".
+    pub(crate) fn rounds_used(&self, pr: &PrCoord) -> usize {
         self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) / self.reviewers_per_round()
     }
 
@@ -1767,6 +1778,10 @@ impl Orchestrator {
                  further pushes will not be reviewed"
             );
         }
+        // STUDIO-1012 (§7.8): consuming the manager exchange authorization at the SAME acceptance
+        // point that charges the budget. A round refused earlier — by a budget, a model refusal or a
+        // drain — never reaches here, so it never burns an authorization it did not use.
+        self.consume_review_round_authorization(pr, &commit.head, &commit.head_patch_id);
     }
 
     /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
@@ -1777,6 +1792,11 @@ impl Orchestrator {
         if let Err(e) = self.store().clear_review_bound(&churn_key(pr)) {
             tracing::warn!(pr = %pr, err = %e, "ticketless review: the durable round bound could not be cleared");
         }
+        // STUDIO-1012 (§7.8): a pull request that leaves the watch set — merged, closed or
+        // dismissed — invalidates every live exchange authorization with it. This is the one
+        // invalidation trigger with no later arming attempt left to observe it: the generation and
+        // hold triggers are handled lazily at the arm.
+        self.invalidate_manager_exchanges(pr);
     }
 
     /// Rebuilds the per-pull-request review bounds from the store at boot — the round counters into
@@ -3219,6 +3239,18 @@ impl Orchestrator {
             let origin = crate::reviewdone::origin_ticket(&row.introduced_by)
                 .map(|t| t.to_ascii_lowercase());
             if origin.as_deref().is_some_and(|t| held.contains(t)) {
+                if self.review_exchange_gate_active(pr) {
+                    self.invalidate_manager_exchanges(pr);
+                }
+                // STUDIO-1012 (§7.4, §7.8): a hold invalidates the pull request's live manager
+                // exchange authorizations, so one granted BEFORE the hold arms nothing once the
+                // hold lifts. This branch is the LIVE path that observes a held pull request —
+                // the arm gate below is never reached for a held row — so the invalidation has to
+                // happen here, not only inside `review_round_arm_authorized`.
+                //
+                // MUTATION: delete this invalidation and
+                // `an_act_hold_invalidates_a_live_authorization` reds on its second assert (the
+                // pre-hold authorization arms once the hold lifts).
                 tracing::debug!(
                     pr = %pr, reviewer = %row.key.reviewer, origin = %row.introduced_by,
                     "ticketless review: the origin ticket is held for a human; the round waits"
@@ -3323,6 +3355,20 @@ impl Orchestrator {
             // further down is a different problem with its own log line, and leaving the count
             // standing would let this row keep claiming a stall it no longer has.
             self.clear_unassignable(pr, &id, &row.key.reviewer);
+            // STUDIO-1012 (§7.8): after the round threshold, in `act` mode, a round arms only under
+            // an active manager exchange authorization. Off/advise and everything before the
+            // threshold short-circuit inside the gate, so those paths are byte-identical. Placed
+            // immediately before the dispatch — after every other deferral — so a row some earlier
+            // gate parks never even reaches the check, and the authorization is consumed later, at
+            // ACCEPTANCE (`commit_review_watch`), not here.
+            //
+            // MUTATION: delete this gate and
+            // `an_act_round_past_the_threshold_arms_only_under_an_authorization` reds on its first
+            // assert (a round is dispatched with no authorization).
+            if !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin) {
+                report.deferred += 1;
+                continue;
+            }
             let reassigned = chosen != row.key.reviewer;
             let picked = chosen.clone();
             let run = ReviewRun {
@@ -3360,6 +3406,8 @@ impl Orchestrator {
             let commit = crate::review::ReviewWatchCommit {
                 incumbent: row.key.clone(),
                 reassigned,
+                head: head.to_string(),
+                head_patch_id: head_patch_id.to_string(),
             };
             match self.dispatch_review_watch(run, commit) {
                 ReviewDispatchOutcome::Dispatched => {
@@ -3596,11 +3644,92 @@ impl Orchestrator {
             author: mine[0].author.clone(),
             head_sha: head.to_string(),
             approved: false,
+            // The conflict route-back is a separate trigger from the findings completion, and
+            // STUDIO-1012 scopes its suppression to the findings verdict alone; this stays a
+            // summoning comment.
+            suppress_summons: false,
             summon_token: self.review_summon_token(),
             changes: Some(plan),
         };
         report.routed += 1;
         self.request_review_notify(Some(completion));
+    }
+
+    /// The §8.3 pre-merge recheck (STUDIO-1011): may a merge that relied on manager approval
+    /// `intervention_id` still be requested, given the plan was made at `(generation,
+    /// evidence_rev)`?
+    ///
+    /// Loop-confined because every input but the stored record is loop-owned state: the pull
+    /// request's CURRENT generation and evidence revision (read back from the durable bound), the
+    /// current-label hold set, and the configured authority. It is a READ — nothing is decided or
+    /// written here — and it fails CLOSED on every uncertainty, because the answer gates an
+    /// irreversible `gh pr merge` on the other side of the seam.
+    ///
+    /// **Nothing is ever effective yet.** [`MANAGER_REVIEW_AUTHORITY_ACT`] is `false` until M6 adds
+    /// `manager.review_authority`, so this always answers `false` today — the design's "treat it as
+    /// always `off`". The machinery is complete so M6 need only make the authority input truthful.
+    pub(crate) fn handle_manager_approval_recheck(
+        &self,
+        intervention_id: &str,
+        generation: i64,
+        evidence_rev: i64,
+    ) -> bool {
+        let approval = match self.store().manager_approval(intervention_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return false, // no record: never assume an approval
+            Err(e) => {
+                tracing::warn!(
+                    intervention_id, err = %e,
+                    "manager approval recheck: the approval record could not be read; not merging"
+                );
+                return false;
+            }
+        };
+        let bound = match self.store().review_bound(&approval.pr) {
+            Ok(Some(bound)) => bound,
+            // No bound row means the pull request's generation and revision are unknown, so neither
+            // half of the plan's binding can be confirmed. Fail closed.
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    pr = %approval.pr, err = %e,
+                    "manager approval recheck: the review bound could not be read; not merging"
+                );
+                return false;
+            }
+        };
+        // Fail closed while the label set has not been read (the same rule every other hold gate
+        // follows), otherwise refuse if any of this pull request's origin tickets wears the hold.
+        let (held, primed) = self.human_holds.labelled_and_primed();
+        let hold_applied = !primed || self.manager_approval_pr_is_held(&approval.pr, &held);
+        crate::managerapproval::approval_still_effective(&crate::managerapproval::RecheckInputs {
+            state: &approval.state,
+            plan_generation: generation,
+            current_generation: bound.generation,
+            plan_evidence_rev: evidence_rev,
+            current_evidence_rev: bound.evidence_rev,
+            hold_applied,
+            authority_act: MANAGER_REVIEW_AUTHORITY_ACT,
+        })
+    }
+
+    /// Whether any live watch row of `pr` names a ticket wearing the `rhapsody:human` hold. Reads
+    /// every live row (a pull request has a handful) rather than the single-PR accessor, because the
+    /// hold is per-TICKET and the ticket is derived from the row's origin. A store failure answers
+    /// `true` — the recheck's caller fails closed on a hold, so an unreadable watch set is one.
+    fn manager_approval_pr_is_held(&self, pr: &str, held: &HashSet<String>) -> bool {
+        let rows = match self.store().load_live_review_watch() {
+            Ok(rows) => rows,
+            Err(_) => return true,
+        };
+        rows.iter()
+            .filter(|row| {
+                churn_key(&PrCoord::new(&row.key.owner, &row.key.repo, row.key.number)) == pr
+            })
+            .any(|row| {
+                crate::reviewdone::origin_ticket(&row.introduced_by)
+                    .is_some_and(|ticket| held.contains(&ticket.to_ascii_lowercase()))
+            })
     }
 
     /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
@@ -3673,6 +3802,13 @@ impl Orchestrator {
                     pr: pr.clone(),
                     head: head.to_string(),
                     approved_by,
+                    // No manager approval yet (STUDIO-1011). The record and the verdict's input
+                    // exist, but nothing can be EFFECTIVE until M6 adds `manager.review_authority`
+                    // (the design says to treat it as always `off`), so the activation transaction
+                    // that would carry an approval into a plan has no writer. This is the natural
+                    // seam for M5/M6 to fill: read the pull request's effective approval here and
+                    // pass its `ApprovalScope` to `auto_merge_verdict_with_proof_and_approval`.
+                    manager_approval: None,
                 });
             }
             // At DEBUG, not INFO: on a pull request awaiting review this is the answer on every
@@ -4712,6 +4848,21 @@ mod tests {
         fn review_bound(&self, pr: &str) -> Result<Option<rs::ReviewBoundRow>, rs::StoreError> {
             self.0.review_bound(pr)
         }
+        fn save_manager_exchange(
+            &self,
+            exchange: rs::ManagerExchange,
+        ) -> Result<(), rs::StoreError> {
+            self.0.save_manager_exchange(exchange)
+        }
+        fn manager_exchanges(&self, pr: &str) -> Result<Vec<rs::ManagerExchange>, rs::StoreError> {
+            self.0.manager_exchanges(pr)
+        }
+        fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), rs::StoreError> {
+            self.0.set_manager_exchange_state(id, state)
+        }
+        fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.invalidate_manager_exchanges(pr)
+        }
         fn record_review_completion(
             &self,
             key: &rs::ReviewWatchKey,
@@ -4759,6 +4910,25 @@ mod tests {
         ) -> Result<(), rs::StoreError> {
             self.0
                 .resolve_review_findings(pr, generation, reviewer, resolved_by)
+        }
+        fn save_manager_approval(&self, row: rs::ManagerApprovalRow) -> Result<(), rs::StoreError> {
+            self.0.save_manager_approval(row)
+        }
+        fn set_manager_approval_state(
+            &self,
+            intervention_id: &str,
+            state: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_approval_state(intervention_id, state)
+        }
+        fn manager_approval(
+            &self,
+            intervention_id: &str,
+        ) -> Result<Option<rs::ManagerApprovalRow>, rs::StoreError> {
+            self.0.manager_approval(intervention_id)
+        }
+        fn load_manager_approvals(&self) -> Result<Vec<rs::ManagerApprovalRow>, rs::StoreError> {
+            self.0.load_manager_approvals()
         }
         fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
             self.0.prune(retention_days)
@@ -4902,6 +5072,17 @@ mod tests {
             .get_review_watch(&key(number, reviewer))
             .expect("read watch row")
             .expect("row exists")
+    }
+
+    /// The state of one manager exchange authorization on pull request 12.
+    fn manager_exchange_state(o: &Orchestrator, id: &str) -> String {
+        o.store()
+            .manager_exchanges(&churn_key(&coord(12)))
+            .expect("exchanges")
+            .into_iter()
+            .find(|e| e.id == id)
+            .map(|e| e.state)
+            .expect("exchange row")
     }
 
     /// The reviewer each dispatched run was given, in dispatch order.
@@ -5527,6 +5708,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "an approved patch must merge after a merge from main, with no further round"
         );
@@ -6635,6 +6817,7 @@ mod tests {
                 pr: coord(64),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }]
         );
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
@@ -6715,6 +6898,7 @@ mod tests {
                 pr: coord(70),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["alice".to_string()],
+                manager_approval: None,
             }],
             "the surviving approval now clears auto-merge — the stall this ticket closes"
         );
@@ -9389,6 +9573,154 @@ mod tests {
         l
     }
 
+    /// STUDIO-1012 (§7.8 path 1): in `act` mode past the round threshold the WATCHER arms a round
+    /// only by consuming an active manager exchange authorization. This drives the real sweep — the
+    /// mutation it pins is deleting the gate from the dispatch loop, which no unit test of the gate
+    /// alone would catch.
+    ///
+    /// MUTATION: delete the `review_round_arm_authorized` call from `handle_review_sweep_slots` and
+    /// this reds on the first assert (a round is dispatched with no authorization).
+    #[test]
+    fn an_act_round_past_the_threshold_arms_only_under_an_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        // STUDIO-1004's answered-exchange count: one round reaches a threshold of one.
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+
+        let unauthorised = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            unauthorised.dispatched, 0,
+            "no authorization: the watcher must not arm a round"
+        );
+
+        // Grant a `review_round` authorization for this head and generation.
+        o.store()
+            .ensure_review_generation(&churn_key(&coord(12)))
+            .expect("generation");
+        o.store()
+            .save_manager_exchange(rs::ManagerExchange {
+                id: "e1".to_string(),
+                intervention_id: "iv-1".to_string(),
+                pr: churn_key(&coord(12)),
+                generation: 1,
+                kind: rs::MANAGER_EXCHANGE_REVIEW_ROUND.to_string(),
+                authorized_head: HEAD_A.to_string(),
+                authorized_patch_id: String::new(),
+                state: rs::MANAGER_EXCHANGE_ACTIVE.to_string(),
+            })
+            .expect("authorize");
+
+        let authorised = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            authorised.dispatched, 1,
+            "an active authorization arms the round"
+        );
+    }
+
+    /// **Acceptance 3, the hold trigger — pinned through the REAL sweep, not the gate alone.**
+    /// §7.4: an active authorization granted before a `rhapsody:human` hold is INVALIDATED, so once
+    /// the hold lifts it arms nothing. The watcher's arm gate is never reached for a held row — the
+    /// hold branch above it defers first — so a test that calls the gate directly with `held = true`
+    /// (as the `managerexchange` unit test does) never exercises the live path this acceptance
+    /// names. This drives the sweep twice: held, then lifted.
+    ///
+    /// MUTATION: delete the `invalidate_manager_exchanges` call from `handle_review_sweep_slots`'s
+    /// hold branch and this reds on the invalidated-state assert (the row stays `active`) and again
+    /// on the post-lift dispatch (the pre-hold authorization arms the round).
+    #[test]
+    fn an_act_hold_invalidates_a_live_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
+        // STUDIO-1004's answered-exchange count: one round reaches a threshold of one.
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+        // An active `review_round` authorization, granted before the hold.
+        o.store()
+            .ensure_review_generation(&churn_key(&coord(12)))
+            .expect("generation");
+        o.store()
+            .save_manager_exchange(rs::ManagerExchange {
+                id: "pre-hold".to_string(),
+                intervention_id: "iv-1".to_string(),
+                pr: churn_key(&coord(12)),
+                generation: 1,
+                kind: rs::MANAGER_EXCHANGE_REVIEW_ROUND.to_string(),
+                authorized_head: HEAD_A.to_string(),
+                authorized_patch_id: String::new(),
+                state: rs::MANAGER_EXCHANGE_ACTIVE.to_string(),
+            })
+            .expect("authorize");
+
+        // The hold lands: the round does not arm, and the authorization is invalidated.
+        o.human_holds.note_human_label("STUDIO-721");
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            0,
+            "a held ticket's round must not arm"
+        );
+        assert_eq!(
+            manager_exchange_state(&o, "pre-hold"),
+            rs::MANAGER_EXCHANGE_INVALIDATED,
+            "a hold invalidates the pre-hold authorization"
+        );
+
+        // The hold lifts — the next selection pass clears the current hold set — and the
+        // invalidated authorization arms nothing, so the round stays deferred.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            0,
+            "an invalidated authorization must not arm once the hold lifts"
+        );
+    }
+
+    /// **Acceptance 5.** An exchange already in flight when the threshold is crossed completes
+    /// normally — it is a live run, not an arm, so the §7.8 gate is never consulted for it and no
+    /// authorization is required. The sweep must not re-arm it (that would be a second round) and
+    /// must not block it either.
+    #[test]
+    fn an_exchange_in_flight_at_the_crossing_completes_without_an_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        let mut r = row(12, "bob");
+        r.status = REVIEW_STATUS_IN_FLIGHT.to_string();
+        r.requested_sha = HEAD_A.to_string();
+        let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+        introduce(&o, r);
+        o.running.insert(
+            id,
+            RunningEntry::empty(rhapsody_core::Issue {
+                id: "iss-review".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                ..Default::default()
+            }),
+        );
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "a round already in flight must not be re-armed"
+        );
+        let row = o
+            .store()
+            .get_review_watch(&key(12, "bob"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.status, REVIEW_STATUS_IN_FLIGHT,
+            "the in-flight round is left to complete on its own run's exit"
+        );
+    }
+
     /// **Acceptance, and the round-8 blocker.** *"The threshold and the recorded decision survive a
     /// daemon restart — assert it by writing rounds, dropping and rebuilding the Orchestrator from
     /// the same store, and reading the count back."*
@@ -9726,6 +10058,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_A.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "a shipped pull request whose rows are all approved still reaches the merge gate"
         );
@@ -9766,6 +10099,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the ship's approval-at-head holds for the patch it was made against"
         );
@@ -10230,6 +10564,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the escalation's head moved and the new head is approved: auto-merge proceeds"
         );
@@ -10470,6 +10805,7 @@ mod tests {
                 pr: coord(12),
                 head: HEAD_B.to_string(),
                 approved_by: vec!["bob".to_string()],
+                manager_approval: None,
             }],
             "the carried approval merges at the new head without a manager turn"
         );
@@ -14117,5 +14453,49 @@ mod tests {
             watch_row(&guard, 13, "bob").requested_sha.is_empty(),
             "a head the budget can no longer afford must stay un-dispatched, re-considered next tick"
         );
+    }
+
+    // --- manager approval recheck (STUDIO-1011) -------------------------------------------------
+
+    /// The control-task recheck fails CLOSED on every uncertainty, and — until M6 makes
+    /// `manager.review_authority` a real config key — on the authority too: `off` means an approval
+    /// can never be effective, so even a nominally `effective` record with a matching generation and
+    /// evidence revision answers "do not merge".
+    #[tokio::test]
+    async fn the_manager_approval_recheck_fails_closed() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+        store
+            .save_manager_approval(rhapsody_store::ManagerApprovalRow {
+                intervention_id: "iv-1".into(),
+                pr: "o/r#1".into(),
+                generation: 1,
+                head: "sha".into(),
+                patch_id: "pid".into(),
+                evidence_rev: 7,
+                covered_reviewers: vec!["bob".into()],
+                membership_hash: "hash".into(),
+                state: rhapsody_store::MANAGER_APPROVAL_EFFECTIVE.into(),
+            })
+            .expect("seed approval");
+        store.ensure_review_generation("o/r#1").expect("generation");
+        store.set_review_evidence_rev("o/r#1", 7).expect("rev");
+
+        let (o, _) = orch_on(ticketless(&["bob", "carol"]), Arc::clone(&store));
+
+        // No record at all: never assume an approval.
+        assert!(!o.handle_manager_approval_recheck("nobody", 1, 7));
+        // A record whose authority is off is not effective — the M6 gate, pinned here so enabling
+        // the key is the only change needed to switch it on.
+        assert!(
+            !o.handle_manager_approval_recheck("iv-1", 1, 7),
+            "with review_authority off, nothing is ever effective"
+        );
+
+        // A generation / evidence revision that does not match the plan's binding also refuses —
+        // though with authority off the authority gate already refuses first; the pure
+        // `managerapproval` tests exercise the other triggers directly.
+        assert!(!o.handle_manager_approval_recheck("iv-1", 2, 7));
+        assert!(!o.handle_manager_approval_recheck("iv-1", 1, 8));
     }
 }

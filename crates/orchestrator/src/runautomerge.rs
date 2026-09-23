@@ -22,6 +22,14 @@
 //! The merge carries `--match-head-commit`, so if the author pushed between the observation and
 //! the merge, GITHUB refuses it rather than this daemon noticing afterwards.
 //!
+//! ⚠️ **`--match-head-commit` guards the HEAD CHANGING and nothing else.** It does not protect
+//! against same-head events: a reviewer publishing a blocking review, or an operator applying a
+//! hold, on the very commit about to merge. STUDIO-1011 narrows that window for a plan that relied
+//! on a manager approval by re-checking the approval on the control task immediately before the
+//! merge command ([`ApprovalRecheckSource`]), but it does NOT close it: between that check and
+//! GitHub completing the merge, a same-head event can still land. Reviewer-only plans keep exactly
+//! the window they had before.
+//!
 //! # Only `CLEAN` proceeds — and `CLEAN` is not sufficient
 //!
 //! The `mergeStateStatus` gate is an ALLOWLIST of one. GitHub's vocabulary here is open and has
@@ -144,6 +152,72 @@ const CHECK_CANCELLED: &str = "CANCELLED";
 /// GitHub adds later — blocks, unless a green sibling supersedes it: see [`blocking_check`].
 const NON_BLOCKING_CHECKS: [&str; 3] = [CHECK_SUCCESS, "SKIPPED", "NEUTRAL"];
 
+/// The refusal a merge gets when the manager approval it relied on is no longer current (§8.3).
+/// Named because the recheck and the "no recheck source" case both answer with it.
+const DECLINE_APPROVAL_STALE: &str =
+    "the manager approval this merge relied on is no longer effective";
+
+/// The answer to the §8.3 pre-merge recheck: is the manager approval the plan counted still
+/// current? Deliberately not a `bool`, so the caller reads the same two words wherever it surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRecheck {
+    /// The approval is still `effective`, in the same generation, at the same evidence revision,
+    /// with no hold and authority still `act` — the merge may proceed.
+    StillEffective,
+    /// Anything else: no longer effective, expired, cancelled, generation or evidence moved, a hold
+    /// applied, or authority changed. The merge is NOT requested.
+    NoLongerEffective,
+}
+
+/// The control-task round-trip the off-loop merge half makes immediately before merging a plan that
+/// counted a manager approval (STUDIO-1011; design record §8.3).
+///
+/// It is a seam rather than a direct store read because the recheck must see the CONTROL TASK's
+/// current state — the generation, the evidence revision, the current-label hold and the live
+/// authority — and the off-loop half holds no `Orchestrator`. The production implementation is the
+/// control handle's `manager_approval_recheck`; a test supplies a fake so each refusal is a fixture.
+///
+/// A missing source (`None`) fails CLOSED: a plan that relied on a manager approval is never merged
+/// without the recheck, exactly as an unreadable gate is never read as a pass elsewhere here.
+#[async_trait::async_trait]
+pub trait ApprovalRecheckSource: Send + Sync {
+    async fn recheck(&self, approval: &crate::automerge::ManagerApprovalPlan) -> ApprovalRecheck;
+}
+
+/// The production [`ApprovalRecheckSource`]: the control handle's §8.3 round-trip. Held by the
+/// off-loop half like every other `gh`-free seam, so it can be asked immediately before the merge
+/// without holding an `Orchestrator`.
+pub struct ControlApprovalRecheck {
+    control: crate::stop::ControlHandle,
+}
+
+impl ControlApprovalRecheck {
+    pub fn new(control: crate::stop::ControlHandle) -> ControlApprovalRecheck {
+        ControlApprovalRecheck { control }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalRecheckSource for ControlApprovalRecheck {
+    async fn recheck(&self, approval: &crate::automerge::ManagerApprovalPlan) -> ApprovalRecheck {
+        // The handle already answers `false` on a gone loop, a dropped reply or a timeout, so there
+        // is no second failure to map: a non-answer is "not effective", which refuses the merge.
+        if self
+            .control
+            .manager_approval_recheck(
+                &approval.intervention_id,
+                approval.generation,
+                approval.evidence_rev,
+            )
+            .await
+        {
+            ApprovalRecheck::StillEffective
+        } else {
+            ApprovalRecheck::NoLongerEffective
+        }
+    }
+}
+
 /// Everything the off-loop half runs against. No `Orchestrator`, no store, no control channel —
 /// the off-loop guarantee, in the type.
 pub struct AutoMergeDeps {
@@ -161,6 +235,11 @@ pub struct AutoMergeDeps {
     pub merger: Arc<dyn MergeSource>,
     /// The head repositories a watched pull request may come from besides the base's own owner.
     pub allow: HeadAllowlist,
+    /// The §8.3 pre-merge recheck for a plan that counted a manager approval (STUDIO-1011), or
+    /// `None` when this daemon has no control source. `None` fails closed for such a plan — a merge
+    /// that relies on an approval is never requested without re-checking it — and is never consulted
+    /// for a reviewer-only plan, so today's merges are unchanged.
+    pub approvals: Option<Arc<dyn ApprovalRecheckSource>>,
     /// What this half has already SAID, and the only state it keeps. See [`AutoMergeLedger`].
     ///
     /// `Arc`-held, not owned outright, so the SAME ledger can be shared with
@@ -306,6 +385,25 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
                 "auto-merge: declining on a check that is not green"
             )
         });
+    }
+
+    // 3b. The manager-approval recheck (STUDIO-1011; §8.3), immediately before the merge command and
+    //     after every read above. A plan that counted an `effective` manager approval must still find
+    //     it effective NOW: a same-head blocking review or a hold applied between planning and here
+    //     changes the control task's answer WITHOUT moving the head, which is precisely what
+    //     `--match-head-commit` cannot catch. A reviewer-only plan (`manager_approval == None`) skips
+    //     this entirely, which is what keeps its behaviour — and its same-head window — unchanged.
+    //
+    //     A missing source fails CLOSED: the merge that relied on an approval is not requested. This
+    //     is only reachable on a daemon whose sink was built without the control handle.
+    if let Some(approval) = &plan.manager_approval {
+        let still_current = match deps.approvals.as_ref() {
+            Some(source) => source.recheck(approval).await == ApprovalRecheck::StillEffective,
+            None => false,
+        };
+        if !still_current {
+            return refuse(plan, deps, DECLINE_APPROVAL_STALE);
+        }
     }
 
     // 4. Merge, pinned to the head every verdict was recorded against.
@@ -618,6 +716,7 @@ mod tests {
             pr: PrCoord::new("makewhatis", "tally", 151),
             head: HEAD.to_string(),
             approved_by: vec!["alice".to_string()],
+            manager_approval: None,
         }
     }
 
@@ -823,8 +922,49 @@ mod tests {
             checks,
             merger,
             allow: HeadAllowlist::none(),
+            approvals: None,
             ledger: Arc::new(AutoMergeLedger::default()),
         }
+    }
+
+    /// A plan that counted an `effective` manager approval (STUDIO-1011), so the pre-merge recheck
+    /// runs. The approval fields are the plan's provenance; the recheck source answers with a fake.
+    fn approved_plan() -> AutoMergePlan {
+        AutoMergePlan {
+            manager_approval: Some(crate::automerge::ManagerApprovalPlan {
+                intervention_id: "iv-1".to_string(),
+                generation: 1,
+                evidence_rev: 7,
+            }),
+            ..plan()
+        }
+    }
+
+    /// A recheck source whose answer a test can change between ticks, and which counts its calls.
+    struct FakeRecheck {
+        answer: std::sync::atomic::AtomicBool,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl ApprovalRecheckSource for FakeRecheck {
+        async fn recheck(
+            &self,
+            _approval: &crate::automerge::ManagerApprovalPlan,
+        ) -> ApprovalRecheck {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.answer.load(Ordering::SeqCst) {
+                ApprovalRecheck::StillEffective
+            } else {
+                ApprovalRecheck::NoLongerEffective
+            }
+        }
+    }
+
+    fn recheck_source(still: bool) -> Arc<FakeRecheck> {
+        Arc::new(FakeRecheck {
+            answer: std::sync::atomic::AtomicBool::new(still),
+            calls: AtomicUsize::new(0),
+        })
     }
 
     /// The acceptance criterion: verdicts at head H, green CI at H, so it merges — with no human
@@ -1816,6 +1956,173 @@ mod tests {
         assert_eq!(
             perform_auto_merge(&moved, &d).await,
             AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+    }
+
+    // ── STUDIO-1011: the manager-approval pre-merge recheck (§8.3) ──────────────────────────────
+
+    /// The reviewer-only case, and the ticket's "reviewer-only merges are byte-identical" criterion:
+    /// a plan with no manager approval never consults the recheck at all, so a daemon that happens
+    /// to have a source configured merges exactly as before.
+    #[tokio::test]
+    async fn a_reviewer_only_plan_never_consults_the_approval_recheck() {
+        let merger = Arc::new(FakeMerger::default());
+        let recheck = recheck_source(false); // would refuse if it were ever asked
+        let d = AutoMergeDeps {
+            approvals: Some(Arc::clone(&recheck) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert_eq!(
+            recheck.calls.load(Ordering::SeqCst),
+            0,
+            "a reviewer-only plan must not spend the recheck round trip"
+        );
+        assert_eq!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            vec![(151, MergeMethod::Squash, false, Some(HEAD.to_string()))]
+        );
+    }
+
+    /// A plan that counted an effective manager approval rechecks it, and merges only when the
+    /// control task still says it is current — pinned to the reviewed head, as ever.
+    #[tokio::test]
+    async fn a_still_current_manager_approval_merges_pinned_to_its_head() {
+        let merger = Arc::new(FakeMerger::default());
+        let recheck = recheck_source(true);
+        let d = AutoMergeDeps {
+            approvals: Some(Arc::clone(&recheck) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert!(matches!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert_eq!(recheck.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            vec![(151, MergeMethod::Squash, false, Some(HEAD.to_string()))]
+        );
+    }
+
+    /// ⚠️ **The ticket's headline acceptance criterion for the recheck.** A same-head blocking review
+    /// (or a hold) between planning and the merge command changes the control task's answer without
+    /// moving the head, so `--match-head-commit` cannot catch it. The recheck does, and no merge is
+    /// requested.
+    ///
+    /// MUTATION: drop the recheck block from `attempt_auto_merge` and this reds (the merge runs).
+    #[tokio::test]
+    async fn a_manager_approval_that_lapsed_before_the_merge_command_is_not_requested() {
+        let merger = Arc::new(FakeMerger::default());
+        let recheck = recheck_source(false); // a same-head event landed after planning
+        let d = AutoMergeDeps {
+            approvals: Some(Arc::clone(&recheck) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert_eq!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_APPROVAL_STALE)
+        );
+        assert!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "no merge may be requested once the approval it relied on lapsed"
+        );
+    }
+
+    /// A missing recheck source fails CLOSED for a plan that relied on a manager approval: the merge
+    /// is not requested. Reachable only on a sink built without the control handle, but it must never
+    /// read as a pass.
+    #[tokio::test]
+    async fn a_missing_recheck_source_fails_closed_for_a_manager_approval_plan() {
+        let merger = Arc::new(FakeMerger::default());
+        let d = deps(
+            found(HEAD, PrStatus::Open),
+            MERGE_STATE_CLEAN,
+            all_green(),
+            Arc::clone(&merger),
+        ); // `approvals: None`
+
+        assert_eq!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_APPROVAL_STALE)
+        );
+        assert!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
+    /// The recheck is re-decided from scratch on every tick and nothing latches: an approval that was
+    /// stale merges the moment the control task says it is current again, just as every other gate
+    /// here does.
+    #[tokio::test]
+    async fn the_approval_recheck_is_re_decided_on_every_tick() {
+        let merger = Arc::new(FakeMerger::default());
+        let recheck = recheck_source(false);
+        let d = AutoMergeDeps {
+            approvals: Some(Arc::clone(&recheck) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert_eq!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_APPROVAL_STALE)
+        );
+        assert_eq!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Held(DECLINE_APPROVAL_STALE),
+            "the same refusal at the same head is announced once"
+        );
+
+        recheck.answer.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            perform_auto_merge(&approved_plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert_eq!(
+            merger.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1
         );
     }
 }

@@ -189,6 +189,30 @@ impl Store for Noop {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+    // The manager approval record (STUDIO-1011) disappears with the rest of the review state: with
+    // persistence off there is nowhere to record an approval and nothing to read back, so every
+    // write is a silent success and every read is empty/None — the guard-free contract above. A
+    // recheck against a Noop store therefore finds no approval and fails closed.
+    fn save_manager_approval(&self, _row: ManagerApprovalRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_manager_approval_state(
+        &self,
+        _intervention_id: &str,
+        _state: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_approval(
+        &self,
+        _intervention_id: &str,
+    ) -> Result<Option<ManagerApprovalRow>, StoreError> {
+        Ok(None)
+    }
+    fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
@@ -271,6 +295,23 @@ impl Store for Noop {
     }
     fn review_bound(&self, _pr: &str) -> Result<Option<ReviewBoundRow>, StoreError> {
         Ok(None)
+    }
+
+    // STUDIO-1012: with persistence off there is nowhere to remember an exchange authorization, so
+    // the review-side gates find none and an `act`-mode install arms no gated round — the fail-closed
+    // direction, and why `review_authority: act` requires durable storage. Exactly the
+    // `summon_watermark`/`review_bound` stance above: a no-op store is a store, not a second policy.
+    fn save_manager_exchange(&self, _exchange: ManagerExchange) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_exchanges(&self, _pr: &str) -> Result<Vec<ManagerExchange>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn set_manager_exchange_state(&self, _id: &str, _state: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn invalidate_manager_exchanges(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
     }
     fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())

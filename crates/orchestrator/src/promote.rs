@@ -1098,6 +1098,24 @@ mod tests {
         ) -> Result<Option<rhapsody_store::ReviewBoundRow>, StoreError> {
             self.0.review_bound(pr)
         }
+        fn save_manager_exchange(
+            &self,
+            exchange: rhapsody_store::ManagerExchange,
+        ) -> Result<(), StoreError> {
+            self.0.save_manager_exchange(exchange)
+        }
+        fn manager_exchanges(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rhapsody_store::ManagerExchange>, StoreError> {
+            self.0.manager_exchanges(pr)
+        }
+        fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+            self.0.set_manager_exchange_state(id, state)
+        }
+        fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError> {
+            self.0.invalidate_manager_exchanges(pr)
+        }
         fn record_review_completion(
             &self,
             key: &rhapsody_store::ReviewWatchKey,
@@ -1148,6 +1166,30 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0
                 .resolve_review_findings(pr, generation, reviewer, resolved_by)
+        }
+        fn save_manager_approval(
+            &self,
+            row: rhapsody_store::ManagerApprovalRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_manager_approval(row)
+        }
+        fn set_manager_approval_state(
+            &self,
+            intervention_id: &str,
+            state: &str,
+        ) -> Result<(), StoreError> {
+            self.0.set_manager_approval_state(intervention_id, state)
+        }
+        fn manager_approval(
+            &self,
+            intervention_id: &str,
+        ) -> Result<Option<rhapsody_store::ManagerApprovalRow>, StoreError> {
+            self.0.manager_approval(intervention_id)
+        }
+        fn load_manager_approvals(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ManagerApprovalRow>, StoreError> {
+            self.0.load_manager_approvals()
         }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)

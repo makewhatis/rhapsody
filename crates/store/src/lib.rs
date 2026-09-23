@@ -492,6 +492,28 @@ pub trait Store {
     /// One pull request's durable review bound, or `None` when the daemon holds none for it.
     fn review_bound(&self, pr: &str) -> Result<Option<ReviewBoundRow>, StoreError>;
 
+    // --- manager exchange authorizations (STUDIO-1012; no Go counterpart — see [`ManagerExchange`]) ---
+
+    /// Writes one manager exchange authorization, replacing the row with the same `id` if one
+    /// exists. The writer is the manager's activation transaction (a later slice); the review-side
+    /// gates here only read it and move its `state`. A no-op store keeps no authorizations, so with
+    /// durable storage off an `act`-mode install can never arm a gated round — which is the
+    /// fail-closed direction, and the reason `review_authority: act` requires durable storage.
+    fn save_manager_exchange(&self, exchange: ManagerExchange) -> Result<(), StoreError>;
+
+    /// Every exchange authorization recorded for `pr` (case-folded `owner/repo#number`), oldest
+    /// first. The caller filters by `kind` and `state`: an active authorization is consumed by the
+    /// exchange it covers, a consumed one still covers the remainder of that exchange.
+    fn manager_exchanges(&self, pr: &str) -> Result<Vec<ManagerExchange>, StoreError>;
+
+    /// Moves one authorization to `state`. Idempotent, and a no-op when `id` names no row.
+    fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), StoreError>;
+
+    /// Marks EVERY live (`active` or `consumed`) authorization for `pr` `invalidated` — a new
+    /// generation, a hold, or the pull request closing. An invalidated authorization arms nothing.
+    /// Idempotent.
+    fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError>;
+
     // --- durable terminal-move ledger (STUDIO-1007; no Go counterpart — see [`ReviewDoneRow`]) ---
 
     /// Records `row` as a terminal-state move owed to `row.identifier`'s merged pull request, or
@@ -614,6 +636,40 @@ pub trait Store {
         reviewer: &str,
         resolved_by: &str,
     ) -> Result<(), StoreError>;
+
+    // --- manager approval record (STUDIO-1011; no Go counterpart — see [`ManagerApprovalRow`]) ----
+    // The manager's approval of one pull request, in a table of its OWN and never a watch-set row
+    // (§3.1, §6.5). The merge gate reads an `effective` row beside the watch rows; nothing here
+    // writes the watch set.
+
+    /// Writes `row` as this intervention's manager approval, replacing any existing row for the same
+    /// `intervention_id`.
+    ///
+    /// A last-write-wins upsert of the WHOLE row, because the control task (the applier and the
+    /// activation transaction) is its single writer and the row it last wrote is authoritative. The
+    /// row is written `pending` at decision time and moved to `effective`/`expired`/`cancelled` by
+    /// [`Store::set_manager_approval_state`].
+    fn save_manager_approval(&self, row: ManagerApprovalRow) -> Result<(), StoreError>;
+
+    /// Moves one approval to `state` — `effective`, `expired` or `cancelled`. A no-op when the
+    /// intervention has no row, and it never touches any field but `state`, so the record of what
+    /// was decided is preserved through its lifecycle.
+    fn set_manager_approval_state(
+        &self,
+        intervention_id: &str,
+        state: &str,
+    ) -> Result<(), StoreError>;
+
+    /// One intervention's approval, or `Ok(None)` when none was recorded. The pre-merge recheck's
+    /// read: the plan carries the id and this answers what state the record is in now.
+    fn manager_approval(
+        &self,
+        intervention_id: &str,
+    ) -> Result<Option<ManagerApprovalRow>, StoreError>;
+
+    /// Every manager approval, in `intervention_id` order — the boot snapshot the approval ledger is
+    /// rehydrated from.
+    fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError>;
 
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
