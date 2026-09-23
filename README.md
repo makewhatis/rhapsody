@@ -157,6 +157,27 @@ This makes the Settings › General "Logs path" setting real — in Go it was pl
 shown in the UI but nothing ever wrote files to it. The retention count (7) is hardcoded; no new
 config field is added, keeping the config schema at parity with Go.
 
+### The daemon guards and repairs its own `runtime.json` (STUDIO-1041)
+
+`rhapsodyd mcp` — an operator's CLI and every dispatched worker — finds the daemon through
+`~/.rhapsody/runtime.json`. Go's daemon writes that file once at startup (unconditional overwrite) and
+removes it on a clean shutdown; if it is deleted, corrupted, or left naming a crashed daemon's PID,
+the MCP facade falls back to the config `server.port` — which the desktop app never uses (it launches
+the daemon on a dynamic `--port`), so every MCP tool fails `daemon_unreachable` until the daemon is
+restarted.
+
+Rhapsody therefore (a) publishes under an **ownership guard** — a file naming another *live* daemon is
+left untouched, so a test or a second daemon can no longer clobber a running daemon's port — and (b)
+runs an off-loop **self-heal** check every 30s that rewrites the file when it is missing, unreadable,
+or stale (dead PID), logging one `warn` per repair. The file's JSON shape and the read-side resolution
+(prefer a published port only when its PID is alive, else config `server.port`) are unchanged.
+
+| `~/.rhapsody/runtime.json` | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| write at startup | unconditional overwrite | overwrite unless another **live** daemon owns it |
+| mid-run repair | none | 30s off-loop self-heal (missing / unreadable / dead PID) |
+| file format + MCP-side lookup | — | unchanged (byte-identical) |
+
 ### `review_states` classifies a clean worker exit (TRA-279)
 
 Go's `classifyCleanExit` never receives `review_states`. An agent that follows its prompt — open a
@@ -3023,9 +3044,13 @@ changes for callers:
 - **`rhapsodyd mcp`** sends the header and a JSON body (`{}` for stop/resume/handoff) on every
   write tool.
 - **The desktop app's window proxy** drops whatever `Host`, `Origin`, `Cookie`, `Sec-Fetch-*` and
-  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly one operator
-  header, but only for requests carrying exactly one `Origin: rhapsody://localhost`, the bundled
-  origin. A request with no `Origin` gets no header. Its native drain request sends the header too.
+  operator headers the webview sent. It sets `Host` to the daemon's own address and injects exactly
+  one operator header for a request that arrived through the app's own custom-protocol handler,
+  unless it carries a `Cookie` or an `Origin` that is not exactly `rhapsody://localhost`. Only that
+  handler can reach the proxy, so this vouches for the app's own window whatever origin evidence
+  WebKit attaches — observed on macOS, WebKit sends **no** `Origin` for a same-origin fetch from
+  `rhapsody://localhost/` (it sends `Referer` instead), which is why the original exact-`Origin` rule
+  refused every console write (STUDIO-1044). Its native drain request sends the header too.
 - **Hand-written clients** (`curl`, scripts) must do the same:
   `curl -X POST http://127.0.0.1:$PORT/api/v1/refresh -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'`.
   The plugin skill's `operating.md` documents this.

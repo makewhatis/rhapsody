@@ -40,6 +40,19 @@ pub struct Info {
     pub pid: i32,
 }
 
+/// What [`ensure_in`] did to the runtime file (STUDIO-1041), so a self-heal caller can log exactly one
+/// line per actual repair rather than every check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// The file was missing, unreadable, stale (dead PID), or named our own stale port — we rewrote
+    /// it with this process's port + PID.
+    Wrote,
+    /// The file already named this process's port + PID; nothing to do.
+    Unchanged,
+    /// The file names another **live** process; it was deliberately left untouched.
+    SkippedLiveDaemon,
+}
+
 /// Go `os.UserHomeDir` (Unix branch): `$HOME` when set and non-empty. The daemon targets macOS/Linux
 /// (the sole platforms it runs on), so only the Unix path is ported; an undiscoverable home is an
 /// error, mirroring Go `UserHomeDir`'s `$HOME is not defined`.
@@ -54,13 +67,21 @@ fn home_dir() -> io::Result<PathBuf> {
 }
 
 /// `<home>/.rhapsody/runtime.json` — the same durable home the DB and logs default to (TRA-238).
-fn runtime_path_in(home: &Path) -> PathBuf {
+/// `pub` so the daemon boot can point its publication/self-heal at an explicit home (STUDIO-1041).
+pub fn path_in(home: &Path) -> PathBuf {
     home.join(".rhapsody").join(FILE_NAME)
 }
 
 /// Returns `~/.rhapsody/runtime.json`. Mirrors Go `Path` (rebranded home, TRA-238).
 pub fn path() -> io::Result<PathBuf> {
-    Ok(runtime_path_in(&home_dir()?))
+    Ok(path_in(&home_dir()?))
+}
+
+/// The resolved runtime home (`$HOME`), or an error when `$HOME` is unset/empty. The daemon boot
+/// resolves it ONCE and threads it explicitly, so an in-process test can stand a temp home in for the
+/// operator's and never touch the live `~/.rhapsody` (STUDIO-1041). Mirrors Go `os.UserHomeDir`.
+pub fn home() -> io::Result<PathBuf> {
+    home_dir()
 }
 
 /// Publishes the daemon's live loopback port, creating `~/.rhapsody` if needed and recording the
@@ -69,6 +90,31 @@ pub fn path() -> io::Result<PathBuf> {
 /// `Write`.
 pub fn write(port: i32) -> io::Result<()> {
     write_in(&home_dir()?, port)
+}
+
+/// Publishes or REPAIRS the runtime file under an explicit `home` (STUDIO-1041): the primitive the
+/// daemon boot publishes through and the off-loop self-heal task re-runs. Unlike [`write`] it is
+/// guarded — it never clobbers a file that names another **live** daemon (concurrent daemons for
+/// distinct configs are legitimate and share this one file, last-writer-wins aside). It (re)writes
+/// when the file is missing, unreadable/corrupt, names a dead PID, or already names this process but
+/// a different port; it leaves a file naming another live PID untouched. Returns what it did so a
+/// self-heal caller can log exactly one line per repair.
+pub fn ensure_in(home: &Path, port: i32) -> io::Result<Published> {
+    match read_in(home) {
+        // Already exactly ours — nothing to do.
+        Ok(info) if info.pid == std::process::id() as i32 && info.port == port => {
+            Ok(Published::Unchanged)
+        }
+        // Another LIVE daemon owns it — never clobber a live peer.
+        Ok(info) if info.pid != std::process::id() as i32 && process_alive(info.pid) => {
+            Ok(Published::SkippedLiveDaemon)
+        }
+        // Missing, unreadable/corrupt, stale (dead PID), or our own stale port: republish.
+        _ => {
+            write_in(home, port)?;
+            Ok(Published::Wrote)
+        }
+    }
 }
 
 /// Returns the published runtime info. A missing file surfaces as an `io::ErrorKind::NotFound` error
@@ -108,19 +154,22 @@ pub fn process_alive(pid: i32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-// --- internal, home-parameterized core -------------------------------------------------------
+// --- home-parameterized core -----------------------------------------------------------------
 //
-// The public `write`/`read`/`remove` resolve `$HOME`; these take the home directory explicitly so
-// the tests drive them against a per-test temp home — never touching a live daemon's
+// The `write`/`read`/`remove` helpers above resolve `$HOME`; these take the home directory
+// explicitly. The tests drive them against a per-test temp home — never touching a live daemon's
 // ~/.rhapsody/runtime.json, and running race-free without mutating process-global env (the same
 // directory-injection the sibling `obslog::Store::new(dir)` / `liveness::group_cpu(root, …)` ports
-// use in place of Go's `t.Setenv`).
+// use in place of Go's `t.Setenv`). `pub` since STUDIO-1041 so the daemon boot and its off-loop
+// self-heal task can target an explicitly-resolved home rather than re-resolving `$HOME`.
 
 /// Process-global counter feeding unique temp-file names (mirrors the `rhapsody_config` `workflow`
 /// atomic-write convention).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn write_in(home: &Path, port: i32) -> io::Result<()> {
+/// Writes the runtime record under an explicit `home`, unconditionally (Go `Write`'s supersede-a-
+/// stale-record semantics). Prefer [`ensure_in`] on any path that must not clobber a live peer.
+pub fn write_in(home: &Path, port: i32) -> io::Result<()> {
     let dir = home.join(".rhapsody");
     // The tree defaults to owner-only (the DB and transcripts under it may hold secrets): dir 0700.
     std::fs::DirBuilder::new()
@@ -187,12 +236,14 @@ fn write_temp_and_rename(
     Ok(())
 }
 
-fn read_in(home: &Path) -> io::Result<Info> {
-    let data = std::fs::read(runtime_path_in(home))?;
+/// Reads the runtime record under an explicit `home`, unconditional counterpart of [`read`].
+pub fn read_in(home: &Path) -> io::Result<Info> {
+    let data = std::fs::read(path_in(home))?;
     serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn remove_in(home: &Path) -> io::Result<()> {
+/// Removes the runtime record under an explicit `home`, unconditional counterpart of [`remove`].
+pub fn remove_in(home: &Path) -> io::Result<()> {
     let info = match read_in(home) {
         Ok(i) => i,
         // Missing (NotFound), or unreadable/corrupt: nothing we can confirm as ours to remove.
@@ -202,7 +253,7 @@ fn remove_in(home: &Path) -> io::Result<()> {
         // A newer daemon (different config) owns the file now — leave it for them.
         return Ok(());
     }
-    match std::fs::remove_file(runtime_path_in(home)) {
+    match std::fs::remove_file(path_in(home)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -321,6 +372,86 @@ mod tests {
             home.runtime_file().exists(),
             "must not delete a file owned by pid {other}"
         );
+    }
+
+    // STUDIO-1041: `ensure_in` is the guarded publish/self-heal primitive. A deleted file is
+    // rewritten with this process's port + PID.
+    #[test]
+    fn ensure_rewrites_a_deleted_file() {
+        let home = TempHome::new();
+        assert_eq!(
+            ensure_in(&home.path, 51981).expect("ensure"),
+            Published::Wrote
+        );
+        let info = read_in(&home.path).expect("read");
+        assert_eq!(info.port, 51981);
+        assert_eq!(info.pid, std::process::id() as i32);
+    }
+
+    // A file naming a DEAD pid (crashed / kill -9'd daemon) is stale and gets rewritten.
+    #[test]
+    fn ensure_rewrites_a_dead_pid() {
+        let home = TempHome::new();
+        let dir = home.path.join(".rhapsody");
+        std::fs::create_dir_all(&dir).expect("mkdir .rhapsody");
+        std::fs::write(
+            dir.join(FILE_NAME),
+            format!(r#"{{"port":1111,"pid":{}}}"#, i32::MAX),
+        )
+        .expect("write stale file");
+
+        assert_eq!(
+            ensure_in(&home.path, 51981).expect("ensure"),
+            Published::Wrote
+        );
+        let info = read_in(&home.path).expect("read");
+        assert_eq!(info.port, 51981);
+        assert_eq!(info.pid, std::process::id() as i32);
+    }
+
+    // A file naming another LIVE process (a concurrent daemon for a distinct config) is left alone.
+    // PID 1 (init/launchd) is always alive and we cannot have written it, so it is the ideal stand-in.
+    #[test]
+    fn ensure_leaves_a_file_owned_by_another_live_process() {
+        let home = TempHome::new();
+        let dir = home.path.join(".rhapsody");
+        std::fs::create_dir_all(&dir).expect("mkdir .rhapsody");
+        let body = r#"{"port":1111,"pid":1}"#;
+        std::fs::write(dir.join(FILE_NAME), body).expect("write other's file");
+
+        assert_eq!(
+            ensure_in(&home.path, 51981).expect("ensure"),
+            Published::SkippedLiveDaemon
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE_NAME)).expect("read"),
+            body,
+            "must not touch a file owned by another live process"
+        );
+    }
+
+    // A file that already names OUR port + PID is left as-is (no write, no warn).
+    #[test]
+    fn ensure_is_unchanged_when_already_current() {
+        let home = TempHome::new();
+        write_in(&home.path, 51981).expect("write"); // records our pid
+        assert_eq!(
+            ensure_in(&home.path, 51981).expect("ensure"),
+            Published::Unchanged
+        );
+    }
+
+    // Our own file left behind by a previous run at a DIFFERENT port is stale for this bind and is
+    // repaired in place.
+    #[test]
+    fn ensure_rewrites_our_own_stale_port() {
+        let home = TempHome::new();
+        write_in(&home.path, 1111).expect("write"); // our pid, old port
+        assert_eq!(
+            ensure_in(&home.path, 51981).expect("ensure"),
+            Published::Wrote
+        );
+        assert_eq!(read_in(&home.path).expect("read").port, 51981);
     }
 
     // Mirrors Go `TestRemoveDeletesOwnFile`: the common single-daemon shutdown removes our own file.
