@@ -1335,6 +1335,22 @@ mod tests {
         assert!(body.contains("259.0M"), "names the spend: {body}");
     }
 
+    /// A crossing body never reports an attempt count it does not have: a zero is omitted (a
+    /// hard-coded `0` in the escalation path was the review's blocking finding). Mutation: print
+    /// the line unconditionally and this reds.
+    #[test]
+    fn the_notification_body_omits_an_unknown_attempt_count() {
+        let mut plan = violation_plan();
+        plan.attempts = 0;
+        let body = crossing_body(&plan);
+        assert!(
+            !body.contains("Author attempts"),
+            "an unknown attempts count must be omitted: {body}"
+        );
+        plan.attempts = 3;
+        assert!(crossing_body(&plan).contains("Author attempts: **3**."));
+    }
+
     /// A spend crossing names the spend that HAPPENED **and** the cap it crossed — never the cap
     /// alone. Mutation: report `min(spent, cap)` and the overshoot disappears from the body.
     #[test]
