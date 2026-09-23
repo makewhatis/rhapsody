@@ -1049,6 +1049,13 @@ where
             checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
             merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            // The §8.3 manager-approval pre-merge recheck (STUDIO-1011): the off-loop half asks the
+            // control task, immediately before it merges, whether the approval a plan counted is
+            // still current. Wired UNCONDITIONALLY like the other seams — a reviewer-only plan never
+            // consults it, and nothing can be effective until M6 adds `manager.review_authority`.
+            approvals: Some(Arc::new(
+                rhapsody_orchestrator::runautomerge::ControlApprovalRecheck::new(handle.clone()),
+            )),
             // `spawn_watcher` gates both this closure and the ledger above, so this is always
             // `Some` in practice; the fallback is a fresh, equally-empty ledger rather than a
             // boot-time panic on a daemon that could otherwise run fine.

@@ -615,6 +615,40 @@ pub trait Store {
         resolved_by: &str,
     ) -> Result<(), StoreError>;
 
+    // --- manager approval record (STUDIO-1011; no Go counterpart — see [`ManagerApprovalRow`]) ----
+    // The manager's approval of one pull request, in a table of its OWN and never a watch-set row
+    // (§3.1, §6.5). The merge gate reads an `effective` row beside the watch rows; nothing here
+    // writes the watch set.
+
+    /// Writes `row` as this intervention's manager approval, replacing any existing row for the same
+    /// `intervention_id`.
+    ///
+    /// A last-write-wins upsert of the WHOLE row, because the control task (the applier and the
+    /// activation transaction) is its single writer and the row it last wrote is authoritative. The
+    /// row is written `pending` at decision time and moved to `effective`/`expired`/`cancelled` by
+    /// [`Store::set_manager_approval_state`].
+    fn save_manager_approval(&self, row: ManagerApprovalRow) -> Result<(), StoreError>;
+
+    /// Moves one approval to `state` — `effective`, `expired` or `cancelled`. A no-op when the
+    /// intervention has no row, and it never touches any field but `state`, so the record of what
+    /// was decided is preserved through its lifecycle.
+    fn set_manager_approval_state(
+        &self,
+        intervention_id: &str,
+        state: &str,
+    ) -> Result<(), StoreError>;
+
+    /// One intervention's approval, or `Ok(None)` when none was recorded. The pre-merge recheck's
+    /// read: the plan carries the id and this answers what state the record is in now.
+    fn manager_approval(
+        &self,
+        intervention_id: &str,
+    ) -> Result<Option<ManagerApprovalRow>, StoreError>;
+
+    /// Every manager approval, in `intervention_id` order — the boot snapshot the approval ledger is
+    /// rehydrated from.
+    fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

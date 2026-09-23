@@ -189,6 +189,30 @@ impl Store for Noop {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+    // The manager approval record (STUDIO-1011) disappears with the rest of the review state: with
+    // persistence off there is nowhere to record an approval and nothing to read back, so every
+    // write is a silent success and every read is empty/None — the guard-free contract above. A
+    // recheck against a Noop store therefore finds no approval and fails closed.
+    fn save_manager_approval(&self, _row: ManagerApprovalRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_manager_approval_state(
+        &self,
+        _intervention_id: &str,
+        _state: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_approval(
+        &self,
+        _intervention_id: &str,
+    ) -> Result<Option<ManagerApprovalRow>, StoreError> {
+        Ok(None)
+    }
+    fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
