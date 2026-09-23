@@ -568,6 +568,21 @@ export function operatorPost(url: string, body: unknown = {}): Promise<Response>
   });
 }
 
+// daemonErrorMessage reads the daemon's `{error:{code,message}}` envelope off a failed write so a
+// caller that only checks the status still shows WHY the daemon refused, rather than a bare number.
+// When the operator-write guard is the refuser (STUDIO-982) that message is the guard's own
+// sentence; when the desktop proxy cannot vouch for the webview's write it arrives as exactly that
+// refusal (STUDIO-1044), so the operator can read what happened instead of a silent failure.
+async function daemonErrorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = (await res.json()) as ApiError | null;
+    if (body?.error?.message) return body.error.message;
+  } catch {
+    /* non-JSON body */
+  }
+  return `${fallback}: ${res.status}`;
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) {
@@ -650,7 +665,7 @@ export async function fetchRunProvenance(runID: number): Promise<RunProvenance> 
 export async function setDrain(active: boolean, reason = "operator"): Promise<DrainState> {
   const res = await operatorPost("/api/v1/drain", { active, reason });
   if (!res.ok) {
-    throw new Error(`drain ${active ? "arm" : "cancel"} failed: ${res.status}`);
+    throw new Error(await daemonErrorMessage(res, `drain ${active ? "arm" : "cancel"} failed`));
   }
   return (await res.json()) as DrainState;
 }
@@ -658,7 +673,7 @@ export async function setDrain(active: boolean, reason = "operator"): Promise<Dr
 export async function postRefresh(): Promise<void> {
   const res = await operatorPost("/api/v1/refresh");
   if (!res.ok && res.status !== 202) {
-    throw new Error(`refresh failed: ${res.status}`);
+    throw new Error(await daemonErrorMessage(res, "refresh failed"));
   }
 }
 

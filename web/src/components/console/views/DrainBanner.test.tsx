@@ -106,9 +106,12 @@ describe("DrainBanner", () => {
   });
 
   // A refused cancel must not read as a successful one: the operator is still in the state the
-  // banner exists to make visible, and has to be told the button did not work.
-  it("says so when the daemon refuses the cancel, and leaves the banner up", async () => {
-    h.setDrain.mockRejectedValue(new Error("drain cancel failed: 503"));
+  // banner exists to make visible, and has to be told the button did not work — with the daemon's
+  // own reason (STUDIO-1044: a guard refusal says which header it wanted), not a generic sentence.
+  it("shows the daemon's own refusal reason, and leaves the banner up", async () => {
+    h.setDrain.mockRejectedValue(
+      new Error("mutating requests need Host 127.0.0.1:<port>, exactly one X-Rhapsody-Operator: 1"),
+    );
     h.fetchState.mockResolvedValue(
       state({ drain: { active: true, reason: "operator", requested_at: "" } }),
     );
@@ -116,6 +119,7 @@ describe("DrainBanner", () => {
     fireEvent.click(await screen.findByRole("button", { name: /cancel drain/i }));
     const note = await screen.findByRole("status");
     await waitFor(() => expect(note.textContent).toMatch(/refused the cancel/i));
+    expect(note.textContent).toMatch(/exactly one X-Rhapsody-Operator: 1/);
     expect(note.textContent).toMatch(/no new work is being started/i);
   });
 
