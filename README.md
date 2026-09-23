@@ -1061,7 +1061,7 @@ reservation, is counted in `unknown_usage_requests`, and gets no provider-report
 `rhapsody_` prefix keeps both new objects out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the ninth name.
 
-### A tenth schema table with no Go counterpart — `rhapsody_manager_exchange` (STUDIO-1012)
+### An eleventh schema table with no Go counterpart — `rhapsody_manager_exchange` (STUDIO-1012)
 
 The manager program bounds the review↔author loop after a round threshold: in `act` mode a review
 round or an author dispatch happens only under an active **manager exchange authorization**. This
@@ -1077,12 +1077,13 @@ The table holds one row per authorization: `intervention_id`, `pr` (the case-fol
 authorized head; re-introduction arms nothing on its own; the automatic findings route-back and its
 summon are suppressed; and a new generation, a hold, the pull request closing, or a `review_round`'s
 patch-id move before consumption invalidates a row. The `rhapsody_` prefix keeps the new table out of
-the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the tenth name.
+the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the eleventh name
+(the tenth, `rhapsody_manager_approval`, is STUDIO-1011's own step).
 
 | schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | `rhapsody_manager_exchange` | — | one row per manager exchange authorization |
-| `PRAGMA user_version` | 6 | **18** |
+| `PRAGMA user_version` | 6 | **19** |
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
