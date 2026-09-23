@@ -570,8 +570,11 @@ impl Orchestrator {
         // open/closed bit beside the head). It is what tells an approval of the CURRENT head from one
         // the author has since pushed past; `None` means the watcher has not observed this coordinate
         // yet, and the loop below then treats a recorded approval as still current. Only the HEAD is
-        // read here — a closed observation carries an empty head, which matches no recorded approval,
-        // so its row is armed exactly as an observation of a different head would arm it.
+        // read here. The memo stores the real head for any `Found` result — an OPEN, MERGED or CLOSED
+        // pull request all carry their head, with `open` carrying that bit (`reviewwatch.rs` records
+        // it for every `Found` whose snapshot names a head) — so only a coordinate the watcher never
+        // observed, or one it observed without a head (`Gone`, `Untrusted`, a headless `Found`),
+        // yields `None`.
         let observed_head = self
             .review_observed_head
             .get(&pr.pr)
