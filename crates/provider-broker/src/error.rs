@@ -38,6 +38,14 @@ pub enum LimitViolation {
     /// A per-turn token reservation exceeds the per-session/run cap.
     #[error("max_reserved_tokens_turn exceeds max_reserved_tokens_session")]
     TurnTokensExceedSession,
+    /// The optional UTC-day cap is configured but no durable authority was injected. Configuring a
+    /// day cap while durable budget storage is unavailable is a refusal, never a best-effort cap.
+    #[error("max_reserved_token_units_per_utc_day requires a durable budget authority")]
+    DayCapWithoutAuthority,
+    /// A durable authority was injected without a configured `max_reserved_token_units_per_utc_day`.
+    /// An authority with no cap has no boundary to enforce, so the pairing is refused.
+    #[error("a durable budget authority was injected without max_reserved_token_units_per_utc_day")]
+    AuthorityWithoutDayCap,
 }
 
 /// The broker's typed error. Refusals are values; callers act on the variant, never on a string.
@@ -85,6 +93,10 @@ pub enum BrokerError {
     /// The per-session/run reserved-token cap is already exhausted.
     #[error("the session token budget is exhausted")]
     SessionBudgetExhausted,
+    /// The optional durable UTC-day reserved-token budget is exhausted (or its store was
+    /// unreachable). Non-retryable: a caller must not retry the same request.
+    #[error("the daily token budget is exhausted")]
+    DayBudgetExhausted,
     /// A per-turn limit would be exceeded by the attempted reservation.
     #[error("the turn budget is exhausted: {0}")]
     TurnBudgetExhausted(&'static str),
