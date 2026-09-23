@@ -54,7 +54,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
-      - run: cargo test --workspace
+      # `--no-fail-fast` (STUDIO-1028): cargo stops at the first failing CRATE by default, so a
+      # Linux portability failure in `rhapsody-workspace` hid every crates/* failure after it. The
+      # full set must surface in one run — a PR-time Linux failure is the signal this matrix exists
+      # to give, and iterating one crate per push against the queued pool is the cost it removes.
+      - run: cargo test --workspace --no-fail-fast
 
   web:
     if: >-
