@@ -184,5 +184,5 @@ async fn a_real_turn_against_a_real_provider() {
     assert_eq!(counter.trim(), "8", "the agent did not edit the file");
 
     sess.stop().await.expect("stop");
-    let _ = std::fs::remove_dir_all(&root);
+    // `root` (a `TempDir`) removes itself on drop.
 }
