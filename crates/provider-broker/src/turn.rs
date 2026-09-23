@@ -315,6 +315,7 @@ impl CapabilityGrant {
     /// synchronously through `Notify`, so a revocation during a stalled upstream read wakes this
     /// immediately; expiry is bounded by a sleep over the remaining monotonic lifetime, so a
     /// trickling provider cannot hold the request open past its deadline.
+    #[cfg(feature = "loopback")]
     pub(crate) async fn wait_cancelled(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
         loop {
             if !self.is_live() || *shutdown.borrow_and_update() {
@@ -353,6 +354,7 @@ impl CapabilityGrant {
     /// authenticate against it, and any in-flight request waiting in [`CapabilityGrant::wait_cancelled`]
     /// wakes. Called by the adapter when the authenticated-denial threshold is reached (design §8.2);
     /// the turn's owner still finalizes the receipt when the access/attempt drops.
+    #[cfg(feature = "loopback")]
     pub(crate) fn revoke(&self) {
         self.inner.revoke_grant();
     }
@@ -360,6 +362,7 @@ impl CapabilityGrant {
     /// Borrow the session's credential bytes for exactly one closure — the adapter's one scope that
     /// constructs the upstream `Authorization` header and its redactor. There is no key accessor on
     /// any public type. `None` once custody has been released (session revoked).
+    #[cfg(feature = "loopback")]
     pub(crate) fn with_credential<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let guard = crate::state::lock(&self.inner.session.credential);
         guard.as_ref().map(|lease| lease.expose_for_upstream(f))
