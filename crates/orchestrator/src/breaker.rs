@@ -531,8 +531,13 @@ pub struct BreakerDeps {
 pub async fn perform_crossing(plan: &BreakerPlan, deps: &BreakerDeps, at: DateTime<Utc>) {
     let body = crossing_body(plan);
     // 1. The hold, first: stopping NEW work is the point, and the operator can act the moment the
-    //    notification lands.
-    if let Some(hold) = deps.hold.as_ref() {
+    //    notification lands. Only a ROUND or SPEND crossing holds — a manager escalation is a
+    //    decision to NOTIFY (the loop is already stopped by the adjudication), not a new hold.
+    let should_hold = plan
+        .kinds
+        .iter()
+        .any(|k| matches!(k, CrossingKind::Rounds | CrossingKind::Spend));
+    if should_hold && let Some(hold) = deps.hold.as_ref() {
         hold.hold(&plan.ticket, &plan.issue_id, &plan.team_id).await;
     }
     // 2. One line to the team room. The ticket is the ref (it re-grounds against the candidate map).
@@ -1394,6 +1399,27 @@ mod tests {
             1,
             "a failing channel must not suppress a healthy one"
         );
+    }
+
+    /// An escalation notifies but does NOT hold the ticket: the loop is already stopped by the
+    /// adjudication, and the ticket's ask is the notification.
+    #[tokio::test]
+    async fn an_escalation_notifies_without_holding_the_ticket() {
+        let hold = Arc::new(RecordingHold::default());
+        let channel = Arc::new(RecordingChannel::default());
+        let deps = BreakerDeps {
+            hold: Some(Arc::clone(&hold) as Arc<dyn BreakerHoldSink>),
+            room: None,
+            channels: vec![Arc::clone(&channel) as Arc<dyn NotifyChannel>],
+        };
+        let mut plan = violation_plan();
+        plan.kinds = vec![CrossingKind::Escalation];
+        perform_crossing(&plan, &deps, Utc::now()).await;
+        assert!(
+            hold.0.lock().expect("lock").is_empty(),
+            "an escalation must not apply the human hold"
+        );
+        assert_eq!(channel.0.lock().expect("lock").len(), 1);
     }
 
     /// The macOS channel pushes onto the shared cell, and `NotificationsState` bounds its queue.
