@@ -1670,6 +1670,10 @@ export interface TeamsMemoryConfig {
   api_key: string;
   bank_prefix: string;
   recall_top_k: number;
+  /** The SHARED team bank id (STUDIO-1040); "" (or absent) ⇒ off, the shipped state. */
+  team_bank?: string;
+  /** How many shared facts a turn-1 recall adds beside the identity's own. */
+  team_recall_top_k?: number;
 }
 
 // TeamsQuorumConfig is the `quorum:` block (STUDIO-659): notified review. `enabled` defaults FALSE
