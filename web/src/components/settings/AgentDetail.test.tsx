@@ -39,6 +39,10 @@ const global: UiGlobal = {
   mcpAllowSendMessage: true,
   mcpAllowStop: false,
   mcpAllowResume: false,
+  provider: "",
+  agentModel: "",
+  providers: [],
+  agentBackend: "claude",
 };
 
 const linearProjects: LinearProject[] = [
