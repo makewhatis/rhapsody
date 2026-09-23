@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 use crate::binding::BoundCredentialLease;
 use crate::broker::BrokerRegistrationPlan;
@@ -233,6 +234,9 @@ pub(crate) struct SessionInner {
     pub(crate) next_ordinal: AtomicU64,
     pub(crate) session_reservations: SessionReservations,
     pub(crate) receipt_slot: Arc<ReceiptSlot>,
+    /// The session-wide cancellation signal an admitted request can await (design §4.2, §7.2).
+    /// Notified synchronously by [`SessionInner::revoke`]; waking a waiter cannot allocate or block.
+    pub(crate) cancellation: Arc<Notify>,
 }
 
 impl SessionInner {
@@ -256,6 +260,7 @@ impl SessionInner {
             next_ordinal: AtomicU64::new(0),
             session_reservations,
             receipt_slot: Arc::new(ReceiptSlot::new()),
+            cancellation: Arc::new(Notify::new()),
         }
     }
 
@@ -271,6 +276,9 @@ impl SessionInner {
             drop(credential);
         }
         lock(&self.broker.registry).revoke_session(&self.id);
+        // Wake every in-flight request so it drops its upstream I/O without waiting for the next
+        // chunk (design §7.2). Synchronous: revocation never depends on an async cleanup task.
+        self.cancellation.notify_waiters();
     }
 
     pub(crate) fn next_ordinal(&self) -> u64 {
@@ -293,6 +301,9 @@ pub(crate) struct TurnInner {
     pub(crate) finalized: Mutex<Option<TurnOutcome>>,
     pub(crate) reservations: Reservations,
     pub(crate) digest: Mutex<Option<TokenDigest>>,
+    /// The turn-scoped cancellation signal for one admitted request (design §4.2, §7.2). Notified
+    /// synchronously from [`Registry::revoke_grant`], which every revocation path funnels through.
+    pub(crate) cancellation: Arc<Notify>,
 }
 
 impl TurnInner {
@@ -313,6 +324,7 @@ impl TurnInner {
             finalized: Mutex::new(None),
             reservations,
             digest: Mutex::new(None),
+            cancellation: Arc::new(Notify::new()),
         }
     }
 
@@ -427,7 +439,7 @@ impl TurnInner {
     /// one method means neither can be hoisted above the lock: a mint that has inserted its grant
     /// but holds the lock is still publishing, and a revocation that read the digest before taking
     /// the lock could miss it and strand the grant.
-    fn revoke_grant(&self) {
+    pub(crate) fn revoke_grant(&self) {
         lock(&self.session.broker.registry).revoke_grant(self);
     }
 
@@ -520,6 +532,9 @@ impl Registry {
         if let Some(digest) = inner.digest() {
             self.grants.remove(&digest);
         }
+        // Wake any admitted request selecting on this grant so it abandons upstream I/O promptly
+        // (design §7.2). The flag is already set, so a waiter that re-checks before waiting returns.
+        inner.cancellation.notify_waiters();
     }
 
     pub(crate) fn revoke_session(&mut self, id: &SessionId) {

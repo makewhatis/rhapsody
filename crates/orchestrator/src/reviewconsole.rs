@@ -479,6 +479,10 @@ impl Orchestrator {
             // watch lifecycle's head — which the reconciliation sweep would read as a supersession
             // of a fresh escalation until the rotating watcher reached it.
             self.review_observed_head.remove(&dismissed);
+            // ...and any in-flight preparation for the coordinate: the sweep will never observe it
+            // again, so a completion that started before the dismissal must not dispatch a review of
+            // work the operator took out of the watch set (STUDIO-988 review round 4, alice #2).
+            self.cancel_review_preparations_for(&dismissed);
             tracing::info!(pr = %pr, rows = dropped, "ticketless review: operator dismissed a pull request from the watch set");
         }
         ReviewControlOutcome::Applied(dropped)
@@ -1512,7 +1516,13 @@ mod tests {
         watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
         // Keyed by the store row's coordinate, casing and all; the operator's own spelling is
         // unnormalized, so the removal must use the matched row's coordinate, not the request's.
-        o.review_observed_head.insert(pr(), HEAD_A.to_string());
+        o.review_observed_head.insert(
+            pr(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
         assert!(
             o.review_observed_head.contains_key(&pr()),
             "precondition: the watcher recorded the head it observed"
@@ -1574,6 +1584,97 @@ mod tests {
         assert_eq!(
             o.handle_review_dismiss(&PrCoord::new("MAKEWHATIS", "RHAPSODY", 12), None),
             ReviewControlOutcome::Applied(1)
+        );
+    }
+
+    // MUTATION GUARD: a dismissal that leaves an in-flight review preparation alone lets a
+    // completion resurrect a live watch row for work the operator removed (STUDIO-988 review round 4,
+    // alice #2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dismissal_cancels_an_in_flight_review_preparation() {
+        use crate::prepare::{
+            PreparationCompletion, PreparationOutcome, PreparedDispatch, PreparedSelection,
+            PreparedTarget, ReviewHeadObservation,
+        };
+        use crate::review::ReviewRun;
+        use crate::testsupport::{DispatchedEntries, HangResolver, record_entries};
+
+        let mut o = ticketless();
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let sink: DispatchedEntries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+
+        let run = ReviewRun {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 12,
+            reviewer: "bob".to_string(),
+            author: "alice".to_string(),
+            repo_url: REPO_URL.to_string(),
+            head_sha: HEAD_B.to_string(),
+            ..Default::default()
+        };
+        // The sweep observed the pull request open at the review's head, so revalidation WOULD accept
+        // the completion were the preparation left alive.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 12),
+            ReviewHeadObservation {
+                open: true,
+                head: HEAD_B.to_string(),
+            },
+        );
+        let route = o.route_for(Some(0)).expect("a configured project route");
+        let target = PreparedTarget::Review {
+            issue: run.synthetic_issue(),
+            run: Box::new(run.clone()),
+            route,
+            commit: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            crate::prepare::BeginPreparation::Started(_)
+        ));
+        let token = o
+            .preparing
+            .get(&run.key())
+            .map(|e| e.token)
+            .expect("review reservation");
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            o.preparing.is_empty(),
+            "the dismissal must cancel the in-flight review preparation"
+        );
+        // A late completion for the cancelled reservation is dropped: no run, no live row.
+        o.handle_dispatch_prepared(
+            run.key(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "opus",
+                    "anthropic",
+                    "rev-1",
+                )),
+                observed_revision: "rev-1".to_string(),
+                resolved: PreparedSelection::default(),
+            },
+        )
+        .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a dismissed review must not dispatch"
+        );
+        assert!(
+            o.store()
+                .load_live_review_watch()
+                .expect("live rows")
+                .is_empty(),
+            "a dismissed review must not come back live"
         );
     }
 }

@@ -268,6 +268,10 @@ impl Orchestrator {
             return;
         }
         self.gh_source = self.new_github_summon_source();
+        // STUDIO-988: a reload changes what any in-flight preparation would resolve and what a
+        // refusal meant, so cancel every reservation (bumping the config generation so a late
+        // completion is stale) and re-arm the refusal gate exactly once.
+        self.reload_preparations();
         tracing::info!(path = %self.workflow_path, "workflow reloaded");
     }
 

@@ -566,10 +566,16 @@ impl Orchestrator {
             return ReviewIntroOutcome::AlreadyWatched;
         }
         // The daemon's last observation of this pull request's head (STUDIO-1005's memo, written on
-        // the control task by the review sweep). It is what tells an approval of the CURRENT head
-        // from one the author has since pushed past; `None` means the watcher has not observed this
-        // coordinate yet, and the loop below then treats a recorded approval as still current.
-        let observed_head = self.review_observed_head.get(&pr.pr).map(String::as_str);
+        // the control task by the review sweep; STUDIO-988 widened the memo's value to carry the
+        // open/closed bit beside the head). It is what tells an approval of the CURRENT head from one
+        // the author has since pushed past; `None` means the watcher has not observed this coordinate
+        // yet, and the loop below then treats a recorded approval as still current. Only the HEAD is
+        // read here — a closed observation carries an empty head, which matches no recorded approval,
+        // so its row is armed exactly as an observation of a different head would arm it.
+        let observed_head = self
+            .review_observed_head
+            .get(&pr.pr)
+            .map(|observed| observed.head.as_str());
         let mut written = 0usize;
         for reviewer in pr.reviewers.iter().filter(|r| !r.trim().is_empty()) {
             let key = ReviewWatchKey {
@@ -1415,8 +1421,13 @@ mod tests {
             approve_row(&o, reviewer, HEAD_A);
         }
         // The watcher has observed the head these approvals were recorded at.
-        o.review_observed_head
-            .insert(pr.pr.clone(), HEAD_A.to_string());
+        o.review_observed_head.insert(
+            pr.pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
 
         // Both re-introductions at this unchanged head write nothing.
         assert_eq!(
@@ -1468,8 +1479,13 @@ mod tests {
         for reviewer in ["alice", "bob", "carol"] {
             approve_row(&o, reviewer, HEAD_A);
         }
-        o.review_observed_head
-            .insert(pr.pr.clone(), HEAD_B.to_string());
+        o.review_observed_head.insert(
+            pr.pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_B.to_string(),
+            },
+        );
 
         assert_eq!(
             o.handle_review_introduce(&pr),
@@ -1502,8 +1518,13 @@ mod tests {
         o.store()
             .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
             .expect("completed");
-        o.review_observed_head
-            .insert(pr.pr.clone(), HEAD_A.to_string());
+        o.review_observed_head.insert(
+            pr.pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_A.to_string(),
+            },
+        );
 
         assert_eq!(
             o.handle_review_introduce(&pr),

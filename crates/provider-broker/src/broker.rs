@@ -219,6 +219,13 @@ impl Broker {
         })
     }
 
+    /// The loopback base URL this broker's turn capabilities carry
+    /// (`http://127.0.0.1:<ephemeral>/v1`). Non-secret: it is the child-facing address, not a
+    /// credential.
+    pub fn base_url(&self) -> &str {
+        &self.inner.base_url
+    }
+
     /// Resolve a presented bearer value to its live grant.
     ///
     /// Missing, malformed, unknown, expired, and revoked values all return
