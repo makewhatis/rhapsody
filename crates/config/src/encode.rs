@@ -27,7 +27,8 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::decode::ConfigError;
 use crate::model::{
-    Config, Project, Raw, RawClaudeOverride, RawHooks, RawNotify, RawProject, RawProviderBudget,
+    Config, Project, Raw, RawBrokerLimits, RawClaudeOverride, RawCredentialRef, RawHooks,
+    RawNotify, RawProject, RawProviderBudget, RawProviderDefinition,
 };
 use crate::workflow::Definition;
 
@@ -109,6 +110,10 @@ fn raw_from_config(c: &Config) -> Raw {
     r.hooks.timeout_ms = Some(c.hooks.timeout_ms);
 
     r.agent.backend = c.agent.backend.clone();
+    // STUDIO-984 (Rhapsody-only): emit only when set; `prune_empty` drops the empty strings so an
+    // install that never writes a normalized provider/model round-trips byte-identically.
+    r.agent.provider = c.agent.provider.clone();
+    r.agent.model = c.agent.model.clone();
     r.agent.max_concurrent_agents = Some(c.agent.max_concurrent_agents);
     // STUDIO-950: emit only when set; `prune_empty` drops the `None` so an untouched workflow
     // round-trips without the key (and stays byte-identical to the pre-key config).
@@ -216,6 +221,17 @@ fn raw_from_config(c: &Config) -> Raw {
             ntfy: c.notify.ntfy.clone(),
         });
     }
+    // STUDIO-984 (Rhapsody-only): a configured provider round-trips; an empty map prunes away,
+    // preserving the no-providers default. A field equal to its V1 default is omitted, so a defaulted
+    // block is never frozen into the file; the capability lifetime is compared as an `Option` so an
+    // explicit value equal to today's derived default is preserved verbatim (jimmy round-6, N1).
+    let default_limits = crate::providers::BrokerLimits::default();
+    for (id, def) in &c.providers {
+        r.providers.insert(
+            id.clone(),
+            raw_provider_from_definition(def, &default_limits),
+        );
+    }
     r.tracker.project_slug = c.tracker.project_slug.clone();
 
     if collapsible_to_single(c) {
@@ -226,7 +242,11 @@ fn raw_from_config(c: &Config) -> Raw {
             r.repo = p.repo.clone();
         }
     } else if !c.projects.is_empty() {
-        r.projects = c.projects.iter().map(raw_project_from_project).collect();
+        r.projects = c
+            .projects
+            .iter()
+            .map(|p| raw_project_from_project(p, &default_limits))
+            .collect();
     }
 
     r
@@ -264,13 +284,105 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.dep_mode_prompt_file.is_empty()
         && p.promote_from_states.is_empty()
         && p.claim_mode.is_empty()
+        && p.providers.is_empty()
         && p.enabled.is_none()
+}
+
+/// Emits a raw field only when it differs from its derived default, so a defaulted value is never
+/// frozen into the file (the `allow_insecure_http` pattern, applied field-by-field to broker limits).
+fn raw_limit<T: PartialEq>(value: T, default: T) -> Option<T> {
+    if value == default { None } else { Some(value) }
+}
+
+/// Maps one typed [`ProviderDefinition`] to a [`RawProviderDefinition`] (STUDIO-984), the inverse of
+/// `decode`'s provider mapping. `allow_insecure_http` is emitted only when `true` so an omitted or
+/// explicit `false` value round-trips identically; a `broker_limits` field is emitted only when it
+/// differs from the V1 default — an absent block decodes to exactly that default, so it is never pinned
+/// into the operator's file. The capability lifetime is an `Option` on both sides, so an explicitly-set
+/// value equal to today's derived default is emitted (and survives), while an unset one stays unset.
+fn raw_provider_from_definition(
+    def: &crate::providers::ProviderDefinition,
+    default_limits: &crate::providers::BrokerLimits,
+) -> RawProviderDefinition {
+    let l = &def.broker_limits;
+    let d = default_limits;
+    // Emit each field only when it differs from the derived default. A block-less provider on any
+    // deadline (including a sub-hour one) therefore writes NO `broker_limits:` key, and a partial
+    // explicit block writes only its explicitly-set fields; an absent block re-derives identically.
+    let block = RawBrokerLimits {
+        forwarded_requests_per_turn: raw_limit(
+            l.forwarded_requests_per_turn,
+            d.forwarded_requests_per_turn,
+        ),
+        denied_requests_before_revocation: raw_limit(
+            l.denied_requests_before_revocation,
+            d.denied_requests_before_revocation,
+        ),
+        concurrent_upstream_requests_per_turn: raw_limit(
+            l.concurrent_upstream_requests_per_turn,
+            d.concurrent_upstream_requests_per_turn,
+        ),
+        json_request_bytes: raw_limit(l.json_request_bytes, d.json_request_bytes),
+        aggregate_request_bytes_per_turn: raw_limit(
+            l.aggregate_request_bytes_per_turn,
+            d.aggregate_request_bytes_per_turn,
+        ),
+        response_bytes_per_request: raw_limit(
+            l.response_bytes_per_request,
+            d.response_bytes_per_request,
+        ),
+        aggregate_response_bytes_per_turn: raw_limit(
+            l.aggregate_response_bytes_per_turn,
+            d.aggregate_response_bytes_per_turn,
+        ),
+        requested_output_tokens_per_request: raw_limit(
+            l.requested_output_tokens_per_request,
+            d.requested_output_tokens_per_request,
+        ),
+        reserved_token_units_per_turn: raw_limit(
+            l.reserved_token_units_per_turn,
+            d.reserved_token_units_per_turn,
+        ),
+        reserved_token_units_per_session: raw_limit(
+            l.reserved_token_units_per_session,
+            d.reserved_token_units_per_session,
+        ),
+        // The lifetime is already an `Option` on both sides: `Some` means explicitly set (emit it even
+        // if it equals today's derived default), `None` means derive at read time (emit nothing).
+        capability_lifetime_ms: l.capability_lifetime_ms,
+        max_reserved_token_units_per_utc_day: l.max_reserved_token_units_per_utc_day,
+    };
+    RawProviderDefinition {
+        protocol: def.protocol.clone(),
+        display_name: def.display_name.clone(),
+        base_url: def.base_url.clone(),
+        allow_insecure_http: if def.allow_insecure_http {
+            Some(true)
+        } else {
+            None
+        },
+        credential: Some(RawCredentialRef {
+            source: def.credential.source.clone(),
+        }),
+        // Emit the limits block ONLY when at least one field differs from the derived default. An
+        // absent block decodes to exactly these values, so omitting it round-trips. Writing all
+        // eleven defaulted values on every Save would pin today's V1 defaults — including the
+        // deadline-derived lifetime — forever in an operator's file.
+        broker_limits: if block == RawBrokerLimits::default() {
+            None
+        } else {
+            Some(block)
+        },
+    }
 }
 
 /// Maps one typed [`Project`] to a [`RawProject`] (Go `rawProjectFromProject`), the inverse of
 /// `decode`'s per-project field copy. Override pointers/slices are copied verbatim (`None`/empty ⇒
 /// inherit) so `prune_empty` drops them and the round-trip preserves inherit-vs-set fidelity.
-fn raw_project_from_project(p: &Project) -> RawProject {
+fn raw_project_from_project(
+    p: &Project,
+    default_limits: &crate::providers::BrokerLimits,
+) -> RawProject {
     let mut rp = RawProject {
         name: p.name.clone(),
         repo: p.repo.clone(),
@@ -294,6 +406,16 @@ fn raw_project_from_project(p: &Project) -> RawProject {
         labels: p.labels.clone(),
         capabilities: p.capabilities.clone(),
         enabled: p.enabled,
+        providers: p
+            .providers
+            .iter()
+            .map(|(id, def)| {
+                (
+                    id.clone(),
+                    raw_provider_from_definition(def, default_limits),
+                )
+            })
+            .collect(),
     };
     if let Some(ov) = &p.claude {
         rp.claude = Some(RawClaudeOverride {
@@ -1127,5 +1249,331 @@ mod tests {
         let bare = "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n";
         let c3 = re_encode_decode(&decode_map(bare, "body"));
         assert!(c3.tracker.promote_from_states.is_empty());
+    }
+
+    // STUDIO-984 (Rhapsody-only, DATA-LOSS class): a provider definition and the normalized
+    // provider/model selection MUST survive an Encode->Decode round-trip, or a Settings save would
+    // silently drop an operator's whole provider configuration. An untouched workflow must
+    // materialize nothing, so the golden/legacy shape is unchanged.
+    #[test]
+    fn providers_round_trip_and_an_absent_block_materializes_nothing() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
+            "providers:\n",
+            "  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            "    allow_insecure_http: false\n",
+            "    credential:\n      source: keychain\n",
+            "    broker_limits:\n      reserved_token_units_per_session: 5000000\n",
+            "      max_reserved_token_units_per_utc_day: 2000000\n",
+        );
+        let c1 = decode_map(front, "body");
+        assert_eq!(c1.agent.provider, "fireworks");
+        assert_eq!(
+            c1.agent.model,
+            "accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        let def = &c1.providers["fireworks"];
+        assert_eq!(def.credential.source, "keychain");
+        assert_eq!(
+            def.broker_limits.max_reserved_token_units_per_utc_day,
+            Some(2_000_000)
+        );
+
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(
+            c2, c1,
+            "provider config must be stable through Encode->Decode"
+        );
+
+        // An untouched workflow materializes no providers block and no selection.
+        let absent = decode_map(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "body",
+        );
+        let def = encode(&absent).expect("encode");
+        assert!(!def.config.contains_key("providers"));
+        assert_eq!(nested(&def.config, "agent", "provider"), None);
+        assert_eq!(nested(&def.config, "agent", "model"), None);
+        assert!(re_encode_decode(&absent).providers.is_empty());
+    }
+
+    // A provider with no `broker_limits:` block must emit NO broker_limits key on encode — the
+    // defaulted V1 column is not pinned into the operator's file — yet still decode back identically.
+    #[test]
+    fn encoded_provider_omits_the_default_broker_limits_block() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        let def = encode(&c).expect("encode");
+        let entry = def
+            .config
+            .get("providers")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get("fireworks"))
+            .and_then(Value::as_mapping)
+            .expect("provider entry present");
+        assert!(
+            !entry.contains_key("broker_limits"),
+            "a defaulted broker_limits block must not be written into the file: {entry:?}"
+        );
+        assert_eq!(
+            re_encode_decode(&c).providers,
+            c.providers,
+            "omitting the defaulted block must still round-trip"
+        );
+    }
+
+    // MUTATION GUARD (secret hygiene / serialization shape): the serialized provider entry carries
+    // EXACTLY the non-secret keys the design allows. Adding a secret-bearing field that reaches the
+    // front matter changes this key set and reds the test.
+    #[test]
+    fn encoded_provider_entry_has_no_secret_bearing_keys() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n",
+            "    base_url: https://api.fireworks.ai/inference/v1\n",
+            "    credential:\n      source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        let def = encode(&c).expect("encode");
+        let entry = def
+            .config
+            .get("providers")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get("fireworks"))
+            .and_then(Value::as_mapping)
+            .expect("provider entry present");
+        let mut keys: Vec<String> = entry
+            .keys()
+            .map(|k| k.as_str().unwrap_or_default().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["base_url", "credential", "display_name", "protocol"],
+            "the serialized provider entry must carry no secret-bearing key; the defaulted \
+             broker_limits block is omitted rather than pinned into the file"
+        );
+        let credential = entry
+            .get("credential")
+            .and_then(Value::as_mapping)
+            .expect("credential mapping");
+        let ckeys: Vec<&str> = credential
+            .keys()
+            .map(|k| k.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ckeys,
+            vec!["source"],
+            "credential carries only a source kind"
+        );
+    }
+
+    /// The encoded `providers.<id>` mapping, or `None` when the entry/key is absent.
+    fn encoded_provider_entry(c: &Config, id: &str) -> Option<Value> {
+        let def = encode(c).expect("encode");
+        def.config
+            .get("providers")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get(id))
+            .and_then(Value::as_mapping)
+            .cloned()
+            .map(Value::Mapping)
+    }
+
+    /// Re-decode an encoded [`Definition`] after rewriting `opencode.turn_timeout_ms`, modelling an
+    /// operator editing the deadline between two console Saves.
+    fn re_decode_with_turn_timeout(def: &Definition, ms: i64) -> Config {
+        let mut d = def.clone();
+        let key = Value::String("opencode".to_string());
+        match d.config.get_mut(&key) {
+            Some(Value::Mapping(m)) => {
+                m.insert(
+                    Value::String("turn_timeout_ms".to_string()),
+                    Value::Number(ms.into()),
+                );
+            }
+            _ => {
+                let mut m = Mapping::new();
+                m.insert(
+                    Value::String("turn_timeout_ms".to_string()),
+                    Value::Number(ms.into()),
+                );
+                d.config.insert(key, Value::Mapping(m));
+            }
+        }
+        decode(&d).expect("decode")
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, DATA-LOSS class): on a SUB-HOUR OpenCode install, a console
+    // Save must not bake the DERIVED `capability_lifetime_ms` into WORKFLOW.md. If encode compared the
+    // block against the fixed compile-time default instead of this config's deadline-derived default,
+    // a block-less provider would write all eleven limits with the pinned 1800000 lifetime; a later
+    // `opencode.turn_timeout_ms` edit would then silently freeze it, or invalidate the config when
+    // lowered. This test decodes at 1800000 and proves the encoded file tracks a later edit.
+    #[test]
+    fn encoded_provider_does_not_pin_a_sub_hour_derived_lifetime() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            None,
+            "an omitted lifetime stays `None` (derived at read time), not baked into the typed value"
+        );
+        let deadline = crate::providers::provider_turn_deadline_ms(c.opencode.turn_timeout_ms);
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(deadline),
+            1_800_000,
+            "the DERIVED lifetime must be min(1h, deadline)"
+        );
+
+        let def = encode(&c).expect("encode");
+        let entry = encoded_provider_entry(&c, "fireworks").expect("provider entry present");
+        assert!(
+            entry.get("broker_limits").is_none(),
+            "a defaulted block must not be pinned into the file on a sub-hour install: {entry:?}"
+        );
+        // Editing the deadline later must move the derived lifetime — nothing was pinned.
+        let lowered = re_decode_with_turn_timeout(&def, 900_000);
+        assert_eq!(
+            lowered.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    lowered.opencode.turn_timeout_ms
+                )),
+            900_000
+        );
+        let raised = re_decode_with_turn_timeout(&def, 3_600_000);
+        assert_eq!(
+            raised.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    raised.opencode.turn_timeout_ms
+                )),
+            3_600_000
+        );
+    }
+
+    // MUTATION GUARD (STUDIO-984, jimmy round-6 N1): an explicitly-set lifetime EQUAL to today's
+    // derived default must survive a Save. If encode cannot tell "explicit" from "equals the derived
+    // default", it drops the value, and a later deadline raise silently WIDENS the operator's narrowed
+    // capability. The explicit `1800000` on a 30-minute install must still be 30 minutes after the
+    // deadline is raised to two hours.
+    #[test]
+    fn an_explicit_lifetime_equal_to_the_derived_default_survives_a_deadline_raise() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+            "    broker_limits:\n      capability_lifetime_ms: 1800000\n",
+        );
+        let c = decode_map(front, "body");
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            Some(1_800_000)
+        );
+        let def = encode(&c).expect("encode");
+        let entry = encoded_provider_entry(&c, "fireworks").expect("provider entry present");
+        assert_eq!(
+            entry
+                .get("broker_limits")
+                .and_then(Value::as_mapping)
+                .and_then(|m| m.get(Value::String("capability_lifetime_ms".to_string()))),
+            Some(&Value::Number(1_800_000.into())),
+            "an explicit lifetime equal to the derived default must still be written: {entry:?}"
+        );
+        // Raising the deadline must NOT widen the operator's explicit 30 minutes.
+        let raised = re_decode_with_turn_timeout(&def, 7_200_000);
+        assert_eq!(
+            raised.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            Some(1_800_000),
+            "the explicit 30-minute lifetime must survive a deadline raise"
+        );
+        assert_eq!(
+            raised.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    raised.opencode.turn_timeout_ms
+                )),
+            1_800_000
+        );
+    }
+
+    // A PARTIAL explicit block must keep only its set fields, so the defaulted lifetime is not dragged
+    // into the file next to it. Decoding re-materializes the rest from the same deadline.
+    #[test]
+    fn a_partial_broker_limits_block_encodes_only_its_set_fields() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+            "    broker_limits:\n      forwarded_requests_per_turn: 10\n",
+        );
+        let c = decode_map(front, "body");
+        let entry = encoded_provider_entry(&c, "fireworks").expect("provider entry present");
+        let block = entry
+            .get("broker_limits")
+            .and_then(Value::as_mapping)
+            .expect("the explicitly-set field keeps the block present");
+        let keys: Vec<&str> = block
+            .keys()
+            .map(|k| k.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["forwarded_requests_per_turn"],
+            "only the explicitly-set field may be written: {entry:?}"
+        );
+        assert_eq!(
+            block.get(Value::String("forwarded_requests_per_turn".to_string())),
+            Some(&Value::Number(10.into()))
+        );
+        assert_eq!(
+            re_encode_decode(&c).providers,
+            c.providers,
+            "a partial block must still round-trip"
+        );
+    }
+
+    // MUTATION GUARD (STUDIO-984 review): the `&& p.providers.is_empty()` guard in
+    // `collapsible_to_single` stops a single TRIVIAL project that has providers from collapsing to the
+    // legacy `project_slug` form, which would drop its providers. Removing that guard reds this test.
+    #[test]
+    fn a_single_trivial_project_with_providers_is_not_collapsed() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "projects:\n- slugs: [p]\n  providers:\n    projp:\n      protocol: openai-compatible\n      base_url: https://project.example/v1\n      credential:\n        source: keychain\n",
+        );
+        let c = decode_map(front, "body");
+        assert_eq!(c.projects.len(), 1);
+        assert_eq!(c.projects[0].providers.len(), 1);
+        let c2 = re_encode_decode(&c);
+        assert_eq!(c2.projects.len(), 1, "the project must survive encode");
+        assert!(
+            c2.projects[0].providers.contains_key("projp"),
+            "a single trivial project's providers must survive encode: {:?}",
+            c2.projects
+        );
     }
 }

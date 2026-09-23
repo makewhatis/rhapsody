@@ -27,6 +27,10 @@ use crate::model::{
     DEPENDENCY_MODE_GRAPHITE, WORKSPACE_MODE_CLONE, WORKSPACE_MODE_WORKTREE,
 };
 use crate::projects::{EffectiveConfig, effective_for};
+use crate::providers::{
+    CREDENTIAL_SOURCE_KEYCHAIN, MAX_PROVIDERS, PROTOCOL_OPENAI_COMPATIBLE,
+    PROVIDER_HARNESS_BACKENDS, base_url_scheme, canonical_provider_id,
+};
 use crate::resolve::Resolved;
 
 /// A dispatch-preflight rejection (Go `internal/config`'s `Err*` sentinels wrapped via
@@ -98,6 +102,28 @@ pub enum ValidationError {
     /// `agent.handoff_drain_grace_ms` is negative (Go `ErrInvalidAgent`).
     #[error("invalid_agent: {0}")]
     InvalidAgent(String),
+    /// A provider definition is malformed (STUDIO-984; Rhapsody-only): a non-canonical id, an
+    /// unsupported protocol, a missing/insecure `base_url`, an unsupported credential source, or a
+    /// broker limit out of range. Carries an actionable reason.
+    #[error("invalid_provider: {0}")]
+    InvalidProvider(String),
+    /// The effective workflow defines more than [`crate::providers::MAX_PROVIDERS`] providers
+    /// (STUDIO-984).
+    #[error("too_many_providers: {0}")]
+    TooManyProviders(String),
+    /// `agent.provider` names a provider that does not exist in the effective set (STUDIO-984).
+    #[error("unknown_provider: {0}")]
+    UnknownProvider(String),
+    /// A provider names a protocol this build does not understand (STUDIO-984).
+    #[error("unsupported_provider_protocol: {0}")]
+    UnsupportedProviderProtocol(String),
+    /// An explicit provider was selected for a harness that has no provider adapter in v1
+    /// (STUDIO-984): only OpenCode materializes providers.
+    #[error("unsupported_provider_harness: {0}")]
+    UnsupportedProviderHarness(String),
+    /// The selected provider's model id violates §2.2's transport bounds (STUDIO-984).
+    #[error("invalid_provider_model: {0}")]
+    InvalidProviderModel(String),
 }
 
 /// Runs the scheduler preflight checks on a resolved config (Go `ValidateDispatch`, upstream §6.3).
@@ -165,6 +191,127 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
         return Err(ValidationError::MissingAgentCommand(
             config.agent.backend.clone(),
         ));
+    }
+    validate_providers(config)?;
+    Ok(())
+}
+
+/// The effective turn deadline (milliseconds) that bounds a provider's capability lifetime
+/// (`provider-broker-design.md` §8.1). V1 materializes providers for OpenCode only, so this is
+/// OpenCode's deadline with an absent/explicit-`0` value materialized to one hour exactly as the
+/// runner does — never the SELECTED backend's deadline, so a `providers:` block on a Claude install
+/// is not failed by a provider that Claude will never consume.
+fn provider_turn_deadline_ms(config: &Resolved) -> u64 {
+    crate::providers::provider_turn_deadline_ms(config.opencode.turn_timeout_ms)
+}
+
+/// Validates the provider configuration (STUDIO-984; Rhapsody-only). Every scope's EFFECTIVE set is
+/// checked (the global map, and each project's global-overlaid-with-own set), then the normalized
+/// `agent.provider`/`agent.model` selection. A no-op when nothing is configured, so a provider-less
+/// workflow validates exactly as before.
+///
+/// The rules are exactly the ticket's: at most [`MAX_PROVIDERS`] per effective scope; canonical ids;
+/// an explicit known protocol; a `base_url` required for the compatible protocol with the
+/// `allow_insecure_http` policy honored; a supported credential source kind; validated broker limits;
+/// and — for an explicit selection — OpenCode only in v1 with an exact, transport-valid model.
+fn validate_providers(config: &Resolved) -> Result<(), ValidationError> {
+    let turn_timeout = provider_turn_deadline_ms(config);
+    validate_provider_map("global", &config.providers, turn_timeout)?;
+    for (i, p) in config.projects.iter().enumerate() {
+        let mut merged = config.providers.clone();
+        for (id, def) in &p.providers {
+            merged.insert(id.clone(), def.clone());
+        }
+        validate_provider_map(&format!("project {i}"), &merged, turn_timeout)?;
+    }
+
+    // A normalized model selection is always transport-validated when written, provider or not, so a
+    // set-but-invalid `agent.model` is never silently ignored.
+    if !config.agent.model.is_empty() {
+        crate::providers::validate_model_id(&config.agent.model).map_err(|reason| {
+            ValidationError::InvalidProviderModel(format!("agent.model: {reason}"))
+        })?;
+    }
+
+    if config.agent.provider.is_empty() {
+        return Ok(());
+    }
+    // V1 scopes provider materialization to OpenCode (`provider-auth-design.md` §3). Claude keeps its
+    // native login path; selecting an explicit provider with it is refused.
+    if !PROVIDER_HARNESS_BACKENDS.contains(&config.agent.backend.as_str()) {
+        return Err(ValidationError::UnsupportedProviderHarness(format!(
+            "agent.backend {:?} has no provider adapter in v1; only opencode can consume a provider \
+             (got agent.provider {:?})",
+            config.agent.backend, config.agent.provider
+        )));
+    }
+    let Some(def) = config.providers.get(&config.agent.provider) else {
+        return Err(ValidationError::UnknownProvider(format!(
+            "agent.provider {:?} is not defined in providers:",
+            config.agent.provider
+        )));
+    };
+    // The protocol was already validated as a definition; re-check for a clear selection error.
+    if def.protocol != PROTOCOL_OPENAI_COMPATIBLE {
+        return Err(ValidationError::UnsupportedProviderProtocol(format!(
+            "provider {:?} uses unsupported protocol {:?} (want {:?})",
+            def.id, def.protocol, PROTOCOL_OPENAI_COMPATIBLE
+        )));
+    }
+    // An explicit provider requires an exact model for the brokered adapter.
+    crate::providers::validate_model_id(&config.agent.model).map_err(|reason| {
+        ValidationError::InvalidProviderModel(format!(
+            "agent.provider {:?} requires an exact model: {reason}",
+            config.agent.provider
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validates one provider map, naming the scope in every message. See [`validate_providers`].
+fn validate_provider_map(
+    scope: &str,
+    providers: &std::collections::BTreeMap<String, crate::providers::ProviderDefinition>,
+    turn_timeout: u64,
+) -> Result<(), ValidationError> {
+    if providers.len() > MAX_PROVIDERS {
+        return Err(ValidationError::TooManyProviders(format!(
+            "{scope} defines {} providers (max {MAX_PROVIDERS})",
+            providers.len()
+        )));
+    }
+    for (id, def) in providers {
+        let invalid = |reason: String| {
+            ValidationError::InvalidProvider(format!("{scope}: provider {id:?}: {reason}"))
+        };
+        canonical_provider_id(id).map_err(invalid)?;
+        if def.id != *id {
+            return Err(invalid(format!(
+                "definition id {:?} does not match its map key",
+                def.id
+            )));
+        }
+        if def.protocol != PROTOCOL_OPENAI_COMPATIBLE {
+            return Err(ValidationError::UnsupportedProviderProtocol(format!(
+                "{scope}: provider {id:?} uses unsupported protocol {:?} (want {:?})",
+                def.protocol, PROTOCOL_OPENAI_COMPATIBLE
+            )));
+        }
+        if !def.credential.is_supported() {
+            return Err(invalid(format!(
+                "credential source {:?} is unsupported (want {:?})",
+                def.credential.source, CREDENTIAL_SOURCE_KEYCHAIN
+            )));
+        }
+        if def.base_url.is_empty() {
+            return Err(invalid(format!(
+                "base_url is required for protocol {:?}",
+                PROTOCOL_OPENAI_COMPATIBLE
+            )));
+        }
+        base_url_scheme(&def.base_url, def.allow_insecure_http).map_err(invalid)?;
+        def.normalized_base_url().map_err(invalid)?;
+        def.broker_limits.validate(turn_timeout).map_err(invalid)?;
     }
     Ok(())
 }
@@ -1104,5 +1251,347 @@ mod tests {
             err.to_string(),
             "invalid_storage: storage.retention_days must be >= 0 (0 = keep forever)"
         );
+    }
+
+    // ---- STUDIO-984 provider config validation (Rhapsody-only) ----
+
+    /// A minimal front matter with a `providers:` block plus a normalized OpenCode selection. The
+    /// provider id and selection are parameters so each row isolates one defect.
+    fn provider_cfg(providers: &str, backend: &str, provider: &str, model: &str) -> Config {
+        // Quote provider/model so an empty value decodes as the empty STRING (meaning "unset") rather
+        // than YAML null.
+        let front = format!(
+            concat!(
+                "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n",
+                "agent:\n  backend: \"{}\"\n  provider: \"{}\"\n  model: \"{}\"\n",
+                "{}",
+            ),
+            backend, provider, model, providers
+        );
+        cfg_from(&front, "body")
+    }
+
+    const ONE_PROVIDER: &str = "providers:\n  fireworks:\n    protocol: openai-compatible\n    display_name: Fireworks\n    base_url: https://api.fireworks.ai/inference/v1\n    credential:\n      source: keychain\n";
+
+    // The happy path: an explicit OpenCode provider with a valid model validates.
+    #[test]
+    fn provider_selection_ok_for_opencode() {
+        let mut c = provider_cfg(
+            ONE_PROVIDER,
+            "opencode",
+            "fireworks",
+            "accounts/fireworks/models/deepseek-v4p1-flash",
+        );
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+    }
+
+    // Old workflows (no providers, no selection) are unaffected — the no-op path.
+    #[test]
+    fn no_providers_validates_as_before() {
+        let mut c = cfg_from(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n",
+            "body",
+        );
+        assert!(validate(&mut c).is_ok());
+    }
+
+    // MUTATION GUARD: a registry over the 256-entry hard ceiling is rejected. Accepting 257 reds
+    // this test.
+    #[test]
+    fn too_many_providers_is_rejected() {
+        let mut front = String::new();
+        front.push_str(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\nproviders:\n",
+        );
+        for i in 0..=MAX_PROVIDERS {
+            front.push_str(&format!(
+                "  p{i}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            ));
+        }
+        let mut c = cfg_from(&front, "body");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::TooManyProviders(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("max 256"), "{err}");
+    }
+
+    // MUTATION GUARD: the per-project overlay is validated against the EFFECTIVE merged set, not the
+    // project's own map. Seeding `merged` with an empty map instead of the global providers leaves
+    // every other test green while accepting a 250-global + 10-project = 260-provider registry.
+    #[test]
+    fn project_overlay_counts_against_the_effective_ceiling() {
+        let mut front = String::from(
+            "tracker:\n  kind: linear\n  api_key: tok\nrepo: git@github.com:o/x.git\nproviders:\n",
+        );
+        for i in 0..250 {
+            front.push_str(&format!(
+                "  g{i}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            ));
+        }
+        front.push_str("projects:\n  - name: P\n    slugs: [a-1]\n    providers:\n");
+        for i in 0..10 {
+            front.push_str(&format!(
+                "      p{i}:\n        protocol: openai-compatible\n        base_url: https://example/v1\n        credential:\n          source: keychain\n"
+            ));
+        }
+        let mut c = cfg_from(&front, "body");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::TooManyProviders(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("project 0"), "{err}");
+
+        // A project entry that OVERLAYS an existing id does not add to the effective count.
+        let mut front = String::from(
+            "tracker:\n  kind: linear\n  api_key: tok\nrepo: git@github.com:o/x.git\nproviders:\n",
+        );
+        for i in 0..250 {
+            front.push_str(&format!(
+                "  g{i}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            ));
+        }
+        front.push_str(
+            "projects:\n  - name: P\n    slugs: [a-1]\n    providers:\n      g0:\n        protocol: openai-compatible\n        base_url: https://overlay.example/v1\n        credential:\n          source: keychain\n",
+        );
+        let mut c = cfg_from(&front, "body");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+    }
+
+    // MUTATION GUARD: non-canonical ids (uppercase, leading digit, dot) are rejected, never
+    // case-folded. A parser that lowercases first reds the uppercase row.
+    #[test]
+    fn non_canonical_provider_ids_are_rejected() {
+        for bad in ["Fireworks", "9lives", "has.dot", "has space"] {
+            let providers = format!(
+                "providers:\n  {bad:?}:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n"
+            );
+            let mut c = provider_cfg(&providers, "opencode", "", "");
+            let err = validate(&mut c).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::InvalidProvider(_)),
+                "id {bad:?}: {err:?}"
+            );
+        }
+    }
+
+    // MUTATION GUARD: an unknown protocol is a typed refusal naming the value.
+    #[test]
+    fn unknown_protocol_is_rejected() {
+        let providers = "providers:\n  fireworks:\n    protocol: anthropic-messages\n    base_url: https://example/v1\n    credential:\n      source: keychain\n";
+        let mut c = provider_cfg(providers, "opencode", "", "");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::UnsupportedProviderProtocol(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("anthropic-messages"), "{err}");
+    }
+
+    // MUTATION GUARD: http without `allow_insecure_http: true` is rejected; the same URL with the
+    // opt-in passes; and `true` on https is rejected. A policy checker that infers from loopback or
+    // ignores the flag reds a row here.
+    #[test]
+    fn provider_tls_policy_is_enforced() {
+        let http_no_optin = "providers:\n  local:\n    protocol: openai-compatible\n    base_url: http://localhost:8080/v1\n    credential:\n      source: keychain\n";
+        let mut c = provider_cfg(http_no_optin, "opencode", "", "");
+        assert!(matches!(
+            validate(&mut c),
+            Err(ValidationError::InvalidProvider(_))
+        ));
+
+        let http_optin = "providers:\n  local:\n    protocol: openai-compatible\n    base_url: http://localhost:8080/v1\n    allow_insecure_http: true\n    credential:\n      source: keychain\n";
+        let mut c = provider_cfg(http_optin, "opencode", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+
+        let https_true = "providers:\n  secure:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    allow_insecure_http: true\n    credential:\n      source: keychain\n";
+        let mut c = provider_cfg(https_true, "opencode", "", "");
+        assert!(matches!(
+            validate(&mut c),
+            Err(ValidationError::InvalidProvider(_))
+        ));
+    }
+
+    // A missing base_url for the compatible protocol is refused (it is required for custom
+    // endpoints).
+    #[test]
+    fn provider_missing_base_url_is_rejected() {
+        let providers = "providers:\n  fireworks:\n    protocol: openai-compatible\n    credential:\n      source: keychain\n";
+        let mut c = provider_cfg(providers, "opencode", "", "");
+        assert!(matches!(
+            validate(&mut c),
+            Err(ValidationError::InvalidProvider(_))
+        ));
+    }
+
+    // An unknown credential source kind is refused — and a value-bearing credential block cannot
+    // satisfy it, because only a `source` kind is representable.
+    #[test]
+    fn provider_unknown_credential_source_is_rejected() {
+        let providers = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: env-file\n";
+        let mut c = provider_cfg(providers, "opencode", "", "");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProvider(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("env-file"), "{err}");
+    }
+
+    // Broker limits: an out-of-range value or a broken ordering is refused with the provider named.
+    #[test]
+    fn provider_broker_limits_are_validated() {
+        let over = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n    broker_limits:\n      forwarded_requests_per_turn: 9999\n";
+        let mut c = provider_cfg(over, "opencode", "", "");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProvider(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("forwarded_requests_per_turn"),
+            "{err}"
+        );
+
+        let bad_order = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n    broker_limits:\n      concurrent_upstream_requests_per_turn: 64\n";
+        let mut c = provider_cfg(bad_order, "opencode", "", "");
+        assert!(matches!(
+            validate(&mut c),
+            Err(ValidationError::InvalidProvider(_))
+        ));
+    }
+
+    // MUTATION GUARD (capability lifetime vs the effective turn deadline): the defaulted lifetime is
+    // min(1h, OpenCode's deadline, 0 ⇒ 1h), so a sub-hour deadline TIGHTENS it instead of failing, and
+    // a `providers:` block on a Claude install (a provider Claude never consumes) is not failed by
+    // Claude's deadline. Refusing on the raw configured deadline reds the first two rows.
+    #[test]
+    fn provider_capability_lifetime_uses_the_effective_turn_deadline() {
+        // Explicit turn_timeout_ms: 0 means one hour, exactly as the runner materializes it.
+        let zero = format!("{}opencode:\n  turn_timeout_ms: 0\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&zero, "opencode", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+
+        // A lowered deadline: the defaulted lifetime becomes min(1h, deadline) rather than a refusal.
+        let sub_hour = format!("{}opencode:\n  turn_timeout_ms: 1800000\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&sub_hour, "opencode", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            None,
+            "an omitted lifetime stays `None`, derived at read time"
+        );
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    c.opencode.turn_timeout_ms
+                )),
+            1_800_000,
+            "the effective lifetime must be min(1h, deadline)"
+        );
+
+        // A provider merely DEFINED on a Claude install is inert and must not fail preflight.
+        let claude = format!("{}claude:\n  turn_timeout_ms: 1800000\n", ONE_PROVIDER);
+        let mut c = provider_cfg(&claude, "claude", "", "");
+        assert!(validate(&mut c).is_ok(), "{:?}", validate(&mut c));
+
+        // An EXPLICIT lifetime longer than the effective deadline is still refused.
+        let explicit_over = format!(
+            "{}opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://example/v1\n    credential:\n      source: keychain\n    broker_limits:\n      capability_lifetime_ms: 3600000\n"
+        );
+        let mut c = provider_cfg(&explicit_over, "opencode", "", "");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProvider(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("capability_lifetime_ms"), "{err}");
+    }
+
+    // MUTATION GUARD: an explicit provider with a non-OpenCode harness is refused in v1.
+    #[test]
+    fn explicit_provider_with_claude_is_refused() {
+        let mut c = provider_cfg(
+            ONE_PROVIDER,
+            "claude",
+            "fireworks",
+            "accounts/fireworks/models/deepseek-v4p1-flash",
+        );
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::UnsupportedProviderHarness(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("claude"), "{err}");
+    }
+
+    // MUTATION GUARD: an unknown provider reference is a typed, actionable refusal.
+    #[test]
+    fn unknown_provider_reference_is_refused() {
+        let mut c = provider_cfg(
+            ONE_PROVIDER,
+            "opencode",
+            "missing",
+            "accounts/fireworks/models/deepseek-v4p1-flash",
+        );
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::UnknownProvider(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    // Model ids enforce only the transport bounds: an opaque id with `/` is fine, an empty one is
+    // not (an exact model is required for the brokered adapter).
+    #[test]
+    fn provider_model_transport_bounds_are_enforced() {
+        let mut missing = provider_cfg(ONE_PROVIDER, "opencode", "fireworks", "");
+        assert!(matches!(
+            validate(&mut missing),
+            Err(ValidationError::InvalidProviderModel(_))
+        ));
+
+        let mut padded = provider_cfg(ONE_PROVIDER, "opencode", "fireworks", " padded ");
+        let err = validate(&mut padded).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProviderModel(_)),
+            "{err:?}"
+        );
+
+        // A set model is transport-validated even with no explicit provider, so an invalid one is
+        // never silently ignored.
+        let mut no_provider = provider_cfg(ONE_PROVIDER, "claude", "", " padded ");
+        let err = validate(&mut no_provider).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProviderModel(_)),
+            "{err:?}"
+        );
+    }
+
+    // A project's own provider definitions are part of that project's EFFECTIVE set, so an invalid
+    // per-project provider is refused even when the global set is clean.
+    #[test]
+    fn per_project_provider_definitions_are_validated() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: tok\n",
+            "repo: git@github.com:o/r.git\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+            "projects:\n",
+            "  - slugs: [a-1]\n    providers:\n      broken:\n        protocol: openai-compatible\n        base_url: http://plain.example/v1\n        credential:\n          source: keychain\n",
+        );
+        let mut c = cfg_from(front, "body");
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidProvider(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("project 0"), "{err}");
     }
 }
