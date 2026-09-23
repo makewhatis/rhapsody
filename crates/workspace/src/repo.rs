@@ -1640,7 +1640,9 @@ mod tests {
         loop {
             let joined = tokio::time::timeout(deadline, set.join_next())
                 .await
-                .expect("after_create hooks never both ran: the mirror lock is held across the hook");
+                .expect(
+                    "after_create hooks never both ran: the mirror lock is held across the hook",
+                );
             match joined {
                 Some(joined) => joined.expect("task panicked").expect("ensure failed"),
                 None => break,
