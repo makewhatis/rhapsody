@@ -179,8 +179,8 @@ pub struct SelectionOrigins {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSelection {
     pub harness: HarnessId,
-    /// The harness NAME, kept verbatim so provenance records what was selected even if the name is
-    /// one this build can still run (never rewritten to `agent.backend`).
+    /// The harness NAME (`"claude"`/`"opencode"`), kept beside the typed id so provenance and
+    /// diagnostics can record the selection without re-deriving a string from the enum.
     pub harness_name: String,
     /// The canonical provider id, or `""` when no explicit Rhapsody provider was selected.
     pub provider_id: String,
