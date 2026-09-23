@@ -23,21 +23,38 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use zeroize::{Zeroize, Zeroizing};
+
+use rhapsody_credential_ipc::bounds;
 use rhapsody_credential_ipc::domain::{
     Binding, BoundCredentialLease, CredentialRead, CredentialRef, CredentialState, Revision,
 };
+use rhapsody_credential_ipc::owner::{CredentialOwner, CredentialStatus};
+
+// The typed mutation vocabulary now lives at the shared crate/process boundary (P1) so the daemon
+// and desktop agree on it; re-exported here for the callers that already name these paths.
+pub use rhapsody_credential_ipc::owner::{MutationError, MutationOutcome};
 
 use crate::credential::{Keyring, KeyringError, OsKeyring};
 
 /// The envelope actually persisted in the Keychain item (design §2.4). `version`/`kind` are pinned
 /// to the only currently-supported shape (`1`/`"api_key"`); anything else — or a value that fails
 /// to parse as this shape at all — decodes as [`CredentialState::Malformed`], not `Absent`.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+// No `Clone`: the `value` is a secret, and a derived clone would silently create a second, un-owned
+// copy of it. `Drop` zeroizes the decoded value, so an `Envelope` that falls out of a mutation or a
+// mismatch/status read never leaves key bytes in a freed allocation.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Envelope {
     version: u32,
     kind: String,
     value: String,
     binding: Binding,
+}
+
+impl Drop for Envelope {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
 }
 
 const ENVELOPE_VERSION: u32 = 1;
@@ -57,33 +74,20 @@ enum Snapshot {
 /// guarded critical section is a plain revision read/CAS with no I/O held across an `.await`, so a
 /// poisoned value is still internally consistent; there is no recoverable "error value" a caller
 /// could act on differently than simply continuing with the value as it stood.
-fn lock_revision(m: &Mutex<Revision>) -> MutexGuard<'_, Revision> {
+fn lock_state(m: &Mutex<OwnerState>) -> MutexGuard<'_, OwnerState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One CAS mutation's success outcome (§2.5's table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationOutcome {
-    /// The mutation applied; the owner's revision is now this value.
-    Advanced(Revision),
-    /// Remove against an already-`Absent` credential: no state change, per §2.5's table — the
-    /// returned revision is the unchanged current one.
-    AlreadyAbsent(Revision),
-}
-
-/// One CAS mutation's failure. Every variant leaves the owner's state and revision untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationError {
-    /// `expected_revision` did not match the owner's actual current revision — covers a stale
-    /// read, a concurrent conflicting mutation, and a previously failed/rolled-back attempt alike.
-    /// Carries the real current revision so a caller can decide whether to retry.
-    StaleRevision(Revision),
-    /// The expected revision matched, but this operation's state precondition did not (e.g.
-    /// Connect against a `Present` item, Replace/Rebind against `Absent`, Replace against a
-    /// binding mismatch, or Replace/Rebind against `Malformed` data).
-    PreconditionFailed,
-    /// The Keychain itself refused the read/write right now (locked or access denied).
-    DeniedOrLocked,
+/// The owner's one guarded snapshot state: the opaque revision (design §2.5) plus the last observed
+/// owner reachability. Keeping both under ONE lock is what makes the revision's availability
+/// transition atomic with the state it is returned alongside — a caller can never see a new revision
+/// paired with the old availability, or vice versa.
+struct OwnerState {
+    revision: Revision,
+    /// `None` until the first snapshot is classified; the first classification is not a transition.
+    /// A reachable<->denied/locked change advances `revision` (design §2.5: availability transitions
+    /// carry revisions even when no secret exists), so a refusal gate keyed on the revision re-arms.
+    last_reachable: Option<bool>,
 }
 
 /// Owns exactly one provider credential's Keychain item and in-memory revision. `keyring` is
@@ -92,7 +96,7 @@ pub enum MutationError {
 pub struct ProviderCredentialOwner {
     account: String,
     keyring: Arc<dyn Keyring>,
-    revision: Mutex<Revision>,
+    state: Mutex<OwnerState>,
 }
 
 impl ProviderCredentialOwner {
@@ -115,7 +119,10 @@ impl ProviderCredentialOwner {
         ProviderCredentialOwner {
             account: credential_ref.account().to_string(),
             keyring,
-            revision: Mutex::new(Revision::INITIAL),
+            state: Mutex::new(OwnerState {
+                revision: Revision::INITIAL,
+                last_reachable: None,
+            }),
         }
     }
 
@@ -138,7 +145,7 @@ impl ProviderCredentialOwner {
     }
 
     /// Reads the current revision AND classifies the Keychain item in exactly ONE `get_password`
-    /// call, under the caller's already-held revision lock, returning both PAIRED from this single
+    /// call, under the caller's already-held state lock, returning both PAIRED from this single
     /// call so a caller physically receives them together rather than assembling them from two
     /// separate reads. `read_bound` and every mutation used to make the Keychain call in two pieces
     /// (`probe_access` for the denied/locked check, then `locked_read` for the decode) — sol's
@@ -153,41 +160,78 @@ impl ProviderCredentialOwner {
     /// below build their returned/compared revision only from this pair, so reintroducing either
     /// shape of the defect requires a caller to visibly discard this return value's revision and
     /// substitute a different one, not merely to add one extra line.
-    fn locked_snapshot(&self, guard: &MutexGuard<'_, Revision>) -> (Revision, Snapshot) {
-        let revision = **guard;
+    ///
+    /// This is also the only place owner reachability is observable, so the availability transition
+    /// that must re-arm a refusal gate (§2.5) is applied here, atomically with the paired snapshot.
+    fn locked_snapshot(&self, guard: &mut MutexGuard<'_, OwnerState>) -> (Revision, Snapshot) {
+        // `raw` is the whole serialized envelope, key included. It is held in a zeroizing buffer so
+        // every exit path — decode, malformed, or a mismatch arm that drops the `Envelope` — wipes
+        // it rather than freeing a buffer that still held the secret.
         let snapshot = match self.keyring.get_password() {
-            Ok(raw) if raw.is_empty() => Snapshot::Absent,
-            Ok(raw) => match serde_json::from_str::<Envelope>(&raw) {
-                Ok(env) if env.version == ENVELOPE_VERSION && env.kind == ENVELOPE_KIND => {
-                    Snapshot::Present(env)
+            Ok(raw) => {
+                let raw = Zeroizing::new(raw);
+                if raw.is_empty() {
+                    Snapshot::Absent
+                } else {
+                    match serde_json::from_str::<Envelope>(&raw) {
+                        Ok(env) if env.version == ENVELOPE_VERSION && env.kind == ENVELOPE_KIND => {
+                            Snapshot::Present(env)
+                        }
+                        // A wrong version/kind, or undecodable data, is still "malformed" from this
+                        // owner's point of view — a future envelope version this build does not
+                        // understand must not be silently treated as absent.
+                        Ok(_) | Err(_) => Snapshot::Malformed,
+                    }
                 }
-                // A wrong version/kind, or undecodable data, is still "malformed" from this
-                // owner's point of view — a future envelope version this build does not
-                // understand must not be silently treated as absent.
-                Ok(_) | Err(_) => Snapshot::Malformed,
-            },
+            }
             Err(KeyringError::NoEntry) => Snapshot::Absent,
             Err(KeyringError::Other(_)) => Snapshot::DeniedOrLocked,
         };
-        (revision, snapshot)
+
+        let reachable = !matches!(snapshot, Snapshot::DeniedOrLocked);
+        if matches!(guard.last_reachable, Some(prev) if prev != reachable) {
+            guard.revision = guard.revision.next();
+        }
+        guard.last_reachable = Some(reachable);
+        (guard.revision, snapshot)
     }
 
     /// §2.5 `read_bound`: `Present` only when the stored envelope's binding matches
     /// `expected_binding` exactly; a well-formed envelope with a different binding is
     /// `BindingMismatch`, never a partial/raw disclosure of the stored endpoint or key.
     pub fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
-        let guard = lock_revision(&self.revision);
-        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let mut guard = lock_state(&self.state);
+        let (revision, snapshot) = self.locked_snapshot(&mut guard);
         let state = match snapshot {
             Snapshot::DeniedOrLocked => CredentialState::DeniedOrLocked,
             Snapshot::Malformed => CredentialState::Malformed,
             Snapshot::Absent => CredentialState::Absent,
-            Snapshot::Present(env) if env.binding == *expected_binding => {
-                CredentialState::Present(BoundCredentialLease::new(env.binding, env.value))
+            Snapshot::Present(mut env) if env.binding == *expected_binding => {
+                let value = std::mem::take(&mut env.value);
+                CredentialState::Present(BoundCredentialLease::new(env.binding.clone(), value))
             }
+            // A mismatch drops the decoded `Envelope`, whose own `Drop` zeroizes the value before
+            // this arm returns — never leaving key bytes in a bare `String` (§2.5).
             Snapshot::Present(_) => CredentialState::BindingMismatch,
         };
         CredentialRead { revision, state }
+    }
+
+    /// The owner's configured/unconfigured status, without ever returning the value (§2.5). Dropping
+    /// the decoded `Envelope` zeroizes the value on the way out, exactly as the `BindingMismatch`
+    /// arm of `read_bound` does.
+    ///
+    /// A `Present` envelope whose stored value would now fail the broker's bounds still reports
+    /// `Configured`: the owner does not re-validate on read, and a later Replace repairs the value;
+    /// the stored bytes are never exposed either way.
+    pub fn status(&self) -> CredentialStatus {
+        let mut guard = lock_state(&self.state);
+        let (_revision, snapshot) = self.locked_snapshot(&mut guard);
+        match snapshot {
+            Snapshot::Present(_) => CredentialStatus::Configured,
+            Snapshot::Absent => CredentialStatus::Unconfigured,
+            Snapshot::Malformed | Snapshot::DeniedOrLocked => CredentialStatus::Unavailable,
+        }
     }
 
     /// Connect: requires `Absent` at `expected_revision`. Stores `value` under `binding`.
@@ -197,8 +241,8 @@ impl ProviderCredentialOwner {
         binding: Binding,
         value: String,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = lock_revision(&self.revision);
-        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let mut guard = lock_state(&self.state);
+        let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
@@ -209,8 +253,8 @@ impl ProviderCredentialOwner {
             return Err(MutationError::PreconditionFailed);
         }
         self.store_envelope(binding, value)?;
-        *guard = guard.next();
-        Ok(MutationOutcome::Advanced(*guard))
+        guard.revision = guard.revision.next();
+        Ok(MutationOutcome::Advanced(guard.revision))
     }
 
     /// Replace: requires `Present` (well-formed, current binding) at `expected_revision`. Only the
@@ -221,8 +265,8 @@ impl ProviderCredentialOwner {
         current_binding: &Binding,
         new_value: String,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = lock_revision(&self.revision);
-        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let mut guard = lock_state(&self.state);
+        let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
@@ -235,8 +279,8 @@ impl ProviderCredentialOwner {
             return Err(MutationError::PreconditionFailed);
         }
         self.store_envelope(current_binding.clone(), new_value)?;
-        *guard = guard.next();
-        Ok(MutationOutcome::Advanced(*guard))
+        guard.revision = guard.revision.next();
+        Ok(MutationOutcome::Advanced(guard.revision))
     }
 
     /// Rebind: requires a well-formed (not malformed, not absent) envelope at `expected_revision` —
@@ -247,8 +291,8 @@ impl ProviderCredentialOwner {
         expected_revision: Revision,
         new_binding: Binding,
     ) -> Result<MutationOutcome, MutationError> {
-        let mut guard = lock_revision(&self.revision);
-        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let mut guard = lock_state(&self.state);
+        let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
@@ -256,12 +300,12 @@ impl ProviderCredentialOwner {
             return Err(MutationError::StaleRevision(revision));
         }
         let value = match snapshot {
-            Snapshot::Present(env) => env.value,
+            Snapshot::Present(mut env) => std::mem::take(&mut env.value),
             _ => return Err(MutationError::PreconditionFailed),
         };
         self.store_envelope(new_binding, value)?;
-        *guard = guard.next();
-        Ok(MutationOutcome::Advanced(*guard))
+        guard.revision = guard.revision.next();
+        Ok(MutationOutcome::Advanced(guard.revision))
     }
 
     /// Remove: any non-absent envelope (`Present` OR `Malformed`) at `expected_revision` is
@@ -269,8 +313,8 @@ impl ProviderCredentialOwner {
     /// UNCHANGED. The revision itself is never deleted — it lives in this owner's `Mutex`, not in
     /// the Keychain item, so it stays observable after the secret bytes are gone.
     pub fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
-        let mut guard = lock_revision(&self.revision);
-        let (revision, snapshot) = self.locked_snapshot(&guard);
+        let mut guard = lock_state(&self.state);
+        let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
             return Err(MutationError::DeniedOrLocked);
         }
@@ -287,28 +331,88 @@ impl ProviderCredentialOwner {
                 other => Err(other),
             })
             .map_err(|_| MutationError::DeniedOrLocked)?;
-        *guard = guard.next();
-        Ok(MutationOutcome::Advanced(*guard))
+        guard.revision = guard.revision.next();
+        Ok(MutationOutcome::Advanced(guard.revision))
     }
 
     /// The owner's current revision, without touching the Keychain — used by tests that need to
     /// observe the revision after a Remove without going through `read_bound` (which would report
     /// `Absent` and could otherwise be mistaken for "no revision to observe").
     pub fn current_revision(&self) -> Revision {
-        *lock_revision(&self.revision)
+        lock_state(&self.state).revision
     }
 
-    fn store_envelope(&self, binding: Binding, value: String) -> Result<(), MutationError> {
+    /// Validate the candidate value and the serialized envelope against the broker's exact
+    /// size/syntax bounds BEFORE anything is written, then store it. A violation is a typed
+    /// [`MutationError::InvalidValue`] and the value is never trimmed, rewritten, or stored (§2.5 /
+    /// PB1 §3.2). The envelope-size check runs on the exact bytes about to be persisted, so a
+    /// value that fits the API-key cap can still be refused when its binding pushes the envelope
+    /// over the independent envelope cap.
+    ///
+    /// Every candidate/envelope buffer is zeroizing: the refused candidate, the decoded `Envelope`,
+    /// and the serialized `raw` all wipe their bytes on every exit path, including the refusal paths.
+    fn store_envelope(&self, binding: Binding, mut value: String) -> Result<(), MutationError> {
+        if let Err(rejection) = bounds::validate_api_key_value(value.as_bytes()) {
+            value.zeroize();
+            return Err(MutationError::InvalidValue(rejection));
+        }
         let envelope = Envelope {
             version: ENVELOPE_VERSION,
             kind: ENVELOPE_KIND.to_string(),
             value,
             binding,
         };
-        let raw = serde_json::to_string(&envelope).map_err(|_| MutationError::DeniedOrLocked)?;
+        let raw = Zeroizing::new(
+            serde_json::to_string(&envelope).map_err(|_| MutationError::DeniedOrLocked)?,
+        );
+        bounds::validate_envelope_size(&raw).map_err(MutationError::InvalidValue)?;
         self.keyring
             .set_password(&raw)
             .map_err(|_| MutationError::DeniedOrLocked)
+    }
+}
+
+/// The owner implements the shared [`CredentialOwner`] abstraction (P1) — the crate/process
+/// boundary the daemon and desktop build units both program against. The inherent methods above are
+/// the implementation; this impl exposes them through the trait so a consumer can hold a
+/// `dyn CredentialOwner` without knowing about the Keychain.
+impl CredentialOwner for ProviderCredentialOwner {
+    fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
+        ProviderCredentialOwner::read_bound(self, expected_binding)
+    }
+
+    fn connect(
+        &self,
+        expected_revision: Revision,
+        binding: Binding,
+        value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::connect(self, expected_revision, binding, value)
+    }
+
+    fn replace(
+        &self,
+        expected_revision: Revision,
+        current_binding: &Binding,
+        new_value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::replace(self, expected_revision, current_binding, new_value)
+    }
+
+    fn rebind(
+        &self,
+        expected_revision: Revision,
+        new_binding: Binding,
+    ) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::rebind(self, expected_revision, new_binding)
+    }
+
+    fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
+        ProviderCredentialOwner::remove(self, expected_revision)
+    }
+
+    fn status(&self) -> CredentialStatus {
+        ProviderCredentialOwner::status(self)
     }
 }
 
@@ -364,7 +468,9 @@ mod tests {
         let ok = owner.read_bound(&want);
         assert_eq!(ok.state.tag(), CredentialStateTag::Present);
         match ok.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-secret"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-secret")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
 
@@ -417,7 +523,11 @@ mod tests {
         );
         match owner.read_bound(&b).state {
             CredentialState::Present(lease) => {
-                assert_eq!(lease.expose_secret(), "sk-1", "value must be untouched")
+                assert_eq!(
+                    lease.into_lease_payload().value,
+                    "sk-1",
+                    "value must be untouched"
+                )
             }
             other => panic!("expected Present, got {other:?}"),
         }
@@ -454,7 +564,9 @@ mod tests {
         };
         assert!(r2 > r1);
         match owner.read_bound(&b).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-2"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-2")
+            }
             other => panic!("expected Present, got {other:?}"),
         }
     }
@@ -523,7 +635,9 @@ mod tests {
         owner.rebind(r1, target.clone()).expect("rebind");
 
         match owner.read_bound(&target).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
             other => panic!("expected Present under the new binding, got {other:?}"),
         }
     }
@@ -667,7 +781,9 @@ mod tests {
             "no failed CAS attempt may advance the revision"
         );
         match owner.read_bound(&b).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
             other => panic!("expected untouched Present, got {other:?}"),
         }
     }
@@ -788,8 +904,10 @@ mod tests {
         let blocked_snapshot = read_handle.join().expect("read thread");
         let removed = remove_handle.join().expect("remove thread");
 
-        match &blocked_snapshot.state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+        match blocked_snapshot.state {
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
             other => panic!(
                 "a read already in flight when Remove starts must still observe the pre-Remove \
                  value as a self-consistent snapshot, got {other:?}"
@@ -808,6 +926,136 @@ mod tests {
         // PB7's rejection rule falls straight out of this: `blocked_snapshot.revision != current`.
         assert_eq!(owner.current_revision(), removed_revision);
         assert_ne!(blocked_snapshot.revision, owner.current_revision());
+    }
+
+    // --- Owner availability transitions carry revisions (§2.5) ------------------------------------
+
+    /// A `Keyring` double whose reachability the test toggles at runtime: when unreachable every
+    /// operation returns a Keychain error, exactly as a locked Keychain does. `MockKeyring`'s forced
+    /// error is fixed at construction, so it cannot express a transition on ONE owner.
+    struct ToggleKeyring {
+        inner: Arc<MockKeyring>,
+        reachable: std::sync::atomic::AtomicBool,
+    }
+
+    impl ToggleKeyring {
+        fn new(inner: Arc<MockKeyring>) -> Arc<ToggleKeyring> {
+            Arc::new(ToggleKeyring {
+                inner,
+                reachable: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+
+        fn set_reachable(&self, value: bool) {
+            self.reachable
+                .store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn error_if_unreachable(&self) -> Result<(), KeyringError> {
+            if self.reachable.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(KeyringError::Other("keychain locked".into()))
+            }
+        }
+    }
+
+    impl crate::credential::Keyring for ToggleKeyring {
+        fn get_password(&self) -> Result<String, KeyringError> {
+            self.error_if_unreachable()?;
+            self.inner.get_password()
+        }
+        fn set_password(&self, token: &str) -> Result<(), KeyringError> {
+            self.error_if_unreachable()?;
+            self.inner.set_password(token)
+        }
+        fn delete_credential(&self) -> Result<(), KeyringError> {
+            self.error_if_unreachable()?;
+            self.inner.delete_credential()
+        }
+    }
+
+    // §2.5: "revision is ... carried even when the owner is unavailable or unauthorized; those
+    // availability transitions change it so refusal gates re-arm." A lock/unlock transition must
+    // advance the revision even though no secret was ever stored, and a steady-state repeat must
+    // not manufacture one.
+    #[test]
+    fn an_owner_availability_transition_advances_the_revision() {
+        let kr = ToggleKeyring::new(MockKeyring::empty());
+        let owner = ProviderCredentialOwner::with_keyring(&test_ref(), kr.clone());
+        let b = binding("https://api.example/v1");
+
+        // Reachable and absent: the first classification is not a transition.
+        let r0 = owner.read_bound(&b);
+        assert_eq!(r0.state.tag(), CredentialStateTag::Absent);
+        assert_eq!(r0.revision, Revision::INITIAL);
+
+        // The owner goes away: the availability transition advances the revision.
+        kr.set_reachable(false);
+        let locked = owner.read_bound(&b);
+        assert_eq!(locked.state.tag(), CredentialStateTag::DeniedOrLocked);
+        assert!(
+            locked.revision > r0.revision,
+            "a reachable->denied transition must advance the revision"
+        );
+
+        // Still unavailable: no further advance.
+        let locked_again = owner.read_bound(&b);
+        assert_eq!(
+            locked_again.revision, locked.revision,
+            "a steady unavailable state must not manufacture revisions"
+        );
+
+        // Coming back is itself a transition.
+        kr.set_reachable(true);
+        let back = owner.read_bound(&b);
+        assert_eq!(back.state.tag(), CredentialStateTag::Absent);
+        assert!(
+            back.revision > locked.revision,
+            "a denied->reachable transition must advance the revision"
+        );
+    }
+
+    // §2.5 + `MutationError`'s contract: a mutation that observes an availability transition fails
+    // typed, writes nothing, and — because the ticket requires the transition to change the revision
+    // so a refusal gate re-arms — advances the revision even though the operation failed. The
+    // `DeniedOrLocked` error carries no revision, so a caller must re-read before retrying; a blind
+    // retry at the old revision is refused by the unlock transition's own bump. This pins the
+    // behaviour alice's review of rhapsody#221 found the old doc contradicting.
+    #[test]
+    fn a_mutation_denied_by_an_availability_transition_advances_the_revision() {
+        let kr = ToggleKeyring::new(MockKeyring::empty());
+        let owner = ProviderCredentialOwner::with_keyring(&test_ref(), kr.clone());
+        let b = binding("https://api.example/v1");
+        // Reachable and absent: the first classification, so `last_reachable` is `Some(true)` and
+        // r0 is Revision(0).
+        let r0 = owner.read_bound(&b).revision;
+        assert_eq!(r0, Revision::INITIAL);
+
+        kr.set_reachable(false);
+        let err = owner
+            .connect(r0, b.clone(), "sk-1".into())
+            .expect_err("a denied owner cannot mutate");
+        assert_eq!(err, MutationError::DeniedOrLocked);
+        let denied = owner.current_revision();
+        assert!(
+            denied > r0,
+            "the observed availability transition must advance the revision even on a failed mutation"
+        );
+
+        // The unlock is itself a further transition, observed on the NEXT owner access; a caller that
+        // blindly retries with `r0` is therefore refused, which is exactly why the doc tells it to
+        // re-read. Nothing was ever written.
+        kr.set_reachable(true);
+        let stale = owner
+            .connect(r0, b.clone(), "sk-1".into())
+            .expect_err("unlock moved the revision again");
+        let after = match stale {
+            MutationError::StaleRevision(r) => r,
+            other => panic!("expected StaleRevision, got {other:?}"),
+        };
+        assert!(after > denied, "unlock is itself a further transition");
+        assert_eq!(owner.read_bound(&b).state.tag(), CredentialStateTag::Absent);
     }
 
     // --- Behavior across a simulated desktop/daemon restart ---------------------------------------
@@ -836,7 +1084,9 @@ mod tests {
 
         // The persisted secret is still readable under its original binding...
         match after_restart.read_bound(&original).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
             other => panic!("expected Present to survive restart, got {other:?}"),
         }
         // ...but a changed canonical endpoint reports BindingMismatch, not a lease.
@@ -853,7 +1103,9 @@ mod tests {
             .rebind(post_restart_revision, changed.clone())
             .expect("rebind after restart");
         match after_restart.read_bound(&changed).state {
-            CredentialState::Present(lease) => assert_eq!(lease.expose_secret(), "sk-1"),
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
             other => panic!("expected Present under the new binding, got {other:?}"),
         }
     }
@@ -870,5 +1122,199 @@ mod tests {
         let read = owner.read_bound(&b);
         let rendered = format!("{read:?}");
         assert!(!rendered.contains("sk-super-secret"), "leaked: {rendered}");
+    }
+
+    // The mismatch arm decodes the stored envelope (key included) to compare bindings; on a mismatch
+    // it must disclose only the typed state. This canary pins that neither the key nor the stored
+    // endpoint reaches a Debug/formatting surface, across both `read_bound` and `status`.
+    #[test]
+    fn a_binding_mismatch_discloses_neither_the_key_nor_the_stored_endpoint() {
+        let kr = MockKeyring::empty();
+        let owner = owner_over(kr);
+        owner
+            .connect(
+                Revision::INITIAL,
+                binding("https://api.example/v1"),
+                "sk-mismatch-canary".into(),
+            )
+            .expect("connect");
+
+        let read = owner.read_bound(&binding("https://api.example/v2"));
+        assert_eq!(read.state.tag(), CredentialStateTag::BindingMismatch);
+        let rendered = format!("{read:?}");
+        assert!(
+            !rendered.contains("sk-mismatch-canary"),
+            "mismatch leaked the key: {rendered}"
+        );
+        assert!(
+            !rendered.contains("api.example/v1"),
+            "mismatch leaked the stored endpoint: {rendered}"
+        );
+
+        // `status` decodes the same value on its own path; it must not surface it either.
+        assert_eq!(owner.status(), CredentialStatus::Configured);
+    }
+
+    // --- Broker bounds enforced before storage (P1 acceptance / §2.5) ---------------------------
+
+    // Mutation discipline: if the bounds check is moved after the write (or dropped), this test
+    // fails because the refusals stop happening and/or a value lands in the Keychain.
+    #[test]
+    fn connect_refuses_an_out_of_bounds_value_before_storing_anything() {
+        let kr = MockKeyring::empty();
+        let owner = owner_over(kr.clone());
+        let b = binding("https://api.example/v1");
+        let cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("space", "sk key with a space".into()),
+            ("control", "sk\nkey".into()),
+            ("too long", "a".repeat(bounds::MAX_API_KEY_BYTES + 1)),
+        ];
+        for (name, bad) in cases {
+            let err = owner
+                .connect(Revision::INITIAL, b.clone(), bad)
+                .expect_err("an out-of-bounds value must be refused");
+            assert!(
+                matches!(err, MutationError::InvalidValue(_)),
+                "{name}: expected InvalidValue, got {err:?}"
+            );
+        }
+        assert_eq!(
+            owner.current_revision(),
+            Revision::INITIAL,
+            "no refused write may advance the revision"
+        );
+        assert_eq!(
+            owner.read_bound(&b).state.tag(),
+            CredentialStateTag::Absent,
+            "no refused write may store anything"
+        );
+    }
+
+    #[test]
+    fn connect_refuses_a_too_long_value_with_the_brokers_typed_reason() {
+        let owner = owner_over(MockKeyring::empty());
+        let too_long = "a".repeat(bounds::MAX_API_KEY_BYTES + 1);
+        let err = owner
+            .connect(
+                Revision::INITIAL,
+                binding("https://api.example/v1"),
+                too_long,
+            )
+            .expect_err("over the API-key cap");
+        assert_eq!(
+            err,
+            MutationError::InvalidValue(
+                rhapsody_credential_ipc::bounds::CredentialRejection::TooLong
+            )
+        );
+    }
+
+    // A value that fits the API-key cap can still push the serialized envelope past the
+    // independently-capped envelope size; the exact bytes about to be stored are checked, and the
+    // caller is refused rather than having anything trimmed.
+    #[test]
+    fn connect_refuses_an_envelope_over_the_cap_even_with_a_valid_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let huge = binding(&format!(
+            "https://api.example/v1/{}",
+            "x".repeat(bounds::MAX_CREDENTIAL_ENVELOPE_BYTES)
+        ));
+        let err = owner
+            .connect(Revision::INITIAL, huge, "sk-valid".into())
+            .expect_err("an oversized envelope must be refused");
+        assert!(matches!(err, MutationError::InvalidValue(_)), "got {err:?}");
+        assert_eq!(owner.current_revision(), Revision::INITIAL);
+    }
+
+    #[test]
+    fn replace_refuses_an_out_of_bounds_value_and_leaves_the_old_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let b = binding("https://api.example/v1");
+        let r1 = match owner
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .unwrap()
+        {
+            MutationOutcome::Advanced(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let err = owner
+            .replace(r1, &b, "sk has a space".into())
+            .expect_err("replace with an invalid value must be refused");
+        assert!(matches!(err, MutationError::InvalidValue(_)), "got {err:?}");
+        assert_eq!(owner.current_revision(), r1);
+        match owner.read_bound(&b).state {
+            CredentialState::Present(lease) => {
+                assert_eq!(lease.into_lease_payload().value, "sk-1")
+            }
+            other => panic!("expected untouched Present, got {other:?}"),
+        }
+    }
+
+    // A refusal must not echo the rejected value into its error string (secret canary across the
+    // error surface).
+    #[test]
+    fn a_bounds_refusal_never_echoes_the_rejected_value() {
+        let owner = owner_over(MockKeyring::empty());
+        let err = owner
+            .connect(
+                Revision::INITIAL,
+                binding("https://api.example/v1"),
+                "sk-canary-secret with a space".into(),
+            )
+            .expect_err("refused");
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains("canary-secret"), "leaked: {rendered}");
+    }
+
+    // --- Configured/unconfigured status (shared abstraction, §2.5) -------------------------------
+
+    #[test]
+    fn status_reports_configured_unconfigured_and_unavailable() {
+        let empty = owner_over(MockKeyring::empty());
+        assert_eq!(empty.status(), CredentialStatus::Unconfigured);
+        let b = binding("https://api.example/v1");
+        empty
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .expect("connect");
+        assert_eq!(empty.status(), CredentialStatus::Configured);
+
+        assert_eq!(
+            owner_over(MockKeyring::erroring("locked")).status(),
+            CredentialStatus::Unavailable
+        );
+
+        let malformed = MockKeyring::empty();
+        malformed.set_password("not an envelope").expect("seed");
+        assert_eq!(
+            owner_over(malformed).status(),
+            CredentialStatus::Unavailable,
+            "present-but-unusable data must never read as configured"
+        );
+    }
+
+    // The desktop owner is usable through the shared abstraction the daemon programs against — this
+    // is the build-unit boundary P1 requires, exercised as a trait object.
+    #[test]
+    fn the_owner_is_usable_through_the_shared_credential_owner_abstraction() {
+        let owner: Box<dyn CredentialOwner> = Box::new(owner_over(MockKeyring::empty()));
+        let b = binding("https://api.example/v1");
+        assert_eq!(owner.status(), CredentialStatus::Unconfigured);
+        owner
+            .connect(Revision::INITIAL, b.clone(), "sk-1".into())
+            .expect("connect through the trait");
+        assert_eq!(owner.status(), CredentialStatus::Configured);
+        match owner.read_bound(&b).state {
+            CredentialState::Present(lease) => {
+                // The value only ever leaves through a consuming transfer (the broker move or the
+                // IPC payload) — no ordinary `&self` string getter exists on the shared lease.
+                assert_eq!(lease.into_lease_payload().value, "sk-1");
+            }
+            other => panic!("expected Present, got {other:?}"),
+        }
+        assert_eq!(
+            owner.remove(Revision(1)),
+            Ok(MutationOutcome::Advanced(Revision(2)))
+        );
     }
 }
