@@ -61,7 +61,25 @@ use rhapsody_store::{
     REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED, ReviewWatchRow,
 };
 
+use crate::managerapproval::ApprovalScope;
 use crate::prstate::PrCoord;
+
+/// The provenance of an `effective` manager approval an [`AutoMergePlan`] counted (STUDIO-1011;
+/// design record `manager-agent-design.md` §6.5, §8.3).
+///
+/// It carries the intervention id and the two values the pre-merge recheck re-asserts —
+/// `generation` and `evidence_rev` — and nothing else: the covered rows and the patch-id live on
+/// the approval record, which the recheck reads by id. A plan with no manager approval carries
+/// `None` here and keeps today's behaviour exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerApprovalPlan {
+    /// The manager intervention the approval belongs to — the recheck's key.
+    pub intervention_id: String,
+    /// The loop generation the approval was decided in.
+    pub generation: i64,
+    /// The evidence revision the approval was bound to.
+    pub evidence_rev: i64,
+}
 
 /// One pull request this tick's gates cleared on the control task, handed to the off-loop half.
 ///
@@ -76,6 +94,10 @@ pub struct AutoMergePlan {
     /// The reviewers whose approval cleared it, in row order — the audit trail for the log line
     /// and the room post, so a merge can always be traced to the verdicts that allowed it.
     pub approved_by: Vec<String>,
+    /// When the plan counted an `effective` manager approval, its provenance (§8.3); the off-loop
+    /// half re-checks it immediately before the merge command. `None` for a reviewer-only plan,
+    /// which keeps today's behaviour including the same-head window.
+    pub manager_approval: Option<ManagerApprovalPlan>,
 }
 
 /// Why a pull request was NOT proposed for an auto-merge this tick.
@@ -145,10 +167,38 @@ impl AutoMergeRefusal {
 /// arrangement: on a differently-cased head they would arm a re-review while this cleared the pull
 /// request to merge, which is exactly the "merging while a reviewer is mid-round" hazard. Matching
 /// them exactly makes the disagreement unrepresentable rather than merely unlikely.
+///
+/// # The manager's approval, and why it is a separate argument
+///
+/// STUDIO-1011 adds ONE input: an [`ApprovalScope`] (§6.5). When a reviewer row is covered by an
+/// `effective` manager approval at the current `(generation, patch_id)`, that row is satisfied even
+/// though its own verdict does not clear the gate — the manager overruled the loop. A `pending`
+/// approval never counts, and neither does a row the approval does not name.
+///
+/// The reviewer-only case is expressed by passing `None` and is *the identical code path* the gate
+/// ran before this input existed — there is no second branch — which is what makes a reviewer-only
+/// merge byte-identical (the ticket's acceptance criterion).
+///
+/// `generation`/`patch_id` are the CURRENT ones, read on the control task beside the watch rows;
+/// they are meaningful only when `approval` is `Some`.
 pub(crate) fn auto_merge_verdict_with_proof(
     rows: &[&ReviewWatchRow],
     head: &str,
     proven: &[&str],
+) -> Result<Vec<String>, AutoMergeRefusal> {
+    auto_merge_verdict_with_proof_and_approval(rows, head, proven, None, 0, "")
+}
+
+/// [`auto_merge_verdict_with_proof`] with the manager-approval input (STUDIO-1011). See that
+/// function for the whole rule; this is the one carrying it, and the reviewer-only wrapper above
+/// delegates here with `approval = None`.
+pub(crate) fn auto_merge_verdict_with_proof_and_approval(
+    rows: &[&ReviewWatchRow],
+    head: &str,
+    proven: &[&str],
+    approval: Option<&ApprovalScope<'_>>,
+    generation: i64,
+    patch_id: &str,
 ) -> Result<Vec<String>, AutoMergeRefusal> {
     let head = head.trim();
     if head.is_empty() {
@@ -160,6 +210,17 @@ pub(crate) fn auto_merge_verdict_with_proof(
     let proven: Vec<&str> = proven.iter().map(|p| p.trim()).collect();
     let mut approved_by = Vec::with_capacity(rows.len());
     for row in rows {
+        // The manager's approval (§6.5), checked FIRST and independently of the row's transient
+        // status: an `effective` approval at this (generation, patch-id) stands in for the row it
+        // names, which is what lets the manager overrule a `reviewed` (findings) row. A `pending`
+        // approval never counts, and an approval that does not name this row leaves the ordinary
+        // rules below in force for it.
+        if let Some(approval) = approval
+            && approval.covers(&row.key.reviewer, generation, patch_id)
+        {
+            approved_by.push(row.key.reviewer.clone());
+            continue;
+        }
         match row.status.as_str() {
             REVIEW_STATUS_APPROVED => {
                 // The head-keying, and the reason this is not merely `status == approved`: the
@@ -562,6 +623,137 @@ mod tests {
             ship_available(&u, HEAD, &[HEAD]),
             Err(AutoMergeRefusal::UnknownStatus),
             "silence is not a read"
+        );
+    }
+
+    // ── STUDIO-1011: the manager approval as a verdict input (§6.5) ─────────────────────────────
+
+    const GEN: i64 = 1;
+    const PATCH: &str = "patch-id-1";
+
+    fn covered_rows(names: &[&str]) -> Vec<String> {
+        names.iter().map(|r| (*r).to_string()).collect()
+    }
+
+    fn scope<'a>(
+        state: &'a str,
+        covered: &'a [String],
+    ) -> crate::managerapproval::ApprovalScope<'a> {
+        crate::managerapproval::ApprovalScope {
+            state,
+            generation: GEN,
+            patch_id: PATCH,
+            covered_reviewers: covered,
+            authority_act: true,
+        }
+    }
+
+    /// **The ticket's acceptance criterion.** An `effective` manager approval satisfies exactly the
+    /// rows it names: here it stands in for `jimmy`'s `reviewed` (findings) row while `alice` clears
+    /// on her own approval. Without it the same rows refuse as changes-requested.
+    ///
+    /// MUTATION: pass `None` (drop the coverage branch) and the first assertion reds.
+    #[test]
+    fn an_effective_manager_approval_satisfies_its_covered_rows() {
+        let rows = [
+            row("alice", REVIEW_STATUS_APPROVED, HEAD),
+            row("jimmy", REVIEW_STATUS_REVIEWED, HEAD),
+        ];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+
+        assert_eq!(
+            auto_merge_verdict_with_proof(&refs, HEAD, &[HEAD]),
+            Err(AutoMergeRefusal::ChangesRequested),
+            "without a manager approval, jimmy's findings block the merge"
+        );
+
+        let covered = covered_rows(&["jimmy"]);
+        let s = scope(rhapsody_store::MANAGER_APPROVAL_EFFECTIVE, &covered);
+        assert_eq!(
+            auto_merge_verdict_with_proof_and_approval(&refs, HEAD, &[HEAD], Some(&s), GEN, PATCH),
+            Ok(vec!["alice".to_string(), "jimmy".to_string()]),
+            "the effective approval stands in for the row it names"
+        );
+    }
+
+    /// **`pending` never counts.** The record exists, names the row, matches the generation and the
+    /// patch — and still satisfies nothing.
+    ///
+    /// MUTATION: count `pending` as effective and this reds.
+    #[test]
+    fn a_pending_manager_approval_satisfies_nothing() {
+        let rows = [row("jimmy", REVIEW_STATUS_REVIEWED, HEAD)];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+        let covered = covered_rows(&["jimmy"]);
+        let pending = scope(rhapsody_store::MANAGER_APPROVAL_PENDING, &covered);
+
+        assert_eq!(
+            auto_merge_verdict_with_proof_and_approval(
+                &refs,
+                HEAD,
+                &[HEAD],
+                Some(&pending),
+                GEN,
+                PATCH
+            ),
+            Err(AutoMergeRefusal::ChangesRequested),
+            "a pending approval is not effective"
+        );
+    }
+
+    /// The approval covers only the reviewers it names: a row it does not name keeps the ordinary
+    /// rules. And an approval at another generation or patch does not apply at all.
+    #[test]
+    fn a_manager_approval_covers_only_its_named_rows_and_only_at_its_binding() {
+        let rows = [
+            row("alice", REVIEW_STATUS_APPROVED, HEAD),
+            row("jimmy", REVIEW_STATUS_REVIEWED, HEAD),
+        ];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+        // Names alice only, so jimmy's findings still block.
+        let covered = covered_rows(&["alice"]);
+        let s = scope(rhapsody_store::MANAGER_APPROVAL_EFFECTIVE, &covered);
+        assert_eq!(
+            auto_merge_verdict_with_proof_and_approval(&refs, HEAD, &[HEAD], Some(&s), GEN, PATCH),
+            Err(AutoMergeRefusal::ChangesRequested),
+            "a row the approval does not name is decided by its own verdict"
+        );
+
+        // Names jimmy, but at a different generation / patch — inert.
+        let covered = covered_rows(&["jimmy"]);
+        let s = scope(rhapsody_store::MANAGER_APPROVAL_EFFECTIVE, &covered);
+        for (generation, patch) in [(GEN + 1, PATCH), (GEN, "other-patch")] {
+            assert_eq!(
+                auto_merge_verdict_with_proof_and_approval(
+                    &refs,
+                    HEAD,
+                    &[HEAD],
+                    Some(&s),
+                    generation,
+                    patch
+                ),
+                Err(AutoMergeRefusal::ChangesRequested),
+                "(gen {generation}, patch {patch})"
+            );
+        }
+    }
+
+    /// An effective approval cannot manufacture a verdict for a row that was never in the watch set:
+    /// the gate is over `rows`, so a covered reviewer absent from it changes nothing, and a row still
+    /// owing a round that the approval does NOT name still refuses.
+    #[test]
+    fn an_approval_does_not_carry_a_row_still_owing_a_round() {
+        let rows = [
+            row("alice", REVIEW_STATUS_APPROVED, HEAD),
+            row("jimmy", REVIEW_STATUS_IN_FLIGHT, HEAD),
+        ];
+        let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
+        let covered = covered_rows(&["carol"]);
+        let s = scope(rhapsody_store::MANAGER_APPROVAL_EFFECTIVE, &covered);
+        assert_eq!(
+            auto_merge_verdict_with_proof_and_approval(&refs, HEAD, &[HEAD], Some(&s), GEN, PATCH),
+            Err(AutoMergeRefusal::RoundInFlight),
+            "jimmy is still mid-round and the approval does not name him"
         );
     }
 }
