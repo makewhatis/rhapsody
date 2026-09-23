@@ -137,11 +137,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use rhapsody_config::room::Message;
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
 use rhapsody_store::{
-    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED,
-    ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
+    REVIEW_STATUS_TRUNCATED, ReviewWatchKey, ReviewWatchRow,
 };
 
 use crate::control_loop::{CancelWait, Event};
@@ -152,6 +153,7 @@ use crate::ghsummons::{
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
+use crate::reviewadjudicate::MANAGER_IDENTITY;
 use crate::stop::ControlHandle;
 use crate::teams::LoadSnapshot;
 
@@ -290,6 +292,36 @@ pub struct ReviewSweepReport {
     /// every installation that has not set `review.adjudicate_after_rounds`, and on every tick
     /// where no pull request reached it.
     pub adjudicate: Vec<crate::reviewadjudicate::ReviewAdjudicationPlan>,
+}
+
+/// What the reconciliation decided to change for ONE watched pull request (STUDIO-1022). A pure
+/// plan — nothing here has been written yet — so
+/// [`Orchestrator::plan_review_reconciliation`] can be mutation-checked without a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrReconcile {
+    /// The pull request the changes belong to.
+    pr: PrCoord,
+    /// Rows to soft-delete through [`rhapsody_store::Store::drop_review_watch`].
+    retires: Vec<ReconcileRetire>,
+    /// Rows to replace with a fresh one for an eligible substitute.
+    reassigns: Vec<ReconcileReassign>,
+}
+
+/// One row the reconciliation retires, with the reason to log and to name in the room line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconcileRetire {
+    key: ReviewWatchKey,
+    reviewer: String,
+    reason: String,
+}
+
+/// One row the reconciliation reassigns: the incumbent to retire, and the fresh row to write for
+/// the substitute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconcileReassign {
+    old: ReviewWatchKey,
+    old_reviewer: String,
+    row: ReviewWatchRow,
 }
 
 /// The carried-budget sentinel meaning "this hand-back reached no decision": it spent nothing and
@@ -1184,7 +1216,7 @@ impl Orchestrator {
                 }
             }
         }
-        let rows = match self.store().load_live_review_watch() {
+        let mut rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; this tick decides nothing");
@@ -1195,6 +1227,18 @@ impl Orchestrator {
                 return (report, slots.unwrap_or(UNCAPPED_SLOTS));
             }
         };
+        // Reconcile the live watch set against the CURRENT `teams.yaml` before any dispatch
+        // decision (STUDIO-1022). This is deliberately ABOVE the dispatch loop and above the
+        // per-observation match, so it also runs on the first sweep after the boot that loaded a
+        // CHANGED config or roster — the incident this ticket was filed on: `review.reviewers`
+        // was lowered and a teammate removed while four pull requests already had live rows for
+        // reviewers nobody could serve, and every one of them was pinned in `requested` forever,
+        // which `auto_merge_verdict_with_proof` reads as a round in flight and refuses to merge
+        // past. It decides from the WHOLE live set rather than only the coordinates observed this
+        // tick, because being off the roster or surplus is a fact about the configuration, not
+        // about a `gh` answer. It only ever retires or reassigns rows; it never introduces one, so
+        // it cannot become a second introduction path.
+        self.reconcile_review_watch(&mut rows, &mut report);
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
         // tick would otherwise spawn twenty agents past a cap the operator set. TWO bounds compose
@@ -2146,6 +2190,393 @@ impl Orchestrator {
             self.review_capacity_held.remove(&id);
         }
         dropped
+    }
+
+    /// Reconciles the whole live watch set against the CURRENT `teams.yaml` (STUDIO-1022), retiring
+    /// or reassigning rows the configuration can no longer serve, and hands the changed rows back
+    /// so the same tick's dispatch loop decides from the set the daemon now holds.
+    ///
+    /// **Called on every sweep, before the dispatch loop.** A live row is only ever compared against
+    /// the configuration — a `gh` observation plays no part — so this also repairs the four pull
+    /// requests the incident left wedged the moment the daemon boots with a lowered
+    /// `review.reviewers` or a shortened roster, without waiting for the rotating cursor to reach
+    /// each one. It never dispatches and never introduces a row: it retires rows and, where a review
+    /// still has room, moves one to an eligible substitute.
+    ///
+    /// The decision is [`Self::plan_review_reconciliation`] (a pure read of config + rows + live
+    /// runs); this half performs it. A store failure on any single write is logged and the row is
+    /// left as it stands, so the next sweep re-decides it rather than the daemon acting on a
+    /// half-applied plan.
+    fn reconcile_review_watch(
+        &mut self,
+        rows: &mut Vec<ReviewWatchRow>,
+        report: &mut ReviewSweepReport,
+    ) {
+        let plans = self.plan_review_reconciliation(rows);
+        for plan in plans {
+            let mut changed = false;
+            // Composed for the one manager room line this pull request earns, if any.
+            let mut retired: Vec<(String, String)> = Vec::new();
+            let mut reassigned: Vec<(String, String)> = Vec::new();
+
+            for r in &plan.retires {
+                let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+                match self.store().drop_review_watch(&r.key) {
+                    Ok(()) => {
+                        report.retired += 1;
+                        retired.push((r.reviewer.clone(), r.reason.clone()));
+                        changed = true;
+                    }
+                    Err(e) => tracing::warn!(
+                        pr = %plan.pr, reviewer = %r.reviewer, err = %e,
+                        "ticketless review: reconciliation could not retire a watch row"
+                    ),
+                }
+                // The in-memory state goes whether or not the store write landed, for
+                // `handle_review_dismiss`'s reason (STUDIO-891, STUDIO-950): a row the daemon is no
+                // longer waiting on must not keep a stall warning latched or a capacity hold
+                // annotated, and a hold that outlived its row would keep the reconciliation sweep
+                // naming a round nothing owes.
+                self.review_unassignable.remove(&id);
+                self.review_capacity_held.remove(&id);
+                rows.retain(|x| x.key != r.key);
+                tracing::info!(
+                    pr = %plan.pr, reviewer = %r.reviewer, reason = %r.reason,
+                    "ticketless review: retiring a watch row that no longer fits the configuration"
+                );
+            }
+
+            for a in &plan.reassigns {
+                let old_id = review_key(&a.old.owner, &a.old.repo, a.old.number, &a.old.reviewer);
+                // The substitute's row is written BEFORE the incumbent's is dropped. A failed write
+                // then leaves the incumbent in place rather than destroying the only record of a
+                // review still owed — the reassignment simply does not happen this sweep.
+                match self.store().save_review_watch(a.row.clone()) {
+                    Ok(()) => {
+                        if let Err(e) = self.store().drop_review_watch(&a.old) {
+                            tracing::warn!(
+                                pr = %plan.pr, err = %e,
+                                "ticketless review: the reassigned watch row could not be retired \
+                                 after its substitute was written"
+                            );
+                        }
+                        self.review_unassignable.remove(&old_id);
+                        self.review_capacity_held.remove(&old_id);
+                        rows.retain(|x| x.key != a.old);
+                        rows.push(a.row.clone());
+                        changed = true;
+                        tracing::info!(
+                            pr = %plan.pr, from = %a.old_reviewer, to = %a.row.key.reviewer,
+                            "ticketless review: reassigning a watch row whose reviewer left the \
+                             roster or cannot be selected"
+                        );
+                        reassigned.push((a.old_reviewer.clone(), a.row.key.reviewer.clone()));
+                    }
+                    Err(e) => tracing::warn!(
+                        pr = %plan.pr, err = %e,
+                        "ticketless review: the substitute watch row could not be written; the \
+                         incumbent row stands"
+                    ),
+                }
+            }
+
+            if changed {
+                self.post_reconcile_line(&plan.pr, &retired, &reassigned);
+            }
+        }
+    }
+
+    /// The pure half of the reconciliation (STUDIO-1022): reads the live rows, the current roster,
+    /// `review.reviewers`, `review.required` and the live runs, and returns what each watched pull
+    /// request needs. It holds the whole rule in one place so it can be mutation-checked without a
+    /// store write.
+    ///
+    /// Two rules per pull request, applied in order:
+    ///
+    /// 1. **A row whose reviewer is off the roster or `unselectable`** is reassigned to an eligible
+    ///    substitute *when a substitute exists and the pull request would still be within
+    ///    `review.reviewers` without this row* — i.e. when the review still has room for it.
+    ///    Otherwise it is retired.
+    ///    Retiring rather than reassigning when the pull request is already at or over its count is
+    ///    what keeps a lowered `review.reviewers` from re-inflating the set: the surplus rule below
+    ///    would only trim the substitute straight back off.
+    /// 2. **More live rows than `review.reviewers`** are trimmed to that count, keeping, in order:
+    ///    rows whose review is running or claimed (**never retired** — their completion must still
+    ///    land), `review.required` members, the reviewer whose completed review is most recent (they
+    ///    have the most context), then roster order. A running row beyond the count is kept rather
+    ///    than retired; the surplus is trimmed on a later sweep once it completes.
+    fn plan_review_reconciliation(&self, rows: &[ReviewWatchRow]) -> Vec<PrReconcile> {
+        if rows.is_empty() {
+            // Nothing watched: skip the roster/harness resolution below entirely, so an idle board
+            // pays nothing for this sweep.
+            return Vec::new();
+        }
+        let Some(teams) = self.teams.as_ref() else {
+            return Vec::new();
+        };
+        let effective = teams.review.effective_reviewers();
+        let exclusions = self.reviewer_exclusions(teams);
+        let load = LoadSnapshot::from_running(&self.running);
+        let required: HashSet<&str> = teams.review_required().into_iter().collect();
+        let roster_index: HashMap<&str, usize> = teams
+            .roster
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.name.as_str(), i))
+            .collect();
+
+        // Distinct pull-request coordinates, in the store's deterministic order. Grouping first
+        // keeps the reconciliation per pull request: the count rule and the keep-order both compare
+        // a pull request's rows against each other, never across pull requests.
+        let mut coords: Vec<PrCoord> = Vec::new();
+        for row in rows {
+            let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            if !coords.iter().any(|c| c == &pr) {
+                coords.push(pr);
+            }
+        }
+
+        let mut plans = Vec::new();
+        for pr in coords {
+            let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, &pr)).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let mut working: Vec<&ReviewWatchRow> = mine.clone();
+            let mut peers: HashSet<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
+            let mut retires: Vec<ReconcileRetire> = Vec::new();
+            let mut reassigns: Vec<ReconcileReassign> = Vec::new();
+
+            // Rule 1 — off-roster or unselectable rows.
+            for row in &mine {
+                let name = row.key.reviewer.as_str();
+                let on_roster = roster_index.contains_key(name);
+                if on_roster && !exclusions.excludes(name) {
+                    continue;
+                }
+                let reason = if on_roster {
+                    format!("{name} cannot be selected as a reviewer for this configuration")
+                } else {
+                    format!("{name} is not on the roster")
+                };
+                // "Room" is about the OTHER rows: this row's slot can be handed to a substitute
+                // exactly while the pull request would still be within `review.reviewers` WITHOUT
+                // this row — `other < effective`, i.e. `live <= effective`. Counting the row itself
+                // would refuse to reassign the only row of a `reviewers: 1` pull request, retiring
+                // an obligation that fits perfectly.
+                let substitute = if working.len() <= effective {
+                    self.pick_reconcile_substitute(teams, row, &peers, &load, &exclusions)
+                } else {
+                    None
+                };
+                match substitute {
+                    Some(sub) => {
+                        peers.remove(name);
+                        peers.insert(sub.clone());
+                        reassigns.push(ReconcileReassign {
+                            old: row.key.clone(),
+                            old_reviewer: name.to_string(),
+                            row: ReviewWatchRow {
+                                key: ReviewWatchKey {
+                                    owner: row.key.owner.clone(),
+                                    repo: row.key.repo.clone(),
+                                    number: row.key.number,
+                                    reviewer: sub,
+                                },
+                                author: row.author.clone(),
+                                introduced_by: row.introduced_by.clone(),
+                                // The substitute is asked about the same head the incumbent was
+                                // (`requested_sha`), but has READ nothing, so the reviewed SHA is
+                                // deliberately empty — a carried verdict would belong to a reviewer
+                                // who no longer exists.
+                                requested_sha: row.requested_sha.clone(),
+                                last_reviewed_sha: String::new(),
+                                status: REVIEW_STATUS_REQUESTED.to_string(),
+                                open: true,
+                            },
+                        });
+                        // The count is unchanged by a reassignment, so `working` keeps its length.
+                    }
+                    None => {
+                        retires.push(ReconcileRetire {
+                            key: row.key.clone(),
+                            reviewer: name.to_string(),
+                            reason,
+                        });
+                        working.retain(|r| r.key != row.key);
+                        peers.remove(name);
+                    }
+                }
+            }
+
+            // Rule 2 — surplus beyond `review.reviewers`.
+            if working.len() > effective {
+                let most_recent = self.most_recent_completed_reviewer(&working);
+                let rank_of = |r: &ReviewWatchRow| -> (u8, usize) {
+                    let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+                    let running = self.running.contains_key(&id) || self.claimed.contains(&id);
+                    let rank = if running {
+                        0
+                    } else if required.contains(r.key.reviewer.as_str()) {
+                        1
+                    } else if most_recent.as_deref() == Some(r.key.reviewer.as_str()) {
+                        2
+                    } else {
+                        3
+                    };
+                    let idx = roster_index
+                        .get(r.key.reviewer.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    (rank, idx)
+                };
+                let mut ranked: Vec<&ReviewWatchRow> = working.clone();
+                ranked.sort_by_key(|r| rank_of(r));
+                let mut kept = 0usize;
+                for r in ranked {
+                    let (rank, _) = rank_of(r);
+                    // A running/claimed row is never retired, and is counted among the kept so the
+                    // surplus is taken from the rows below it — the "wait for it to finish" half.
+                    if rank == 0 || kept < effective {
+                        kept += 1;
+                    } else {
+                        retires.push(ReconcileRetire {
+                            key: r.key.clone(),
+                            reviewer: r.key.reviewer.clone(),
+                            reason: format!("surplus beyond review.reviewers: {effective}"),
+                        });
+                    }
+                }
+            }
+
+            if !retires.is_empty() || !reassigns.is_empty() {
+                plans.push(PrReconcile {
+                    pr,
+                    retires,
+                    reassigns,
+                });
+            }
+        }
+        plans
+    }
+
+    /// The eligible substitute for a row whose reviewer cannot serve it (STUDIO-1022) — the first
+    /// `rank_reviewers` candidate that is not already holding another of this pull request's rows.
+    ///
+    /// `None` when the author is unknown (the row predates the author column, or it was written
+    /// empty), because the whole roster is a candidate then and the daemon would be guessing who to
+    /// exclude — the same fail-closed rule [`Self::choose_review_reviewer`] applies. Required
+    /// reviewers are ranked first by `rank_reviewers`, so a pin is honoured here as at dispatch.
+    fn pick_reconcile_substitute(
+        &self,
+        teams: &Teams,
+        row: &ReviewWatchRow,
+        peers: &HashSet<String>,
+        load: &LoadSnapshot,
+        exclusions: &crate::quorum::ReviewerExclusions,
+    ) -> Option<String> {
+        if row.author.trim().is_empty() {
+            return None;
+        }
+        crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts(), exclusions)
+            .into_iter()
+            .find(|name| !peers.contains(name.as_str()))
+    }
+
+    /// The reviewer whose COMPLETED review of this pull request is most recent, or `None` when that
+    /// cannot be established (STUDIO-1022).
+    ///
+    /// The watch rows carry no timestamp, so recency is read from the daemon's own run ledger: a
+    /// review run is recorded under the `pr:owner/repo#n@reviewer` identifier, and its `ended_at` is
+    /// the instant that review finished. Durable on purpose — the incident this ticket was filed on
+    /// happened across a restart, so an in-memory tally would be empty exactly when it was needed.
+    /// A pull request whose reviews are all still owed (no completed row) has no recency to rank and
+    /// falls back to roster order; so does a ledger that could not be read, logged and not fatal.
+    fn most_recent_completed_reviewer(&self, mine: &[&ReviewWatchRow]) -> Option<String> {
+        let mut by_key: HashMap<String, &str> = HashMap::new();
+        for r in mine.iter().copied() {
+            if r.status != REVIEW_STATUS_REVIEWED && r.status != REVIEW_STATUS_APPROVED {
+                continue;
+            }
+            by_key.insert(
+                review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer),
+                r.key.reviewer.as_str(),
+            );
+        }
+        if by_key.is_empty() {
+            return None;
+        }
+        let keys: Vec<String> = by_key.keys().cloned().collect();
+        // The default page (50) is far above any pull request's honest run count: the shared budget
+        // caps a pull request at eight dispatches, so every reviewer's whole history fits.
+        let runs = match self.store().runs_for_issues(&keys, 0) {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "ticketless review: the run ledger could not be read to rank the review \
+                     surplus; falling back to roster order"
+                );
+                return None;
+            }
+        };
+        let mut best: Option<(String, &str)> = None;
+        for run in &runs {
+            if run.ended_at.is_empty() {
+                continue;
+            }
+            let Some(reviewer) = by_key.get(run.issue_identifier.as_str()).copied() else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(at, _)| run.ended_at.as_str() > at.as_str())
+            {
+                best = Some((run.ended_at.clone(), reviewer));
+            }
+        }
+        best.map(|(_, reviewer)| reviewer.to_string())
+    }
+
+    /// Posts ONE manager room line for a pull request the reconciliation changed (STUDIO-1022), so
+    /// the team reads why its review set shrank or moved. The line is host-composed from the
+    /// daemon's own values, never from anything a client sent, and a room that cannot be written is
+    /// logged and nothing else — the room is advisory (§0.11.4).
+    fn post_reconcile_line(
+        &self,
+        pr: &PrCoord,
+        retired: &[(String, String)],
+        reassigned: &[(String, String)],
+    ) {
+        let Some(room) = self.teams_room.as_ref() else {
+            return;
+        };
+        let mut parts: Vec<String> = retired
+            .iter()
+            .map(|(name, reason)| format!("retired {name} ({reason})"))
+            .collect();
+        parts.extend(
+            reassigned
+                .iter()
+                .map(|(from, to)| format!("reassigned {from} to {to}")),
+        );
+        if parts.is_empty() {
+            return;
+        }
+        let line = format!(
+            "review reconciliation on {pr}: the configured reviewer count or roster no longer \
+             matches this pull request's open reviews — {}. The watch set now matches the current \
+             configuration.",
+            parts.join("; ")
+        );
+        if let Err(e) = room.append(
+            &Message::room(MANAGER_IDENTITY, chrono::Utc::now(), line).with_refs([pr.to_string()]),
+        ) {
+            tracing::warn!(
+                pr = %pr, err = %e,
+                "ticketless review: the reconciliation room line could not be posted"
+            );
+        }
     }
 
     /// Services one OPEN pull request at `head`: re-arms whatever the advance re-armed, then
@@ -3408,9 +3839,10 @@ mod tests {
     use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult};
     use crate::orchestrator::RunningEntry;
     use crate::testsupport::{
-        DispatchedEntries, capture_events, empty_effective, empty_resolved_project, retry_entry,
-        set_of,
+        DispatchedEntries, TempDir, capture_events, empty_effective, empty_resolved_project,
+        retry_entry, set_of,
     };
+    use rhapsody_config::room::{Cursor, LocalRoom};
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OWNER: &str = "makewhatis";
@@ -5493,6 +5925,237 @@ mod tests {
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
     }
 
+    // --- watch-set reconciliation against the live config (STUDIO-1022) -----------------------
+
+    /// A completed review RUN for `(number, reviewer)`, ending at `at` — the durable recency the
+    /// surplus rule ranks by. The watch rows carry no timestamp, so this is how the daemon knows
+    /// which reviewer read the change most recently.
+    fn seed_review_run(o: &Orchestrator, number: i64, reviewer: &str, at: &str) {
+        let id = o
+            .store()
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: review_key(OWNER, REPO, number, reviewer),
+                started_at: at.to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start review run");
+        o.store()
+            .end_run(
+                id,
+                rhapsody_store::RunEnd {
+                    outcome: rhapsody_store::OUTCOME_COMPLETED.to_string(),
+                    ended_at: at.to_string(),
+                    ..rhapsody_store::RunEnd::default()
+                },
+            )
+            .expect("end review run");
+    }
+
+    /// The reviewers of `number`'s LIVE watch rows, in the store's order.
+    fn live_reviewers(o: &Orchestrator, number: i64) -> Vec<String> {
+        o.store()
+            .load_live_review_watch()
+            .expect("live watch")
+            .into_iter()
+            .filter(|r| row_is(r, &coord(number)))
+            .map(|r| r.key.reviewer)
+            .collect()
+    }
+
+    /// **The incident replay (STUDIO-1022).** `review.reviewers: 1`, `sol` removed from the roster,
+    /// and three live rows on one open, approved pull request — exactly the four pull requests the
+    /// incident left wedged. Before this ticket `sol`'s row could never be served (the author is
+    /// excluded and the other two hold the remaining rows), so it stayed `requested` forever and
+    /// `auto_merge_verdict_with_proof` read that as a round in flight: the pull request could never
+    /// merge, whatever alice and jimmy decided.
+    ///
+    /// MUTATION: skip the reconciliation call in `handle_review_sweep_slots` and this reds — the
+    /// surplus rows stay live and `report.merge` is empty with a `RoundInFlight` refusal.
+    #[test]
+    fn a_lowered_reviewer_count_and_a_departed_reviewer_let_the_survivor_merge() {
+        let mut teams = ticketless_automerge(&["alice", "jimmy"]);
+        teams.review.reviewers = 1;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(70, "alice", HEAD_A));
+        introduce(&o, reviewed_row(70, "jimmy", HEAD_A));
+        introduce(&o, row(70, "sol"));
+        // Alice read the change most recently, so hers is the row the surplus rule keeps.
+        seed_review_run(&o, 70, "jimmy", "2026-09-20T00:00:00Z");
+        seed_review_run(&o, 70, "alice", "2026-09-21T00:00:00Z");
+
+        let report = o.handle_review_sweep(&[open_at(70, HEAD_A)]);
+
+        assert_eq!(
+            live_reviewers(&o, 70),
+            vec!["alice".to_string()],
+            "one row survives — the reviewer whose completed review is most recent"
+        );
+        assert_eq!(
+            report.retired, 2,
+            "the departed reviewer's row and the surplus row are both retired"
+        );
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(70),
+                head: HEAD_A.to_string(),
+                approved_by: vec!["alice".to_string()],
+            }],
+            "the surviving approval now clears auto-merge — the stall this ticket closes"
+        );
+    }
+
+    /// **Acceptance: a departed reviewer with an eligible substitute and room under
+    /// `effective_reviewers()` is reassigned, not retired.** The review is still owed, so the row
+    /// moves to somebody who can serve it rather than being dropped.
+    #[test]
+    fn a_departed_reviewer_with_room_and_a_substitute_is_reassigned_not_retired() {
+        let mut teams = ticketless(&["alice", "bob"]);
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(71, "sol"));
+
+        let report = o.handle_review_sweep(&[open_at(71, HEAD_A)]);
+
+        assert_eq!(
+            live_reviewers(&o, 71),
+            vec!["bob".to_string()],
+            "the row moved to the first eligible substitute rather than dying"
+        );
+        assert_eq!(report.retired, 0, "a reassignment retires no obligation");
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["bob".to_string()],
+            "and the reassigned round is dispatched to the substitute this same tick"
+        );
+    }
+
+    /// **Acceptance: a running review is never retired, and the surplus is trimmed after it
+    /// completes.** Both rows exceed `review.reviewers: 1`, but both reviews are in flight, so
+    /// neither may be dropped — their completions must still land. Once one finishes, the next
+    /// sweep trims it away, keeping the one that is still running.
+    ///
+    /// MUTATION: drop the `rank == 0` pin in the surplus rule and this reds on the first sweep
+    /// (a running row is retired).
+    #[test]
+    fn a_running_review_is_never_retired_and_the_surplus_waits_its_turn() {
+        let mut teams = ticketless(&["alice", "jimmy"]);
+        teams.review.reviewers = 1;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(72, "alice"));
+        introduce(&o, row(72, "jimmy"));
+        o.claimed.insert(review_key(OWNER, REPO, 72, "alice"));
+        o.claimed.insert(review_key(OWNER, REPO, 72, "jimmy"));
+
+        let first = o.handle_review_sweep(&[open_at(72, HEAD_A)]);
+        assert_eq!(
+            first.retired, 0,
+            "a running review is never retired, even over the count"
+        );
+        assert_eq!(
+            live_reviewers(&o, 72).len(),
+            2,
+            "both wait for their completion"
+        );
+
+        // Alice's review finishes; the surplus is trimmed on the next sweep, and the review that
+        // is STILL running is the one kept.
+        o.claimed.remove(&review_key(OWNER, REPO, 72, "alice"));
+        let second = o.handle_review_sweep(&[open_at(72, HEAD_A)]);
+        assert_eq!(second.retired, 1, "the completed surplus is trimmed");
+        assert_eq!(
+            live_reviewers(&o, 72),
+            vec!["jimmy".to_string()],
+            "the still-running review survives"
+        );
+    }
+
+    /// **Acceptance: `review.required` outranks recency when picking survivors.** Bob completed the
+    /// most recent review, but carol is pinned and must be the one kept.
+    ///
+    /// MUTATION: ignore `review.required` in the surplus ranking and this reds (bob survives).
+    #[test]
+    fn a_surplus_trim_keeps_a_required_reviewer_over_a_more_recent_one() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 1;
+        teams.review.required = vec!["carol".to_string()];
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(74, "bob", HEAD_A));
+        introduce(&o, approved_row(74, "carol", HEAD_A));
+        seed_review_run(&o, 74, "carol", "2026-09-20T00:00:00Z");
+        seed_review_run(&o, 74, "bob", "2026-09-21T00:00:00Z");
+
+        let report = o.handle_review_sweep(&[open_at(74, HEAD_A)]);
+
+        assert_eq!(
+            live_reviewers(&o, 74),
+            vec!["carol".to_string()],
+            "a required reviewer is kept whatever the recency order says"
+        );
+        assert_eq!(report.retired, 1);
+    }
+
+    /// **Byte-identical when nothing changed.** Two rows, exactly `review.reviewers`, every reviewer
+    /// on the roster and dispatchable: the reconciliation decides nothing, posts nothing and
+    /// retires nobody. This is the guard the ticket asks to pass on both the old and new code.
+    #[test]
+    fn an_unchanged_config_and_roster_reconciles_nothing() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(73, "bob"));
+        introduce(&o, row(73, "carol"));
+
+        let report = o.handle_review_sweep(&[open_at(73, HEAD_A)]);
+
+        assert_eq!(report.retired, 0, "no row is retired");
+        assert_eq!(
+            live_reviewers(&o, 73).len(),
+            2,
+            "the watch set is left exactly as it was"
+        );
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["bob".to_string(), "carol".to_string()],
+            "and both rounds still dispatch"
+        );
+    }
+
+    /// **One manager room line per changed pull request.** The change is reported to the team, and
+    /// named host-side rather than left to be inferred from a vanished row.
+    #[test]
+    fn a_changed_pull_request_earns_one_manager_room_line() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut teams = ticketless(&["alice", "jimmy"]);
+        teams.review.reviewers = 1;
+        let (mut o, _d) = orch(teams);
+        o.teams_room = Some(Arc::clone(&room));
+        introduce(&o, approved_row(75, "alice", HEAD_A));
+        introduce(&o, approved_row(75, "jimmy", HEAD_A));
+        seed_review_run(&o, 75, "jimmy", "2026-09-20T00:00:00Z");
+        seed_review_run(&o, 75, "alice", "2026-09-21T00:00:00Z");
+
+        o.handle_review_sweep(&[open_at(75, HEAD_A)]);
+
+        let lines: Vec<String> = room
+            .read_since("reader", &Cursor::default(), 100)
+            .expect("read room")
+            .messages
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the one changed pull request: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("jimmy"),
+            "the line names what changed: {lines:?}"
+        );
+    }
+
     /// STUDIO-949 round 5: an approved, at-head pull request whose ORIGIN ticket is held for a human
     /// is not proposed for merge. The round gate refuses to dispatch a review against a held ticket;
     /// without this one, a pull request approved before the label landed would still merge, and the
@@ -5680,7 +6343,9 @@ mod tests {
     /// head blocks the merge the first row's approval would otherwise clear.
     #[test]
     fn one_reviewers_approval_does_not_merge_a_two_reviewer_pull_request() {
-        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob", "carol"]));
+        let mut teams = ticketless_automerge(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
         introduce(&o, approved_row(64, "bob", HEAD_A));
         introduce(&o, row(64, "carol"));
 
@@ -6629,18 +7294,21 @@ mod tests {
         );
     }
 
-    /// STUDIO-978 / alice's F2: an AUTHOR-LESS row can only ever be serviced by its INCUMBENT, so an
-    /// incumbent whose dispatch `spawn_worker` would REFUSE must defer the round rather than being
-    /// re-offered every tick. Without the unselectable check the row is dispatched, refused in the
-    /// worker, left `in_flight`, and crash recovery re-offers the same impossible incumbent — the
-    /// loop this branch is the only backstop for. The authored test above
-    /// (`an_unselectable_required_reviewer_does_not_break_continuity`) exercises the other branch and
-    /// cannot see this one.
+    /// STUDIO-978 / alice's F2: an AUTHOR-LESS row can only ever be serviced by its INCUMBENT, and an
+    /// incumbent whose dispatch `spawn_worker` would REFUSE (an unimplemented harness) must never be
+    /// dispatched: without the unselectable check the row is dispatched, refused in the worker, left
+    /// `in_flight`, and crash recovery re-offers the same impossible incumbent forever.
+    ///
+    /// Two halves are pinned here, because STUDIO-1022 moved the outcome. The pure `choose_review_
+    /// reviewer` still offers NOBODY for such a row (the guard directly below), and the
+    /// reconciliation sweep now RETIRES the row before the dispatch loop rather than deferring a
+    /// round no tick can ever resolve. The settlement path is exercised directly because the sweep
+    /// no longer reaches it for this fixture.
     ///
     /// MUTATION GUARD: `(on_roster && !exclusions.unselectable.contains(incumbent))` →
-    /// `(on_roster)` and the refused incumbent is dispatched.
+    /// `(on_roster)` and the pure selector names the refused incumbent.
     #[test]
-    fn an_authorless_row_defers_when_its_incumbent_cannot_run() {
+    fn an_authorless_row_whose_incumbent_cannot_run_is_retired() {
         let dir = crate::testsupport::TempDir::new();
         write_profile(
             &dir,
@@ -6655,7 +7323,14 @@ mod tests {
         // ever name the incumbent `sol`.
         let mut r = row(12, "sol");
         r.author = String::new();
-        introduce(&o, r);
+        introduce(&o, r.clone());
+
+        let load = LoadSnapshot::from_running(&o.running);
+        assert!(
+            o.choose_review_reviewer(&r, &HashSet::new(), &load)
+                .is_none(),
+            "an author-less row may only ever be offered its incumbent, and his dispatch is refused"
+        );
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
 
@@ -6663,8 +7338,12 @@ mod tests {
             report.dispatched, 0,
             "an incumbent whose dispatch is refused must not be dispatched"
         );
-        assert_eq!(report.deferred, 1, "the round is deferred, not lost");
+        assert_eq!(
+            report.retired, 1,
+            "the reconciliation retires an unfillable row rather than deferring forever"
+        );
         assert!(dispatched.lock().expect("lock").is_empty());
+        assert!(live_reviewers(&o, 12).is_empty());
     }
 
     /// STUDIO-951 / round 4: a persisted incumbent that is a TAIL pin beyond `review.reviewers`
@@ -6704,12 +7383,13 @@ mod tests {
     /// lost — the next tick considers it again.
     ///
     /// The lever used to be capacity; STUDIO-800 removed that as a deferral reason (D2), so this
-    /// pins the same behaviour on one that survives: the ranking has nobody to offer. `alice`
-    /// authored the pull request and is the only teammate left on the roster, and an author never
-    /// reviews their own work — so the round has no candidate at all. Deliberately ONE row and one
-    /// roster member, so the deferral can only have come from reviewer selection: with two rows a
-    /// downstream guard (an already-in-flight review key) reports the same counts, and the test
-    /// would pass for a reason it is not about.
+    /// pins the same behaviour on one that survives: the ranking has nobody to offer. The row names
+    /// its own AUTHOR, and the author is the whole roster, so the ranking has nothing to offer by
+    /// construction and the row's incumbent — being the author — is no substitute either.
+    ///
+    /// Deliberately ONE row naming an ON-ROSTER reviewer: a row whose reviewer had LEFT the roster
+    /// is now retired by the reconciliation sweep (STUDIO-1022) rather than deferred, which is a
+    /// different branch. This pins the deferral the reconciliation deliberately leaves alone.
     #[test]
     fn a_round_nobody_can_take_is_deferred_and_reconsidered() {
         let (mut o, dispatched) = orch(teams_with(
@@ -6717,7 +7397,7 @@ mod tests {
             ReviewMode::Ticketless,
             vec![ident("alice", 0)],
         ));
-        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "alice"));
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!((report.dispatched, report.deferred), (0, 1));
@@ -6760,7 +7440,10 @@ mod tests {
             ReviewMode::Ticketless,
             vec![ident("alice", 0)],
         ));
-        introduce(&o, row(12, "bob"));
+        // The row names its own AUTHOR, who is the whole roster — an on-roster reviewer no
+        // candidate can outrank, so the reconciliation leaves it alone and it defers. (A row whose
+        // reviewer had left the roster is retired instead, STUDIO-1022.)
+        introduce(&o, row(12, "alice"));
 
         // `alice` authored it and is the whole roster, so no sweep can ever assign this round.
         for sweep in 1..REVIEW_UNASSIGNABLE_SWEEPS {
@@ -6812,7 +7495,9 @@ mod tests {
             ReviewMode::Ticketless,
             vec![ident("alice", 0)],
         ));
-        introduce(&o, row(12, "bob"));
+        // The row names its own author, so it is DEFERRED (stalls) rather than reconciled away
+        // (STUDIO-1022 retires a row whose reviewer has left the roster).
+        introduce(&o, row(12, "alice"));
         for _ in 0..REVIEW_UNASSIGNABLE_SWEEPS {
             o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         }
@@ -6835,9 +7520,9 @@ mod tests {
     /// may only be serviced by its INCUMBENT: with no author to exclude, any substitution could
     /// hand a teammate their own pull request.
     ///
-    /// The incumbent is unavailable here because `bob` has left the roster — after STUDIO-800 the
-    /// only thing this path still requires of him. `carol` is idle and eligible and must STILL not
-    /// be handed the round; the row waits for `bob` instead.
+    /// The incumbent has left the roster, so the row cannot be served at all. `carol` is idle and
+    /// eligible and must STILL not be handed the round: STUDIO-1022 retires the row rather than
+    /// substituting for an author-less review, and no dispatch happens.
     #[test]
     fn an_author_less_row_never_substitutes() {
         let (mut o, dispatched) = orch(teams_with(
@@ -6854,8 +7539,13 @@ mod tests {
         );
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
-        assert_eq!((report.dispatched, report.deferred), (0, 1));
+        assert_eq!(
+            report.dispatched, 0,
+            "nobody may be handed an author-less review"
+        );
+        assert_eq!(report.retired, 1, "the unfillable row leaves the watch set");
         assert!(dispatched.lock().expect("lock").is_empty());
+        assert!(live_reviewers(&o, 12).is_empty());
     }
 
     // --- the approval terminal and the churn floor ------------------------------------------
@@ -8552,7 +9242,9 @@ mod tests {
         const OLD_BOB: &str = "0ldb0b0000000000000000000000000000000000";
         const OLD_CAROL: &str = "ca40101010101010101010101010101010101010";
         const SHIPPED: &str = "5h1pped000000000000000000000000000000000";
-        let (mut o, _d) = orch(adjudicating(&["alice", "bob", "carol"], 2));
+        let mut teams = adjudicating(&["alice", "bob", "carol"], 2);
+        teams.review.reviewers = 2;
+        let (mut o, _d) = orch(teams);
         let l = ledger(&mut o);
         introduce(&o, approved_row(12, "bob", OLD_BOB));
         introduce(&o, approved_row(12, "carol", OLD_CAROL));
@@ -9217,7 +9909,7 @@ mod tests {
         introduce(&o, row(13, "bob"));
 
         assert_eq!(
-            o.handle_review_dismiss(&coord(12)),
+            o.handle_review_dismiss(&coord(12), None),
             crate::reviewconsole::ReviewControlOutcome::Applied(1)
         );
 
@@ -9257,7 +9949,9 @@ mod tests {
     /// are what make that true: the first completer cannot stamp the pull request done.
     #[test]
     fn a_crashed_second_reviewer_is_re_dispatched() {
-        let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol"]));
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
         introduce(&o, row(12, "bob"));
         introduce(&o, row(12, "carol"));
 
@@ -9282,7 +9976,7 @@ mod tests {
     /// other rows' reviewers, so a capped incumbent cannot be replaced by their own peer.
     #[test]
     fn a_substitution_never_doubles_up_one_reviewer() {
-        let (mut o, dispatched) = orch(teams_with(
+        let mut teams = teams_with(
             true,
             ReviewMode::Ticketless,
             vec![
@@ -9291,7 +9985,9 @@ mod tests {
                 ident("carol", 0),
                 ident("dave", 0),
             ],
-        ));
+        );
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
         introduce(&o, row(12, "bob"));
         introduce(&o, row(12, "carol"));
         let mut busy = RunningEntry::empty(rhapsody_core::Issue {
@@ -9349,11 +10045,13 @@ mod tests {
     /// required reviews.
     #[test]
     fn two_reassignments_in_one_tick_do_not_land_on_the_same_substitute() {
-        let (mut o, dispatched) = orch(teams_with(
+        let mut teams = teams_with(
             true,
             ReviewMode::Ticketless,
             vec![ident("alice", 0), ident("carol", 0), ident("erin", 0)],
-        ));
+        );
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
         introduce(&o, row(12, "bob"));
         introduce(&o, row(12, "dave"));
         // Both incumbents have left the roster, so both rounds must be reassigned. (Until
