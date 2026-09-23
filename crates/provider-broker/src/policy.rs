@@ -5,8 +5,10 @@
 //! normalized adapter axis (v1: OpenAI Chat Completions only). Nothing here is negotiated with the
 //! harness: the block is validated at registration and can only be tightened per provider.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::authority::CumulativeBudgetAuthority;
 use crate::error::LimitViolation;
 
 /// The normalized broker protocol. V1 supports exactly one; a future protocol is a separate adapter,
@@ -50,6 +52,10 @@ pub struct BrokerLimits {
     pub max_reserved_tokens_turn: u64,
     /// Reserved token units allowed per Rhapsody session/run.
     pub max_reserved_tokens_session: u64,
+    /// Optional reserved token units allowed per UTC day. `None` (the default) means no Rhapsody
+    /// daily cap and UI/docs must say so; there is no permissive implicit default. When `Some`, the
+    /// daemon must inject a [`CumulativeBudgetAuthority`] into the session policy.
+    pub max_reserved_token_units_per_utc_day: Option<u64>,
     /// Maximum capability lifetime; the turn's absolute expiry never exceeds the earlier of this and
     /// the adapter's turn deadline (design §4.3).
     pub max_capability_lifetime: Duration,
@@ -67,6 +73,8 @@ pub const DEFAULT_BROKER_LIMITS: BrokerLimits = BrokerLimits {
     max_output_tokens_request: 32_000,
     max_reserved_tokens_turn: 1_000_000,
     max_reserved_tokens_session: 20_000_000,
+    // Absent means no Rhapsody daily cap; the operator opts in with a checked positive value.
+    max_reserved_token_units_per_utc_day: None,
     max_capability_lifetime: Duration::from_secs(60 * 60),
 };
 
@@ -83,6 +91,9 @@ pub const HARD_BROKER_LIMITS: BrokerLimits = BrokerLimits {
     max_output_tokens_request: 131_072,
     max_reserved_tokens_turn: 32_000_000,
     max_reserved_tokens_session: 640_000_000,
+    // The optional daily value is a checked positive `u64` and may deliberately be lower than one
+    // run cap; it has no compile-time hard ceiling, so `None` here means "not bounded by the block".
+    max_reserved_token_units_per_utc_day: None,
     max_capability_lifetime: Duration::from_secs(60 * 60),
 };
 
@@ -136,6 +147,11 @@ impl BrokerLimits {
         if self.max_capability_lifetime.is_zero() {
             return Err(LimitViolation::Zero("max_capability_lifetime"));
         }
+        // The optional daily value is a checked positive `u64`; absent is the only way to say
+        // "no daily cap". `Some(0)` is a refusal, never a silent unlock.
+        if self.max_reserved_token_units_per_utc_day == Some(0) {
+            return Err(LimitViolation::Zero("max_reserved_token_units_per_utc_day"));
+        }
         Ok(())
     }
 
@@ -172,23 +188,58 @@ impl Default for BrokerLimits {
     }
 }
 
-/// The session-scoped policy snapshot taken at registration. It is non-secret metadata: later slices
-/// may layer an optional durable day-budget authority onto it, which this crate only calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The session-scoped policy snapshot taken at registration. It is non-secret metadata carrying the
+/// validated limit block and, when the optional UTC-day cap is configured, the injected durable
+/// [`CumulativeBudgetAuthority`] this crate only calls.
+#[derive(Debug, Clone)]
 pub struct SessionPolicy {
     limits: BrokerLimits,
+    day_authority: Option<Arc<dyn CumulativeBudgetAuthority>>,
 }
 
 impl SessionPolicy {
-    /// Validate and freeze the session's limit block.
+    /// Validate and freeze the session's limit block. Refuses when the optional UTC-day cap is set
+    /// without a durable authority (a configured cap must be backed by storage).
     pub fn new(limits: BrokerLimits) -> Result<Self, LimitViolation> {
+        Self::build(limits, None)
+    }
+
+    /// Validate and freeze the session's limit block together with the injected durable day-budget
+    /// authority. Refuses when either is present without the other, so a day cap is never
+    /// configured without storage and an authority never exists with no cap to enforce.
+    pub fn with_day_authority(
+        limits: BrokerLimits,
+        authority: Arc<dyn CumulativeBudgetAuthority>,
+    ) -> Result<Self, LimitViolation> {
+        Self::build(limits, Some(authority))
+    }
+
+    fn build(
+        limits: BrokerLimits,
+        day_authority: Option<Arc<dyn CumulativeBudgetAuthority>>,
+    ) -> Result<Self, LimitViolation> {
         limits.validate()?;
-        Ok(Self { limits })
+        match (
+            limits.max_reserved_token_units_per_utc_day,
+            day_authority.as_ref(),
+        ) {
+            (Some(_), None) => Err(LimitViolation::DayCapWithoutAuthority),
+            (None, Some(_)) => Err(LimitViolation::AuthorityWithoutDayCap),
+            _ => Ok(Self {
+                limits,
+                day_authority,
+            }),
+        }
     }
 
     /// The validated limit block.
     pub fn limits(&self) -> &BrokerLimits {
         &self.limits
+    }
+
+    /// The injected durable day-budget authority, present exactly when the UTC-day cap is set.
+    pub fn day_authority(&self) -> Option<&Arc<dyn CumulativeBudgetAuthority>> {
+        self.day_authority.as_ref()
     }
 }
 
@@ -196,6 +247,7 @@ impl Default for SessionPolicy {
     fn default() -> Self {
         Self {
             limits: DEFAULT_BROKER_LIMITS,
+            day_authority: None,
         }
     }
 }
@@ -280,5 +332,95 @@ mod tests {
             BrokerProtocol::OpenAiChatCompletions.canonical_id(),
             "openai_chat_completions_v1"
         );
+    }
+
+    #[test]
+    fn the_optional_daily_cap_has_no_implicit_default() {
+        assert_eq!(
+            DEFAULT_BROKER_LIMITS.max_reserved_token_units_per_utc_day,
+            None
+        );
+        let policy = SessionPolicy::default();
+        assert!(policy.day_authority().is_none());
+        assert_eq!(policy.limits().max_reserved_token_units_per_utc_day, None);
+    }
+
+    #[test]
+    fn a_zero_daily_cap_is_refused_by_name() {
+        let limits = BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(0),
+            ..DEFAULT_BROKER_LIMITS
+        };
+        assert_eq!(
+            limits.validate(),
+            Err(LimitViolation::Zero("max_reserved_token_units_per_utc_day"))
+        );
+    }
+
+    #[test]
+    fn a_daily_cap_may_be_lower_than_one_run_cap() {
+        // Deliberately lower than `max_reserved_tokens_session`: the design allows it.
+        let limits = BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(1),
+            ..DEFAULT_BROKER_LIMITS
+        };
+        assert_eq!(limits.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_daily_cap_without_a_durable_authority_is_refused() {
+        let limits = BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(1_000),
+            ..DEFAULT_BROKER_LIMITS
+        };
+        assert_eq!(
+            SessionPolicy::new(limits).unwrap_err(),
+            LimitViolation::DayCapWithoutAuthority
+        );
+    }
+
+    #[test]
+    fn a_durable_authority_without_a_daily_cap_is_refused() {
+        let authority = Arc::new(super::tests::FakeAuthority::new());
+        assert_eq!(
+            SessionPolicy::with_day_authority(DEFAULT_BROKER_LIMITS, authority).unwrap_err(),
+            LimitViolation::AuthorityWithoutDayCap
+        );
+    }
+
+    /// A minimal in-memory authority used only to pin the policy pairing rules.
+    #[derive(Debug)]
+    struct FakeAuthority;
+
+    impl FakeAuthority {
+        fn new() -> Self {
+            FakeAuthority
+        }
+    }
+
+    impl CumulativeBudgetAuthority for FakeAuthority {
+        fn try_charge(
+            &self,
+            _provider_id: &str,
+            _tokens: u64,
+            _cap: u64,
+        ) -> Result<(), crate::authority::DayBudgetRefusal> {
+            Ok(())
+        }
+
+        fn charged_today(&self, _provider_id: &str) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_daily_cap_with_a_durable_authority_validates() {
+        let limits = BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(1_000),
+            ..DEFAULT_BROKER_LIMITS
+        };
+        let policy = SessionPolicy::with_day_authority(limits, Arc::new(FakeAuthority::new()))
+            .expect("policy");
+        assert!(policy.day_authority().is_some());
     }
 }

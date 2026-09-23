@@ -19,6 +19,7 @@ use crate::binding::{BoundCredentialLease, CredentialBinding};
 use crate::clock::Clock;
 use crate::error::BrokerError;
 use crate::ledger::TurnOutcome;
+use crate::metrics::BrokerMetrics;
 use crate::policy::{BrokerLimits, BrokerProtocol, SessionPolicy};
 use crate::random::RandomSource;
 use crate::session::{BrokerLedgerReceiver, BrokerSession};
@@ -161,10 +162,17 @@ impl Broker {
                 clock,
                 rng,
                 registry: Mutex::new(Registry::default()),
+                metrics: BrokerMetrics::new(),
                 #[cfg(test)]
                 mint_race: crate::state::MintRaceGate::default(),
             }),
         })
+    }
+
+    /// The broker's bounded, non-secret counters. Shared with every session; carries no session,
+    /// run, capability, or key identifier (design §13).
+    pub fn metrics(&self) -> Arc<BrokerMetrics> {
+        Arc::clone(&self.inner.metrics)
     }
 
     /// Register a session from a bound credential lease.

@@ -17,12 +17,14 @@ use crate::binding::BoundCredentialLease;
 use crate::broker::BrokerRegistrationPlan;
 use crate::clock::{Clock, MonotonicTime};
 use crate::error::BrokerError;
-use crate::ledger::{ReservationCounters, TurnLedger, TurnOutcome};
+use crate::ledger::{ReservationCounters, TurnLedger, TurnOutcome, UsageCounters};
 use crate::policy::SessionPolicy;
 use crate::random::RandomSource;
 use crate::reservations::{
     ConcurrencyPermit, ReservationSnapshot, Reservations, ReserveRequest, SessionReservations,
+    UsageSnapshot,
 };
+use crate::sse::UsageObservation;
 
 /// Recover a poisoned lock instead of propagating: no broker method panics while holding one.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -372,12 +374,29 @@ impl TurnInner {
         Ok(())
     }
 
-    /// Atomically reserve one forwarded request against the turn and session limits.
+    /// Atomically reserve one forwarded request against the turn, session/run, and optional durable
+    /// UTC-day limits.
     pub(crate) fn reserve_request(&self, request: ReserveRequest) -> Result<(), BrokerError> {
-        self.reservations
-            .try_reserve(&self.session.session_reservations, request, || {
-                self.check_live()
-            })
+        let policy = &self.session.policy;
+        self.reservations.try_reserve(
+            &self.session.session_reservations,
+            self.session.plan.stable_provider_id(),
+            policy.day_authority(),
+            request,
+            || self.check_live(),
+        )
+    }
+
+    /// Settle one admitted request's provider usage into the turn ledger, exactly once per request
+    /// (design §7.3). Never releases a token reservation.
+    pub(crate) fn settle_usage(&self, observation: &UsageObservation) {
+        self.reservations.settle_usage(observation);
+    }
+
+    /// Settle a forwarded response's byte reservation down to the bytes actually forwarded (design
+    /// §8.2). Token reservations never settle downward in the generic adapter.
+    pub(crate) fn settle_response_bytes(&self, reserved: u64, forwarded: u64) {
+        self.reservations.settle_response_bytes(reserved, forwarded);
     }
 
     /// Acquire one concurrency permit for this turn.
@@ -400,8 +419,8 @@ impl TurnInner {
             return None;
         }
         *finalized = Some(outcome);
-        let counters = self.reservations.close_and_snapshot();
-        let ledger = self.build_ledger(outcome, counters);
+        let (counters, usage) = self.reservations.close_and_snapshot();
+        let ledger = self.build_ledger(outcome, counters, usage);
         self.slot.finalize(ledger.clone());
         Some(ledger)
     }
@@ -443,7 +462,12 @@ impl TurnInner {
         lock(&self.session.broker.registry).revoke_grant(self);
     }
 
-    fn build_ledger(&self, outcome: TurnOutcome, snapshot: ReservationSnapshot) -> TurnLedger {
+    fn build_ledger(
+        &self,
+        outcome: TurnOutcome,
+        snapshot: ReservationSnapshot,
+        usage: UsageSnapshot,
+    ) -> TurnLedger {
         let counters = ReservationCounters {
             forwarded_requests: snapshot.forwarded_requests,
             denied_requests: snapshot.denied_requests,
@@ -451,12 +475,18 @@ impl TurnInner {
             response_bytes: snapshot.response_bytes,
             reserved_tokens: snapshot.reserved_tokens,
         };
+        let usage = UsageCounters {
+            provider_reported_tokens: usage.provider_reported_tokens,
+            reported_requests: usage.reported_requests,
+            unknown_usage_requests: usage.unknown_usage_requests,
+            inconsistent_usage_requests: usage.inconsistent_usage_requests,
+        };
         TurnLedger::new(
             self.ordinal,
             outcome,
             self.issued.load(Ordering::Acquire),
             counters,
-            None,
+            usage,
         )
     }
 }
@@ -504,6 +534,7 @@ pub(crate) struct BrokerInner {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) rng: Arc<dyn RandomSource>,
     pub(crate) registry: Mutex<Registry>,
+    pub(crate) metrics: Arc<crate::metrics::BrokerMetrics>,
     #[cfg(test)]
     pub(crate) mint_race: MintRaceGate,
 }
@@ -594,7 +625,7 @@ mod tests {
             TurnOutcome::NoCapability,
             false,
             ReservationCounters::default(),
-            None,
+            UsageCounters::default(),
         );
         assert!(slot.finalize(ledger.clone()));
         assert!(!slot.finalize(ledger.clone()));
@@ -613,7 +644,7 @@ mod tests {
             TurnOutcome::Completed,
             true,
             ReservationCounters::default(),
-            None,
+            UsageCounters::default(),
         );
         assert!(slot.finalize(first.clone()));
         // A stale receipt for turn 2 must neither hand back nor drain turn 1's ledger.
@@ -628,7 +659,7 @@ mod tests {
             TurnOutcome::Completed,
             true,
             ReservationCounters::default(),
-            None,
+            UsageCounters::default(),
         );
         assert!(slot.finalize(second.clone()));
         assert_eq!(slot.take(1), None, "turn 1 must not steal turn 2's ledger");
@@ -645,7 +676,7 @@ mod tests {
             TurnOutcome::Completed,
             true,
             ReservationCounters::default(),
-            None,
+            UsageCounters::default(),
         );
         assert!(slot.finalize(second.clone()));
         // A dropped turn-1 receipt drains only its own ledger, never turn 2's.

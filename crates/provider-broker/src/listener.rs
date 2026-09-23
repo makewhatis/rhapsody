@@ -45,13 +45,14 @@ use crate::budget::{
     buffered_response_weight, request_weight,
 };
 use crate::error::BrokerError;
+use crate::metrics::BrokerMetrics;
 use crate::redact::StreamingRedactor;
 use crate::refusal::{PolicyRefusal, refusal_response};
 use crate::reservations::ConcurrencyPermit;
 use crate::schema::{ChatRequestPolicy, RequestRejection, validate_chat_request};
 use crate::secret::ZeroizingBytes;
-use crate::sse::SseUsageObserver;
-use crate::turn::CapabilityGrant;
+use crate::sse::{SseUsageObserver, UsageObservation};
+use crate::turn::{CapabilityGrant, RequestSettlement};
 use crate::upstream::{
     NormalizedEndpoint, UpstreamClient, canonical_content_type, contains_secret, parse_retry_after,
     parse_retry_after_ms,
@@ -93,6 +94,7 @@ struct BrokerState {
     client: Arc<UpstreamClient>,
     request_budget: Arc<WeightedBudget>,
     response_budget: Arc<WeightedBudget>,
+    metrics: Arc<BrokerMetrics>,
     expected_host: Arc<str>,
     /// Daemon shutdown broadcast: every in-flight request selects on this and drops its upstream
     /// I/O when it flips (design §7.2).
@@ -143,11 +145,13 @@ impl BrokerListener {
             UpstreamClient::new().map_err(|error| std::io::Error::other(error.to_string()))?,
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = broker.metrics();
         let state = BrokerState {
             broker,
             client,
             request_budget: WeightedBudget::new(REQUEST_MEMORY_BUDGET),
             response_budget: WeightedBudget::new(BUFFERED_RESPONSE_BUDGET),
+            metrics,
             expected_host: Arc::clone(&expected_host),
             shutdown: shutdown_rx,
         };
@@ -355,20 +359,20 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     // through the whole downstream response (see `forward_response`), not just the response head.
     let permit = match grant.acquire_concurrency() {
         Ok(permit) => permit,
-        Err(_) => return deny(&grant, PolicyRefusal::BudgetExhausted),
+        Err(_) => return deny(&state, &grant, PolicyRefusal::BudgetExhausted),
     };
 
     // Weighted request-memory budget: charged before the body is allocated.
     let max_request_bytes = grant.limits().max_request_bytes;
     let declared = declared_content_length(&parts.headers);
     if declared.is_some_and(|length| length > max_request_bytes) {
-        return deny(&grant, PolicyRefusal::RequestTooLarge);
+        return deny(&state, &grant, PolicyRefusal::RequestTooLarge);
     }
     let Some(weight) = request_weight(declared, max_request_bytes) else {
-        return deny(&grant, PolicyRefusal::RequestTooLarge);
+        return deny(&state, &grant, PolicyRefusal::RequestTooLarge);
     };
     let Some(_memory) = state.request_budget.try_acquire(weight) else {
-        return deny(&grant, PolicyRefusal::BudgetExhausted);
+        return deny(&state, &grant, PolicyRefusal::BudgetExhausted);
     };
 
     // Every admission after authentication selects over revocation/expiry/shutdown as well as its
@@ -385,7 +389,7 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
             _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
             result = read => match result {
                 Ok(buffer) => buffer,
-                Err(refusal) => return deny(&grant, refusal),
+                Err(refusal) => return deny(&state, &grant, refusal),
             },
         }
     };
@@ -399,20 +403,20 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         },
     ) {
         Ok(request) => request,
-        Err(rejection) => return deny(&grant, map_rejection(rejection)),
+        Err(rejection) => return deny(&state, &grant, map_rejection(rejection)),
     };
 
     // The fixed, normalized upstream endpoint (parsed once for this turn).
     let endpoint =
         match NormalizedEndpoint::parse(grant.normalized_endpoint(), grant.allow_insecure_http()) {
             Ok(endpoint) => endpoint,
-            Err(_) => return deny(&grant, PolicyRefusal::ProviderMisconfigured),
+            Err(_) => return deny(&state, &grant, PolicyRefusal::ProviderMisconfigured),
         };
 
     // Re-serialize the validated object and apply the outbound body-size limit again.
     let outbound = request.to_json_bytes();
     if outbound.len() as u64 > max_request_bytes {
-        return deny(&grant, PolicyRefusal::RequestTooLarge);
+        return deny(&state, &grant, PolicyRefusal::RequestTooLarge);
     }
 
     // A non-streaming response buffers its whole body, so its broker-wide weighted budget is
@@ -425,15 +429,17 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         None
     } else {
         let Some(weight) = buffered_response_weight(grant.limits().max_response_bytes) else {
-            return deny(&grant, PolicyRefusal::BudgetExhausted);
+            return deny(&state, &grant, PolicyRefusal::BudgetExhausted);
         };
         match state.response_budget.try_acquire(weight) {
             Some(guard) => Some(guard),
-            None => return deny(&grant, PolicyRefusal::BudgetExhausted),
+            None => return deny(&state, &grant, PolicyRefusal::BudgetExhausted),
         }
     };
 
-    // Outbound admission: consume the forwarded-request slot immediately before construction.
+    // Outbound admission: consume the forwarded-request slot immediately before construction. This
+    // one transaction also charges the session/run and optional durable UTC-day caps (design §8.2).
+    let token_cost = outbound.len() as u64 + request.max_tokens;
     if grant
         .reserve_request(
             outbound.len() as u64,
@@ -442,8 +448,15 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         )
         .is_err()
     {
-        return deny(&grant, PolicyRefusal::BudgetExhausted);
+        return deny(&state, &grant, PolicyRefusal::BudgetExhausted);
     }
+    state.metrics.record_admitted(outbound.len() as u64);
+    state.metrics.record_forwarded(token_cost);
+    // Bounded, non-secret counters; the guard keeps the active count truthful for the whole request.
+    let _active = state.metrics.enter_request();
+    // Exactly one settlement per admitted request: an explicit observation, or a conservative
+    // unknown on drop (client disconnect, upstream failure, turn revocation, or expiry).
+    let settlement = grant.begin_request_settlement();
 
     // The credential is borrowed for exactly this request and its redactor; the capability never
     // leaves the loopback. The `Authorization` header (and its transient buffer) is built inside the
@@ -483,10 +496,13 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     forward_response(
         grant,
         request.stream,
-        upstream,
-        secret,
-        permit,
-        buffered_budget,
+        OutboundResponse {
+            upstream,
+            secret,
+            permit,
+            buffered_budget,
+            settlement,
+        },
         &state,
     )
     .await
@@ -502,21 +518,38 @@ fn cancelled_response(grant: &CapabilityGrant) -> Response {
     }
 }
 
+/// Everything an admitted request carries into its response phase: the upstream response, the
+/// borrowed secret and single-use credential copy, the held concurrency permit, the optional
+/// buffered-response guard, and the exactly-once usage settlement handle.
+struct OutboundResponse {
+    upstream: crate::upstream::UpstreamResponse,
+    secret: ZeroizingBytes,
+    permit: ConcurrencyPermit,
+    buffered_budget: Option<WeightedGuard>,
+    settlement: RequestSettlement,
+}
+
 /// Build the downstream response from a received upstream response: fresh headers, media-type
 /// validation, and a bounded/redacted body (streamed for a successful SSE turn, buffered otherwise).
 async fn forward_response(
     grant: CapabilityGrant,
     streaming: bool,
-    upstream: crate::upstream::UpstreamResponse,
-    secret: ZeroizingBytes,
-    permit: ConcurrencyPermit,
-    buffered_budget: Option<WeightedGuard>,
+    outbound: OutboundResponse,
     state: &BrokerState,
 ) -> Response {
+    let OutboundResponse {
+        upstream,
+        secret,
+        permit,
+        buffered_budget,
+        mut settlement,
+    } = outbound;
     if upstream.has_non_identity_encoding() {
+        // The request was admitted; the unmetered protocol error still settles as unknown.
         return refusal_response(PolicyRefusal::UpstreamProtocol);
     }
     let status = upstream.status();
+    state.metrics.record_upstream_status(status.as_u16());
     let success_streaming = streaming && status.is_success();
     if status.is_success() {
         let media = upstream.media_type();
@@ -550,6 +583,7 @@ async fn forward_response(
             secret,
             max_response_bytes,
             permit,
+            settlement,
             state.shutdown.clone(),
         ))
     } else {
@@ -586,7 +620,15 @@ async fn forward_response(
             }
         };
         match buffered {
-            Ok(bytes) => Body::from(bytes),
+            Ok((bytes, observation)) => {
+                // A buffered body is fully read: its usage settles as measurement and its
+                // response-byte reservation settles down to the bytes actually forwarded. The token
+                // reservation is never released from the report (design §7.3, §8.2).
+                settlement.settle(&observation, Some(bytes.len() as u64));
+                Body::from(bytes)
+            }
+            // The request was admitted but produced no usable body; settlement drops as unknown and
+            // keeps the full response-byte and token reservations.
             Err(refusal) => return refusal_response(refusal),
         }
     };
@@ -605,6 +647,7 @@ fn streaming_body<S>(
     secret: ZeroizingBytes,
     max_bytes: u64,
     permit: ConcurrencyPermit,
+    settlement: RequestSettlement,
     shutdown: watch::Receiver<bool>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
 where
@@ -619,6 +662,9 @@ where
         emitted: u64,
         max_bytes: u64,
         finished: bool,
+        /// Settles this request's usage exactly once when the stream ends, errors, or (on a client
+        /// disconnect) the body is dropped (design §7.1, §7.3).
+        settlement: RequestSettlement,
         /// Held until the downstream body is dropped or completes (design §7.1).
         _permit: ConcurrencyPermit,
         /// Daemon-shutdown broadcast (design §7.2).
@@ -634,6 +680,7 @@ where
         emitted: 0,
         max_bytes,
         finished: false,
+        settlement,
         _permit: permit,
         shutdown,
     };
@@ -666,16 +713,27 @@ where
                     state.observer.finish();
                     let tail = state.redactor.finish();
                     state.finished = true;
+                    state.emitted = state.emitted.saturating_add(tail.len() as u64);
+                    let observation = state.observer.observation();
+                    if state.emitted > state.max_bytes {
+                        // A response that breached its byte ceiling is malformed: keep the full
+                        // response-byte reservation.
+                        state.settlement.settle(&observation, None);
+                        return Some((Err(limit_error()), state));
+                    }
+                    // The stream completed: settle usage once and the response-byte reservation
+                    // down to the bytes actually forwarded.
+                    state.settlement.settle(&observation, Some(state.emitted));
                     if tail.is_empty() {
                         return None;
-                    }
-                    state.emitted = state.emitted.saturating_add(tail.len() as u64);
-                    if state.emitted > state.max_bytes {
-                        return Some((Err(limit_error()), state));
                     }
                     return Some((Ok(Bytes::from(tail)), state));
                 }
                 Some(Err(_)) => {
+                    // A failed stream was admitted; settle whatever usage was observed (or unknown)
+                    // and keep the full response-byte reservation (design §7.3, §8.2).
+                    let observation = state.observer.observation();
+                    state.settlement.settle(&observation, None);
                     state.finished = true;
                     return Some((Err(upstream_error()), state));
                 }
@@ -687,6 +745,8 @@ where
                     }
                     state.upstream_seen = state.upstream_seen.saturating_add(chunk.len() as u64);
                     if state.upstream_seen > state.max_bytes {
+                        let observation = state.observer.observation();
+                        state.settlement.settle(&observation, None);
                         state.finished = true;
                         return Some((Err(limit_error()), state));
                     }
@@ -697,6 +757,8 @@ where
                     state.observer.observe(&emitted);
                     state.emitted = state.emitted.saturating_add(emitted.len() as u64);
                     if state.emitted > state.max_bytes {
+                        let observation = state.observer.observation();
+                        state.settlement.settle(&observation, None);
                         state.finished = true;
                         return Some((Err(limit_error()), state));
                     }
@@ -718,7 +780,7 @@ async fn buffer_body<S>(
     mut redactor: StreamingRedactor,
     max_bytes: u64,
     require_json: bool,
-) -> Result<Bytes, PolicyRefusal>
+) -> Result<(Bytes, UsageObservation), PolicyRefusal>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
 {
@@ -755,7 +817,7 @@ where
     if require_json && !is_json_object {
         return Err(PolicyRefusal::UpstreamProtocol);
     }
-    Ok(Bytes::from(out))
+    Ok((Bytes::from(out), observer.observation()))
 }
 
 fn limit_error() -> std::io::Error {
@@ -869,12 +931,14 @@ async fn read_body_frames(body: Body, max_bytes: u64) -> Result<Vec<u8>, PolicyR
 /// Refuse an authenticated request and count the local denial against the turn's bounded abuse
 /// counter (design §5.2, §8.2). The denial that *reaches* the configured threshold revokes the turn
 /// token here, so a subsequent request cannot authenticate at all.
-fn deny(grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
+fn deny(state: &BrokerState, grant: &CapabilityGrant, refusal: PolicyRefusal) -> Response {
+    state.metrics.record_denied();
     if matches!(
         grant.record_denied(),
         Err(BrokerError::TurnBudgetExhausted("max_denied_requests"))
     ) {
         grant.revoke();
+        state.metrics.record_revocation();
     }
     refusal_response(refusal)
 }

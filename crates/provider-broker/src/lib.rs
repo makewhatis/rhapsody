@@ -1,16 +1,19 @@
-//! rhapsody-provider-broker — the protocol-neutral provider-broker core (PB1) and the private
-//! OpenAI-compatible loopback adapter (PB2).
+//! rhapsody-provider-broker — the protocol-neutral provider-broker core (PB1), the private
+//! OpenAI-compatible loopback adapter (PB2), and the ledger/reservation/budget slice (PB3).
 //!
 //! This crate is **not** a parity port of a Go package: it realizes the Rhapsody-only
-//! provider-broker design (`provider-broker-design.md`, approved 2026-09-19, slices PB1 and PB2).
+//! provider-broker design (`provider-broker-design.md`, approved 2026-09-19, slices PB1-PB3).
 //! PB1 owns the session/turn capability registry, the bound credential-lease contract, the
 //! capacity-one turn-receipt ledger, and the atomic reservation primitives. PB2 adds the one private
 //! loopback listener, the exact Chat Completions route, the closed request schema, the fixed
-//! outbound client with its redirect/proxy/TLS policy, the bounded streaming pipeline, and the
-//! exact-secret redactor. It still depends on no `rhapsody-agent`, `rhapsody-orchestrator`,
-//! `rhapsody-httpapi`, `rhapsody-config`, `rhapsody-store`, or desktop type, so the security boundary
-//! (a harness receives only a bounded per-turn capability, never a reusable provider key) can be
-//! tested in isolation.
+//! outbound client with its redirect/proxy/TLS policy, the bounded streaming pipeline, the
+//! exact-secret redactor, and the bounded SSE/JSON usage observer. PB3 enforces every finite
+//! request/concurrency/byte/output-token/session admission bound atomically, adds the optional
+//! durable UTC-day [`CumulativeBudgetAuthority`] contract, settles parsed provider usage exactly
+//! once into separate provider-reported/reserved totals, and exposes bounded metrics. It still
+//! depends on no `rhapsody-agent`, `rhapsody-orchestrator`, `rhapsody-httpapi`, `rhapsody-config`,
+//! `rhapsody-store`, or desktop type, so the security boundary (a harness receives only a bounded
+//! per-turn capability, never a reusable provider key) can be tested in isolation.
 //!
 //! Ownership summary, straight from the binding design (§3.2):
 //!
@@ -36,6 +39,7 @@
 //! can make transient copies Rhapsody cannot prove were wiped — the guarantee is prompt release of
 //! Rhapsody's *owned* primary buffer, not allocator-wide forensic erasure.
 
+pub mod authority;
 pub mod binding;
 pub mod broker;
 pub mod budget;
@@ -43,6 +47,7 @@ pub mod clock;
 pub mod error;
 pub mod ledger;
 pub mod listener;
+pub mod metrics;
 pub mod policy;
 pub mod random;
 pub mod refusal;
@@ -57,6 +62,7 @@ mod redact;
 mod reservations;
 mod state;
 
+pub use authority::{CumulativeBudgetAuthority, DayBudgetRefusal, UtcDay};
 pub use binding::{
     BindingFingerprint, BoundCredentialLease, CredentialBinding, MAX_API_KEY_BYTES,
     MAX_CREDENTIAL_ENVELOPE_BYTES, validate_api_key_value,
@@ -65,10 +71,11 @@ pub use broker::{Broker, BrokerRegistration, BrokerRegistrationPlan};
 pub use budget::{WeightedBudget, WeightedGuard};
 pub use clock::{Clock, ManualClock, MonotonicTime, SystemClock};
 pub use error::{BrokerError, CredentialRejection, LimitViolation};
-pub use ledger::{TurnLedger, TurnOutcome};
+pub use ledger::{TurnLedger, TurnOutcome, UsageAuthority};
 pub use listener::{
     BrokerListener, HEADER_READ_TIMEOUT, MAX_CONNECTIONS, MAX_REQUESTS_PER_CONNECTION,
 };
+pub use metrics::{BrokerMetrics, BrokerMetricsSnapshot};
 pub use policy::{
     BrokerLimits, BrokerProtocol, DEFAULT_BROKER_LIMITS, HARD_BROKER_LIMITS, SessionPolicy,
 };

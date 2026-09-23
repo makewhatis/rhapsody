@@ -21,9 +21,10 @@ use futures_util::stream;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use rhapsody_provider_broker::{
-    BoundCredentialLease, BrokerLedgerReceiver, BrokerLimits, BrokerListener, BrokerProtocol,
-    BrokerRegistrationPlan, BrokerSession, Clock, CredentialBinding, DEFAULT_BROKER_LIMITS,
-    ManualClock, ScriptedRandom, SessionPolicy, SystemClock, TurnAccess, TurnMeta, TurnReceipt,
+    BoundCredentialLease, Broker, BrokerLedgerReceiver, BrokerLimits, BrokerListener,
+    BrokerProtocol, BrokerRegistrationPlan, BrokerSession, Clock, CredentialBinding,
+    DEFAULT_BROKER_LIMITS, ManualClock, ScriptedRandom, SessionPolicy, SystemClock, TurnAccess,
+    TurnMeta, TurnReceipt, UsageAuthority,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -175,14 +176,14 @@ async fn fake_handler(State(state): State<FakeUpstream>, req: Request) -> Respon
 struct Harness {
     api_port: u16,
     capability: String,
-    #[allow(dead_code)]
     access: Option<TurnAccess>,
-    #[allow(dead_code)]
     receipt: TurnReceipt,
     #[allow(dead_code)]
     session: BrokerSession,
     #[allow(dead_code)]
     ledgers: BrokerLedgerReceiver,
+    #[allow(dead_code)]
+    broker: Broker,
     upstream: FakeUpstream,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -232,6 +233,17 @@ impl Harness {
         allow_insecure_http: bool,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let policy = SessionPolicy::new(limits).expect("policy");
+        Self::against_logins(upstream, limits, allow_insecure_http, clock, policy).await
+    }
+
+    async fn against_logins(
+        upstream: FakeUpstream,
+        limits: BrokerLimits,
+        allow_insecure_http: bool,
+        clock: Arc<dyn Clock>,
+        policy: SessionPolicy,
+    ) -> Self {
         let rng = Arc::new(ScriptedRandom::new());
         let (listener, broker) = BrokerListener::bind_with(clock.clone(), rng).expect("listener");
         let api_port = listener.local_addr().port();
@@ -255,7 +267,7 @@ impl Harness {
         )
         .expect("plan");
         let mut registration = broker
-            .register_session(plan, lease, SessionPolicy::new(limits).expect("policy"))
+            .register_session(plan, lease, policy)
             .expect("registration");
         let (attempt, receipt) = registration
             .ledgers
@@ -283,11 +295,18 @@ impl Harness {
             receipt,
             session: registration.session,
             ledgers: registration.ledgers,
+            broker,
             upstream,
             shutdown: Some(tx),
             server: Some(server),
             clock,
         }
+    }
+
+    /// Drop the turn access (finalizing the receipt) and drain the finalized ledger.
+    fn finish_turn(&mut self) -> rhapsody_provider_broker::TurnLedger {
+        drop(self.access.take());
+        self.receipt.take().expect("a finalized turn ledger")
     }
 
     fn chat_url(&self) -> String {
@@ -1620,4 +1639,203 @@ async fn raw(port: u16, head: &str, body: &[u8]) -> RawResponse {
     // Sanity: the refusal bodies are bounded and never echo a token.
     assert!(!text.contains(UPSTREAM_KEY));
     RawResponse { status }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PB3: usage settlement and budget enforcement through the real loopback adapter
+// ---------------------------------------------------------------------------------------------
+
+fn non_stream_body(model: &str) -> Vec<u8> {
+    serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 32_000,
+        "stream": false,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A final streaming usage chunk settles exactly once and is kept apart from the conservative
+/// admission reservation (design §7.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_usage_settles_once_and_the_reservation_is_retained() {
+    let mut response = FakeResponse::sse(Vec::new());
+    response.chunks = sse_body().into_iter().map(String::into_bytes).collect();
+    let mut harness = Harness::with(response, default_limits(), true).await;
+
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.expect("body");
+
+    let ledger = harness.finish_turn();
+    assert_eq!(ledger.forwarded_requests(), 1);
+    assert_eq!(
+        ledger.response_bytes(),
+        body.len() as u64,
+        "a forwarded response settles its byte reservation down to the bytes actually forwarded"
+    );
+    assert_eq!(ledger.provider_reported_tokens(), Some(5));
+    assert_eq!(ledger.reported_requests(), 1);
+    assert_eq!(
+        ledger.usage_authority(),
+        Some(UsageAuthority::ProviderReportedUnverified),
+        "generic v1 usage is measurement, never exact measured authority"
+    );
+    assert!(!ledger.usage_incomplete());
+    assert_eq!(ledger.unknown_usage_requests(), 0);
+    assert!(
+        ledger.reserved_tokens() > 5,
+        "the admission reservation stays separate from and larger than the report"
+    );
+
+    let snapshot = harness.broker.metrics().snapshot();
+    assert_eq!(snapshot.forwarded_requests, 1);
+    assert_eq!(snapshot.reported_requests, 1);
+    assert_eq!(snapshot.unknown_usage_requests, 0);
+    assert_eq!(snapshot.active_requests, 0);
+}
+
+/// A non-streaming JSON response reads its top-level usage object and settles once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_streaming_json_usage_settles_once() {
+    let body = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+    })
+    .to_string();
+    let mut harness = Harness::with(FakeResponse::json(body), default_limits(), true).await;
+
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &non_stream_body(MODEL))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("body");
+
+    let ledger = harness.finish_turn();
+    assert_eq!(ledger.forwarded_requests(), 1);
+    assert_eq!(ledger.provider_reported_tokens(), Some(10));
+    assert_eq!(ledger.reported_requests(), 1);
+    assert!(!ledger.usage_incomplete());
+    assert_eq!(harness.upstream.count(), 1);
+}
+
+/// A malformed usage stream cannot release the reservation: it is counted unknown and stays charged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_stream_keeps_the_reservation_and_counts_unknown() {
+    let mut response = FakeResponse::sse(Vec::new());
+    response.chunks = vec![
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
+        b"data: {not json}\n\n".to_vec(),
+    ];
+    let mut harness = Harness::with(response, default_limits(), true).await;
+
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.expect("body");
+
+    let ledger = harness.finish_turn();
+    assert_eq!(ledger.provider_reported_tokens(), None);
+    assert_eq!(ledger.reported_requests(), 0);
+    assert_eq!(ledger.usage_authority(), None);
+    assert!(ledger.usage_incomplete());
+    assert_eq!(ledger.unknown_usage_requests(), 1);
+    assert!(
+        ledger.reserved_tokens() >= 32_000,
+        "the full admission reservation remains charged"
+    );
+}
+
+/// An under-reporting provider cannot release the generic reservation or buy another request: every
+/// attempt consumes a forwarded-request slot and its own advertised admission cost (design §7.3,
+/// §8.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_under_report_does_not_release_the_reservation_or_allow_extra_requests() {
+    let limits = BrokerLimits {
+        max_forwarded_requests: 2,
+        max_concurrent_requests: 1,
+        ..default_limits()
+    };
+    let mut response = FakeResponse::sse(Vec::new());
+    // The provider claims a single token per response — a severe under-report.
+    response.chunks = vec![
+        "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n"
+            .to_owned()
+            .into_bytes(),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let mut harness = Harness::with(response, limits, true).await;
+
+    let capability = harness.capability.clone();
+    for _ in 0..2 {
+        let resp = harness
+            .post(Some(&capability), &[], &chat_body(MODEL, true))
+            .await;
+        assert_eq!(resp.status(), 200);
+        let _ = resp.bytes().await.expect("body");
+    }
+
+    // The third attempt cannot be admitted: the two previous reservations were never released.
+    let refused = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "a policy refusal, never a retryable 429"
+    );
+    let refusal = refused.text().await.expect("refusal body");
+    assert!(refusal.contains("budget_exhausted"), "got {refusal}");
+    assert_eq!(
+        harness.upstream.count(),
+        2,
+        "the refused attempt must not reach the upstream"
+    );
+
+    let ledger = harness.finish_turn();
+    assert_eq!(ledger.forwarded_requests(), 2);
+    assert_eq!(ledger.provider_reported_tokens(), Some(2));
+    assert!(
+        ledger.reserved_tokens() >= 64_000,
+        "two full reservations remain despite the tiny reports, got {}",
+        ledger.reserved_tokens()
+    );
+}
+
+/// Every retry is a fresh admission: it consumes a forwarded-request slot and its own reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_retry_consumes_a_forwarded_admission() {
+    let limits = BrokerLimits {
+        max_forwarded_requests: 3,
+        max_concurrent_requests: 1,
+        ..default_limits()
+    };
+    let mut response = FakeResponse::sse(Vec::new());
+    response.chunks = sse_body().into_iter().map(String::into_bytes).collect();
+    let mut harness = Harness::with(response, limits, true).await;
+
+    let capability = harness.capability.clone();
+    for _ in 0..3 {
+        let resp = harness
+            .post(Some(&capability), &[], &chat_body(MODEL, true))
+            .await;
+        assert_eq!(resp.status(), 200);
+        let _ = resp.bytes().await.expect("body");
+    }
+    let refused = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    assert_eq!(refused.status(), 403);
+
+    let ledger = harness.finish_turn();
+    assert_eq!(ledger.forwarded_requests(), 3, "every retry is charged");
+    assert_eq!(ledger.provider_reported_tokens(), Some(15));
+    assert_eq!(harness.upstream.count(), 3);
 }
