@@ -62,7 +62,7 @@ use rhapsody_tracker::Tracker;
 use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::teams::{LoadSnapshot, route};
-use crate::teamscompose::recall_query;
+use crate::teamscompose::{recall_query, team_recall_query};
 
 /// The prefetch pass's own cadence. One minute matches [`triage`]'s and is
 /// slower than the 30s poll on purpose: this is ahead-of-dispatch work nobody
@@ -130,10 +130,14 @@ impl PrefetchKey {
     }
 }
 
-/// One cached recall: the facts, and when they were fetched.
+/// One cached recall: the identity's own facts, the SHARED team bank's facts
+/// recalled for the same ticket (STUDIO-1040), and when they were fetched.
 #[derive(Debug, Clone)]
 struct Entry {
     facts: Vec<Fact>,
+    /// Empty when no `memory.team_bank` is configured, which is what keeps the
+    /// team-off cache byte-identical to before this field existed.
+    team: Vec<Fact>,
     at: DateTime<Utc>,
 }
 
@@ -173,6 +177,27 @@ impl PrefetchCache {
         Some(entry.facts.clone())
     }
 
+    /// **The dispatch-path read for the SHARED team bank** (STUDIO-1040).
+    ///
+    /// The same non-blocking read as [`try_get`](Self::try_get), returning the
+    /// shared facts recalled for `(identity, ticket)` instead of the identity's
+    /// own. Empty is a miss, exactly as `None` is above; an entry that holds only
+    /// own facts (no team bank configured) answers an empty vector rather than
+    /// `None`, because the team section it feeds is empty either way.
+    pub fn try_get_team(
+        &self,
+        identity: &str,
+        ticket: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<Fact>> {
+        let guard = self.entries.try_read().ok()?;
+        let entry = guard.get(&PrefetchKey::new(identity, ticket))?;
+        if is_stale(entry.at, now) {
+            return None;
+        }
+        Some(entry.team.clone())
+    }
+
     /// Installs this cycle's `fresh` results and **evicts everything whose ticket
     /// is no longer a live candidate**.
     ///
@@ -200,6 +225,26 @@ impl PrefetchCache {
         live: &HashSet<PrefetchKey>,
         now: DateTime<Utc>,
     ) {
+        self.sync_both(
+            fresh
+                .into_iter()
+                .map(|(key, facts)| (key, facts, Vec::new()))
+                .collect(),
+            live,
+            now,
+        );
+    }
+
+    /// [`sync`](Self::sync) carrying the SHARED team bank's facts beside the
+    /// identity's own (STUDIO-1040). One entry per `(identity, ticket)` holds
+    /// both, so the team facts expire, carry and evict on exactly the own facts'
+    /// schedule — there is no second TTL to get wrong.
+    pub fn sync_both(
+        &self,
+        fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)>,
+        live: &HashSet<PrefetchKey>,
+        now: DateTime<Utc>,
+    ) {
         // Snapshot what survives under the read lock, then release it: the whole
         // rebuild happens outside any lock.
         let mut carried: Vec<(PrefetchKey, Entry)> = match self.entries.read() {
@@ -223,8 +268,17 @@ impl PrefetchCache {
         let mut bytes = 0usize;
         // This cycle's answers first: they are the freshest, and a fresh entry
         // must win over a carried copy of the same key.
-        for (key, facts) in fresh {
-            insert_bounded(&mut next, &mut bytes, key, Entry { facts, at: now });
+        for (key, facts, team) in fresh {
+            insert_bounded(
+                &mut next,
+                &mut bytes,
+                key,
+                Entry {
+                    facts,
+                    team,
+                    at: now,
+                },
+            );
         }
         for (key, entry) in carried {
             if !next.contains_key(&key) {
@@ -245,6 +299,16 @@ impl PrefetchCache {
     pub fn replace(&self, fresh: Vec<(PrefetchKey, Vec<Fact>)>, now: DateTime<Utc>) {
         let live: HashSet<PrefetchKey> = fresh.iter().map(|(k, _)| k.clone()).collect();
         self.sync(fresh, &live, now);
+    }
+
+    /// [`replace`](Self::replace) carrying shared team facts too (STUDIO-1040).
+    pub fn replace_both(
+        &self,
+        fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)>,
+        now: DateTime<Utc>,
+    ) {
+        let live: HashSet<PrefetchKey> = fresh.iter().map(|(k, _, _)| k.clone()).collect();
+        self.sync_both(fresh, &live, now);
     }
 
     /// How many entries are cached. Test/observability only — never consulted by
@@ -287,7 +351,12 @@ fn insert_bounded(
     if out.len() >= MAX_CACHE_ENTRIES {
         return;
     }
-    let cost: usize = entry.facts.iter().map(|f| f.content.len()).sum();
+    let cost: usize = entry
+        .facts
+        .iter()
+        .chain(entry.team.iter())
+        .map(|f| f.content.len())
+        .sum();
     if *bytes + cost > MAX_CACHE_BYTES {
         return;
     }
@@ -492,7 +561,7 @@ where
         .collect();
     *cursor = start + take;
 
-    let mut fresh: Vec<(PrefetchKey, Vec<Fact>)> = Vec::with_capacity(window.len());
+    let mut fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)> = Vec::with_capacity(window.len());
     for (identity, iss) in window {
         // A shutdown must not have to wait out a whole cycle of remote recalls.
         if ctx.is_cancelled() {
@@ -512,9 +581,11 @@ where
                         "teams memory prefetch: skipping an unusable bank record"
                     );
                 }
+                let team = prefetch_team_facts(deps, iss).await;
                 fresh.push((
                     PrefetchKey::new(identity, iss.identifier.clone()),
                     recalled.facts,
+                    team,
                 ));
             }
             Err(e) => {
@@ -529,17 +600,57 @@ where
                     "teams memory prefetch: the remote bank failed; keeping what this cycle \
                      already recalled and backing off"
                 );
-                deps.cache.sync(fresh, &live, (deps.now)());
+                deps.cache.sync_both(fresh, &live, (deps.now)());
                 return CycleOutcome::BankFailure;
             }
         }
     }
     let n = fresh.len();
-    deps.cache.sync(fresh, &live, (deps.now)());
+    deps.cache.sync_both(fresh, &live, (deps.now)());
     if n == 0 {
         CycleOutcome::Idle
     } else {
         CycleOutcome::Prefetched(n)
+    }
+}
+
+/// Recalls the SHARED team bank for one candidate (STUDIO-1040), bounded by
+/// `team_recall_top_k`.
+///
+/// **Best-effort and isolated from the identity's recall**: a team bank that
+/// fails degrades the team section to empty and the cycle continues, because one
+/// shared bank being down must not cost every candidate its OWN memory too. The
+/// shared recall is the same ticket-scoped query the identity's own is (see
+/// [`team_recall_query`]), so the two are ranked against the same terms.
+async fn prefetch_team_facts<TF>(deps: &PrefetchDeps<TF>, iss: &Issue) -> Vec<Fact> {
+    let teams = &deps.teams;
+    if !teams.memory.team_bank_enabled() {
+        return Vec::new();
+    }
+    let bank = teams.memory.team_bank.as_str();
+    let q = team_recall_query(teams, iss);
+    match deps.backend.recall_shared(bank, &q).await {
+        Ok(recalled) => {
+            for (what, why) in &recalled.skipped {
+                tracing::warn!(
+                    bank = %bank,
+                    item = %what,
+                    reason = %why,
+                    "teams memory prefetch: skipping an unusable team-bank record"
+                );
+            }
+            recalled.facts
+        }
+        Err(e) => {
+            tracing::warn!(
+                bank = %bank,
+                ticket = %iss.identifier,
+                error = %e,
+                "teams memory prefetch: the shared team bank failed; caching no team facts for \
+                 this ticket (the identity's own recall is unaffected)"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -624,8 +735,12 @@ mod tests {
     #[derive(Default)]
     struct FakeBank {
         facts: HashMap<String, Vec<Fact>>,
+        /// The facts every shared-bank recall answers with (STUDIO-1040).
+        team_facts: Vec<Fact>,
         fail: bool,
         asked: Mutex<Vec<(String, String)>>,
+        /// `(bank, ticket)` for each shared-bank recall.
+        asked_shared: Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait]
@@ -644,6 +759,20 @@ mod tests {
             }
             Ok(Recalled {
                 facts: self.facts.get(identity).cloned().unwrap_or_default(),
+                skipped: Vec::new(),
+            })
+        }
+
+        async fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+            self.asked_shared
+                .lock()
+                .expect("asked_shared")
+                .push((bank.to_string(), q.ticket.clone()));
+            if self.fail {
+                return Err(MemoryError::Io("the tailnet is down".to_string()));
+            }
+            Ok(Recalled {
+                facts: self.team_facts.clone(),
                 skipped: Vec::new(),
             })
         }
@@ -1250,5 +1379,79 @@ mod tests {
             "a down bank must be backed off, not retried hot: {attempts} attempts in 300ms"
         );
         assert!(cache.is_empty(), "and dispatch degrades to exactly `none`");
+    }
+
+    // ── the shared team bank in the cycle (STUDIO-1040) ──────────────────
+
+    /// With a `team_bank` configured the cycle queries it too, once per window
+    /// item, and caches its facts beside the identity's own under the same key.
+    #[tokio::test]
+    async fn the_cycle_recalls_the_team_bank_and_caches_it_beside_own_facts() {
+        let mut cfg = teams(true, BackendKind::Hindsight);
+        cfg.memory.team_bank = "agent-team".to_string();
+        cfg.memory.team_recall_top_k = 2;
+        let mut bank = FakeBank {
+            facts: [("alice".to_string(), vec![fact("own", "my own note")])]
+                .into_iter()
+                .collect(),
+            team_facts: vec![fact("team1", "goldens are recaptured only")],
+            ..FakeBank::default()
+        };
+        // Deterministic map contents for the one candidate.
+        bank.facts
+            .insert("alice".to_string(), vec![fact("own", "my own note")]);
+        let bank = Arc::new(bank);
+        let cache = Arc::new(PrefetchCache::new());
+        let d = deps(
+            cfg,
+            Arc::clone(&bank),
+            tracker(vec![issue("1", "MT-1", &["rust"])]),
+            Arc::clone(&cache),
+            0,
+        );
+        let mut cursor = 0usize;
+        let outcome = prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+        assert_eq!(outcome, CycleOutcome::Prefetched(1));
+
+        let shared = bank.asked_shared.lock().expect("asked_shared").clone();
+        assert_eq!(
+            shared,
+            vec![("agent-team".to_string(), "MT-1".to_string())],
+            "the team bank must be queried with the candidate's ticket"
+        );
+        let own = cache.try_get("alice", "MT-1", at(1)).expect("own hit");
+        assert_eq!(own[0].id, "own");
+        let team = cache
+            .try_get_team("alice", "MT-1", at(1))
+            .expect("team hit");
+        assert_eq!(team[0].id, "team1", "the team facts are cached beside own");
+    }
+
+    /// With no `team_bank` the cycle makes NO shared recall: the team-off path
+    /// issues exactly the requests it did before STUDIO-1040.
+    #[tokio::test]
+    async fn a_team_off_cycle_makes_no_shared_recall() {
+        let bank = bank_with(&[("alice", vec![fact("f1", "x")])]);
+        let cache = Arc::new(PrefetchCache::new());
+        let d = deps(
+            teams(true, BackendKind::Hindsight),
+            Arc::clone(&bank),
+            tracker(vec![issue("1", "MT-1", &["rust"])]),
+            Arc::clone(&cache),
+            0,
+        );
+        let mut cursor = 0usize;
+        prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+        assert!(
+            bank.asked_shared.lock().expect("asked_shared").is_empty(),
+            "team bank off ⇒ no shared recall"
+        );
+        assert!(
+            cache
+                .try_get_team("alice", "MT-1", at(1))
+                .expect("hit")
+                .is_empty(),
+            "and the cached entry carries no team facts"
+        );
     }
 }

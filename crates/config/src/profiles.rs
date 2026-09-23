@@ -264,6 +264,38 @@ const BUILTINS: &[BuiltinProfile] = &[
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v3.md"),
     },
+    // v3 (STUDIO-1040): the software engineer is told to use `teams_retain
+    // {shared: true}` for durable repo knowledge — and never for PR or round
+    // status. Shipped as an ADDED file, per §4: `swe@2` still resolves
+    // byte-for-byte for anyone who pinned it, and `extends: swe` picks it up on
+    // upgrade for free.
+    BuiltinProfile {
+        name: "swe",
+        version: 3,
+        model: "",
+        effort: "",
+        harness: "",
+        provider: "",
+        capabilities: &[
+            "design-first",
+            "test-coverage",
+            "code-review",
+            "adversarial-verify",
+        ],
+        tools: &[],
+        body: include_str!("profiles/builtin/swe.v3.md"),
+    },
+    BuiltinProfile {
+        name: "reviewer",
+        version: 4,
+        model: "",
+        effort: "",
+        harness: "",
+        provider: "",
+        capabilities: &["code-review", "security-review", "simplify"],
+        tools: &[],
+        body: include_str!("profiles/builtin/reviewer.v4.md"),
+    },
 ];
 
 /// The bundled default profiles, newest version last for any given name.
@@ -907,9 +939,10 @@ mod tests {
     ///
     /// T4 bumped every role to v2 (the "retain what the next run will need"
     /// section, §5.1). STUDIO-1034 bumped the reviewer to v3 (the acceptance
-    /// checklist). **Every earlier version is still listed, unedited**: §4's
-    /// upgrade story is that a bump is an ADDED file, so anyone who wrote
-    /// `extends: reviewer@2` keeps exactly the bytes they pinned.
+    /// checklist) and STUDIO-1040 bumped swe to v3 and the reviewer to v4 (the
+    /// `teams_retain {shared: true}` guidance). **Every earlier version is still
+    /// listed, unedited**: §4's upgrade story is that a bump is an ADDED file, so
+    /// anyone who wrote `extends: reviewer@2` keeps exactly the bytes they pinned.
     #[test]
     fn builtins_ship_v1_and_v2_of_swe_reviewer_sre() {
         let got: Vec<(&str, u32)> = builtin_profiles()
@@ -925,7 +958,9 @@ mod tests {
                 ("swe", 2),
                 ("reviewer", 2),
                 ("sre", 2),
-                ("reviewer", 3)
+                ("reviewer", 3),
+                ("swe", 3),
+                ("reviewer", 4)
             ]
         );
         // Every v2 teaches the retain half of §5.1, and every v1 predates it.
@@ -967,7 +1002,7 @@ mod tests {
             .filter(|b| b.name == "reviewer")
             .max_by_key(|b| b.version)
             .expect("a reviewer built-in ships");
-        assert_eq!(newest.version, 3);
+        assert_eq!(newest.version, 4);
         assert!(
             newest.body.contains("acceptance source of truth"),
             "the reviewer must be pointed at the prompt's acceptance source"
@@ -1687,15 +1722,16 @@ mod tests {
             issue.to_string(),
             "alice's profile \"swe\" overlays swe@1; the built-in is now swe@2"
         );
-        // The SHIPPED registry now ships swe@2 too (T4's retain section), so
-        // this pin is real drift and the boot-time roster check reports it —
-        // exactly the operator warning §4 designed the pin to earn.
+        // The SHIPPED registry now ships swe@3 too (T4's retain section, then
+        // STUDIO-1040's shared-bank guidance), so this pin is real drift and the
+        // boot-time roster check reports it — exactly the operator warning §4
+        // designed the pin to earn.
         assert_eq!(
             check_roster(&teams, p)
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            vec!["alice's profile \"swe\" overlays swe@1; the built-in is now swe@2"]
+            vec!["alice's profile \"swe\" overlays swe@1; the built-in is now swe@3"]
         );
     }
 }

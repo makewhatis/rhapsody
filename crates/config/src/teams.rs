@@ -148,6 +148,11 @@ pub const MIN_MODEL_TIMEOUT_MS: i64 = 15000;
 const DEFAULT_BANK_PREFIX: &str = "agent-";
 /// `memory.recall_top_k` — how many facts a recall returns.
 const DEFAULT_RECALL_TOP_K: i64 = 8;
+/// `memory.team_recall_top_k` — how many SHARED team facts a recall adds beside
+/// the identity's own (STUDIO-1040). Smaller than [`DEFAULT_RECALL_TOP_K`]: the
+/// shared bank is a supplement to the teammate's own memory, not a replacement,
+/// and every shared fact is turn-1 cost on every run of every teammate.
+const DEFAULT_TEAM_RECALL_TOP_K: i64 = 3;
 /// `prompt_budget_bytes` — the ONE total byte budget the Teams composer spends
 /// across the whole teammate prepend (§0.11.6). See [`Teams::prompt_budget_bytes`]
 /// for why the default is this size and not smaller.
@@ -167,6 +172,10 @@ fn default_bank_prefix() -> String {
 
 fn default_recall_top_k() -> i64 {
     DEFAULT_RECALL_TOP_K
+}
+
+fn default_team_recall_top_k() -> i64 {
+    DEFAULT_TEAM_RECALL_TOP_K
 }
 
 fn default_prompt_budget_bytes() -> i64 {
@@ -812,6 +821,26 @@ pub struct Memory {
     pub bank_prefix: String,
     #[serde(default = "default_recall_top_k")]
     pub recall_top_k: i64,
+    /// The SHARED team bank (STUDIO-1040): a bank every teammate both reads and
+    /// can write to on purpose, for durable repo knowledge rather than per-PR
+    /// status. A **bank id**, not an identity: it is `banks/<team_bank>/` under
+    /// [`path`](Self::path) and bank `<team_bank>` on `hindsight`.
+    ///
+    /// **Empty ⇒ today's behaviour, byte-identical**: no extra recall, no extra
+    /// prompt section, no extra API field. That is why it is an empty string and
+    /// not an `Option`: absent and `""` resolve to the same off state, exactly as
+    /// every other empty-means-unset field in this file does.
+    ///
+    /// Validated like a bank id (`is_label_safe`) and required NOT to equal any
+    /// roster identity's resolved bank — a collision would make the shared bank
+    /// and a teammate's personal bank the same directory, so a shared retain
+    /// would land in one teammate's recall.
+    #[serde(default)]
+    pub team_bank: String,
+    /// `memory.team_recall_top_k` — how many shared facts a turn-1 recall adds in
+    /// their own section, capped independently of [`recall_top_k`](Self::recall_top_k).
+    #[serde(default = "default_team_recall_top_k")]
+    pub team_recall_top_k: i64,
 }
 
 impl Default for Memory {
@@ -823,7 +852,29 @@ impl Default for Memory {
             api_key: String::new(),
             bank_prefix: default_bank_prefix(),
             recall_top_k: DEFAULT_RECALL_TOP_K,
+            team_bank: String::new(),
+            team_recall_top_k: DEFAULT_TEAM_RECALL_TOP_K,
         }
+    }
+}
+
+impl Memory {
+    /// Whether the shared team bank is configured (STUDIO-1040). The one gate
+    /// every shared-bank path checks, so "empty ⇒ byte-identical to before" is a
+    /// single predicate rather than a scattering of `is_empty` checks.
+    pub fn team_bank_enabled(&self) -> bool {
+        !self.team_bank.is_empty()
+    }
+
+    /// [`team_recall_top_k`](Self::team_recall_top_k) as the effective cap, with
+    /// the non-positive fallback applied — the shared bank's sibling of
+    /// [`recall_top_k`](Self::recall_top_k)'s rule, so `0` never silently means
+    /// "recall nothing" here while it means "the default" there.
+    pub fn effective_team_recall_top_k(&self) -> usize {
+        usize::try_from(self.team_recall_top_k)
+            .ok()
+            .filter(|k| *k > 0)
+            .unwrap_or(DEFAULT_TEAM_RECALL_TOP_K as usize)
     }
 }
 
@@ -1456,6 +1507,35 @@ impl Teams {
                 "manager.default_identity {:?} is not a roster entry",
                 self.manager.default_identity
             )));
+        }
+        // ── STUDIO-1040: the shared team bank ─────────────────────────────────
+        // The shared bank is a bank id, so it gets a bank id's charset check, and
+        // it must not be the bank any roster identity resolves to. A collision
+        // would make the shared bank and one teammate's personal bank the same
+        // directory (or URL segment): a shared retain would surface only in that
+        // teammate's recall, which is worse than either bank alone.
+        if !self.memory.team_bank.is_empty() {
+            let bank = self.memory.team_bank.as_str();
+            if !is_label_safe(bank) {
+                return Err(TeamsError::Invalid(format!(
+                    "memory.team_bank {bank:?} is not label-safe (must match ^[a-z][a-z0-9-]*$; \
+                     it becomes a bank id and a directory name)"
+                )));
+            }
+            for entry in &self.roster {
+                let own = crate::memory::resolve_bank_id(
+                    &self.memory.bank_prefix,
+                    &entry.bank,
+                    &entry.name,
+                );
+                if own == bank {
+                    return Err(TeamsError::Invalid(format!(
+                        "memory.team_bank {bank:?} is the resolved bank of roster identity {:?} — \
+                         the shared bank must not collide with a teammate's personal bank",
+                        entry.name
+                    )));
+                }
+            }
         }
         // ── STUDIO-985: the selection tuple schema ─────────────────────────────
         // The manager carries its OWN tuple and never inherits a teammate's (§2.3, parent D6). An
@@ -3484,6 +3564,11 @@ mod tests {
                 api_key: "$HINDSIGHT_API_KEY".to_string(),
                 bank_prefix: "team-".to_string(),
                 recall_top_k: 3,
+                // STUDIO-1040: the shared team bank, round-tripped like the rest.
+                // `alice`'s bank is the `"b"` override, so `agent-team` collides
+                // with nobody.
+                team_bank: "agent-team".to_string(),
+                team_recall_top_k: 4,
             },
             quorum: Quorum {
                 enabled: true,
@@ -3718,5 +3803,100 @@ roster:
             !yaml.contains("supersecret"),
             "a credential round-tripped through the typed model: {yaml}"
         );
+    }
+
+    // ── STUDIO-1040: the shared team bank ─────────────────────────────────────
+
+    /// Absent `memory.team_bank` parses to empty with the default `team_recall_top_k`, so every
+    /// existing `teams.yaml` is byte-identically the off state.
+    #[test]
+    fn memory_team_bank_defaults_to_off() {
+        let t = Teams::parse("memory:\n  backend: local\n").expect("parse");
+        assert!(t.memory.team_bank.is_empty());
+        assert!(!t.memory.team_bank_enabled());
+        assert_eq!(t.memory.team_recall_top_k, 3);
+        assert_eq!(t.memory.effective_team_recall_top_k(), 3);
+    }
+
+    /// The shared bank is label-safe like a `bank:` override, and it must not collide with any
+    /// roster identity's RESOLVED bank — including one an override (not the prefix) produced.
+    #[test]
+    fn validate_rejects_a_bad_or_colliding_team_bank() {
+        let base = Teams {
+            enabled: true,
+            roster: vec![
+                Identity {
+                    name: "alice".to_string(),
+                    bank: String::new(),
+                    ..Identity::default()
+                },
+                Identity {
+                    name: "bob".to_string(),
+                    bank: "custom-bank".to_string(),
+                    ..Identity::default()
+                },
+            ],
+            ..Teams::disabled()
+        };
+
+        // Not label-safe.
+        let bad = Teams {
+            memory: Memory {
+                team_bank: "Not/Safe".to_string(),
+                ..Memory::default()
+            },
+            ..base.clone()
+        };
+        let err = bad
+            .validate()
+            .expect_err("non-label-safe team_bank must refuse");
+        assert!(err.to_string().contains("not label-safe"), "{err}");
+
+        // Collides with the prefix-derived bank of `alice` (`agent-alice`).
+        let collide_prefix = Teams {
+            memory: Memory {
+                team_bank: "agent-alice".to_string(),
+                ..Memory::default()
+            },
+            ..base.clone()
+        };
+        let err = collide_prefix
+            .validate()
+            .expect_err("apex collision with a prefix bank must refuse");
+        assert!(err.to_string().contains("shared bank"), "{err}");
+
+        // Collides with the RESOLVED bank of `bob` (his `bank:` override). This is the one a
+        // prefix-only check would miss.
+        let collide_override = Teams {
+            memory: Memory {
+                team_bank: "custom-bank".to_string(),
+                ..Memory::default()
+            },
+            ..base.clone()
+        };
+        let err = collide_override
+            .validate()
+            .expect_err("collision with an override bank must refuse");
+        assert!(err.to_string().contains("shared bank"), "{err}");
+
+        // A distinct, label-safe bank validates.
+        let ok = Teams {
+            memory: Memory {
+                team_bank: "agent-team".to_string(),
+                ..Memory::default()
+            },
+            ..base
+        };
+        ok.validate().expect("a distinct shared bank is valid");
+    }
+
+    /// `0` (or negative) `team_recall_top_k` falls back to the default rather than meaning
+    /// "recall nothing" — the same non-positive rule `recall_top_k` follows.
+    #[test]
+    fn team_recall_top_k_non_positive_falls_back() {
+        let t = Teams::parse("memory:\n  team_bank: agent-team\n  team_recall_top_k: 0\n")
+            .expect("parse");
+        assert_eq!(t.memory.effective_team_recall_top_k(), 3);
+        assert!(t.memory.team_bank_enabled());
     }
 }

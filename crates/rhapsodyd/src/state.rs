@@ -436,6 +436,16 @@ impl StateProvider for DaemonState {
         self.teams_memory()?.recall(identity, query, state).await
     }
 
+    /// The SHARED team bank's recall (STUDIO-1040) — same off-loop task, no
+    /// identity: the shared bank belongs to the team, not to a teammate.
+    async fn teams_recall_team(
+        &self,
+        query: &str,
+        state: &str,
+    ) -> Result<RecallView, TeamsMemoryError> {
+        self.teams_memory()?.recall_team(query, state).await
+    }
+
     async fn teams_invalidate(
         &self,
         identity: &str,
@@ -447,6 +457,15 @@ impl StateProvider for DaemonState {
             .await
     }
 
+    /// A shared-bank correction (STUDIO-1040).
+    async fn teams_invalidate_team(
+        &self,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<InvalidateView, TeamsMemoryError> {
+        self.teams_memory()?.invalidate_team(fact_id, reason).await
+    }
+
     /// §5.3's reversal (STUDIO-689) — the same bank, the same off-loop task, no `reason`.
     async fn teams_reinstate(
         &self,
@@ -456,6 +475,11 @@ impl StateProvider for DaemonState {
         self.teams_memory()?.reinstate(identity, fact_id).await
     }
 
+    /// A shared-bank reversal (STUDIO-1040).
+    async fn teams_reinstate_team(&self, fact_id: &str) -> Result<ReinstateView, TeamsMemoryError> {
+        self.teams_memory()?.reinstate_team(fact_id).await
+    }
+
     async fn teams_retain(
         &self,
         run_id: i64,
@@ -463,6 +487,19 @@ impl StateProvider for DaemonState {
     ) -> Result<RetainView, TeamsMemoryError> {
         self.teams_memory()?
             .retain_for_run(run_id, content, Utc::now())
+            .await
+    }
+
+    /// A SHARED retain (STUDIO-1040) — provenance stamped the same way, so the
+    /// caller cannot forge the author; the record just lands in the team bank
+    /// instead of its own.
+    async fn teams_retain_shared(
+        &self,
+        run_id: i64,
+        content: &str,
+    ) -> Result<RetainView, TeamsMemoryError> {
+        self.teams_memory()?
+            .retain_for_run_scoped(run_id, content, true, Utc::now())
             .await
     }
 

@@ -18,6 +18,12 @@ export const ANY = "all";
 /** One teammate's bank as the page read it, in roster order. */
 export interface MemoryBank {
   identity: string;
+  /**
+   * `"team"` for the SHARED bank (STUDIO-1040), absent for a teammate's own. It decides whether a
+   * correction targets the shared bank or the author's personal one, and keeps the shared bank out
+   * of the teammate filter (its `identity` is a bank id, not a roster name).
+   */
+  scope?: "team";
   facts: readonly TeamsFact[];
   /** Record files the daemon could not parse — reported rather than hidden, as recall reports them. */
   skipped?: readonly string[];
@@ -130,7 +136,10 @@ export function sortFacts(facts: readonly TeamsFact[], sort: MemorySort): TeamsF
 
 /** The teammate Select's options — roster order, because §1.5 assigns color by that position. */
 export function teammateOptions(banks: readonly MemoryBank[]): string[] {
-  return banks.map((b) => b.identity);
+  // The shared team bank's `identity` is a bank id, not a teammate: filtering by it would offer a
+  // name no one can match facts against, so it is left out. Its facts still appear under their
+  // AUTHORS, who are roster names.
+  return banks.filter((b) => b.scope !== "team").map((b) => b.identity);
 }
 
 /** The ticket Select's options — each ticket once, sorted, skipping records stamped with none. */

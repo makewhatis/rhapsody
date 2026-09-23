@@ -1557,6 +1557,9 @@ export interface TeamsOverview {
   default_identity: string;
   /** "none" | "local" | "hindsight". */
   backend: string;
+  /** The configured SHARED team bank id (STUDIO-1040). ABSENT ⇒ the feature is off: the daemon
+   * omits the key entirely when empty, so a Teams-off overview is unchanged. */
+  team_bank?: string;
   roster: TeamsRosterRow[];
 }
 
@@ -1615,6 +1618,8 @@ export interface TeamsFact {
 
 export interface TeamsRecallResponse {
   identity: string;
+  /** "identity" (a teammate's own bank) or "team" (the shared bank, STUDIO-1040). */
+  scope?: string;
   facts: TeamsFact[];
   /** Bank files that could not be read — reported rather than hidden. */
   skipped: string[];
@@ -1725,8 +1730,14 @@ export async function fetchTeamsRecall(
   identity: string,
   query = "",
   state = "",
+  scope = "",
 ): Promise<TeamsRecallResponse> {
-  const params = new URLSearchParams({ identity, query });
+  // `scope: "team"` reads the SHARED bank (STUDIO-1040), which takes no identity:
+  // the bank belongs to the team, so no roster name is reused for it.
+  const params =
+    scope === "team"
+      ? new URLSearchParams({ scope: "team", query })
+      : new URLSearchParams({ identity, query });
   if (state !== "") params.set("state", state);
   const r = await getJSON<TeamsRecallResponse>(`/api/v1/teams/recall?${params}`);
   r.facts ??= [];
@@ -1759,11 +1770,14 @@ export async function postTeamsInvalidate(
   identity: string,
   factID: string,
   reason: string,
+  scope = "",
 ): Promise<TeamsInvalidateResponse> {
   return postJSON<TeamsInvalidateResponse>("/api/v1/teams/invalidate", {
     identity,
     fact_id: factID,
     reason,
+    // Omitted unless shared, so a personal invalidation's body is unchanged.
+    ...(scope === "team" ? { scope: "team" } : {}),
   });
 }
 
@@ -1773,10 +1787,12 @@ export async function postTeamsInvalidate(
 export async function postTeamsReinstate(
   identity: string,
   factID: string,
+  scope = "",
 ): Promise<TeamsReinstateResponse> {
   return postJSON<TeamsReinstateResponse>("/api/v1/teams/reinstate", {
     identity,
     fact_id: factID,
+    ...(scope === "team" ? { scope: "team" } : {}),
   });
 }
 

@@ -338,32 +338,7 @@ impl HindsightBackend {
     /// side of that doubt.
     pub async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
         let bank = self.checked_bank_id(identity)?;
-        let id = checked_fact_id(fact_id)?;
-        let url = format!("{}/memories/{id}", self.bank_url(&bank));
-        let current = self
-            .send(self.http.get(&url), "hindsight read fact")
-            .await?;
-        if current.status == 404 {
-            return Err(MemoryError::NotFound(format!(
-                "no fact {fact_id:?} in bank {bank:?}"
-            )));
-        }
-        if current.status < 400
-            && let Ok(v) = serde_json::from_str::<Value>(&current.body)
-            && v.get("state").and_then(Value::as_str) == Some(STATE_VALID)
-        {
-            return Ok(false);
-        }
-        self.send(
-            self.http.patch(&url).json(&json!({ "state": STATE_VALID })),
-            "hindsight revalidate",
-        )
-        .await?
-        .ok_or_not_found(
-            "revalidate",
-            &format!("no fact {fact_id:?} in bank {bank:?}"),
-        )?;
-        Ok(true)
+        self.revalidate_in_bank(&bank, fact_id).await
     }
 
     /// `GET …/memories/list` — the browse path (STUDIO-652's "show me what this
@@ -427,34 +402,28 @@ impl HindsightBackend {
         }
         Ok(out)
     }
-}
 
-#[async_trait]
-impl MemoryBackend for HindsightBackend {
-    /// `POST …/memories` with one `MemoryItem`.
-    ///
-    /// §5.1's provenance travels as the item's `metadata`, which the deployed
-    /// schema types as `{string: string}` — so all five host-stamped fields go
-    /// over as strings, present even when empty, mirroring what `local` writes
-    /// into front matter. `document_id` carries §5.1's `run-<run_id>`.
-    ///
-    /// `async: true`, so the call returns as soon as the service has accepted the
-    /// document rather than waiting for LLM fact extraction — measured at 14–25s
-    /// against Hindsight 0.10.1, far past [`REQUEST_TIMEOUT`]. Waiting
-    /// synchronously made every retain report a client-side failure while the
-    /// server still stored the fact (STUDIO-1036). The background retain answers
-    /// in well under the timeout, and the response's `operation_id` is logged at
-    /// debug when it carries one; a response without one still succeeds.
-    ///
-    /// **The returned id is the `document_id` we supplied, not a fact id.**
-    /// Hindsight *extracts* facts from the content, so one retain can produce
-    /// several facts and the response (`RetainResponse`) names none of them; the
-    /// document is the only stable handle the caller gave and can name again.
-    async fn retain(&self, rec: &Record) -> Result<String, MemoryError> {
-        let bank = self.checked_bank_id(&rec.identity)?;
+    /// Refuses a shared bank id that is not label-safe (STUDIO-1040). `bank`
+    /// arrives from `memory.team_bank`, which config validation already checked,
+    /// but it is checked again here rather than trusted: it becomes a URL path
+    /// segment, the same reason [`checked_bank_id`](HindsightBackend::checked_bank_id)
+    /// checks an identity.
+    fn checked_shared_bank(bank: &str) -> Result<(), MemoryError> {
+        if !crate::teams::is_label_safe(bank) {
+            return Err(MemoryError::Invalid(format!(
+                "bank {bank:?} is not label-safe (must match ^[a-z][a-z0-9-]*$)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The one retain writer, on a resolved BANK ID. `retain` resolves an
+    /// identity's bank and calls this; `retain_shared` passes the team bank
+    /// straight through.
+    async fn retain_in_bank(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
         // Best-effort and never fatal to the retain (§5.1): a bank whose
         // consolidation could not be switched off still stores the fact.
-        if let Err(e) = self.ensure_bank_config(&bank).await {
+        if let Err(e) = self.ensure_bank_config(bank).await {
             tracing::warn!(
                 bank = %bank,
                 error = %e,
@@ -462,7 +431,7 @@ impl MemoryBackend for HindsightBackend {
                  anyway (a bank with consolidation left on still stores the fact)"
             );
         }
-        let url = format!("{}/memories", self.bank_url(&bank));
+        let url = format!("{}/memories", self.bank_url(bank));
         let body = json!({
             "items": [{
                 "content": truncate_bytes(&rec.content, MAX_RETAIN_CONTENT_BYTES),
@@ -498,45 +467,29 @@ impl MemoryBackend for HindsightBackend {
         Ok(rec.document_id.clone())
     }
 
-    /// `POST …/memories/recall` with the two overrides the STUDIO-1036 operator
-    /// decision (2026-09-23) requires — `types: ["experience", "world"]` and
-    /// `include: {source_facts: {}}` — both of which §5.2 says the service's
-    /// defaults get wrong for this use.
-    ///
-    /// **`top_k` is applied here, not by the service.** The deployed
-    /// `RecallRequest` has no `top_k` or `limit`, only `budget` and `max_tokens`,
-    /// so the "every recalled byte is turn-1 prompt cost, forever" bound is
-    /// enforced on the response — which is where `local` enforces it too.
-    ///
-    /// `source_facts` is requested because §5.2 requires it. It is sent
-    /// unconditionally rather than only when some `types` entry could carry
-    /// sources, so the request shape does not quietly change if a future slice
-    /// ever asks for observations.
-    async fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError> {
-        let bank = self.checked_bank_id(identity)?;
+    /// The one recall reader, on a resolved BANK ID. `fallback_identity` is the
+    /// identity a result with no `identity` metadata is attributed to — the
+    /// reading identity for a personal bank, and empty for the shared bank (a
+    /// shared fact's author comes from its own metadata).
+    async fn recall_in_bank(
+        &self,
+        bank: &str,
+        fallback_identity: &str,
+        q: &Query,
+    ) -> Result<Recalled, MemoryError> {
         let top_k = effective_top_k(q);
-        // Anything but `valid` cannot go through search at all: §5.3 records
-        // that hindsight's `readableByModel` "refuses **any** non-`valid`
-        // state", so `POST …/memories/recall` would answer a state-widened
-        // query with the valid records and no sign that the rest were dropped.
-        // The list endpoint is the only surface that can serve them, so a
-        // state-widened read is a bounded LIST rather than a scored search —
-        // and the query narrows nothing there (STUDIO-689).
         if q.state != RecallState::Valid {
-            return self.browse(&bank, identity, top_k, q.state).await;
+            return self.browse(bank, fallback_identity, top_k, q.state).await;
         }
         let query = query_text(q);
         if query.is_empty() {
-            // A browse with no terms, or a query whose every term was empty. The
-            // recall endpoint requires a query string, so the honest answer to
-            // "what does this teammate remember" comes from the list endpoint.
             return if q.browse {
-                self.browse(&bank, identity, top_k, q.state).await
+                self.browse(bank, fallback_identity, top_k, q.state).await
             } else {
                 Ok(Recalled::default())
             };
         }
-        let url = format!("{}/memories/recall", self.bank_url(&bank));
+        let url = format!("{}/memories/recall", self.bank_url(bank));
         let body = json!({
             "query": query,
             "types": [FACT_TYPE_EXPERIENCE, FACT_TYPE_WORLD],
@@ -550,32 +503,20 @@ impl MemoryBackend for HindsightBackend {
         let recalled: RecallResponse = decode_json(&resp, "recall")?;
         let mut out = Recalled::default();
         for r in recalled.results.into_iter().take(top_k) {
-            out.facts.push(r.into_fact(identity));
+            out.facts.push(r.into_fact(fallback_identity));
         }
         Ok(out)
     }
 
-    /// `PATCH …/memories/{id}` with `{"state":"invalidated","reason":…}` — §5.3's
-    /// path verbatim, and the one the design says is confirmed: the 400 the
-    /// ticket warned about came from the Go client's reason-less body, which this
-    /// never sends.
-    ///
-    /// The record is not deleted, so this is reversible ([`revalidate`]).
-    /// `Ok(false)` ⇒ already invalidated, which is read from the fact's own
-    /// `state` before the PATCH so the answer matches `local`'s. When that read
-    /// cannot answer, the PATCH goes ahead: doing the work is the safe side of
-    /// that particular doubt.
-    ///
-    /// [`revalidate`]: HindsightBackend::revalidate
-    async fn invalidate(
+    /// The one invalidate writer, on a resolved BANK ID.
+    async fn invalidate_in_bank(
         &self,
-        identity: &str,
+        bank: &str,
         fact_id: &str,
         reason: &str,
     ) -> Result<bool, MemoryError> {
-        let bank = self.checked_bank_id(identity)?;
         let id = checked_fact_id(fact_id)?;
-        let url = format!("{}/memories/{id}", self.bank_url(&bank));
+        let url = format!("{}/memories/{id}", self.bank_url(bank));
         let current = self
             .send(self.http.get(&url), "hindsight read fact")
             .await?;
@@ -605,11 +546,164 @@ impl MemoryBackend for HindsightBackend {
         Ok(true)
     }
 
+    /// The one revalidate writer, on a resolved BANK ID.
+    async fn revalidate_in_bank(&self, bank: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        let id = checked_fact_id(fact_id)?;
+        let url = format!("{}/memories/{id}", self.bank_url(bank));
+        let current = self
+            .send(self.http.get(&url), "hindsight read fact")
+            .await?;
+        if current.status == 404 {
+            return Err(MemoryError::NotFound(format!(
+                "no fact {fact_id:?} in bank {bank:?}"
+            )));
+        }
+        if current.status < 400
+            && let Ok(v) = serde_json::from_str::<Value>(&current.body)
+            && v.get("state").and_then(Value::as_str) == Some(STATE_VALID)
+        {
+            return Ok(false);
+        }
+        self.send(
+            self.http.patch(&url).json(&json!({ "state": STATE_VALID })),
+            "hindsight revalidate",
+        )
+        .await?
+        .ok_or_not_found(
+            "revalidate",
+            &format!("no fact {fact_id:?} in bank {bank:?}"),
+        )?;
+        Ok(true)
+    }
+
+    /// The shared team bank's retain (STUDIO-1040).
+    pub async fn retain_shared(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
+        Self::checked_shared_bank(bank)?;
+        self.retain_in_bank(bank, rec).await
+    }
+
+    /// The shared team bank's recall (STUDIO-1040).
+    pub async fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        Self::checked_shared_bank(bank)?;
+        // Empty fallback: a shared fact's author lives in its own metadata, so an
+        // item that names none reads as unattributed rather than as the reader.
+        self.recall_in_bank(bank, "", q).await
+    }
+
+    /// The shared team bank's invalidate (STUDIO-1040).
+    pub async fn invalidate_shared(
+        &self,
+        bank: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        Self::checked_shared_bank(bank)?;
+        self.invalidate_in_bank(bank, fact_id, reason).await
+    }
+
+    /// The shared team bank's revalidate (STUDIO-1040).
+    pub async fn revalidate_shared(&self, bank: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        Self::checked_shared_bank(bank)?;
+        self.revalidate_in_bank(bank, fact_id).await
+    }
+}
+
+#[async_trait]
+impl MemoryBackend for HindsightBackend {
+    /// `POST …/memories` with one `MemoryItem`.
+    ///
+    /// §5.1's provenance travels as the item's `metadata`, which the deployed
+    /// schema types as `{string: string}` — so all five host-stamped fields go
+    /// over as strings, present even when empty, mirroring what `local` writes
+    /// into front matter. `document_id` carries §5.1's `run-<run_id>`.
+    ///
+    /// `async: true`, so the call returns as soon as the service has accepted the
+    /// document rather than waiting for LLM fact extraction — measured at 14–25s
+    /// against Hindsight 0.10.1, far past [`REQUEST_TIMEOUT`]. Waiting
+    /// synchronously made every retain report a client-side failure while the
+    /// server still stored the fact (STUDIO-1036). The background retain answers
+    /// in well under the timeout, and the response's `operation_id` is logged at
+    /// debug when it carries one; a response without one still succeeds.
+    ///
+    /// **The returned id is the `document_id` we supplied, not a fact id.**
+    /// Hindsight *extracts* facts from the content, so one retain can produce
+    /// several facts and the response (`RetainResponse`) names none of them; the
+    /// document is the only stable handle the caller gave and can name again.
+    async fn retain(&self, rec: &Record) -> Result<String, MemoryError> {
+        let bank = self.checked_bank_id(&rec.identity)?;
+        self.retain_in_bank(&bank, rec).await
+    }
+
+    /// `POST …/memories/recall` with the two overrides the STUDIO-1036 operator
+    /// decision (2026-09-23) requires — `types: ["experience", "world"]` and
+    /// `include: {source_facts: {}}` — both of which §5.2 says the service's
+    /// defaults get wrong for this use.
+    ///
+    /// **`top_k` is applied here, not by the service.** The deployed
+    /// `RecallRequest` has no `top_k` or `limit`, only `budget` and `max_tokens`,
+    /// so the "every recalled byte is turn-1 prompt cost, forever" bound is
+    /// enforced on the response — which is where `local` enforces it too.
+    ///
+    /// `source_facts` is requested because §5.2 requires it. It is sent
+    /// unconditionally rather than only when some `types` entry could carry
+    /// sources, so the request shape does not quietly change if a future slice
+    /// ever asks for observations.
+    async fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        let bank = self.checked_bank_id(identity)?;
+        self.recall_in_bank(&bank, identity, q).await
+    }
+
+    /// `PATCH …/memories/{id}` with `{"state":"invalidated","reason":…}` — §5.3's
+    /// path verbatim, and the one the design says is confirmed: the 400 the
+    /// ticket warned about came from the Go client's reason-less body, which this
+    /// never sends.
+    ///
+    /// The record is not deleted, so this is reversible ([`revalidate`]).
+    /// `Ok(false)` ⇒ already invalidated, which is read from the fact's own
+    /// `state` before the PATCH so the answer matches `local`'s. When that read
+    /// cannot answer, the PATCH goes ahead: doing the work is the safe side of
+    /// that particular doubt.
+    ///
+    /// [`revalidate`]: HindsightBackend::revalidate
+    async fn invalidate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        let bank = self.checked_bank_id(identity)?;
+        self.invalidate_in_bank(&bank, fact_id, reason).await
+    }
+
     /// The reversal, on the trait (STUDIO-689) — the same PATCH
     /// [`HindsightBackend::revalidate`] sends, reached through the backend the
     /// daemon's endpoints actually hold.
     async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
         HindsightBackend::revalidate(self, identity, fact_id).await
+    }
+
+    /// The shared team bank's four operations (STUDIO-1040), through the trait
+    /// the daemon's endpoints hold. Each delegates to the inherent method that
+    /// does the same bank-id work the identity-based paths use.
+    async fn retain_shared(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
+        HindsightBackend::retain_shared(self, bank, rec).await
+    }
+
+    async fn recall_shared(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        HindsightBackend::recall_shared(self, bank, q).await
+    }
+
+    async fn invalidate_shared(
+        &self,
+        bank: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<bool, MemoryError> {
+        HindsightBackend::invalidate_shared(self, bank, fact_id, reason).await
+    }
+
+    async fn revalidate_shared(&self, bank: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        HindsightBackend::revalidate_shared(self, bank, fact_id).await
     }
 }
 
@@ -1825,5 +1919,92 @@ mod tests {
         assert_eq!(b.bank_id("alice"), "shared");
         assert_eq!(b.bank_id("bob"), "agent-bob");
         assert_eq!(b.base(), "https://x.example");
+    }
+
+    // ── the shared team bank (STUDIO-1040) ───────────────────────────────
+
+    /// **The shared bank is a bank id, not an identity.** A shared retain goes to
+    /// `/v1/default/banks/<team_bank>/memories` — verbatim, with NO `agent-`
+    /// prefix and no roster override applied — and it configures that bank with
+    /// `enable_observations: false` exactly as a personal bank is configured.
+    #[tokio::test]
+    async fn a_shared_retain_targets_the_team_bank_by_id() {
+        let stub = Stub::accepting().await;
+        let b = backend(&stub);
+        b.retain_shared(
+            "agent-team",
+            &record("alice", "goldens are recaptured only"),
+        )
+        .await
+        .expect("shared retain");
+
+        let req = stub.request("POST", "/memories");
+        assert_eq!(
+            req.path, "/v1/default/banks/agent-team/memories",
+            "the team bank id is used verbatim"
+        );
+        assert_eq!(
+            req.body["items"][0]["metadata"]["identity"], "alice",
+            "the shared record still carries its author"
+        );
+        let cfg = stub.request("PATCH", "/banks/agent-team");
+        assert_eq!(cfg.body["enable_observations"], false);
+    }
+
+    /// A shared recall queries the team bank and trims the answer to `top_k`
+    /// client-side (`team_recall_top_k`), exactly as a personal recall does.
+    #[tokio::test]
+    async fn a_shared_recall_queries_the_team_bank_and_caps_at_top_k() {
+        let stub = Stub::start(|_| {
+            let body = json!({
+                "results": (0..4).map(|i| json!({
+                    "id": format!("fact-{i}"),
+                    "text": format!("team fact {i}"),
+                    "type": "world",
+                    "metadata": { "identity": "alice", "ticket": "STUDIO-1040" },
+                })).collect::<Vec<_>>(),
+                "entities": null,
+                "source_facts": {},
+            })
+            .to_string();
+            Reply::ok(&body)
+        })
+        .await;
+        let b = backend(&stub);
+        let q = Query {
+            ticket: "STUDIO-1040".to_string(),
+            top_k: 2,
+            ..Query::default()
+        };
+        let got = b
+            .recall_shared("agent-team", &q)
+            .await
+            .expect("shared recall");
+        assert_eq!(got.facts.len(), 2, "top_k bounds the shared answer");
+        let req = stub.request("POST", "/memories/recall");
+        assert_eq!(req.path, "/v1/default/banks/agent-team/memories/recall");
+    }
+
+    /// A shared bank id that is not label-safe never reaches the wire — it would
+    /// become a URL path segment.
+    #[tokio::test]
+    async fn an_unsafe_shared_bank_id_never_reaches_the_wire() {
+        let stub = Stub::accepting().await;
+        let b = backend(&stub);
+        assert!(
+            b.recall_shared("../../etc", &ticket_query("X"))
+                .await
+                .is_err(),
+            "a traversal bank id must be refused"
+        );
+        assert!(
+            b.retain_shared("Not/Safe", &record("alice", "x"))
+                .await
+                .is_err()
+        );
+        assert!(
+            stub.requests().is_empty(),
+            "nothing may reach the wire for an unsafe bank id"
+        );
     }
 }

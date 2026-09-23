@@ -78,11 +78,15 @@ The turn-1 prompt gains one budgeted prepend (`prompt_budget_bytes`, default 160
 the profile (from `~/.rhapsody/teams/profiles/`, versioned; built-ins swe/reviewer/sre),
 then **room catch-up** (what the team recorded since this identity last woke), then
 **memory recall** (top-`recall_top_k` retained facts matching the ticket, re-grounded against
-live candidate state or flagged "(state not re-verified)"). Room and memory content renders
+live candidate state or flagged "(state not re-verified)"; with a `memory.team_bank` set, up to
+`team_recall_top_k` **shared team** facts follow in their own section, each attributed to the
+teammate who wrote it). Room and memory content renders
 as quoted, attributed *data* — never as instructions.
 
-In-run tools: `teams_roster`, `teams_recall`, `teams_retain` (host stamps who/when/commit —
-identity is unforgeable), `teams_invalidate`, `teams_reinstate`, `teams_room_read`,
+In-run tools: `teams_roster`, `teams_recall` (add `scope: "team"` for the shared bank),
+`teams_retain` (host stamps who/when/commit — identity is unforgeable; add `shared: true` for
+durable repo knowledge the whole team should see), `teams_invalidate`, `teams_reinstate`,
+`teams_room_read`,
 `teams_post`. Direct message to a live teammate arrives mid-turn with a "TEAMMATE MESSAGE"
 wrap (never operator authority); to a sleeping one it waits in the room.
 
@@ -144,6 +148,15 @@ prefetched off-loop, so the control loop never waits on the network; a retain is
 background, so a retained memory becomes recallable after server-side extraction, about 30s
 later), or `none`. Retained facts carry host-stamped provenance (ticket/run/commit). Wrong
 memories: the panel's invalidate button (reason required, reversible) or `teams_invalidate`.
+
+**The shared team bank** (STUDIO-1040) is a second bank the whole roster reads and writes on
+purpose. Set `memory.team_bank` (a bank id; off when empty) and every teammate's turn-1 recall
+adds up to `memory.team_recall_top_k` shared facts in their own attributed section. Write to it
+with `teams_retain {shared: true}` — for durable repo knowledge (conventions, gotchas, how tests
+and CI behave, "the source of truth for X is Y"), never for PR or round status, which expires.
+Read it with `teams_recall {scope: "team"}`; correct it with `teams_invalidate`/`teams_reinstate`
+and `scope: "team"`. The automatic end-of-run record stays personal, so PR chatter never floods
+the shared bank.
 
 ## Review: two models, and they are mutually exclusive
 
