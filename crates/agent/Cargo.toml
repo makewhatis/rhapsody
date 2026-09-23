@@ -81,10 +81,13 @@ harness-fixtures = { path = "../harness-fixtures" }
 # new external crate enters Cargo.lock.
 rhapsody-config = { path = "../config" }
 # rhapsody-provider-broker (test-only, STUDIO-984 review): the canonical credential-binding adapter
-# identity is ONE value across config, agent and broker registration, and the plan's carried limits
-# must match the broker's V1 default column. The broker crate cannot depend on this one (its
-# dependency guard), so the pin test lives here and compares all three. Workspace-internal path dep —
-# no new external crate enters Cargo.lock.
+# identity is ONE value across config, agent and broker registration, so
+# `canonical_adapter_identity_agrees_across_config_agent_and_broker` compares all three. Separately,
+# `provider_limits_agree_with_the_config_crate` pins the plan's mirrored limits field-for-field to
+# config's V1 default column — the broker has no matching operator-limits type yet (PB5 lowers the
+# plan into its own policy types), so that pin is agent↔config only. The broker crate cannot depend on
+# this one (its dependency guard), so both pins live here. Workspace-internal path dep — no new
+# external crate enters Cargo.lock.
 rhapsody-provider-broker = { path = "../provider-broker" }
 
 [lints]

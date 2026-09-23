@@ -2547,16 +2547,19 @@ config goldens and an old-vs-new round-trip test.
   storage *kind* (`keychain`), and validated broker limits. No value/token/key field exists anywhere
   in the YAML-facing or pure resolved types, and none may be added. The provider, credential and
   broker-limits blocks also reject unknown keys outright, and the config view filters each provider
-  block to the schema's known keys — so a secret-shaped spelling such as `credential.value` can
-  neither decode into the typed config nor appear in `GET /api/v1/config`.
+  block to the schema's known keys *and shapes* — a non-mapping provider, a scalar/list `credential`
+  or `broker_limits`, and a non-scalar value where a scalar is expected are all dropped — so a
+  secret-shaped spelling such as `credential.value` or a pasted `credential: sk-…` can neither decode
+  into the typed config nor appear in `GET /api/v1/config`.
 - **`base_url` is the protocol root immediately above `chat/completions`.** Normalization strips a
   trailing `/` and appends `/v1` only when the path does not already end in `/v1`, so
   `https://api.fireworks.ai/inference/v1` and `https://api.openai.com/v1` are left alone and never
   grow a second `/v1`. The URL is parsed, not string-split: userinfo (`user:pass@`), a query string,
-  a fragment, whitespace/control characters, a missing host, a non-numeric port, an unclosed IPv6
-  literal, a percent-encoded path separator/dot segment, a literal `.`/`..` segment, and a base that
-  already ends in `chat/completions` are all refused — those are the parts that could smuggle a
-  reusable key into `WORKFLOW.md` or make the upstream route ambiguous.
+  a fragment, whitespace/control characters, a literal backslash (which URL parsers treat as `/`), a
+  missing host, an illegal host character, a port that is not `1..=65535`, an unclosed IPv6 literal, a
+  percent-encoded path separator/dot segment, a literal `.`/`..` segment, and a base that already ends
+  in `chat/completions` are all refused — those are the parts that could smuggle a reusable key into
+  `WORKFLOW.md` or make the upstream route ambiguous.
 - **TLS policy is explicit.** `allow_insecure_http` defaults `false`, is required `true` for an
   `http` base URL, and is rejected `true` on `https`; an omitted or explicit `false` value on
   `https` round-trips identically. It is operator policy, never inferred from loopback/private
@@ -2579,12 +2582,14 @@ config goldens and an old-vs-new round-trip test.
   `PROVIDER_HARNESS_BACKENDS` and a cross-crate pin test asserts the two declarations agree — adding a
   protocol to a registry row without teaching config reds that test rather than drifting silently.
 - **The defaulted broker-limits column is not pinned into the file.** A provider with no
-  `broker_limits:` block is validated against the V1 defaults (with the capability lifetime bounded
-  by OpenCode's effective turn deadline, `min(1h, deadline)`) but `encode` emits only the fields that
-  differ from the values the decoder would derive from that same deadline — on any deadline, including
-  a sub-hour one — so a console Save never freezes today's defaults (or a derived lifetime) into an
-  operator's `WORKFLOW.md`. An explicit block round-trips verbatim; a partial block keeps only its
-  explicitly-set fields.
+  `broker_limits:` block is validated against the V1 defaults, with its capability lifetime bounded by
+  OpenCode's effective turn deadline (`min(1h, deadline)`). The lifetime is stored as an *optional*
+  value: an omitted one is derived at read time, so a block-less provider keeps tracking the deadline
+  and `encode` emits no `broker_limits:` key, while an explicitly-set lifetime — even one equal to
+  today's derived default — is preserved verbatim and never silently widened by a later timeout
+  change. For every other field, `encode` emits only the fields that differ from the V1 default, so a
+  console Save never freezes today's defaults into an operator's `WORKFLOW.md`; a partial block keeps
+  only its explicitly-set fields.
 - **Brokered OpenCode is version-gated and fail-closed.** The supported-version table is
   single-sourced from the PB0 probe (`1.18.30` / `@ai-sdk/openai-compatible` `2.0.41`), and the
   initial row accepts only an empty or `build` `opencode.agent`, an empty `variant`, an

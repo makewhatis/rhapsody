@@ -215,8 +215,9 @@ fn build_global(c: &Config) -> Value {
         && let Value::Object(m) = &mut global
     {
         let mut providers = Map::new();
+        let deadline = crate::providers::provider_turn_deadline_ms(c.opencode.turn_timeout_ms);
         for (id, def) in &c.providers {
-            providers.insert(id.clone(), provider_json(def));
+            providers.insert(id.clone(), provider_json(def, deadline));
         }
         m.insert("providers".into(), Value::Object(providers));
     }
@@ -225,8 +226,9 @@ fn build_global(c: &Config) -> Value {
 
 /// The non-secret view of one provider definition (STUDIO-984). Carries no key, token, envelope, or
 /// binding fingerprint — only what an operator wrote plus the derived normalized endpoint and the
-/// validated limits.
-fn provider_json(def: &crate::providers::ProviderDefinition) -> Value {
+/// validated limits. `turn_deadline_ms` is OpenCode's effective deadline, used to report the
+/// capability lifetime's effective value when the operator did not set one.
+fn provider_json(def: &crate::providers::ProviderDefinition, turn_deadline_ms: u64) -> Value {
     let l = &def.broker_limits;
     let mut limits = Map::new();
     limits.insert(
@@ -271,7 +273,7 @@ fn provider_json(def: &crate::providers::ProviderDefinition) -> Value {
     );
     limits.insert(
         "capability_lifetime_ms".into(),
-        num(l.capability_lifetime_ms as i64),
+        num(l.effective_capability_lifetime_ms(turn_deadline_ms) as i64),
     );
     limits.insert(
         "max_reserved_token_units_per_utc_day".into(),
@@ -570,6 +572,14 @@ const ALLOWED_PROVIDER_KEYS: &[&str] = &[
     "credential",
     "broker_limits",
 ];
+/// The provider keys whose value is a scalar on the schema. A non-scalar value here is a shape
+/// violation that must not be echoed.
+const ALLOWED_PROVIDER_SCALAR_KEYS: &[&str] = &[
+    "protocol",
+    "display_name",
+    "base_url",
+    "allow_insecure_http",
+];
 const ALLOWED_CREDENTIAL_KEYS: &[&str] = &["source"];
 const ALLOWED_BROKER_LIMIT_KEYS: &[&str] = &[
     "forwarded_requests_per_turn",
@@ -595,9 +605,7 @@ fn sanitize_provider_blocks(root: &mut Value) {
         return;
     };
     if let Some(Value::Object(providers)) = map.get_mut("providers") {
-        for def in providers.values_mut() {
-            sanitize_one_provider(def);
-        }
+        sanitize_provider_map(providers);
     }
     if let Some(Value::Array(projects)) = map.get_mut("projects") {
         for project in projects.iter_mut() {
@@ -605,25 +613,70 @@ fn sanitize_provider_blocks(root: &mut Value) {
                 continue;
             };
             if let Some(Value::Object(providers)) = pmap.get_mut("providers") {
-                for def in providers.values_mut() {
-                    sanitize_one_provider(def);
-                }
+                sanitize_provider_map(providers);
             }
         }
     }
 }
 
-/// Drops unknown keys from one provider object, its `credential` block and its `broker_limits` block.
+/// Drops every provider entry whose value is not a mapping, then filters each survivor. A key-only
+/// filter would echo `providers: {fireworks: sk-…}` verbatim (jimmy's B1), so the shape itself is
+/// rejected here rather than left to `decode`.
+fn sanitize_provider_map(providers: &mut Map<String, Value>) {
+    let non_mappings: Vec<String> = providers
+        .iter()
+        .filter(|(_, def)| !matches!(def, Value::Object(_)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in non_mappings {
+        providers.remove(&k);
+    }
+    for def in providers.values_mut() {
+        sanitize_one_provider(def);
+    }
+}
+
+/// Filters one provider object: unknown keys are dropped, the scalar fields are reduced to scalars, and
+/// its `credential`/`broker_limits` sub-blocks are filtered. A secret can be smuggled in not only as an
+/// unknown KEY but as a scalar/list value where a mapping belongs (`credential: sk-…` is the natural
+/// way an operator pastes a key), so every shape is normalized to the schema before echoing.
 fn sanitize_one_provider(def: &mut Value) {
     let Value::Object(obj) = def else {
         return;
     };
     retain_keys(obj, ALLOWED_PROVIDER_KEYS);
-    if let Some(Value::Object(credential)) = obj.get_mut("credential") {
-        retain_keys(credential, ALLOWED_CREDENTIAL_KEYS);
+    drop_non_scalars(obj, ALLOWED_PROVIDER_SCALAR_KEYS);
+    sanitize_nested_block(obj, "credential", ALLOWED_CREDENTIAL_KEYS);
+    sanitize_nested_block(obj, "broker_limits", ALLOWED_BROKER_LIMIT_KEYS);
+}
+
+/// Removes every named key whose value is an object or array. The named keys are scalar on the schema,
+/// so an object value is a shape violation that could otherwise carry a nested secret.
+fn drop_non_scalars(obj: &mut Map<String, Value>, keys: &[&str]) {
+    let non_scalars: Vec<String> = obj
+        .iter()
+        .filter(|(k, v)| {
+            keys.contains(&k.as_str()) && matches!(v, Value::Object(_) | Value::Array(_))
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in non_scalars {
+        obj.remove(&k);
     }
-    if let Some(Value::Object(limits)) = obj.get_mut("broker_limits") {
-        retain_keys(limits, ALLOWED_BROKER_LIMIT_KEYS);
+}
+
+/// Filters one nested provider block. A value that is not a mapping at all (`credential: sk-…` or a
+/// list) is dropped outright; inside a mapping, unknown keys and non-scalar values are dropped too.
+fn sanitize_nested_block(obj: &mut Map<String, Value>, key: &str, allowed: &[&str]) {
+    match obj.get_mut(key) {
+        Some(Value::Object(sub)) => {
+            retain_keys(sub, allowed);
+            drop_non_scalars(sub, allowed);
+        }
+        Some(_) => {
+            obj.remove(key);
+        }
+        None => {}
     }
 }
 
@@ -871,6 +924,46 @@ mod tests {
         assert!(
             !rendered2.contains("sk-review-probe"),
             "secret leaked through an unknown provider/limits key: {rendered2}"
+        );
+        // MUTATION GUARD (jimmy round-6, B1): a key-only filter still echoes a secret pasted where a
+        // MAPPING belongs. A scalar `credential`, a scalar provider value, a scalar `broker_limits`, and
+        // a list `credential` must each be dropped by the shape normalization, not just by key removal.
+        for (label, body) in [
+            (
+                "credential-scalar",
+                "providers:\n  fireworks:\n    credential: sk-review-probe\n",
+            ),
+            (
+                "provider-scalar",
+                "providers:\n  fireworks: sk-review-probe\n",
+            ),
+            (
+                "limits-scalar",
+                "providers:\n  fireworks:\n    broker_limits: sk-review-probe\n",
+            ),
+            (
+                "credential-list",
+                "providers:\n  fireworks:\n    credential: [sk-review-probe]\n",
+            ),
+        ] {
+            let front = format!("tracker:\n  kind: linear\n  api_key: $X\n{body}");
+            let leaked = render_front(&front, "body").to_string();
+            assert!(
+                !leaked.contains("sk-review-probe"),
+                "{label} leaked through the render filter: {leaked}"
+            );
+        }
+        // The per-project branch of the filter (jimmy round-6, N2a): a project-level provider must be
+        // normalized too, so deleting the `projects` lookup leaves this secret echoed and reds here.
+        let front3 = concat!(
+            "tracker:\n  kind: linear\n  api_key: $X\n",
+            "projects:\n  - name: Infra\n    slugs: [infra]\n",
+            "    providers:\n      projp:\n        credential:\n          value: sk-review-probe\n",
+        );
+        let rendered3 = render_front(front3, "body").to_string();
+        assert!(
+            !rendered3.contains("sk-review-probe"),
+            "per-project provider secret leaked: {rendered3}"
         );
     }
 }

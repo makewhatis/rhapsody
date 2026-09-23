@@ -128,7 +128,14 @@ pub struct BrokerLimits {
     pub requested_output_tokens_per_request: u64,
     pub reserved_token_units_per_turn: u64,
     pub reserved_token_units_per_session: u64,
-    pub capability_lifetime_ms: u64,
+    /// Capability lifetime, in milliseconds. `None` when the workflow did not set it, meaning "derive
+    /// the V1 default at read time": `min(1h, the consuming harness's effective turn deadline)` via
+    /// [`Self::effective_capability_lifetime_ms`]. Storing the raw explicitness (rather than baking the
+    /// derived value in at decode) is what lets an explicitly-narrowed lifetime equal to today's derived
+    /// default survive a console Save: an operator who writes `capability_lifetime_ms: 1800000` on a
+    /// 30-minute OpenCode install keeps 30 minutes even after raising `opencode.turn_timeout_ms`, while a
+    /// block-less provider keeps tracking the deadline (jimmy round-6, N1).
+    pub capability_lifetime_ms: Option<u64>,
     /// Optional durable UTC-day cap. `None` — the default, and every install that never writes the
     /// key — means no Rhapsody daily cap. When present it is a checked positive `u64`, may be lower
     /// than one run cap, and needs durable budget storage available at runtime.
@@ -171,13 +178,21 @@ impl Default for BrokerLimits {
             requested_output_tokens_per_request: DEFAULT_REQUESTED_OUTPUT_TOKENS_PER_REQUEST,
             reserved_token_units_per_turn: DEFAULT_RESERVED_TOKEN_UNITS_PER_TURN,
             reserved_token_units_per_session: DEFAULT_RESERVED_TOKEN_UNITS_PER_SESSION,
-            capability_lifetime_ms: DEFAULT_CAPABILITY_LIFETIME_MS,
+            capability_lifetime_ms: None,
             max_reserved_token_units_per_utc_day: None,
         }
     }
 }
 
 impl BrokerLimits {
+    /// The effective capability lifetime for an effective turn deadline: an explicitly-set value
+    /// verbatim, or the V1 derived default `min(1h, deadline)` when the workflow omitted it. This is
+    /// the value the broker-capability grant, the effective view and a lowered plan all use.
+    pub fn effective_capability_lifetime_ms(&self, turn_deadline_ms: u64) -> u64 {
+        self.capability_lifetime_ms
+            .unwrap_or_else(|| default_capability_lifetime_ms(turn_deadline_ms))
+    }
+
     /// Validates every limit together, returning an actionable reason on the first failure
     /// (`provider-broker-design.md` §8.1). Rules, in order:
     ///
@@ -253,11 +268,17 @@ impl BrokerLimits {
             self.reserved_token_units_per_session,
             MAX_RESERVED_TOKEN_UNITS_PER_SESSION
         );
-        bounded!(
-            "capability_lifetime_ms",
-            self.capability_lifetime_ms,
-            MAX_CAPABILITY_LIFETIME_MS
-        );
+        if let Some(lifetime) = self.capability_lifetime_ms {
+            if lifetime == 0 {
+                return Err("capability_lifetime_ms must be positive".to_string());
+            }
+            if lifetime > MAX_CAPABILITY_LIFETIME_MS {
+                return Err(format!(
+                    "capability_lifetime_ms must be at most {} (the daemon hard ceiling)",
+                    MAX_CAPABILITY_LIFETIME_MS
+                ));
+            }
+        }
 
         if self.json_request_bytes > self.aggregate_request_bytes_per_turn {
             return Err(
@@ -282,7 +303,9 @@ impl BrokerLimits {
                     .to_string(),
             );
         }
-        if self.capability_lifetime_ms > turn_timeout_ms {
+        if let Some(lifetime) = self.capability_lifetime_ms
+            && lifetime > turn_timeout_ms
+        {
             return Err(
                 "capability_lifetime_ms must not exceed the harness turn timeout".to_string(),
             );
@@ -483,6 +506,15 @@ fn parse_base_url(base_url: &str) -> Result<BaseUrlScheme, String> {
     if !base_url.is_ascii() {
         return Err(format!("base_url {base_url:?} must be ASCII"));
     }
+    // WHATWG parsers (including the `url` crate reqwest uses) treat a literal `\` in an `http(s)` URL
+    // as `/`, so `https://api.example/v1\..\..\admin` would be parsed upstream as a dot segment and
+    // `https://api.example/v1\chat\completions` as the terminal route — bypassing [`validate_base_path`],
+    // which only refuses the percent-encoded `%5c` (jimmy round-6, B2). Refuse it outright.
+    if base_url.contains('\\') {
+        return Err(format!(
+            "base_url {base_url:?} must not contain a backslash (it is a path separator to URL parsers)"
+        ));
+    }
     let (scheme, rest) = split_scheme(base_url)
         .ok_or_else(|| format!("base_url {base_url:?} must be an absolute http(s) URL"))?;
     let scheme = match scheme {
@@ -565,15 +597,18 @@ fn validate_authority(base_url: &str, authority: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A port is an optional, non-empty run of ASCII digits (`provider-broker-design.md` §6.1's
-/// "invalid port").
+/// A port is an optional, non-empty run of ASCII digits in `1..=65535`
+/// (`provider-broker-design.md` §6.1's "invalid port"). An all-digit port above `65535` is refused
+/// here rather than left for the URL client at dispatch (`url::Url::parse` reports `InvalidPort`).
 fn validate_port(base_url: &str, port: &str) -> Result<(), String> {
+    let invalid = || format!("base_url {base_url:?} has an invalid port {port:?}");
     if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "base_url {base_url:?} has an invalid port {port:?}"
-        ));
+        return Err(invalid());
     }
-    Ok(())
+    match port.parse::<u32>() {
+        Ok(n) if (1..=65535).contains(&n) => Ok(()),
+        _ => Err(invalid()),
+    }
 }
 
 /// Refuses the `base_url` path forms `provider-broker-design.md` §6.1 makes unrepresentable: a
@@ -771,7 +806,7 @@ impl ProviderReload {
                 l.requested_output_tokens_per_request,
                 l.reserved_token_units_per_turn,
                 l.reserved_token_units_per_session,
-                l.capability_lifetime_ms,
+                l.capability_lifetime_ms.unwrap_or(0),
                 l.max_reserved_token_units_per_utc_day.unwrap_or(0),
             ] {
                 hash = fnv1a(hash, &value.to_le_bytes());
@@ -942,6 +977,17 @@ mod tests {
             "https://api.example/a/../v1",             // literal dot segment
             "https://api.example/v1/chat/completions", // already-terminal route
             "https://api.example/v1/chat/completions/",
+            // jimmy round-6 B2: a literal backslash is `/` to the URL parser, so it dodges the
+            // dot-segment and terminal-route refusals above.
+            "https://api.example/v1\\..\\..\\admin",
+            "https://api.example/v1\\chat\\completions",
+            // jimmy round-6 B2: an all-digit port above 65535 is not a valid URL port.
+            "https://api.example:99999/v1",
+            "https://api.example:0/v1",
+            // jimmy round-6 N2b: pin the host charset check. `"` is ASCII and not whitespace, so it
+            // reaches the host pattern; every other bad-host row is caught earlier by the whitespace
+            // check, leaving this pattern unpinned without this row.
+            "https://api\"x/v1",
         ] {
             assert!(
                 base_url_scheme(bad, false).is_err(),
@@ -1122,7 +1168,15 @@ mod tests {
         assert_eq!(l.requested_output_tokens_per_request, 32_000);
         assert_eq!(l.reserved_token_units_per_turn, 1_000_000);
         assert_eq!(l.reserved_token_units_per_session, 20_000_000);
-        assert_eq!(l.capability_lifetime_ms, 3_600_000);
+        assert_eq!(
+            l.capability_lifetime_ms, None,
+            "an omitted lifetime is DERIVED at read time, not baked into the default column"
+        );
+        // The derived effective value on a default (1h) deadline is exactly the V1 ceiling.
+        assert_eq!(
+            l.effective_capability_lifetime_ms(DEFAULT_CAPABILITY_LIFETIME_MS),
+            3_600_000
+        );
         assert_eq!(
             l.max_reserved_token_units_per_utc_day, None,
             "absent means no Rhapsody daily cap, never a permissive implicit one"
@@ -1172,7 +1226,7 @@ mod tests {
 
         // Capability lifetime greater than the harness turn timeout.
         let bad = BrokerLimits {
-            capability_lifetime_ms: 3_600_000,
+            capability_lifetime_ms: Some(3_600_000),
             ..base.clone()
         };
         assert!(

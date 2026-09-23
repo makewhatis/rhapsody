@@ -1373,7 +1373,13 @@ mod tests {
             ours.reserved_token_units_per_session,
             theirs.reserved_token_units_per_session
         );
-        assert_eq!(ours.capability_lifetime_ms, theirs.capability_lifetime_ms);
+        // Config keeps the lifetime `None` (derived at read time); the plan carries the materialized V1
+        // value. Pin the plan's concrete default to config's derived default on a 1-hour deadline.
+        assert_eq!(
+            ours.capability_lifetime_ms,
+            rhapsody_config::BrokerLimits::default()
+                .effective_capability_lifetime_ms(rhapsody_config::DEFAULT_CAPABILITY_LIFETIME_MS)
+        );
         assert_eq!(
             ours.max_reserved_token_units_per_utc_day,
             theirs.max_reserved_token_units_per_utc_day

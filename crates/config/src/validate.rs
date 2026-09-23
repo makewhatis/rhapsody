@@ -1482,7 +1482,17 @@ mod tests {
             c.providers["fireworks"]
                 .broker_limits
                 .capability_lifetime_ms,
-            1_800_000
+            None,
+            "an omitted lifetime stays `None`, derived at read time"
+        );
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    c.opencode.turn_timeout_ms
+                )),
+            1_800_000,
+            "the effective lifetime must be min(1h, deadline)"
         );
 
         // A provider merely DEFINED on a Claude install is inert and must not fail preflight.

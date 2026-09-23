@@ -211,9 +211,10 @@ fn raw_from_config(c: &Config) -> Raw {
         );
     }
     // STUDIO-984 (Rhapsody-only): a configured provider round-trips; an empty map prunes away,
-    // preserving the no-providers default. The derived default column is computed once from THIS
-    // config's OpenCode deadline so a sub-hour install does not encode a pinned lifetime.
-    let default_limits = derived_default_broker_limits(c);
+    // preserving the no-providers default. A field equal to its V1 default is omitted, so a defaulted
+    // block is never frozen into the file; the capability lifetime is compared as an `Option` so an
+    // explicit value equal to today's derived default is preserved verbatim (jimmy round-6, N1).
+    let default_limits = crate::providers::BrokerLimits::default();
     for (id, def) in &c.providers {
         r.providers.insert(
             id.clone(),
@@ -276,21 +277,6 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.enabled.is_none()
 }
 
-/// The broker-limits column a workflow that omits a valid `broker_limits:` block would DECODE to for
-/// this config's effective OpenCode turn deadline. Only the capability lifetime differs from the
-/// compile-time [`BrokerLimits::default`]: it is `min(1h, deadline)` (`default_capability_lifetime_ms`),
-/// exactly as [`crate::decode::decode_broker_limits`] materializes it. Comparing each encoded field
-/// against THIS derived value — not the fixed compile-time default — is what stops a console Save from
-/// pinning a sub-hour install's derived lifetime into `WORKFLOW.md`, where it could later fail
-/// validation when the operator lowers `opencode.turn_timeout_ms`.
-fn derived_default_broker_limits(c: &Config) -> crate::providers::BrokerLimits {
-    let deadline = crate::providers::provider_turn_deadline_ms(c.opencode.turn_timeout_ms);
-    crate::providers::BrokerLimits {
-        capability_lifetime_ms: crate::providers::default_capability_lifetime_ms(deadline),
-        ..crate::providers::BrokerLimits::default()
-    }
-}
-
 /// Emits a raw field only when it differs from its derived default, so a defaulted value is never
 /// frozen into the file (the `allow_insecure_http` pattern, applied field-by-field to broker limits).
 fn raw_limit<T: PartialEq>(value: T, default: T) -> Option<T> {
@@ -300,8 +286,9 @@ fn raw_limit<T: PartialEq>(value: T, default: T) -> Option<T> {
 /// Maps one typed [`ProviderDefinition`] to a [`RawProviderDefinition`] (STUDIO-984), the inverse of
 /// `decode`'s provider mapping. `allow_insecure_http` is emitted only when `true` so an omitted or
 /// explicit `false` value round-trips identically; a `broker_limits` field is emitted only when it
-/// differs from `default_limits` — the value the decoder would derive from this config's OpenCode
-/// deadline — so an absent or defaulted block is never pinned into the operator's file.
+/// differs from the V1 default — an absent block decodes to exactly that default, so it is never pinned
+/// into the operator's file. The capability lifetime is an `Option` on both sides, so an explicitly-set
+/// value equal to today's derived default is emitted (and survives), while an unset one stays unset.
 fn raw_provider_from_definition(
     def: &crate::providers::ProviderDefinition,
     default_limits: &crate::providers::BrokerLimits,
@@ -349,7 +336,9 @@ fn raw_provider_from_definition(
             l.reserved_token_units_per_session,
             d.reserved_token_units_per_session,
         ),
-        capability_lifetime_ms: raw_limit(l.capability_lifetime_ms, d.capability_lifetime_ms),
+        // The lifetime is already an `Option` on both sides: `Some` means explicitly set (emit it even
+        // if it equals today's derived default), `None` means derive at read time (emit nothing).
+        capability_lifetime_ms: l.capability_lifetime_ms,
         max_reserved_token_units_per_utc_day: l.max_reserved_token_units_per_utc_day,
     };
     RawProviderDefinition {
@@ -1429,8 +1418,16 @@ mod tests {
             c.providers["fireworks"]
                 .broker_limits
                 .capability_lifetime_ms,
+            None,
+            "an omitted lifetime stays `None` (derived at read time), not baked into the typed value"
+        );
+        let deadline = crate::providers::provider_turn_deadline_ms(c.opencode.turn_timeout_ms);
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(deadline),
             1_800_000,
-            "the defaulted lifetime must be min(1h, deadline)"
+            "the DERIVED lifetime must be min(1h, deadline)"
         );
 
         let def = encode(&c).expect("encode");
@@ -1444,15 +1441,69 @@ mod tests {
         assert_eq!(
             lowered.providers["fireworks"]
                 .broker_limits
-                .capability_lifetime_ms,
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    lowered.opencode.turn_timeout_ms
+                )),
             900_000
         );
         let raised = re_decode_with_turn_timeout(&def, 3_600_000);
         assert_eq!(
             raised.providers["fireworks"]
                 .broker_limits
-                .capability_lifetime_ms,
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    raised.opencode.turn_timeout_ms
+                )),
             3_600_000
+        );
+    }
+
+    // MUTATION GUARD (STUDIO-984, jimmy round-6 N1): an explicitly-set lifetime EQUAL to today's
+    // derived default must survive a Save. If encode cannot tell "explicit" from "equals the derived
+    // default", it drops the value, and a later deadline raise silently WIDENS the operator's narrowed
+    // capability. The explicit `1800000` on a 30-minute install must still be 30 minutes after the
+    // deadline is raised to two hours.
+    #[test]
+    fn an_explicit_lifetime_equal_to_the_derived_default_survives_a_deadline_raise() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "agent:\n  backend: opencode\n",
+            "opencode:\n  turn_timeout_ms: 1800000\n",
+            "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n",
+            "    broker_limits:\n      capability_lifetime_ms: 1800000\n",
+        );
+        let c = decode_map(front, "body");
+        assert_eq!(
+            c.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            Some(1_800_000)
+        );
+        let def = encode(&c).expect("encode");
+        let entry = encoded_provider_entry(&c, "fireworks").expect("provider entry present");
+        assert_eq!(
+            entry
+                .get("broker_limits")
+                .and_then(Value::as_mapping)
+                .and_then(|m| m.get(Value::String("capability_lifetime_ms".to_string()))),
+            Some(&Value::Number(1_800_000.into())),
+            "an explicit lifetime equal to the derived default must still be written: {entry:?}"
+        );
+        // Raising the deadline must NOT widen the operator's explicit 30 minutes.
+        let raised = re_decode_with_turn_timeout(&def, 7_200_000);
+        assert_eq!(
+            raised.providers["fireworks"]
+                .broker_limits
+                .capability_lifetime_ms,
+            Some(1_800_000),
+            "the explicit 30-minute lifetime must survive a deadline raise"
+        );
+        assert_eq!(
+            raised.providers["fireworks"]
+                .broker_limits
+                .effective_capability_lifetime_ms(crate::providers::provider_turn_deadline_ms(
+                    raised.opencode.turn_timeout_ms
+                )),
+            1_800_000
         );
     }
 
