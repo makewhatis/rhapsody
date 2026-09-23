@@ -925,6 +925,12 @@ mod tests {
         ) -> Result<Option<rhapsody_store::RunProvenance>, StoreError> {
             self.0.run_provenance(id)
         }
+        fn set_run_usage(&self, id: i64, u: &rhapsody_store::RunUsage) -> Result<(), StoreError> {
+            self.0.set_run_usage(id, u)
+        }
+        fn run_usage(&self, id: i64) -> Result<Option<rhapsody_store::RunUsage>, StoreError> {
+            self.0.run_usage(id)
+        }
         fn load_run_provenances(
             &self,
             ids: &[i64],

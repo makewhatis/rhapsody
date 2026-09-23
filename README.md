@@ -1027,7 +1027,41 @@ every M1 finding row is backfilled onto the same value in the same migration ste
 is dormant unless `teams.enabled` and `review.mode: ticketless`, so every other installation is
 byte-identical.
 
-### A ninth schema table with no Go counterpart — `rhapsody_manager_exchange` (STUDIO-1012)
+### A ninth schema table with no Go counterpart — `rhapsody_run_usage`, and a provider ORIGIN (STUDIO-987)
+
+Provider-first runs select a **stable** Rhapsody provider id, distinct from the ephemeral
+`rhapsody-<22 base64url>` id OpenCode mints per session (which must never be persisted). The
+provenance row gained a `provider_origin` column beside `provider` so a selected provider is
+distinguishable from the legacy/inferred one, and a brokered run's settled usage is recorded in its
+own table:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **17** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done`, `rhapsody_review_finding`, `rhapsody_breaker_crossings` and `rhapsody_run_usage` |
+| a run's provider origin | — | `rhapsody_run_provenance.provider_origin` (`default` for an inferred provider, the selection tier once the resolver is wired) |
+| a brokered run's settled usage | — | `rhapsody_run_usage` (`provider_reported_tokens`, `reserved_tokens`, `usage_authority`, `usage_incomplete`, `unknown_usage_requests`), keyed by the run id |
+
+**Append-only, and historical rows read unchanged.** `provider_origin` is added with
+`ADD COLUMN ... NOT NULL DEFAULT ''`, so every pre-existing provenance row reads an empty origin —
+"no origin was recorded", exactly the legacy/inferred case — while its recorded `provider` VALUE is
+left byte-identical. `rhapsody_run_usage` starts empty, so a run that predates the feature reads
+`None` ("no broker usage") rather than a fabricated zero. On a fresh database the migration is the
+same step; on a Go-written database it runs after steps 7-16 exactly as any other step.
+
+**Usage is not provenance, and the two never mix.** `rhapsody_run_usage` is written when a run
+settles, long after the write-once provenance row, so a late usage write cannot rewrite what the run
+says it ran on. `provider_reported_tokens` is the provider's own report; `reserved_tokens` is the
+conservative admission charge the broker actually consumed; the two are separate fields and neither
+is ever folded into the other. V1's generic adapter is measurement, not authority, so a report is
+labelled `provider_reported_unverified` and `GET /api/v1/runs/{id}/provenance` renders it under its
+own name (`usage.provider_reported_tokens` beside `usage.reserved_tokens`) — never as exact measured
+usage and never as a generic `total_tokens`. A request whose usage never arrived keeps its full
+reservation, is counted in `unknown_usage_requests`, and gets no provider-reported figure. The
+`rhapsody_` prefix keeps both new objects out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` pins the ninth name.
+
+### A tenth schema table with no Go counterpart — `rhapsody_manager_exchange` (STUDIO-1012)
 
 The manager program bounds the review↔author loop after a round threshold: in `act` mode a review
 round or an author dispatch happens only under an active **manager exchange authorization**. This
@@ -1043,12 +1077,12 @@ The table holds one row per authorization: `intervention_id`, `pr` (the case-fol
 authorized head; re-introduction arms nothing on its own; the automatic findings route-back and its
 summon are suppressed; and a new generation, a hold, the pull request closing, or a `review_round`'s
 patch-id move before consumption invalidates a row. The `rhapsody_` prefix keeps the new table out of
-the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the ninth name.
+the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the tenth name.
 
 | schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | `rhapsody_manager_exchange` | — | one row per manager exchange authorization |
-| `PRAGMA user_version` | 6 | **17** |
+| `PRAGMA user_version` | 6 | **18** |
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 

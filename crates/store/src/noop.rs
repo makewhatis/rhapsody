@@ -118,6 +118,14 @@ impl Store for Noop {
     ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
         Ok(std::collections::HashMap::new())
     }
+    // Broker usage (STUDIO-987) disappears with the rest of the history: a store that holds nothing
+    // has no run to attribute, so it answers "no row".
+    fn set_run_usage(&self, _run_id: i64, _u: &RunUsage) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn run_usage(&self, _run_id: i64) -> Result<Option<RunUsage>, StoreError> {
+        Ok(None)
+    }
     // Per-run review verdicts (STUDIO-1020) disappear with the rest of the history: a store that
     // holds nothing has no review run to attribute, so it answers "no verdict".
     fn set_review_verdict(&self, _run_id: i64, _verdict: &str) -> Result<(), StoreError> {
@@ -440,6 +448,31 @@ mod tests {
                 .expect("list_run_messages")
                 .is_empty()
         );
+
+        // Provenance + broker usage (STUDIO-909 / STUDIO-987): the disabled store persists neither,
+        // so the write is a no-op and the read is the honest `None`.
+        st.set_run_provenance(
+            1,
+            &RunProvenance {
+                provider_origin: "default".into(),
+                ..Default::default()
+            },
+        )
+        .expect("set_run_provenance");
+        assert!(st.run_provenance(1).expect("run_provenance").is_none());
+        assert!(st.load_run_provenances(&[1]).expect("batch").is_empty());
+        st.set_run_usage(
+            1,
+            &RunUsage {
+                provider_reported_tokens: Some(1),
+                reserved_tokens: 2,
+                usage_authority: USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.into(),
+                usage_incomplete: false,
+                unknown_usage_requests: 0,
+            },
+        )
+        .expect("set_run_usage");
+        assert!(st.run_usage(1).expect("run_usage").is_none());
 
         st.prune(30).expect("prune");
         st.close().expect("close");

@@ -14,12 +14,16 @@
 //! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007), step 14
 //! (`rhapsody_review_finding`, STUDIO-1008), step 15
 //! (`rhapsody_breaker_crossings`, STUDIO-1026), step 16 (the review evidence ledger's
-//! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009)
-//! and step 17 (`rhapsody_manager_exchange`, STUDIO-1012) have no Go counterpart: they are
+//! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009),
+//! step 17 (`rhapsody_run_provenance`'s
+//! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987) and step 18
+//! (`rhapsody_manager_exchange`, STUDIO-1012) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
-//! ledger, the structured review-finding revisions and the runaway-loop breaker's crossings, none of which the frozen
+//! ledger, the structured review-finding revisions, the runaway-loop breaker's crossings, the
+//! review evidence ledger's columns, the
+//! provider origin plus broker usage record, and the manager exchange authorizations, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -47,13 +51,14 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 16 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 17 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
-/// review evidence ledger) and are
+/// review evidence ledger, then the
+/// provider origin + broker usage record) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -358,10 +363,40 @@ ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_verdict    TEXT    N
 UPDATE rhapsody_review_bound   SET generation = 1;
 UPDATE rhapsody_review_finding SET generation = 1;
 "#,
-    // v16 -> v17: manager EXCHANGE AUTHORIZATIONS (STUDIO-1012, design record
+    // v16 -> v17: the provider ORIGIN on the run's provenance, and the broker's per-run USAGE record
+    // (STUDIO-987). Rhapsody-only, so the `rhapsody_` prefix gates both out of the Go-recaptured
+    // schema golden by name exactly as steps 7-16 are.
+    //
+    // `provider_origin` is APPENDED to the existing provenance row rather than folded into a new
+    // table: it is part of the same immutable dispatch snapshot as harness/model/provider, and an
+    // `ADD COLUMN ... NOT NULL DEFAULT ''` backfills every historical row with the empty string —
+    // which reads as "no origin was recorded" for a row written before the column existed, and
+    // leaves the historical provider VALUE untouched. New runs record the origin their dispatch
+    // derived (`default` for an inferred provider; a real tier once the resolver is wired). `provider`
+    // itself is still persisted verbatim; the origin
+    // is a separate field so the two can never be relabeled as one another.
+    //
+    // `rhapsody_run_usage` is a separate one-row-per-run table because usage is settled at run END,
+    // long after the write-once provenance row. `provider_reported_tokens` is NULLable so "no usable
+    // report" is distinct from a reported zero; `reserved_tokens` is the conservative admission
+    // charge and is never derived from the report. `usage_authority` is the closed non-secret
+    // spelling (`provider_reported_unverified`), and `usage_incomplete`/`unknown_usage_requests`
+    // keep the unknown-request accounting apart from the reported total.
+    r#"
+ALTER TABLE rhapsody_run_provenance ADD COLUMN provider_origin TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS rhapsody_run_usage (
+  run_id                   INTEGER NOT NULL PRIMARY KEY,
+  provider_reported_tokens INTEGER,
+  reserved_tokens          INTEGER NOT NULL DEFAULT 0,
+  usage_authority          TEXT    NOT NULL DEFAULT '',
+  usage_incomplete         INTEGER NOT NULL DEFAULT 0,
+  unknown_usage_requests   INTEGER NOT NULL DEFAULT 0
+);
+"#,
+    // v17 -> v18: manager EXCHANGE AUTHORIZATIONS (STUDIO-1012, design record
     // `manager-agent-design.md` §7.8). Rhapsody-only, on a Rhapsody-only table, so the
     // `rhapsody_` prefix gates every column out of the Go-recaptured schema golden by name exactly
-    // as steps 7-16 are.
+    // as steps 7-17 are.
     //
     // One row per authorization the manager's activation transaction (M4) writes: a `review_round`
     // (a re-review of the current head) or an `author_round` (an author dispatch, plus the review
@@ -650,7 +685,13 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 
 /// The `rhapsody_run_provenance` value columns, in DDL order — the single shared list for every
 /// provenance read, read positionally by [`map_run_provenance`].
-const PROVENANCE_COLS: &str = "harness, harness_origin, model, model_origin, provider";
+const PROVENANCE_COLS: &str =
+    "harness, harness_origin, model, model_origin, provider, provider_origin";
+
+/// The `rhapsody_run_usage` value columns, in DDL order — the single shared list for the usage read,
+/// read positionally by [`map_run_usage`].
+const RUN_USAGE_COLS: &str = "provider_reported_tokens, reserved_tokens, usage_authority, usage_incomplete, \
+     unknown_usage_requests";
 
 /// How many run ids a batched page read binds per statement, shared by
 /// [`Sqlite::load_run_provenances`] and [`Sqlite::load_review_verdicts`]. Well under SQLite's
@@ -667,12 +708,25 @@ fn map_run_provenance_at(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Resul
         model: row.get(off + 2)?,
         model_origin: row.get(off + 3)?,
         provider: row.get(off + 4)?,
+        provider_origin: row.get(off + 5)?,
     })
 }
 
 /// Map one `rhapsody_run_provenance` row selected as [`PROVENANCE_COLS`].
 fn map_run_provenance(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunProvenance> {
     map_run_provenance_at(row, 0)
+}
+
+/// Map one `rhapsody_run_usage` row selected as [`RUN_USAGE_COLS`]. `provider_reported_tokens` is a
+/// NULLABLE column: NULL is "no usable report", kept distinct from a reported zero.
+fn map_run_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunUsage> {
+    Ok(RunUsage {
+        provider_reported_tokens: row.get(0)?,
+        reserved_tokens: row.get(1)?,
+        usage_authority: row.get(2)?,
+        usage_incomplete: row.get(3)?,
+        unknown_usage_requests: row.get(4)?,
+    })
 }
 
 /// Build the ` WHERE …` clause (empty string when unfiltered) and its bound arguments for a
@@ -1183,12 +1237,12 @@ impl Store for Sqlite {
         // same run id (impossible today) must overwrite rather than fail a PRIMARY KEY constraint.
         conn.execute(
             "INSERT INTO rhapsody_run_provenance
-               (run_id, harness, harness_origin, model, model_origin, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               (run_id, harness, harness_origin, model, model_origin, provider, provider_origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(run_id) DO UPDATE SET
                harness = excluded.harness, harness_origin = excluded.harness_origin,
                model = excluded.model, model_origin = excluded.model_origin,
-               provider = excluded.provider",
+               provider = excluded.provider, provider_origin = excluded.provider_origin",
             params![
                 run_id,
                 p.harness,
@@ -1196,6 +1250,7 @@ impl Store for Sqlite {
                 p.model,
                 p.model_origin,
                 p.provider,
+                p.provider_origin,
             ],
         )?;
         Ok(())
@@ -1476,6 +1531,46 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn set_run_usage(&self, run_id: i64, u: &RunUsage) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // UPSERT on the run id: usage is settled once at run end, but a re-settle of the same run id
+        // (impossible today) must overwrite rather than fail a PRIMARY KEY. This writes ONLY the
+        // usage row — it can never touch the immutable `rhapsody_run_provenance` row beside it.
+        conn.execute(
+            "INSERT INTO rhapsody_run_usage
+               (run_id, provider_reported_tokens, reserved_tokens, usage_authority,
+                usage_incomplete, unknown_usage_requests)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id) DO UPDATE SET
+               provider_reported_tokens = excluded.provider_reported_tokens,
+               reserved_tokens = excluded.reserved_tokens,
+               usage_authority = excluded.usage_authority,
+               usage_incomplete = excluded.usage_incomplete,
+               unknown_usage_requests = excluded.unknown_usage_requests",
+            params![
+                run_id,
+                u.provider_reported_tokens,
+                u.reserved_tokens,
+                u.usage_authority,
+                u.usage_incomplete,
+                u.unknown_usage_requests,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_USAGE_COLS} FROM rhapsody_run_usage WHERE run_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map([run_id], map_run_usage)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 
     fn metrics_by_provider(
@@ -2493,11 +2588,37 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// The scratch directory's name. `nonce` distinguishes otherwise-identical `(pid, seq)` pairs,
+    /// so a name never depends on pid + counter alone — the reused-pid collision (STUDIO-1027): two
+    /// processes that over time draw the same pid and counter would otherwise reopen each other's
+    /// `symphony.db`.
+    fn scratch_dir_name(pid: u32, seq: u32, nonce: u128) -> String {
+        format!("rhapsody-store-test-{pid}-{seq}-{nonce}")
+    }
+
+    /// The current-time nanosecond nonce used in a scratch directory name.
+    fn scratch_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// Clear anything already at `dir`, then create it, and return the path. `create_dir_all` alone
+    /// would leave a stale `symphony.db` in place — the old plain-create scheme that produced
+    /// `duplicate column name: project_slug` when a newer schema opened it.
+    fn clear_scratch_dir(dir: &Path) -> PathBuf {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("create scratch dir");
+        dir.to_path_buf()
+    }
+
     /// A unique scratch directory under the system temp dir, removed on drop. Avoids a tempfile
     /// dependency; uniqueness comes from the pid + a per-process atomic counter + a nanosecond
     /// nonce, so a recycled pid can never adopt an earlier run's leftover (STUDIO-1027's store
-    /// rule). [`scratch_dir`] hands back the guard: keep it alive for the test's lifetime or the
-    /// directory is removed the moment the temporary drops.
+    /// rule). The directory is cleared before create as well, so even a nonce collision (or an
+    /// exactly-reused name) starts empty. [`scratch_dir`] hands back the guard: keep it alive for
+    /// the test's lifetime or the directory is removed the moment the temporary drops.
     struct TempDir {
         path: PathBuf,
     }
@@ -2505,17 +2626,14 @@ mod tests {
     impl TempDir {
         fn new() -> TempDir {
             static N: AtomicU32 = AtomicU32::new(0);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!(
-                "rhapsody-store-test-{}-{}-{nonce}",
+            let path = std::env::temp_dir().join(scratch_dir_name(
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed),
+                scratch_nonce(),
             ));
-            std::fs::create_dir_all(&path).expect("create scratch dir");
-            TempDir { path }
+            TempDir {
+                path: clear_scratch_dir(&path),
+            }
         }
 
         /// Joins `name` under the scratch dir, returning the (not-yet-created) path.
@@ -2545,6 +2663,39 @@ mod tests {
     /// the directory before the test has used it.
     fn scratch_dir() -> TempDir {
         TempDir::new()
+    }
+
+    // A REUSED pid must not reopen the previous process's database. Two processes that draw the same
+    // pid and the same counter produce the same name under the old scheme and collide; the nanosecond
+    // nonce makes them distinct. Dropping the nonce from the name (the old pid+counter scheme) reds
+    // this.
+    #[test]
+    fn scratch_dir_names_do_not_collide_when_a_pid_is_reused() {
+        assert_ne!(
+            scratch_dir_name(4242, 0, 111),
+            scratch_dir_name(4242, 0, 222),
+            "a reused pid at the same counter must not reuse a scratch directory"
+        );
+    }
+
+    // Creating a scratch directory over a stale one must START EMPTY, so a leftover `symphony.db`
+    // can never be reopened against a newer schema (`duplicate column name: project_slug`). Dropping
+    // the `remove_dir_all` from `clear_scratch_dir` — the old plain `create_dir_all` — reds this.
+    #[test]
+    fn a_reused_scratch_dir_is_cleared_before_use() {
+        let dir =
+            std::env::temp_dir().join(scratch_dir_name(std::process::id(), 0, scratch_nonce()));
+        std::fs::create_dir_all(&dir).expect("seed stale dir");
+        std::fs::write(dir.join("symphony.db"), b"stale schema").expect("seed stale db");
+
+        let fresh = clear_scratch_dir(&dir);
+        assert_eq!(
+            std::fs::read_dir(&fresh).expect("read fresh dir").count(),
+            0,
+            "a reused scratch directory must be cleared, not reopened"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Reassemble the live schema the way `sqlite3 .schema` (which produced the fixture) does.
@@ -5166,6 +5317,11 @@ mod tests {
             model: model.into(),
             model_origin: format!("review.model.{harness}"),
             provider: provider.into(),
+            provider_origin: if provider.is_empty() {
+                String::new()
+            } else {
+                "default".into()
+            },
         }
     }
 
@@ -5267,6 +5423,171 @@ mod tests {
         let rewritten = provenance_fixture("claude", "claude-sonnet-4", "anthropic");
         store.set_run_provenance(with, &rewritten).expect("rewrite");
         assert_eq!(store.run_provenance(with).expect("get"), Some(rewritten));
+    }
+
+    // Broker usage round-trips through its OWN table (STUDIO-987), separate from provenance. A run
+    // that recorded none reads back `None`; a reported ZERO is distinct from no report; an unknown
+    // request keeps its full reservation and is never given a provider-reported figure.
+    #[test]
+    fn run_usage_round_trips_and_absent_reads_none() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let with = start_provenance_run(&store, "with");
+        let without = start_provenance_run(&store, "without");
+        let reported = RunUsage {
+            provider_reported_tokens: Some(1_234),
+            reserved_tokens: 9_000,
+            usage_authority: USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.into(),
+            usage_incomplete: false,
+            unknown_usage_requests: 0,
+        };
+        store.set_run_usage(with, &reported).expect("set");
+        assert_eq!(store.run_usage(with).expect("get"), Some(reported));
+        assert_eq!(
+            store.run_usage(without).expect("get"),
+            None,
+            "a run with no usage row is absent, not a zero-usage record"
+        );
+
+        // A reported zero is NOT the same as "never reported".
+        let zero = RunUsage {
+            provider_reported_tokens: Some(0),
+            ..store.run_usage(with).expect("get").expect("row")
+        };
+        store.set_run_usage(with, &zero).expect("set zero");
+        assert_eq!(
+            store
+                .run_usage(with)
+                .expect("get")
+                .expect("row")
+                .provider_reported_tokens,
+            Some(0)
+        );
+
+        // Unknown usage: no reported figure, but the full conservative reservation survives and the
+        // unknown-request count is recorded. Re-setting the SAME run id replaces the row.
+        let unknown = RunUsage {
+            provider_reported_tokens: None,
+            reserved_tokens: 5_000,
+            usage_authority: String::new(),
+            usage_incomplete: true,
+            unknown_usage_requests: 2,
+        };
+        store.set_run_usage(with, &unknown).expect("set unknown");
+        assert_eq!(store.run_usage(with).expect("get"), Some(unknown.clone()));
+        assert_eq!(store.run_usage(with).expect("get"), Some(unknown));
+
+        // Writing usage never disturbs the provenance row beside it.
+        let prov = provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai");
+        store.set_run_provenance(with, &prov).expect("set prov");
+        store
+            .set_run_usage(
+                with,
+                &RunUsage {
+                    reserved_tokens: 42,
+                    ..Default::default()
+                },
+            )
+            .expect("set usage again");
+        assert_eq!(store.run_provenance(with).expect("get"), Some(prov));
+    }
+
+    // The stored provenance/usage columns are pinned to exactly the documented, non-secret set
+    // (STUDIO-987). The mutation this guards: adding a column that could carry a credential, an
+    // ephemeral OpenCode provider id, or a broker capability — none of which may ever be persisted.
+    #[test]
+    fn run_provenance_and_usage_tables_hold_only_non_secret_columns() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let conn = store.lock();
+        let columns = |table: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("prepare table_info");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query table_info")
+                .map(|r| r.expect("column name"))
+                .collect()
+        };
+        assert_eq!(
+            columns("rhapsody_run_provenance"),
+            vec![
+                "run_id",
+                "harness",
+                "harness_origin",
+                "model",
+                "model_origin",
+                "provider",
+                "provider_origin",
+            ],
+            "provenance holds identity + origins only, never a credential or runtime provider id"
+        );
+        assert_eq!(
+            columns("rhapsody_run_usage"),
+            vec![
+                "run_id",
+                "provider_reported_tokens",
+                "reserved_tokens",
+                "usage_authority",
+                "usage_incomplete",
+                "unknown_usage_requests",
+            ],
+            "usage holds accounting fields only, never a secret"
+        );
+    }
+
+    // A byte scan of the persisted database after a normal run: neither the ephemeral OpenCode
+    // runtime provider id (design §9.1's `rhapsody-<22 base64url>` shape) nor a credential-shaped
+    // canary appears anywhere in the file. The mutation this guards: leaking the runtime id or a
+    // secret into the run record. The scan is over the raw file (checkpointed first) because a
+    // secret written anywhere — including a column the tests above do not name — would show here.
+    #[test]
+    fn stored_run_record_never_contains_a_runtime_provider_id_or_secret() {
+        let scratch = scratch_dir();
+        let db = scratch.join("provenance.db");
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+        let id = start_provenance_run(&store, "T-1");
+        store
+            .set_run_provenance(
+                id,
+                &provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            )
+            .expect("set provenance");
+        store
+            .set_run_usage(
+                id,
+                &RunUsage {
+                    provider_reported_tokens: Some(1_234),
+                    reserved_tokens: 9_000,
+                    usage_authority: USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.into(),
+                    usage_incomplete: false,
+                    unknown_usage_requests: 0,
+                },
+            )
+            .expect("set usage");
+        // Fold the WAL back into the main file so the scan sees every written page.
+        store
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint");
+        let bytes = std::fs::read(&db).expect("read db bytes");
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(
+            !hay.contains("rhapsody-"),
+            "the ephemeral runtime provider id must never be persisted as provenance"
+        );
+        for canary in ["sk-live-", "api_key", "OPENCODE_AUTH_CONTENT", "Bearer "] {
+            assert!(
+                !hay.contains(canary),
+                "a credential-shaped canary {canary:?} must never reach the run record"
+            );
+        }
+        // The stable id IS recorded — the scan above is not passing merely because nothing was
+        // written at all.
+        assert!(
+            hay.contains("fireworks-ai"),
+            "the stable provider id is the recorded provenance"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -5487,6 +5808,65 @@ mod tests {
                 .expect("tally")
                 .is_empty()
         );
+    }
+
+    // A database already at the shipped step-15 schema gains the provider ORIGIN column and the
+    // usage table WITHOUT rewriting any historical value (STUDIO-987). The `ADD COLUMN ... DEFAULT ''`
+    // backfills every pre-existing provenance row with the empty origin — which reads as "no
+    // configured provider tier", exactly the legacy/inferred case — while the historical provider
+    // VALUE is left byte-identical. The usage table starts empty, so every pre-existing run reads as
+    // "no broker usage" rather than a fabricated zero.
+    #[test]
+    fn a_v15_database_gains_provider_origin_and_the_usage_table() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v15.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..15] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 15")
+                .expect("stamp v15");
+            tx.commit().expect("commit");
+            // A row written by the pre-STUDIO-987 build: no `provider_origin` column existed yet.
+            conn.execute(
+                "INSERT INTO rhapsody_run_provenance \
+                   (run_id, harness, harness_origin, model, model_origin, provider) \
+                 VALUES (1, 'opencode', 'profile', 'fireworks-ai/dsv4', 'opencode.model', \
+                         'fireworks-ai')",
+                [],
+            )
+            .expect("insert historical provenance row");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let row = store
+            .run_provenance(1)
+            .expect("read provenance")
+            .expect("the historical row survives the migration");
+        assert_eq!(
+            row.provider, "fireworks-ai",
+            "the migration must not rewrite the historical inferred provider value"
+        );
+        assert_eq!(
+            row.provider_origin, "",
+            "a row written before the column existed has no configured provider tier, and reads empty"
+        );
+        assert_eq!(row.harness, "opencode");
+        assert_eq!(row.model, "fireworks-ai/dsv4");
+        assert_eq!(
+            store.run_usage(1).expect("read usage"),
+            None,
+            "the usage table starts empty; a pre-existing run has no broker usage"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     // A database already at the shipped step-7 schema migrates forward to step 8 rather than
@@ -5909,6 +6289,7 @@ mod tests {
                 "rhapsody_review_done".to_string(),
                 "rhapsody_review_finding".to_string(),
                 "rhapsody_breaker_crossings".to_string(),
+                "rhapsody_run_usage".to_string(),
                 "rhapsody_manager_exchange".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
