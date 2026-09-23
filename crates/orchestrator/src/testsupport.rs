@@ -27,9 +27,65 @@ use rhapsody_tracker::fake::Fake;
 
 use crate::dispatch::EligibilityGate;
 use crate::effective::{DEFAULT_CLAIM_SETTLE_DELAY, DEFAULT_CLAIM_TTL, Effective, ResolvedProject};
+
 use crate::liveness::{self, Sampler};
 use crate::obslog::Store as TranscriptStore;
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
+
+/// A preparation resolver that never answers, for tests that only need asynchronous preparation to
+/// ENGAGE (STUDIO-988) and never to complete. The permit is dropped when the future is dropped;
+/// tests that care about permit ownership live in `prepare.rs` beside `BlockingResolver`.
+pub(crate) struct HangResolver;
+
+#[async_trait::async_trait]
+impl crate::prepare::PreparationResolver for HangResolver {
+    async fn prepare(
+        &self,
+        _req: &crate::prepare::PreparationRequest,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> crate::prepare::PreparationCompletion {
+        std::future::pending::<crate::prepare::PreparationCompletion>().await
+    }
+}
+
+/// The secret-free selection every READY completion carries, so an accepted preparation can resume
+/// its dispatch.
+pub(crate) fn ready_selection() -> crate::prepare::PreparedSelection {
+    crate::prepare::PreparedSelection {
+        harness: "claude".to_string(),
+        model: "opus".to_string(),
+        provider: "anthropic".to_string(),
+    }
+}
+
+/// A READY preparation completion, for tests that drive a preparation all the way to acceptance.
+pub(crate) fn ready_preparation_completion() -> crate::prepare::PreparationCompletion {
+    crate::prepare::PreparationCompletion {
+        outcome: crate::prepare::PreparationOutcome::Ready(crate::prepare::PreparedDispatch::new(
+            "claude",
+            "opus",
+            "anthropic",
+            "rev-1",
+        )),
+        observed_revision: "rev-1".to_string(),
+        resolved: ready_selection(),
+    }
+}
+
+/// A preparation resolver that always answers READY — the "preparation completes" counterpart to
+/// [`HangResolver`].
+pub(crate) struct ReadyResolver;
+
+#[async_trait::async_trait]
+impl crate::prepare::PreparationResolver for ReadyResolver {
+    async fn prepare(
+        &self,
+        _req: &crate::prepare::PreparationRequest,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> crate::prepare::PreparationCompletion {
+        ready_preparation_completion()
+    }
+}
 
 // --- issue / blocker / set builders (Go dispatch_test / select_test helpers) -----------------
 

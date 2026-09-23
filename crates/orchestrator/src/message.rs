@@ -268,12 +268,14 @@ impl Orchestrator {
     /// summons is spent, so neither can deliver it twice; a rejected (full/absent mailbox) admission
     /// leaves the watermark unadvanced.
     ///
-    /// Called from `promote_and_dispatch` (`loop.rs`) immediately AFTER `dispatch_issue` — the entry
-    /// and its mailbox must exist first. There is no await between the two, so this runs before the
-    /// control task can yield; and because the worker holds the SAME receiver across every turn, a
-    /// message queued while it is still provisioning its workspace is drained at the first turn
-    /// regardless. Rhapsody-only: Go's `promoteAndDispatch` has no counterpart (see README
-    /// "Divergences").
+    /// Called from `dispatch_issue` (`retry.rs`) immediately after the running entry is inserted and
+    /// the worker spawned — the entry and its mailbox must exist first. With a preparation resolver
+    /// installed the promote and the summons are deferred until the preparation is ACCEPTED
+    /// (`prepare.rs::finish_prepared`), so the entry is seeded there rather than in
+    /// `promote_and_dispatch`; with none, `promote_and_dispatch` promotes and dispatches inline
+    /// exactly as before. Because the worker holds the SAME receiver across every turn, a message
+    /// queued while it is still provisioning its workspace is drained at the first turn regardless.
+    /// Rhapsody-only: Go's `promoteAndDispatch` has no counterpart (see README "Divergences").
     pub(crate) fn seed_reopen_summons(
         &mut self,
         issue_id: &str,

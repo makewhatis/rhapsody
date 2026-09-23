@@ -30,6 +30,13 @@ pub const OUTCOME_INTERRUPTED: &str = "interrupted";
 /// would be a lie in the history table. The console's `runOutcomeLabel` prints an unrecognised
 /// outcome verbatim, so this reads as itself everywhere.
 pub const OUTCOME_TOKEN_CEILING: &str = "token_ceiling";
+/// A zero-turn refusal: provider/credential preparation was refused before any claim, workspace,
+/// or agent attempt (STUDIO-988). **Rhapsody-only**, beyond Go's six-value set. Like
+/// [`OUTCOME_TOKEN_CEILING`] it is a distinct value on purpose: a refusal is not a failed agent
+/// attempt (no agent ran), not queued work, and not an operator stop, and the API/UI/metrics treat
+/// it as its own state so a refused ticket is never rendered as failed work. The run row carries
+/// zero turns and zero tokens.
+pub const OUTCOME_REFUSED: &str = "refused";
 
 // --- claim states (claims.state) -------------------------------------------------------------
 
