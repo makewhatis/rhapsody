@@ -51,6 +51,7 @@ import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
   OUTCOME_RUNNING,
+  REVIEW_STATE_LABELS,
   TRACE_FILTERS,
   TRACE_FILTER_LABELS,
   attemptBucket,
@@ -431,22 +432,32 @@ function RunTrace({
           own kind of row rather than a fourth attempt. */}
       {reviewStrip.length === 0 ? null : (
         <div className="trreviews" role="group" aria-label="Reviews">
-          {reviewStrip.map((r) => (
-            <button
-              key={r.id}
-              type="button"
-              className={r.id === run.id ? "trrev on" : "trrev"}
-              aria-pressed={r.id === run.id}
-              title={
-                r.named
-                  ? `${r.label} · run ${r.id} · started ${formatDateTime(r.startedAt)}`
-                  : `run ${r.id} · started ${formatDateTime(r.startedAt)}`
-              }
-              onClick={() => selectRun(r.id)}
-            >
-              {r.label}
-            </button>
-          ))}
+          {reviewStrip.map((r) => {
+            // The verdict phrase the tooltip adds (STUDIO-1020), or "" for a round with no verdict.
+            const verdict = REVIEW_STATE_LABELS[r.state];
+            const id = `run ${r.id}`;
+            // A NAMED entry's label already carries "review · <who>", so the run id follows it; the
+            // unnamed fallback's label IS the run id, so the tooltip must not repeat it.
+            const head = r.named ? [r.label, verdict] : [verdict];
+            return (
+              <button
+                key={r.id}
+                type="button"
+                className={r.id === run.id ? "trrev on" : "trrev"}
+                // The state the chip paints its colour and its leading glyph from (STUDIO-1020). A
+                // data attribute rather than a class because the View must not decide the form the
+                // stylesheet draws — the model names the state, the stylesheet encodes it.
+                data-verdict={r.state}
+                aria-pressed={r.id === run.id}
+                title={[...head, id, `started ${formatDateTime(r.startedAt)}`]
+                  .filter((part) => part !== "")
+                  .join(" · ")}
+                onClick={() => selectRun(r.id)}
+              >
+                {r.label}
+              </button>
+            );
+          })}
         </div>
       )}
 

@@ -2697,6 +2697,18 @@ mod tests {
         > {
             self.0.load_run_provenances(a0)
         }
+        fn set_review_verdict(&self, a0: i64, a1: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_review_verdict(a0, a1)
+        }
+        fn review_verdict(&self, a0: i64) -> Result<Option<String>, rhapsody_store::StoreError> {
+            self.0.review_verdict(a0)
+        }
+        fn load_review_verdicts(
+            &self,
+            a0: &[i64],
+        ) -> Result<std::collections::HashMap<i64, String>, rhapsody_store::StoreError> {
+            self.0.load_review_verdicts(a0)
+        }
         fn tokens_by_provider(
             &self,
             a0: &str,

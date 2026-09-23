@@ -847,9 +847,17 @@ pub(crate) async fn handle_issue_history(
     // the reviews in time order with the attempts they answered. The join is the server's existing
     // one — see `review_runs_for_ticket` — never a second client-side rule.
     let reviews = review_runs_for_ticket(provider.history().as_ref(), &id, limit);
+    // Each review round's OWN verdict (STUDIO-1020), one store read for the whole strip, keyed by
+    // run id. Best-effort like the decorations beside it: a store error yields an empty map and
+    // every round renders exactly as it did before the field existed — neutral, never a guess.
+    let review_ids: Vec<i64> = reviews.iter().map(|r| r.id).collect();
+    let verdicts = provider
+        .history()
+        .load_review_verdicts(&review_ids)
+        .unwrap_or_default();
     write_json(
         StatusCode::OK,
-        &issue_history_response(&id, &runs, &reviews),
+        &issue_history_response(&id, &runs, &reviews, &verdicts),
     )
 }
 
@@ -1191,8 +1199,8 @@ mod tests {
     };
     use rhapsody_store::{
         DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, OUTCOME_FAILED, OUTCOME_STOPPED,
-        ReviewWatchKey, ReviewWatchRow, RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store,
-        StoreError, StorePath,
+        REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey, ReviewWatchRow,
+        RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError, StorePath,
     };
     use serde_json::{Value, json};
 
@@ -1490,6 +1498,12 @@ mod tests {
         ) -> Result<std::collections::HashMap<i64, rhapsody_store::RunProvenance>, StoreError>
         {
             Store::load_run_provenances(&self.inner, run_ids)
+        }
+        fn load_review_verdicts(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
+            Store::load_review_verdicts(&self.inner, run_ids)
         }
         fn tokens_by_provider(
             &self,
@@ -2083,6 +2097,59 @@ mod tests {
             .map(|r| r["issue_identifier"].as_str().unwrap_or_default())
             .collect();
         assert_eq!(keys, vec![sol, alice]);
+    }
+
+    // STUDIO-1020 — each review ROUND carries its own verdict. The watch set holds only the latest
+    // status per (PR, reviewer), so it cannot describe an older round; the daemon records the
+    // verdict against the run id and the response decorates each review row with it. A round that
+    // recorded none carries no `verdict` key at all, which the console reads as its neutral state.
+    #[tokio::test]
+    async fn issue_history_carries_each_review_runs_own_verdict() {
+        let store = mem_store();
+        seed_run_for("iss_impl", "STUDIO-1020", "2026-08-01T00:00:00Z", &store);
+        let jimmy = "pr:makewhatis/rhapsody#223@jimmy";
+        let alice = "pr:makewhatis/rhapsody#223@alice";
+        // Three rounds by two reviewers: two findings by jimmy, one approval by alice, and one round
+        // that ended without a declared verdict (a crash/truncation).
+        let jimmy_first = seed_run_for(jimmy, jimmy, "2026-08-01T01:00:00Z", &store);
+        let jimmy_second = seed_run_for(jimmy, jimmy, "2026-08-01T02:00:00Z", &store);
+        let alice_run = seed_run_for(alice, alice, "2026-08-01T03:00:00Z", &store);
+        let unjudged = seed_run_for(jimmy, jimmy, "2026-08-01T04:00:00Z", &store);
+        store
+            .set_review_verdict(jimmy_first, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
+        store
+            .set_review_verdict(jimmy_second, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
+        store
+            .set_review_verdict(alice_run, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        seed_watch(&store, 223, "jimmy", "handoff:STUDIO-1020");
+        seed_watch(&store, 223, "alice", "handoff:STUDIO-1020");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/issues/STUDIO-1020/history")).await;
+        assert_eq!(status, 200);
+        let reviews = body["reviews"].as_array().expect("reviews");
+        let by_id: std::collections::HashMap<i64, &Value> = reviews
+            .iter()
+            .map(|r| (r["id"].as_i64().expect("id"), r))
+            .collect();
+        assert_eq!(by_id.len(), 4, "every round is its own review row");
+        assert_eq!(
+            by_id[&jimmy_first]["verdict"], REVIEW_VERDICT_CHANGES_REQUESTED,
+            "an earlier round keeps its own findings"
+        );
+        assert_eq!(
+            by_id[&jimmy_second]["verdict"],
+            REVIEW_VERDICT_CHANGES_REQUESTED
+        );
+        assert_eq!(by_id[&alice_run]["verdict"], REVIEW_VERDICT_APPROVED);
+        assert!(
+            by_id[&unjudged].get("verdict").is_none(),
+            "a round with no verdict carries the field ABSENT, not null: {body}"
+        );
     }
 
     // STUDIO-976 trap 6 — a RETIRED pull request. `drop_review_watch` is a SOFT delete: the watch
