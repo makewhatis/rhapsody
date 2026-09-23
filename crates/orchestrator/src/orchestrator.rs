@@ -629,6 +629,18 @@ pub struct Orchestrator {
     /// — the state that makes the poke once per head consecutively and the escalation once ever,
     /// rather than once per tick.
     pub(crate) draft_pokes: HashMap<String, crate::draftpoke::DraftPokeState>,
+    /// The round each watched pull request was DEFERRED behind a live author run (STUDIO-1025),
+    /// keyed by coordinate, holding the run's identifier and the head the branch stood at when the
+    /// deferral was recorded. Written and read only by the watcher's loop-side handler, and dropped
+    /// when the pull request leaves the watch set.
+    ///
+    /// It is not what KEEPS the round owed — `handle_review_head_advanced` has already re-armed the
+    /// row to `requested`, and that arm is what survives the run — but it is how the deferral and
+    /// its resolution are LOGGED (debug on the deferral, info on the arming) and how an operator can
+    /// see WHICH run a watched pull request is waiting on. A restart forgets it and can only lose a
+    /// log line: the row is re-read, the run is re-read, and the round is re-decided.
+    pub(crate) review_deferred_by_author:
+        HashMap<crate::prstate::PrCoord, crate::reviewwatch::AuthorDeferral>,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
@@ -1054,6 +1066,7 @@ impl Orchestrator {
             auto_merge_announced: HashMap::new(),
             conflict_routed: HashMap::new(),
             draft_pokes: HashMap::new(),
+            review_deferred_by_author: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),
             review_watch_swept: None,
