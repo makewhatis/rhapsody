@@ -61,8 +61,9 @@ impl BrokerLedgerReceiver {
     /// and the broker's maximum capability lifetime.
     ///
     /// Refuses with [`BrokerError::TurnAlreadyArmed`] when the prior receipt has not been drained,
-    /// with [`BrokerError::TurnAlreadyActive`] when an attempt/access is still live, and with
-    /// [`BrokerError::SessionBudgetExhausted`] when the session/run token cap is already spent.
+    /// with [`BrokerError::TurnAlreadyActive`] when an attempt/access is still live,
+    /// [`BrokerError::SessionBudgetExhausted`] when the session/run token cap is already spent, and
+    /// [`BrokerError::DayBudgetExhausted`] when the configured durable UTC-day budget is exhausted.
     pub fn arm_turn(
         &mut self,
         meta: TurnMeta,
@@ -88,6 +89,19 @@ impl BrokerLedgerReceiver {
             drop(gate);
             session.receipt_slot.abandon_armed();
             return Err(BrokerError::SessionBudgetExhausted);
+        }
+
+        // Refuse before child spawn when the configured durable UTC-day budget is already exhausted.
+        // This is the early refusal; the atomic per-request charge is what actually prevents
+        // first-turn and concurrent-run oversubscription.
+        if let (Some(authority), Some(cap)) = (
+            session.policy.day_authority(),
+            session.policy.limits().max_reserved_token_units_per_utc_day,
+        ) && authority.charged_today(session.plan.stable_provider_id()) >= cap
+        {
+            drop(gate);
+            session.receipt_slot.abandon_armed();
+            return Err(BrokerError::DayBudgetExhausted);
         }
 
         let ordinal = session.next_ordinal();

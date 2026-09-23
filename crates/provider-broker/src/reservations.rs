@@ -19,9 +19,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::authority::CumulativeBudgetAuthority;
 use crate::error::BrokerError;
 use crate::policy::BrokerLimits;
 use crate::state::lock;
+use crate::usage::UsageObservation;
 
 /// The per-session/run reserved-token cap, shared across that session's turns. Token reservations
 /// are charged atomically and never released by the generic adapter.
@@ -57,6 +59,17 @@ impl SessionReservations {
     pub(crate) fn remaining(&self) -> u64 {
         self.max_tokens.saturating_sub(self.reserved())
     }
+
+    /// Undo a reservation that was charged as part of an admission which then failed on a later
+    /// step (the durable day-authority charge). Releasing is *not* usage-based settlement; it only
+    /// backs out a reservation for a request that was never admitted.
+    pub(crate) fn release(&self, tokens: u64) {
+        let _ = self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(tokens))
+            });
+    }
 }
 
 /// What one admission transaction wants to reserve.
@@ -77,12 +90,46 @@ pub(crate) struct ReservationSnapshot {
     pub reserved_tokens: u64,
 }
 
+/// The turn's usage accounting, accumulated as provider responses settle (design §7.3). It lives in
+/// the same critical section as the reservation counters, so admission, settlement and finalization
+/// cannot interleave.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UsageState {
+    /// Requests admitted but not yet settled. At finalization these are counted unknown, so a still
+    /// active or usage-less request is conservatively charged rather than dropped.
+    outstanding: u64,
+    /// The conservative sum of syntactically valid provider-reported totals.
+    reported_tokens: u64,
+    /// How many requests settled with a valid provider report.
+    reported_requests: u64,
+    /// How many requests settled as unknown (malformed, missing, or aborted).
+    unknown_requests: u64,
+    /// How many valid reports disagreed internally (the bounded §7.3 diagnostic; settlement used
+    /// the larger conservative value).
+    inconsistent_requests: u64,
+}
+
+/// The usage totals published with a finalized turn. Provider-reported and admission-reservation
+/// totals are deliberately separate: a generic adapter never lets a report release a reservation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UsageSnapshot {
+    /// The conservative provider-reported total, `None` when no request reported usable usage.
+    pub provider_reported_tokens: Option<u64>,
+    /// How many requests settled with a valid provider report.
+    pub reported_requests: u64,
+    /// Requests that never produced usable usage, including those still outstanding at finalization.
+    pub unknown_usage_requests: u64,
+    /// Valid reports whose total and components disagreed (a bounded diagnostic).
+    pub inconsistent_usage_requests: u64,
+}
+
 /// The counters plus the turn's liveness gate, both behind one mutex so an admission and a
 /// finalization can never interleave between the check and the commit.
 #[derive(Debug, Default)]
 struct ReservationState {
     closed: bool,
     counters: ReservationSnapshot,
+    usage: UsageState,
 }
 
 /// The grant's per-turn reservation counters. Held behind an `Arc` so a [`ConcurrencyPermit`] can
@@ -107,6 +154,8 @@ impl Reservations {
     pub(crate) fn try_reserve(
         &self,
         session: &SessionReservations,
+        provider_id: &str,
+        day_authority: Option<&Arc<dyn CumulativeBudgetAuthority>>,
         request: ReserveRequest,
         live: impl FnOnce() -> Result<(), BrokerError>,
     ) -> Result<(), BrokerError> {
@@ -170,11 +219,70 @@ impl Reservations {
         // the turn counters are left untouched.
         session.try_reserve(token_cost)?;
 
+        // Charge the durable UTC-day authority inside the same admission transaction. This is the
+        // atomic step that stops first-turn and concurrent-run oversubscription: checking only prior
+        // completed receipts at the next turn would not. If the authority refuses, the session
+        // reservation just charged is backed out so a refused request reserves nothing.
+        if let (Some(authority), Some(cap)) =
+            (day_authority, limits.max_reserved_token_units_per_utc_day)
+            && authority.try_charge(provider_id, token_cost, cap).is_err()
+        {
+            session.release(token_cost);
+            return Err(BrokerError::DayBudgetExhausted);
+        }
+
         state.forwarded_requests = forwarded;
         state.request_bytes = request_bytes;
         state.response_bytes = response_bytes;
         state.reserved_tokens = turn_tokens;
+        // One request is now admitted and awaiting settlement; finalization counts any that never
+        // settle as unknown (design §4.3, §7.3).
+        guard.usage.outstanding = guard.usage.outstanding.saturating_add(1);
         Ok(())
+    }
+
+    /// Settle a forwarded response's byte reservation down to the bytes actually forwarded (design
+    /// §8.2). Only a *successfully* forwarded response calls this; an aborted or malformed response
+    /// keeps the full reservation so repeated early disconnects cannot bypass the turn aggregate.
+    /// Ignored once the turn has closed (the finalized ledger already kept the full reservation).
+    ///
+    /// Driven only by the `loopback` adapter, so a `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
+    pub(crate) fn settle_response_bytes(&self, reserved: u64, forwarded: u64) {
+        let mut guard = lock(&self.state);
+        if guard.closed {
+            return;
+        }
+        let release = reserved.saturating_sub(forwarded);
+        guard.counters.response_bytes = guard.counters.response_bytes.saturating_sub(release);
+    }
+
+    /// Settle one admitted request's usage exactly once (design §7.3). A syntactically valid provider
+    /// report is recorded as `provider_reported_unverified` measurement; it never releases the token
+    /// reservation. A malformed/missing report is counted unknown. A settlement after the turn has
+    /// closed is ignored — the outstanding request was already counted unknown at close.
+    ///
+    /// Driven only by the `loopback` adapter, so a `loopback`-off build has no caller.
+    #[cfg_attr(not(feature = "loopback"), allow(dead_code))]
+    pub(crate) fn settle_usage(&self, observation: &UsageObservation) {
+        let mut guard = lock(&self.state);
+        if guard.closed {
+            return;
+        }
+        guard.usage.outstanding = guard.usage.outstanding.saturating_sub(1);
+        match (observation.is_unknown(), observation.conservative_total()) {
+            (false, Some(tokens)) => {
+                guard.usage.reported_tokens = guard.usage.reported_tokens.saturating_add(tokens);
+                guard.usage.reported_requests = guard.usage.reported_requests.saturating_add(1);
+                if observation.inconsistent {
+                    guard.usage.inconsistent_requests =
+                        guard.usage.inconsistent_requests.saturating_add(1);
+                }
+            }
+            _ => {
+                guard.usage.unknown_requests = guard.usage.unknown_requests.saturating_add(1);
+            }
+        }
     }
 
     /// Acquire one of the turn's concurrent-request permits. The permit releases the slot on drop.
@@ -235,14 +343,28 @@ impl Reservations {
         lock(&self.state).counters
     }
 
-    /// Finalize admission: set the closed gate and return the committed counters in one critical
-    /// section. Called exactly once, from [`TurnInner::finalize`](crate::state::TurnInner). Any
-    /// admission under way either commits before this and is included, or is refused because the
-    /// turn is already closed.
-    pub(crate) fn close_and_snapshot(&self) -> ReservationSnapshot {
+    /// Finalize admission: set the closed gate and return the committed counters and usage totals in
+    /// one critical section. Called exactly once, from
+    /// [`TurnInner::finalize`](crate::state::TurnInner). Any admission under way either commits
+    /// before this and is included, or is refused because the turn is already closed; any request
+    /// admitted but not yet settled is counted unknown, conservatively.
+    pub(crate) fn close_and_snapshot(&self) -> (ReservationSnapshot, UsageSnapshot) {
         let mut guard = lock(&self.state);
         guard.closed = true;
-        guard.counters
+        let usage = UsageSnapshot {
+            provider_reported_tokens: if guard.usage.reported_requests > 0 {
+                Some(guard.usage.reported_tokens)
+            } else {
+                None
+            },
+            reported_requests: guard.usage.reported_requests,
+            unknown_usage_requests: guard
+                .usage
+                .unknown_requests
+                .saturating_add(guard.usage.outstanding),
+            inconsistent_usage_requests: guard.usage.inconsistent_requests,
+        };
+        (guard.counters, usage)
     }
 }
 
@@ -265,6 +387,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::authority::DayBudgetRefusal;
 
     fn limits() -> BrokerLimits {
         BrokerLimits {
@@ -316,7 +439,7 @@ mod tests {
                     output_tokens: 0,
                 };
                 if reservations
-                    .try_reserve(&session, request, || Ok(()))
+                    .try_reserve(&session, "provider-a", None, request, || Ok(()))
                     .is_ok()
                 {
                     successes.fetch_add(1, Ordering::AcqRel);
@@ -334,6 +457,63 @@ mod tests {
         assert!(snapshot.forwarded_requests <= u64::from(limits().max_forwarded_requests));
         assert!(snapshot.reserved_tokens <= limits().max_reserved_tokens_turn);
         assert!(snapshot.request_bytes <= limits().max_request_bytes_turn);
+    }
+
+    #[test]
+    fn concurrent_session_reservations_never_oversubscribe_the_run_cap() {
+        // Many independent turns of one session race the session/run cap across a barrier. Its
+        // `fetch_update` is the one atomic charge; a read-then-write charge would let a lost update
+        // admit more requests than the cap allows (fewer charges stored than threads that read a
+        // slot). The turn limits are generous, so the session cap is the binding constraint.
+        //
+        // Several rounds of high contention so a broken counter is reliably caught; each
+        // round starts from a fresh session, and the success count is the discriminating invariant
+        // (`reserved` alone never exceeds the cap even for a read-then-write, because every store
+        // re-checks).
+        let threads = 256u64;
+        let cost = 100u64;
+        let cap = 800u64;
+        for round in 0..64 {
+            let session = Arc::new(SessionReservations::new(cap));
+            let barrier = Arc::new(Barrier::new(threads as usize));
+            let successes = Arc::new(AtomicU64::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..threads {
+                let reservations = Reservations::new(limits());
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                let successes = Arc::clone(&successes);
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let request = ReserveRequest {
+                        request_bytes: cost,
+                        response_bytes: 0,
+                        output_tokens: 0,
+                    };
+                    if reservations
+                        .try_reserve(&session, "provider-a", None, request, || Ok(()))
+                        .is_ok()
+                    {
+                        successes.fetch_add(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("thread");
+            }
+
+            assert_eq!(
+                successes.load(Ordering::Acquire),
+                cap / cost,
+                "round {round}: the shared session/run cap admitted more than it allows"
+            );
+            assert_eq!(
+                session.reserved(),
+                cap,
+                "round {round}: the shared session/run cap is never oversubscribed"
+            );
+        }
     }
 
     #[test]
@@ -380,7 +560,7 @@ mod tests {
             output_tokens: 500,
         };
         assert_eq!(
-            reservations.try_reserve(&session, big, || Ok(())),
+            reservations.try_reserve(&session, "provider-a", None, big, || Ok(())),
             Err(BrokerError::TurnBudgetExhausted("max_reserved_tokens_turn"))
         );
         assert_eq!(reservations.snapshot().forwarded_requests, 0);
@@ -427,6 +607,8 @@ mod tests {
             thread::spawn(move || {
                 reservations.try_reserve(
                     &session,
+                    "provider-a",
+                    None,
                     ReserveRequest {
                         request_bytes: 10,
                         response_bytes: 0,
@@ -458,7 +640,7 @@ mod tests {
             admitting.join().expect("admission thread").is_ok(),
             "the admission commits"
         );
-        let snapshot = finalizing.join().expect("finalization thread");
+        let (snapshot, _usage) = finalizing.join().expect("finalization thread");
         assert_eq!(
             snapshot.forwarded_requests, 1,
             "the committed reservation is in the finalized ledger"
@@ -469,6 +651,8 @@ mod tests {
             reservations
                 .try_reserve(
                     &session,
+                    "provider-a",
+                    None,
                     ReserveRequest {
                         request_bytes: 10,
                         response_bytes: 0,
@@ -521,7 +705,7 @@ mod tests {
             .join()
             .expect("acquisition thread")
             .expect("the permit commits");
-        let snapshot = finalizing.join().expect("finalization thread");
+        let (snapshot, _usage) = finalizing.join().expect("finalization thread");
         assert_eq!(
             snapshot.concurrent_requests, 1,
             "the committed permit is in the finalized ledger"
@@ -535,6 +719,318 @@ mod tests {
         assert_eq!(reservations.snapshot().concurrent_requests, 1);
         drop(permit);
         assert_eq!(reservations.snapshot().concurrent_requests, 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeAuthority {
+        charged: AtomicU64,
+    }
+
+    impl CumulativeBudgetAuthority for FakeAuthority {
+        fn try_charge(
+            &self,
+            _provider_id: &str,
+            tokens: u64,
+            cap: u64,
+        ) -> Result<(), DayBudgetRefusal> {
+            self.charged
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(tokens).filter(|next| *next <= cap)
+                })
+                .map(|_| ())
+                .map_err(|_| DayBudgetRefusal::Exhausted)
+        }
+
+        fn charged_today(&self, _provider_id: &str) -> u64 {
+            self.charged.load(Ordering::Acquire)
+        }
+    }
+
+    fn observation(input: u64, output: u64) -> UsageObservation {
+        UsageObservation {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            total_tokens: Some(input.saturating_add(output)),
+            complete: true,
+            ..UsageObservation::default()
+        }
+    }
+
+    #[test]
+    fn a_durable_day_charge_refuses_and_reserves_nothing_past_the_cap() {
+        let reservations = Reservations::new(BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(100),
+            ..limits()
+        });
+        let session = SessionReservations::new(10_000);
+        let authority: Arc<dyn CumulativeBudgetAuthority> = Arc::new(FakeAuthority::default());
+        let request = ReserveRequest {
+            request_bytes: 40,
+            response_bytes: 0,
+            output_tokens: 20,
+        };
+        assert_eq!(
+            reservations.try_reserve(&session, "provider-a", Some(&authority), request, || Ok(())),
+            Ok(())
+        );
+        assert_eq!(
+            reservations.try_reserve(&session, "provider-a", Some(&authority), request, || Ok(())),
+            Err(BrokerError::DayBudgetExhausted)
+        );
+        assert_eq!(authority.charged_today("provider-a"), 60);
+        assert_eq!(reservations.snapshot().forwarded_requests, 1);
+    }
+
+    #[test]
+    fn a_day_charge_refusal_backs_out_the_session_reservation() {
+        // The day cap is smaller than one request's cost, so the session charge succeeds first and
+        // must then be released rather than leaking.
+        let reservations = Reservations::new(BrokerLimits {
+            max_reserved_token_units_per_utc_day: Some(50),
+            ..limits()
+        });
+        let session = SessionReservations::new(10_000);
+        let authority: Arc<dyn CumulativeBudgetAuthority> = Arc::new(FakeAuthority::default());
+        let request = ReserveRequest {
+            request_bytes: 40,
+            response_bytes: 0,
+            output_tokens: 20,
+        };
+        assert_eq!(
+            reservations.try_reserve(&session, "provider-a", Some(&authority), request, || Ok(())),
+            Err(BrokerError::DayBudgetExhausted)
+        );
+        assert_eq!(
+            session.reserved(),
+            0,
+            "a refused admission reserves nothing"
+        );
+        assert_eq!(reservations.snapshot().forwarded_requests, 0);
+        assert_eq!(authority.charged_today("provider-a"), 0);
+    }
+
+    #[test]
+    fn concurrent_runs_cannot_oversubscribe_a_shared_day_authority() {
+        // Many independent runs (each its own turn) share one durable authority; a barrier race must
+        // never charge past the cap. If admission were a read-then-write (or only charged once at
+        // arm time) this would oversubscribe.
+        let authority: Arc<dyn CumulativeBudgetAuthority> = Arc::new(FakeAuthority::default());
+        let threads = 40u64;
+        let cost = 100u64;
+        let cap = 1_000u64;
+        let barrier = Arc::new(Barrier::new(threads as usize));
+        let successes = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let authority = Arc::clone(&authority);
+            let barrier = Arc::clone(&barrier);
+            let successes = Arc::clone(&successes);
+            let reservations = Reservations::new(BrokerLimits {
+                max_reserved_token_units_per_utc_day: Some(cap),
+                ..limits()
+            });
+            let session = SessionReservations::new(10_000_000);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let request = ReserveRequest {
+                    request_bytes: cost,
+                    response_bytes: 0,
+                    output_tokens: 0,
+                };
+                if reservations
+                    .try_reserve(&session, "provider-a", Some(&authority), request, || Ok(()))
+                    .is_ok()
+                {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(successes.load(Ordering::Acquire), cap / cost);
+        assert_eq!(authority.charged_today("provider-a"), cap);
+    }
+
+    #[test]
+    fn a_forwarded_response_settles_its_bytes_down_but_a_failed_one_keeps_the_full_reservation() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        let request = ReserveRequest {
+            request_bytes: 10,
+            response_bytes: 100_000,
+            output_tokens: 0,
+        };
+        reservations
+            .try_reserve(&session, "provider-a", None, request, || Ok(()))
+            .expect("admission");
+        assert_eq!(reservations.snapshot().response_bytes, 100_000);
+        // A successful forward of 300 bytes settles the reservation down to the actual bytes.
+        reservations.settle_response_bytes(100_000, 300);
+        assert_eq!(reservations.snapshot().response_bytes, 300);
+
+        // A second request that never forwards keeps its full reservation (no settle call).
+        reservations
+            .try_reserve(&session, "provider-a", None, request, || Ok(()))
+            .expect("second admission");
+        assert_eq!(reservations.snapshot().response_bytes, 100_300);
+    }
+
+    #[test]
+    fn settlement_records_a_provider_report_once_and_keeps_the_reservation() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        reservations
+            .try_reserve(
+                &session,
+                "provider-a",
+                None,
+                ReserveRequest {
+                    request_bytes: 400,
+                    response_bytes: 0,
+                    output_tokens: 100,
+                },
+                || Ok(()),
+            )
+            .expect("admission");
+        reservations.settle_usage(&observation(30, 10));
+        let (counters, usage) = reservations.close_and_snapshot();
+        assert_eq!(usage.provider_reported_tokens, Some(40));
+        assert_eq!(usage.unknown_usage_requests, 0);
+        assert_eq!(
+            counters.reserved_tokens, 500,
+            "the full admission reservation is retained; a report never releases it"
+        );
+    }
+
+    #[test]
+    fn an_under_report_cannot_buy_another_request() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        let request = ReserveRequest {
+            request_bytes: 400,
+            response_bytes: 0,
+            output_tokens: 100,
+        };
+        reservations
+            .try_reserve(&session, "provider-a", None, request, || Ok(()))
+            .expect("first admission");
+        // The provider claims a tiny total; the reservation must stay consumed.
+        reservations.settle_usage(&observation(1, 1));
+        assert_eq!(reservations.snapshot().reserved_tokens, 500);
+        // A second request still consumes its own advertised cost on top.
+        reservations
+            .try_reserve(&session, "provider-a", None, request, || Ok(()))
+            .expect("second admission");
+        assert_eq!(reservations.snapshot().reserved_tokens, 1_000);
+    }
+
+    #[test]
+    fn finalization_counts_an_unsettled_request_unknown() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        reservations
+            .try_reserve(
+                &session,
+                "provider-a",
+                None,
+                ReserveRequest {
+                    request_bytes: 10,
+                    response_bytes: 0,
+                    output_tokens: 0,
+                },
+                || Ok(()),
+            )
+            .expect("admission");
+        let (_counters, usage) = reservations.close_and_snapshot();
+        assert_eq!(usage.provider_reported_tokens, None);
+        assert_eq!(usage.unknown_usage_requests, 1);
+    }
+
+    #[test]
+    fn a_malformed_report_is_counted_unknown() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        reservations
+            .try_reserve(
+                &session,
+                "provider-a",
+                None,
+                ReserveRequest {
+                    request_bytes: 10,
+                    response_bytes: 0,
+                    output_tokens: 0,
+                },
+                || Ok(()),
+            )
+            .expect("admission");
+        reservations.settle_usage(&UsageObservation {
+            malformed_events: 1,
+            ..UsageObservation::default()
+        });
+        let (_counters, usage) = reservations.close_and_snapshot();
+        assert_eq!(usage.provider_reported_tokens, None);
+        assert_eq!(usage.unknown_usage_requests, 1);
+    }
+
+    #[test]
+    fn a_disagreeing_report_uses_the_larger_total_and_records_the_diagnostic() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        reservations
+            .try_reserve(
+                &session,
+                "provider-a",
+                None,
+                ReserveRequest {
+                    request_bytes: 10,
+                    response_bytes: 0,
+                    output_tokens: 0,
+                },
+                || Ok(()),
+            )
+            .expect("admission");
+        reservations.settle_usage(&UsageObservation {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            total_tokens: Some(99),
+            complete: true,
+            inconsistent: true,
+            ..UsageObservation::default()
+        });
+        let (_counters, usage) = reservations.close_and_snapshot();
+        assert_eq!(
+            usage.provider_reported_tokens,
+            Some(99),
+            "settlement uses the larger of the total and the summed components"
+        );
+        assert_eq!(usage.inconsistent_usage_requests, 1);
+    }
+
+    #[test]
+    fn a_settlement_after_close_is_ignored() {
+        let reservations = Reservations::new(limits());
+        let session = SessionReservations::new(50_000_000);
+        reservations
+            .try_reserve(
+                &session,
+                "provider-a",
+                None,
+                ReserveRequest {
+                    request_bytes: 10,
+                    response_bytes: 0,
+                    output_tokens: 0,
+                },
+                || Ok(()),
+            )
+            .expect("admission");
+        let (_counters, first) = reservations.close_and_snapshot();
+        assert_eq!(first.unknown_usage_requests, 1);
+        // A late report cannot reopen a finalized turn, nor relabel the conservatively charged
+        // unknown request as provider-reported.
+        reservations.settle_usage(&observation(10, 10));
+        let (_counters, second) = reservations.close_and_snapshot();
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -575,7 +1071,7 @@ mod tests {
             .join()
             .expect("denial thread")
             .expect("the denial commits");
-        let snapshot = finalizing.join().expect("finalization thread");
+        let (snapshot, _usage) = finalizing.join().expect("finalization thread");
         assert_eq!(
             snapshot.denied_requests, 1,
             "the committed denial is in the finalized ledger"
