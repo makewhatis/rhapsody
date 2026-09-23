@@ -901,17 +901,41 @@ impl Orchestrator {
                 // still owed will never be dispatched; an in-flight round is progressing and an
                 // approved pull request is the merge gate's business, so neither is reported here.
                 //
-                // A manager adjudication suppresses the row rules entirely: an ESCALATE is reported
-                // as the decision it is (with its findings and rounds), a SHIP is reported only
-                // while the merge gate is still stuck on an unapproved row, and a pull request the
-                // manager is still deciding is not a stall at all.
+                // A manager adjudication suppresses the row rules entirely: an ESCALATE or a SHIP is
+                // reported as the decision it is (with its findings and rounds) ONLY while the merge
+                // gate is still stuck on an unapproved row, and a pull request the manager is still
+                // deciding is not a stall at all.
+                //
+                // STUDIO-1021: the convergence guard is the same for BOTH decisions. A decision
+                // stopped the loop over open findings; once every live row has APPROVED the change
+                // the branch now carries, the loop has converged and the merge gate — not the
+                // manager — owns the next move. Without this an `escalate` stayed reported forever
+                // after its resumed round approved (auto-merge off, the default), which is the
+                // page-a-human-for-nothing this ticket exists to remove, one step later. It also
+                // un-hid the `ApprovedStillOpen` report that should replace it (auto-merge on).
+                //
+                // Gated on adjudication being ON. The ticket's byte-identical acceptance covers an
+                // install that never set `review.adjudicate_after_rounds` — whose ledger is empty, so
+                // the `Escalate`/`Ship` arms cannot match either way — but a durable decision left
+                // behind by a key that was set and later UNSET must still render as it did before
+                // this ticket, so the suppression does not apply there.
+                //
+                // MUTATION: make the `Escalate` arm unconditional (drop `any_unapproved ||
+                // !adjudicating`) and `a_converged_escalation_is_not_reported_as_escalated` reds
+                // (`review_escalated` for a pull request every reviewer approved).
+                let adjudicating = self.adjudication_threshold().is_some();
+                let any_unapproved = facts.rows.iter().any(|r| {
+                    r.open
+                        && r.status != REVIEW_STATUS_DROPPED
+                        && r.status != REVIEW_STATUS_APPROVED
+                });
                 let mut d = match self.adjudication(pr) {
                     Some(crate::reviewadjudicate::Adjudication::Escalate {
                         head,
                         rounds,
                         findings,
                         reason,
-                    }) => Some(Divergence {
+                    }) if any_unapproved || !adjudicating => Some(Divergence {
                         pr: pr.to_string(),
                         kind: DivergenceKind::ReviewEscalated,
                         ticket: facts
@@ -940,6 +964,12 @@ impl Orchestrator {
                         findings,
                         reason,
                     }),
+                    // An escalation whose rows are now ALL approved is not this rule's either: the
+                    // loop converged past it (STUDIO-1021), so it is the merge gate's business
+                    // exactly as a fully-approved `ship` is.
+                    Some(crate::reviewadjudicate::Adjudication::Escalate { .. }) => {
+                        reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
+                    }
                     // A `ship` adjudicates the OPEN FINDINGS, never the gates — so if a live row
                     // still records findings rather than an approval at the head, the merge gate
                     // will never clear on its own and the pull request would otherwise be silent
@@ -947,11 +977,7 @@ impl Orchestrator {
                     // are ALL approved falls through below, where auto-merge either merges it or
                     // `ApprovedStillOpen` reports the gate holding it after the staleness threshold.
                     Some(crate::reviewadjudicate::Adjudication::Ship { head, rounds })
-                        if facts.rows.iter().any(|r| {
-                            r.open
-                                && r.status != REVIEW_STATUS_DROPPED
-                                && r.status != REVIEW_STATUS_APPROVED
-                        }) =>
+                        if any_unapproved =>
                     {
                         Some(Divergence {
                             pr: pr.to_string(),
@@ -3564,6 +3590,78 @@ mod store_tests {
             rendered["review_divergence"][0]["superseded"], true,
             "the minimal move must reach the wire, not only the struct"
         );
+    }
+
+    /// **STUDIO-1021 (alice's round-2 P2): a converged escalation is not reported as `escalate`.**
+    /// The manager escalated at `HEAD`; the author pushed a content-changing `HEAD_PUSHED`; the
+    /// resumed round the push bought then APPROVED it. The escalation no longer governs and the loop
+    /// has converged, so the operator must not keep seeing "a human is needed" over a pull request
+    /// every reviewer approved. With `auto_merge` OFF (the default) nothing merges the pull request
+    /// out from under the stale row, so before this fix the escalation was reported forever — the
+    /// page-a-human-for-nothing this ticket exists to remove, one step later.
+    ///
+    /// The `Escalate` arm now carries the same "some live row is unapproved" guard `Ship` has, so a
+    /// converged escalation falls to the merge gate's rules. This is a supersession that is NOT
+    /// reported, unlike `a_superseded_escalation_is_reported_with_both_heads` — there the row is
+    /// still `reviewed` (findings unaddressed), so the escalation is genuinely still open.
+    ///
+    /// MUTATION: drop the `any_unapproved` guard from the `Escalate` arm and this reds —
+    /// `review_escalated` is reported for a pull request every reviewer approved.
+    #[test]
+    fn a_converged_escalation_is_not_reported_as_escalated() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        approved_row(o, "alice", "STUDIO-1021");
+        escalated_at(o, HEAD);
+        // The author pushed past the escalated head and the resumed round approved it.
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD_PUSHED.to_string(),
+        );
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "an escalation whose loop converged past it must not be reported: {:?}",
+            o.review_divergences()
+        );
+    }
+
+    /// **STUDIO-1021's byte-identical claim, on the reconcile half.** With no
+    /// `review.adjudicate_after_rounds` the sweep renders a durable escalation exactly as it did
+    /// before this ticket, even when every row has approved the current head: the
+    /// converged-escalation suppression is gated on adjudication being ON. A decision can only be in
+    /// the ledger because the key was set once, but an operator who has since UNSET it must not see
+    /// the report change. **This assertion holds on the pre-STUDIO-1021 code too** — the `Escalate`
+    /// arm was unconditional then — which is what makes it the unset-path control.
+    #[test]
+    fn an_unset_threshold_still_reports_a_converged_escalation() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        assert!(
+            o.adjudication_threshold_for_test().is_none(),
+            "sanity: this fixture never set the adjudication key"
+        );
+        approved_row(o, "alice", "STUDIO-1021");
+        escalated_at(o, HEAD);
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD_PUSHED.to_string(),
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "an install with no threshold must keep the report it had before this ticket: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ReviewEscalated);
     }
 
     /// A supersession APPEARING is its own log transition: the sweep that learns the head moved

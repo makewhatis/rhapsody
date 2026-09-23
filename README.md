@@ -1370,8 +1370,13 @@ with findings buys a FRESH decision at the new head. An `escalate` is head-scope
 `ship`; it used to govern however far the head moved, which paged a human for every fix pushed after
 one. Symmetrically, a head no live reviewer has completed a review of is never handed to the
 manager: a threshold crossed by such a head arms the one round instead, and the manager is asked only
-once that round returns findings. At `REVIEW_ROUNDS_PER_PR_CAP` no round can arm, so the unread head
-is the manager's there. A `rhapsody:human` hold still stops all of it.
+once that round returns findings. That one round is spent the moment it is DISPATCHED at the head, so
+a round that ends `truncated` — or crashes with no live run — does not re-arm sweep after sweep up to
+the hard cap; the unfinished head is the manager's. At `REVIEW_ROUNDS_PER_PR_CAP` no round can arm, so
+the unread head is the manager's there. A decision whose loop converges past it — its resumed round
+approves the change the branch now carries — stops being reported, exactly as a fully-approved `ship`
+is left to the merge gate rather than the `review_escalated`/`review_shipped` report. A
+`rhapsody:human` hold still stops all of it.
 
 **Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
 assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot

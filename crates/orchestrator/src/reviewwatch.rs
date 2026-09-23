@@ -140,8 +140,8 @@ use async_trait::async_trait;
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
 use rhapsody_store::{
-    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED,
-    ReviewWatchKey, ReviewWatchRow,
+    REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED,
+    REVIEW_STATUS_TRUNCATED, ReviewWatchKey, ReviewWatchRow,
 };
 
 use crate::control_loop::{CancelWait, Event};
@@ -1557,7 +1557,12 @@ impl Orchestrator {
     }
 
     /// The configured adjudication threshold, or `None` when adjudication is off (STUDIO-956).
-    fn adjudication_threshold(&self) -> Option<usize> {
+    ///
+    /// `pub(crate)` for [`crate::reviewreconcile`], which uses "adjudication is on" to keep its own
+    /// converged-escalation suppression out of the unset path (STUDIO-1021's byte-identical
+    /// acceptance): a durable decision left behind by an install that has since UNSET the key is
+    /// rendered exactly as it was before this ticket.
+    pub(crate) fn adjudication_threshold(&self) -> Option<usize> {
         self.teams
             .as_ref()
             .and_then(|t| t.review_adjudicate_after_rounds())
@@ -1803,6 +1808,18 @@ impl Orchestrator {
     /// human hold, a drain — still owes its round, and some later sweep can arm it. An unassignable
     /// row is the one such deferral that can persist; it is reported as `stalled` by
     /// [`Self::note_unassignable`] rather than silently, and the round genuinely has not happened.
+    ///
+    /// **The round is spent the moment it is DISPATCHED at `head`.** `requested_sha` is written at
+    /// dispatch ([`Orchestrator::dispatch_review`]), so a row that has already been dispatched here
+    /// has had the one round this head buys. That matters for the two non-terminal ends: a round
+    /// that parks `truncated` (the `max_turns` backstop, or a STUDIO-967 ceiling stop) and a round
+    /// that CRASHES (`in_flight` with no live run) both keep `requested_sha == head`, so
+    /// [`review_round_due`] reports them owed again and, without this, the resumed arm would re-arm
+    /// them on every sweep until [`REVIEW_ROUNDS_PER_PR_CAP`] — spending the whole gap between the
+    /// configured threshold and the hard cap on the most expensive kind of round. The unfinished head
+    /// is the MANAGER's instead, and [`Self::open_findings`] names the review that never finished.
+    /// A row still owed its FIRST round here carries an older `requested_sha` (or none), so it is
+    /// unaffected; a live run is excluded above by [`review_round_due`]'s in-flight arm.
     fn resumed_round_owed(
         &self,
         pr: &PrCoord,
@@ -1817,6 +1834,16 @@ impl Orchestrator {
             // A verdict the head-advance CARRIED across a patch-id-preserving move is a completed
             // review of this same change; it does not owe another round.
             if carried.contains(&r.key) {
+                return false;
+            }
+            // STUDIO-1021: the one round was already DISPATCHED at this head. `requested_sha` is
+            // written at dispatch, and only a non-terminal end (`truncated`, or a crashed
+            // `in_flight` with no live run) leaves it naming this very head while
+            // `review_round_due` calls the row due again — the unbounded re-arm alice's round-2
+            // review found. The head goes to the manager.
+            if r.requested_sha.trim() == head
+                && (r.status == REVIEW_STATUS_TRUNCATED || r.status == REVIEW_STATUS_IN_FLIGHT)
+            {
                 return false;
             }
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
@@ -9184,8 +9211,14 @@ mod tests {
         assert!(dispatched.lock().expect("lock").is_empty());
     }
 
-    /// A TRUNCATED round at the cap is a review that never happened and cannot be re-armed; the plan
-    /// must say that rather than hand the manager "none recorded" over a round nobody completed.
+    /// A TRUNCATED round at the threshold is a review that never happened; the plan must say that
+    /// rather than hand the manager "none recorded" over a round nobody completed.
+    ///
+    /// **STUDIO-1021:** the round here was already DISPATCHED at `HEAD_A` (`requested_sha`), so the
+    /// one round this head buys is spent. The threshold hands the head to the MANAGER rather than
+    /// re-arming it — the unbounded re-arm alice's round-2 review found, which spent the whole gap
+    /// between the threshold and the hard cap on the most expensive kind of round. The same fixture
+    /// at `REVIEW_ROUNDS_PER_PR_CAP` is the cap's own case and is unchanged.
     #[test]
     fn a_truncated_round_at_the_threshold_names_the_review_that_never_finished() {
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
@@ -9197,10 +9230,8 @@ mod tests {
         o.store()
             .mark_review_completed(&key(12, "bob"), HEAD_A, REVIEW_STATUS_TRUNCATED)
             .expect("completed");
-        o.review_rounds.insert(
-            churn_key(&coord(12)),
-            REVIEW_ROUNDS_PER_PR_CAP * o.reviewers_per_round(),
-        );
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         let plan = &report.adjudicate[0];
@@ -9213,6 +9244,58 @@ mod tests {
             plan.findings[0].contains(&HEAD_A[..7]),
             "the unfinished review names the head it was attempted at: {:?}",
             plan.findings
+        );
+    }
+
+    /// **STUDIO-1021 (alice's round-2 P2): a truncated resumed round does not re-arm at the same
+    /// head.** The unread head arms its one round; the round is DISPATCHED (so `requested_sha`
+    /// names this head) and then ends without a verdict. The one round is spent — the next sweep
+    /// hands the unfinished head to the manager instead of re-arming. Without the `requested_sha`
+    /// exclusion in `resumed_round_owed`, `review_round_due` calls the `truncated` row owed again
+    /// every sweep, so a review that keeps hitting the token ceiling spends every round between
+    /// `review.adjudicate_after_rounds` and `REVIEW_ROUNDS_PER_PR_CAP` before the manager is asked.
+    ///
+    /// MUTATION (the ticket's): drop the `requested_sha == head` exclusion and the second sweep
+    /// re-arms (`dispatched == 1`, `adjudicate` empty) instead of adjudicating.
+    #[test]
+    fn a_truncated_resumed_round_does_not_re_arm_at_the_same_head() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        // The unread head arms exactly one round, which records `requested_sha == HEAD_B`.
+        let first = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(first.dispatched, 1, "the unread head buys one round");
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+
+        // The round ends without declaring a verdict — the run is gone (as a real exit leaves it)
+        // and the row is parked `truncated` at the head it was dispatched against.
+        let id = review_key(OWNER, REPO, 12, "bob");
+        o.running.remove(&id);
+        o.claimed.remove(&id);
+        o.store()
+            .mark_review_completed(&key(12, "bob"), HEAD_B, REVIEW_STATUS_TRUNCATED)
+            .expect("completed");
+
+        // The one round is spent: the manager decides, no second round arms.
+        let next = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            next.dispatched, 0,
+            "the dispatched round is not re-armed at the same head"
+        );
+        assert_eq!(
+            next.adjudicate.len(),
+            1,
+            "the unfinished head goes to the manager: {:?}",
+            next.adjudicate
+        );
+        assert_eq!(next.adjudicate[0].head, HEAD_B);
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "exactly one dispatch across both sweeps"
         );
     }
 
