@@ -16,6 +16,16 @@ on:
 # boot-e2e timeouts); moving the PR traffic that can run on Linux keeps the Macs for the desktop
 # gate and the push-to-main daemon runs.
 # rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
+
+# Per-branch cancellation (STUDIO-1027). A superseded push to the same branch would otherwise queue
+# a second full run behind the self-hosted runners — at 02:00Z on 2026-09-23 eleven runs were queued
+# and jobs failed with "The job was not acquired by Runner of type self-hosted even after multiple
+# attempts". Keyed on `github.ref` so it is per-branch, and `cancel-in-progress` is off for `main`:
+# main's run is the one that must complete and it is not a superseded duplicate of anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   lint:
     # Fork-PR guard (TRA-264): every job runs only on trusted events — a push, or a same-repo

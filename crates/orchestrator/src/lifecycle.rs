@@ -2688,6 +2688,19 @@ mod tests {
         ) -> Result<Option<rhapsody_store::RunProvenance>, rhapsody_store::StoreError> {
             self.0.run_provenance(a0)
         }
+        fn set_run_usage(
+            &self,
+            a0: i64,
+            a1: &rhapsody_store::RunUsage,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_run_usage(a0, a1)
+        }
+        fn run_usage(
+            &self,
+            a0: i64,
+        ) -> Result<Option<rhapsody_store::RunUsage>, rhapsody_store::StoreError> {
+            self.0.run_usage(a0)
+        }
         fn load_run_provenances(
             &self,
             a0: &[i64],
