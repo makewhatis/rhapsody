@@ -74,6 +74,21 @@ tokio = { version = "1", features = ["macros", "rt", "time", "io-util", "process
 # used to build the `/api/v1/runs/{id}/events`-shaped objects the gate compares, is already a
 # non-test dependency above and needs no dev re-declaration.)
 harness-fixtures = { path = "../harness-fixtures" }
+# rhapsody-config (test-only, STUDIO-984 review): the harness registry's provider-protocol
+# compatibility must AGREE with config's provider-selection policy, and config cannot depend on this
+# crate (layering). This dev-dependency exists solely for the cross-crate pin tests in
+# `src/harness.rs` that assert the two declarations cannot drift. Workspace-internal path dep — no
+# new external crate enters Cargo.lock.
+rhapsody-config = { path = "../config" }
+# rhapsody-provider-broker (test-only, STUDIO-984 review): the canonical credential-binding adapter
+# identity is ONE value across config, agent and broker registration, so
+# `canonical_adapter_identity_agrees_across_config_agent_and_broker` compares all three. Separately,
+# `provider_limits_agree_with_the_config_crate` pins the plan's mirrored limits field-for-field to
+# config's V1 default column — the broker has no matching operator-limits type yet (PB5 lowers the
+# plan into its own policy types), so that pin is agent↔config only. The broker crate cannot depend on
+# this one (its dependency guard), so both pins live here. Workspace-internal path dep — no new
+# external crate enters Cargo.lock.
+rhapsody-provider-broker = { path = "../provider-broker" }
 
 [lints]
 workspace = true

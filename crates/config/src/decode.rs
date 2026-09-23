@@ -19,8 +19,10 @@ use serde_yaml_ng::Value;
 use crate::model::{
     Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT,
     DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Opencode, Otel, Polling, Project,
-    ProviderBudget, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker, Workspace,
+    ProviderBudget, Raw, RawBrokerLimits, RawClaudeOverride, RawProject, RawProviderDefinition,
+    Server, Storage, Tracker, Workspace,
 };
+use crate::providers::{BrokerLimits, CredentialSource, ProviderDefinition};
 use crate::workflow::Definition;
 
 /// Errors from [`decode`]. `Parse` Displays with Go's `workflow_parse_error` sentinel token
@@ -124,6 +126,9 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 
     let agent = Agent {
         backend: or_str(r.agent.backend, "claude"),
+        // STUDIO-984: normalized provider/model selection, mapped verbatim (empty ⇒ legacy path).
+        provider: r.agent.provider,
+        model: r.agent.model,
         max_concurrent_agents: or_int(r.agent.max_concurrent_agents, 10),
         // STUDIO-950: no default — absent means "share `max_concurrent_agents`", the pre-key
         // behaviour. A default of 0 would be ambiguous with an explicit 0, so the raw `Option`
@@ -233,6 +238,8 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
 
     // multi-project routing — overrides mapped verbatim (nil preserved) so ResolveProjects can
     // tell inherit from set; a workflow without `projects:` decodes to repo == "" and no projects.
+    // Providers are consumed only by OpenCode in v1, so their capability-lifetime bound is applied at
+    // read/validate time (OpenCode's effective turn deadline) rather than baked in here.
     let projects = r.projects.into_iter().map(decode_project).collect();
 
     // Per-provider daily token budgets (STUDIO-957). Rhapsody-only, and deliberately absent from
@@ -248,6 +255,19 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
                     daily_tokens: b.daily_tokens.unwrap_or(0),
                 },
             )
+        })
+        .collect();
+
+    // Global provider definitions (STUDIO-984). Rhapsody-only and purely additive: an absent
+    // `providers:` block decodes to an empty map, so a config that never writes one is byte-identical
+    // to a daemon built before this existed. The map key is the provider id and is copied onto the
+    // definition; canonical-syntax and ceiling checks run in `validate`.
+    let providers = r
+        .providers
+        .into_iter()
+        .map(|(id, rp)| {
+            let def = decode_provider(rp);
+            (id.clone(), ProviderDefinition { id, ..def })
         })
         .collect();
 
@@ -280,6 +300,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // byte-parity golden is affected.
         pr_label: or_str(r.pr_label, "rhapsody"),
         budgets,
+        providers,
     })
 }
 
@@ -344,6 +365,81 @@ fn decode_project(rp: RawProject) -> Project {
         promote_from_states: rp.promote_from_states,
         // Mapped verbatim (None preserved) so the enabled default is applied at resolve time.
         enabled: rp.enabled,
+        // Per-project provider definitions (STUDIO-984): mapped verbatim (empty ⇒ inherit).
+        providers: rp
+            .providers
+            .into_iter()
+            .map(|(id, rp)| {
+                let def = decode_provider(rp);
+                (id.clone(), ProviderDefinition { id, ..def })
+            })
+            .collect(),
+    }
+}
+
+/// Maps one raw provider definition to its typed form (STUDIO-984). All defaults are materialized
+/// here — `allow_insecure_http` false, the credential source verbatim (validated later), and the V1
+/// broker-limits default column — so the typed definition is complete without a second defaulting
+/// stage. The capability lifetime is the one field carried as an `Option`: `None` means "derive
+/// `min(1h, deadline)` at read time", so an operator's explicit value equal to today's derived default
+/// is not confused with an absent one (jimmy round-6, N1). The `id` is stamped by the caller from the
+/// map key.
+fn decode_provider(rp: RawProviderDefinition) -> ProviderDefinition {
+    ProviderDefinition {
+        id: String::new(),
+        protocol: rp.protocol,
+        display_name: rp.display_name,
+        base_url: rp.base_url,
+        allow_insecure_http: or_bool(rp.allow_insecure_http, false),
+        credential: rp
+            .credential
+            .map(|c| CredentialSource { source: c.source })
+            .unwrap_or_default(),
+        broker_limits: decode_broker_limits(rp.broker_limits),
+    }
+}
+
+/// Materializes the V1 broker-limits default column (`provider-broker-design.md` §8.1) over an
+/// optional raw block. An explicit value — including an explicit `0` — is carried verbatim and
+/// validated later, so a zero is refused rather than silently defaulted away. The capability lifetime
+/// stays `Option`: `None` means the V1 derived default `min(1h, deadline)` is applied when the value is
+/// read or validated, which keeps "explicitly set" distinguishable from "equals today's default".
+fn decode_broker_limits(raw: Option<RawBrokerLimits>) -> BrokerLimits {
+    let d = BrokerLimits::default();
+    let Some(r) = raw else {
+        return d;
+    };
+    BrokerLimits {
+        forwarded_requests_per_turn: r
+            .forwarded_requests_per_turn
+            .unwrap_or(d.forwarded_requests_per_turn),
+        denied_requests_before_revocation: r
+            .denied_requests_before_revocation
+            .unwrap_or(d.denied_requests_before_revocation),
+        concurrent_upstream_requests_per_turn: r
+            .concurrent_upstream_requests_per_turn
+            .unwrap_or(d.concurrent_upstream_requests_per_turn),
+        json_request_bytes: r.json_request_bytes.unwrap_or(d.json_request_bytes),
+        aggregate_request_bytes_per_turn: r
+            .aggregate_request_bytes_per_turn
+            .unwrap_or(d.aggregate_request_bytes_per_turn),
+        response_bytes_per_request: r
+            .response_bytes_per_request
+            .unwrap_or(d.response_bytes_per_request),
+        aggregate_response_bytes_per_turn: r
+            .aggregate_response_bytes_per_turn
+            .unwrap_or(d.aggregate_response_bytes_per_turn),
+        requested_output_tokens_per_request: r
+            .requested_output_tokens_per_request
+            .unwrap_or(d.requested_output_tokens_per_request),
+        reserved_token_units_per_turn: r
+            .reserved_token_units_per_turn
+            .unwrap_or(d.reserved_token_units_per_turn),
+        reserved_token_units_per_session: r
+            .reserved_token_units_per_session
+            .unwrap_or(d.reserved_token_units_per_session),
+        capability_lifetime_ms: r.capability_lifetime_ms,
+        max_reserved_token_units_per_utc_day: r.max_reserved_token_units_per_utc_day,
     }
 }
 
@@ -597,6 +693,58 @@ mod tests {
             prompt_template: prompt.to_string(),
         };
         decode(&def).expect("decode should succeed")
+    }
+
+    /// Like [`decode_yaml`] but returns the error, for the provider-shape refusals.
+    fn try_decode_yaml(front: &str, prompt: &str) -> Result<Config, crate::decode::ConfigError> {
+        let config: YamlMap = if front.trim().is_empty() {
+            YamlMap::new()
+        } else {
+            serde_yaml_ng::from_str(front).expect("test front matter must parse")
+        };
+        decode(&Definition {
+            config,
+            prompt_template: prompt.to_string(),
+        })
+    }
+
+    // MUTATION GUARD (STUDIO-984 review, sol): `credential.value` must be unrepresentable, not merely
+    // unvalidated. `.` is a permissive flaw: without `deny_unknown_fields` a provider carrying
+    // `credential: {source: keychain, value: sk-…}` decodes, and `effective_json::render` echoes the
+    // raw front matter, publishing the secret in `GET /api/v1/config`. The same holds for an unknown
+    // key on the provider block or the broker-limits block. All three must REFUSE at decode.
+    #[test]
+    fn provider_blocks_reject_unknown_secret_bearing_fields() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: tok\n",
+            "agent:\n  backend: opencode\n  provider: fireworks\n  model: m\n",
+        );
+        let with_credential_value = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n      value: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_credential_value, "body").is_err(),
+            "a credential value must be refused, not silently ignored"
+        );
+        let with_provider_key = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    api_key: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_provider_key, "body").is_err(),
+            "an unknown secret-bearing provider key must be refused"
+        );
+        let with_limit_key = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    broker_limits:\n      api_key: sk-review-probe\n"
+        );
+        assert!(
+            try_decode_yaml(&with_limit_key, "body").is_err(),
+            "an unknown secret-bearing broker-limits key must be refused"
+        );
+        // The supported shape still decodes, so the refusal is not over-broad.
+        let good = format!(
+            "{front}providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n"
+        );
+        assert!(try_decode_yaml(&good, "body").is_ok());
     }
 
     // ---- config_test.go mirrors ----
