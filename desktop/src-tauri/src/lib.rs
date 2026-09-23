@@ -27,6 +27,7 @@ pub mod logbridge;
 pub mod menu;
 pub mod onboarding;
 pub mod prefs;
+pub mod provider_commands;
 pub mod provider_credential;
 pub mod supervisor;
 #[cfg(test)]

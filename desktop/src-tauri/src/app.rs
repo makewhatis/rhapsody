@@ -345,6 +345,13 @@ impl App {
             .is_some_and(path_is_file)
     }
 
+    /// The WORKFLOW.md this app supervises, or `None` when `$HOME` is unset. STUDIO-991's provider
+    /// command service derives the canonical provider bindings from this same file, so the endpoint
+    /// a credential is stored under is the one the daemon reads it under.
+    pub fn workflow_path(&self) -> Option<PathBuf> {
+        self.inner.workflow_path.clone()
+    }
+
     // ---- quit / close lifecycle -------------------------------------------------------------
 
     /// Marks shutdown underway and, on the FIRST call, allocates the [`StopSignal`] the single stop

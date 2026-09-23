@@ -247,6 +247,25 @@ schedules the same bounded off-loop refresh against the new canonical binding (c
 moved endpoint to `binding_mismatch` without waiting for a dispatch). A reload that fails keeps the
 last-good config and therefore invalidates nothing.
 
+### Desktop provider credential commands (STUDIO-991)
+
+The desktop app owns provider Keychain mutations through a set of Rhapsody-only Tauri commands
+(`provider_statuses`, `provider_status`, `provider_prepare`, `provider_connect`, `provider_replace`,
+`provider_rebind`, `provider_remove`, `provider_test_connection`). The webview originates one
+credential string per Connect/Replace; Rust derives the canonical binding from the same validated
+`WORKFLOW.md` pipeline the daemon runs, mints a short-lived one-use confirmation nonce bound to the
+provider/config-generation/owner-snapshot, and returns only status/result DTOs — never the value, the
+stored binding, or the opaque owner revision. The commands are gated to the bundled `main` window's
+`rhapsody://localhost` origin, and the app's CSP was tightened from `null` to a restrictive policy
+(no remote script/content, no eval) for the credential surface. With no `providers:` block the whole
+surface is empty, so legacy Claude and native-login OpenCode behavior is unchanged.
+
+A committed mutation reports `synchronized` only once the running daemon has been served a revision
+at least as new as the mutation, `stored_offline` with no daemon, and `stored_unsynchronized` when a
+running daemon has not yet observed it — never a generic failure that invites a blind replay. (Live
+daemon observation over the P0c authenticated channel is wired by the prepared-dispatch slice; until
+then a running daemon honestly reports `stored_unsynchronized`.)
+
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 
 Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies

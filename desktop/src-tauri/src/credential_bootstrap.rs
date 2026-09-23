@@ -16,12 +16,14 @@
 //! for a ticket whose job is to prove and specify the mechanism (P0c), not to finish wiring it into
 //! every call site (P1's "production boundary").
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use rhapsody_credential_ipc::domain::CredentialRef;
+use rhapsody_credential_ipc::domain::{CredentialRef, Revision};
+use rhapsody_credential_ipc::owner::CredentialOwner;
 use rhapsody_credential_ipc::session::{ServerSession, Token};
 use rhapsody_credential_ipc::wire::{
     BootstrapMessage, ClientFrame, HelloFrame, ServerFrame, read_frame, write_frame,
@@ -30,6 +32,68 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider_credential::ProviderCredentialOwner;
+
+/// A shared, non-secret record of the newest owner revision each credential account has actually
+/// been served over the authenticated channel (STUDIO-991). It is how the desktop learns that a
+/// committed Connect/Replace/Rebind/Remove is *daemon-observable*: an entry appears the moment a
+/// `ReadBoundResult` carrying that revision (or a newer one) is written to an authenticated daemon
+/// connection. It carries only the opaque [`Revision`] — never a secret, a binding, or a lease.
+#[derive(Default)]
+pub struct ChannelObservations {
+    inner: Mutex<HashMap<String, Revision>>,
+}
+
+impl ChannelObservations {
+    pub fn new() -> ChannelObservations {
+        ChannelObservations::default()
+    }
+
+    /// Record that `account` has been served at `revision`. Monotone: an older revision never lowers
+    /// the recorded one (two connections may race, and the daemon's view must not regress).
+    pub fn record(&self, account: &str, revision: Revision) {
+        let mut inner = lock_observations(&self.inner);
+        let entry = inner.entry(account.to_string()).or_insert(revision);
+        if revision > *entry {
+            *entry = revision;
+        }
+    }
+
+    /// The newest revision the daemon has observed for `account`, or `None` if it has observed none.
+    pub fn observed(&self, account: &str) -> Option<Revision> {
+        lock_observations(&self.inner).get(account).copied()
+    }
+}
+
+/// Recovers a poisoned lock rather than propagating the panic, mirroring the crate's other locks —
+/// the guarded section is a plain map read/write with no I/O held across an `.await`.
+fn lock_observations(
+    m: &Mutex<HashMap<String, Revision>>,
+) -> MutexGuard<'_, HashMap<String, Revision>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The lookup the listener serves `read_bound` requests against: account (`v1:<id>`) → that
+/// credential's owner. STUDIO-991 needs more than one provider to be reachable over one channel, so
+/// the listener routes by account instead of being hard-wired to a single owner; the single-owner
+/// wrapper below preserves the STUDIO-981/P0c construction for its own tests.
+pub trait CredentialOwnerLookup: Send + Sync {
+    fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>>;
+}
+
+/// The single-owner adapter used by [`BootstrapListener::accept_and_serve`].
+struct SingleOwnerLookup {
+    owner: Arc<ProviderCredentialOwner>,
+}
+
+impl CredentialOwnerLookup for SingleOwnerLookup {
+    fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+        if account == self.owner.account() {
+            Some(self.owner.clone())
+        } else {
+            None
+        }
+    }
+}
 
 /// How long a freshly accepted connection's own task waits for its `Hello` frame before giving up
 /// on that connection specifically. Since B3 (jimmy's review of rhapsody#213), each connection's
@@ -114,6 +178,19 @@ impl BootstrapListener {
         self,
         owner: Arc<ProviderCredentialOwner>,
     ) -> (impl Future<Output = ()> + Send + 'static, ListenerShutdown) {
+        let lookup: Arc<dyn CredentialOwnerLookup> = Arc::new(SingleOwnerLookup { owner });
+        self.accept_and_serve_registry(lookup, Arc::new(ChannelObservations::new()))
+    }
+
+    /// The multi-provider form (STUDIO-991): serve a lookup that routes each `read_bound` account to
+    /// its own owner, recording every answered read's revision into `observations` so the desktop can
+    /// tell whether a committed mutation has become daemon-observable. The single-owner
+    /// [`Self::accept_and_serve`] delegates here.
+    pub fn accept_and_serve_registry(
+        self,
+        lookup: Arc<dyn CredentialOwnerLookup>,
+        observations: Arc<ChannelObservations>,
+    ) -> (impl Future<Output = ()> + Send + 'static, ListenerShutdown) {
         let cancel = CancellationToken::new();
         let shutdown = ListenerShutdown {
             cancel: cancel.clone(),
@@ -143,12 +220,13 @@ impl BootstrapListener {
                             // Keychain read this file's whole later history is about).
                             Err(_) => break,
                         };
-                        let owner = owner.clone();
+                        let lookup = lookup.clone();
+                        let observations = observations.clone();
                         let token = self.token.clone();
                         let serving_slot = serving_slot.clone();
                         let cancel = cancel.clone();
                         connections.tasks.spawn(async move {
-                            serve_one(stream, token, owner, serving_slot, cancel).await;
+                            serve_one(stream, token, lookup, serving_slot, cancel, observations).await;
                         });
                     }
                     // Reap finished connections so `connections` doesn't grow without bound; the
@@ -231,9 +309,10 @@ impl ListenerShutdown {
 async fn serve_one(
     mut stream: UnixStream,
     token: String,
-    owner: Arc<ProviderCredentialOwner>,
+    lookup: Arc<dyn CredentialOwnerLookup>,
     serving_slot: Arc<tokio::sync::Semaphore>,
     cancel: CancellationToken,
+    observations: Arc<ChannelObservations>,
 ) {
     let mut session = ServerSession::new(Token::new(token));
 
@@ -283,14 +362,15 @@ async fn serve_one(
         }
         // Re-validate `account` (the wire form of a `CredentialRef`) rather than trusting whatever
         // the peer sent, even though only an already-authenticated peer reaches this line — AND
-        // require it to name exactly the one credential `owner` is bound to. `owner` is
-        // single-credential-scoped (see module doc), so without this check a syntactically valid
-        // but WRONG account (e.g. a typo, or a future multi-provider client asking for a different
-        // provider than this owner holds) would silently receive this owner's data instead of a
-        // refusal.
-        if CredentialRef::for_provider(strip_v1(&account)).is_err() || account != owner.account() {
+        // require the lookup to name exactly one owner for it. A syntactically valid but WRONG
+        // account (e.g. a typo, or a client asking for a provider this desktop does not own) must
+        // get a refusal, never another owner's data.
+        if CredentialRef::for_provider(strip_v1(&account)).is_err() {
             return;
         }
+        let Some(owner) = lookup.owner_for(&account) else {
+            return;
+        };
         let read = owner.read_bound(&expected_binding);
         // `owner.read_bound` is fully synchronous (a Keychain call, possibly blocking on macOS
         // Keychain locking), so it runs to completion within this task's current poll no matter
@@ -319,6 +399,9 @@ async fn serve_one(
         {
             return;
         }
+        // Record only AFTER the response was actually delivered: a revision the daemon never
+        // received must never be reported as daemon-observable (STUDIO-991's sync verdict).
+        observations.record(&account, read.revision);
     }
 }
 
@@ -980,5 +1063,80 @@ mod tests {
                 ServerFrame::RevisionChanged { .. } => Err(()),
             }
         }
+    }
+
+    // STUDIO-991: the listener routes each `read_bound` account to its own owner and records the
+    // answered revision so the desktop can report whether a committed mutation is daemon-observable.
+    // A registry hard-wired to one owner, or one that never records, would red the account-routing
+    // or the observation assertions respectively.
+    struct MapLookup(std::collections::HashMap<String, Arc<dyn CredentialOwner>>);
+    impl CredentialOwnerLookup for MapLookup {
+        fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+            self.0.get(account).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_registry_routes_by_account_and_records_the_observed_revision() {
+        let dir = temp_dir();
+        let listener = BootstrapListener::bind(&dir).expect("bind");
+        let msg = listener.bootstrap_message();
+        let observations = Arc::new(ChannelObservations::new());
+
+        let fire_binding = Binding {
+            provider_id: "fireworks".into(),
+            adapter: "openai-chat-completions-bearer-v1".into(),
+            base_url: "https://api.fireworks/v1".into(),
+        };
+        let fire = ProviderCredentialOwner::for_test_provider("fireworks", MockKeyring::empty());
+        fire.connect(Revision::INITIAL, fire_binding.clone(), "sk-fire".into())
+            .expect("connect fireworks");
+        let other_binding = Binding {
+            provider_id: "other".into(),
+            adapter: "openai-chat-completions-bearer-v1".into(),
+            base_url: "https://api.other/v1".into(),
+        };
+        let other = ProviderCredentialOwner::for_test_provider("other", MockKeyring::empty());
+        other
+            .connect(Revision::INITIAL, other_binding, "sk-other".into())
+            .expect("connect other");
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "v1:fireworks".to_string(),
+            Arc::new(fire) as Arc<dyn CredentialOwner>,
+        );
+        map.insert(
+            "v1:other".to_string(),
+            Arc::new(other) as Arc<dyn CredentialOwner>,
+        );
+        let (fut, shutdown) =
+            listener.accept_and_serve_registry(Arc::new(MapLookup(map)), observations.clone());
+        let serve = tokio::spawn(fut);
+
+        let stream = UnixStream::connect(&msg.socket_path)
+            .await
+            .expect("connect");
+        let mut client = rhapsodyd_test_client(stream, msg.token.clone()).await;
+        let read = client
+            .read_bound("v1:fireworks".into(), fire_binding)
+            .await
+            .expect("read fireworks");
+        assert_eq!(read.state.tag(), CredentialStateTag::Present);
+        assert_eq!(
+            observations.observed("v1:fireworks"),
+            Some(Revision(1)),
+            "the served revision must be recorded for the routed account"
+        );
+        assert_eq!(
+            observations.observed("v1:other"),
+            None,
+            "a different account must not observe another provider's revision"
+        );
+
+        drop(client);
+        shutdown.shutdown();
+        let _ = serve.await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -140,7 +140,18 @@ impl ProviderCredentialOwner {
     /// owner-level test in this crate already uses.
     #[cfg(test)]
     pub(crate) fn for_test(keyring: Arc<dyn Keyring>) -> ProviderCredentialOwner {
-        let credential_ref = CredentialRef::for_provider("spike-test-provider").expect("valid id");
+        ProviderCredentialOwner::for_test_provider("spike-test-provider", keyring)
+    }
+
+    /// The *same* test-only seam as [`Self::for_test`], but for an arbitrary (validated) provider id
+    /// — the STUDIO-991 command layer tests build one owner per configured provider over injected
+    /// keychain doubles.
+    #[cfg(test)]
+    pub(crate) fn for_test_provider(
+        provider_id: &str,
+        keyring: Arc<dyn Keyring>,
+    ) -> ProviderCredentialOwner {
+        let credential_ref = CredentialRef::for_provider(provider_id).expect("valid id");
         ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
     }
 
@@ -241,6 +252,11 @@ impl ProviderCredentialOwner {
         binding: Binding,
         value: String,
     ) -> Result<MutationOutcome, MutationError> {
+        // The candidate value is owned here and wiped on EVERY exit path, including the typed
+        // refusals below (which never reach `store_envelope`'s own zeroizing paths). STUDIO-991's
+        // acceptance: "Rust drops/zeroizes its owned input after the selected credential owner
+        // accepts it" — and equally on the paths where it does not accept it.
+        let mut value = Zeroizing::new(value);
         let mut guard = lock_state(&self.state);
         let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
@@ -252,7 +268,7 @@ impl ProviderCredentialOwner {
         if !matches!(snapshot, Snapshot::Absent) {
             return Err(MutationError::PreconditionFailed);
         }
-        self.store_envelope(binding, value)?;
+        self.store_envelope(binding, std::mem::take(&mut *value))?;
         guard.revision = guard.revision.next();
         Ok(MutationOutcome::Advanced(guard.revision))
     }
@@ -265,6 +281,8 @@ impl ProviderCredentialOwner {
         current_binding: &Binding,
         new_value: String,
     ) -> Result<MutationOutcome, MutationError> {
+        // Zeroized on every exit, exactly as `connect` above (STUDIO-991).
+        let mut new_value = Zeroizing::new(new_value);
         let mut guard = lock_state(&self.state);
         let (revision, snapshot) = self.locked_snapshot(&mut guard);
         if matches!(snapshot, Snapshot::DeniedOrLocked) {
@@ -278,7 +296,7 @@ impl ProviderCredentialOwner {
         if !matches_binding {
             return Err(MutationError::PreconditionFailed);
         }
-        self.store_envelope(current_binding.clone(), new_value)?;
+        self.store_envelope(current_binding.clone(), std::mem::take(&mut *new_value))?;
         guard.revision = guard.revision.next();
         Ok(MutationOutcome::Advanced(guard.revision))
     }

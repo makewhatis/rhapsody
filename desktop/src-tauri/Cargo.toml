@@ -48,6 +48,16 @@ tauri-plugin-notification = "2"
 # see root `Cargo.toml`); the reverse pull adds no Tauri/tauri-adjacent dependency to `crates/*`, so
 # it does not reintroduce that coupling. No Go parity: this whole feature is Rhapsody-only.
 rhapsody-credential-ipc = { path = "../../crates/credential-ipc" }
+# rhapsody-config (STUDIO-991/P10): the desktop credential commands derive the canonical provider
+# binding from the SAME validated WORKFLOW.md pipeline the daemon runs (workflow::load → decode →
+# resolve → validate → ProviderDefinition::credential_binding), so the endpoint the desktop stores a
+# key under is byte-identical to the one the daemon reads it under. Re-deriving the normalization
+# here would be exactly the drift this boundary must not have. It is a path dependency into the root
+# workspace's `crates/` tree, mirroring the credential-ipc edge above; it carries no Tauri coupling.
+# Cost: it pulls rhapsody-config's own reqwest 0.12 (the hindsight memory backend) alongside this
+# crate's reqwest 0.13 — a compile-time-only duplication, justified because a second, hand-rolled
+# URL normalizer on the security boundary is worse.
+rhapsody-config = { path = "../../crates/config" }
 # semver (TRA-266): parse the Makefile-stamped RHAPSODY_VERSION so the updater compares latest.json
 # against the REAL release version, not tauri.conf.json's static 0.1.0 (see update.rs). This is the
 # SAME semver crate `tauri-plugin-updater` already uses for `RemoteRelease.version`, so its
