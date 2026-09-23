@@ -53,6 +53,7 @@ pub mod lifecycle;
 pub mod liveness;
 pub mod managerapproval;
 pub mod managerdecision;
+pub mod managerexchange;
 pub mod mergeconsole;
 pub mod message;
 pub mod obslog;

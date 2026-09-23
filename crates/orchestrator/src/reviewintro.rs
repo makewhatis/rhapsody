@@ -579,6 +579,15 @@ impl Orchestrator {
             .review_observed_head
             .get(&pr.pr)
             .map(|observed| observed.head.as_str());
+        // STUDIO-1012 (§7.8, path 2): after the round threshold, in `act` mode, a re-introduction
+        // can never ARM a round on its own — the F9 path (a handoff resetting settled rows back to
+        // `requested`) is closed structurally here. What arms a round past the threshold is an
+        // active manager exchange authorization, consumed by the watcher. Off/advise and every
+        // pre-threshold introduction behave exactly as before, so this is a no-op for them.
+        //
+        // MUTATION: delete this check and `an_act_reintroduction_past_the_threshold_arms_nothing`
+        // reds (the settled row is reset to `requested`).
+        let gate_active = self.review_exchange_gate_active(&pr.pr);
         let mut written = 0usize;
         for reviewer in pr.reviewers.iter().filter(|r| !r.trim().is_empty()) {
             let key = ReviewWatchKey {
@@ -597,6 +606,14 @@ impl Orchestrator {
                     review = %id,
                     "ticketless review: a review of this pull request is already in flight; its \
                      watch row is left as it is"
+                );
+                continue;
+            }
+            if gate_active {
+                tracing::debug!(
+                    review = %id, pr = %pr.pr,
+                    "manager exchange: act mode past the round threshold, so a re-introduction \
+                     arms nothing; the row is left exactly as it is"
                 );
                 continue;
             }
@@ -1513,6 +1530,49 @@ mod tests {
             assert_eq!(
                 row.status, REVIEW_STATUS_REQUESTED,
                 "{} must be armed for the new head",
+                row.key.reviewer
+            );
+        }
+    }
+
+    /// STUDIO-1012 (§7.8 path 2): in `act` mode after the round threshold a re-introduction arms
+    /// NOTHING — the same head move that arms every row above leaves them untouched. This closes the
+    /// F9 path structurally: a handoff cannot start a post-threshold exchange on its own, only a
+    /// manager exchange authorization can.
+    ///
+    /// MUTATION: delete the `gate_active` check in `handle_review_introduce` and this reds (three
+    /// rows come back `requested`).
+    #[test]
+    fn an_act_reintroduction_past_the_threshold_arms_nothing() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob", "carol"]);
+        teams.review.adjudicate_after_rounds = 1;
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let mut o = orch(teams);
+        let pr = introduced("makewhatis", "rhapsody", 12, &["alice", "bob", "carol"]);
+        o.handle_review_introduce(&pr);
+        for reviewer in ["alice", "bob", "carol"] {
+            approve_row(&o, reviewer, HEAD_A);
+        }
+        o.review_observed_head.insert(
+            pr.pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_B.to_string(),
+            },
+        );
+        // The round threshold is reached: STUDIO-1004's answered-exchange count, one round here.
+        o.review_rounds
+            .insert(crate::reviewwatch::churn_key(&pr.pr), 1);
+
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(0),
+            "act mode past the threshold arms no round from a re-introduction"
+        );
+        for row in o.store().load_live_review_watch().expect("read") {
+            assert_eq!(
+                row.status, REVIEW_STATUS_APPROVED,
+                "{} was armed by a re-introduction past the threshold",
                 row.key.reviewer
             );
         }
