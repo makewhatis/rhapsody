@@ -10,6 +10,7 @@ import {
 } from "@/hooks/useConfig";
 import { clearLinearToken, setLinearToken } from "@/lib/bindings";
 import { ConfigSaveError } from "@/lib/api";
+import { globalSelectionFeedback } from "@/lib/providers-model";
 import type { GlobalConfigDTO, LinearIdentity, LinearProject, ProjectConfigDTO } from "@/lib/api";
 import {
   applyUiAgent,
@@ -219,7 +220,14 @@ export function useConfigDraft(): ConfigDraftModel {
   const promoteAgentInvalid = agents.some((a) => !reviewPromoteValid(a));
   // Each agent must watch a unique Linear project; the daemon rejects duplicate slugs.
   const slugConflict = draft ? duplicateSlugs(draft.projects) : false;
-  const saveBlocked = promoteGlobalInvalid || promoteAgentInvalid || slugConflict;
+  // The global provider/model selection must satisfy the daemon's compatibility rules (STUDIO-992):
+  // a provider on a non-opencode backend, an unknown provider, or a missing model would 400. Block
+  // the autosave locally with the typed reason rather than firing a doomed POST.
+  const providerFeedback = draft
+    ? globalSelectionFeedback(draft.global)
+    : { ok: true, reason: null as string | null };
+  const providerInvalid = !providerFeedback.ok;
+  const saveBlocked = promoteGlobalInvalid || promoteAgentInvalid || slugConflict || providerInvalid;
   // Scope-specific message so a global-scope failure doesn't point the user at the per-agent editors.
   const blocked = slugConflict
     ? "Each agent must watch a unique Linear project."
@@ -227,7 +235,9 @@ export function useConfigDraft(): ConfigDraftModel {
       ? "Review-promote state must be one of the global active states."
       : promoteAgentInvalid
         ? "Review-promote state must be one of each agent's active states."
-        : null;
+        : providerInvalid
+          ? (providerFeedback.reason ?? "The global provider/model selection is not usable.")
+          : null;
 
   const saving = save.isPending || flushing;
 

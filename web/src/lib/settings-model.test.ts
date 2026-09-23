@@ -133,6 +133,52 @@ describe("toUiGlobal / applyUiGlobal", () => {
     expect(next.prompt).toBe("global prompt");
   });
 
+  it("surfaces the global provider selection + registry and writes the selection through (STUDIO-992)", () => {
+    const withProv = makeGlobal({
+      agent: {
+        backend: "opencode",
+        max_concurrent_agents: 8,
+        max_turns: 20,
+        max_retry_backoff_ms: 300000,
+        provider: "fireworks",
+        model: "accounts/fireworks/models/x",
+      },
+      providers: {
+        fireworks: {
+          id: "fireworks",
+          protocol: "openai-compatible",
+          display_name: "Fireworks",
+          base_url: "https://api.fireworks.ai/inference/v1",
+          allow_insecure_http: false,
+          credential: { source: "keychain" },
+        },
+      },
+    });
+    const ui = toUiGlobal(withProv);
+    expect(ui.provider).toBe("fireworks");
+    expect(ui.agentModel).toBe("accounts/fireworks/models/x");
+    expect(ui.providers.map((p) => p.id)).toEqual(["fireworks"]);
+
+    const next = applyUiGlobal(withProv, { ...ui, provider: "other", agentModel: "m" });
+    expect(next.agent.provider).toBe("other");
+    expect(next.agent.model).toBe("m");
+    // The registry is authored in WORKFLOW.md, not edited here, and rides through verbatim.
+    expect(next.providers).toEqual(withProv.providers);
+  });
+
+  it("reads an unset provider selection as empty (legacy path); clearing writes empty", () => {
+    const g = makeGlobal();
+    const ui = toUiGlobal(g);
+    expect(ui.provider).toBe("");
+    expect(ui.agentModel).toBe("");
+    expect(ui.providers).toEqual([]);
+    const cleared = applyUiGlobal(g, { ...ui, provider: "", agentModel: "" });
+    expect(cleared.agent.provider).toBe("");
+    expect(cleared.agent.model).toBe("");
+    // The pre-existing claude model is untouched by the provider-first selection.
+    expect(cleared.claude.model).toBe("claude-sonnet-4-6");
+  });
+
   it("maps otel.enabled to an explicit toggle, independent of endpoint-presence (INF-299)", () => {
     // The seeded default-on config (enabled + a hub endpoint) surfaces the toggle ON.
     const seeded = makeGlobal({
