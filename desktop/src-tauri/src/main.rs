@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use rhapsody_credential_ipc::domain::CredentialRef;
 use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
-use rhapsody_desktop::credential_bootstrap::ChannelObservations;
+use rhapsody_desktop::credential_bootstrap::{ChannelObservations, default_socket_dir};
 use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATOR};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::provider_commands::{
     DaemonObservation, HttpConnectionTester, MutationResultDto, PreparedCommandDto,
     ProviderCommandError, ProviderCommandService, ProviderOperation, ProviderStatusDto,
-    TestConnectionDto, authorize_invocation,
+    ServiceOwnerLookup, TestConnectionDto, authorize_invocation,
 };
 use rhapsody_desktop::supervisor;
 use rhapsody_desktop::toolcheck::ToolResult;
@@ -450,16 +450,26 @@ fn run() -> tauri::Result<()> {
         .setup(|app| {
             let application = App::from_env();
             app.manage(application.clone());
-            // STUDIO-991: the desktop-only provider credential command service. It derives canonical
-            // provider bindings from the same WORKFLOW.md the app supervises, and owns every
-            // Connect/Replace/Rebind/Remove through the P0c credential owner. The observations map is
-            // shared with a bootstrap listener once the supervisor wires one (PB7's named step).
+            // STUDIO-991 + STUDIO-1035: the desktop-only provider credential command service derives
+            // canonical provider bindings from the same WORKFLOW.md the app supervises, and owns every
+            // Connect/Replace/Rebind/Remove through the P0c credential owner. The supervisor is wired
+            // to spawn the daemon with `--credential-bootstrap` and serve the authenticated channel
+            // from THIS service's own owners, recording what the daemon observed into THIS observations
+            // map — so a command's sync verdict compares against the daemon's real reads, not a second
+            // owner instance's independent revision counter.
+            let service = ProviderCommandService::new(
+                application.workflow_path(),
+                Arc::new(HttpConnectionTester::new()),
+            );
+            let observations = Arc::new(ChannelObservations::new());
+            application.set_credential_bootstrap(supervisor::CredentialBootstrap {
+                socket_dir: default_socket_dir(),
+                lookup: Arc::new(ServiceOwnerLookup::new(service.clone())),
+                observations: observations.clone(),
+            });
             app.manage(ProviderCommandState {
-                service: ProviderCommandService::new(
-                    application.workflow_path(),
-                    Arc::new(HttpConnectionTester::new()),
-                ),
-                observations: Arc::new(ChannelObservations::new()),
+                service,
+                observations,
             });
             // Owns the Logs view's host-side log-stream bridge (TRA-252); the start/stop_log_stream
             // commands drive it.

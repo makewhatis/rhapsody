@@ -11,15 +11,30 @@
 //!
 //!   make app && RHAPSODY_PARITY_E2E=1 cargo test -p rhapsody-desktop --test parity_e2e -- --nocapture
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
+use rhapsody_credential_ipc::domain::{
+    Binding, BoundCredentialLease, CredentialRead, CredentialRef, CredentialState, Revision,
+};
+use rhapsody_credential_ipc::owner::{
+    CredentialOwner, CredentialStatus, MutationError, MutationOutcome,
+};
 use rhapsody_desktop::apiproxy::{self, ProxyRequest};
-use rhapsody_desktop::supervisor::{Options, State, Supervisor, resolve_binary, resources_dir_for};
+use rhapsody_desktop::credential_bootstrap::{ChannelObservations, CredentialOwnerLookup};
+use rhapsody_desktop::provider_commands::{
+    DaemonObservation, HttpConnectionTester, OwnerFactory, ProviderCommandService,
+    ProviderOperation, SystemClock,
+};
+use rhapsody_desktop::supervisor::{
+    CredentialBootstrap, Options, State, Supervisor, resolve_binary, resources_dir_for,
+};
 
 const GATE: &str = "RHAPSODY_PARITY_E2E";
 
@@ -316,6 +331,35 @@ fn unique_tmp(prefix: &str) -> TempDir {
     TempDir::new(prefix)
 }
 
+/// A scratch dir directly under `/tmp` (removed on drop), for the credential-listener socket: a Unix
+/// `sun_path` is capped at ~104 bytes, and the per-session `$TMPDIR` is long enough on its own to
+/// blow that budget. Not `rhapsody-`-prefixed for that reason; the drop guard is what keeps it tidy.
+struct ShortDir {
+    path: PathBuf,
+}
+
+impl ShortDir {
+    fn new(prefix: &str) -> ShortDir {
+        let path = PathBuf::from("/tmp").join(format!("{prefix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create short dir");
+        ShortDir { path }
+    }
+}
+
+impl std::ops::Deref for ShortDir {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for ShortDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Marks `p` executable (0755) — the daemon execs the copied fake-claude by absolute path.
 fn set_executable(p: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -332,4 +376,371 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+// ---- STUDIO-1035: packaged desktop-to-sidecar credential bootstrap -------------------------------
+
+/// A read/write in-memory `CredentialOwner` — the injected stand-in for the production Keychain
+/// owner. The [`CredentialOwner`] trait IS the P0c crate/process boundary, so serving this over the
+/// authenticated channel exercises the same supervisor wiring the real Keychain owner uses, without
+/// requiring the CI runner's login keychain to be unlocked. The production owner's own CAS semantics
+/// (and their mutation-discipline tests) live in `provider_credential`.
+struct InMemoryOwner {
+    revision: Mutex<Revision>,
+    state: Mutex<Option<(Binding, String)>>,
+}
+
+impl InMemoryOwner {
+    fn new() -> Arc<InMemoryOwner> {
+        Arc::new(InMemoryOwner {
+            revision: Mutex::new(Revision::INITIAL),
+            state: Mutex::new(None),
+        })
+    }
+}
+
+impl CredentialOwner for InMemoryOwner {
+    fn read_bound(&self, expected_binding: &Binding) -> CredentialRead {
+        let revision = *self.revision.lock().expect("revision");
+        let state = match self.state.lock().expect("state").as_ref() {
+            None => CredentialState::Absent,
+            Some((binding, value)) if binding == expected_binding => {
+                CredentialState::Present(BoundCredentialLease::new(binding.clone(), value.clone()))
+            }
+            Some(_) => CredentialState::BindingMismatch,
+        };
+        CredentialRead { revision, state }
+    }
+    fn connect(
+        &self,
+        expected_revision: Revision,
+        binding: Binding,
+        value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        if expected_revision != *self.revision.lock().expect("revision") {
+            return Err(MutationError::StaleRevision(
+                *self.revision.lock().expect("revision"),
+            ));
+        }
+        let mut state = self.state.lock().expect("state");
+        if state.is_some() {
+            return Err(MutationError::PreconditionFailed);
+        }
+        *state = Some((binding, value));
+        drop(state);
+        Ok(MutationOutcome::Advanced(self.advance()))
+    }
+    fn replace(
+        &self,
+        expected_revision: Revision,
+        current_binding: &Binding,
+        new_value: String,
+    ) -> Result<MutationOutcome, MutationError> {
+        if expected_revision != *self.revision.lock().expect("revision") {
+            return Err(MutationError::StaleRevision(
+                *self.revision.lock().expect("revision"),
+            ));
+        }
+        let mut state = self.state.lock().expect("state");
+        match state.as_ref() {
+            Some((binding, _)) if binding == current_binding => {}
+            _ => return Err(MutationError::PreconditionFailed),
+        }
+        let existing = state.take().ok_or(MutationError::PreconditionFailed)?;
+        *state = Some((existing.0, new_value));
+        drop(state);
+        Ok(MutationOutcome::Advanced(self.advance()))
+    }
+    fn rebind(
+        &self,
+        _expected_revision: Revision,
+        _new_binding: Binding,
+    ) -> Result<MutationOutcome, MutationError> {
+        Err(MutationError::PreconditionFailed)
+    }
+    fn remove(&self, expected_revision: Revision) -> Result<MutationOutcome, MutationError> {
+        if expected_revision != *self.revision.lock().expect("revision") {
+            return Err(MutationError::StaleRevision(
+                *self.revision.lock().expect("revision"),
+            ));
+        }
+        let mut state = self.state.lock().expect("state");
+        if state.is_none() {
+            return Ok(MutationOutcome::AlreadyAbsent(expected_revision));
+        }
+        *state = None;
+        drop(state);
+        Ok(MutationOutcome::Advanced(self.advance()))
+    }
+    fn status(&self) -> CredentialStatus {
+        if self.state.lock().expect("state").is_some() {
+            CredentialStatus::Configured
+        } else {
+            CredentialStatus::Unconfigured
+        }
+    }
+}
+
+impl InMemoryOwner {
+    fn advance(&self) -> Revision {
+        let mut revision = self.revision.lock().expect("revision");
+        *revision = revision.next();
+        *revision
+    }
+}
+
+/// A shared provider-id → owner registry, used BOTH as the command service's owner factory and as
+/// the credential listener's lookup — so the daemon observes the exact instance the command surface
+/// mutates (one revision counter per provider).
+#[derive(Clone)]
+struct SharedOwners {
+    owners: Arc<Mutex<BTreeMap<String, Arc<dyn CredentialOwner>>>>,
+}
+
+impl SharedOwners {
+    fn factory(&self) -> OwnerFactory {
+        let owners = self.owners.clone();
+        Arc::new(move |provider_id: &str| owners.lock().ok()?.get(provider_id).cloned())
+    }
+}
+
+impl CredentialOwnerLookup for SharedOwners {
+    fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+        let provider_id = account.strip_prefix("v1:")?;
+        CredentialRef::for_provider(provider_id).ok()?;
+        self.owners.lock().ok()?.get(provider_id).cloned()
+    }
+}
+
+/// One provider definition in the packaged e2e's WORKFLOW.md, bound to a dead loopback endpoint
+/// (the boot status refresh only reads the credential — it never contacts the provider).
+fn workflow_with_providers(ws: &Path, logs: &Path, provider_ids: &[&str]) -> String {
+    let mut providers = String::new();
+    for id in provider_ids {
+        providers.push_str(&format!(
+            "  {id}:\n    protocol: openai-compatible\n    display_name: {id}\n    base_url: https://127.0.0.1:9/v1\n    credential:\n      source: keychain\n"
+        ));
+    }
+    format!(
+        "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nproviders:\n{providers}workspace:\n  root: {ws}\nlogging:\n  dir: {logs}\nstorage:\n  path: \"off\"\n---\nWork.\n",
+        ws = ws.display(),
+        logs = logs.display(),
+    )
+}
+
+/// Polls the shared observations map until the daemon has been served `account`, bounded.
+async fn wait_observed(
+    observations: &Arc<ChannelObservations>,
+    account: &str,
+    timeout: Duration,
+) -> Revision {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(revision) = observations.observed(account) {
+            return revision;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the packaged daemon never read {account} over the credential channel within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The packaged P0c ownership model, end to end (STUDIO-1035): the app's OWN supervisor spawns the
+/// REAL packaged `rhapsodyd` from the `make app` bundle with `--credential-bootstrap`, serves the
+/// authenticated channel from the injected desktop-owned `CredentialOwner`, and the daemon's boot
+/// provider status refresh reads the credential — the revision lands in the shared observations map
+/// that the provider commands read. A credential stored while the daemon was offline is observed on
+/// the next startup, and the sync verdict is `stored_unsynchronized` until the daemon has observed
+/// the mutation's revision (never before).
+///
+/// Gated with the P7-D5 parity e2e (`RHAPSODY_PARITY_E2E=1`, `make app` first).
+#[tokio::test]
+async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync_verdict() {
+    if std::env::var_os(GATE).is_none() {
+        eprintln!(
+            "skip: set {GATE}=1 to run the packaged credential-bootstrap e2e (`make app` first)"
+        );
+        return;
+    }
+    let root = repo_root();
+    let bundle = root.join("desktop/target/release/bundle/macos/Rhapsody.app");
+    assert!(
+        bundle.is_dir(),
+        "Rhapsody.app not found at {} — run `make app` first",
+        bundle.display()
+    );
+    let app_exe = bundle.join("Contents/MacOS/rhapsody-desktop");
+    let resources = resources_dir_for(app_exe.to_str().expect("utf-8 path"))
+        .expect("bundle must have a Contents/Resources layout");
+    let sidecar = resolve_binary("", resources.to_str().expect("utf-8 path"))
+        .expect("resolve the packaged rhapsodyd sidecar");
+
+    let work = unique_tmp("rhapsody-1035-e2e");
+    let ws = work.join("ws");
+    let logs = work.join("logs");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    std::fs::create_dir_all(&logs).expect("mkdir logs");
+    let workflow = work.join("WORKFLOW.md");
+    std::fs::write(
+        &workflow,
+        workflow_with_providers(&ws, &logs, &["packaged-e2e", "packaged-e2e-absent"]),
+    )
+    .expect("write WORKFLOW.md");
+
+    // Two desktop-owned credentials: one stored while the daemon is OFFLINE (the acceptance's
+    // store-offline case), and one deliberately absent to exercise `already_absent` synchronization.
+    let present = InMemoryOwner::new();
+    let present_binding = Binding {
+        provider_id: "packaged-e2e".into(),
+        adapter: "openai-chat-completions-bearer-v1".into(),
+        base_url: "https://127.0.0.1:9/v1".into(),
+    };
+    let stored_revision = match present
+        .connect(
+            Revision::INITIAL,
+            present_binding.clone(),
+            "sk-packaged-e2e-fake".into(),
+        )
+        .expect("seed the offline credential")
+    {
+        MutationOutcome::Advanced(r) => r,
+        other => panic!("unexpected connect outcome: {other:?}"),
+    };
+    let absent = InMemoryOwner::new();
+
+    let shared = SharedOwners {
+        owners: Arc::new(Mutex::new(BTreeMap::from([
+            (
+                "packaged-e2e".to_string(),
+                present.clone() as Arc<dyn CredentialOwner>,
+            ),
+            (
+                "packaged-e2e-absent".to_string(),
+                absent.clone() as Arc<dyn CredentialOwner>,
+            ),
+        ]))),
+    };
+    let observations = Arc::new(ChannelObservations::new());
+
+    // The command service and the listener share ONE owner registry (see `SharedOwners`).
+    let service = ProviderCommandService::with_dependencies(
+        Some(workflow.clone()),
+        shared.factory(),
+        Arc::new(HttpConnectionTester::new()),
+        Arc::new(SystemClock),
+        Arc::new(rhapsody_credential_ipc::token::generate),
+        std::time::Duration::from_secs(120),
+    );
+
+    let socket_dir = ShortDir::new("rd-1035-sock");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let sup = Supervisor::new(Options {
+        binary_path: sidecar,
+        workflow_path: Some(workflow.clone()),
+        base_env: Some(vec![
+            format!("HOME={}", work.join("home").display()),
+            format!("PATH={path}"),
+        ]),
+        linear_api_key: "stub-key".to_string(),
+        startup_timeout: Duration::from_secs(20),
+        max_restarts: 1,
+        credential_bootstrap: Some(CredentialBootstrap {
+            socket_dir: socket_dir.to_path_buf(),
+            lookup: Arc::new(shared.clone()),
+            observations: observations.clone(),
+        }),
+        ..Default::default()
+    });
+
+    sup.start(tokio::time::sleep(Duration::from_secs(30)))
+        .await
+        .expect("supervisor start: the packaged rhapsodyd must become healthy");
+    assert_eq!(sup.status().state, State::Running);
+
+    // Bullet 3: the credential stored while the daemon was offline is observed on this startup.
+    let observed = wait_observed(&observations, "v1:packaged-e2e", Duration::from_secs(10)).await;
+    assert_eq!(
+        observed, stored_revision,
+        "the daemon must observe the revision stored while it was offline"
+    );
+    let absent_observed = wait_observed(
+        &observations,
+        "v1:packaged-e2e-absent",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(absent_observed, Revision::INITIAL);
+
+    // Bullet 2: a committed mutation reports `stored_unsynchronized` — never `synchronized` — while
+    // the daemon's observed revision is older than the mutation's, then `synchronized` is reachable
+    // once the daemon has observed the revision it is acknowledged against.
+    let prepared = service
+        .prepare("packaged-e2e", ProviderOperation::Replace)
+        .expect("prepare replace");
+    let stale = service
+        .commit(
+            "packaged-e2e",
+            ProviderOperation::Replace,
+            &prepared.nonce,
+            Some("sk-packaged-e2e-replaced".into()),
+            DaemonObservation {
+                running: true,
+                observed_revision: Some(observed),
+            },
+        )
+        .expect("commit replace");
+    assert!(stale.mutated);
+    assert_eq!(
+        stale.sync, "stored_unsynchronized",
+        "a mutation the daemon has not observed must never claim synchronization"
+    );
+
+    // `already_absent` on the other credential is acknowledged against the UNCHANGED revision it was
+    // observed at, without a mutation — and IS synchronized because the daemon has observed it.
+    let prepared = service
+        .prepare("packaged-e2e-absent", ProviderOperation::Remove)
+        .expect("prepare remove");
+    let acknowledged = service
+        .commit(
+            "packaged-e2e-absent",
+            ProviderOperation::Remove,
+            &prepared.nonce,
+            None,
+            DaemonObservation {
+                running: true,
+                observed_revision: Some(absent_observed),
+            },
+        )
+        .expect("commit remove");
+    assert!(!acknowledged.mutated);
+    assert_eq!(acknowledged.sync, "synchronized");
+
+    // With the daemon stopped, the same class of mutation is `stored_offline`, never synchronized.
+    sup.stop().await;
+    assert_eq!(sup.status().state, State::Stopped);
+    let prepared = service
+        .prepare("packaged-e2e", ProviderOperation::Replace)
+        .expect("prepare replace offline");
+    let offline = service
+        .commit(
+            "packaged-e2e",
+            ProviderOperation::Replace,
+            &prepared.nonce,
+            Some("sk-packaged-e2e-offline".into()),
+            DaemonObservation {
+                running: false,
+                observed_revision: Some(stored_revision),
+            },
+        )
+        .expect("commit offline");
+    assert_eq!(offline.sync, "stored_offline");
+
+    std::fs::remove_dir_all(&work).ok();
+    eprintln!(
+        "STUDIO-1035 packaged e2e OK: supervisor bootstrapped the credential owner; offline store \
+         observed on startup; sync verdicts ordered correctly"
+    );
 }
