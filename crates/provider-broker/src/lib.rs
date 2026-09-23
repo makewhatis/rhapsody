@@ -49,6 +49,7 @@ pub mod ledger;
 pub mod metrics;
 pub mod policy;
 pub mod random;
+pub mod registrar;
 pub mod secret;
 pub mod session;
 pub mod turn;
@@ -88,6 +89,7 @@ pub use policy::{
     BrokerLimits, BrokerProtocol, DEFAULT_BROKER_LIMITS, HARD_BROKER_LIMITS, SessionPolicy,
 };
 pub use random::{OsRandom, RandomError, RandomSource, ScriptedRandom};
+pub use registrar::BrokerRegistrar;
 pub use reservations::ConcurrencyPermit;
 pub use secret::{CapabilityToken, ZeroizingBytes};
 pub use session::{BrokerLedgerReceiver, BrokerSession};

@@ -115,4 +115,9 @@ pub enum BrokerError {
     /// The registration plan's limit block and the session policy's block disagree.
     #[error("registration plan limits and session policy limits disagree")]
     LimitsMismatch,
+    /// The broker's serving task exited unexpectedly and the broker was marked unavailable
+    /// (design §11.2, the typed `provider_broker_unavailable` refusal). Registration refuses until
+    /// the process restarts; there is no direct-key fallback.
+    #[error("the provider broker is unavailable")]
+    Unavailable,
 }
