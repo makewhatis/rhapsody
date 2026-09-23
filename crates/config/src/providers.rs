@@ -1089,6 +1089,14 @@ mod tests {
         assert_eq!(binding.adapter, ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1);
         assert_eq!(binding.base_url, "https://api.fireworks.ai/inference/v1");
         assert_eq!(binding.keychain_account(), "v1:fireworks");
+        // CROSS-CRATE PIN (STUDIO-983 added the shared bound credential abstraction, which declares its
+        // own adapter label): the one reviewed adapter identity must be the SAME string in config and in
+        // the credential owner, just as the agent↔broker pin already requires. Renaming either side reds.
+        assert_eq!(
+            binding.adapter,
+            rhapsody_credential_ipc::domain::OPENAI_CHAT_COMPLETIONS_BEARER_V1,
+            "config and the credential owner must spell the v1 adapter identically"
+        );
         // The identity is stable and contains no secret-looking value.
         assert_eq!(binding.identity(), binding.identity());
         assert!(!binding.identity().contains("Fireworks"));
