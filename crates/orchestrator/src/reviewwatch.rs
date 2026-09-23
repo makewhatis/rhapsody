@@ -3231,6 +3231,18 @@ impl Orchestrator {
             let origin = crate::reviewdone::origin_ticket(&row.introduced_by)
                 .map(|t| t.to_ascii_lowercase());
             if origin.as_deref().is_some_and(|t| held.contains(t)) {
+                if self.review_exchange_gate_active(pr) {
+                    self.invalidate_manager_exchanges(pr);
+                }
+                // STUDIO-1012 (§7.4, §7.8): a hold invalidates the pull request's live manager
+                // exchange authorizations, so one granted BEFORE the hold arms nothing once the
+                // hold lifts. This branch is the LIVE path that observes a held pull request —
+                // the arm gate below is never reached for a held row — so the invalidation has to
+                // happen here, not only inside `review_round_arm_authorized`.
+                //
+                // MUTATION: delete this invalidation and
+                // `an_act_hold_invalidates_a_live_authorization` reds on its second assert (the
+                // pre-hold authorization arms once the hold lifts).
                 tracing::debug!(
                     pr = %pr, reviewer = %row.key.reviewer, origin = %row.introduced_by,
                     "ticketless review: the origin ticket is held for a human; the round waits"
@@ -4949,6 +4961,17 @@ mod tests {
             .get_review_watch(&key(number, reviewer))
             .expect("read watch row")
             .expect("row exists")
+    }
+
+    /// The state of one manager exchange authorization on pull request 12.
+    fn manager_exchange_state(o: &Orchestrator, id: &str) -> String {
+        o.store()
+            .manager_exchanges(&churn_key(&coord(12)))
+            .expect("exchanges")
+            .into_iter()
+            .find(|e| e.id == id)
+            .map(|e| e.state)
+            .expect("exchange row")
     }
 
     /// The reviewer each dispatched run was given, in dispatch order.
@@ -9480,6 +9503,65 @@ mod tests {
         assert_eq!(
             authorised.dispatched, 1,
             "an active authorization arms the round"
+        );
+    }
+
+    /// **Acceptance 3, the hold trigger — pinned through the REAL sweep, not the gate alone.**
+    /// §7.4: an active authorization granted before a `rhapsody:human` hold is INVALIDATED, so once
+    /// the hold lifts it arms nothing. The watcher's arm gate is never reached for a held row — the
+    /// hold branch above it defers first — so a test that calls the gate directly with `held = true`
+    /// (as the `managerexchange` unit test does) never exercises the live path this acceptance
+    /// names. This drives the sweep twice: held, then lifted.
+    ///
+    /// MUTATION: delete the `invalidate_manager_exchanges` call from `handle_review_sweep_slots`'s
+    /// hold branch and this reds on the invalidated-state assert (the row stays `active`) and again
+    /// on the post-lift dispatch (the pre-hold authorization arms the round).
+    #[test]
+    fn an_act_hold_invalidates_a_live_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
+        // STUDIO-1004's answered-exchange count: one round reaches a threshold of one.
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+        // An active `review_round` authorization, granted before the hold.
+        o.store()
+            .ensure_review_generation(&churn_key(&coord(12)))
+            .expect("generation");
+        o.store()
+            .save_manager_exchange(rs::ManagerExchange {
+                id: "pre-hold".to_string(),
+                intervention_id: "iv-1".to_string(),
+                pr: churn_key(&coord(12)),
+                generation: 1,
+                kind: rs::MANAGER_EXCHANGE_REVIEW_ROUND.to_string(),
+                authorized_head: HEAD_A.to_string(),
+                authorized_patch_id: String::new(),
+                state: rs::MANAGER_EXCHANGE_ACTIVE.to_string(),
+            })
+            .expect("authorize");
+
+        // The hold lands: the round does not arm, and the authorization is invalidated.
+        o.human_holds.note_human_label("STUDIO-721");
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            0,
+            "a held ticket's round must not arm"
+        );
+        assert_eq!(
+            manager_exchange_state(&o, "pre-hold"),
+            rs::MANAGER_EXCHANGE_INVALIDATED,
+            "a hold invalidates the pre-hold authorization"
+        );
+
+        // The hold lifts — the next selection pass clears the current hold set — and the
+        // invalidated authorization arms nothing, so the round stays deferred.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            0,
+            "an invalidated authorization must not arm once the hold lifts"
         );
     }
 
