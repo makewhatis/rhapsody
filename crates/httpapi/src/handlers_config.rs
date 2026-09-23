@@ -218,8 +218,12 @@ Default prompt for {{ issue.identifier }}.\n";
     impl TempWorkflow {
         fn new(body: &str) -> TempWorkflow {
             let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let dir = std::env::temp_dir().join(format!(
-                "rhapsody-httpapi-config-{}-{n}",
+                "rhapsody-httpapi-config-{}-{n}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).expect("create temp dir");
@@ -235,7 +239,9 @@ Default prompt for {{ issue.identifier }}.\n";
 
     impl Drop for TempWorkflow {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = fs::remove_dir_all(&self.dir);
+            }
         }
     }
 

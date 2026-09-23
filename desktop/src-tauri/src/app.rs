@@ -1141,19 +1141,13 @@ mod tests {
     use super::*;
     use crate::credential::Store;
     use crate::credential::mock::{MockKeyring, keychain as mock_keychain};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_app() -> App {
         App::new(None, PathBuf::new())
     }
 
-    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("rhapsody-d4-app-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).expect("create temp dir");
-        p
+    fn temp_dir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("rhapsody-d4-app")
     }
 
     /// An App wired with an in-memory keychain (the Rust analog of `keyring.MockInit`) and a temp
@@ -1421,8 +1415,7 @@ mod tests {
     // directory or missing path is not.
     #[test]
     fn configured_true_for_a_regular_file_false_for_dir_or_missing() {
-        let dir = std::env::temp_dir().join(format!("rhapsody-d3-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::testutil::TempDir::new("rhapsody-d3-cfg");
         let file = dir.join("WORKFLOW.md");
         std::fs::write(&file, b"---\n").expect("write temp file");
 

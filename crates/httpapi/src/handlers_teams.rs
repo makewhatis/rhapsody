@@ -584,8 +584,14 @@ mod tests {
         fn new() -> Self {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = std::env::temp_dir()
-                .join(format!("rhapsody-httpapi-teams-{}-{n}", std::process::id()));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!(
+                "rhapsody-httpapi-teams-{}-{n}-{nonce}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&p).expect("create temp dir");
             Self(p)
         }
@@ -593,7 +599,9 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
     }
 
