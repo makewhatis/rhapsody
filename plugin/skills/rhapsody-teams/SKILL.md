@@ -138,10 +138,12 @@ message mailbox (`agent_send_message` / the run's message box) instead.
 Pluggable via `memory.backend`: `local` (default — human-readable markdown records under
 `~/.rhapsody/teams/banks/<name>/`, created on first retain), `hindsight` (a shared remote
 memory service, so several installations can read one bank: point `memory.endpoint` at your
-own deployment and give it `memory.api_key` — every path there rejects an unauthenticated
-request. Recall is prefetched off-loop, so the control loop never waits on the network), or
-`none`. Retained facts carry host-stamped provenance (ticket/run/commit). Wrong memories: the
-panel's invalidate button (reason required, reversible) or `teams_invalidate`.
+own deployment and, if it is authenticated, give it `memory.api_key`. `api_key` is optional —
+an unauthenticated local deployment sends no `Authorization` header at all. Recall is
+prefetched off-loop, so the control loop never waits on the network; a retain is sent in the
+background, so a retained memory becomes recallable after server-side extraction, about 30s
+later), or `none`. Retained facts carry host-stamped provenance (ticket/run/commit). Wrong
+memories: the panel's invalidate button (reason required, reversible) or `teams_invalidate`.
 
 ## Review: two models, and they are mutually exclusive
 

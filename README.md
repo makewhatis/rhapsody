@@ -585,13 +585,16 @@ Answering needs the model turn, so it is a `manager.mode: labels+model` capabili
 but cannot read one as a question — and a daemon with no durable store has no records to answer from,
 so it behaves the same way.
 
-Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
+Memory is a pluggable backend (`none` / `local` / `hindsight`). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
 `~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
 on the first retain and at no other time. A roster entry may name its bank explicitly with `bank:`,
 but only a label-safe value is honoured — a bank id becomes a directory name — and anything else is
 dropped in favour of `<bank_prefix><name>`. `teams_roster` and `GET /api/v1/teams` report the id
 that was actually resolved, so the view always names the directory the daemon reads (STUDIO-729).
+`hindsight` is the shared remote bank instead: point `memory.endpoint` at a deployment and give it
+`memory.api_key` — optional for an unauthenticated local one. A retained memory becomes recallable
+after the service's own extraction finishes, about 30s later.
 
 **The team room** is an append-only log read at hydration, not a message bus: identities are durable
 state rather than processes, so nobody receives and everybody catches up. It is JSONL under
