@@ -106,7 +106,7 @@ where
 /// child's stdin, then never writes to that pipe again (the supervisor closes its write end
 /// immediately after). This is the only place the bootstrap token is allowed to travel — never
 /// argv, never an inheritable env var, never `runtime.json`, never a log line.
-#[derive(Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct BootstrapMessage {
     pub token: String,
     pub socket_path: String,
