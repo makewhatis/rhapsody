@@ -1218,7 +1218,8 @@ impl Orchestrator {
             let (prev_hold, prev_unreadable, prev_superseded) = previous
                 .get(d.pr.as_str())
                 .copied()
-                .unwrap_or((None, false, false)); // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
+                .unwrap_or((None, false, false));
+            // A supersession APPEARING is its own transition (STUDIO-1005), for the capacity
             // annotations' reason one paragraph up: the head move is the news, and waiting out the
             // steady-state rate limit would leave the log repeating "still unaddressed" for a full
             // `RECONCILE_LOG_EVERY` window after the branch moved. Presence only — `current_head`
