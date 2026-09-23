@@ -267,10 +267,18 @@ impl RefreshCoordinator {
     /// (or its bounded error) under the cache key. The global concurrency semaphore is acquired HERE,
     /// so both the explicit operator POST (which calls this directly) and the spawned path are
     /// bounded by [`MAX_CONCURRENT_REFRESHES`].
+    ///
+    /// The permit is acquired BEFORE the provider binding and the status generation are snapshotted,
+    /// and no `.await` separates those two snapshots. A reload that lands while this refresh waits for
+    /// a permit (e.g. a Settings autosave moving or removing the provider) must not be partly visible:
+    /// if the binding were read first and the generation second, the refresh would contact the old
+    /// endpoint and then publish it as fresh under the new generation. A reload that lands after both
+    /// snapshots is caught by the post-discovery generation re-check below.
     pub async fn refresh_catalog(
         &self,
         provider_id: &str,
     ) -> Result<CatalogSnapshot, CatalogError> {
+        let _permit = self.permits.acquire().await;
         let config = match Self::lock(&self.providers).get(provider_id).cloned() {
             Some(config) => config,
             None => return Err(CatalogError::Unsupported),
@@ -278,13 +286,14 @@ impl RefreshCoordinator {
         let Some(guard) = self.begin_catalog_in_flight(provider_id) else {
             return Err(CatalogError::InFlight);
         };
-        let _permit = self.permits.acquire().await;
         let account = CredentialRef::for_provider(provider_id)
             .map(|r| r.account().to_string())
             .unwrap_or_default();
-        // The generation this refresh is scoped to. If a definition reload moves it while the
-        // discovery request is in flight, `apply_reload` has already invalidated every catalog; a
-        // late publish must not resurrect a stale list keyed to the old generation.
+        // The generation this refresh is scoped to. Snapshotted together with `config` above — no
+        // `.await` between them — so a reload cannot leave us holding the old binding under the new
+        // generation. If a definition reload moves the generation while the discovery request is in
+        // flight, `apply_reload` has already invalidated every catalog; a late publish must not
+        // resurrect a stale list keyed to the old generation.
         let generation = Self::lock(&self.status).generation();
         let observed = self
             .source
@@ -718,6 +727,66 @@ mod tests {
         assert!(
             peak >= 2,
             "the test must observe real overlap, otherwise it proves nothing (saw {peak})"
+        );
+    }
+
+    /// A discovery that records every endpoint it was asked to contact, so a test can prove which
+    /// binding a refresh actually used.
+    struct RecordingDiscovery {
+        endpoints: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ModelDiscovery for RecordingDiscovery {
+        async fn list_models(
+            &self,
+            request: DiscoveryRequest,
+        ) -> Result<DiscoveredCatalog, CatalogError> {
+            RefreshCoordinator::lock(&self.endpoints).push(request.endpoint.clone());
+            Ok(DiscoveredCatalog {
+                entries: vec![ModelEntry {
+                    id: "from-endpoint".into(),
+                    display_name: None,
+                    capabilities: Vec::new(),
+                }],
+                truncated: false,
+            })
+        }
+    }
+
+    // MUTATION GUARD (a reload that lands while a refresh waits for a permit must not be used
+    // stale): the refresh snapshots its binding and its status generation AFTER acquiring the global
+    // permit, with no `.await` between them. Re-inserting an await (the F2 permit) between the two
+    // snapshots makes the refresh contact the endpoint the operator moved away from and publish it
+    // under the new generation, and this reds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_while_waiting_for_a_permit_is_not_used_stale() {
+        let discovery = Arc::new(RecordingDiscovery {
+            endpoints: Mutex::new(Vec::new()),
+        });
+        let coordinator = RefreshCoordinator::with_now(
+            Arc::new(AlwaysPresent),
+            Arc::clone(&discovery) as Arc<dyn ModelDiscovery>,
+            fixed_now(0),
+        );
+        let _ = coordinator.apply_reload(1, &[config("https://old.example/v1")]);
+        // Hold every permit so the refresh below blocks waiting for one.
+        let held = Arc::clone(&coordinator.permits)
+            .acquire_many_owned(MAX_CONCURRENT_REFRESHES as u32)
+            .await
+            .expect("permits");
+        let runner = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move { runner.refresh_catalog("fireworks").await });
+        // Let the task reach the permit wait, then move the endpoint out from under it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = coordinator.apply_reload(2, &[config("https://new.example/v1")]);
+        drop(held);
+        let _ = task.await.expect("join");
+        let endpoints = RefreshCoordinator::lock(&discovery.endpoints);
+        assert_eq!(
+            endpoints.as_slice(),
+            ["https://new.example/v1"],
+            "a refresh that ran after the reload must contact only the current endpoint"
         );
     }
 }

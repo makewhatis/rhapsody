@@ -145,21 +145,27 @@ impl ProviderRuntime {
 
     /// One provider's cache-only catalog. A configured provider with no cache yet answers an empty,
     /// unknown-aged snapshot (never misreported as a fetched empty list); an unknown id is `None`.
+    ///
+    /// `knows` is checked FIRST: a provider the current config no longer defines is a 404 even if a
+    /// cache entry somehow survived a removal. That is defence in depth for a refresh that publishes
+    /// after its provider was removed — the coordinator already refuses that publish, and the second
+    /// check keeps the route honest if it ever slips through.
     pub fn catalog(&self, provider_id: &str) -> Option<CatalogSnapshot> {
+        if !self.coordinator.knows(provider_id) {
+            return None;
+        }
         if let Some(snapshot) = self.coordinator.catalog_view(provider_id) {
             return Some(snapshot);
         }
-        self.coordinator
-            .knows(provider_id)
-            .then(|| CatalogSnapshot {
-                provider_id: provider_id.to_string(),
-                models: Vec::new(),
-                truncated: false,
-                cache_age_ms: None,
-                error: None,
-                error_message: None,
-                manual_entry_allowed: true,
-            })
+        Some(CatalogSnapshot {
+            provider_id: provider_id.to_string(),
+            models: Vec::new(),
+            truncated: false,
+            cache_age_ms: None,
+            error: None,
+            error_message: None,
+            manual_entry_allowed: true,
+        })
     }
 
     /// The explicit, bounded catalog refresh (`POST …/models/refresh`). Unknown provider ⇒
@@ -350,6 +356,43 @@ mod tests {
         panic!(
             "status did not converge; statuses={:?}",
             provider_runtime.statuses()
+        );
+    }
+
+    /// STUDIO-990 (P9), J1 removal variant: a reload that removes the last provider must drop its
+    /// status AND its catalog, so `GET /api/v1/providers/{id}` and `.../{id}/models` stop answering
+    /// for an id the current config no longer defines.
+    ///
+    /// MUTATION GUARD: restoring an `if providers.is_empty() { return; }` early return in
+    /// `apply_providers` would skip the reload, keep the removed provider alive, and red this.
+    /// (`catalog`'s `knows` check is defence in depth on top of this — the coordinator already
+    /// refuses a publish that raced a removal, so that ordering is not separately observable here.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_the_last_provider_drops_its_status_and_catalog() {
+        let broker = crate::broker::BrokerRuntime::bind().expect("bind the loopback broker");
+        let provider_runtime = ProviderRuntime::new(unavailable_owner(), broker.registrar());
+        let providers =
+            BTreeMap::from([("fireworks".to_string(), provider_definition("fireworks"))]);
+        assert_eq!(
+            provider_runtime.apply_providers(&providers, 3_600_000),
+            1,
+            "the new provider must schedule exactly one status refresh"
+        );
+        assert!(provider_runtime.status("fireworks").is_some());
+        assert!(provider_runtime.catalog("fireworks").is_some());
+
+        assert_eq!(
+            provider_runtime.apply_providers(&BTreeMap::new(), 3_600_000),
+            0,
+            "an empty set schedules nothing"
+        );
+        assert!(
+            provider_runtime.status("fireworks").is_none(),
+            "a removed provider must not keep serving a status"
+        );
+        assert!(
+            provider_runtime.catalog("fireworks").is_none(),
+            "a removed provider must 404 its catalog, not serve a stale list"
         );
     }
 }
