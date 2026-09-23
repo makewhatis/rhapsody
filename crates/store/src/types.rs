@@ -239,6 +239,50 @@ pub struct RunProvenance {
     pub model_origin: String,
     /// Derived from the recorded harness + model, not from live config.
     pub provider: String,
+    /// The config tier that supplied `provider` (STUDIO-987), the third of the three origins. For a
+    /// legacy/inferred provider — one DERIVED from the model rather than selected by a configured
+    /// tier — this records the resolver's `default` spelling ("an implicit value with no configured
+    /// tier behind it"). Empty only when `provider` itself is empty, exactly as `model_origin` is
+    /// empty when `model` is. A provider-first run records the resolver's real tier (`global`,
+    /// `profile`, `ticket`, …). Persisted at dispatch beside the value, never re-derived at render.
+    pub provider_origin: String,
+}
+
+/// The authority string persisted for a generic OpenAI-compatible provider usage report (STUDIO-987,
+/// `provider-broker-design.md` §7.3). V1's generic adapter is measurement only — even a
+/// syntactically valid report can under-report — so it is never authoritative for admission and the
+/// API must label it unverified rather than "measured".
+pub const USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED: &str = "provider_reported_unverified";
+
+/// The broker usage-completeness record for one run (STUDIO-987, `provider-broker-design.md` §7.3).
+/// Rhapsody-only: the frozen Go reference accounts for no broker at all.
+///
+/// This is deliberately a SEPARATE row from [`RunProvenance`]: provenance is the immutable identity a
+/// run was dispatched with, written once before the worker starts, whereas usage is settled at run
+/// end from the broker's finalized turn ledger. Keeping them apart means a late usage write can never
+/// rewrite what the run says it ran on. A run with no row is "no broker usage recorded" — the
+/// ordinary state for every native-login run — which is why the read returns `None`.
+///
+/// The two token fields are SEPARATE on purpose. `provider_reported_tokens` is the provider's own
+/// report (measurement, never authority); `reserved_tokens` is the conservative admission charge the
+/// broker actually consumed and can never be released by a report. An unknown/aborted request keeps
+/// its full reservation and is counted in `unknown_usage_requests` — it is NOT relabeled as
+/// provider-reported usage, so the two figures never double-count the same request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    /// The provider-reported token total, or `None` when no forwarded request produced a usable
+    /// report. `None` is distinct from a reported zero.
+    pub provider_reported_tokens: Option<i64>,
+    /// The conservative admission-reservation total charged against the turn/session/optional day
+    /// caps. Never reduced by a provider report in the generic adapter.
+    pub reserved_tokens: i64,
+    /// [`USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED`] when at least one request produced a usable
+    /// report; empty when none did. Never an "exact"/"measured" spelling.
+    pub usage_authority: String,
+    /// True when at least one forwarded request never produced a usable report.
+    pub usage_incomplete: bool,
+    /// The bounded count of forwarded requests whose provider usage was never reported.
+    pub unknown_usage_requests: i64,
 }
 
 /// The windowed token tally for ONE provider — the cost question STUDIO-909 exists to answer

@@ -73,6 +73,25 @@ pub(crate) fn derive_provider(harness: &str, model: &str) -> String {
     }
 }
 
+/// The ORIGIN of the provider [`derive_provider`] derived (STUDIO-987): the third provenance origin,
+/// recorded beside the value so a later reader can tell a selected provider from an inferred one.
+///
+/// No configured provider tier selects a provider on this build's dispatch path yet — the pure
+/// resolver (STUDIO-986) is not wired into dispatch, which is the later PB5/P6 slice. So a non-empty
+/// provider here is always INFERRED from the model, and the resolver's own spelling for "an implicit
+/// value with no configured tier behind it" is [`DEFAULT`](crate::selection::Origin::Default)
+/// — `"default"`. An empty provider has no origin at all, exactly as an empty model does.
+///
+/// When PB5 wires the resolver in, this becomes `resolved.origins.provider`, and a row's origin
+/// names the real tier (`global`, `profile`, `ticket`, …) instead.
+pub(crate) fn derive_provider_origin(provider: &str) -> String {
+    if provider.is_empty() {
+        String::new()
+    } else {
+        crate::selection::Origin::Default.as_str().to_string()
+    }
+}
+
 /// The time-based flush cadence for the async writer (~1s). Mirrors Go `flushInterval`.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -250,8 +269,10 @@ impl Orchestrator {
         } else {
             re.model_origin.clone()
         };
+        let provider = derive_provider(&harness, &model);
         store::RunProvenance {
-            provider: derive_provider(&harness, &model),
+            provider_origin: derive_provider_origin(&provider),
+            provider,
             harness,
             harness_origin: re.harness_origin.clone(),
             model,
