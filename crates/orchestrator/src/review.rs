@@ -875,6 +875,7 @@ mod tests {
                 labels: Vec::new(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             }],
             ..Teams::disabled()
         });
@@ -1156,6 +1157,7 @@ mod tests {
                 labels: Vec::new(),
                 bank: String::new(),
                 max_concurrent: 0,
+                ..Default::default()
             });
         }
         o.eff.as_mut().expect("eff").cfg.budgets.insert(

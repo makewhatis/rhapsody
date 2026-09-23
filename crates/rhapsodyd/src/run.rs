@@ -1329,14 +1329,24 @@ fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_pa
     else {
         return;
     };
-    let (mut broken, mut drifted) = (Vec::new(), Vec::new());
+    let (mut broken, mut drifted, mut routing) = (Vec::new(), Vec::new(), Vec::new());
     for issue in rhapsody_config::profiles::check_roster(teams, &dir) {
         match issue {
             i @ rhapsody_config::profiles::RosterIssue::Unresolvable { .. } => {
                 broken.push(i.to_string())
             }
             i @ rhapsody_config::profiles::RosterIssue::Drift { .. } => drifted.push(i.to_string()),
+            i @ rhapsody_config::profiles::RosterIssue::Routing { .. } => {
+                routing.push(i.to_string())
+            }
         }
+    }
+    if !routing.is_empty() {
+        tracing::warn!(
+            identities = %routing.join("; "),
+            "teams roster has invalid routing fields (STUDIO-985); a run routed to one of these \
+             identities is refused rather than dispatched on a fallback harness/provider/model"
+        );
     }
     if !broken.is_empty() {
         tracing::warn!(
