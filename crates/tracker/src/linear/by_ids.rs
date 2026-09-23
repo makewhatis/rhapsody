@@ -84,16 +84,39 @@ pub(super) async fn fetch_issue_labels_by_ids(
     .await
 }
 
+/// The `issue(id:)` envelope for the by-identifier description read (STUDIO-1034). `issue` is
+/// `Option` because Linear answers a single-object query with `null` for an identifier that
+/// matches nothing — the same "there is no ticket" the absent-node case meant before.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct IssueByIdentifierPage {
+    issue: Option<IssueByIdentifierNode>,
+}
+
+/// One `issue(id:)` node. `identifier` tolerates a JSON `null` like every other string in this
+/// adapter ([`super::decode::null_to_empty`]); `description` is `Option` because Linear declares it
+/// nullable.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct IssueByIdentifierNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
+    identifier: String,
+    description: Option<String>,
+}
+
 /// The DESCRIPTION of the issue with the given human identifier (e.g. `STUDIO-1034`), or `None`
 /// when no such issue is readable (STUDIO-1034).
 ///
 /// A single-purpose read, Rhapsody-only: a ticketless review has no Linear access, so the daemon
 /// reads the origin ticket's acceptance criteria here, off the control task, and quotes them into
-/// the review prompt. `identifier` compares case-insensitively — Linear stores it uppercase, but a
-/// caller naming a ticket from prose should not have to match its casing. An empty or whitespace
-/// identifier returns `None` with no API call, mirroring the other by-id reads' empty shortcut. An
-/// empty or whitespace DESCRIPTION is `None` too: "the ticket says nothing" and "there is no
-/// ticket" reach the prompt as the same honest statement.
+/// the review prompt. It resolves through `issue(id:)` — Linear's `IssueFilter` has no `identifier`
+/// field, so the filter form is rejected at validation (see
+/// [`query::QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER`]) — and still compares the returned
+/// `identifier` case-insensitively, since Linear stores it uppercase while a caller naming a ticket
+/// from prose should not have to match its casing. An empty or whitespace identifier returns `None`
+/// with no API call, mirroring the other by-id reads' empty shortcut. An empty or whitespace
+/// DESCRIPTION is `None` too: "the ticket says nothing" and "there is no ticket" reach the prompt as
+/// the same honest statement.
 pub(super) async fn fetch_issue_description_by_identifier(
     c: &Client,
     identifier: &str,
@@ -105,21 +128,14 @@ pub(super) async fn fetch_issue_description_by_identifier(
     super::client::traced(
         crate::tracker_span!("fetch_issue_description"),
         async move {
-            let vars = serde_json::json!({ "identifier": identifier, "first": 1 });
-            let page: IdsPage = c
+            let vars = serde_json::json!({ "id": identifier });
+            let page: IssueByIdentifierPage = c
                 .do_graphql(query::QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER, Some(vars))
                 .await?;
-            page.issues
-                .nodes
-                .warn_dropped("fetch issue description by identifier");
             Ok(page
-                .issues
-                .nodes
-                .kept
-                .into_iter()
-                .map(|n| c.normalize_issue(n))
-                .find(|iss| iss.identifier.eq_ignore_ascii_case(identifier))
-                .and_then(|iss| iss.description)
+                .issue
+                .filter(|n| n.identifier.eq_ignore_ascii_case(identifier))
+                .and_then(|n| n.description)
                 .filter(|d| !d.trim().is_empty()))
         },
     )
@@ -253,15 +269,10 @@ mod tests {
         let seen = Arc::new(Mutex::new(Option::<(String, String)>::None));
         let seen_h = Arc::clone(&seen);
         let (c, _server) = new_test_client(move |req| {
-            let id = req
-                .var("identifier")
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
+            let id = req.var_str("id").unwrap_or_default().to_string();
             *seen_h.lock().expect("seen") = Some((req.query.clone(), id));
             MockResp::ok(
-                r#"{"data":{"issues":{"nodes":[
-                    {"identifier":"STUDIO-1034","description":"the acceptance text"}
-                ]}}}"#,
+                r#"{"data":{"issue":{"identifier":"STUDIO-1034","description":"the acceptance text"}}}"#,
             )
         })
         .await;
@@ -273,11 +284,26 @@ mod tests {
             .expect("description");
 
         let (query, id) = seen.lock().expect("seen").clone().expect("request seen");
+        // The query resolves by `issue(id:)`. Linear's `IssueFilter` has NO `identifier` field, so
+        // the old `issues(filter: { identifier: { eq: … } })` form was rejected at validation and
+        // every live read degraded to "no ticket available" (the whole feature never lit up).
         assert!(
-            query.contains("identifier: { eq: $identifier }"),
-            "the query must filter by identifier: {query}"
+            query.contains("issue(id: $id)"),
+            "the query must resolve by issue(id:), not an identifier filter: {query}"
         );
-        assert_eq!(id, "studio-1034");
+        assert!(
+            query.contains("identifier description"),
+            "the query must ask for the two fields the read uses: {query}"
+        );
+        assert!(
+            query.contains("$id: String!"),
+            "the query must type its argument as String!: {query}"
+        );
+        assert!(
+            !query.contains("filter:"),
+            "no filter is used — IssueFilter has no identifier field: {query}"
+        );
+        assert_eq!(id, "studio-1034", "the id variable is the raw identifier");
         assert_eq!(got.as_deref(), Some("the acceptance text"));
     }
 
@@ -285,15 +311,22 @@ mod tests {
     async fn fetch_description_by_identifier_empty_or_missing_is_none() {
         let called = Arc::new(AtomicBool::new(false));
         let called_h = Arc::clone(&called);
-        let (c, _server) = new_test_client(move |_req| {
+        let (c, _server) = new_test_client(move |req| {
             called_h.store(true, Ordering::SeqCst);
-            // A null description, and an empty one, are both "the ticket says nothing".
-            MockResp::ok(
-                r#"{"data":{"issues":{"nodes":[
-                    {"identifier":"STUDIO-1","description":null},
-                    {"identifier":"STUDIO-2","description":"   "}
-                ]}}}"#,
-            )
+            // A null description, an empty one, a null issue (nothing matched), and a node whose
+            // identifier is NOT what was asked for are all "no ticket".
+            match req.var_str("id").unwrap_or_default() {
+                "STUDIO-1" => MockResp::ok(
+                    r#"{"data":{"issue":{"identifier":"STUDIO-1","description":null}}}"#,
+                ),
+                "STUDIO-2" => MockResp::ok(
+                    r#"{"data":{"issue":{"identifier":"STUDIO-2","description":"   "}}}"#,
+                ),
+                "STUDIO-3" => {
+                    MockResp::ok(r#"{"data":{"issue":{"identifier":"OTHER-3","description":"x"}}}"#)
+                }
+                _ => MockResp::ok(r#"{"data":{"issue":null}}"#),
+            }
         })
         .await;
 
@@ -308,6 +341,13 @@ mod tests {
                 .await
                 .expect("blank"),
             None
+        );
+        assert_eq!(
+            c.fetch_issue_description_by_identifier("STUDIO-3")
+                .await
+                .expect("wrong identifier"),
+            None,
+            "a resolved issue that is not the one asked for is not the ticket"
         );
         assert_eq!(
             c.fetch_issue_description_by_identifier("STUDIO-404")

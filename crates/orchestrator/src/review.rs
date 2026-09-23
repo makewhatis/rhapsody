@@ -1699,6 +1699,40 @@ mod tests {
         );
     }
 
+    /// STUDIO-1034: [`ReviewRun::checkout`] resolves the checkout's `origin_ticket` from the run's
+    /// `introduced_by` through the daemon's one origin-ticket join. This is the STEP the ticket
+    /// names — "resolve the origin ticket through the daemon's own origin-ticket join" — and the
+    /// worker reads the reviewer's acceptance source straight off `origin_ticket`. Dropping it to
+    /// `None` silently puts every review back on the author's own pull-request summary, and nothing
+    /// else in the suite notices; this test is what goes red instead.
+    #[test]
+    fn the_checkout_resolves_the_origin_ticket_from_introduced_by() {
+        let mut run = review_run("alice", HEAD_A);
+
+        run.introduced_by = "handoff:STUDIO-1034".to_string();
+        assert_eq!(
+            run.checkout().origin_ticket.as_deref(),
+            Some("STUDIO-1034"),
+            "a handoff origin must reach the checkout as the ticket key"
+        );
+
+        run.introduced_by = "adopt: STUDIO-7 ".to_string();
+        assert_eq!(
+            run.checkout().origin_ticket.as_deref(),
+            Some("STUDIO-7"),
+            "an adopted origin is trimmed to the ticket key too"
+        );
+
+        for origin in ["handoff", "handoff:", "console:operator", ""] {
+            run.introduced_by = origin.to_string();
+            assert_eq!(
+                run.checkout().origin_ticket,
+                None,
+                "an origin naming no ticket must resolve to None: {origin:?}"
+            );
+        }
+    }
+
     /// §16: with Teams off the whole subsystem is dormant. Nothing is dispatched, nothing is
     /// claimed, and — the part that is easy to get wrong — nothing is WRITTEN either.
     #[test]
