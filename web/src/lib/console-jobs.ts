@@ -121,6 +121,11 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
       // rather than resuming it. Folding it into the default `queued` would hide the one thing the
       // operator has to act on.
     case "token_ceiling":
+    // STUDIO-988: a preparation refused before any agent ran (a missing/denied credential). It is
+    // its own state — never queued work and never a failed agent attempt, because no agent ran — and
+    // it needs a person (fix the credential), exactly as a failure does. Blocking it keeps the
+    // deliberate refusal one pill away from real failed work rather than hiding it in `queued`.
+    case "refused":
       return "blocked";
     default:
       return "queued";

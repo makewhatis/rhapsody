@@ -227,6 +227,10 @@ const GH_ENRICH_BUDGET_DIVISOR: u32 = 2;
 pub enum Event {
     /// A poll-timer fire (Go `evTick`).
     Tick,
+    /// An explicit operator refresh (`POST /api/v1/refresh`, STUDIO-988): re-arms the refusal gate so
+    /// a suppressed fingerprint is re-probed immediately, then runs the ordinary tick. Distinct from
+    /// [`Event::Tick`] only in that re-arm.
+    Refresh,
     /// A worker task's terminal report (Go `evWorkerExit`).
     WorkerExit(EvWorkerExit),
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
@@ -424,6 +428,14 @@ pub enum Event {
         plan: Box<crate::runmerge::MergePlan>,
         outcome: crate::runmerge::MergeControlOutcome,
         reply: oneshot::Sender<()>,
+    },
+    /// An off-loop preparation's completion (STUDIO-988, P6; NEW beyond Go v0.4.0). The resolver task
+    /// sends this back; the control task accepts it only for the CURRENT token/config generation and
+    /// drops a stale payload without touching loop state.
+    DispatchPrepared {
+        id: String,
+        token: crate::prepare::PreparationToken,
+        completion: crate::prepare::PreparationCompletion,
     },
 }
 
@@ -625,6 +637,10 @@ impl Orchestrator {
     async fn handle(&mut self, ev: Event) {
         match ev {
             Event::Tick => self.on_tick().await,
+            Event::Refresh => {
+                self.rearm_refusal_gate();
+                self.on_tick().await;
+            }
             Event::WorkerExit(e) => self.on_worker_exit(e),
             Event::AgentUpdate(e) => self.on_agent_update(e),
             Event::TranscriptOpened { issue_id, path } => {
@@ -632,6 +648,11 @@ impl Orchestrator {
             }
             Event::Retry(e) => self.on_retry(e).await,
             Event::Reload => self.on_reload(),
+            Event::DispatchPrepared {
+                id,
+                token,
+                completion,
+            } => self.handle_dispatch_prepared(id, token, completion).await,
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
             }
@@ -932,6 +953,18 @@ impl Orchestrator {
                 tagged.iter().map(|t| (&t.iss, t.proj)),
                 std::time::Instant::now(),
             );
+            // STUDIO-988: an issue that dropped out of this tick's candidate set must not keep a
+            // preparation reservation / resolver task / slot — but ONLY when the board was actually
+            // READ. `poll_all_projects` `continue`s past a project whose fetch FAILED and reports it
+            // through `read_the_board`; acting on a partial candidate set would treat every issue of
+            // the failed project as departed and cancel its preparation (and, before the claim-held
+            // skip, lose a retry's claim and row). A pass that could not read the whole board must
+            // not act on what it did not see, the same fail-closed call STUDIO-949 made.
+            if read_the_board && !self.preparing.is_empty() {
+                let present: std::collections::HashSet<String> =
+                    tagged.iter().map(|t| t.iss.id.clone()).collect();
+                self.cancel_dropped_preparations(&present);
+            }
             let (picked, reopen, held_for_capacity) =
                 self.select_dispatch_multi_after_fetch(tagged, read_the_board);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
@@ -952,11 +985,12 @@ impl Orchestrator {
                 }
             }
             for (iss, route) in direct {
-                self.dispatch_issue(iss, None, route, String::new());
+                self.dispatch_or_prepare(iss, None, route, String::new());
             }
-            for ti in self.claim_winners(pool_picks).await {
-                let route = self.route_for(ti.proj);
-                self.dispatch_issue(ti.iss, None, route, String::new());
+            // Pool picks are PREPARED first (STUDIO-988): the cross-daemon claim election runs on
+            // acceptance, so a refusal leaves the ticket unassigned rather than claimed-and-moved.
+            for ti in pool_picks {
+                self.dispatch_or_prepare_pool(ti).await;
             }
             // Review-reopens: promote (Linear WRITE) THEN dispatch.
             for ti in reopen {
@@ -1022,6 +1056,12 @@ impl Orchestrator {
             issues.iter().map(|iss| (iss, None)),
             std::time::Instant::now(),
         );
+        // STUDIO-988: cancel any preparation whose issue dropped out of this tick's candidate set.
+        if !self.preparing.is_empty() {
+            let present: std::collections::HashSet<String> =
+                issues.iter().map(|i| i.id.clone()).collect();
+            self.cancel_dropped_preparations(&present);
+        }
         let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
@@ -1036,12 +1076,13 @@ impl Orchestrator {
                 .into_iter()
                 .map(|iss| TaggedIssue { iss, proj: None })
                 .collect();
-            for ti in self.claim_winners(pool_picks).await {
-                self.dispatch_issue(ti.iss, None, None, String::new());
+            // Prepared first, claimed on acceptance (STUDIO-988): see the multi-project ladder.
+            for ti in pool_picks {
+                self.dispatch_or_prepare_pool(ti).await;
             }
         } else {
             for iss in active {
-                self.dispatch_issue(iss, None, None, String::new());
+                self.dispatch_or_prepare(iss, None, None, String::new());
             }
         }
         for iss in reopen {
@@ -1062,7 +1103,9 @@ impl Orchestrator {
     }
 
     /// Builds the dispatch routing snapshot for a tagged pick's owning project (`None` proj ⇒ legacy).
-    fn route_for(&self, proj: Option<usize>) -> Option<DispatchRoute> {
+    /// `pub(crate)` because the pool preparation path (`prepare.rs`) re-derives the winning pick's
+    /// route at completion.
+    pub(crate) fn route_for(&self, proj: Option<usize>) -> Option<DispatchRoute> {
         let idx = proj?;
         let p = self.eff.as_ref()?.projects.get(idx)?;
         Some(DispatchRoute {
@@ -1391,24 +1434,62 @@ impl Orchestrator {
             };
             (tracker, eff.review_promote_state.clone())
         };
-        if let Err(e) = tracker
-            .move_issue_state(&iss.id, &iss.team_id, &promote_state)
-            .await
-        {
-            tracing::error!(issue_id = %iss.id, issue_identifier = %iss.identifier, promote_state = %promote_state, err = %e, "review-reopen promote failed; skipping (not dispatching un-promoted review issue)");
+        // With no resolver, preparation is inert: promote immediately and dispatch inline, exactly
+        // as before this feature existed.
+        if self.prepare_resolver.is_none() {
+            if let Err(e) = tracker
+                .move_issue_state(&iss.id, &iss.team_id, &promote_state)
+                .await
+            {
+                tracing::error!(issue_id = %iss.id, issue_identifier = %iss.identifier, promote_state = %promote_state, err = %e, "review-reopen promote failed; skipping (not dispatching un-promoted review issue)");
+                return;
+            }
+            tracing::info!(issue_id = %iss.id, issue_identifier = %iss.identifier, from_state = %iss.state, promote_state = %promote_state, "review-reopen: summoned ticket promoted and dispatched");
+            iss.state = promote_state;
+            if let Some(at) = iss.latest_summon_at {
+                self.pending_reopen_summons
+                    .insert(iss.id.clone(), (at, iss.latest_summon_body.clone()));
+            }
+            self.dispatch_or_prepare(iss, None, route, String::new());
             return;
         }
-        tracing::info!(issue_id = %iss.id, issue_identifier = %iss.identifier, from_state = %iss.state, promote_state = %promote_state, "review-reopen: summoned ticket promoted and dispatched");
-        iss.state = promote_state;
-        // STUDIO-649: the summons that triggered this reopen predates the run about to start, so the
-        // mid-run router can never deliver it. Capture it before the issue moves into dispatch, then
-        // seed the fresh run's operator mailbox with it (see `message::seed_reopen_summons`).
-        let reopen_summons = iss
+        // With a resolver installed, the promote (a Linear write) and the summons BOTH move after
+        // acceptance, exactly as the pool claim election did. A refused/suppressed/stale reopen then
+        // leaves the ticket in its review state with its summons intact, so the reopen ladder can
+        // re-offer it — the STUDIO-649 guarantee a pre-acceptance promote silently destroyed
+        // (STUDIO-988 review round 4, jimmy #3 / alice #4). STUDIO-649: the summons predates the run,
+        // so it is captured here and seeded into the fresh run's mailbox by `dispatch_issue` once the
+        // run is live.
+        let summon = iss
             .latest_summon_at
-            .map(|at| (iss.id.clone(), at, iss.latest_summon_body.clone()));
-        self.dispatch_issue(iss, None, route, String::new());
-        if let Some((id, at, body)) = reopen_summons {
-            self.seed_reopen_summons(&id, at, &body);
+            .map(|at| (at, iss.latest_summon_body.clone()));
+        let id = iss.id.clone();
+        let target = crate::prepare::PreparedTarget::Ticket {
+            issue: iss,
+            attempt: None,
+            route,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: Some(crate::prepare::ReopenPromote {
+                state: promote_state,
+                summon,
+            }),
+        };
+        match self.begin_preparation(target, false) {
+            // Unreachable: `prepare_resolver` was checked above and cannot change without an await
+            // between. Kept non-panicking so an impossible state can never crash the control task.
+            crate::prepare::BeginPreparation::NoResolver => {}
+            crate::prepare::BeginPreparation::Started(_) => {}
+            crate::prepare::BeginPreparation::AlreadyPreparing => {
+                tracing::debug!(issue_id = %id, "review-reopen preparation already in flight");
+            }
+            crate::prepare::BeginPreparation::AlreadyInFlight => {
+                tracing::debug!(issue_id = %id, "review-reopen skipped: already in flight");
+            }
+            crate::prepare::BeginPreparation::Suppressed => {
+                tracing::debug!(issue_id = %id, "review-reopen suppressed by the refusal gate");
+            }
         }
     }
 
@@ -1474,6 +1555,9 @@ impl Orchestrator {
         for re in self.running.values() {
             re.cancel.cancel();
         }
+        // STUDIO-988: an in-flight preparation is work this daemon is abandoning; cancel it so its
+        // resolver task stops waiting and a late completion is stale.
+        self.cancel_all_preparations();
         if let Some(t) = self.tick_timer.take() {
             t.abort();
         }
@@ -1804,7 +1888,8 @@ impl ControlHandle {
     pub fn refresh(&self) -> RefreshResult {
         // Best-effort: a send failure means the loop is already gone (the daemon is shutting down), in
         // which case the tick is moot; still report `queued` to match Go's unconditional result shape.
-        let _ = self.events.send(Event::Tick);
+        // STUDIO-988: an explicit refresh also re-arms the refusal gate (see `Event::Refresh`).
+        let _ = self.events.send(Event::Refresh);
         RefreshResult {
             queued: true,
             coalesced: false,
@@ -1896,6 +1981,7 @@ mod tests {
         DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
         proj_with_tracker, record_entries, running_entry, set_of,
     };
+    use chrono::TimeZone;
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
@@ -2883,6 +2969,173 @@ mod tests {
         assert!(
             entered.load(Ordering::SeqCst),
             "the parked call must have been reconcile's tracker round-trip"
+        );
+    }
+
+    // STUDIO-988: the review-reopen path shares the preparation machinery rather than dispatching
+    // inline. With a resolver installed, `promote_and_dispatch` must BEGIN a preparation; the Linear
+    // promote, the run and its reopening-summon mailbox seed all happen only on an accepted
+    // completion. Before this, the reopen path called `dispatch_issue` directly and bypassed the
+    // gate entirely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_reopen_begins_a_preparation_instead_of_dispatching_inline() {
+        use crate::testsupport::HangResolver;
+        let mut tr = Fake::new();
+        tr.move_to_type_name = "Todo".to_string();
+        let tracker = Arc::new(tr);
+        let (mut o, spawned) = orch_for_retry_multi(
+            vec![proj_with_tracker("a", Arc::clone(&tracker), "promptA")],
+            10,
+        );
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_promote_state = "Todo".to_string();
+        }
+        o.prepare_timeout = Duration::from_secs(3600);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let iss = issue("1", "MT-1", "In Review");
+        let route = o.route_for(Some(0));
+        o.promote_and_dispatch(iss, route).await;
+        assert!(
+            o.preparing.contains("1"),
+            "the reopen path must begin a preparation with a resolver installed"
+        );
+        assert!(
+            spawned.lock().expect("dispatched lock").is_empty(),
+            "no run may be dispatched before the preparation completes"
+        );
+        assert!(
+            tracker.move_calls().is_empty(),
+            "the Linear promote must be DEFERRED until acceptance, not run before preparation"
+        );
+    }
+
+    /// Wires the reopen scenario the round-4 tests share: an `In Review` ticket with a fresh summons,
+    /// a prior run so `review_reopen_eligible` reaches its store half, and a hanging resolver so the
+    /// test drives the completion by hand.
+    fn reopen_orch() -> (Orchestrator, Arc<Fake>, Issue) {
+        use crate::testsupport::HangResolver;
+        let mut tr = Fake::new();
+        let mut iss = issue("1", "MT-1", "In Review");
+        iss.team_id = "team-1".to_string();
+        iss.latest_summon_at = Some(
+            Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
+                .single()
+                .expect("summon instant"),
+        );
+        iss.latest_summon_body = "please reopen this ticket".to_string();
+        tr.by_id.insert("1".to_string(), iss.clone());
+        let tracker = Arc::new(tr);
+        let (mut o, _spawned) = orch_for_retry_multi(
+            vec![proj_with_tracker("a", Arc::clone(&tracker), "promptA")],
+            10,
+        );
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+            eff.active_states = set_of(&["todo", "in progress"]);
+            eff.review_promote_state = "In Progress".to_string();
+            // The multi-project reopen ladder offers a reopen from the OWNING project's
+            // `review_states`/`active_states`, and completion revalidation now reads those same sets
+            // (STUDIO-988 review round 6, alice #1). A fixture whose routed project named no review
+            // state would describe a reopen the ladder never offers; set both so it is reachable.
+            for p in eff.projects.iter_mut() {
+                p.review_states = set_of(&["in review"]);
+                p.active_states = set_of(&["todo", "in progress"]);
+            }
+        }
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        // A prior run that ended BEFORE the summons, so the summons lifts review-reopen eligibility.
+        crate::testsupport::seed_run(
+            store.as_ref(),
+            "1",
+            "MT-1",
+            Utc.with_ymd_and_hms(2029, 1, 1, 0, 0, 0)
+                .single()
+                .expect("run instant"),
+        );
+        o.set_store(store);
+        o.prepare_timeout = Duration::from_secs(3600);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        (o, tracker, iss)
+    }
+
+    fn ready_dispatch() -> crate::prepare::PreparationCompletion {
+        crate::prepare::PreparationCompletion {
+            outcome: crate::prepare::PreparationOutcome::Ready(
+                crate::prepare::PreparedDispatch::new("claude", "opus", "anthropic", "rev-1"),
+            ),
+            observed_revision: "rev-1".to_string(),
+            resolved: crate::prepare::PreparedSelection::default(),
+        }
+    }
+
+    // MUTATION GUARD: promote before preparation and a REFUSED reopen leaves the ticket moved out of
+    // the review state with no run — exactly the mutation a refusal must not leave behind
+    // (STUDIO-988 review round 4, jimmy #3 / alice #4).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_reopen_leaves_the_ticket_unpromoted_and_re_offerable() {
+        use crate::prepare::{PreparationCompletion, PreparationOutcome, RefusalReason};
+        let (mut o, tracker, iss) = reopen_orch();
+        let route = o.route_for(Some(0));
+        o.promote_and_dispatch(iss.clone(), route.clone()).await;
+        assert!(o.preparing.contains("1"), "the reopen begins a preparation");
+        assert!(tracker.move_calls().is_empty(), "nothing is promoted yet");
+
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: String::new(),
+                resolved: crate::prepare::PreparedSelection::default(),
+            },
+        )
+        .await;
+
+        assert!(
+            tracker.move_calls().is_empty(),
+            "a refused reopen must NOT have moved the ticket out of its review state"
+        );
+        assert!(
+            o.pending_reopen_summons.is_empty(),
+            "no summons is left for an unrelated later run"
+        );
+        // The gate re-arms (a credential/revision change) and the ticket is still reopen-eligible:
+        // the reopen ladder can offer it again with its summons intact.
+        o.rearm_refusal_gate();
+        o.promote_and_dispatch(iss, route).await;
+        assert!(
+            o.preparing.contains("1"),
+            "the refused reopen is re-offered rather than lost"
+        );
+    }
+
+    // MUTATION GUARD: promote before preparation and an ACCEPTED reopen cannot promote-then-seed
+    // atomically after acceptance; this test asserts the move happens only on the accepted
+    // completion and the summons reaches the fresh run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_reopen_promotes_and_seeds_the_summons() {
+        let (mut o, tracker, iss) = reopen_orch();
+        let route = o.route_for(Some(0));
+        o.promote_and_dispatch(iss, route).await;
+        assert!(
+            tracker.move_calls().is_empty(),
+            "nothing is promoted before acceptance"
+        );
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_dispatch())
+            .await;
+        let calls = tracker.move_calls();
+        assert_eq!(calls.len(), 1, "an accepted reopen promotes exactly once");
+        assert_eq!(calls[0].state_name, "In Progress");
+        let msg = o
+            .mailbox_try_recv("1")
+            .expect("the reopening summons must be seeded into the fresh run's mailbox");
+        assert!(
+            msg.contains("please reopen this ticket"),
+            "the summon body reaches the fresh run: {msg}"
         );
     }
 }
