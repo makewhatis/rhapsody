@@ -6112,6 +6112,42 @@ mod tests {
         assert!(live_reviewers(&o, 76).is_empty());
     }
 
+    /// **Acceptance: a reconciled row takes its in-memory state with it.** A row retired by the
+    /// reconciliation must not keep a stall warning latched or a capacity hold annotated, exactly as
+    /// `handle_review_dismiss` clears them — a hold that outlived its row would keep the
+    /// reconciliation sweep naming a round nothing owes.
+    ///
+    /// MUTATION: drop the two `remove` calls in `reconcile_review_watch`'s retire branch and this
+    /// reds.
+    #[test]
+    fn a_reconciled_row_leaves_no_latched_warning_or_capacity_hold() {
+        let (mut o, _d) = orch(ticketless(&["alice"]));
+        introduce(&o, row(77, "sol"));
+        let id = review_key(OWNER, REPO, 77, "sol");
+        o.review_unassignable
+            .insert(id.clone(), REVIEW_UNASSIGNABLE_SWEEPS);
+        o.review_capacity_held.insert(
+            id.clone(),
+            CapacityHold {
+                holders: 1,
+                separate: false,
+                recorded: chrono::Utc::now(),
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(77, HEAD_A)]);
+
+        assert_eq!(report.retired, 1, "the off-roster row is retired");
+        assert!(
+            !o.review_unassignable.contains_key(&id),
+            "a retired row must not keep a stall count latched"
+        );
+        assert!(
+            !o.review_capacity_held.contains_key(&id),
+            "a retired row must not keep a capacity hold annotated"
+        );
+    }
+
     /// **Acceptance: `review.required` outranks recency when picking survivors.** Bob completed the
     /// most recent review, but carol is pinned and must be the one kept.
     ///
