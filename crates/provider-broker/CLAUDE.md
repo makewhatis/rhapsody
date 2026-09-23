@@ -1,11 +1,14 @@
 # CLAUDE.md — crates/provider-broker
 
-Rhapsody-only crate (NOT a Go parity port): the protocol-neutral provider-broker core, slice PB1 of
+Rhapsody-only crate (NOT a Go parity port): the protocol-neutral provider-broker core (slice PB1)
+plus the private OpenAI-compatible loopback adapter (slice PB2) of
 `~/.rhapsody/docs/provider-broker-design.md` (approved 2026-09-19). Read `src/lib.rs`'s top-of-file
 doc comment first — it is the ownership map. There is no Go package to mirror here; the design record
 is authoritative.
 
 ## Layout
+
+PB1 (protocol-neutral custody/capabilities/receipts):
 
 - `lib.rs` — crate doc + public re-exports.
 - `error.rs` — `BrokerError`, `CredentialRejection`, `LimitViolation` (typed refusals, no strings).
@@ -15,7 +18,8 @@ is authoritative.
 - `policy.rs` — `BrokerLimits` + the `DEFAULT_BROKER_LIMITS` / `HARD_BROKER_LIMITS` constants and
   whole-block validation; `BrokerProtocol`; `SessionPolicy`.
 - `binding.rs` — `CredentialBinding`, its non-secret `BindingFingerprint`, and the move-only
-  `BoundCredentialLease` (API-key shape validation).
+  `BoundCredentialLease` (API-key shape validation; `expose_for_upstream` is the one crate-internal
+  key borrow).
 - `reservations.rs` — the atomic admission transaction and the releasable `ConcurrencyPermit`.
 - `ledger.rs` — `TurnOutcome` / `TurnLedger` (the finalized, non-secret receipt).
 - `state.rs` — private shared internals: `SessionInner`, `TurnInner`, `ReceiptSlot`, `CapacityOne`,
@@ -23,6 +27,24 @@ is authoritative.
 - `session.rs` — `BrokerSession` (custody) and `BrokerLedgerReceiver::arm_turn`.
 - `turn.rs` — `BrokerTurnAttempt` / `TurnAccess` / `TurnReceipt` / `CapabilityGrant`.
 - `broker.rs` — `Broker`, `BrokerRegistrationPlan`, `BrokerRegistration`, `lookup_capability`.
+
+PB2 (the loopback adapter):
+
+- `schema.rs` — the bounded JSON parser and the closed Chat Completions schema
+  (`validate_chat_request`); refuses unknown top-level fields, generation-control aliases and
+  remote-fetch content forms, and inserts/clamps `max_tokens`.
+- `upstream.rs` — `NormalizedEndpoint` (one exact base-URL join to `chat/completions`) and the fixed
+  `UpstreamClient` (redirects off, ambient proxies off, HTTP/1 only, platform roots, bounded
+  timeouts, no decompression). `forward_chat_completions` is `pub(crate)` on purpose — there is no
+  public generic forwarding primitive.
+- `redact.rs` — `StreamingRedactor`: exact-byte secret replacement that matches across chunk
+  boundaries with minimal look-behind.
+- `sse.rs` — `SseUsageObserver` (bounded line buffer; malformed/oversized usage becomes unknown).
+- `budget.rs` — the broker-wide weighted request-memory and buffered-response budgets.
+- `refusal.rs` — `PolicyRefusal` and the pinned non-retryable status/code/message table.
+- `listener.rs` — `BrokerListener`: the IPv4 loopback `TcpListener`, HTTP/1-only hyper driver,
+  exact `Host`/no-`Origin`/POST-only guards, bearer auth from the header block, body/memory bounds,
+  the one outbound request, and the backpressured redacted response stream.
 
 ## Invariants a change must not break
 
@@ -40,8 +62,18 @@ is authoritative.
 - **No panics on production paths.** `lock()` recovers poisoned mutexes; every error is a returned
   value; checked arithmetic everywhere.
 - **Dependency direction.** This crate must not depend on `rhapsody-agent`, `rhapsody-orchestrator`,
-  `rhapsody-httpapi`, `rhapsody-config`, or the desktop crate, and no HTTP stack yet
-  (`tests/dependency_guard.rs` enforces this against the manifest).
+  `rhapsody-httpapi`, `rhapsody-config`, or the desktop crate (`tests/dependency_guard.rs` enforces
+  this against the manifest). PB2 owns the one HTTP stack, so `axum`/`hyper`/`reqwest`/`tokio` are
+  expected dependencies and are deliberately not in that guard's forbidden list.
+- **The loopback is not authentication (PB2).** Every request must present exactly one
+  `Authorization: Bearer <capability>`; missing/repeated/malformed/unknown all collapse to the same
+  401 that closes the connection. The capability authenticates *into the broker* and must never be
+  attached to the outbound request; only the leased upstream key is. The reusable key must never
+  come back to the child — every response body passes through the exact-secret streaming redactor.
+- **One fixed destination (PB2).** `NormalizedEndpoint` joins the operator base exactly once to
+  `chat/completions`; redirects and ambient proxies are disabled, plaintext needs the typed
+  `allow_insecure_http` opt-in, and the forwarding entry point stays `pub(crate)` — no public generic
+  `forward(url, headers, body)` primitive may be added.
 
 ## Test patterns
 

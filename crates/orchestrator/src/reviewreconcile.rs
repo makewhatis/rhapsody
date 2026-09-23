@@ -934,7 +934,7 @@ impl Orchestrator {
                         current_head: self
                             .review_observed_head
                             .get(pr)
-                            .cloned()
+                            .map(|o| o.head.clone())
                             .unwrap_or_default(),
                         rounds,
                         findings,
@@ -3480,7 +3480,10 @@ mod store_tests {
         // The watcher observed a head that is NOT the escalation's: the author pushed after it.
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD_PUSHED.to_string(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
         );
 
         o.reconcile_review_divergence();
@@ -3545,7 +3548,10 @@ mod store_tests {
         );
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            one_char_later.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: one_char_later.clone(),
+            },
         );
         o.reconcile_review_divergence();
         let minimal = o.review_divergences();
@@ -3578,7 +3584,13 @@ mod store_tests {
         reviewed_row(o, "alice", "STUDIO-1005");
         escalated_at(o, HEAD);
         let pr = PrCoord::new("makewhatis", "rhapsody", 164);
-        o.review_observed_head.insert(pr.clone(), HEAD.to_string());
+        o.review_observed_head.insert(
+            pr.clone(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD.to_string(),
+            },
+        );
 
         // First sweep: the escalation is current.
         o.reconcile_review_divergence();
@@ -3586,7 +3598,13 @@ mod store_tests {
 
         // The author pushes. The very NEXT sweep must log the supersession, not wait for the
         // steady-state rate limit.
-        o.review_observed_head.insert(pr, HEAD_PUSHED.to_string());
+        o.review_observed_head.insert(
+            pr,
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
+        );
         let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
         assert!(
             events
@@ -3608,7 +3626,10 @@ mod store_tests {
         // The watcher observed exactly the head the escalation was computed at: no supersession.
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD.to_string(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD.to_string(),
+            },
         );
 
         o.reconcile_review_divergence();
@@ -3689,7 +3710,10 @@ mod store_tests {
         escalated_at(o, "");
         o.review_observed_head.insert(
             PrCoord::new("makewhatis", "rhapsody", 164),
-            HEAD_PUSHED.to_string(),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: HEAD_PUSHED.to_string(),
+            },
         );
 
         o.reconcile_review_divergence();

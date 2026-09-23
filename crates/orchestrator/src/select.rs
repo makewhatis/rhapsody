@@ -23,6 +23,7 @@ use rhapsody_core::{Issue, normalize_state};
 use crate::concurrency::{global_slots, state_limit};
 use crate::dispatch::{EligibilityGate, dispatch_cmp, eligibility};
 use crate::orchestrator::Orchestrator;
+use crate::retry::DispatchRoute;
 
 /// Pairs a candidate with the INDEX of the project it was polled from (into the effective's
 /// `projects`), so routing, slot accounting, and eligibility use the issue's owning project's
@@ -197,6 +198,18 @@ impl Orchestrator {
                     );
                     continue;
                 }
+                // STUDIO-988 review round 5 (alice #1): a REFUSED reopen stays in its review state
+                // (the promote is deferred to acceptance), so `review_reopen_eligible` keeps this
+                // branch live every tick. It must skip a gate-suppressed candidate BEFORE reserving
+                // the slot, exactly as the active branch below does — otherwise one refused reopen
+                // holds the only slot and starves the queue behind it for the whole gate window.
+                if self.preparation_suppressed(&iss, None) {
+                    tracing::debug!(
+                        issue_identifier = %iss.identifier,
+                        "skipping reopen: suppressed by the refusal gate until its next probe"
+                    );
+                    continue;
+                }
                 let pst = normalize_state(&eff.review_promote_state);
                 if count(&state_counts, &pst)
                     >= state_limit(
@@ -290,12 +303,7 @@ impl Orchestrator {
             {
                 None
             } else {
-                let load = impl_load.get_or_insert_with(|| {
-                    crate::teams::LoadSnapshot::from_running_and_retries(
-                        &self.running,
-                        &self.retry_attempts,
-                    )
-                });
+                let load = impl_load.get_or_insert_with(|| self.teammate_load());
                 // Routed against the load THIS pass has already created, not the frozen
                 // start-of-pass load — the dispatch loop re-routes per issue with `running`
                 // advanced, so anything else answers a different question than the one that
@@ -317,6 +325,17 @@ impl Orchestrator {
                     "skipping dispatch: teammate at max_concurrent"
                 );
                 *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
+            }
+            // STUDIO-988: a candidate the refusal gate is suppressing is NOT admitted — skipping it
+            // here, before the slot is spent, lets the next eligible candidate take the slot.
+            // Checking only in `begin_preparation` (after this pass) let one refused ticket hold a
+            // slot and starve the queue behind it.
+            if self.preparation_suppressed(&iss, None) {
+                tracing::debug!(
+                    issue_identifier = %iss.identifier,
+                    "skipping dispatch: suppressed by the refusal gate until its next probe"
+                );
                 continue;
             }
             if count(&state_counts, &st)
@@ -344,10 +363,19 @@ impl Orchestrator {
     /// a multi-slug project admits at most its cap of concurrent agents in total. `group == slug` for
     /// single-slug / legacy modes. Mirrors Go `runningInProjectGroup`.
     pub(crate) fn running_in_project_group(&self, group: &str) -> i64 {
-        self.running
+        let running = self
+            .running
             .values()
             .filter(|re| re.project_group == group)
-            .count() as i64
+            .count();
+        // STUDIO-988: a `preparing` reservation spends its project's slot before a `RunningEntry`
+        // exists, or a preparation could over-admit a project.
+        let preparing = self
+            .preparing
+            .values()
+            .filter(|e| e.project_group() == group)
+            .count();
+        i64::try_from(running + preparing).unwrap_or(i64::MAX)
     }
 
     /// How many running entries currently spend the IMPLEMENTATION global pool (STUDIO-950). With
@@ -361,6 +389,10 @@ impl Orchestrator {
     /// subtracted: only [`running_ticketless_reviews`](Orchestrator::running_ticketless_reviews)
     /// (the entries carrying `review` coordinates) belong to the separate pool.
     ///
+    /// STUDIO-988: the count also includes the `preparing` reservations — ticket preparations add to
+    /// the implementation total, review preparations subtract from it — so a preparation spends the
+    /// pool before its `RunningEntry` exists.
+    ///
     /// `pub(crate)` because the RETRY ladder
     /// ([`on_retry`](Orchestrator::on_retry)) is a third implementation draw that dispatches straight
     /// from itself, bypassing both ladders above — it must ask the same question or a due retry is
@@ -372,9 +404,11 @@ impl Orchestrator {
     /// inherits `max_concurrent_agents` the project gate can bind first — see the README's
     /// STUDIO-950 entry, which says so.
     pub(crate) fn implementation_pool_holders(&self) -> i64 {
-        let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
+        // STUDIO-988: the `preparing` reservations are in-flight work too — a preparation must count
+        // against the global pool before its `RunningEntry` exists, or two concurrent paths over-admit.
+        let total = i64::try_from(self.running.len() + self.preparing.len()).unwrap_or(i64::MAX);
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
-            Some(_) => (total - self.running_ticketless_reviews()).max(0),
+            Some(_) => (total - self.ticketless_review_holders()).max(0),
             None => total,
         }
     }
@@ -527,6 +561,24 @@ impl Orchestrator {
                     );
                     continue;
                 }
+                // STUDIO-988 review round 5 (alice #1): see the single-project ladder. The reopen
+                // path spends the global, per-project and promote-state budgets below, so a
+                // suppressed reopen must be skipped FIRST — with the SAME route `promote_and_dispatch`
+                // will resolve from the project index, or the gate keys would not agree.
+                let reopen_route = DispatchRoute {
+                    slug: p.slug.clone(),
+                    group: p.group.clone(),
+                    repo: p.repo.clone(),
+                    model: p.model.clone(),
+                    workspace_mode: p.workspace_mode.clone(),
+                };
+                if self.preparation_suppressed(&ti.iss, Some(&reopen_route)) {
+                    tracing::debug!(
+                        issue_identifier = %ti.iss.identifier,
+                        "skipping reopen: suppressed by the refusal gate until its next probe"
+                    );
+                    continue;
+                }
                 if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
                     continue;
                 }
@@ -614,12 +666,7 @@ impl Orchestrator {
             {
                 None
             } else {
-                let load = impl_load.get_or_insert_with(|| {
-                    crate::teams::LoadSnapshot::from_running_and_retries(
-                        &self.running,
-                        &self.retry_attempts,
-                    )
-                });
+                let load = impl_load.get_or_insert_with(|| self.teammate_load());
                 // Routed against the load THIS pass has already created, not the frozen
                 // start-of-pass load — the dispatch loop re-routes per issue with `running`
                 // advanced, so anything else answers a different question than the one that
@@ -641,6 +688,22 @@ impl Orchestrator {
                     "skipping dispatch: teammate at max_concurrent"
                 );
                 *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
+            }
+            // STUDIO-988: a gate-suppressed candidate is skipped BEFORE any slot is spent, so the
+            // next eligible candidate takes it — see the single-project ladder above.
+            let suppression_route = DispatchRoute {
+                slug: p.slug.clone(),
+                group: p.group.clone(),
+                repo: p.repo.clone(),
+                model: p.model.clone(),
+                workspace_mode: p.workspace_mode.clone(),
+            };
+            if self.preparation_suppressed(&ti.iss, Some(&suppression_route)) {
+                tracing::debug!(
+                    issue_identifier = %ti.iss.identifier,
+                    "skipping dispatch: suppressed by the refusal gate until its next probe"
+                );
                 continue;
             }
             if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
@@ -1396,6 +1459,88 @@ mod tests {
         let held = o.human_holds.held();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].project, "a");
+    }
+
+    // STUDIO-988 review round 5 (alice #1): a REFUSED reopen stays in its review state (the promote
+    // is deferred to acceptance), so this ladder re-enters the reopen branch every tick. Before the
+    // fix the branch reserved the only slot BEFORE `begin_preparation` could report `Suppressed`, so
+    // one refused reopen starved an eligible lower-priority Todo behind it for the whole gate window.
+    //
+    // MUTATION GUARD: drop the `preparation_suppressed` skip from the single-project reopen branch
+    // and this reds with `active=[] reopen=["A-1"]`.
+    #[test]
+    fn a_refused_reopen_does_not_spend_the_only_slot() {
+        use crate::prepare::ticket_gate_key;
+        use crate::testsupport::HangResolver;
+        let mut o = orch_for_reopen("A-1");
+        o.eff.as_mut().expect("eff").max_concurrent = 1;
+        o.now = Box::new(|| Utc.with_ymd_and_hms(2030, 6, 1, 0, 0, 0).unwrap());
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        // The higher-priority review ticket, and a gate entry for exactly its (identity, selection).
+        let mut review = summoned_review_issue(false);
+        review.priority = Some(1);
+        o.refusal_gate.record(
+            &ticket_gate_key(&review, None),
+            "credential_absent",
+            "",
+            (o.now)(),
+        );
+        let mut low = issue("2", "A-2", "Todo");
+        low.priority = Some(3);
+
+        let (active, reopen, _) = o.select_dispatch_with_reopens(vec![review, low]);
+        assert!(
+            reopen.is_empty(),
+            "a gate-suppressed reopen must not reserve the only slot"
+        );
+        assert_eq!(active.len(), 1, "the slot frees for the next candidate");
+        assert_eq!(active[0].identifier, "A-2");
+    }
+
+    // The SAME starvation on the ladder a `projects:` install actually runs (STUDIO-988 review round
+    // 5, alice #1). MUTATION GUARD: drop the multi-project reopen branch's skip and this reds while
+    // the single-project test above still passes.
+    #[test]
+    fn a_refused_reopen_does_not_spend_the_only_slot_in_the_multi_project_ladder() {
+        use crate::prepare::ticket_gate_key;
+        use crate::testsupport::HangResolver;
+        let mut projects = vec![proj("a", 10, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let mut o = orch_for_multi(1, projects, None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+        o.now = Box::new(|| Utc.with_ymd_and_hms(2030, 6, 1, 0, 0, 0).unwrap());
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+
+        let mut review = summoned_review_issue(false);
+        review.priority = Some(1);
+        let route = o.route_for(Some(0));
+        o.refusal_gate.record(
+            &ticket_gate_key(&review, route.as_ref()),
+            "credential_absent",
+            "",
+            (o.now)(),
+        );
+        let mut low = issue("2", "A-2", "Todo");
+        low.priority = Some(3);
+
+        let (picked, reopen, _) =
+            o.select_dispatch_multi_with_reopens(tag_for(0, vec![review, low]));
+        assert!(
+            reopen.is_empty(),
+            "the multi-project ladder must skip a gate-suppressed reopen before reserving the only slot"
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].iss.identifier, "A-2");
     }
 
     // STUDIO-949 round 4: the review-state branch is the THIRD site of the class round 3 fixed at the
@@ -2450,6 +2595,77 @@ mod tests {
         let (picked, _, held) =
             o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])]);
         assert!(picked.is_empty(), "alice's one seat is taken");
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// **A teammate's seat is spent by an in-flight PREPARATION, not only by a `RunningEntry`
+    /// (STUDIO-988 review round 7, sol #2).** A `preparing` reservation has no running entry yet, so
+    /// seeding the ladder's load from `running`/`retry_attempts` alone reads alice idle and admits a
+    /// second ticket past `max_concurrent` on a later tick. The reservation retains its planned
+    /// teammate, and the ladder's snapshot folds it in.
+    ///
+    /// MUTATION GUARD: drop `PreparingEntry::planned_identity` from `Orchestrator::teammate_load`
+    /// (seed the ladders from `from_running_and_retries` only) and the second ticket is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hanging_preparation_holds_its_teammates_seat_in_the_single_project_ladder() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let target = PreparedTarget::Ticket {
+            issue: teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        let (picked, _, held) =
+            o.select_dispatch_with_reopens(vec![teams_issue("2", "MT-2", &["rhapsody:@alice"])]);
+        assert!(
+            picked.is_empty(),
+            "alice's one seat is spent by the in-flight preparation"
+        );
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// The SAME protection on the ladder a `projects:` install actually runs (STUDIO-988 review
+    /// round 7, sol #2). MUTATION GUARD: drop the preparing fold from the multi ladder and the
+    /// second ticket is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hanging_preparation_holds_its_teammates_seat_in_the_multi_project_ladder() {
+        use crate::prepare::{BeginPreparation, PreparedTarget};
+        use crate::testsupport::HangResolver;
+        let mut o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 10, HashMap::new())]);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        let target = PreparedTarget::Ticket {
+            issue: teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            attempt: None,
+            route: o.route_for(Some(0)),
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: Some(0),
+            reopen: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![teams_issue("2", "MT-2", &["rhapsody:@alice"])],
+        ));
+        assert!(
+            picked.is_empty(),
+            "alice's one seat is spent by the in-flight preparation"
+        );
         assert_eq!(held.get("alice").copied(), Some(1));
     }
 
