@@ -132,6 +132,16 @@ pub struct BreakerPlan {
     pub reason: String,
 }
 
+/// Whether a crossing applies the `rhapsody:human` hold. A ROUND or SPEND crossing holds; a
+/// manager ESCALATION only notifies (the loop is already stopped by the adjudication). Both
+/// [`perform_crossing`] and [`crossing_body`] read this one predicate so the headline the operator
+/// reads can never disagree with whether the label was actually written.
+fn crossing_applies_hold(kinds: &[CrossingKind]) -> bool {
+    kinds
+        .iter()
+        .any(|k| matches!(k, CrossingKind::Rounds | CrossingKind::Spend))
+}
+
 impl BreakerPlan {
     /// The pull request URL, for the notification body.
     pub fn pr_url(&self) -> String {
@@ -179,10 +189,7 @@ pub fn crossing_body(plan: &BreakerPlan) -> String {
     // Only a ROUND or SPEND crossing applies the hold (see `perform_crossing`); a manager
     // ESCALATION notifies without holding. The headline must match, or every channel and the room
     // tell the operator a `rhapsody:human` label exists that was never applied and never will be.
-    let held = plan
-        .kinds
-        .iter()
-        .any(|k| matches!(k, CrossingKind::Rounds | CrossingKind::Spend));
+    let held = crossing_applies_hold(&plan.kinds);
     let mut body = if held {
         format!(
             "**{ticket}** crossed its {crossed} limit on `{pr}` — the ticket is now held \
@@ -561,11 +568,9 @@ pub async fn perform_crossing(plan: &BreakerPlan, deps: &BreakerDeps, at: DateTi
     // 1. The hold, first: stopping NEW work is the point, and the operator can act the moment the
     //    notification lands. Only a ROUND or SPEND crossing holds — a manager escalation is a
     //    decision to NOTIFY (the loop is already stopped by the adjudication), not a new hold.
-    let should_hold = plan
-        .kinds
-        .iter()
-        .any(|k| matches!(k, CrossingKind::Rounds | CrossingKind::Spend));
-    if should_hold && let Some(hold) = deps.hold.as_ref() {
+    if crossing_applies_hold(&plan.kinds)
+        && let Some(hold) = deps.hold.as_ref()
+    {
         hold.hold(&plan.ticket, &plan.issue_id, &plan.team_id).await;
     }
     // 2. One line to the team room. The ticket is the ref (it re-grounds against the candidate map).
