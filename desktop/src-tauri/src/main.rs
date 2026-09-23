@@ -185,6 +185,11 @@ fn run() -> tauri::Result<()> {
         // pickers (frontend calls `open` from @tauri-apps/plugin-dialog). Gated by `dialog:allow-open`
         // in capabilities/default.json — without that grant the IPC is silently denied at runtime.
         .plugin(tauri_plugin_dialog::init())
+        // STUDIO-1026: the native macOS notification behind `notify.macos`. The webview shows each
+        // pending notification the daemon queues on `/api/v1/state` via the plugin's JS API
+        // (bindings.ts `notifyNative`); the `notification:allow-*` grants live in
+        // capabilities/default.json (a missing grant is silently denied at runtime).
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             status,
             app_version,

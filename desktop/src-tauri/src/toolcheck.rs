@@ -192,40 +192,60 @@ mod tests {
     /// above any plausible stall. Production's 5s [`DEFAULT_TIMEOUT`] is unchanged.
     const GENEROUS_TIMEOUT: Duration = Duration::from_secs(60);
 
-    /// A freshly-created scratch directory under the system temp dir that is removed on drop.
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique scratch directory removed on drop (STUDIO-1031). `Deref`s to `Path`, so existing
+    /// `let dir = temp_dir(); dir.join(..)` call sites keep working while the directory is now
+    /// cleaned up at the end of the test.
     ///
     /// Uniqueness comes from pid + a nanosecond nonce + a per-process counter, so a **reused** pid —
     /// two processes over time that happened to draw the same pid — can never reopen the previous
     /// process's directory. `remove_dir_all` before `create_dir_all` is the belt to that braces:
-    /// even an exactly-reused name starts empty. Mirrors the store's scratch-dir fix (STUDIO-1027).
-    struct TempDir(PathBuf);
+    /// even an exactly-reused name starts empty.
+    struct TempDir {
+        path: PathBuf,
+    }
 
     impl TempDir {
-        fn new() -> Self {
-            static N: AtomicU64 = AtomicU64::new(0);
+        fn new() -> TempDir {
+            let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let path = std::env::temp_dir().join(format!(
-                "rhapsody-d4-tool-{}-{nonce}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
+                "rhapsody-d4-tool-{}-{n}-{nonce}",
+                std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("create temp dir");
-            TempDir(path)
+            TempDir { path }
         }
+    }
 
-        fn path(&self) -> &Path {
-            &self.0
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
+    }
+
+    fn temp_dir() -> TempDir {
+        TempDir::new()
     }
 
     /// Writes an executable shell stub that prints `output` and exits `code`. Mirror of `writeFakeTool`.
@@ -278,16 +298,13 @@ mod tests {
     // with detail.
     #[tokio::test]
     async fn probe_detects_presence_version_and_health() {
-        let dir = TempDir::new();
-        write_fake_tool(dir.path(), "claude", "1.2.3 (Claude Code)", 0);
-        write_fake_tool(dir.path(), "git", "git version 2.40.0", 0);
-        write_fake_tool(dir.path(), "gt", "broken", 1); // present but exits non-zero (unhealthy)
+        let dir = temp_dir();
+        write_fake_tool(&dir, "claude", "1.2.3 (Claude Code)", 0);
+        write_fake_tool(&dir, "git", "git version 2.40.0", 0);
+        write_fake_tool(&dir, "gt", "broken", 1); // present but exits non-zero (unhealthy)
         // gh is intentionally absent.
 
-        let p = prober(
-            vec![dir.path().to_string_lossy().into_owned()],
-            HashMap::new(),
-        );
+        let p = prober(vec![dir.to_string_lossy().into_owned()], HashMap::new());
         let rs = p.probe(&default_tools()).await;
 
         let claude = result_by_name(&rs, "claude");
@@ -295,7 +312,7 @@ mod tests {
             claude.found && claude.healthy,
             "claude = {claude:?}; want found+healthy"
         );
-        assert_eq!(claude.path, dir.path().join("claude").to_string_lossy());
+        assert_eq!(claude.path, dir.join("claude").to_string_lossy());
         assert!(
             !claude.version.is_empty(),
             "claude.version empty; want the parsed version line"
@@ -322,16 +339,13 @@ mod tests {
     // not on the search dirs (the file-picker override from the UI).
     #[tokio::test]
     async fn probe_honors_per_tool_override() {
-        let search_dir = TempDir::new();
-        let other_dir = TempDir::new();
-        let gh_path = write_fake_tool(other_dir.path(), "gh", "gh version 2.50.0", 0);
+        let search_dir = temp_dir();
+        let other_dir = temp_dir();
+        let gh_path = write_fake_tool(&other_dir, "gh", "gh version 2.50.0", 0);
 
         let mut overrides = HashMap::new();
         overrides.insert("gh".to_string(), gh_path.to_string_lossy().into_owned());
-        let p = prober(
-            vec![search_dir.path().to_string_lossy().into_owned()],
-            overrides,
-        );
+        let p = prober(vec![search_dir.to_string_lossy().into_owned()], overrides);
         let rs = p.probe(&default_tools()).await;
 
         let gh = result_by_name(&rs, "gh");
@@ -350,15 +364,12 @@ mod tests {
     // and neither is decided by the machine's speed.
     #[tokio::test]
     async fn probe_independent_per_tool_timeout() {
-        let dir = TempDir::new();
-        write_sleeping_tool(dir.path(), "claude", "0.6", "1.0.0", 0); // slow, but under the budget
-        write_fake_tool(dir.path(), "git", "git version 2.40.0", 0); // instant + healthy
+        let dir = temp_dir();
+        write_sleeping_tool(&dir, "claude", "0.6", "1.0.0", 0); // slow, but under the budget
+        write_fake_tool(&dir, "git", "git version 2.40.0", 0); // instant + healthy
         // gh and gt are intentionally absent (resolve to not-found instantly).
 
-        let p = prober(
-            vec![dir.path().to_string_lossy().into_owned()],
-            HashMap::new(),
-        );
+        let p = prober(vec![dir.to_string_lossy().into_owned()], HashMap::new());
         let rs = p.probe(&default_tools()).await;
 
         let claude = result_by_name(&rs, "claude");

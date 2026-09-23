@@ -36,15 +36,9 @@ pub fn save_tool_overrides(path: &Path, m: &HashMap<String, String>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> std::path::PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("rhapsody-d4-prefs-{}-{n}", std::process::id()));
-        fs::create_dir_all(&p).expect("create temp dir");
-        p
+    fn temp_dir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("rhapsody-d4-prefs")
     }
 
     // Mirrors TestToolOverridesRoundTrip: saved overrides load back identically, and Save creates the

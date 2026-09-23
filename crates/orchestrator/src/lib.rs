@@ -34,6 +34,7 @@
 pub mod agentupdate;
 pub mod automerge;
 pub mod backoff;
+pub mod breaker;
 pub mod budget;
 pub mod claim;
 pub mod concurrency;

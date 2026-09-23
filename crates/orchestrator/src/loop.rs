@@ -854,6 +854,12 @@ impl Orchestrator {
         // has quietly stopped, and that is when this report is worth the most. It also runs before
         // the publish so the snapshot below carries the same tick's verdict.
         self.reconcile_review_divergence();
+        // STUDIO-1026: the runaway-loop breaker — hold a ticket and notify the operator when its
+        // completed-review-round count or its per-ticket spend crosses a configured limit. Beside the
+        // sweep and above the same early returns, for the same reason: a daemon whose dispatch is
+        // gated is exactly one whose loop may be quietly burning budget. Local reads only (the watch
+        // set + the `runs` ledger); the hold and the notifications happen off-loop.
+        self.reconcile_breaker();
         // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
         // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
         // to finish (STUDIO-551).

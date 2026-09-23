@@ -913,6 +913,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         review_divergence: Vec::new(),
         held_for_human: Vec::new(),
         budget_held: Vec::new(),
+        notifications: Vec::new(),
     }
 }
 

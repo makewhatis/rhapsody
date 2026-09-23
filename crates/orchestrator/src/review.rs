@@ -1066,7 +1066,10 @@ mod tests {
             eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
-                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+                rhapsody_config::ProviderBudget {
+                    daily_tokens: 200,
+                    per_ticket: 0,
+                },
             );
         }
         // Today's spend is already over the ceiling.
@@ -1169,7 +1172,10 @@ mod tests {
             eff.projects[0].mcfg.claude.model = "claude-opus-4-8".to_string();
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
-                rhapsody_config::ProviderBudget { daily_tokens: 200 },
+                rhapsody_config::ProviderBudget {
+                    daily_tokens: 200,
+                    per_ticket: 0,
+                },
             );
         }
         // Today's anthropic spend is already over the ceiling, so the TICKET gate would refuse.
@@ -1265,7 +1271,10 @@ mod tests {
         }
         o.eff.as_mut().expect("eff").cfg.budgets.insert(
             "anthropic".to_string(),
-            rhapsody_config::ProviderBudget { daily_tokens: 200 },
+            rhapsody_config::ProviderBudget {
+                daily_tokens: 200,
+                per_ticket: 0,
+            },
         );
 
         // Today's anthropic spend is already over the ceiling; Fireworks has no budget at all.

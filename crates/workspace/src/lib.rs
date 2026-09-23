@@ -143,8 +143,12 @@ pub(crate) mod testutil {
     impl TempDir {
         pub(crate) fn new() -> TempDir {
             let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let path = std::env::temp_dir().join(format!(
-                "rhapsody-workspace-{}-{}",
+                "rhapsody-workspace-{}-{}-{nonce}",
                 std::process::id(),
                 n
             ));
@@ -162,7 +166,9 @@ pub(crate) mod testutil {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
     }
 
