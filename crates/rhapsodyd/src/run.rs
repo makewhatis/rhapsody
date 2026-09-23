@@ -2393,7 +2393,8 @@ mod tests {
             .expect("the seam must observe the serving broker")
             .expect("observation");
 
-        // Mint a live grant through the handle `run` actually injected into the orchestrator.
+        // Mint a live grant through the registrar the run wiring exposed (a clone of the one
+        // injected into the orchestrator, over the same registry).
         let (token, access, receipt, session) = crate::broker::mint_live(&observation.registrar);
         assert!(
             observation.broker.lookup_capability(&token).is_ok(),
