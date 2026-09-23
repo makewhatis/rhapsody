@@ -527,13 +527,16 @@ impl Parser<'_> {
     }
 }
 
-/// Whether a JSON number literal survives a `serde_json` parse/serialize round-trip without changing
-/// its *value*, so the re-serialized outbound body is the validated value (design §5.3.9).
+/// Whether a JSON number literal is exactly representable in the value `serde_json` will serialize
+/// back out, so the re-serialized outbound body can never turn the validated number into `null` or a
+/// different type (design §5.3.9).
 ///
-/// The check is on value preservation, not lexical identity: `1e0`, `1E+2`, `0.50` and `-0` are
+/// The check is on representability, not lexical identity: `1e0`, `1E+2`, `0.50` and `-0` are
 /// ordinary spellings that `serde_json` keeps numerically. An integer literal must fit `i64`/`u64`
 /// (a wider integer would re-serialize as a lossy float), and a fractional/exponent literal must
-/// parse to a finite `f64` (a value like `1e400` would otherwise become `null`).
+/// parse to a finite `f64` (a value like `1e400` would otherwise become `null`). It does not
+/// preserve precision beyond `f64`, so `1e-400` becomes `0.0` and an overlong decimal becomes the
+/// nearest `f64` — both remain finite, representable numbers.
 fn number_round_trips(text: &str) -> bool {
     let integer_lexeme = !text.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'));
     if integer_lexeme {

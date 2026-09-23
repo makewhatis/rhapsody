@@ -1428,6 +1428,72 @@ async fn an_exhausted_buffered_response_budget_refuses_before_egress() {
     harness.shutdown().await;
 }
 
+/// §7.1 + mutation "reserve the buffered budget only when the request asked for `stream:false`": a
+/// `stream:true` request whose upstream returns a non-2xx is buffered too — and OpenCode always
+/// streams, so a provider returning large error bodies can otherwise buffer past the broker-wide
+/// cap with no reservation at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_streaming_error_body_is_charged_the_buffered_response_budget() {
+    // Each buffered error body charges 3 * 32 MiB + 2 MiB = 98 MiB; three exceed the 256 MiB budget.
+    let limits = BrokerLimits {
+        max_response_bytes: 32 * 1024 * 1024,
+        max_response_bytes_turn: 256 * 1024 * 1024,
+        max_forwarded_requests: 8,
+        ..DEFAULT_BROKER_LIMITS
+    };
+    // A delayed error body, so each response holds its reservation while the next request arrives.
+    let response = FakeResponse {
+        status: 500,
+        content_type: "application/json",
+        chunks: vec![br#"{"error":{"message":""#.to_vec(), b"x\"}}".to_vec()],
+        chunk_delay: Duration::from_secs(2),
+        extra_headers: Vec::new(),
+    };
+    let harness = Harness::with(response, limits, true).await;
+    let capability = harness.capability.clone();
+
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        let capability = capability.clone();
+        let url = harness.chat_url();
+        let body = chat_body(MODEL, true);
+        requests.push(tokio::spawn(async move {
+            Harness::client()
+                .post(url)
+                .bearer_auth(capability)
+                .body(body)
+                .send()
+                .await
+                .expect("request")
+                .status()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.expect("join"));
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::FORBIDDEN)
+            .count(),
+        1,
+        "exactly the over-budget streaming error is refused, got {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::INTERNAL_SERVER_ERROR)
+            .count(),
+        2,
+        "only the reserveable error bodies are buffered, got {statuses:?}"
+    );
+    // A streaming request cannot know it will be buffered until the response status arrives, so all
+    // three were forwarded; the budget cap bounds how many error bodies are buffered at once.
+    assert_eq!(harness.upstream.count(), 3, "all three were forwarded");
+    harness.shutdown().await;
+}
+
 /// The closed schema is fixture-backed: every top-level key and message role the committed PB0
 /// OpenCode captures exercise must be inside the allow-list, and a minimal request shaped from each
 /// fixture must validate.

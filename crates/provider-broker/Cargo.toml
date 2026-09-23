@@ -51,6 +51,12 @@ tower = { version = "0.5", features = ["util"] }
 # serde_json: the bounded parser produces `serde_json::Value` for outbound re-serialization, and the
 # response redactor/observer walk provider JSON. Already in Cargo.lock.
 serde_json = "1"
+# serde (derive): `NonStreamingBody` deserializes a non-streaming provider response once, validating
+# it as a JSON object and reading `usage` while skipping (and not allocating) every other field. A
+# whole-body `serde_json::Value` tree would amplify a bounded response into far more memory than its
+# byte budget charges. serde/serde_derive are already in Cargo.lock; only the derive feature is newly
+# enabled here.
+serde = { version = "1", features = ["derive"] }
 # url: the one normalized upstream base URL and its exact round-trip validation (§6.1). Already in
 # Cargo.lock.
 url = "2"
@@ -61,9 +67,6 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 
 [dev-dependencies]
-# serde: the compile-guard test asserts the secret-bearing types do NOT implement `Serialize`.
-# Already in the lock; test-only here.
-serde = "1"
 # static_assertions: `assert_not_impl_any!` is the standard stable-Rust negative-impl guard
 # (`CapabilityToken` is not `Clone`/`Display`/`Serialize`, custody handles are not `Clone`). Already
 # in the lock as a transitive; test-only here.

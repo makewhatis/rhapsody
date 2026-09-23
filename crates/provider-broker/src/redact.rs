@@ -21,10 +21,12 @@ pub const REDACTION_MARKER: &[u8] = b"[redacted-provider-key]";
 /// suffix that could still become the secret is held until more bytes arrive (or the stream ends).
 pub struct StreamingRedactor {
     secret: ZeroizingBytes,
-    /// The bytes substituted for each exact secret match. The fixed marker normally, but an empty
-    /// replacement when the marker itself contains the secret (a valid credential such as
-    /// `provider` occurs verbatim inside `[redacted-provider-key]`), so the emitted output can never
-    /// contain the exact credential.
+    /// The bytes substituted for each exact secret match. The fixed marker normally, but a single
+    /// non-`b64token` byte (`*`) when the marker itself contains the secret (a valid credential such
+    /// as `provider` occurs verbatim inside `[redacted-provider-key]`). The replacement must be
+    /// non-empty: removing a match entirely would splice its neighbours together, and the joined
+    /// bytes could re-form the credential (`pro` + `vider` -> `provider`). `*` is outside the
+    /// credential alphabet (`[A-Za-z0-9._~+/-]`), so no window crossing it can equal the secret.
     replacement: Vec<u8>,
     /// Bytes held back because they might be the beginning of the secret.
     pending: Vec<u8>,
@@ -36,9 +38,10 @@ impl StreamingRedactor {
     /// degrades to a pass-through.
     pub fn new(secret: ZeroizingBytes) -> Self {
         // `contains_secret` is the same exact-byte check used for response headers: if the marker
-        // would itself contain the secret, remove the match instead of emitting a leaking marker.
+        // would itself contain the secret, substitute a non-`b64token` byte instead of emitting a
+        // leaking marker (leaving the match out would splice its neighbours into a new match).
         let replacement = if contains_secret(REDACTION_MARKER, secret.as_slice()) {
-            Vec::new()
+            vec![b'*']
         } else {
             REDACTION_MARKER.to_vec()
         };
@@ -201,16 +204,37 @@ mod tests {
 
     #[test]
     fn a_replacement_that_contains_the_secret_never_emits_the_secret() {
-        // `provider` occurs verbatim inside `[redacted-provider-key]`; emitting that marker would
-        // leak a valid credential, so the match is removed instead.
-        for secret in [&b"provider"[..], b"key", b"redacted-provider-key", b"a"] {
-            let body = [b"before ", secret, b" after"].concat();
-            let out = redact_all(secret, &[&body]);
-            assert!(
-                !out.windows(secret.len()).any(|window| window == secret),
-                "secret {secret:?} leaked through the replacement: {:?}",
-                String::from_utf8_lossy(&out)
-            );
+        // A credential such as `provider` occurs verbatim inside `[redacted-provider-key]`, and a
+        // credential such as `d-p` occurs inside `redacted-provider-key`. Emitting the marker would
+        // leak it; *deleting* the match would splice its neighbours into a new occurrence
+        // (`pro` + `vider` -> `provider`). The fallback replacement is a single non-`b64token` byte,
+        // so neither the containment case nor the splice case can re-emit the secret.
+        let bodies: [&[u8]; 6] = [
+            b"before provider after",
+            b"proprovidervider",
+            b"d-d-pp",
+            b"aaaaa",
+            b"redacted-provider-key",
+            b"xkeykeyy",
+        ];
+        for secret in [
+            &b"provider"[..],
+            b"key",
+            b"redacted-provider-key",
+            b"d-p",
+            b"a",
+        ] {
+            for body in bodies {
+                // The whole body and every single-byte split boundary.
+                for split in 0..=body.len() {
+                    let out = redact_all(secret, &[&body[..split], &body[split..]]);
+                    assert!(
+                        !out.windows(secret.len()).any(|window| window == secret),
+                        "secret {secret:?} leaked from {body:?} split at {split}: {:?}",
+                        String::from_utf8_lossy(&out)
+                    );
+                }
+            }
         }
     }
 

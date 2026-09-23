@@ -64,6 +64,15 @@ impl UsageObservation {
     }
 }
 
+/// The one field read from a non-streaming JSON response body. Deserializing into this typed
+/// envelope both validates the body as a JSON object and extracts `usage` in a single pass, skipping
+/// (and not allocating) every other choice/message field.
+#[derive(serde::Deserialize)]
+struct NonStreamingBody {
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
 /// A bounded SSE line observer.
 #[derive(Debug)]
 pub struct SseUsageObserver {
@@ -127,27 +136,35 @@ impl SseUsageObserver {
         self.overflowed
     }
 
-    /// Read the top-level `usage` object of a non-streaming JSON response body (design §7.3).
-    pub fn observe_json(&mut self, body: &[u8]) {
-        let value: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(value) => value,
+    /// Parse a non-streaming response body once: return whether it is a JSON object at all, and read
+    /// its top-level `usage` object (design §7.3). Deserializing into a typed envelope skips every
+    /// unknown field without building a `serde_json::Value` tree, so a bounded body cannot amplify
+    /// into far more memory than its byte budget charges (a 16 MiB `[0,0,...]` body would otherwise
+    /// allocate hundreds of MiB as a `Value`).
+    ///
+    /// A body that is not a JSON object returns `false` (a successful non-streaming response must be
+    /// a JSON object); a valid object whose `usage` is present but not an object still returns
+    /// `true`, marking only the usage observation malformed. `"usage": null` means "no usage", not
+    /// malformed.
+    pub fn observe_json(&mut self, body: &[u8]) -> bool {
+        let parsed: NonStreamingBody = match serde_json::from_slice(body) {
+            Ok(parsed) => parsed,
             Err(_) => {
                 self.mark_malformed();
-                return;
+                return false;
             }
         };
-        let Some(usage) = value.get("usage") else {
-            return;
+        let Some(usage) = parsed.usage else {
+            return true;
         };
-        // A provider that sends `"usage": null` on every chunk/response reports no usage; that is
-        // not malformed.
         if usage.is_null() {
-            return;
+            return true;
         }
         match usage.as_object() {
             Some(usage) => self.apply_usage(usage),
             None => self.mark_malformed(),
         }
+        true
     }
 
     fn mark_malformed(&mut self) {

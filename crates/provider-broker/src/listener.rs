@@ -417,8 +417,10 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
 
     // A non-streaming response buffers its whole body, so its broker-wide weighted budget is
     // reserved *before* the request goes out: an exhausted budget must not bill provider work or
-    // consume a forwarded slot (design §7.1). A streaming response uses only the bounded working
-    // buffer instead.
+    // consume a forwarded slot (design §7.1). A streaming request reserves nothing here because a
+    // successful stream uses only the bounded working buffer; if its upstream returns a non-2xx it
+    // is buffered too, and that error-body reservation is taken in `forward_response` once the
+    // status is known.
     let buffered_budget = if request.stream {
         None
     } else {
@@ -485,7 +487,7 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         secret,
         permit,
         buffered_budget,
-        shutdown,
+        &state,
     )
     .await
 }
@@ -509,7 +511,7 @@ async fn forward_response(
     secret: ZeroizingBytes,
     permit: ConcurrencyPermit,
     buffered_budget: Option<WeightedGuard>,
-    shutdown: watch::Receiver<bool>,
+    state: &BrokerState,
 ) -> Response {
     if upstream.has_non_identity_encoding() {
         return refusal_response(PolicyRefusal::UpstreamProtocol);
@@ -548,17 +550,30 @@ async fn forward_response(
             secret,
             max_response_bytes,
             permit,
-            shutdown,
+            state.shutdown.clone(),
         ))
     } else {
-        // The permit is held across buffering, redaction and usage parsing; the broker-wide weighted
-        // budget was reserved at admission, before egress.
+        // The permit is held across buffering, redaction and usage parsing. A `stream:false` request
+        // reserved the broker-wide budget at admission, before egress; a `stream:true` request that
+        // received a non-2xx is buffered too, so its reservation is taken here now that the status is
+        // known. Either way the buffer cannot bypass the 256 MiB cap (design §7.1).
         let _permit = permit;
-        let _budget = buffered_budget;
+        let _budget = match buffered_budget {
+            Some(guard) => guard,
+            None => {
+                let Some(weight) = buffered_response_weight(max_response_bytes) else {
+                    return refusal_response(PolicyRefusal::BudgetExhausted);
+                };
+                match state.response_budget.try_acquire(weight) {
+                    Some(guard) => guard,
+                    None => return refusal_response(PolicyRefusal::BudgetExhausted),
+                }
+            }
+        };
         let stream = upstream.into_byte_stream();
         let require_json = status.is_success();
         let buffered = {
-            let mut shutdown = shutdown;
+            let mut shutdown = state.shutdown.clone();
             tokio::select! {
                 biased;
                 _ = grant.wait_cancelled(&mut shutdown) => return cancelled_response(&grant),
@@ -732,12 +747,14 @@ where
     if out.len() as u64 > max_bytes {
         return Err(PolicyRefusal::UpstreamProtocol);
     }
-    // A successful non-streaming body that is not a JSON document is a protocol violation, not a
-    // 200 to pass through to the child (design §6.3, §7.1).
-    if require_json && serde_json::from_slice::<serde_json::Value>(&out).is_err() {
+    // One typed parse both validates that a successful non-streaming body is a JSON object (design
+    // §6.3: anything else is a protocol violation, not a 200 to pass through) and extracts its
+    // `usage`. Parsing into a `Value` tree would let a bounded body amplify into far more memory
+    // than its byte budget charges, so the typed envelope is the only parse.
+    let is_json_object = observer.observe_json(&out);
+    if require_json && !is_json_object {
         return Err(PolicyRefusal::UpstreamProtocol);
     }
-    observer.observe_json(&out);
     Ok(Bytes::from(out))
 }
 
