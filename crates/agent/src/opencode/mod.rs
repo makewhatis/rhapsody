@@ -115,7 +115,9 @@ pub(crate) mod testdir {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
         }
     }
 }

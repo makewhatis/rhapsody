@@ -29,6 +29,45 @@ use rhapsody_core::Issue;
 
 const DEFAULT_MODEL: &str = "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash";
 
+/// A scratch dir removed on drop (STUDIO-1031), so an assertion panic mid-smoke does not leak
+/// `rhapsody-oc-smoke-*` into `$TMPDIR`.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(prefix: &str) -> TempDir {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        TempDir { path }
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs the real opencode binary, a real credential and network; set RHAPSODY_OPENCODE_SMOKE"]
 async fn a_real_turn_against_a_real_provider() {
@@ -43,7 +82,7 @@ async fn a_real_turn_against_a_real_provider() {
         .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
 
     // A scratch workspace under the configured root, with something real to read and edit.
-    let root = std::env::temp_dir().join(format!("rhapsody-oc-smoke-{}", std::process::id()));
+    let root = TempDir::new("rhapsody-oc-smoke");
     let ws = root.join("sandbox");
     std::fs::create_dir_all(&ws).expect("create sandbox");
     std::fs::write(

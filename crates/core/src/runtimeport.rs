@@ -224,8 +224,14 @@ mod tests {
         fn new() -> TempHome {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("rhapsody-runtimeport-{}-{n}", std::process::id()));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-runtimeport-{}-{n}-{nonce}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&path).expect("create temp home");
             TempHome { path }
         }
@@ -237,7 +243,9 @@ mod tests {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            if std::env::var_os("RHAPSODY_KEEP_TEST_DIRS").is_none() {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
     }
 
