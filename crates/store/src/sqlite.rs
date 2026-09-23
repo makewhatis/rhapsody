@@ -10,10 +10,12 @@
 //!
 //! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
 //! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909),
-//! step 11 (`rhapsody_review_bound`, STUDIO-956) and step 12 (`rhapsody_review_verdicts`,
-//! STUDIO-1020) have no Go counterpart: they are the ticketless
+//! step 11 (`rhapsody_review_bound`, STUDIO-956), step 12 (`rhapsody_review_verdicts`,
+//! STUDIO-1020) and step 13 (`rhapsody_review_done`, STUDIO-1007) have no Go counterpart: they are
+//! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
-//! the per-pull-request review bound and the per-review-run verdict, none of which the frozen
+//! the per-pull-request review bound, the per-review-run verdict and the durable terminal-move
+//! ledger, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -41,11 +43,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 12 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 13 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
-/// per-pull-request review bound, then the per-review-run verdict) and are the one documented
-/// reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 12;
+/// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
+/// ledger) and are the one documented reason this number is ahead of the reference — see the module
+/// doc above.
+const SCHEMA_VERSION: i64 = 13;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -245,6 +248,30 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_bound (
 CREATE TABLE IF NOT EXISTS rhapsody_review_verdicts (
   run_id  INTEGER NOT NULL PRIMARY KEY,
   verdict TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v12 -> v13: the DURABLE terminal-move ledger — one row per ticket whose merged pull request
+    // owes a move to its terminal state (STUDIO-1007). Rhapsody-only, so the `rhapsody_` prefix
+    // gates it out of the Go-recaptured schema golden by name exactly as steps 7-12 are.
+    //
+    // A row is written before the first attempt and deleted only when the move lands, so the fact
+    // the ticket's pull request MERGED survives a restart. Three readers depend on it: the bounded
+    // retry, the handoff's terminal/merged guard (STUDIO-1007's "a handoff never un-terminates a
+    // ticket"), and the reconciliation sweep's "PR merged, ticket not terminal" report. Keyed by
+    // the TICKET identifier: one ticket has one implementation pull request, and every one of those
+    // three questions is per-ticket. `identifier TEXT PRIMARY KEY` on a rowid table gets SQLite's
+    // implicit auto-index, whose `sqlite_master.sql IS NULL`, so no explicit index reaches the
+    // golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_review_done (
+  identifier TEXT    NOT NULL PRIMARY KEY,
+  pr         TEXT    NOT NULL DEFAULT '',
+  issue_id   TEXT    NOT NULL DEFAULT '',
+  team_id    TEXT    NOT NULL DEFAULT '',
+  state      TEXT    NOT NULL DEFAULT '',
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  next_at    TEXT    NOT NULL DEFAULT '',
+  gave_up    INTEGER NOT NULL DEFAULT 0
 );
 "#,
 ];
@@ -1725,6 +1752,72 @@ impl Store for Sqlite {
                         })
                     })
                     .transpose()?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn save_review_done(&self, row: ReviewDoneRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A whole-row upsert (attempts and next_at included) because there is exactly one writer —
+        // the off-loop auto-done half — so the row it last wrote IS authoritative and no column
+        // needs protecting from a second writer. See the trait method's doc.
+        conn.execute(
+            "INSERT INTO rhapsody_review_done
+               (identifier, pr, issue_id, team_id, state, attempts, next_at, gave_up)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(identifier) DO UPDATE SET
+               pr       = excluded.pr,
+               issue_id = excluded.issue_id,
+               team_id  = excluded.team_id,
+               state    = excluded.state,
+               attempts = excluded.attempts,
+               next_at  = excluded.next_at,
+               gave_up  = excluded.gave_up",
+            params![
+                row.identifier,
+                row.pr,
+                row.issue_id,
+                row.team_id,
+                row.state,
+                row.attempts,
+                row.next_at,
+                i64::from(row.gave_up),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn clear_review_done(&self, identifier: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM rhapsody_review_done WHERE identifier = ?1",
+            params![identifier],
+        )?;
+        Ok(())
+    }
+
+    fn load_review_done(&self) -> Result<Vec<ReviewDoneRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT identifier, pr, issue_id, team_id, state, attempts, next_at, gave_up \
+             FROM rhapsody_review_done ORDER BY identifier",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let gave_up: i64 = row.get(7)?;
+            Ok(ReviewDoneRow {
+                identifier: row.get(0)?,
+                pr: row.get(1)?,
+                issue_id: row.get(2)?,
+                team_id: row.get(3)?,
+                state: row.get(4)?,
+                attempts: row.get(5)?,
+                next_at: row.get(6)?,
+                gave_up: gave_up != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -4012,6 +4105,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    // --- the durable terminal-move ledger (STUDIO-1007) ---------------------------------------
+
+    /// The whole point of the row: an owed terminal move, its attempt count and its next due time
+    /// all survive a restart, so a handoff on the far side of one still sees the merge and the
+    /// bounded retry still knows where it was.
+    #[test]
+    fn a_review_done_row_round_trips_across_a_restart() {
+        let scratch = scratch_dir();
+        let db = scratch.join("done.db");
+
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            store
+                .save_review_done(ReviewDoneRow {
+                    identifier: "STUDIO-1004".into(),
+                    pr: "makewhatis/rhapsody#216".into(),
+                    issue_id: "ID-1004".into(),
+                    team_id: "TEAM-1".into(),
+                    state: "Done".into(),
+                    attempts: 2,
+                    next_at: "2026-09-22T21:25:11Z".into(),
+                    gave_up: false,
+                })
+                .expect("save");
+        } // store dropped — the daemon "restarts" here
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store.load_review_done().expect("recover"),
+            vec![ReviewDoneRow {
+                identifier: "STUDIO-1004".into(),
+                pr: "makewhatis/rhapsody#216".into(),
+                issue_id: "ID-1004".into(),
+                team_id: "TEAM-1".into(),
+                state: "Done".into(),
+                attempts: 2,
+                next_at: "2026-09-22T21:25:11Z".into(),
+                gave_up: false,
+            }]
+        );
+
+        // A landed move forgets the row; a second clear is a no-op.
+        store.clear_review_done("STUDIO-1004").expect("clear");
+        store.clear_review_done("STUDIO-1004").expect("clear twice");
+        assert!(store.load_review_done().expect("empty").is_empty());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The retry rewrites the SAME row — it does not accumulate — and `gave_up` round-trips as a
+    /// bool rather than the 0/1 the column stores.
+    #[test]
+    fn saving_a_review_done_row_replaces_it_and_round_trips_gave_up() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let row = |attempts: i64, gave_up: bool| ReviewDoneRow {
+            identifier: "STUDIO-1004".into(),
+            pr: "makewhatis/rhapsody#216".into(),
+            issue_id: "ID-1004".into(),
+            team_id: "TEAM-1".into(),
+            state: "Done".into(),
+            attempts,
+            next_at: String::new(),
+            gave_up,
+        };
+        store.save_review_done(row(1, false)).expect("first");
+        store.save_review_done(row(3, true)).expect("second");
+        assert_eq!(store.load_review_done().expect("load"), vec![row(3, true)]);
+    }
+
     /// The counter and the decision have DIFFERENT writers — the control task charges rounds while
     /// the off-loop adjudication half records what the manager said — so neither upsert may carry
     /// the other's columns. A later charge must not erase a landed decision, and dropping the
@@ -5034,6 +5196,7 @@ mod tests {
                 "rhapsody_run_provenance".to_string(),
                 "rhapsody_review_bound".to_string(),
                 "rhapsody_review_verdicts".to_string(),
+                "rhapsody_review_done".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

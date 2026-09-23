@@ -519,6 +519,10 @@ fn worker_deps_for(
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
         review_handoff_state: eff.review_states.iter().next().cloned(),
+        // The merge→Done terminal state (STUDIO-1007), stamping the auto-park's terminal guard's
+        // gate. `spawn_worker` fills it from the daemon's loaded teams config (the guard's own source
+        // is `self.teams`, not `Effective`); `None` here keeps a construction that skips it inert.
+        review_done_state: None,
         // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
         // can be restarted, and there is no restart of one project.
         drain: drain.clone(),
@@ -1613,6 +1617,16 @@ impl Orchestrator {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
+        // The auto-park's terminal guard's gate (STUDIO-1007): the merge→Done transition is "on"
+        // only when the loaded teams config names one. Read from the SAME `self.teams` the handoff's
+        // terminal/merged guard reads, so the two guards that protect the same transition can never
+        // disagree about whether it is configured. `None` on an installation without it — the park
+        // then makes no extra tracker read and is byte-identical to before this ticket.
+        deps.review_done_state = self
+            .teams
+            .as_ref()
+            .and_then(|t| t.review_done_state())
+            .map(str::to_string);
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
