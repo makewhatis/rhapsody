@@ -1380,6 +1380,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: "Done".to_string(),
                 declared_handoff: true,
+                review_verdict: None,
                 refused: false,
             }))
             .expect("worker-exit send");

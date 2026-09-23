@@ -38,6 +38,24 @@ use rhapsody_workspace::{self as workspace, Manager, gtguard};
 use tokio::sync::mpsc;
 
 use crate::obslog;
+use crate::reviewfindings::{self, ReviewVerdictBlock};
+
+/// What a worker attempt DECLARES on exit, beyond its last-known state (STUDIO-1008).
+///
+/// A named struct rather than a bare `bool` because a review run's exit carries a second fact the
+/// exit path needs: the structured `rhapsody-review-verdict` block the reviewer emitted. The two are
+/// independent — a review may declare a hand-off and emit an unparseable block (the unstructured
+/// fallback), or declare one with a perfectly structured block — so both travel together and
+/// [`crate::retry::EvWorkerExit`] carries both. `declared_handoff` is exactly what the old `bool` was.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerDeclaration {
+    /// The agent's final result text ended with a `HANDOFF:` line (INF-272).
+    pub declared_handoff: bool,
+    /// The parsed structured verdict block, when this was a review run and one parsed. `None` on
+    /// every non-review run and on any review whose block is absent, ambiguous or unparseable —
+    /// which is the unstructured fallback the review path records.
+    pub review_verdict: Option<ReviewVerdictBlock>,
+}
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
 /// thread history (upstream §7.1). Mirrors Go `continuationGuidance`.
@@ -345,7 +363,7 @@ pub async fn run_agent_attempt(
     messages: Option<&mut mpsc::Receiver<String>>,
     on_event: &(dyn Fn(Event) + Send + Sync),
     on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
-) -> (String, bool, Option<WorkerError>) {
+) -> (String, WorkerDeclaration, Option<WorkerError>) {
     // CAPABILITY VALIDATION, BEFORE ANYTHING IS SPAWNED (STUDIO-978; design §5).
     //
     // The ticket's mutation discipline is explicit: moving this check after the runner spawn must
@@ -363,7 +381,7 @@ pub async fn run_agent_attempt(
         );
         return (
             issue.state.clone(),
-            false,
+            WorkerDeclaration::default(),
             Some(WorkerError::CapabilityRefused(refusal)),
         );
     }
@@ -391,7 +409,7 @@ pub async fn run_agent_attempt(
             );
             return (
                 issue.state.clone(),
-                false,
+                WorkerDeclaration::default(),
                 Some(WorkerError::CapabilityRefused(refusal)),
             );
         }
@@ -434,7 +452,13 @@ pub async fn run_agent_attempt(
     };
     let ws = match ws {
         Ok(w) => w,
-        Err(e) => return (issue.state.clone(), false, Some(e.into())),
+        Err(e) => {
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(e.into()),
+            );
+        }
     };
     // Inject the Graphite guardrail hook into the worktree BEFORE spawn when git_flow is "graphite"
     // (INF-251). Idempotent on a reused worktree; a no-op for any other policy. A write failure fails
@@ -452,7 +476,7 @@ pub async fn run_agent_attempt(
         Err(e) => {
             return (
                 issue.state.clone(),
-                false,
+                WorkerDeclaration::default(),
                 Some(WorkerError::GraphiteGuard(e)),
             );
         }
@@ -473,7 +497,13 @@ pub async fn run_agent_attempt(
     } else {
         match resolve_prompt_template(&deps.prompt_tmpl, &deps.prompt_file, &ws.path) {
             Ok(v) => v,
-            Err(e) => return (issue.state.clone(), false, Some(e.into())),
+            Err(e) => {
+                return (
+                    issue.state.clone(),
+                    WorkerDeclaration::default(),
+                    Some(e.into()),
+                );
+            }
         }
     };
     // A soft fallback (relative prompt_file missing/empty) does not fail the run; surface it.
@@ -513,7 +543,11 @@ pub async fn run_agent_attempt(
         .before_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
         .await
     {
-        return (issue.state.clone(), false, Some(e.into()));
+        return (
+            issue.state.clone(),
+            WorkerDeclaration::default(),
+            Some(e.into()),
+        );
     }
 
     // Open a per-run transcript (best-effort: a failure logs and continues without local logging).
@@ -563,7 +597,11 @@ pub async fn run_agent_attempt(
                 .workspace
                 .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
                 .await;
-            return (issue.state.clone(), false, Some(e.into()));
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(e.into()),
+            );
         }
     };
     // Thread the store run id onto the session (Go: the optional-interface `SetRunID` right after
@@ -605,7 +643,22 @@ pub async fn run_agent_attempt(
         .label_run_prs(&deps.repo_url, &ws.path, &deps.pr_label)
         .await;
 
-    (final_state, has_handoff_marker(&result_text), loop_err)
+    // The structured verdict block is parsed ONLY for a review run: a ticket run's message is never
+    // read for one, so the whole feature stays structurally absent from every non-review path
+    // (STUDIO-1008). The parse is pure and its failure is not an error — `None` is the unstructured
+    // fallback the review exit records.
+    let review_verdict = deps
+        .review
+        .as_ref()
+        .and_then(|_| reviewfindings::parse_verdict_block(&result_text));
+    (
+        final_state,
+        WorkerDeclaration {
+            declared_handoff: has_handoff_marker(&result_text),
+            review_verdict,
+        },
+        loop_err,
+    )
 }
 
 impl WorkerDeps {
@@ -1252,7 +1305,19 @@ mod tests {
         let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
         git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
 
-        let ag = fake_agent(vec![succeeded_turn()]);
+        // The review turn ends with a structured verdict block (STUDIO-1008); the exit declaration
+        // below must carry it, which is what makes the worker the place the block is read.
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "posted 1 finding\n\n```rhapsody-review-verdict\n\
+                     {\"approve\": false, \"findings\": [{\"id\": \"B8\", \"blocking\": true, \
+                     \"summary\": \"abort bypasses cancellation\"}]}\n```\n\nHANDOFF: findings"
+                    .to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
         let tr = fake_tracker_by_id(&[("pr:o/r#12@alice", "pr:o/r#12@alice", "Done")]);
         let (ws, root) = test_workspace(HookScripts::default());
         // max_turns 1 so the agent's LAST prompt is its TURN-1 prompt, which is what the
@@ -1268,10 +1333,16 @@ mod tests {
         });
         let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
 
-        let (_last, _declared, err) =
+        let (_last, declaration, err) =
             run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
 
+        let block = declaration
+            .review_verdict
+            .expect("the worker parses the review run's verdict block");
+        assert_eq!(block.findings.len(), 1);
+        assert_eq!(block.findings[0].id, "B8");
+        assert!(!block.approve);
         assert_eq!(
             ag.last_review_head(),
             Some(head.clone()),
@@ -2172,7 +2243,10 @@ mod tests {
         let (last, handed_off, err) =
             run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
-        assert!(handed_off, "handoff marker should be detected");
+        assert!(
+            handed_off.declared_handoff,
+            "handoff marker should be detected"
+        );
         assert_eq!(
             refreshes.load(Ordering::SeqCst),
             0,
@@ -2230,10 +2304,13 @@ mod tests {
             let tr = Arc::new(tr);
             let (ws, _root) = test_workspace(HookScripts::default());
             let d = make_deps(ws, ag, tr, "do it", 20);
-            let (_l, declared, err) =
+            let (_l, declaration, err) =
                 run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
             assert!(err.is_none(), "expected normal exit, got {err:?}");
-            assert_eq!(declared, *want, "result_text = {result_text:?}");
+            assert_eq!(
+                declaration.declared_handoff, *want,
+                "result_text = {result_text:?}"
+            );
         }
     }
 
@@ -2259,14 +2336,18 @@ mod tests {
         let ag = fake_agent(vec![agentfake::TurnScript {
             result: TurnResult {
                 status: TURN_SUCCEEDED.to_string(),
-                result_text: "wrapped up the work\nHANDOFF: in-review".to_string(),
+                // A block is present, but this is a TICKET run (`deps.review` unset), so the worker
+                // must NOT read it as a review verdict (STUDIO-1008) — asserted below.
+                result_text: "wrapped up the work\n\n```rhapsody-review-verdict\n\
+                     {\"approve\": false, \"findings\": []}\n```\n\nHANDOFF: in-review"
+                    .to_string(),
                 ..Default::default()
             },
             ..Default::default()
         }]);
         let (ws, _root) = test_workspace(HookScripts::default());
         let d = make_deps(ws, ag.clone(), tr, "do it", 20); // generous budget — only the handoff ends it
-        let (last, declared, err) =
+        let (last, declaration, err) =
             run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected a clean exit, got {err:?}");
         assert_eq!(
@@ -2280,8 +2361,12 @@ mod tests {
             "worker's last-known state is the review handoff state"
         );
         assert!(
-            declared,
+            declaration.declared_handoff,
             "the agent declared HANDOFF, so the clean exit classifies completed"
+        );
+        assert!(
+            declaration.review_verdict.is_none(),
+            "a ticket run's text is never read for a review verdict block"
         );
     }
 

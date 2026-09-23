@@ -953,6 +953,29 @@ lives on the watcher's off-loop half — and a default installation with `teams.
 unset writes no row and makes no extra tracker read. `divergent_objects_are_gated_by_name_only`
 pins the sixth name.
 
+### A seventh schema table with no Go counterpart — `rhapsody_review_finding` (STUDIO-1008)
+
+A review's verdict used to be only a per-(reviewer, sha) status plus free text, so nothing downstream
+could tell which objection was which, whether it was addressed, or whether a later review was raising
+the same thing again. The reviewer output contract now ends with one machine-readable verdict block
+(fenced, tagged `rhapsody-review-verdict`), and each finding revision it declares is recorded durably:
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **14** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark`, `rhapsody_run_provenance`, `rhapsody_review_bound`, `rhapsody_review_verdicts`, `rhapsody_review_done` and `rhapsody_review_finding` |
+| a reviewer's findings | — | `rhapsody_review_finding`, one row per finding REVISION, keyed by `(pr, generation, reviewer, finding_id, revision)` |
+
+One row per revision, not per finding: a repeat raise increments `revision`, which is what lets the
+reopen rule compare a re-raise against the dismissed revision it follows. A later **approving** review
+by the same reviewer resolves every revision that reviewer has open. A completed `changes` review with
+no parseable block records one synthetic `blocking` finding scoped to that run
+(`<reviewer>:unstructured:<run_id>`), so two unstructured reviews are two distinct findings and one
+dismissal cannot silence a reviewer's later, unrelated objection. `generation` is a documented `0`
+until the manager's next slice introduces the real value. `divergent_objects_are_gated_by_name_only`
+pins the seventh name. **Off is still off:** `storage.path: off` records nothing, and every non-
+ticketless install takes no part of this path.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
