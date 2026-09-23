@@ -304,6 +304,28 @@ describe("selectionCompatibility", () => {
     ).toMatch(/control/);
   });
 
+  it("measures the model bound in UTF-8 bytes, not UTF-16 code units", () => {
+    // `é` is one UTF-16 code unit but two UTF-8 bytes, so 300 of them are legal by `.length` (300)
+    // yet over the 512-byte daemon bound — this must be refused locally rather than 400'd by the
+    // daemon. 256 of them (512 bytes) is exactly at the bound and stays legal.
+    const over = selectionCompatibility({
+      backend: "opencode",
+      providers: [def()],
+      provider: "fireworks",
+      model: "é".repeat(300),
+    });
+    expect(over.ok).toBe(false);
+    expect(over.reason).toMatch(/at most/);
+
+    const atBound = selectionCompatibility({
+      backend: "opencode",
+      providers: [def()],
+      provider: "fireworks",
+      model: "é".repeat(256),
+    });
+    expect(atBound.ok).toBe(true);
+  });
+
   it("validates a provider-less model against transport bounds", () => {
     const v = selectionCompatibility({
       backend: "claude",

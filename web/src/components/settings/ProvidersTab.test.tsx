@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { GlobalConfigDTO, ProviderCatalogDTO, ProviderConfigDTO } from "@/lib/api";
 import { toUiGlobal } from "@/lib/settings-model";
@@ -193,11 +193,19 @@ describe("ProvidersTab", () => {
       error_message: "deadline exceeded",
       manual_entry_allowed: true,
     });
-    renderTab();
+    const { onChange } = renderTab();
     const input = (await screen.findByLabelText("Global model")) as HTMLInputElement;
+    // Await the failed-catalog state BEFORE asserting usability: reading `disabled` as soon as the
+    // field first renders would pass even if the failed catalog then disabled it. The failure copy
+    // only renders once the query has resolved with `error`, so this pins the real defect.
+    expect(await screen.findByText(/Manual entry remains available/i)).toBeTruthy();
     expect(input.disabled).toBe(false);
     expect(input.value).toBe("accounts/fireworks/models/x");
-    expect(await screen.findByText(/Manual entry remains available/i)).toBeTruthy();
+    // Typing still reaches the parent after the failure — suggestions are not an allow-list.
+    fireEvent.change(input, { target: { value: "accounts/fireworks/models/typed" } });
+    expect(onChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ agentModel: "accounts/fireworks/models/typed" }),
+    );
   });
 
   // MUTATION GUARD (secrets): a status row carrying forbidden fields (a credential value, a stored

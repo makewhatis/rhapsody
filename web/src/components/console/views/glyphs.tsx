@@ -86,7 +86,8 @@ export function ProvidersRowGlyph(props: Glyph) {
 }
 
 /** The Settings "Storage" row badge. */
-export function StorageRowGlyph(props: Glyph) {  return (
+export function StorageRowGlyph(props: Glyph) {
+  return (
     <Stroke strokeWidth={1.5} {...props}>
       <path d="M2 4h12v8H2zM2 7h12" />
     </Stroke>

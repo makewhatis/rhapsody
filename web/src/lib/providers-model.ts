@@ -17,6 +17,10 @@ import type { SelectOption } from "@/components/ui/select";
  *  MODEL_ID_MAX_BYTES). Mirrored here so the UI refuses to POST what the daemon will reject. */
 export const MODEL_ID_MAX_BYTES = 512;
 
+/** UTF-8 byte length, matching the daemon's `str::len()`. `String.prototype.length` counts UTF-16
+ *  code units, so a multibyte id could pass the local gate and then be 400'd by the daemon. */
+const utf8Len = (s: string): number => new TextEncoder().encode(s).length;
+
 /** One provider status row, from EITHER source: the daemon's HTTP `ProviderStatusView` or the desktop
  *  bridge's richer `ProviderStatus` DTO. Both structure-typed inputs satisfy the fields read here. */
 export interface ProviderStatusInput {
@@ -254,7 +258,7 @@ export function selectionCompatibility(input: {
     return { ok: false, reason: "Model id must not have surrounding whitespace." };
   }
   if (model !== "") {
-    if (model.length > MODEL_ID_MAX_BYTES) {
+    if (utf8Len(model) > MODEL_ID_MAX_BYTES) {
       return { ok: false, reason: `Model id must be at most ${MODEL_ID_MAX_BYTES} UTF-8 bytes.` };
     }
     // C0/C1 control characters (includes NUL), mirroring `char::is_control`.
