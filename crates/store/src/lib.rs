@@ -475,6 +475,28 @@ pub trait Store {
     /// One pull request's durable review bound, or `None` when the daemon holds none for it.
     fn review_bound(&self, pr: &str) -> Result<Option<ReviewBoundRow>, StoreError>;
 
+    // --- manager exchange authorizations (STUDIO-1012; no Go counterpart — see [`ManagerExchange`]) ---
+
+    /// Writes one manager exchange authorization, replacing the row with the same `id` if one
+    /// exists. The writer is the manager's activation transaction (a later slice); the review-side
+    /// gates here only read it and move its `state`. A no-op store keeps no authorizations, so with
+    /// durable storage off an `act`-mode install can never arm a gated round — which is the
+    /// fail-closed direction, and the reason `review_authority: act` requires durable storage.
+    fn save_manager_exchange(&self, exchange: ManagerExchange) -> Result<(), StoreError>;
+
+    /// Every exchange authorization recorded for `pr` (case-folded `owner/repo#number`), oldest
+    /// first. The caller filters by `kind` and `state`: an active authorization is consumed by the
+    /// exchange it covers, a consumed one still covers the remainder of that exchange.
+    fn manager_exchanges(&self, pr: &str) -> Result<Vec<ManagerExchange>, StoreError>;
+
+    /// Moves one authorization to `state`. Idempotent, and a no-op when `id` names no row.
+    fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), StoreError>;
+
+    /// Marks EVERY live (`active` or `consumed`) authorization for `pr` `invalidated` — a new
+    /// generation, a hold, or the pull request closing. An invalidated authorization arms nothing.
+    /// Idempotent.
+    fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError>;
+
     // --- durable terminal-move ledger (STUDIO-1007; no Go counterpart — see [`ReviewDoneRow`]) ---
 
     /// Records `row` as a terminal-state move owed to `row.identifier`'s merged pull request, or

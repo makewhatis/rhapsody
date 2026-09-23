@@ -1702,7 +1702,10 @@ impl Orchestrator {
     /// [`REVIEW_ROUNDS_PER_PR_CAP`]'s unit, so the configured threshold and the hard cap are the
     /// same number of rounds. Under the threshold both sides charge this counter; unset, only
     /// reviews do.
-    fn rounds_used(&self, pr: &PrCoord) -> usize {
+    ///
+    /// `pub(crate)` for [`crate::managerexchange`]'s §7.8 gate, which reads the same answered-
+    /// exchange count to classify "after the threshold".
+    pub(crate) fn rounds_used(&self, pr: &PrCoord) -> usize {
         self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0) / self.reviewers_per_round()
     }
 
@@ -1767,6 +1770,10 @@ impl Orchestrator {
                  further pushes will not be reviewed"
             );
         }
+        // STUDIO-1012 (§7.8): consuming the manager exchange authorization at the SAME acceptance
+        // point that charges the budget. A round refused earlier — by a budget, a model refusal or a
+        // drain — never reaches here, so it never burns an authorization it did not use.
+        self.consume_review_round_authorization(pr, &commit.head, &commit.head_patch_id);
     }
 
     /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
@@ -1777,6 +1784,11 @@ impl Orchestrator {
         if let Err(e) = self.store().clear_review_bound(&churn_key(pr)) {
             tracing::warn!(pr = %pr, err = %e, "ticketless review: the durable round bound could not be cleared");
         }
+        // STUDIO-1012 (§7.8): a pull request that leaves the watch set — merged, closed or
+        // dismissed — invalidates every live exchange authorization with it. This is the one
+        // invalidation trigger with no later arming attempt left to observe it: the generation and
+        // hold triggers are handled lazily at the arm.
+        self.invalidate_manager_exchanges(pr);
     }
 
     /// Rebuilds the per-pull-request review bounds from the store at boot — the round counters into
@@ -3311,6 +3323,20 @@ impl Orchestrator {
             // further down is a different problem with its own log line, and leaving the count
             // standing would let this row keep claiming a stall it no longer has.
             self.clear_unassignable(pr, &id, &row.key.reviewer);
+            // STUDIO-1012 (§7.8): after the round threshold, in `act` mode, a round arms only under
+            // an active manager exchange authorization. Off/advise and everything before the
+            // threshold short-circuit inside the gate, so those paths are byte-identical. Placed
+            // immediately before the dispatch — after every other deferral — so a row some earlier
+            // gate parks never even reaches the check, and the authorization is consumed later, at
+            // ACCEPTANCE (`commit_review_watch`), not here.
+            //
+            // MUTATION: delete this gate and
+            // `an_act_round_past_the_threshold_arms_only_under_an_authorization` reds on its first
+            // assert (a round is dispatched with no authorization).
+            if !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin) {
+                report.deferred += 1;
+                continue;
+            }
             let reassigned = chosen != row.key.reviewer;
             let picked = chosen.clone();
             let run = ReviewRun {
@@ -3344,6 +3370,8 @@ impl Orchestrator {
             let commit = crate::review::ReviewWatchCommit {
                 incumbent: row.key.clone(),
                 reassigned,
+                head: head.to_string(),
+                head_patch_id: head_patch_id.to_string(),
             };
             match self.dispatch_review_watch(run, commit) {
                 ReviewDispatchOutcome::Dispatched => {
@@ -3580,6 +3608,10 @@ impl Orchestrator {
             author: mine[0].author.clone(),
             head_sha: head.to_string(),
             approved: false,
+            // The conflict route-back is a separate trigger from the findings completion, and
+            // STUDIO-1012 scopes its suppression to the findings verdict alone; this stays a
+            // summoning comment.
+            suppress_summons: false,
             summon_token: self.review_summon_token(),
             changes: Some(plan),
         };
@@ -4689,6 +4721,21 @@ mod tests {
         }
         fn review_bound(&self, pr: &str) -> Result<Option<rs::ReviewBoundRow>, rs::StoreError> {
             self.0.review_bound(pr)
+        }
+        fn save_manager_exchange(
+            &self,
+            exchange: rs::ManagerExchange,
+        ) -> Result<(), rs::StoreError> {
+            self.0.save_manager_exchange(exchange)
+        }
+        fn manager_exchanges(&self, pr: &str) -> Result<Vec<rs::ManagerExchange>, rs::StoreError> {
+            self.0.manager_exchanges(pr)
+        }
+        fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), rs::StoreError> {
+            self.0.set_manager_exchange_state(id, state)
+        }
+        fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), rs::StoreError> {
+            self.0.invalidate_manager_exchanges(pr)
         }
         fn record_review_completion(
             &self,
@@ -9333,6 +9380,95 @@ mod tests {
         let l = Arc::new(AdjudicationLedger::with_store(store));
         o.adjudication_ledger = Some(Arc::clone(&l));
         l
+    }
+
+    /// STUDIO-1012 (§7.8 path 1): in `act` mode past the round threshold the WATCHER arms a round
+    /// only by consuming an active manager exchange authorization. This drives the real sweep — the
+    /// mutation it pins is deleting the gate from the dispatch loop, which no unit test of the gate
+    /// alone would catch.
+    ///
+    /// MUTATION: delete the `review_round_arm_authorized` call from `handle_review_sweep_slots` and
+    /// this reds on the first assert (a round is dispatched with no authorization).
+    #[test]
+    fn an_act_round_past_the_threshold_arms_only_under_an_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        // STUDIO-1004's answered-exchange count: one round reaches a threshold of one.
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+
+        let unauthorised = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            unauthorised.dispatched, 0,
+            "no authorization: the watcher must not arm a round"
+        );
+
+        // Grant a `review_round` authorization for this head and generation.
+        o.store()
+            .ensure_review_generation(&churn_key(&coord(12)))
+            .expect("generation");
+        o.store()
+            .save_manager_exchange(rs::ManagerExchange {
+                id: "e1".to_string(),
+                intervention_id: "iv-1".to_string(),
+                pr: churn_key(&coord(12)),
+                generation: 1,
+                kind: rs::MANAGER_EXCHANGE_REVIEW_ROUND.to_string(),
+                authorized_head: HEAD_A.to_string(),
+                authorized_patch_id: String::new(),
+                state: rs::MANAGER_EXCHANGE_ACTIVE.to_string(),
+            })
+            .expect("authorize");
+
+        let authorised = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            authorised.dispatched, 1,
+            "an active authorization arms the round"
+        );
+    }
+
+    /// **Acceptance 5.** An exchange already in flight when the threshold is crossed completes
+    /// normally — it is a live run, not an arm, so the §7.8 gate is never consulted for it and no
+    /// authorization is required. The sweep must not re-arm it (that would be a second round) and
+    /// must not block it either.
+    #[test]
+    fn an_exchange_in_flight_at_the_crossing_completes_without_an_authorization() {
+        let mut teams = adjudicating(&["alice", "bob"], 1);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        let mut r = row(12, "bob");
+        r.status = REVIEW_STATUS_IN_FLIGHT.to_string();
+        r.requested_sha = HEAD_A.to_string();
+        let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
+        introduce(&o, r);
+        o.running.insert(
+            id,
+            RunningEntry::empty(rhapsody_core::Issue {
+                id: "iss-review".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                ..Default::default()
+            }),
+        );
+        let per_round = o.reviewers_per_round();
+        o.review_rounds.insert(churn_key(&coord(12)), per_round);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.dispatched, 0,
+            "a round already in flight must not be re-armed"
+        );
+        let row = o
+            .store()
+            .get_review_watch(&key(12, "bob"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.status, REVIEW_STATUS_IN_FLIGHT,
+            "the in-flight round is left to complete on its own run's exit"
+        );
     }
 
     /// **Acceptance, and the round-8 blocker.** *"The threshold and the recorded decision survive a

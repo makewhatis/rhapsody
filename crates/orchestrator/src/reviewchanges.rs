@@ -170,6 +170,21 @@ impl Orchestrator {
         if approved {
             return None;
         }
+        // STUDIO-1012 (§7.8, path 4): after the round threshold, in `act` mode, the daemon's
+        // automatic route-back on a findings verdict is suppressed — the completed review is
+        // evidence for the manager's next decision instead of an exchange the daemon starts on its
+        // own. The summons in its completion comment is suppressed beside this, in
+        // `reviewnotify::plan_review_notify`. Operator actions (`/rerun`, a person's summons) and
+        // the conflict route-back are deliberately untouched here; off/advise never reach this.
+        let pr_coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+        if self.review_exchange_gate_active(&pr_coord) {
+            tracing::info!(
+                pr = %pr_coord,
+                "manager exchange: act mode past the round threshold suppresses the findings \
+                 route-back; the review is evidence for the manager's next decision"
+            );
+            return None;
+        }
         let identifier = origin_ticket(&run.introduced_by)?.to_string();
         let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         // The anti-race guard against `reviewdone`: a merged pull request's rows are retired, so an
@@ -302,7 +317,7 @@ impl ControlHandle {
 mod tests {
     use std::sync::Arc;
 
-    use rhapsody_config::teams::{Review, ReviewMode, Teams};
+    use rhapsody_config::teams::{Review, ReviewAuthority, ReviewMode, Teams};
     use rhapsody_store::{REVIEW_STATUS_IN_FLIGHT, ReviewWatchRow, RunStart, Sqlite, StorePath};
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
@@ -438,8 +453,38 @@ mod tests {
         );
     }
 
-    // ── empty configuration is off ───────────────────────────────────────────────────────────────
+    /// STUDIO-1012 (§7.8 path 4): in `act` mode past the round threshold the daemon's automatic
+    /// findings route-back is suppressed — the review is evidence for the manager's next decision,
+    /// not an exchange the daemon starts on its own. Off/advise are untouched, proven beside it.
+    ///
+    /// MUTATION: leave the automatic route-back on and this reds (a plan is produced in `act`).
+    #[test]
+    fn an_act_findings_round_past_the_threshold_plans_no_route_back() {
+        for authority in [
+            ReviewAuthority::Act,
+            ReviewAuthority::Off,
+            ReviewAuthority::Advise,
+        ] {
+            let (mut o, run) = ready("In Progress");
+            let teams = o.teams.as_mut().expect("teams");
+            teams.manager.review_authority = authority;
+            teams.review.adjudicate_after_rounds = 1;
+            // STUDIO-1004's answered-exchange count, one round: the threshold is reached.
+            o.review_rounds.insert(
+                crate::reviewwatch::churn_key(&PrCoord::new(OWNER, REPO, 64)),
+                1,
+            );
 
+            let planned = o.plan_review_changes(&run, false).is_some();
+            assert_eq!(
+                planned,
+                authority != ReviewAuthority::Act,
+                "{authority:?}: only act suppresses the automatic route-back"
+            );
+        }
+    }
+
+    // ── empty configuration is off ───────────────────────────────────────────────────────────────
     /// The byte-identical-when-unconfigured property, which is what makes this safe to ship: an
     /// installation that has not named a state behaves exactly as it did before — and so does one
     /// on any other review path, or with Teams off, or with no Teams runtime at all.

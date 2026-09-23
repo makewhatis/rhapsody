@@ -13,9 +13,9 @@
 //! step 11 (`rhapsody_review_bound`, STUDIO-956), step 12 (`rhapsody_review_verdicts`,
 //! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007), step 14
 //! (`rhapsody_review_finding`, STUDIO-1008), step 15
-//! (`rhapsody_breaker_crossings`, STUDIO-1026) and step 16 (the review evidence ledger's
+//! (`rhapsody_breaker_crossings`, STUDIO-1026), step 16 (the review evidence ledger's
 //! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009)
-//! have no Go counterpart: they are
+//! and step 17 (`rhapsody_manager_exchange`, STUDIO-1012) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
@@ -53,7 +53,7 @@ use std::sync::{Mutex, MutexGuard};
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
 /// review evidence ledger) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -357,6 +357,31 @@ ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_patch_id   TEXT    N
 ALTER TABLE rhapsody_review_watch ADD COLUMN last_completed_verdict    TEXT    NOT NULL DEFAULT '';
 UPDATE rhapsody_review_bound   SET generation = 1;
 UPDATE rhapsody_review_finding SET generation = 1;
+"#,
+    // v16 -> v17: manager EXCHANGE AUTHORIZATIONS (STUDIO-1012, design record
+    // `manager-agent-design.md` §7.8). Rhapsody-only, on a Rhapsody-only table, so the
+    // `rhapsody_` prefix gates every column out of the Go-recaptured schema golden by name exactly
+    // as steps 7-16 are.
+    //
+    // One row per authorization the manager's activation transaction (M4) writes: a `review_round`
+    // (a re-review of the current head) or an `author_round` (an author dispatch, plus the review
+    // round that answers the author's push). After the round threshold and in `act` mode only, the
+    // review-side arming paths consume one of these; §7.8's bound is that no daemon-automated
+    // exchange happens without one. The `authorized_head`/`authorized_patch_id` bind a
+    // `review_round` to the change it was granted for, so a patch-id move before it is consumed
+    // invalidates it rather than arming a round nobody authorized. The row is written only by the
+    // manager path; the review paths here read it and move its `state`.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_manager_exchange (
+  id                  TEXT    NOT NULL PRIMARY KEY,
+  intervention_id     TEXT    NOT NULL DEFAULT '',
+  pr                  TEXT    NOT NULL DEFAULT '',
+  generation          INTEGER NOT NULL DEFAULT 0,
+  kind                TEXT    NOT NULL DEFAULT '',
+  authorized_head     TEXT    NOT NULL DEFAULT '',
+  authorized_patch_id TEXT    NOT NULL DEFAULT '',
+  state               TEXT    NOT NULL DEFAULT ''
+);
 "#,
 ];
 
@@ -2083,6 +2108,90 @@ impl Store for Sqlite {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    fn save_manager_exchange(&self, exchange: ManagerExchange) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A whole-row upsert keyed by the opaque id: the writer is the manager's activation
+        // transaction (a later slice), which creates each authorization once, so a re-create with
+        // the same id is idempotent rather than a second authorization.
+        conn.execute(
+            "INSERT INTO rhapsody_manager_exchange
+               (id, intervention_id, pr, generation, kind, authorized_head, authorized_patch_id, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               intervention_id     = excluded.intervention_id,
+               pr                  = excluded.pr,
+               generation          = excluded.generation,
+               kind                = excluded.kind,
+               authorized_head     = excluded.authorized_head,
+               authorized_patch_id = excluded.authorized_patch_id,
+               state               = excluded.state",
+            params![
+                exchange.id,
+                exchange.intervention_id,
+                exchange.pr,
+                exchange.generation,
+                exchange.kind,
+                exchange.authorized_head,
+                exchange.authorized_patch_id,
+                exchange.state,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn manager_exchanges(&self, pr: &str) -> Result<Vec<ManagerExchange>, StoreError> {
+        let conn = self.lock();
+        // Insertion order (`rowid`) is creation order, and the caller takes the newest live row it
+        // can use. The explicit id is a TEXT primary key, so `rowid` is not an alias for it.
+        let mut stmt = conn.prepare(
+            "SELECT id, intervention_id, pr, generation, kind, authorized_head, authorized_patch_id, state \
+             FROM rhapsody_manager_exchange WHERE pr = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![pr], |row| {
+            Ok(ManagerExchange {
+                id: row.get(0)?,
+                intervention_id: row.get(1)?,
+                pr: row.get(2)?,
+                generation: row.get(3)?,
+                kind: row.get(4)?,
+                authorized_head: row.get(5)?,
+                authorized_patch_id: row.get(6)?,
+                state: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn set_manager_exchange_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_exchange SET state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Only the LIVE states move. An already-terminal row (completed/invalidated) is left
+        // exactly as it is, so a later invalidation cannot rewrite history.
+        conn.execute(
+            "UPDATE rhapsody_manager_exchange SET state = ?2 \
+             WHERE pr = ?1 AND state IN (?3, ?4)",
+            params![
+                pr,
+                MANAGER_EXCHANGE_INVALIDATED,
+                MANAGER_EXCHANGE_ACTIVE,
+                MANAGER_EXCHANGE_CONSUMED,
+            ],
+        )?;
+        Ok(())
     }
 
     fn record_review_completion(
@@ -4633,8 +4742,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    // --- the durable terminal-move ledger (STUDIO-1007) ---------------------------------------
+    // --- manager exchange authorizations (STUDIO-1012) ----------------------------------------
 
+    /// A manager exchange authorization round-trips across a restart, and invalidation moves only
+    /// the LIVE states — a completed row is left exactly as it is.
+    #[test]
+    fn manager_exchanges_round_trip_and_invalidation_spares_terminal_rows() {
+        let scratch = scratch_dir();
+        let db = scratch.join("exchange.db");
+
+        let row = |id: &str, kind: &str, state: &str| ManagerExchange {
+            id: id.to_string(),
+            intervention_id: "iv-1".to_string(),
+            pr: "makewhat/rhapsody#84".to_string(),
+            generation: 2,
+            kind: kind.to_string(),
+            authorized_head: "aaa111".to_string(),
+            authorized_patch_id: "patch-1".to_string(),
+            state: state.to_string(),
+        };
+
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            store
+                .save_manager_exchange(row(
+                    "a",
+                    MANAGER_EXCHANGE_REVIEW_ROUND,
+                    MANAGER_EXCHANGE_ACTIVE,
+                ))
+                .expect("save active");
+            store
+                .save_manager_exchange(row(
+                    "b",
+                    MANAGER_EXCHANGE_AUTHOR_ROUND,
+                    MANAGER_EXCHANGE_COMPLETED,
+                ))
+                .expect("save completed");
+            store
+                .set_manager_exchange_state("a", MANAGER_EXCHANGE_CONSUMED)
+                .expect("consume");
+        } // store dropped — the daemon "restarts" here
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        let mut rows = store
+            .manager_exchanges("makewhat/rhapsody#84")
+            .expect("read");
+        rows.sort_by(|l, r| l.id.cmp(&r.id));
+        assert_eq!(rows.len(), 2, "both rows survive the restart");
+        assert_eq!(rows[0].state, MANAGER_EXCHANGE_CONSUMED);
+        assert_eq!(rows[0].kind, MANAGER_EXCHANGE_REVIEW_ROUND);
+        assert_eq!(rows[0].generation, 2);
+        assert_eq!(rows[0].authorized_patch_id, "patch-1");
+        assert_eq!(rows[1].state, MANAGER_EXCHANGE_COMPLETED);
+
+        store
+            .invalidate_manager_exchanges("makewhat/rhapsody#84")
+            .expect("invalidate");
+        let mut rows = store
+            .manager_exchanges("makewhat/rhapsody#84")
+            .expect("read");
+        rows.sort_by(|l, r| l.id.cmp(&r.id));
+        assert_eq!(
+            rows[0].state, MANAGER_EXCHANGE_INVALIDATED,
+            "a live (consumed) row is invalidated"
+        );
+        assert_eq!(
+            rows[1].state, MANAGER_EXCHANGE_COMPLETED,
+            "a terminal row is left exactly as it is"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // --- the durable terminal-move ledger (STUDIO-1007) ---------------------------------------
     /// The whole point of the row: an owed terminal move, its attempt count and its next due time
     /// all survive a restart, so a handoff on the far side of one still sees the merge and the
     /// bounded retry still knows where it was.
@@ -5729,6 +5909,7 @@ mod tests {
                 "rhapsody_review_done".to_string(),
                 "rhapsody_review_finding".to_string(),
                 "rhapsody_breaker_crossings".to_string(),
+                "rhapsody_manager_exchange".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

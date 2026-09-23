@@ -1027,6 +1027,29 @@ every M1 finding row is backfilled onto the same value in the same migration ste
 is dormant unless `teams.enabled` and `review.mode: ticketless`, so every other installation is
 byte-identical.
 
+### A ninth schema table with no Go counterpart — `rhapsody_manager_exchange` (STUDIO-1012)
+
+The manager program bounds the review↔author loop after a round threshold: in `act` mode a review
+round or an author dispatch happens only under an active **manager exchange authorization**. This
+slice (M5) adds the table and the review-side gates that READ it; the writer — the manager's
+activation transaction — is a later slice, and the gates are inert unless
+`teams.manager.review_authority: act` (default `off`, so every existing install is byte-identical).
+Nothing runs before the threshold, and `off`/`advise` add no gating.
+
+The table holds one row per authorization: `intervention_id`, `pr` (the case-folded
+`owner/repo#number`), the loop `generation`, `kind` (`review_round` or `author_round`),
+`authorized_head`, `authorized_patch_id` and `state` (`active` → `consumed` → `completed`, or
+`invalidated`). The review watcher's round arming consumes an `active` authorization at the
+authorized head; re-introduction arms nothing on its own; the automatic findings route-back and its
+summon are suppressed; and a new generation, a hold, the pull request closing, or a `review_round`'s
+patch-id move before consumption invalidates a row. The `rhapsody_` prefix keeps the new table out of
+the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the ninth name.
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_manager_exchange` | — | one row per manager exchange authorization |
+| `PRAGMA user_version` | 6 | **17** |
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so

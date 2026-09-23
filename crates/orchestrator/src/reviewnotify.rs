@@ -112,6 +112,14 @@ pub struct ReviewCompletion {
     /// Whether the reviewer declared `HANDOFF: approved`. It is the whole of the token decision:
     /// approved ⇒ tokenless, findings ⇒ token-bearing.
     pub approved: bool,
+    /// Whether the daemon must NOT summon the author even though this round left findings
+    /// (STUDIO-1012; §7.8 path 4). Set in `act` mode after the round threshold: the automatic
+    /// route-back is suppressed, so its summon must be too — the comment becomes a record of the
+    /// review, and the manager's next decision is what may wake the author.
+    ///
+    /// `false` everywhere else, so an approved round stays tokenless by [`Self::approved`] alone and
+    /// an ordinary findings round still summons exactly as before.
+    pub suppress_summons: bool,
     /// The configured summon token, resolved once on the control task. Carried rather than re-read
     /// so the comment that is POSTED and the predicate that judged it cannot disagree across a
     /// config reload.
@@ -130,6 +138,16 @@ pub struct ReviewCompletion {
 impl std::fmt::Display for ReviewCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}#{}", self.owner, self.repo, self.number)
+    }
+}
+
+impl ReviewCompletion {
+    /// Whether the comment this completion produces should carry the summon token: a findings round
+    /// whose summons has not been suppressed (STUDIO-1012). An approved round is tokenless by
+    /// [`Self::approved`]; a suppressed findings round is tokenless because the manager, not this
+    /// comment, owns what happens next.
+    pub fn wants_summons(&self) -> bool {
+        !self.approved && !self.suppress_summons
     }
 }
 
@@ -200,6 +218,19 @@ pub fn re_engage_comment(c: &ReviewCompletion) -> String {
              No changes are requested, so nothing is being asked of {who} and this comment \
              deliberately carries no summon. Pushing to this branch arms one more review of the \
              new commits.\n\
+             \n\
+             Reviewed, not merged — {who} owns the merge.\n"
+        );
+    }
+    if c.suppress_summons {
+        // STUDIO-1012 (§7.8 path 4): the review is recorded, but the daemon does not wake the
+        // author from here — the manager decides what happens next. Tokenless by construction.
+        return format!(
+            "**{reviewer}** reviewed this pull request at `{head}` and left findings on it.\n\
+             \n\
+             This comment deliberately carries no summon: after the review-round threshold the \
+             manager decides whether to bring {who} back. The findings above are the record of what \
+             this round found.\n\
              \n\
              Reviewed, not merged — {who} owns the merge.\n"
         );
@@ -322,10 +353,10 @@ async fn post_completion(deps: &ReviewNotifyDeps, c: &ReviewCompletion) -> bool 
     let body = re_engage_comment(c);
     // The contract, in the log, on every comment: whether THIS body will reopen the author's
     // ticket. Recomputed from the body that is actually about to be posted rather than from
-    // `c.approved`, so an edit to the template that lost the token reads as "will not
-    // re-engage" here instead of failing silently three systems away (design §14.2).
+    // `c.approved`/`c.suppress_summons`, so an edit to the template that lost the token reads as
+    // "will not re-engage" here instead of failing silently three systems away (design §14.2).
     let summons = summons_author(&body, &c.summon_token);
-    if summons != !c.approved {
+    if summons != c.wants_summons() {
         // The two disagree only if the template and the verdict have come apart — a findings
         // comment whose token no longer matches, or an approval that grew one. Neither is
         // recoverable here and both are worth saying out loud before posting.
@@ -441,6 +472,11 @@ impl Orchestrator {
         if run.owner.is_empty() || run.repo.is_empty() || run.number <= 0 {
             return None;
         }
+        // STUDIO-1012 (§7.8 path 4): in `act` mode after the round threshold the daemon suppresses
+        // its automatic findings route-back, and the summon in this comment with it. The review
+        // becomes evidence for the manager's next decision, which is what may wake the author.
+        let coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+        let suppress_summons = !approved && self.review_exchange_gate_active(&coord);
         Some(ReviewCompletion {
             reason: CompletionReason::Verdict,
             owner: run.owner.clone(),
@@ -450,6 +486,7 @@ impl Orchestrator {
             author: run.author.clone(),
             head_sha: run.head_sha.clone(),
             approved,
+            suppress_summons,
             summon_token: self.review_summon_token(),
             changes: self.plan_review_changes(run, approved),
         })
@@ -498,7 +535,7 @@ mod tests {
     use std::sync::Mutex;
 
     use chrono::{DateTime, TimeZone, Utc};
-    use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
+    use rhapsody_config::teams::{Identity, Review, ReviewAuthority, ReviewMode, Teams};
     use rhapsody_core::{Issue, LinkedPRRef};
     use rhapsody_store::{Sqlite, StorePath};
     use rhapsody_tracker::fake::Fake;
@@ -521,6 +558,7 @@ mod tests {
             author: "alice".to_string(),
             head_sha: HEAD.to_string(),
             approved,
+            suppress_summons: false,
             summon_token: token.to_string(),
             changes: None,
         }
@@ -940,6 +978,48 @@ mod tests {
             .expect("the ticketless daemon plans a comment");
         assert_eq!(c.head_sha, HEAD);
         assert!(re_engage_comment(&c).contains(&HEAD[..7]));
+    }
+
+    /// STUDIO-1012 (§7.8 path 4): in `act` mode past the round threshold a findings round's
+    /// completion comment carries NO summon — the daemon suppresses its automatic route-back, so it
+    /// must not wake the author either. Off/advise still summon, proven beside it.
+    ///
+    /// MUTATION: leave the summon token on and this reds.
+    #[test]
+    fn an_act_findings_round_past_the_threshold_suppresses_the_summon() {
+        for authority in [
+            ReviewAuthority::Act,
+            ReviewAuthority::Off,
+            ReviewAuthority::Advise,
+        ] {
+            let mut o = orch(true, ReviewMode::Ticketless, "@symphony");
+            let teams = o.teams.as_mut().expect("teams");
+            teams.manager.review_authority = authority;
+            teams.review.adjudicate_after_rounds = 1;
+            o.review_rounds.insert(
+                crate::reviewwatch::churn_key(&crate::prstate::PrCoord::new(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                )),
+                1,
+            );
+
+            let c = o
+                .plan_review_notify(&run(), false)
+                .expect("a completion is still planned");
+            let wants = c.wants_summons();
+            assert_eq!(
+                wants,
+                authority != ReviewAuthority::Act,
+                "{authority:?}: only act suppresses the summon"
+            );
+            assert_eq!(
+                summons_author(&re_engage_comment(&c), &c.summon_token),
+                wants,
+                "the rendered comment must carry the token exactly when it wants one"
+            );
+        }
     }
 
     // ── the `gh` seam ────────────────────────────────────────────────────────────────────────────

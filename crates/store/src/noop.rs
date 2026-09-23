@@ -264,6 +264,23 @@ impl Store for Noop {
     fn review_bound(&self, _pr: &str) -> Result<Option<ReviewBoundRow>, StoreError> {
         Ok(None)
     }
+
+    // STUDIO-1012: with persistence off there is nowhere to remember an exchange authorization, so
+    // the review-side gates find none and an `act`-mode install arms no gated round — the fail-closed
+    // direction, and why `review_authority: act` requires durable storage. Exactly the
+    // `summon_watermark`/`review_bound` stance above: a no-op store is a store, not a second policy.
+    fn save_manager_exchange(&self, _exchange: ManagerExchange) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_exchanges(&self, _pr: &str) -> Result<Vec<ManagerExchange>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn set_manager_exchange_state(&self, _id: &str, _state: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn invalidate_manager_exchanges(&self, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())
     }

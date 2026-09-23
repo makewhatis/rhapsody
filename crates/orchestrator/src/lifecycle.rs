@@ -2882,6 +2882,28 @@ mod tests {
         ) -> Result<Option<rhapsody_store::ReviewBoundRow>, rhapsody_store::StoreError> {
             self.0.review_bound(a0)
         }
+        fn save_manager_exchange(
+            &self,
+            a0: rhapsody_store::ManagerExchange,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_manager_exchange(a0)
+        }
+        fn manager_exchanges(
+            &self,
+            a0: &str,
+        ) -> Result<Vec<rhapsody_store::ManagerExchange>, rhapsody_store::StoreError> {
+            self.0.manager_exchanges(a0)
+        }
+        fn set_manager_exchange_state(
+            &self,
+            a0: &str,
+            a1: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_manager_exchange_state(a0, a1)
+        }
+        fn invalidate_manager_exchanges(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.invalidate_manager_exchanges(a0)
+        }
         fn record_review_completion(
             &self,
             a0: &rhapsody_store::ReviewWatchKey,
