@@ -36,6 +36,10 @@ use rhapsody_desktop::supervisor::{
     CredentialBootstrap, Options, State, Supervisor, resolve_binary, resources_dir_for,
 };
 
+mod support;
+
+use support::SupervisorGuard;
+
 const GATE: &str = "RHAPSODY_PARITY_E2E";
 
 /// Total budget for `/api/v1/state` to answer 200 through the apiproxy once the daemon is healthy.
@@ -121,6 +125,9 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
         max_restarts: 1,
         ..Default::default()
     });
+    // STUDIO-1038: the daemon runs in its own process group, so any assertion panic below would
+    // orphan it; the guard kills the group on every exit path (a no-op once `stop()` has run).
+    let _sup_guard = SupervisorGuard::new(&sup);
 
     // --- start -> healthy ---
     sup.start(tokio::time::sleep(Duration::from_secs(30)))
@@ -654,6 +661,9 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
         }),
         ..Default::default()
     });
+    // STUDIO-1038: as above — a failed assertion must not leave this daemon (or its temp dir)
+    // behind. Declared after `work` so it drops (kills the daemon) before the temp dir is removed.
+    let _sup_guard = SupervisorGuard::new(&sup);
 
     sup.start(tokio::time::sleep(Duration::from_secs(30)))
         .await
