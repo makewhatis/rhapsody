@@ -585,13 +585,16 @@ Answering needs the model turn, so it is a `manager.mode: labels+model` capabili
 but cannot read one as a question — and a daemon with no durable store has no records to answer from,
 so it behaves the same way.
 
-Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
+Memory is a pluggable backend (`none` / `local` / `hindsight`). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
 `~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
 on the first retain and at no other time. A roster entry may name its bank explicitly with `bank:`,
 but only a label-safe value is honoured — a bank id becomes a directory name — and anything else is
 dropped in favour of `<bank_prefix><name>`. `teams_roster` and `GET /api/v1/teams` report the id
 that was actually resolved, so the view always names the directory the daemon reads (STUDIO-729).
+`hindsight` is the shared remote bank instead: point `memory.endpoint` at a deployment and give it
+`memory.api_key` — optional for an unauthenticated local one. A retained memory becomes recallable
+after the service's own extraction finishes, about 30s later.
 
 **The team room** is an append-only log read at hydration, not a message bus: identities are durable
 state rather than processes, so nobody receives and everybody catches up. It is JSONL under
@@ -2877,13 +2880,20 @@ execute an arbitrary on-disk binary as the same OS user.
   spawned daemon child's piped stdin (then never written to again), authenticates the daemon's
   connection to a Unix socket the desktop hosts — never HTTP, and the token never appears in argv,
   an inheritable env var, `runtime.json`, or a log line.
-- **Wiring the socket server into the real supervisor spawn call is intentionally not yet done.**
-  `desktop/src-tauri/src/credential_bootstrap.rs`'s `BootstrapListener` is real and tested against a
-  real `UnixListener`/`UnixStream` pair (and, gated behind `RHAPSODY_CREDENTIAL_BOOTSTRAP_E2E=1`,
-  against the real built `rhapsodyd` binary end to end), but `supervisor::Inner::build_command`
-  itself is untouched — this ticket's job was to prove and specify the ownership mechanism, not
-  finish wiring every call site, and the supervisor's own restart/backoff state machine is heavily
-  tested and deliberately left alone here.
+- **The supervisor wires that channel into every daemon launch (STUDIO-1035).** When the desktop app
+  builds a supervisor it installs a `CredentialBootstrap` (`socket_dir` + owner lookup + the shared
+  `ChannelObservations`); `supervisor::Inner::run_once` then binds a `BootstrapListener`, spawns the
+  sidecar with `--credential-bootstrap` and a PIPED stdin, writes the one bootstrap frame, closes the
+  pipe, and serves the channel for the launch's life (shutting it down before any restart). The
+  listener routes each `read_bound` account through the SAME `ProviderCredentialOwner` instances the
+  desktop command surface mutates (one revision counter per provider), and records every answer's
+  revision into `ChannelObservations` — the map the provider commands read for their sync verdict.
+  `rhapsodyd`'s no-probe boot path seeds its one `CredentialResolver` with the frame it read
+  (`adopt_bootstrap`), so the boot provider-status read goes over the channel and a credential stored
+  while the daemon was offline is observed on the next startup. A provider-less install still gets the
+  flag and an empty channel, which is inert. The wiring is proven by an ungated supervisor lifecycle
+  test against the `fakedaemon` stub AND by a packaged `make app` e2e against the real `rhapsodyd`
+  (gated behind `RHAPSODY_PARITY_E2E=1`, run by the `desktop` CI job).
 
 ### Provider metadata in `WORKFLOW.md`, and the harness registry that gates it (STUDIO-984)
 

@@ -29,6 +29,33 @@ fn env_duration_ms(key: &str) -> Duration {
     }
 }
 
+/// Whether `--name` (or `--name=…`) appears in argv. Used to decide whether the supervisor piped a
+/// credential-bootstrap frame to us at all (STUDIO-1035's lifecycle test).
+fn has_flag(name: &str) -> bool {
+    std::env::args().any(|a| a == name || a.starts_with(&format!("{name}=")))
+}
+
+/// Reads ONE length-prefixed bootstrap frame from stdin and writes its raw bytes to `path`, so a
+/// lifecycle test can prove the supervisor really piped a frame (STUDIO-1035). Runs on a blocking
+/// task (plain `std::io`) so it never delays `/healthz`; a read error just leaves no capture file.
+fn capture_bootstrap_frame(path: &str) {
+    use std::io::Read;
+    let mut stdin = std::io::stdin();
+    let mut len = [0u8; 4];
+    if stdin.read_exact(&mut len).is_err() {
+        return;
+    }
+    let n = u32::from_be_bytes(len) as usize;
+    let mut body = vec![0u8; n];
+    if stdin.read_exact(&mut body).is_err() {
+        return;
+    }
+    let mut frame = Vec::with_capacity(4 + n);
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&body);
+    let _ = std::fs::write(path, frame);
+}
+
 /// Parses the `--port N` / `--port=N` flag from argv (positional workflow args are ignored).
 fn parse_port() -> u16 {
     let mut args = std::env::args().skip(1);
@@ -106,6 +133,16 @@ async fn main() {
         let _ = std::fs::write(&marker, b"crashed");
         eprintln!("fakedaemon: simulated crash on first launch");
         std::process::exit(3);
+    }
+
+    // STUDIO-1035: when the supervisor launched us with the credential-bootstrap flag and a test
+    // asked for a capture, drain its one stdin frame to a file on a blocking task (never delaying
+    // the health server). A real rhapsodyd reads the frame itself; this stub only records it.
+    if has_flag("--credential-bootstrap")
+        && let Ok(path) = std::env::var("FAKE_CAPTURE_BOOTSTRAP")
+        && !path.is_empty()
+    {
+        tokio::task::spawn_blocking(move || capture_bootstrap_frame(&path));
     }
 
     let ready_delay = env_duration_ms("FAKE_READY_DELAY_MS");

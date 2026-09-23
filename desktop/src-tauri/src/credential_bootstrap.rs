@@ -9,12 +9,11 @@
 //! construction, exactly the daemon this desktop instance just spawned, and no one else, since the
 //! token never touches argv, an inheritable env var, `runtime.json`, or a log line.
 //!
-//! Wiring `bind`/`bootstrap_message`/`accept_and_serve` into `supervisor::Inner::build_command`'s
-//! actual spawn call (piping the child's stdin and adding `--credential-bootstrap`) is the named,
-//! precise next integration step this ticket leaves for the composition root — deliberately not
-//! done here, to avoid touching the supervisor's own heavily-tested restart/backoff state machine
-//! for a ticket whose job is to prove and specify the mechanism (P0c), not to finish wiring it into
-//! every call site (P1's "production boundary").
+//! Since STUDIO-1035 that wiring is done: `supervisor::Inner::run_once` binds a `BootstrapListener`,
+//! spawns the child with `--credential-bootstrap` and a piped stdin, writes the one frame from
+//! [`BootstrapListener::bootstrap_message`], and drives [`BootstrapListener::accept_and_serve_registry`]
+//! for the launch's whole lifetime (shutting it down before a restart). See [`BootstrapListener`] for
+//! the socket and [`ChannelObservations`] for how the desktop learns what the daemon has observed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -32,6 +31,18 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider_credential::ProviderCredentialOwner;
+
+/// The production socket directory: `$HOME/.rhapsody/run`, the Rhapsody runtime home the daemon
+/// itself uses. An absent/empty `$HOME` falls back to a short `/tmp` path so a bind still has a
+/// home and the socket name stays well under the ~104-byte `sun_path` cap.
+pub fn default_socket_dir() -> std::path::PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => {
+            std::path::PathBuf::from(home).join(".rhapsody").join("run")
+        }
+        _ => std::path::PathBuf::from("/tmp").join("rhapsody-credential-run"),
+    }
+}
 
 /// A shared, non-secret record of the newest owner revision each credential account has actually
 /// been served over the authenticated channel (STUDIO-991). It is how the desktop learns that a

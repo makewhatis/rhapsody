@@ -21,7 +21,7 @@
 //! | §5 says | `/openapi.json` says |
 //! | --- | --- |
 //! | bank `<bank_prefix><name>`, `default` tenant | `/v1/default/banks/{bank_id}/…` — matches |
-//! | recall `types:["experience"]`, source facts | `POST …/memories/recall`, `RecallRequest.types` + `include.source_facts` — matches |
+//! | recall `types:["experience","world"]`, source facts | `POST …/memories/recall`, `RecallRequest.types` + `include.source_facts` — matches |
 //! | invalidate `PATCH {"state":"invalidated","reason":…}` | `PATCH …/memories/{id}`, `UpdateMemoryRequest{state,reason}` — matches, **and `state:"valid"` reverts** |
 //! | `enable_observations: false` | a *bank* setting, not a per-retain one: `CreateBankRequest.enable_observations` |
 //! | — | **recall has no `top_k`/`limit`**, only `budget`/`max_tokens`, so `Query::top_k` is applied client-side |
@@ -77,9 +77,24 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 /// down" fails fast and distinctly from "the bank is slow".
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `RecallRequest.types` — §5.2: "`types: ["experience"]`", because `world` "is
-/// where laundered conclusions live".
+/// `RecallRequest.types[0]` — the extractor's classification for an agent's own
+/// authored note.
 pub const FACT_TYPE_EXPERIENCE: &str = "experience";
+
+/// `RecallRequest.types[1]` — the extractor's classification for a fact *about
+/// the world*.
+///
+/// §5.2 originally asked for `experience` alone and excluded `world` as "where
+/// laundered conclusions live". **That was reversed by the STUDIO-1036 operator
+/// decision (2026-09-23)** against Hindsight 0.10.1: the extractor files most of
+/// a teammate's own note as `world` — one real record produced 0 `experience`
+/// facts and five `world` ones, so `experience`-only recall returned nothing and
+/// every teammate was effectively memoryless. An identity's bank holds only what
+/// that identity retained, with host-stamped provenance, so the `world` /
+/// `experience` split is how the extractor classified the note, not a trust
+/// boundary. `observation` stays excluded, and banks keep
+/// `enable_observations: false`: quoting and re-grounding are unchanged.
+pub const FACT_TYPE_WORLD: &str = "world";
 
 /// `RecallRequest.max_tokens`. The API's own default, restated so the request
 /// shape is pinned by this crate's tests rather than by a server default that
@@ -403,9 +418,13 @@ impl MemoryBackend for HindsightBackend {
     /// over as strings, present even when empty, mirroring what `local` writes
     /// into front matter. `document_id` carries §5.1's `run-<run_id>`.
     ///
-    /// `async: false`, so the call returns only once the fact is stored: a
-    /// fire-and-forget retain would report success for a run whose memory never
-    /// landed, and this is already the off-loop path where waiting is free.
+    /// `async: true`, so the call returns as soon as the service has accepted the
+    /// document rather than waiting for LLM fact extraction — measured at 14–25s
+    /// against Hindsight 0.10.1, far past [`REQUEST_TIMEOUT`]. Waiting
+    /// synchronously made every retain report a client-side failure while the
+    /// server still stored the fact (STUDIO-1036). The background retain answers
+    /// in well under the timeout, and the response's `operation_id` is logged at
+    /// debug when it carries one; a response without one still succeeds.
     ///
     /// **The returned id is the `document_id` we supplied, not a fact id.**
     /// Hindsight *extracts* facts from the content, so one retain can produce
@@ -437,28 +456,42 @@ impl MemoryBackend for HindsightBackend {
                     "run_id": rec.run_id,
                 },
             }],
-            "async": false,
+            "async": true,
         });
-        self.send(self.http.post(&url).json(&body), "hindsight retain")
+        let resp = self
+            .send(self.http.post(&url).json(&body), "hindsight retain")
             .await?
             .ok("retain")?;
+        // Best-effort: the operation id is the handle the service assigns to the
+        // background extraction. Log it when the response carried one and stay
+        // quiet when it did not — a shape change here must not fail a retain.
+        if let Ok(v) = serde_json::from_str::<Value>(&resp)
+            && let Some(op) = v.get("operation_id").and_then(Value::as_str)
+        {
+            tracing::debug!(
+                bank = %bank,
+                document_id = %rec.document_id,
+                operation_id = %op,
+                "hindsight retain accepted for background extraction"
+            );
+        }
         Ok(rec.document_id.clone())
     }
 
-    /// `POST …/memories/recall` with §5.2's two overrides — `types:
-    /// ["experience"]` and `include: {source_facts: {}}` — both of which §5.2
-    /// says are wrong by default for this use.
+    /// `POST …/memories/recall` with the two overrides the STUDIO-1036 operator
+    /// decision (2026-09-23) requires — `types: ["experience", "world"]` and
+    /// `include: {source_facts: {}}` — both of which §5.2 says the service's
+    /// defaults get wrong for this use.
     ///
     /// **`top_k` is applied here, not by the service.** The deployed
     /// `RecallRequest` has no `top_k` or `limit`, only `budget` and `max_tokens`,
     /// so the "every recalled byte is turn-1 prompt cost, forever" bound is
     /// enforced on the response — which is where `local` enforces it too.
     ///
-    /// `source_facts` is requested because §5.2 requires it, and is normally
-    /// empty under `types: ["experience"]`: it carries the sources of
-    /// *observation* results, and this recall asks for none. It is sent anyway
-    /// rather than conditionally, so the request shape does not quietly change
-    /// if a future slice ever asks for observations.
+    /// `source_facts` is requested because §5.2 requires it. It is sent
+    /// unconditionally rather than only when some `types` entry could carry
+    /// sources, so the request shape does not quietly change if a future slice
+    /// ever asks for observations.
     async fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError> {
         let bank = self.checked_bank_id(identity)?;
         let top_k = effective_top_k(q);
@@ -486,7 +519,7 @@ impl MemoryBackend for HindsightBackend {
         let url = format!("{}/memories/recall", self.bank_url(&bank));
         let body = json!({
             "query": query,
-            "types": [FACT_TYPE_EXPERIENCE],
+            "types": [FACT_TYPE_EXPERIENCE, FACT_TYPE_WORLD],
             "include": { "source_facts": {} },
             "max_tokens": RECALL_MAX_TOKENS,
         });
@@ -1094,8 +1127,9 @@ mod tests {
         assert_eq!(item["content"], "shipped the prefetch");
         assert_eq!(item["document_id"], "run-412");
         assert_eq!(
-            req.body["async"], false,
-            "a fire-and-forget retain would report a fact that never landed"
+            req.body["async"], true,
+            "a synchronous retain waits on 14–25s of extraction under a 4s timeout and reports \
+             failure while the fact still lands"
         );
         // §5.1's five host-stamped provenance fields, all of them, as strings.
         assert_eq!(item["metadata"]["identity"], "alice");
@@ -1154,11 +1188,11 @@ mod tests {
         stub.request("POST", "/memories");
     }
 
-    /// §5.2's two overrides, both of which the section says are wrong by default
-    /// for this use — and the absence of a `top_k` field, which is why the bound
-    /// is applied to the response instead.
+    /// The STUDIO-1036 operator decision, pinned against the wire: recall asks
+    /// for both `experience` and `world`, and no `top_k` field is sent, which is
+    /// why the bound is applied to the response instead.
     #[tokio::test]
-    async fn recall_asks_for_experience_facts_with_source_facts() {
+    async fn recall_asks_for_experience_and_world_facts_with_source_facts() {
         let stub =
             Stub::start(|_| Reply::ok(&recall_body("the poller skipped null attachments"))).await;
         let b = backend(&stub);
@@ -1178,7 +1212,11 @@ mod tests {
             .expect("recall");
         let req = stub.request("POST", "/memories/recall");
         assert_eq!(req.path, "/v1/default/banks/agent-alice/memories/recall");
-        assert_eq!(req.body["types"], json!(["experience"]));
+        assert_eq!(
+            req.body["types"],
+            json!(["experience", "world"]),
+            "the extractor files a teammate's own note as world, so experience-only recall is empty"
+        );
         assert_eq!(req.body["include"]["source_facts"], json!({}));
         assert_eq!(req.body["max_tokens"], 4096);
         assert_eq!(

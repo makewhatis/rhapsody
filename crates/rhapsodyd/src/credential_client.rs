@@ -314,6 +314,17 @@ impl CredentialResolver {
             .await;
     }
 
+    /// Seeds this resolver's channel directly with an already-read bootstrap frame (or `None` for "no
+    /// frame arrived"). The daemon's boot path uses this on the no-probe branch, where it has to
+    /// consume stdin itself to log the "stream established" line: without seeding, the SAME resolver
+    /// the provider-status and dispatch paths read through would keep an UNINITIALIZED channel and
+    /// resolve `OwnerUnavailable` for the process's lifetime, even though a perfectly good channel was
+    /// received — the daemon-observable revision would never advance (STUDIO-1035). Idempotent: a
+    /// `OnceCell::set` on an already-set cell is a no-op, so a later `learn_bootstrap` cannot clobber it.
+    pub fn adopt_bootstrap(&self, message: Option<BootstrapMessage>) {
+        let _ = self.channel.set(message);
+    }
+
     /// Reads one credential through the learned channel and folds the result into this resolver.
     /// Callers route EVERY read for a credential through the same resolver, which is what lets
     /// successive reads observe an availability transition. Not `resolve(stdin, ..)`: the bootstrap
@@ -659,6 +670,72 @@ mod tests {
         let empty: &[u8] = &[];
         let resolver = CredentialResolver::new();
         resolver.learn_bootstrap(empty).await;
+        let read = resolver.read_bound("v1:x".into(), a_binding()).await;
+        assert_eq!(read.read.state.tag(), CredentialStateTag::OwnerUnavailable);
+    }
+
+    // STUDIO-1035: the daemon's no-probe boot path consumes stdin itself and seeds the resolver via
+    // `adopt_bootstrap`. Without that seeding the SAME resolver the provider-status and dispatch paths
+    // read through stays uninitialized and resolves `OwnerUnavailable` forever — so a credential
+    // stored while the daemon was offline would never be observed on the next startup. This drives a
+    // real socket: adopt the frame, then a read goes over it.
+    #[tokio::test]
+    async fn adopt_bootstrap_seeds_the_channel_for_later_reads() {
+        let path = unix_socket_path("adopt");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+        let binding = a_binding();
+        let server_binding = binding.clone();
+
+        let accept = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            let (mut r, mut w) = tokio::io::split(stream);
+            let mut session = ServerSession::new(Token::new("adopted-token".into()));
+            let hello: HelloFrame = read_frame(&mut r).await.unwrap();
+            session.accept_hello(&hello.token).expect("hello accepted");
+            let ClientFrame::ReadBound { seq, .. } = read_frame(&mut r).await.unwrap();
+            session.accept_client_seq(seq).unwrap();
+            let resp_seq = session.next_outgoing_seq();
+            write_frame(
+                &mut w,
+                &ServerFrame::ReadBoundResult {
+                    seq: resp_seq,
+                    revision: Revision(11),
+                    state: CredentialStateTag::Present,
+                    lease: Some(LeasePayload {
+                        binding: server_binding,
+                        value: "sk-adopted".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let resolver = CredentialResolver::new();
+        // Exactly what `run`'s no-probe branch does instead of `learn_bootstrap`.
+        resolver.adopt_bootstrap(Some(BootstrapMessage {
+            token: "adopted-token".into(),
+            socket_path: path.to_string_lossy().into_owned(),
+        }));
+        let read = resolver
+            .read_bound("v1:spike-test-provider".into(), binding)
+            .await;
+        assert_eq!(
+            read.read.revision,
+            Revision(11),
+            "an adopted frame must carry later reads over the real channel"
+        );
+        assert_eq!(read.read.state.tag(), CredentialStateTag::Present);
+
+        accept.await.unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn adopt_bootstrap_none_keeps_the_owner_unavailable() {
+        let resolver = CredentialResolver::new();
+        resolver.adopt_bootstrap(None);
         let read = resolver.read_bound("v1:x".into(), a_binding()).await;
         assert_eq!(read.read.state.tag(), CredentialStateTag::OwnerUnavailable);
     }
