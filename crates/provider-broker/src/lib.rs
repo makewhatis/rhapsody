@@ -59,6 +59,10 @@ pub mod usage;
 // pipeline). Gated behind the `loopback` feature so a PB1-only consumer does not link the HTTP stack.
 #[cfg(feature = "loopback")]
 pub mod budget;
+// STUDIO-990 (P9): the fixed-endpoint `/models` catalog fetch. PB2 owns the one HTTP stack, so the
+// credentialed catalog leg shares this crate's egress policy by construction.
+#[cfg(feature = "loopback")]
+pub mod catalog;
 #[cfg(feature = "loopback")]
 pub mod listener;
 #[cfg(feature = "loopback")]

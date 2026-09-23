@@ -59,10 +59,7 @@ pub fn filter_reflected(
     let mut dropped = false;
     for entry in entries {
         let reflected = contains_secret(&entry.id)
-            || entry
-                .display_name
-                .as_deref()
-                .is_some_and(&contains_secret)
+            || entry.display_name.as_deref().is_some_and(&contains_secret)
             || entry.capabilities.iter().any(|c| contains_secret(c));
         if reflected {
             dropped = true;

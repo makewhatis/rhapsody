@@ -93,6 +93,9 @@ impl std::fmt::Display for EndpointError {
 pub struct NormalizedEndpoint {
     canonical: String,
     chat_completions: String,
+    /// The one exact `models` URL derived from the same canonical base. STADIO-990: the provider
+    /// model-catalog adapter reaches exactly this path, never an arbitrary one.
+    models: String,
     insecure_http: bool,
 }
 
@@ -198,9 +201,14 @@ impl NormalizedEndpoint {
         if url::Url::parse(&chat_completions).is_err() {
             return Err(EndpointError::InvalidUrl);
         }
+        let models = format!("{canonical}/models");
+        if url::Url::parse(&models).is_err() {
+            return Err(EndpointError::InvalidUrl);
+        }
         Ok(Self {
             canonical,
             chat_completions,
+            models,
             insecure_http: scheme == "http",
         })
     }
@@ -213,6 +221,12 @@ impl NormalizedEndpoint {
     /// The one exact Chat Completions endpoint, joined exactly once.
     pub fn chat_completions_url(&self) -> &str {
         &self.chat_completions
+    }
+
+    /// The one exact model-catalog endpoint, joined exactly once (STUDIO-990). Purpose-specific: the
+    /// catalog adapter reaches this URL and no other.
+    pub fn models_url(&self) -> &str {
+        &self.models
     }
 
     /// Whether this endpoint is plaintext HTTP (the operator explicitly opted in).
@@ -350,10 +364,42 @@ impl UpstreamClient {
     }
 }
 
+impl UpstreamClient {
+    /// One GET to the fixed `/models` URL with only the protocol headers (STUDIO-990). This is
+    /// deliberately a *purpose-specific* primitive, not a generic forwarder: the destination is
+    /// derived from an already-validated [`NormalizedEndpoint`] and the only caller-supplied header
+    /// is the leased Bearer credential. It never mints or returns an agent capability.
+    pub(crate) async fn fetch_models(
+        &self,
+        endpoint: &NormalizedEndpoint,
+        authorization: HeaderValue,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let response = self
+            .client
+            .get(endpoint.models_url())
+            .header(AUTHORIZATION, authorization)
+            .header(ACCEPT, HeaderValue::from_static("application/json"))
+            .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"))
+            .send()
+            .await
+            .map_err(UpstreamError::Transport)?;
+        Ok(UpstreamResponse { response })
+    }
+}
+
 impl std::fmt::Debug for UpstreamClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<upstream client>")
     }
+}
+
+/// Why a bounded body read failed.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    /// The body exceeded the caller's cap; the read stopped there.
+    TooLarge,
+    /// The transport failed mid-body.
+    Transport(reqwest::Error),
 }
 
 /// A received upstream response. The caller validates the media type, selects headers and streams the
@@ -395,6 +441,25 @@ impl UpstreamResponse {
                     .trim()
                     .to_ascii_lowercase()
             })
+    }
+
+    /// Read the whole body into memory, refusing once it exceeds `max` bytes (STUDIO-990's 8 MiB
+    /// catalog cap). Purpose-specific for the catalog adapter; the streaming forwarding path uses
+    /// [`Self::into_byte_stream`] instead and never buffers the whole body.
+    pub(crate) async fn read_bounded(mut self, max: usize) -> Result<Vec<u8>, ReadError> {
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > max {
+                        return Err(ReadError::TooLarge);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => return Ok(body),
+                Err(error) => return Err(ReadError::Transport(error)),
+            }
+        }
     }
 
     /// The backpressured body stream of raw (unredacted) upstream chunks. Built from
