@@ -189,6 +189,11 @@ the `Orchestrator` struct itself. Concretely:
   is a pure function (`reconcile_pr`) so each of the six incidents it exists for is a table fixture;
   if you add a divergence shape, mutation-check it, and keep the default for an unrecognised status
   SILENT.
+  `reviewfindings.rs` (STUDIO-1008; Rhapsody-only) owns the REVIEWER OUTPUT CONTRACT: the
+  `rhapsody-review-verdict` fenced block, the finding revisions it produces and §6.3's mechanical
+  reopen rule. It is pure — the worker parses the block and carries it on `EvWorkerExit`
+  (`review_verdict`), and `review.rs::on_review_exit` applies the plan to the store. `generation` is
+  a documented `0` and `raised_at_patch_id` empty until M2 tracks them; don't invent either here.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
   Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still

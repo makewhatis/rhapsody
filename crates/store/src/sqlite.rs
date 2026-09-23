@@ -11,11 +11,12 @@
 //! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
 //! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909),
 //! step 11 (`rhapsody_review_bound`, STUDIO-956), step 12 (`rhapsody_review_verdicts`,
-//! STUDIO-1020) and step 13 (`rhapsody_review_done`, STUDIO-1007) have no Go counterpart: they are
+//! STUDIO-1020), step 13 (`rhapsody_review_done`, STUDIO-1007) and step 14
+//! (`rhapsody_review_finding`, STUDIO-1008) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
-//! the per-pull-request review bound, the per-review-run verdict and the durable terminal-move
-//! ledger, none of which the frozen
+//! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
+//! ledger and the structured review-finding revisions, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -43,12 +44,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 13 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 14 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
-/// ledger) and are the one documented reason this number is ahead of the reference — see the module
-/// doc above.
-const SCHEMA_VERSION: i64 = 13;
+/// ledger, then the structured review findings) and are the one documented reason this number is
+/// ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 14;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -274,6 +275,41 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_done (
   gave_up    INTEGER NOT NULL DEFAULT 0
 );
 "#,
+    // v13 -> v14: the STRUCTURED REVIEW FINDINGS ledger — one row per finding REVISION a reviewer
+    // raised on a pull request (STUDIO-1008, design record `manager-agent-design.md` §5.3).
+    // Rhapsody-only, so the `rhapsody_` prefix gates it out of the Go-recaptured schema golden by
+    // name exactly as steps 7-13 are.
+    //
+    // One row per REVISION, not per finding: a repeat raise is a new row whose `revision` is one
+    // higher, which is what lets the reopen rule (§6.3) compare the re-raise against the dismissed
+    // revision it follows. The primary key is the whole coordinate, so two reviewers can each raise
+    // a `B8` (ids are scoped `sol:B8`). `paths` is stored NEWLINE-JOINED in one column via the same
+    // `join_findings`/`split_findings` pair the adjudication ledger uses — a path never contains a
+    // newline, so folding one would be malformed input rather than content. `summary_hash` stores a
+    // DIGEST, never the summary text: the row answers "same objection?" and keeps no prose.
+    // `blocking`/`new_evidence`/`regression` are INTEGER 0/1 columns. The composite PRIMARY KEY gives
+    // SQLite's implicit index and no explicit index reaches the golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_review_finding (
+  pr                 TEXT    NOT NULL,
+  generation         INTEGER NOT NULL,
+  reviewer           TEXT    NOT NULL,
+  finding_id         TEXT    NOT NULL,
+  revision           INTEGER NOT NULL,
+  review_run_id      INTEGER NOT NULL,
+  raised_at_sha      TEXT    NOT NULL DEFAULT '',
+  raised_at_patch_id TEXT    NOT NULL DEFAULT '',
+  paths              TEXT    NOT NULL DEFAULT '',
+  summary_hash       TEXT    NOT NULL DEFAULT '',
+  blocking           INTEGER NOT NULL DEFAULT 0,
+  new_evidence       INTEGER NOT NULL DEFAULT 0,
+  regression         INTEGER NOT NULL DEFAULT 0,
+  status             TEXT    NOT NULL DEFAULT 'open',
+  resolved_by        TEXT    NOT NULL DEFAULT '',
+  dismissed_by       TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (pr, generation, reviewer, finding_id, revision)
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -345,6 +381,37 @@ fn map_review_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewWatchRow>
         last_reviewed_sha: row.get(7)?,
         status: row.get(8)?,
         open: row.get(9)?,
+    })
+}
+
+/// The `rhapsody_review_finding` columns, in DDL order — the single shared list for every finding
+/// query, read POSITIONALLY by [`map_review_finding`] exactly as [`REVIEW_WATCH_COLS`] is by
+/// [`map_review_watch`].
+const REVIEW_FINDING_COLS: &str = "pr, generation, reviewer, finding_id, revision, review_run_id, \
+     raised_at_sha, raised_at_patch_id, paths, summary_hash, blocking, new_evidence, regression, \
+     status, resolved_by, dismissed_by";
+
+/// Scan one `rhapsody_review_finding` row selected with [`REVIEW_FINDING_COLS`] (positional, in DDL
+/// order). `paths` is the newline-joined TEXT column read back through [`split_findings`] (a path
+/// never contains a newline); the three flag columns read as INTEGER 0/1, like `runs.usage_estimated`.
+fn map_review_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFindingRow> {
+    Ok(ReviewFindingRow {
+        pr: row.get(0)?,
+        generation: row.get(1)?,
+        reviewer: row.get(2)?,
+        finding_id: row.get(3)?,
+        revision: row.get(4)?,
+        review_run_id: row.get(5)?,
+        raised_at_sha: row.get(6)?,
+        raised_at_patch_id: row.get(7)?,
+        paths: split_findings(&row.get::<_, String>(8)?),
+        summary_hash: row.get(9)?,
+        blocking: row.get::<_, i64>(10)? != 0,
+        new_evidence: row.get::<_, i64>(11)? != 0,
+        regression: row.get::<_, i64>(12)? != 0,
+        status: row.get(13)?,
+        resolved_by: row.get(14)?,
+        dismissed_by: row.get(15)?,
     })
 }
 
@@ -1827,6 +1894,99 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn save_review_finding(&self, row: ReviewFindingRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A revision row is IMMUTABLE once written: the row is the record of what a completed review
+        // said at a moment, so a duplicate write (a replayed exit) does nothing rather than
+        // rewriting history. `paths` rides the shared newline-join the adjudication ledger uses.
+        conn.execute(
+            "INSERT INTO rhapsody_review_finding
+               (pr, generation, reviewer, finding_id, revision, review_run_id, raised_at_sha,
+                raised_at_patch_id, paths, summary_hash, blocking, new_evidence, regression, status,
+                resolved_by, dismissed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(pr, generation, reviewer, finding_id, revision) DO NOTHING",
+            params![
+                row.pr,
+                row.generation,
+                row.reviewer,
+                row.finding_id,
+                row.revision,
+                row.review_run_id,
+                row.raised_at_sha,
+                row.raised_at_patch_id,
+                join_findings(&row.paths),
+                row.summary_hash,
+                i64::from(row.blocking),
+                i64::from(row.new_evidence),
+                i64::from(row.regression),
+                row.status,
+                row.resolved_by,
+                row.dismissed_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_review_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError> {
+        let conn = self.lock();
+        // Ordered by the key so a caller folding the rows into per-finding revisions sees each
+        // finding's revisions in ascending order.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_FINDING_COLS} FROM rhapsody_review_finding \
+               WHERE pr = ?1 ORDER BY reviewer, finding_id, revision"
+        ))?;
+        let rows = stmt.query_map([pr], map_review_finding)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn open_blocking_findings(&self, pr: &str) -> Result<Vec<ReviewFindingRow>, StoreError> {
+        let conn = self.lock();
+        // The read later tickets want: the revisions that are still live and still block. A
+        // `resolved`/`dismissed`/`settled` revision is filtered in SQL, and so is a non-blocking one.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_FINDING_COLS} FROM rhapsody_review_finding \
+               WHERE pr = ?1 AND status = ?2 AND blocking = 1 \
+               ORDER BY reviewer, finding_id, revision"
+        ))?;
+        let rows = stmt.query_map(params![pr, REVIEW_FINDING_OPEN], map_review_finding)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn resolve_review_findings(
+        &self,
+        pr: &str,
+        generation: i64,
+        reviewer: &str,
+        resolved_by: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A later APPROVING review by the same reviewer resolves every revision that reviewer has
+        // OPEN (§5.3). Settled/dismissed/resolved rows are left alone: the rule resolves what was
+        // live, not history.
+        conn.execute(
+            "UPDATE rhapsody_review_finding SET status = ?5, resolved_by = ?6 \
+               WHERE pr = ?1 AND generation = ?2 AND reviewer = ?3 AND status = ?4",
+            params![
+                pr,
+                generation,
+                reviewer,
+                REVIEW_FINDING_OPEN,
+                REVIEW_FINDING_RESOLVED,
+                resolved_by,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
         if retention_days <= 0 {
             return Ok(()); // 0 = keep forever
@@ -1972,11 +2132,12 @@ mod tests {
     ///
     /// A THIRD exclusion, `name NOT LIKE 'rhapsody\_%' ESCAPE '\'`, gates out the Rhapsody-only objects
     /// that the Go daemon cannot create and therefore can never appear in a recaptured golden
-    /// (today: `rhapsody_review_watch`, STUDIO-711 — see this module's doc comment and the README
-    /// "Divergences" entry). It excludes by NAME only, so it cannot hide drift in any of the 6
+    /// (today: every `rhapsody_*` object the Rhapsody-only migrations create — see this module's doc
+    /// comment and the README "Divergences" entry). It excludes by NAME only, so it cannot hide drift
+    /// in any of the 6
     /// ported tables: a Go table is never named `rhapsody_*`, and a new un-prefixed table still
     /// turns this golden red. `divergent_objects_are_gated_by_name_only` asserts that property and
-    /// pins the excluded set to exactly the documented object.
+    /// pins the excluded set to exactly the documented objects.
     ///
     /// The `_` in the prefix is ESCAPEd: unescaped it is a LIKE single-character wildcard, which
     /// would silently widen the exclusion to any `rhapsody?*` name. Escaped, the SQL is exactly
@@ -5240,6 +5401,7 @@ mod tests {
                 "rhapsody_review_bound".to_string(),
                 "rhapsody_review_verdicts".to_string(),
                 "rhapsody_review_done".to_string(),
+                "rhapsody_review_finding".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -5386,5 +5548,103 @@ mod tests {
         let later = crate::format_summon_at(precise + chrono::Duration::days(400));
         assert_eq!(later.len(), once.len());
         assert!(once < later, "lexicographic order is chronological order");
+    }
+
+    // --- structured review findings (STUDIO-1008) ---------------------------------------------
+
+    fn finding(
+        reviewer: &str,
+        id: &str,
+        revision: i64,
+        status: &str,
+        blocking: bool,
+    ) -> ReviewFindingRow {
+        ReviewFindingRow {
+            pr: "o/r#1".into(),
+            generation: 0,
+            reviewer: reviewer.into(),
+            finding_id: format!("{reviewer}:{id}"),
+            revision,
+            review_run_id: 100 + revision,
+            raised_at_sha: "sha".into(),
+            raised_at_patch_id: String::new(),
+            paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            summary_hash: "deadbeef".into(),
+            blocking,
+            new_evidence: false,
+            regression: false,
+            status: status.into(),
+            resolved_by: String::new(),
+            dismissed_by: String::new(),
+        }
+    }
+
+    // One row per revision round-trips, `paths` included, and the write is idempotent on the key.
+    #[test]
+    fn review_findings_round_trip() {
+        let st = open_mem();
+        st.save_review_finding(finding("sol", "B8", 1, REVIEW_FINDING_OPEN, true))
+            .expect("save 1");
+        st.save_review_finding(finding("sol", "B8", 2, REVIEW_FINDING_SETTLED, true))
+            .expect("save 2");
+        // A duplicate of an immutable revision is a no-op, not an error or a rewrite.
+        st.save_review_finding(finding("sol", "B8", 1, REVIEW_FINDING_RESOLVED, false))
+            .expect("duplicate");
+
+        let rows = st.load_review_findings("o/r#1").expect("load");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].revision, rows[0].status.as_str()),
+            (1, REVIEW_FINDING_OPEN)
+        );
+        assert_eq!(rows[1].revision, 2);
+        assert_eq!(
+            rows[1].paths,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        // Another pull request sees none of it.
+        assert!(st.load_review_findings("o/r#2").expect("other").is_empty());
+    }
+
+    // The manager-facing read returns only OPEN and BLOCKING revisions.
+    #[test]
+    fn open_blocking_findings_filters_status_and_flag() {
+        let st = open_mem();
+        st.save_review_finding(finding("sol", "B8", 1, REVIEW_FINDING_OPEN, true))
+            .expect("open blocking");
+        st.save_review_finding(finding("sol", "B9", 1, REVIEW_FINDING_RESOLVED, true))
+            .expect("resolved");
+        st.save_review_finding(finding("sol", "B10", 1, REVIEW_FINDING_OPEN, false))
+            .expect("non-blocking");
+        st.save_review_finding(finding("sol", "B11", 1, REVIEW_FINDING_SETTLED, true))
+            .expect("settled");
+
+        let open = st.open_blocking_findings("o/r#1").expect("open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].finding_id, "sol:B8");
+    }
+
+    // Resolution touches only that reviewer's OPEN rows on that pull request/generation.
+    #[test]
+    fn resolving_findings_scope_is_exact() {
+        let st = open_mem();
+        st.save_review_finding(finding("sol", "B8", 1, REVIEW_FINDING_OPEN, true))
+            .expect("sol open");
+        st.save_review_finding(finding("bob", "B1", 1, REVIEW_FINDING_OPEN, true))
+            .expect("bob open");
+
+        st.resolve_review_findings("o/r#1", 0, "sol", "42")
+            .expect("resolve sol");
+
+        let rows = st.load_review_findings("o/r#1").expect("load");
+        let sol = rows.iter().find(|r| r.reviewer == "sol").expect("sol row");
+        assert_eq!(sol.status, REVIEW_FINDING_RESOLVED);
+        assert_eq!(sol.resolved_by, "42");
+        let bob = rows.iter().find(|r| r.reviewer == "bob").expect("bob row");
+        assert_eq!(
+            bob.status, REVIEW_FINDING_OPEN,
+            "another reviewer is untouched"
+        );
+        assert!(bob.resolved_by.is_empty());
     }
 }

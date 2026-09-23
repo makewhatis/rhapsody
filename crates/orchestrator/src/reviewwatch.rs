@@ -2018,6 +2018,32 @@ impl Orchestrator {
                 .any(|entry| entry.identifier == identifier)
     }
 
+    /// Whether `row`'s pull request has a live AUTHOR run right now — the run that pushes the
+    /// intermediate commits a round armed on the head advance would review half-finished
+    /// (STUDIO-1025).
+    ///
+    /// **Both halves are required, and neither is optional.** `origin_ticket` is the daemon's own
+    /// join from the row's `introduced_by` to the ticket whose run pushed the pull request
+    /// (STUDIO-976's reader, shared rather than re-derived); a `pr:`/`console:` origin resolves to
+    /// no ticket, so the row names no run and nothing is deferred. The row's `author` is what
+    /// attributes the pull request to a run at all — an introduction with no recorded author is a
+    /// row the daemon cannot say belongs to a live run, and it is left exactly as it was before this
+    /// gate existed. Both together mean the deferral is a fact about the RUN, not a guess from the
+    /// pull request's shape.
+    ///
+    /// [`Self::author_run_live`] is the run-half predicate and covers `running` (a live worker) and
+    /// `retry_attempts` (a continuation or failure backoff that is `claimed` without being
+    /// `running`, which is how a failed run parks before it re-dispatches). A claim held with
+    /// neither — a run stopped at its token ceiling, or one still being prepared — has no live
+    /// pushes behind it, so it is not what this gate is for.
+    fn author_run_live_for_row(&self, row: &ReviewWatchRow) -> bool {
+        if row.author.is_empty() {
+            return false;
+        }
+        crate::reviewdone::origin_ticket(&row.introduced_by)
+            .is_some_and(|ticket| self.author_run_live(ticket))
+    }
+
     /// Records an AUTHOR round for every linked pull request of `iss` that already carries a budget,
     /// so the author half of the loop counts toward the adjudication threshold — but only once a
     /// reviewer has answered it (STUDIO-1004).
@@ -2318,6 +2344,10 @@ impl Orchestrator {
         // And the draft-poke bookkeeping (STUDIO-962): a re-introduced pull request must be poked
         // afresh, and an entry for a gone one would be a map that only ever grows.
         self.draft_pokes.remove(&churn_key(pr));
+        // And the author-deferral record (STUDIO-1025), for the same reason: a pull request that
+        // left the watch set owes no round for anyone to arm, and an entry keyed by coordinate would
+        // outlive the pull request it names.
+        self.review_deferred_by_author.remove(pr);
         // The failure record goes too (STUDIO-950 round 14): keyed by coordinate, it would otherwise
         // outlive the pull request it names and sit in the map for the daemon's whole life. It is
         // part of this function's own contract to forget EVERYTHING about the coordinate, even
@@ -2982,6 +3012,43 @@ impl Orchestrator {
             if !review_round_due(row, head, live) {
                 continue;
             }
+            // STUDIO-1025: an author's run pushes INTERMEDIATE commits — a merge of the base branch
+            // first, then the fixes — and a round armed on one of those reviews work that is not
+            // finished. PR 223 was reviewed at a merge-only head while its author's run was still
+            // going, and the review re-reported both open findings as unaddressed; PR 222 the same.
+            // Each is a wasted reviewer run and a round charged toward the threshold, pushing the
+            // pull request toward an escalation for a head the author had not finished with.
+            //
+            // DEFER, do not disarm. `handle_review_head_advanced` has already re-armed the row to
+            // `requested`, and that armed row is what survives the run: the round is armed once, at
+            // whatever head the branch stands at, on the sweep after the run ends — DETECTED by the
+            // run being gone, whether it handed off, crashed, or stopped at a ceiling, because the
+            // only question asked here is "is there a run for this ticket right now". Several pushes
+            // during one run therefore collapse into the single round the run finally earns, and a
+            // push with no live author run (a human's, the operator's rebase) arms exactly as it did
+            // before this gate existed.
+            //
+            // MUTATION: delete this gate and `a_push_from_a_live_author_run_defers_the_round` reds
+            // (the merge-only and fixes heads each arm their own round).
+            if self.author_run_live_for_row(row) {
+                let identifier = crate::reviewdone::origin_ticket(&row.introduced_by)
+                    .unwrap_or_default()
+                    .to_string();
+                tracing::debug!(
+                    pr = %pr, reviewer = %row.key.reviewer, run = %identifier, head = %head,
+                    "ticketless review: the author's run is still going, so this round is deferred \
+                     to the head it settles on"
+                );
+                self.review_deferred_by_author.insert(
+                    pr.clone(),
+                    AuthorDeferral {
+                        identifier,
+                        head: head.to_string(),
+                    },
+                );
+                report.deferred += 1;
+                continue;
+            }
             // A `rhapsody:human` origin ticket is refused at dispatch on every path (STUDIO-949), and
             // this watcher is a dispatch path. The gate is deliberately on the ROW'S CURRENT HOLD
             // rather than on the row's creation: a ticket labelled after an agent already flailed on
@@ -3155,6 +3222,22 @@ impl Orchestrator {
                     // The churn charge and the reassigned-incumbent retirement ran inside
                     // `dispatch_review_watch` / `commit_review_watch`, so they cover the prepared
                     // path too and are deliberately not repeated here.
+                    //
+                    // STUDIO-1025: this round is the one a live author run deferred, if the run has
+                    // since ended. Logged at `info` because it resolves a delay an operator can see,
+                    // and named with the run that caused it. Removed on the dispatch itself rather
+                    // than on the gate, so a row that passes the gate and then defers for capacity
+                    // or a human hold does not lose the record to a round that never armed. The
+                    // head named is the one being armed — the branch as it stands — not the one the
+                    // deferral recorded, which the run may have pushed past.
+                    if let Some(deferred) = self.review_deferred_by_author.remove(pr) {
+                        tracing::info!(
+                            pr = %pr, run = %deferred.identifier, deferred_head = %deferred.head,
+                            head = %head,
+                            "ticketless review: the author's run has ended; the round it deferred is \
+                             armed at the head the branch now stands at"
+                        );
+                    }
                 }
                 // Not a failure: something claimed the key between the check above and here, which
                 // is precisely what the guard exists for. Next tick.
@@ -3830,6 +3913,23 @@ impl CapacityHold {
 /// [`Orchestrator::review_capacity_held`]. STUDIO-950.
 pub(crate) type CapacityHolds = HashMap<String, CapacityHold>;
 
+/// The live author run one round was deferred behind, and the head the pull request stood at when
+/// the deferral was recorded (STUDIO-1025). See [`Orchestrator::review_deferred_by_author`].
+///
+/// The head is the edge the deferral must not lose: it is the head the author had pushed to when
+/// the round was held back, and the round is armed at whatever head the branch has reached by the
+/// time the run ends — several pushes during one run collapse into one round, so the recorded head
+/// is what lets the debug line say which push triggered the deferral, while the arming reads the
+/// head the branch is actually at rather than the stale one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorDeferral {
+    /// The origin ticket's identifier — the ticket `origin_ticket(row.introduced_by)` resolved to,
+    /// whose run was live when the round was deferred.
+    pub(crate) identifier: String,
+    /// The head the branch stood at when the deferral was recorded.
+    pub(crate) head: String,
+}
+
 /// How long the watcher's liveness ([`Orchestrator::review_watch_swept`]) may go un-refreshed
 /// before a recorded [`CapacityHold`] stops being meaningful. The watcher stamps its liveness on
 /// EVERY sweep it runs — not once per hold — so the thing this bounds is the sweep-to-sweep gap, and
@@ -4418,6 +4518,31 @@ mod tests {
         fn load_review_done(&self) -> Result<Vec<rs::ReviewDoneRow>, rs::StoreError> {
             self.0.load_review_done()
         }
+        fn save_review_finding(&self, row: rs::ReviewFindingRow) -> Result<(), rs::StoreError> {
+            self.0.save_review_finding(row)
+        }
+        fn load_review_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rs::ReviewFindingRow>, rs::StoreError> {
+            self.0.load_review_findings(pr)
+        }
+        fn open_blocking_findings(
+            &self,
+            pr: &str,
+        ) -> Result<Vec<rs::ReviewFindingRow>, rs::StoreError> {
+            self.0.open_blocking_findings(pr)
+        }
+        fn resolve_review_findings(
+            &self,
+            pr: &str,
+            generation: i64,
+            reviewer: &str,
+            resolved_by: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0
+                .resolve_review_findings(pr, generation, reviewer, resolved_by)
+        }
         fn prune(&self, retention_days: i64) -> Result<(), rs::StoreError> {
             self.0.prune(retention_days)
         }
@@ -4634,6 +4759,163 @@ mod tests {
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 2);
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    // --- STUDIO-1025: a push from a still-running author run --------------------------------
+
+    /// Acceptance, the PR 223 replay: an author run is live and pushes a merge-only head, then the
+    /// fixes, then ends. EXACTLY ONE round is armed, at the fixes head, after the run ends — not one
+    /// per intermediate push, each of which reviews half-finished work and charges the threshold.
+    ///
+    /// Mutation: delete the `author_run_live_for_row` gate in `service_review_pr` and this reds
+    /// (the merge-only and fixes heads each arm their own round).
+    #[test]
+    fn a_push_from_a_live_author_run_defers_the_round_until_the_run_ends() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // The introduction's own round. `row`'s origin is `handoff:STUDIO-721`.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        // The author's fix run is live and pushes a merge of main first...
+        live_author_run(&mut o, "STUDIO-721");
+        let merge = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            merge.dispatched, 0,
+            "the merge-only head must not be reviewed"
+        );
+        assert_eq!(merge.deferred, 1);
+        assert_eq!(
+            o.review_deferred_by_author
+                .get(&coord(12))
+                .map(|d| (d.identifier.as_str(), d.head.as_str())),
+            Some(("STUDIO-721", HEAD_B)),
+            "the deferral records the run and the head the branch stood at"
+        );
+
+        // ...then the fixes, still inside the same run.
+        let fixes = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
+        assert_eq!(
+            fixes.dispatched, 0,
+            "the fixes head is still inside the run"
+        );
+        assert_eq!(fixes.deferred, 1);
+
+        // The run ends. The round the head moves bought is armed ONCE, at the head as it is then.
+        o.running.clear();
+        let after = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
+        assert_eq!(after.dispatched, 1, "one round, after the run ends");
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_C);
+        assert!(
+            !o.review_deferred_by_author.contains_key(&coord(12)),
+            "the record is cleared once the round it deferred is armed"
+        );
+
+        // Exactly two dispatches in total: the introduction's and the one deferred round.
+        assert_eq!(reviewers_of(&dispatched).len(), 2);
+    }
+
+    /// Acceptance: a run that CRASHES — ends with no handoff, gone from `running` and from the
+    /// retry queue — still arms the round it deferred, so a review is never lost to the way the
+    /// author's run ended.
+    ///
+    /// Mutation: flush the deferral only on a handoff signal and this reds (no round).
+    #[test]
+    fn a_crashed_author_run_still_arms_its_deferred_round() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        live_author_run(&mut o, "STUDIO-721");
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 0);
+
+        // The run crashes: no handoff, nothing queued.
+        o.running.clear();
+        o.retry_attempts.clear();
+
+        let after = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(after.dispatched, 1, "a crashed run still earns its round");
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+        assert_eq!(reviewers_of(&dispatched).len(), 2);
+    }
+
+    /// Acceptance: a run parked in BACKOFF is `claimed` but not `running` for the whole delay, and
+    /// it will re-dispatch and keep pushing. The deferral covers that window, or the head it is
+    /// about to push past is reviewed before it does. This is the `retry_attempts` half of the
+    /// live-run predicate `author_run_live`.
+    #[test]
+    fn an_author_run_parked_in_backoff_defers_the_round() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        o.claimed.insert("iss-author".to_string());
+        o.retry_attempts.insert(
+            "iss-author".to_string(),
+            retry_entry("iss-author", "STUDIO-721", 1),
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "a queued author run still owns the head"
+        );
+        assert_eq!(report.deferred, 1);
+    }
+
+    /// Acceptance: a push with NO live author run — a human's, the operator's rebase — arms
+    /// immediately, exactly as it did before the deferral existed.
+    #[test]
+    fn a_push_with_no_live_author_run_arms_immediately() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.deferred, 0);
+    }
+
+    /// Acceptance: a row that records NO author names no run, so a live run for its origin ticket
+    /// cannot be attributed to it and the push arms immediately. This test passes on both the old
+    /// and the new code — it is the byte-identical guard for an unattributed row.
+    #[test]
+    fn a_row_with_no_author_is_never_deferred() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        let mut r = row(12, "bob");
+        r.author = String::new();
+        introduce(&o, r);
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        live_author_run(&mut o, "STUDIO-721");
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(
+            report.dispatched, 1,
+            "an unattributed row arms as it always did"
+        );
+        assert_eq!(report.deferred, 0);
+    }
+
+    /// …and a `pr:` origin names no ticket for the join to resolve, so a live run cannot be matched
+    /// to it either. Byte-identical to the old code, like the empty-author case.
+    #[test]
+    fn a_row_whose_origin_names_no_ticket_is_never_deferred() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        let mut r = row(12, "bob");
+        r.introduced_by = "pr:makewhatis/rhapsody#12".to_string();
+        introduce(&o, r);
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
+
+        live_author_run(&mut o, "STUDIO-721");
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.deferred, 0);
     }
 
     /// STUDIO-1005: the watcher remembers the head it OBSERVED, not merely the one it dispatched
@@ -8417,6 +8699,7 @@ mod tests {
                 last_state: String::new(),
                 // The max_turns backstop, not a declared hand-off.
                 declared_handoff: false,
+                review_verdict: None,
                 refused: false,
             },
         );
@@ -8475,6 +8758,7 @@ mod tests {
                 err_msg: String::new(),
                 last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
                 declared_handoff: true,
+                review_verdict: None,
                 refused: false,
             },
         );
