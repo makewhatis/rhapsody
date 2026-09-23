@@ -66,6 +66,11 @@ reqwest = { version = "0.12", default-features = false, features = ["default-tls
 # the workspace's `repo_key` and the provider broker's fingerprints already use, so no new crate
 # enters Cargo.lock.
 sha2 = "0.10"
+# rhapsody-provider-broker (PB4, STUDIO-999): the daemon injects the cloneable registration handle
+# into the orchestrator before `o.control()` (design §11.1). `default-features = false` so the
+# orchestrator carries only the protocol-neutral PB1 handle — never the loopback HTTP stack, which
+# belongs to rhapsodyd's composition root and keeps its dependency direction intact.
+rhapsody-provider-broker = { path = "../provider-broker", default-features = false }
 
 [dev-dependencies]
 # harness-fixtures (test-only): the O4 snapshot-shape cross-check renders a snapshot through

@@ -12,7 +12,7 @@
 //! cannot inspect credentials or enumerate unrelated ones.
 
 use std::fmt;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::binding::{BoundCredentialLease, CredentialBinding};
@@ -22,6 +22,7 @@ use crate::ledger::TurnOutcome;
 use crate::metrics::BrokerMetrics;
 use crate::policy::{BrokerLimits, BrokerProtocol, SessionPolicy};
 use crate::random::RandomSource;
+use crate::registrar::BrokerRegistrar;
 use crate::session::{BrokerLedgerReceiver, BrokerSession};
 use crate::state::{
     BrokerInner, Registry, SESSION_ID_BYTES, SessionId, TokenDigest, is_valid_token_shape, lock,
@@ -163,10 +164,63 @@ impl Broker {
                 rng,
                 registry: Mutex::new(Registry::default()),
                 metrics: BrokerMetrics::new(),
+                available: AtomicBool::new(true),
                 #[cfg(test)]
                 mint_race: crate::state::MintRaceGate::default(),
             }),
         })
+    }
+
+    /// A cloneable, create-only registration handle for preparation (design §3.3, §11.1). It can
+    /// register sessions and observe availability; it exposes no credential, capability, or
+    /// registry-wide revocation access.
+    pub fn registrar(&self) -> BrokerRegistrar {
+        BrokerRegistrar::new(self.clone())
+    }
+
+    /// Whether the broker's listener is still serving. `false` once its serving task has failed
+    /// unexpectedly and [`Broker::mark_unavailable`] has run.
+    pub fn is_available(&self) -> bool {
+        self.inner.available.load(Ordering::Acquire)
+    }
+
+    /// Atomically mark the broker unavailable and revoke every live grant and session (design §11.2).
+    ///
+    /// Called when the serving task exits unexpectedly, so future explicit-provider preparation
+    /// refuses with [`BrokerError::Unavailable`] and no capability can keep spending. Idempotent.
+    pub fn mark_unavailable(&self) {
+        self.inner.available.store(false, Ordering::Release);
+        self.revoke_all();
+    }
+
+    /// Revoke every entry still in the registry: each live session (which releases custody and drops
+    /// its child grants) and any orphaned turn grant. Idempotent, and safe to call on a clean
+    /// shutdown after the orchestrator has already stopped its workers (design §11.3).
+    ///
+    /// The live owners are snapshotted under the registry lock and revoked *outside* it: both
+    /// session and grant revocation re-take that same lock, so revoking while holding it would
+    /// deadlock.
+    pub fn revoke_all(&self) {
+        let (grants, sessions) = {
+            let registry = lock(&self.inner.registry);
+            let grants: Vec<Arc<crate::state::TurnInner>> =
+                registry.grants.values().cloned().collect();
+            let sessions: Vec<Arc<crate::state::SessionInner>> = registry
+                .sessions
+                .values()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            (grants, sessions)
+        };
+        // Sessions first: revoking a session also removes its grants from the registry.
+        for session in &sessions {
+            session.revoke();
+        }
+        // Then any grant whose session was already gone (a weak session entry cannot be upgraded),
+        // so no digest-indexed grant can survive.
+        for grant in &grants {
+            grant.revoke_grant();
+        }
     }
 
     /// The broker's bounded, non-secret counters. Shared with every session; carries no session,
@@ -211,6 +265,15 @@ impl Broker {
         ));
         {
             let mut registry = lock(&self.inner.registry);
+            // The availability check is INSIDE the registry lock so it is atomic with the insert:
+            // `mark_unavailable` stores the flag and then snapshots the registry under this same
+            // lock, so a session either enters before the snapshot (and is revoked with it) or sees
+            // the cleared flag here and refuses. A check only in `BrokerRegistrar` would leave a
+            // TOCTOU window in which a session could register against an already-down broker.
+            if !self.inner.available.load(Ordering::Acquire) {
+                // Dropping `session` here also drops (and zeroizes) the lease.
+                return Err(BrokerError::Unavailable);
+            }
             if registry.sessions.contains_key(&id) {
                 // Dropping `session` here also drops (and zeroizes) the lease.
                 return Err(BrokerError::SessionIdCollision);

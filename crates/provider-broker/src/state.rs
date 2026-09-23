@@ -539,6 +539,9 @@ pub(crate) struct BrokerInner {
     pub(crate) rng: Arc<dyn RandomSource>,
     pub(crate) registry: Mutex<Registry>,
     pub(crate) metrics: Arc<crate::metrics::BrokerMetrics>,
+    /// Whether the broker's listener is still serving. Flipped to `false` exactly once, when the
+    /// serving task fails unexpectedly (design §11.2); registration refuses from then on.
+    pub(crate) available: AtomicBool,
     #[cfg(test)]
     pub(crate) mint_race: MintRaceGate,
 }
