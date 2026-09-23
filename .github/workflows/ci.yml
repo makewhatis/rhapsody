@@ -8,13 +8,13 @@ on:
 # `pr-title` moved off the saturated Macs onto the Linux pool (`rhapsody-linux`:
 # djohansen-fedora-desktop-1-rhapsody-{1,2,3}, each with its own warm `_work`), and `boot-e2e` runs
 # there at PR time too — it was the job timing out on the busy Macs and it passes on Linux. `test`
-# stays on the macOS pool (`mac-arm-{1..4}`) because the Linux trial found one real Linux-only
-# classification difference in `rhapsodyd` that this ticket does not fix (see the `test` job), and
-# `desktop` (the Tauri `.app`) is macOS everywhere. `boot-e2e` falls back to macOS on a push to main
-# so the assembled daemon is still exercised on the platform that ships. The Macs were the only
-# runners until 2026-09-23, when they saturated (queued runs, "not acquired by Runner of type
-# self-hosted", boot-e2e timeouts); moving the PR traffic that can run on Linux keeps the Macs for
-# `test` and the desktop gate.
+# joined them at PR time in STUDIO-1029, once the credential client stopped reading a Linux
+# `ECONNRESET` after a rejected `Hello` as an unavailable owner (see the `test` job); both `test` and
+# `boot-e2e` fall back to macOS on a push to main so the daemon is still exercised on the platform
+# that ships, and `desktop` (the Tauri `.app`) is macOS everywhere. The Macs were the only runners
+# until 2026-09-23, when they saturated (queued runs, "not acquired by Runner of type self-hosted",
+# boot-e2e timeouts); moving the PR traffic that can run on Linux keeps the Macs for the desktop
+# gate and the push-to-main daemon runs.
 # rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
 jobs:
   lint:
@@ -52,16 +52,13 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # STAYS ON macOS (STUDIO-1028 step 3): the Linux trial surfaced one Linux-only failure the
-    # fix is not this ticket's to make — `rhapsodyd`'s
-    # `credential_client::resolve_credential_reports_owner_unauthorized_when_the_real_owner_rejects_the_token`
-    # reads a rejected owner as `OwnerUnavailable` instead of `OwnerUnauthorized`, because a unix
-    # socket closed with an unread inbound frame yields `ECONNRESET` on Linux where macOS still
-    # delivers a clean EOF. That is a real client-classification difference, not a flake, so gating
-    # or weakening the test would hide it; `test` stays on the Macs and the operator files the
-    # portability follow-up. `--no-fail-fast` stays: it is what let the ONE failing crate be seen
-    # without a per-crate push, and it still surfaces every failure when this job is re-pointed.
-    runs-on: [self-hosted, macOS, ARM64]
+    # The credential client now reads a rejected owner as `OwnerUnauthorized` on Linux too: a unix
+    # socket closed with an unread inbound frame yields `ECONNRESET` there where macOS delivers a
+    # clean EOF, and both are classified as the rejection they are (STUDIO-1029). The last Linux
+    # blocker is gone, so `test` runs on the Linux pool at PR time like `boot-e2e` — and on macOS on
+    # a push to main, the platform that ships. `--no-fail-fast` stays: it is what surfaces every
+    # failing crate in one run rather than stopping at the first.
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","macOS","ARM64"]') || fromJSON('["self-hosted","Linux","rhapsody-linux"]') }}
     steps:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
