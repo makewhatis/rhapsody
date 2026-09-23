@@ -162,7 +162,10 @@ pub fn validate_routing_fields(harness: &str, provider: &str, model: &str) -> Re
 pub fn parse_ticket_selection(labels: &[String]) -> Result<TicketSelection, RoutingLabelError> {
     let mut out = TicketSelection::default();
     for raw in labels {
-        let label = raw.trim();
+        // Deliberately NOT trimmed: a suffix's surrounding whitespace is a transport-bound violation
+        // the model-id rules must keep refusing, and a label carrying stray whitespace is simply not
+        // the routing label it resembles.
+        let label = raw.as_str();
         if !label.is_empty() && label.len() > MAX_TICKET_LABEL_LEN {
             return Err(RoutingLabelError::TooLong {
                 label: label.to_string(),
