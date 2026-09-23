@@ -1,11 +1,36 @@
-//! Dependency-direction guard (PB1 acceptance: "crate has no dependency on
-//! agent/orchestrator/httpapi/desktop"; explicit non-goal: "No HTTP/Axum").
+//! Dependency-direction guard (design §3.3: the broker depends on no agent, orchestrator, HTTP API,
+//! config, store or desktop crate).
 //!
-//! This asserts against the crate's own manifest so a future edit that reaches for an agent,
-//! orchestrator, HTTP API, or desktop type reddens immediately, before the ownership boundary is
-//! quietly broken.
+//! PB1 carried no HTTP stack at all (the crate was protocol-neutral custody). PB2 owns the one
+//! private loopback listener, so the HTTP crates (`hyper`/`hyper-util`/`axum`/`tokio`/`reqwest`) are
+//! now expected dependencies and are deliberately absent from this list; the ownership boundary that
+//! still matters — no `rhapsody-*` sibling and no desktop crate — is asserted both here and below.
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
+/// PB2 source scanned to keep the forwarding entry point crate-private (design §5/§6, ticket
+/// acceptance: "no generic forwarding primitive is public").
+const UPSTREAM_SRC: &str = include_str!("../src/upstream.rs");
+const LISTENER_SRC: &str = include_str!("../src/listener.rs");
+
+#[test]
+fn no_public_generic_forwarding_primitive() {
+    assert!(
+        UPSTREAM_SRC.contains("pub(crate) async fn forward_chat_completions"),
+        "the forwarding entry point must exist and stay crate-private"
+    );
+    for needle in [
+        "pub async fn forward_chat_completions",
+        "pub fn forward(",
+        "pub async fn forward(",
+        "pub fn forward_request",
+        "pub fn proxy",
+    ] {
+        assert!(
+            !UPSTREAM_SRC.contains(needle) && !LISTENER_SRC.contains(needle),
+            "a public generic forwarding primitive (`{needle}`) must not be added"
+        );
+    }
+}
 
 #[test]
 fn forbidden_crate_dependencies_are_absent() {
@@ -20,10 +45,6 @@ fn forbidden_crate_dependencies_are_absent() {
         "rhapsody-workspace",
         "desktop",
         "tauri",
-        "axum",
-        "hyper",
-        "reqwest",
-        "tokio",
     ];
     for name in forbidden {
         assert!(
