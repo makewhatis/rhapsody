@@ -552,3 +552,52 @@ pub struct ReviewBoundRow {
     /// The manager's settled decision, or `None` when there is none.
     pub adjudication: Option<ReviewAdjudication>,
 }
+
+/// A terminal-state move owed to one merged pull request's implementation ticket (STUDIO-1007).
+/// No Go counterpart — the whole review feature, and with it the merge→Done transition, is a
+/// Rhapsody addition (see the README "Divergences" entry).
+///
+/// It exists because the move is a TRACKER round-trip and a tracker that refuses one used to cost
+/// the transition for good: the merged pull request is retired from the watch set on the tick its
+/// merge is observed, so nothing ever asked again, and the ticket sat in review blocking every
+/// dependent of it (STUDIO-1004). The row is therefore written BEFORE the first attempt and DELETED
+/// only when the move lands, so a restart, a tracker outage and a refused move all leave the same
+/// durable fact: this ticket's pull request MERGED and its terminal move is still owed.
+///
+/// Two readers depend on that fact and neither may re-derive it:
+///
+/// * the bounded retry (`reviewdone`) walks these rows until each lands or is given up on;
+/// * the handoff guard (`handoff`) refuses to move a ticket back into review while its merge is
+///   still owed here, so a late author handoff cannot un-terminate a ticket;
+/// * the reconciliation sweep (`reviewreconcile`) reports any row it finds as the divergence
+///   "PR merged, ticket not terminal", which is what puts a stalled train on the operator's feed
+///   instead of leaving it to block dependents silently.
+///
+/// Keyed by the TICKET identifier rather than the pull request: the move, the handoff and the
+/// sweep's report are all per-ticket questions, and one ticket has one implementation pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewDoneRow {
+    /// The ticket's tracker identifier (`STUDIO-712`) — the primary key.
+    pub identifier: String,
+    /// `owner/repo#number` of the merged pull request whose merge triggered the move. Carried for
+    /// the log line and the sweep's report (the operator needs to know WHICH pull request merged).
+    pub pr: String,
+    /// The tracker's opaque issue id, resolved off the run that produced the pull request.
+    pub issue_id: String,
+    /// The tracker team the terminal state name is resolved within.
+    pub team_id: String,
+    /// The terminal state NAME (`teams.review.done_state`), by name because Linear has no
+    /// `completed`-type-and-terminal set this move could target by type.
+    pub state: String,
+    /// How many move attempts have been made. The retry is BOUNDED against this
+    /// (`reviewdone::REVIEW_DONE_ATTEMPTS`), so an outage that never clears is reported rather than
+    /// retried forever.
+    pub attempts: i64,
+    /// When the next attempt is due, RFC3339 UTC at seconds precision with a `Z` suffix — the same
+    /// canonical form every other timestamp column here uses, so a lexicographic comparison is a
+    /// chronological one. Empty means "due now", which is the state the first attempt leaves it in.
+    pub next_at: String,
+    /// Set once the bounded retry is exhausted. A given-up row is never attempted again, and exists
+    /// only so the reconciliation sweep keeps reporting the stuck transition until a human clears it.
+    pub gave_up: bool,
+}
