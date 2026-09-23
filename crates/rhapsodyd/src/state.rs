@@ -34,8 +34,8 @@ use rhapsody_orchestrator::{
 };
 use rhapsody_store::{
     DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
-    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, Store,
-    StoreError,
+    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, RunUsage,
+    Store, StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The
@@ -97,6 +97,9 @@ impl HistoryStore for HistoryView {
     }
     fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
         self.0.run_provenance(run_id)
+    }
+    fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError> {
+        self.0.run_usage(run_id)
     }
     fn load_run_provenances(
         &self,

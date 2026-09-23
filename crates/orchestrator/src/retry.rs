@@ -1642,6 +1642,10 @@ mod tests {
         assert_eq!(p.model, "claude-sonnet-4");
         assert_eq!(p.model_origin, "claude.model");
         assert_eq!(p.provider, "anthropic");
+        assert_eq!(
+            p.provider_origin, "default",
+            "the provider is inferred from the model, not selected by a configured provider tier"
+        );
     }
 
     /// STUDIO-909 round 1: a harness with no model knob records NO model and therefore NO
@@ -1673,6 +1677,54 @@ mod tests {
             "an origin for a model that was never resolved asserts something untrue"
         );
         assert_eq!(p.provider, "");
+        assert_eq!(
+            p.provider_origin, "",
+            "an empty provider has no origin, exactly as an empty model does"
+        );
+    }
+
+    /// STUDIO-987: the provenance SNAPSHOT survives a live config change. Two dispatches separated
+    /// by a hot model change must each record the model/provider/origin that was live when THEY were
+    /// dispatched — the first row is not rewritten by the second. The mutation this guards: deriving
+    /// provenance from the live config at read time, which would make both rows report the second
+    /// model.
+    #[test]
+    fn dispatch_provenance_is_a_snapshot_a_later_config_change_cannot_rewrite() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "claude".to_string();
+            eff.cfg.claude.model = "claude-sonnet-4".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let first_run = o.running["1"].run_id;
+
+        // Simulate a WORKFLOW.md hot-reload: the live model changes under the running daemon.
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.claude.model = "claude-opus-4".to_string();
+        }
+        o.dispatch_issue(issue("2", "MT-2", "Todo"), None, None, String::new());
+        let second_run = o.running["2"].run_id;
+        assert_ne!(first_run, second_run);
+
+        let first = store
+            .run_provenance(first_run)
+            .expect("read first")
+            .expect("row");
+        assert_eq!(
+            first.model, "claude-sonnet-4",
+            "the earlier run keeps the model it actually used"
+        );
+        assert_eq!(first.model_origin, "claude.model");
+        assert_eq!(first.provider_origin, "default");
+        let second = store
+            .run_provenance(second_run)
+            .expect("read second")
+            .expect("row");
+        assert_eq!(second.model, "claude-opus-4");
     }
 
     // BO-12: dispatch computes the ADDITIVE capability set (project defaults ∪ the ticket's

@@ -4530,6 +4530,12 @@ mod tests {
         fn run_provenance(&self, run_id: i64) -> Result<Option<rs::RunProvenance>, rs::StoreError> {
             self.0.run_provenance(run_id)
         }
+        fn set_run_usage(&self, run_id: i64, u: &rs::RunUsage) -> Result<(), rs::StoreError> {
+            self.0.set_run_usage(run_id, u)
+        }
+        fn run_usage(&self, run_id: i64) -> Result<Option<rs::RunUsage>, rs::StoreError> {
+            self.0.run_usage(run_id)
+        }
         fn load_run_provenances(
             &self,
             run_ids: &[i64],
