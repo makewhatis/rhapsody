@@ -19,6 +19,10 @@ use std::time::Duration;
 
 use rhapsody_desktop::supervisor::{Options, State, Supervisor, resolve_binary};
 
+mod support;
+
+use support::SupervisorGuard;
+
 #[tokio::test]
 async fn smoke_supervises_real_release_rhapsodyd() {
     if std::env::var_os("RHAPSODY_SMOKE_RHAPSODYD").is_none() {
@@ -69,6 +73,9 @@ async fn smoke_supervises_real_release_rhapsodyd() {
         max_restarts: 1,
         ..Default::default()
     });
+    // STUDIO-1038: the daemon is its own process-group leader, so an assertion panic would orphan
+    // it; the guard kills the group on every exit path (a no-op once `stop()` has run).
+    let _sup_guard = SupervisorGuard::new(&sup);
 
     match sup.start(tokio::time::sleep(Duration::from_secs(20))).await {
         Ok(()) => {
