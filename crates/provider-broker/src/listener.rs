@@ -452,7 +452,8 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
     }
     state.metrics.record_admitted(outbound.len() as u64);
     state.metrics.record_forwarded(token_cost);
-    // Bounded, non-secret counters; the guard keeps the active count truthful for the whole request.
+    // Bounded, non-secret counters; the guard covers this handler (the turn's concurrency permit
+    // covers the streamed body, which outlives the handler).
     let _active = state.metrics.enter_request();
     // Exactly one settlement per admitted request: an explicit observation, or a conservative
     // unknown on drop (client disconnect, upstream failure, turn revocation, or expiry).

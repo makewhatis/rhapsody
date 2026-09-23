@@ -57,7 +57,10 @@ pub struct BrokerMetricsSnapshot {
     pub provider_reported_tokens: u64,
     /// Abuse-threshold and capability-expiry revocations.
     pub revocations: u64,
-    /// Requests currently admitted and in flight.
+    /// Admitted requests whose handler is still live. For a buffered response the handler runs to
+    /// completion, but a streamed response's body is polled after the handler returns the response
+    /// head, so an open stream is not counted here — the turn's concurrency permit covers it
+    /// (design §7.1).
     pub active_requests: i64,
     /// Upstream responses by status class.
     pub upstream_2xx: u64,
@@ -136,7 +139,8 @@ impl BrokerMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Enter an in-flight request; the returned guard decrements the active count on drop.
+    /// Enter an in-flight request handler; the returned guard decrements the active count on drop.
+    /// For a streamed response the guard covers the handler only, not the open downstream stream.
     pub fn enter_request(self: &Arc<Self>) -> ActiveRequestGuard {
         self.active_requests.fetch_add(1, Ordering::Relaxed);
         ActiveRequestGuard {
