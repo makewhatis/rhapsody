@@ -932,6 +932,18 @@ mod tests {
         {
             self.0.load_run_provenances(ids)
         }
+        fn set_review_verdict(&self, run_id: i64, verdict: &str) -> Result<(), StoreError> {
+            self.0.set_review_verdict(run_id, verdict)
+        }
+        fn review_verdict(&self, run_id: i64) -> Result<Option<String>, StoreError> {
+            self.0.review_verdict(run_id)
+        }
+        fn load_review_verdicts(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
+            self.0.load_review_verdicts(run_ids)
+        }
         fn tokens_by_provider(
             &self,
             since: &str,

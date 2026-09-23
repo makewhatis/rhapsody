@@ -118,6 +118,20 @@ impl Store for Noop {
     ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
         Ok(std::collections::HashMap::new())
     }
+    // Per-run review verdicts (STUDIO-1020) disappear with the rest of the history: a store that
+    // holds nothing has no review run to attribute, so it answers "no verdict".
+    fn set_review_verdict(&self, _run_id: i64, _verdict: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn review_verdict(&self, _run_id: i64) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+    fn load_review_verdicts(
+        &self,
+        _run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
+        Ok(std::collections::HashMap::new())
+    }
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
