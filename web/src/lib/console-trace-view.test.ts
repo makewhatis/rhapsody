@@ -3,6 +3,7 @@ import type { LogEntry, RunDetail, RunProvenance, RunSummary, TicketCostRow } fr
 import { buildResult, buildTrace, type TracePhase } from "@/lib/trace-model";
 import {
   PROVENANCE_UNKNOWN,
+  REVIEW_STATE_LABELS,
   TRACE_FILTERS,
   harnessFidelity,
   attemptBucket,
@@ -22,6 +23,7 @@ import {
   resultBanner,
   resultEyebrow,
   reviewOptions,
+  reviewState,
   runBranch,
   runTeammate,
   runVitals,
@@ -681,12 +683,89 @@ describe("reviewOptions — the run detail's review strip (STUDIO-976)", () => {
       run({ id: 601, issue_identifier: "pr:owner/repo#1", started_at: "2026-09-03T10:00:00Z" }),
     ];
     expect(reviewOptions(reviews, NONE, "")).toEqual([
-      { id: 601, label: "review 601", named: false, startedAt: "2026-09-03T10:00:00Z" },
+      {
+        id: 601,
+        label: "review 601",
+        named: false,
+        startedAt: "2026-09-03T10:00:00Z",
+        state: "none",
+      },
     ]);
   });
 
   it("renders nothing for a ticket the daemon credited no reviews to", () => {
     expect(reviewOptions([], NONE, "")).toEqual([]);
+  });
+
+  // STUDIO-1020 — each round's chip carries its OWN verdict state, read from the run rather than
+  // from the per-(PR, reviewer) watch set, which holds only the latest status. The four states are
+  // exclusive, and `ended_at` decides "reviewing" before the verdict does.
+  describe("each round's verdict state (STUDIO-1020)", () => {
+    const key = (id: number) => `pr:makewhatis/rhapsody#223@${id === 1 ? "jimmy" : "alice"}`;
+
+    it("reads reviewing while the run has not ended, whatever a stale verdict says", () => {
+      const running = run({
+        id: 1,
+        issue_identifier: key(1),
+        ended_at: "",
+        verdict: "approved",
+      });
+      expect(reviewState(running)).toBe("reviewing");
+      expect(reviewOptions([running], NONE, "")[0].state).toBe("reviewing");
+    });
+
+    it("reads the daemon's own verdict once the run has ended", () => {
+      const approved = run({
+        id: 1,
+        issue_identifier: key(1),
+        ended_at: "2026-09-03T10:04:30Z",
+        verdict: "approved",
+      });
+      const changes = run({
+        id: 2,
+        issue_identifier: key(2),
+        ended_at: "2026-09-03T10:04:30Z",
+        verdict: "changes_requested",
+      });
+      expect(reviewState(approved)).toBe("approved");
+      expect(reviewState(changes)).toBe("changes_requested");
+      // Two rounds of one pull request keep their own answers — the whole point of per-run records.
+      expect(reviewOptions([approved, changes], NONE, "").map((o) => o.state)).toEqual([
+        "approved",
+        "changes_requested",
+      ]);
+    });
+
+    it("reads neutral for an ended round the daemon recorded no verdict for", () => {
+      for (const over of [
+        { outcome: "failed" },
+        { outcome: "stopped" },
+        { outcome: "completed" }, // a truncated/undeclared round also lands here
+      ]) {
+        const round = run({
+          id: 1,
+          issue_identifier: key(1),
+          ended_at: "2026-09-03T10:04:30Z",
+          ...over,
+        });
+        expect(reviewState(round)).toBe("none");
+      }
+      // A value this build does not recognise is neutral, never rounded to either verdict.
+      const unknown = run({
+        id: 1,
+        issue_identifier: key(1),
+        ended_at: "2026-09-03T10:04:30Z",
+        verdict: "lgtm" as never,
+      });
+      expect(reviewState(unknown)).toBe("none");
+    });
+
+    it("gives each state a tooltip phrase and none to the neutral chip", () => {
+      expect(REVIEW_STATE_LABELS.reviewing).toBe("reviewing");
+      expect(REVIEW_STATE_LABELS.changes_requested).toBe("changes requested");
+      expect(REVIEW_STATE_LABELS.approved).toBe("approved");
+      expect(REVIEW_STATE_LABELS.none).toBe("");
+    });
   });
 });
 

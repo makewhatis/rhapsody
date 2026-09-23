@@ -247,6 +247,35 @@
 .rh-console .trrev:hover { color: var(--ink); border-color: var(--line-strong); }
 .rh-console .trrev.on { color: var(--ink); border-style: solid; border-color: var(--rust-text); }
 
+/* The strip's verdict states (STUDIO-1020). Each state is encoded in the chip's FORM — a leading
+   glyph drawn by `::before`, so the label text is untouched — as well as its colour, so the four
+   states are distinguishable without depending on hue. Scoped `.trreviews .trrev` because the
+   Review TAB's own rows reuse the bare `.trrev` class further down this file; the extra class gives
+   these rules the specificity to win there, and the `::before` is invisible to `textContent`, so
+   the strip's accessible name and the STUDIO-976 assertions on it are unchanged.
+
+   `reviewing` is the violet the product already reserves for an agent doing a review; a request
+   for changes is the AMBER warning tone rather than `--bad`, because it is normal work and not a
+   failure; an approval is green; and a round with no verdict carries NO states rule, so it keeps
+   the neutral chip exactly as it rendered before this feature. */
+.rh-console .trreviews .trrev { display: inline-flex; flex-direction: row; align-items: center; gap: 5px; }
+.rh-console .trreviews .trrev[data-verdict="reviewing"] { color: var(--reviewing); border-color: var(--reviewing); }
+.rh-console .trreviews .trrev[data-verdict="changes_requested"] { color: var(--warn); border-color: var(--warn); }
+.rh-console .trreviews .trrev[data-verdict="approved"] { color: var(--ok); border-color: var(--ok); }
+.rh-console .trreviews .trrev[data-verdict="reviewing"]::before { content: "○"; }
+.rh-console .trreviews .trrev[data-verdict="changes_requested"]::before { content: "!"; }
+.rh-console .trreviews .trrev[data-verdict="approved"]::before { content: "✓"; }
+
+/* Selection and hover must win over the verdict rules above, and they are written HERE for that:
+   `[data-verdict="…"]` carries one more specificity token than a bare `.trrev.on` or `.trrev:hover`
+   (0,4,0 against 0,3,0), so the bare rules earlier in this file would lose and a chip with a verdict
+   would show no selection at all once every finished round has one. Equal specificity is decided by
+   source order, so these come after. A verdict chip keeps its verdict TEXT colour (never restated
+   here) and marks the selection with the solid rust border instead; a neutral chip renders exactly
+   as it did before this feature, since it entered with the same rust border already. */
+.rh-console .trreviews .trrev:hover { border-color: var(--line-strong); }
+.rh-console .trreviews .trrev.on { border-style: solid; border-color: var(--rust-text); }
+
 .rh-console .trtitle { margin: 0 0 10px; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 
 .rh-console .trmode { display: flex; align-items: center; gap: 8px; margin: 12px 0; }

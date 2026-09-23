@@ -9,10 +9,12 @@
 //! # The divergent schema objects, and how the golden still gates the rest (STUDIO-711)
 //!
 //! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
-//! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909) and
-//! step 11 (`rhapsody_review_bound`, STUDIO-956) have no Go counterpart: they are the ticketless
-//! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record
-//! and the per-pull-request review bound, none of which the frozen v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
+//! (`rhapsody_summon_watermark`, STUDIO-885), step 10 (`rhapsody_run_provenance`, STUDIO-909),
+//! step 11 (`rhapsody_review_bound`, STUDIO-956) and step 12 (`rhapsody_review_verdicts`,
+//! STUDIO-1020) have no Go counterpart: they are the ticketless
+//! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
+//! the per-pull-request review bound and the per-review-run verdict, none of which the frozen
+//! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
 //! `schema_matches_committed_golden` permanently red with no honest way to fix it. Hand-editing
@@ -39,11 +41,11 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7, 8, 9, 10 and 11 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 12 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
-/// per-pull-request review bound) and are the one documented reason this number is ahead of the
-/// reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 11;
+/// per-pull-request review bound, then the per-review-run verdict) and are the one documented
+/// reason this number is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 12;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -225,6 +227,24 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_bound (
   rounds     INTEGER NOT NULL DEFAULT 0,
   findings   TEXT    NOT NULL DEFAULT '',
   reason     TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v11 -> v12: one review RUN's own verdict (STUDIO-1020). Rhapsody-only, so the `rhapsody_`
+    // prefix gates it out of the Go-recaptured schema golden by name exactly as steps 7-11 are.
+    //
+    // Keyed by `run_id` — the review run's own `runs.id` — rather than by the review's
+    // (PR, reviewer): the watch set holds only the LATEST status per pair, so colouring an older
+    // round from it would show a past round as approved once a later one approved. Written once at
+    // the run's exit, so the row is a property of the run and survives the round it belongs to.
+    // `run_id INTEGER PRIMARY KEY` gives SQLite's implicit auto-index (whose `sqlite_master.sql IS
+    // NULL`), so no explicit index reaches the golden comparison.
+    //
+    // A pruned run simply orphans a row no query joins from, exactly as `rhapsody_run_provenance`'s
+    // does.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_review_verdicts (
+  run_id  INTEGER NOT NULL PRIMARY KEY,
+  verdict TEXT    NOT NULL DEFAULT ''
 );
 "#,
 ];
@@ -465,7 +485,8 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 /// provenance read, read positionally by [`map_run_provenance`].
 const PROVENANCE_COLS: &str = "harness, harness_origin, model, model_origin, provider";
 
-/// How many run ids [`Sqlite::load_run_provenances`] binds per statement. Well under SQLite's
+/// How many run ids a batched page read binds per statement, shared by
+/// [`Sqlite::load_run_provenances`] and [`Sqlite::load_review_verdicts`]. Well under SQLite's
 /// 32766-variable ceiling, and small enough that a very large page is a few queries rather than one
 /// that fails closed (STUDIO-909 round 1).
 const PROVENANCE_BIND_CHUNK: usize = 500;
@@ -1037,6 +1058,59 @@ impl Store for Sqlite {
             for r in rows {
                 let (id, p) = r?;
                 out.insert(id, p);
+            }
+        }
+        Ok(out)
+    }
+
+    fn set_review_verdict(&self, run_id: i64, verdict: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // UPSERT on the run id: the verdict is written once at the run's exit, but a re-dispatch of
+        // the same run id (impossible today) must overwrite rather than fail a PRIMARY KEY.
+        conn.execute(
+            "INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES (?1, ?2) \
+             ON CONFLICT(run_id) DO UPDATE SET verdict = excluded.verdict",
+            params![run_id, verdict],
+        )?;
+        Ok(())
+    }
+
+    fn review_verdict(&self, run_id: i64) -> Result<Option<String>, StoreError> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT verdict FROM rhapsody_review_verdicts WHERE run_id = ?1")?;
+        let mut rows = stmt.query_map([run_id], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_review_verdicts(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
+        if run_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.lock();
+        let mut out = std::collections::HashMap::new();
+        // Chunked for `load_run_provenances`'s reason: a caller-controlled page can carry more ids
+        // than SQLite allows bind variables in one statement (32766), and an un-chunked query would
+        // fail closed and silently drop EVERY verdict on the page (STUDIO-909 round 1).
+        for chunk in run_ids.chunks(PROVENANCE_BIND_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let q = format!(
+                "SELECT run_id, verdict FROM rhapsody_review_verdicts \
+                  WHERE run_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&q)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (id, verdict) = r?;
+                out.insert(id, verdict);
             }
         }
         Ok(out)
@@ -4323,6 +4397,85 @@ mod tests {
         assert_eq!(store.run_provenance(with).expect("get"), Some(rewritten));
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Per-run review verdicts (STUDIO-1020)
+    // ---------------------------------------------------------------------------------------------
+
+    // A verdict is recorded once per RUN, so a ticket's several rounds keep their own answers — the
+    // property the per-(PR, reviewer) watch set cannot provide. A run that recorded none reads back
+    // as `None`, the console's neutral "no verdict", and the page read leaves it ABSENT rather than
+    // zeroed so a missing row and an empty string are not conflated.
+    #[test]
+    fn review_verdicts_key_by_run_id_and_absent_ids_stay_absent() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let a = start_provenance_run(&store, "pr:x/y#1@jimmy");
+        let b = start_provenance_run(&store, "pr:x/y#2@jimmy");
+        let c = start_provenance_run(&store, "pr:x/y#3@alice");
+        store
+            .set_review_verdict(a, REVIEW_VERDICT_APPROVED)
+            .expect("set a");
+        store
+            .set_review_verdict(b, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("set b");
+
+        assert_eq!(
+            store.review_verdict(a).expect("get a").as_deref(),
+            Some(REVIEW_VERDICT_APPROVED)
+        );
+        assert_eq!(
+            store.review_verdict(b).expect("get b").as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+        // A run that never declared a verdict (failed, truncated, still running) has no row.
+        assert_eq!(store.review_verdict(c).expect("get c"), None);
+
+        let batch = store.load_review_verdicts(&[a, b, c]).expect("batch");
+        assert_eq!(
+            batch.get(&a).map(String::as_str),
+            Some(REVIEW_VERDICT_APPROVED)
+        );
+        assert_eq!(
+            batch.get(&b).map(String::as_str),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+        assert!(!batch.contains_key(&c), "a run with no verdict is absent");
+        assert!(store.load_review_verdicts(&[]).expect("empty").is_empty());
+
+        // Upserting on the run id replaces rather than failing the primary key.
+        store
+            .set_review_verdict(a, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("rewrite");
+        assert_eq!(
+            store.review_verdict(a).expect("get").as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+    }
+
+    // The verdict is durable: an approval recorded through one store must be readable from the SAME
+    // on-disk database after the daemon restarts. This is the acceptance the console's strip leans
+    // on — a review round is history, not a live snapshot.
+    #[test]
+    fn a_review_verdict_round_trips_across_a_restart() {
+        let scratch = scratch_dir();
+        let db = scratch.join("review-verdicts.db");
+
+        let run_id;
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            run_id = start_provenance_run(&store, "pr:makewhatis/rhapsody#223@sol");
+            store
+                .set_review_verdict(run_id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("set");
+        } // store dropped — the daemon "restarts" here
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store.review_verdict(run_id).expect("get").as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED),
+            "a round's verdict must survive the restart"
+        );
+    }
+
     // The cost question this exists to answer: every token in the WINDOW attributed to the provider
     // that spent it, summed over that window's rows rather than one page. A run with no provenance
     // row is a different bucket — it is absent entirely, never folded into the empty-string provider
@@ -4880,6 +5033,7 @@ mod tests {
                 "rhapsody_summon_watermark".to_string(),
                 "rhapsody_run_provenance".to_string(),
                 "rhapsody_review_bound".to_string(),
+                "rhapsody_review_verdicts".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
