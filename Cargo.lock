@@ -1654,8 +1654,10 @@ name = "rhapsody-credential-ipc"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "rhapsody-provider-broker",
  "serde",
  "serde_json",
+ "static_assertions",
  "tokio",
  "zeroize",
 ]

@@ -75,6 +75,11 @@ serde_json = "1"
 # unsigned build still reads/writes the login keychain; the 0600 file fallback covers write friction.
 # Plan-anticipated ("Keychain via the security-framework/keyring crate").
 keyring = { version = "3", features = ["apple-native"] }
+# zeroize (STUDIO-983/P1): the provider-credential owner zeroizes the decoded envelope value, the raw
+# Keychain JSON, and the serialized envelope on every exit path, and `BoundCredentialLease` (shared
+# with the daemon via rhapsody-credential-ipc) uses the same crate. Already in this workspace's
+# Cargo.lock transitively (pulled in by keyring/rustls), so this adds only a direct edge.
+zeroize = "1"
 # serde_yaml_ng (D4): renders the onboarding WORKFLOW.md front matter (mirror of
 # $REF/desktop/internal/onboarding, which uses gopkg.in/yaml.v3). This is the SAME maintained
 # serde_yaml fork the daemon's `rhapsody-config` uses, so the generated YAML parses back identically.
