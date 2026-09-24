@@ -269,6 +269,20 @@ impl Orchestrator {
                 );
                 continue;
             }
+            // STUDIO-1017 (§7.8 path 3): after the round threshold, in `act` mode, a ticket whose
+            // pull request has passed the threshold is not dispatched without an active
+            // `author_round` authorization — the manager's next decision owns the exchange, and the
+            // human feed reports it as awaiting the manager. The wake admission is the authorized
+            // path; this is the safety net. A person's summons (the reopen ladder above) is an
+            // operator action and is deliberately NOT gated.
+            if !self.author_dispatch_authorized(&iss) {
+                tracing::info!(
+                    issue_identifier = %iss.identifier,
+                    "awaiting manager: a post-threshold author dispatch needs an author_round \
+                     authorization"
+                );
+                continue;
+            }
             // Work already materialized as a linked PR with no newer summons → don't fresh-dispatch
             // on a state flap. Info-level so a suppressed issue isn't an unexplained live-list hang.
             if self.pr_suppressed(&iss) {

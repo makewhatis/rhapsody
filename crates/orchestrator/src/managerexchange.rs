@@ -64,6 +64,121 @@ impl Orchestrator {
                 .is_some_and(|threshold| self.rounds_used(pr) >= threshold)
     }
 
+    /// §7.8: consumes the author half of an active [`MANAGER_EXCHANGE_AUTHOR_ROUND`] when the wake
+    /// admission dispatches the author it covers (`active` → `consumed`). The authorization then
+    /// stays live for its review half — the round answering the author's push — and nothing else may
+    /// consume it.
+    ///
+    /// Called by [`crate::managerwake`]'s admission, which is the `ROUTE_TO_AUTHOR` path §7.8 names.
+    /// A retry or continuation is the SAME exchange and never reaches here.
+    pub(crate) fn consume_author_round_authorization(&self, pr: &str) {
+        let exchanges = match self.store().manager_exchanges(pr) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    pr = %pr, err = %e,
+                    "manager exchange: the authorization store could not be read; the author-round \
+                     authorization was not consumed"
+                );
+                return;
+            }
+        };
+        for exchange in exchanges {
+            if exchange.kind != MANAGER_EXCHANGE_AUTHOR_ROUND
+                || exchange.state != MANAGER_EXCHANGE_ACTIVE
+            {
+                continue;
+            }
+            if let Err(e) = self
+                .store()
+                .set_manager_exchange_state(&exchange.id, MANAGER_EXCHANGE_CONSUMED)
+            {
+                tracing::warn!(
+                    pr = %pr, id = %exchange.id, err = %e,
+                    "manager exchange: consuming the author-round authorization failed"
+                );
+                return;
+            }
+            tracing::info!(
+                pr = %pr, id = %exchange.id,
+                "manager exchange: the author dispatch consumed its author-round authorization"
+            );
+            return;
+        }
+    }
+
+    /// The pull request this ticket's review loop is on, from the daemon's OWN record: the first
+    /// open live watch row whose origin ticket is `iss`, falling back to the tracker's linkage for
+    /// an install whose repository is not connected (`linked_prs` empty).
+    ///
+    /// `None` when the ticket is on no open pull request — nothing to gate.
+    pub(crate) fn manager_issue_pr(&self, iss: &rhapsody_core::Issue) -> Option<PrCoord> {
+        if let Ok(rows) = self.store().load_live_review_watch() {
+            for r in rows {
+                if !r.open {
+                    continue;
+                }
+                if crate::reviewdone::origin_ticket(&r.introduced_by)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&iss.identifier))
+                {
+                    return Some(PrCoord::new(&r.key.owner, &r.key.repo, r.key.number));
+                }
+            }
+        }
+        iss.linked_prs
+            .iter()
+            .flatten()
+            .filter(|p| !p.merged)
+            .map(|p| PrCoord::new(&p.owner, &p.repo, p.number))
+            .next()
+    }
+
+    /// Whether `pr` carries an ACTIVE [`MANAGER_EXCHANGE_AUTHOR_ROUND`] — an author dispatch the
+    /// manager authorized after the threshold, not yet consumed.
+    fn active_author_round(&self, pr: &PrCoord) -> bool {
+        let key = crate::reviewwatch::churn_key(pr);
+        match self.store().manager_exchanges(&key) {
+            Ok(rows) => rows.iter().any(|e| {
+                e.kind == MANAGER_EXCHANGE_AUTHOR_ROUND && e.state == MANAGER_EXCHANGE_ACTIVE
+            }),
+            Err(e) => {
+                // Fail CLOSED: an unreadable store might hold the authorization this dispatch needs,
+                // and dispatching without one is the direction §7.8 forbids.
+                tracing::warn!(
+                    pr = %pr, err = %e,
+                    "manager exchange: the authorization store could not be read; the author \
+                     dispatch waits"
+                );
+                false
+            }
+        }
+    }
+
+    /// §7.8 path 3: whether ordinary selection may dispatch `iss` as an author round right now.
+    ///
+    /// `true` unless the gate is active for the ticket's pull request — `act` mode, past the round
+    /// threshold — in which case an active `author_round` authorization is required. `off`/`advise`
+    /// and every pre-threshold dispatch are therefore byte-identical.
+    ///
+    /// **The wake admission owns consumption.** This is a permission check only: the activation
+    /// transaction writes the authorization, and [`crate::managerwake`]'s admission consumes it when
+    /// it wakes the author through the obligation. Ordinary selection is a safety net that refuses a
+    /// post-threshold dispatch with no authorization, never a second consumer.
+    pub(crate) fn author_dispatch_authorized(&self, iss: &rhapsody_core::Issue) -> bool {
+        if self.manager_review_authority() != ReviewAuthority::Act
+            || self.adjudication_threshold().is_none()
+        {
+            return true;
+        }
+        let Some(pr) = self.manager_issue_pr(iss) else {
+            return true;
+        };
+        if !self.review_exchange_gate_active(&pr) {
+            return true;
+        }
+        self.active_author_round(&pr)
+    }
+
     /// Whether a review round may ARM for `pr` at `head` under the §7.8 gate.
     ///
     /// Returns `true` when arming is allowed:
@@ -259,12 +374,12 @@ mod tests {
     use rhapsody_store::{
         MANAGER_EXCHANGE_ACTIVE, MANAGER_EXCHANGE_AUTHOR_ROUND, MANAGER_EXCHANGE_COMPLETED,
         MANAGER_EXCHANGE_CONSUMED, MANAGER_EXCHANGE_INVALIDATED, MANAGER_EXCHANGE_REVIEW_ROUND,
-        ManagerExchange, Sqlite, StorePath,
+        ManagerExchange, ReviewWatchKey, ReviewWatchRow, Sqlite, StorePath,
     };
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::testsupport::empty_effective;
+    use crate::testsupport::{empty_effective, issue};
 
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PATCH: &str = "patch-one";
@@ -515,5 +630,105 @@ mod tests {
         let id = authorize(&o, MANAGER_EXCHANGE_REVIEW_ROUND, MANAGER_EXCHANGE_ACTIVE);
         o.invalidate_manager_exchanges(&pr());
         assert_eq!(state_of(&o, &id), MANAGER_EXCHANGE_INVALIDATED);
+    }
+
+    // --- STUDIO-1017: the author-dispatch half of §7.8 path 3 --------------------------------
+
+    /// An open watch row whose origin ticket is `ticket`, so `manager_issue_pr` resolves the ticket's
+    /// pull request from the daemon's own record.
+    fn seed_watch(o: &Orchestrator, ticket: &str) {
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: ReviewWatchKey {
+                    owner: "makewhatis".to_string(),
+                    repo: "rhapsody".to_string(),
+                    number: 64,
+                    reviewer: "alice".to_string(),
+                },
+                author: "bob".to_string(),
+                introduced_by: format!("adopt:{ticket}"),
+                requested_sha: HEAD.to_string(),
+                last_reviewed_sha: String::new(),
+                status: "reviewed".to_string(),
+                open: true,
+            })
+            .expect("watch");
+    }
+
+    fn author() -> rhapsody_core::Issue {
+        issue("ID-1", "STUDIO-1", "In Progress")
+    }
+
+    /// After the threshold in `act` mode, an author dispatch needs an active `author_round`
+    /// authorization. MUTATION: answer `true` unconditionally and the first assert reds.
+    #[test]
+    fn an_act_post_threshold_author_dispatch_needs_an_authorization() {
+        let o = with_rounds(ReviewAuthority::Act, 1, 1);
+        seed_watch(&o, "STUDIO-1");
+        assert!(
+            !o.author_dispatch_authorized(&author()),
+            "no authorization exists, so the author must not be dispatched"
+        );
+        let id = authorize(&o, MANAGER_EXCHANGE_AUTHOR_ROUND, MANAGER_EXCHANGE_ACTIVE);
+        assert!(
+            o.author_dispatch_authorized(&author()),
+            "an active author_round authorization permits the dispatch"
+        );
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_EXCHANGE_ACTIVE,
+            "the permission check must not consume the authorization (the wake admission does)"
+        );
+    }
+
+    /// A `review_round` authorization does NOT authorize an author dispatch: the kinds are distinct.
+    #[test]
+    fn a_review_round_authorization_does_not_authorize_the_author() {
+        let o = with_rounds(ReviewAuthority::Act, 1, 1);
+        seed_watch(&o, "STUDIO-1");
+        authorize(&o, MANAGER_EXCHANGE_REVIEW_ROUND, MANAGER_EXCHANGE_ACTIVE);
+        assert!(!o.author_dispatch_authorized(&author()));
+    }
+
+    /// Before the threshold, and in `off`/`advise`, the author dispatch is not gated at all.
+    #[test]
+    fn off_advise_and_before_the_threshold_authorize_the_dispatch() {
+        for o in [
+            with_rounds(ReviewAuthority::Act, 3, 1),
+            with_rounds(ReviewAuthority::Off, 1, 1),
+            with_rounds(ReviewAuthority::Advise, 1, 1),
+        ] {
+            seed_watch(&o, "STUDIO-1");
+            assert!(
+                o.author_dispatch_authorized(&author()),
+                "the gate must be inert here"
+            );
+        }
+    }
+
+    /// A ticket on no open pull request is not gated: there is nothing to bound.
+    #[test]
+    fn a_ticket_without_a_pull_request_is_not_gated() {
+        let o = with_rounds(ReviewAuthority::Act, 1, 1);
+        assert!(o.author_dispatch_authorized(&author()));
+    }
+
+    /// §7.8 "Retries?": a retry or continuation of a run already dispatched under an authorization
+    /// is the SAME exchange (`attempt` is `Some`), goes through the retry path, and consumes nothing
+    /// new. MUTATION: make the retry path consume an authorization and this reds.
+    #[tokio::test]
+    async fn a_retry_consumes_no_authorization() {
+        let mut o = with_rounds(ReviewAuthority::Act, 1, 1);
+        seed_watch(&o, "STUDIO-1");
+        let id = authorize(&o, MANAGER_EXCHANGE_AUTHOR_ROUND, MANAGER_EXCHANGE_ACTIVE);
+
+        // The retry path (`attempt` is `Some`) — the same entry `on_retry` uses.
+        o.dispatch_issue(author(), Some(2), None, String::new());
+
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_EXCHANGE_ACTIVE,
+            "a retry is the same exchange and consumes nothing new"
+        );
     }
 }
