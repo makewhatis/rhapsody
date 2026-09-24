@@ -56,17 +56,25 @@ pub fn legacy_warnings(config: &Config) -> Vec<LegacyWarning> {
     let providers_configured = !config.providers.is_empty();
 
     // §7: "opencode.auth_source remains valid and is used when no provider credential reference is
-    // configured". It is the native-login path, not a target-state registry.
+    // configured". It is the native-login path, not a target-state registry. When an explicit
+    // provider IS selected this field is inert, and the suggestion says so rather than repeating the
+    // selection advice.
     if !config.opencode.auth_source.trim().is_empty() {
+        let provider_selected = !config.agent.provider.trim().is_empty();
         warnings.push(LegacyWarning::new(
             "legacy_opencode_auth_source",
             "opencode.auth_source",
             "opencode.auth_source is the legacy native-login path: OpenCode runs against a copy of \
              the operator's own auth.json. It still works with no provider configured."
                 .to_string(),
-            "Configure a `providers:` entry and select it with `agent.provider`/`agent.model` to use \
-             brokered credential custody instead."
-                .to_string(),
+            if provider_selected {
+                "A provider is selected, so this field is unused; remove `opencode.auth_source`."
+                    .to_string()
+            } else {
+                "Configure a `providers:` entry and select it with `agent.provider`/`agent.model` to \
+                 use brokered credential custody instead."
+                    .to_string()
+            },
         ));
     }
 
@@ -209,6 +217,25 @@ mod tests {
         assert!(
             warnings[0].suggestion.contains("agent.provider"),
             "the suggestion must name the new form: {}",
+            warnings[0].suggestion
+        );
+    }
+
+    /// When a provider is already selected, the legacy auth source is inert and the suggestion
+    /// says to remove it rather than to select a provider it already has.
+    #[test]
+    fn an_auth_source_beside_a_provider_is_reported_as_unused() {
+        let mut c = config();
+        c.opencode.auth_source = "/tmp/auth.json".to_string();
+        c.agent.backend = "opencode".to_string();
+        c.agent.provider = "fireworks".to_string();
+        c.agent.model = "m".to_string();
+        let warnings = legacy_warnings(&c);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "legacy_opencode_auth_source");
+        assert!(
+            warnings[0].suggestion.contains("remove"),
+            "a selected provider makes the field unused: {}",
             warnings[0].suggestion
         );
     }
