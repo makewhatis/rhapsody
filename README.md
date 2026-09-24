@@ -1353,7 +1353,7 @@ columns, all `rhapsody_`-prefixed so the Go-recaptured schema golden gates them 
 | `rhapsody_review_bound.manager_runs_used` | — | manager runs launched for the generation, charged only by the atomic reservation |
 | `rhapsody_review_bound.manager_interventions_applied` | — | post-threshold interventions applied |
 | `rhapsody_review_bound.manager_stopped` | — | empty while live; a reason once the generation is stopped |
-| `PRAGMA user_version` | 6 | **22** |
+| `PRAGMA user_version` | 6 | **23** |
 
 Launching a run is **one SQLite transaction** (§7.3): it checks the generation is not stopped, that
 `manager_runs_used < manager.max_runs_per_generation` (12) and the intervention's `attempts < 3`,
@@ -1365,7 +1365,8 @@ expiry); at boot a lease from another boot, or one that has expired, becomes a `
 shown on the human feed, and the sweep never creates another intervention for it; only an operator
 `/clear` (a new generation) resets it. With `manager.review_authority: off` none of this runs and
 the sweep's human feed is byte-identical. `divergent_objects_are_gated_by_name_only` pins the
-fourteenth and fifteenth names (the table and its partial index).
+fourteenth and fifteenth names (the table and its partial index); STUDIO-1016's
+`rhapsody_manager_wake` and its index are the sixteenth and seventeenth.
 
 A manager run's EXIT settles its intervention (§7.2, §7.5): the run's final message is parsed for
 its `rhapsody-manager-decision` block, a valid one is stored and the row moves `decided`, then
@@ -1381,6 +1382,43 @@ the credential preflight — or the §4.7 self-test has not passed, the stall is
 it stays on the human feed as a `manager_deferred` divergence whose `reason` carries the manager's
 own sentence (`manager deferred: drain` / `: budget` / `: credentials`, `manager unavailable: CLI
 contract`), rendered onto `/api/v1/state` beside the row.
+
+### Applying a decision, and the one activation transaction (STUDIO-1016)
+
+The manager's effect half (`manager-agent-design.md` §7.6–§7.9, §6.6, §11) adds a sixteenth
+`rhapsody_`-prefixed schema object and makes nothing a decision grants take effect until one SQLite
+transaction commits it:
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_manager_wake` | — | one wake OBLIGATION per `ROUTE_TO_AUTHOR` intervention (`state` pending/admitted/delivered/refused), written only by the activation transaction |
+| `rhapsody_manager_wake_issue` | — | plain index on `rhapsody_manager_wake(issue_id)` |
+| `PRAGMA user_version` | 6 | **23** |
+
+Every decision except `ESCALATE` posts one **mandatory explanation** comment; `ROUTE_TO_AUTHOR`
+additionally moves the ticket to `changes_state`. Effects run on an off-loop applier task
+(`runmanagerapply`, structured like `runautomerge`) that makes a cheap §8.3 check round-trip to the
+control task before **each** effect, so a revoked decision stops early. Each comment carries a
+hidden marker `<!-- rhapsody-manager:{id}:{effect} -->`; after a timeout or error the applier
+searches for it (bounded) and posts at most once more, so delivery is at-least-once and a duplicate
+is harmless. **No manager comment carries a summon token** — the token is stripped from the body
+before it is ever posted.
+
+**Activation is one rule for every variant.** The activation transaction re-runs the full §7.7
+revalidation against current state (the generation, `review_authority = act`, a KNOWN and empty
+hold set, the PR open, the manager enabled, the named finding revisions, the membership hash, and
+every §6.4 condition for `APPROVE` **evaluated now**). If it passes, the transaction atomically
+makes the pending records effective, re-requests the eligible rows, writes the exchange
+authorization and (for `ROUTE_TO_AUTHOR`) the wake obligation, reserves the post-threshold slot,
+sets `activated_at` and moves to `awaiting_effect`. If it fails, it cancels every pending record,
+records `unapplied_explanation` and ends `superseded` (generation/authority/hold/open/enablement)
+or `stale` (findings/membership/evidence/threshold) — and **reserves no slot**. Recovery after a
+crash reconciles the mandatory effects and then runs **the same** transaction with **the same**
+revalidation; a confirmed comment is one prerequisite, never permission on its own. Until M10 lands
+admission, a ticket with an unspent `pending` wake obligation is SKIPPED by ordinary selection, so
+no route-back dispatches without its seed. The memory mirror is written last, best effort: a memory
+failure leaves the decision applied and `memory_state = pending`, and never re-runs or reverts
+anything.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
