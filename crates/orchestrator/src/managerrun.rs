@@ -149,8 +149,9 @@ impl Orchestrator {
     /// dispatch path.
     ///
     /// Refusal is ordered so nothing observable happens before every check has passed: the Teams
-    /// gate, then the authority, then the §4.7 self-test, then the drain gate, then the coordinates,
-    /// then the routing, and only then the overwrite guard and the dispatch.
+    /// gate, then the authority, then the coordinates and the route (the route's project names the
+    /// `claude` command the self-test gate re-probes), then the §4.7 self-test, then the drain gate,
+    /// and only then the overwrite guard and the dispatch.
     pub fn dispatch_manager(&mut self, run: ManagerRun) -> ManagerDispatchOutcome {
         // The manager is a built-in TEAM identity (M6): with Teams off there is no manager to run.
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
@@ -160,19 +161,6 @@ impl Orchestrator {
         // whole feature hangs on, and `off` must remain byte-identical — so it is checked first.
         if self.manager_review_authority() == ReviewAuthority::Off {
             return ManagerDispatchOutcome::AuthorityOff;
-        }
-        // §4.7/§10.2: the self-test must have passed on the CURRENT CLI version before the manager
-        // acts again. Fail-closed — a missing, crashed or version-stale verdict refuses here.
-        if let Err(reason) = self.manager_launch_permitted() {
-            tracing::warn!(
-                pr = %format!("{}/{}#{}", run.owner, run.repo, run.number),
-                reason = %reason.message(),
-                "manager run refused: the startup self-test has not passed on the current CLI"
-            );
-            return ManagerDispatchOutcome::SelfTestFailed(reason);
-        }
-        if self.drain.is_draining() {
-            return ManagerDispatchOutcome::Draining;
         }
         if run.owner.is_empty() || run.repo.is_empty() {
             return ManagerDispatchOutcome::Refused("pull request has no owner/repo".to_string());
@@ -191,13 +179,45 @@ impl Orchestrator {
             );
         };
         let id = run.key();
-        // THE overwrite guard: never point a second agent at a live manager run's identity.
+        // THE overwrite guard: never point a second agent at a live manager run's identity. Checked
+        // before the self-test gate's version re-probe so a repeated sweep for an in-flight run does
+        // no work.
         if self.running.contains_key(&id) || self.claimed.contains(&id) {
             return ManagerDispatchOutcome::AlreadyInFlight;
+        }
+        // §4.7/§10.2: the self-test must have passed on the CURRENT CLI version before the manager
+        // acts again. Re-probe the installed version HERE — and record it — so a CLI that updated
+        // itself in place mid-process can never be acted on before the off-loop self-test watcher
+        // re-runs the canary (the watcher re-runs because the verdict's version no longer matches).
+        // `claude --version` is ~15 ms and manager launches are rare.
+        let command = self.manager_cli_command(&route.slug);
+        let probed = crate::managerselftest::probe_cli_version(&command);
+        self.manager_selftest.observe_probe(&probed);
+        if let Err(reason) = self.manager_launch_permitted() {
+            tracing::warn!(
+                pr = %format!("{}/{}#{}", run.owner, run.repo, run.number),
+                reason = %reason.message(),
+                "manager run refused: the startup self-test has not passed on the current CLI"
+            );
+            return ManagerDispatchOutcome::SelfTestFailed(reason);
+        }
+        if self.drain.is_draining() {
+            return ManagerDispatchOutcome::Draining;
         }
         let iss = run.synthetic_issue();
         self.finish_manager_dispatch(run, route, iss);
         ManagerDispatchOutcome::Dispatched
+    }
+
+    /// The `claude` command a manager run for `slug` would launch: the routed project's resolved
+    /// command, else the CLI name. Used only to re-probe `--version` at the §4.7 gate.
+    fn manager_cli_command(&self, slug: &str) -> String {
+        self.eff
+            .as_ref()
+            .and_then(|e| e.projects.iter().find(|p| p.slug == slug))
+            .map(|p| p.mcfg.claude.command.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     /// The tail of a manager dispatch: stage the coordinates for
@@ -250,6 +270,23 @@ mod tests {
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
 
+    /// The version the fake CLI below answers `--version` with. The launch gate re-probes the real
+    /// command, so tests point the routed project at this fake so the probe is hermetic.
+    const TEST_CLI_VERSION: &str = "9.9.9";
+
+    /// A `bash`-runnable fake `claude` that answers `--version` deterministically. Written once per
+    /// test process under the temp dir; the probe only reads the first non-empty line.
+    fn test_cli_command() -> String {
+        static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let path = SCRIPT.get_or_init(|| {
+            let p = std::env::temp_dir().join("rhapsody-manager-test-cli.sh");
+            std::fs::write(&p, format!("#!/bin/sh\necho {TEST_CLI_VERSION}\n"))
+                .expect("write test cli");
+            p.to_string_lossy().into_owned()
+        });
+        format!("bash {path}")
+    }
+
     fn record_entries(sink: &DispatchedEntries) -> crate::orchestrator::SpawnFn {
         let sink = Arc::clone(sink);
         Box::new(move |_iss, _attempt, re| {
@@ -259,7 +296,8 @@ mod tests {
 
     /// An orchestrator with Teams ON + ticketless review mode (which is what makes
     /// `manager_review_authority()` non-`off`), one project owning [`REPO_URL`], an in-memory store,
-    /// and a recording spawn seam.
+    /// and a recording spawn seam. The project's `claude` command is the fake above, so the §4.7
+    /// gate's version re-probe is deterministic.
     fn orch(authority: ReviewAuthority) -> (Orchestrator, DispatchedEntries) {
         let tracker = Arc::new(Fake::new());
         let mut eff = empty_effective(tracker.clone());
@@ -270,6 +308,7 @@ mod tests {
         eff.max_concurrent = 10;
         let mut proj = empty_resolved_project("rhapsody", tracker);
         proj.repo = REPO_URL.to_string();
+        proj.mcfg.claude.command = test_cli_command();
         eff.projects = vec![proj];
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
@@ -356,11 +395,28 @@ mod tests {
         ));
     }
 
+    // §4.7/§10.2 + the ticket's B3: a verdict measured on a version other than the one installed NOW
+    // refuses at the launch gate, even after a successful boot pass. The gate re-probes, so a
+    // mid-process CLI update cannot be acted on.
+    #[test]
+    fn dispatch_refuses_when_the_installed_cli_version_changed() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o, "0.0.1"); // a verdict measured on an OLD version
+        assert!(
+            matches!(
+                o.dispatch_manager(manager_run()),
+                ManagerDispatchOutcome::SelfTestFailed(_)
+            ),
+            "a stale verdict must refuse"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
     // §10.2/§12: `review_authority: off` refuses before anything is touched.
     #[test]
     fn dispatch_refuses_when_authority_is_off() {
         let (mut o, dispatched) = orch(ReviewAuthority::Off);
-        pass_self_test(&o, "1.0.0"); // even with a passing self-test, off means off
+        pass_self_test(&o, TEST_CLI_VERSION); // even with a passing self-test, off means off
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::AuthorityOff
@@ -398,7 +454,7 @@ mod tests {
     #[test]
     fn dispatch_manager_rides_the_shared_funnel_with_no_watch_row() {
         let (mut o, dispatched) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, "1.0.0");
+        pass_self_test(&o, TEST_CLI_VERSION);
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
@@ -434,7 +490,7 @@ mod tests {
     #[test]
     fn dispatch_manager_refuses_an_already_in_flight_run() {
         let (mut o, dispatched) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, "1.0.0");
+        pass_self_test(&o, TEST_CLI_VERSION);
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
@@ -451,20 +507,46 @@ mod tests {
     fn dispatch_manager_refuses_when_teams_is_off() {
         let (mut o, _) = orch(ReviewAuthority::Act);
         o.teams = Some(Teams::disabled());
-        pass_self_test(&o, "1.0.0");
+        pass_self_test(&o, TEST_CLI_VERSION);
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::TeamsOff
         );
     }
 
-    // A manager run's `pr:` key resolves to no ticket, so its exit must NOT go through the ticket
-    // classifier (which would schedule a continuation retry forever). It ends the run, releases the
-    // claim, and schedules nothing.
+    // The manager run's harness is always `claude` and its model/effort come from M6's config
+    // (`manager.model`/`manager.effort`). Pinned because alice's review noted the override could be
+    // disabled (`if false && manager.is_some()`) with every test still green.
+    #[test]
+    fn a_dispatched_manager_run_carries_the_manager_model_effort_and_harness() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        {
+            let teams = o.teams.as_mut().expect("teams");
+            teams.manager.model = "claude-opus-5-5".to_string();
+            teams.manager.effort = "high".to_string();
+        }
+        pass_self_test(&o, TEST_CLI_VERSION);
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        let d = dispatched.lock().expect("lock");
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].harness, "claude",
+            "a manager run is always the claude harness"
+        );
+        assert_eq!(d[0].model_override.model, "claude-opus-5-5");
+        assert_eq!(d[0].model_override.effort, "high");
+    }
+
+    // The exit path of a manager run (STUDIO-1049): its `pr:` key resolves to no tracker issue, so
+    // it ends exactly as a review does — recording the outcome and releasing the persisted claim —
+    // without the ticket classifier and without scheduling any retry. M8 owns the decision effects.
     #[test]
     fn a_manager_exit_ends_the_run_and_schedules_no_retry() {
         let (mut o, _) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, "1.0.0");
+        pass_self_test(&o, TEST_CLI_VERSION);
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched

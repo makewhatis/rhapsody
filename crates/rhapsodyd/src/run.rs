@@ -399,6 +399,17 @@ where
     // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
     // manager's replies. See the sharing note where the off-loop tasks take their clones.
     let mut teams_room: Option<Arc<rhapsody_config::room::LocalRoom>> = None;
+    // The off-loop self-test watcher wiring (STUDIO-1049, §4.7): `Some` only when
+    // `manager.review_authority` is not `off` after the boot self-test, so a default install spawns
+    // no task and has no delta. Carried out of the Teams block for `teams_prefetch`'s reason — the
+    // watcher is spawned beside the prune scheduler, by which point `o` has moved into the control
+    // task.
+    let mut manager_selftest_watch: Option<(
+        Arc<rhapsody_orchestrator::managerselftest::ManagerSelfTestState>,
+        String,
+        String,
+        String,
+    )> = None;
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
@@ -427,6 +438,21 @@ where
             &flags.path.to_string_lossy(),
         )
         .await;
+        // When the manager may act, keep the §4.7 verdict fresh across a CLI version change: the
+        // watcher re-probes the installed version and re-runs the canary whenever it changed. The
+        // launch gate re-probes too, so nothing acts on a stale verdict in the meantime.
+        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+            manager_selftest_watch = Some((
+                o.manager_selftest_handle(),
+                resolved
+                    .as_ref()
+                    .map_or_else(|| "claude".to_string(), |c| c.claude.command.clone()),
+                resolved
+                    .as_ref()
+                    .map_or_else(String::new, |c| c.workspace.root.clone()),
+                flags.path.to_string_lossy().into_owned(),
+            ));
+        }
         o.teams = Some(teams_cfg.clone());
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
@@ -833,6 +859,30 @@ where
         };
         crate::prune::run_prune_schedule(prune_ctx, sf, rf, pw, rl).await;
     });
+
+    // --- manager self-test watcher (STUDIO-1049, §4.7) ---
+    //
+    // Spawned only when the manager may act. It re-probes the installed `claude` version on a fixed
+    // cadence and re-runs the canary whenever it changed, so a CLI that auto-updates in place is
+    // re-verified without a daemon restart. It holds no `Orchestrator`: its whole contact is the
+    // shared `ManagerSelfTestState` handle and the resolved command/paths.
+    let manager_watch_task =
+        manager_selftest_watch.map(|(state, command, workspace_root, workflow_path)| {
+            let ctx = shutdown.wait();
+            let daemon_bin = std::env::current_exe()
+                .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
+            tokio::spawn(async move {
+                rhapsody_orchestrator::managerselftest::run_selftest_watch_task(
+                    ctx,
+                    command,
+                    workspace_root,
+                    daemon_bin,
+                    workflow_path,
+                    state,
+                )
+                .await;
+            })
+        });
 
     // --- Rhapsody Teams triage (STUDIO-644, slice T3b; design record
     // ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md, §0.11.2) ---
@@ -1468,6 +1518,12 @@ where
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
+    // The manager self-test watcher is cancelled by the same signal and checks it around its sleep,
+    // so its wait is bounded by one probe (and, at most, one canary turn, itself capped by the turn
+    // timeout).
+    if let Some(t) = manager_watch_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
     // The triage task is cancelled by the same signal, and checks it between model turns as well as
     // between cycles. The wait is still BOUNDED: a turn already in flight can take up to
     // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the

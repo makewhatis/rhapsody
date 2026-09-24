@@ -486,11 +486,14 @@ async fn run_manager_attempt(
 ) -> (String, WorkerDeclaration, Option<WorkerError>) {
     // The empty, daemon-owned, per-run cwd (§4.2), under the workspace root so the launch
     // containment invariant holds. There is deliberately NO checkout: the host serves every read.
-    let cwd = std::path::Path::new(&deps.manager_root)
+    // The config directory is a SIBLING of the cwd, not a child of it, so the run's working
+    // directory stays empty and the model credential is never inside it.
+    let run_dir = std::path::Path::new(&deps.manager_root)
         .join("manager")
         .join(workspace::sanitize_key(&mgr.key));
-    let config_dir = cwd.join("config");
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+    let cwd = run_dir.join("cwd");
+    let config_dir = run_dir.join("config");
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
         return (
             issue.state.clone(),
             WorkerDeclaration::default(),
@@ -500,9 +503,11 @@ async fn run_manager_attempt(
         );
     }
     // Removed on every exit path below (including an early return / a dropped run future).
-    let _cleanup = ManagerDirGuard(cwd.clone());
-    // The dedicated manager configuration directory carries ONLY the model credential (§4.2).
-    provision_manager_config_dir(&config_dir);
+    let _cleanup = ManagerDirGuard(run_dir.clone());
+    // The dedicated manager configuration directory carries ONLY the model credential (§4.2), and
+    // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
+    // authenticate from the file on macOS (§4.5).
+    let model_credential = provision_manager_config_dir(&config_dir);
 
     // Optional transcript, best-effort exactly as the ordinary path.
     let mut transcript: Option<Transcript> = None;
@@ -525,6 +530,7 @@ async fn run_manager_attempt(
         cwd: cwd.to_string_lossy().into_owned(),
         config_dir: config_dir.to_string_lossy().into_owned(),
         run_timeout_ms: mgr.run_timeout_ms.max(0) as u64,
+        model_credential,
     };
     let session = match deps
         .agent
@@ -575,36 +581,58 @@ impl Drop for ManagerDirGuard {
     }
 }
 
-/// Copies ONLY the model credential into a dedicated manager configuration directory (§4.2).
+/// Copies ONLY the model credential into a dedicated manager configuration directory (§4.2) and
+/// returns the OAuth access token to inject as `CLAUDE_CODE_OAUTH_TOKEN` (§4.5).
 ///
-/// The source is the operator's own Claude config root (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`);
-/// the one file copied is `.credentials.json`. Best-effort: an absent source credential is logged
-/// and the run proceeds — the child then fails to authenticate, which is a runtime failure rather
-/// than a boundary hole (no operator hook, plugin, MCP server or permission rule is ever copied).
-pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) {
+/// The source is the operator's own Claude config root (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`).
+/// The document it reads is `.credentials.json`; what is WRITTEN into `config_dir` is a FILTERED
+/// document carrying only `claudeAiOauth` — the operator file's unrelated `mcpOAuth` tokens (Linear,
+/// Cloudflare, …) are never copied.
+///
+/// The token is returned because a relocated config root cannot authenticate from the file alone on
+/// macOS, where the CLI reads its OAuth credential from the login Keychain keyed by the config root
+/// (measured on `claude` 2.1.281: `loggedIn: false` with the file present). The adapter therefore
+/// injects the same token as `CLAUDE_CODE_OAUTH_TOKEN`, which the relocated CLI DOES honour.
+///
+/// Best-effort: an absent or credential-free source is logged and the run proceeds — the child then
+/// fails to authenticate, which is a runtime failure rather than a boundary hole (no operator hook,
+/// plugin, MCP server or permission rule is ever copied).
+pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) -> Option<String> {
     if let Err(e) = std::fs::create_dir_all(config_dir) {
         tracing::warn!(dir = %config_dir.display(), err = %e, "manager: could not create the config dir");
-        return;
+        return None;
     }
     let source = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
-    let Some(source) = source else {
-        return;
-    };
+    let source = source?;
     let cred = source.join(".credentials.json");
-    match std::fs::read(&cred) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(config_dir.join(".credentials.json"), bytes) {
-                tracing::warn!(err = %e, "manager: could not copy the model credential");
+    let raw = match std::fs::read_to_string(&cred) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(
+                source = %cred.display(),
+                err = %e,
+                "manager: no model credential found to provision; the manager run will fail to \
+                 authenticate"
+            );
+            return None;
+        }
+    };
+    // Write the filtered document (only `claudeAiOauth`) when the source has a usable OAuth token.
+    match rhapsody_agent::manager::manager_credential_document(&raw) {
+        Some(doc) => {
+            if let Err(e) = std::fs::write(config_dir.join(".credentials.json"), doc) {
+                tracing::warn!(err = %e, "manager: could not write the filtered model credential");
             }
         }
-        Err(e) => tracing::warn!(
+        None => tracing::warn!(
             source = %cred.display(),
-            err = %e,
-            "manager: no model credential found to provision; the manager run will fail to authenticate"
+            "manager: the operator credential holds no OAuth access token; the manager run will \
+             fail to authenticate"
         ),
     }
+    rhapsody_agent::manager::model_credential_from_config_json(&raw)
 }
 
 /// Performs one worker attempt (upstream §16.5). Returns the worker's last-known issue state — the
@@ -3831,10 +3859,12 @@ mod tests {
             cwd.starts_with(&root.path),
             "the manager cwd must be under the workspace root: {cwd:?}"
         );
+        // The config dir is a SIBLING of the cwd, so the run's working directory stays empty and the
+        // model credential is never inside it.
         assert_eq!(
-            started.config_dir,
-            cwd.join("config").to_string_lossy(),
-            "the dedicated config dir lives inside the per-run cwd"
+            std::path::PathBuf::from(&started.config_dir),
+            cwd.parent().expect("the cwd has a parent").join("config"),
+            "the dedicated config dir is a sibling of the per-run cwd"
         );
         assert_eq!(
             started.run_timeout_ms, 1234,
@@ -3843,6 +3873,10 @@ mod tests {
         assert!(
             !cwd.exists(),
             "the daemon-owned per-run cwd must be removed afterwards"
+        );
+        assert!(
+            !std::path::Path::new(&started.config_dir).exists(),
+            "the dedicated config dir must be removed with the run directory"
         );
         assert_eq!(
             tr.move_calls().len(),
