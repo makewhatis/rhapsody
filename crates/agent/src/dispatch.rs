@@ -448,37 +448,16 @@ impl DispatchRunner {
     ///   context through the legacy setters, preserving byte-identical behavior for an installation
     ///   with no explicit provider.
     pub async fn start(mut self, start: SessionStart) -> Result<StartedSession, AgentError> {
-        // The adapter session is built from the SAME frozen start value on both branches, so the
-        // workspace/issue/transcript inputs cannot diverge between them.
-        let inner = self
-            .harness
-            .start_session(&start.workspace_path, start.issue.clone(), start.transcript)
-            .await?;
-
         match self.provider.take() {
-            None => {
-                // Legacy bridge: the ported traits keep their late setters. This is what keeps the
-                // no-provider path byte-identical to a daemon built before this layer existed.
-                inner.set_run_id(start.launch.run_id);
-                if let Some(sha) = start.launch.review_head.as_deref()
-                    && !sha.is_empty()
-                {
-                    inner.set_review_head(sha);
-                }
-                if let Some(model) = self.model.as_deref()
-                    && !model.is_empty()
-                {
-                    inner.set_model_override(ModelOverride {
-                        model: model.to_string(),
-                        ..Default::default()
-                    });
-                }
-                Ok(StartedSession {
-                    session: inner,
-                    broker_turns: None,
-                })
-            }
+            // The provider path starts the harness's BROKERED session: the adapter's turns mint a
+            // per-turn capability from the broker attempt rather than reaching a native login. A
+            // harness with no brokered materialization refuses here — never a legacy fallback.
             Some(mut provider) => {
+                let inner = self.harness.start_brokered_session(
+                    &start.workspace_path,
+                    start.issue.clone(),
+                    start.transcript,
+                )?;
                 let access = provider
                     .take_access()
                     .ok_or(DispatchRefusal::CustodyAlreadyTaken)
@@ -497,6 +476,32 @@ impl DispatchRunner {
                 Ok(StartedSession {
                     session,
                     broker_turns: Some(ledgers),
+                })
+            }
+            None => {
+                // Legacy bridge: the ported traits keep their late setters. This is what keeps the
+                // no-provider path byte-identical to a daemon built before this layer existed.
+                let inner = self
+                    .harness
+                    .start_session(&start.workspace_path, start.issue.clone(), start.transcript)
+                    .await?;
+                inner.set_run_id(start.launch.run_id);
+                if let Some(sha) = start.launch.review_head.as_deref()
+                    && !sha.is_empty()
+                {
+                    inner.set_review_head(sha);
+                }
+                if let Some(model) = self.model.as_deref()
+                    && !model.is_empty()
+                {
+                    inner.set_model_override(ModelOverride {
+                        model: model.to_string(),
+                        ..Default::default()
+                    });
+                }
+                Ok(StartedSession {
+                    session: inner,
+                    broker_turns: None,
                 })
             }
         }
@@ -636,6 +641,18 @@ mod tests {
 
         fn capabilities(&self) -> &HarnessCapabilities {
             &self.caps
+        }
+
+        /// The brokered start a prepared dispatch uses: the fake has no broker loopback, so it
+        /// returns the SAME recorded session the legacy path would, which is all the custody-transfer
+        /// tests need.
+        fn start_brokered_session(
+            &self,
+            _workspace_path: &str,
+            _issue: Issue,
+            transcript: Option<Transcript>,
+        ) -> Result<Box<dyn Session>, AgentError> {
+            self.inner.start_session_sync(transcript)
         }
     }
 

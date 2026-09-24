@@ -291,6 +291,31 @@ where
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
     let resolved = load_resolved(&flags.path);
+    // PB7 (STUDIO-1002): install the prepared-dispatch resolver UNCONDITIONALLY, not only when the
+    // startup workflow already configures a provider (B3). The broker itself is bound unconditionally
+    // above (§11.1) for the same reason a hot reload must not discover a missing listener: a
+    // `providers:` block can appear later, or live only in a per-project overlay. The resolver's own
+    // `begin_preparation` returns `NoResolver` while the current effective config defines no provider
+    // at all, so an installation that never has one still dispatches inline byte-for-byte. An
+    // explicit-provider dispatch then resolves its pure selection and, for `Present`, reads the bound
+    // credential through the daemon's authenticated owner adapter and registers it with the broker —
+    // all OFF the control task. The same credential boundary the provider-status runtime uses is
+    // shared, so one tracker observes every availability transition; with no bootstrap channel the
+    // owner is an `OwnerUnavailable` resolver, which is the honest refusal rather than a direct-key
+    // fallback.
+    let prep_owner = credential_owner_boundary
+        .clone()
+        .unwrap_or_else(crate::providers::unavailable_owner);
+    o.set_credential_revision_source(Arc::new(crate::providers::ResolverRevisionSource::new(
+        Arc::clone(&prep_owner),
+    )));
+    let prep_source = Arc::new(crate::providers::DaemonProviderSource::new(
+        prep_owner,
+        broker_runtime.registrar(),
+    ));
+    o.set_preparation_resolver(Arc::new(
+        rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
+    ));
     // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
     // failed open. Only the one reader that would ACT on an absence uses it (the Teams
     // identity-label reconcile, STUDIO-672); everything else is guard-free by design.

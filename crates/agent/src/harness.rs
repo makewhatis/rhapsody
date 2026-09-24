@@ -107,6 +107,18 @@ pub enum HarnessId {
     Opencode,
 }
 
+impl HarnessId {
+    /// The harness's config-facing name (`"claude"`/`"opencode"`), the same spelling
+    /// [`harness_id_for_name`] parses. Exhaustive, so a new harness must add its name rather than
+    /// inherit one.
+    pub const fn name(self) -> &'static str {
+        match self {
+            HarnessId::Claude => "claude",
+            HarnessId::Opencode => "opencode",
+        }
+    }
+}
+
 /// A provider protocol a harness adapter can consume. One variant in v1: OpenAI Chat Completions
 /// with Bearer API-key auth — the reviewed adapter `provider-auth-design.md` §3 means by the config
 /// value `openai-compatible`, NOT arbitrary auth headers or fields.
@@ -420,6 +432,25 @@ pub struct HarnessCapabilities {
 pub trait Harness: Runner {
     fn id(&self) -> HarnessId;
     fn capabilities(&self) -> &HarnessCapabilities;
+
+    /// Start a BROKERED session for an explicit-provider dispatch (PB7, STUDIO-1002): the session's
+    /// turns run through [`crate::Session::run_turn_brokered`] against the broker loopback rather
+    /// than a harness-native login. `None` (the default) refuses with a typed, non-secret reason
+    /// rather than starting a legacy session — a prepared dispatch must never silently fall back to
+    /// the native-login path. `crate::opencode::Runner` overrides this with its brokered
+    /// materialization; Claude has no provider adapter in v1, so a prepared spec for it is refused
+    /// earlier as an unsupported protocol.
+    fn start_brokered_session(
+        &self,
+        _workspace_path: &str,
+        _issue: rhapsody_core::Issue,
+        _transcript: Option<crate::Transcript>,
+    ) -> Result<Box<dyn crate::Session>, crate::AgentError> {
+        Err(crate::AgentError::Other(format!(
+            "brokered_start_unsupported: harness {:?} has no brokered session",
+            self.id()
+        )))
+    }
 }
 
 /// What one dispatch NEEDS from its resolved harness (design §5's table). This is the PURE input to

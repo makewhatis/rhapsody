@@ -151,12 +151,12 @@ impl Default for Fake {
     }
 }
 
-#[async_trait]
-impl Runner for Fake {
-    async fn start_session(
+impl Fake {
+    /// Synchronous session construction. Shared by the async [`Runner::start_session`] and a
+    /// wrapper's brokered start (PB7), so a fake's recorded start behavior cannot diverge between the
+    /// legacy and brokered paths.
+    pub fn start_session_sync(
         &self,
-        _workspace_path: &str,
-        _issue: Issue,
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError> {
         {
@@ -173,6 +173,18 @@ impl Runner for Fake {
             turn_n: AtomicI64::new(0),
             recorded: Arc::clone(&self.recorded),
         }))
+    }
+}
+
+#[async_trait]
+impl Runner for Fake {
+    async fn start_session(
+        &self,
+        _workspace_path: &str,
+        _issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.start_session_sync(transcript)
     }
 }
 
