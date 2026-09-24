@@ -122,6 +122,21 @@ pub enum MemoryBackend {
 
 /// `manager.max_tokens` — the hard cap on the (future) triage arbitration turn.
 const DEFAULT_MAX_TOKENS: i64 = 4000;
+/// `manager.max_interventions` — the post-threshold (§7.3) ceiling on how many times one
+/// generation's review loop may ask the manager to intervene.
+const DEFAULT_MAX_INTERVENTIONS: i64 = 3;
+/// `manager.max_runs_per_generation` — the hard bound on the manager's own model runs for one
+/// pull request within one loop generation (§7.3, §13).
+const DEFAULT_MAX_RUNS_PER_GENERATION: i64 = 12;
+/// `manager.max_concurrent` — how many manager runs may be in flight at once, outside the review
+/// slots.
+const DEFAULT_MAX_CONCURRENT: i64 = 1;
+/// `manager.effort` — the reasoning effort a manager run asks its harness for.
+const DEFAULT_MANAGER_EFFORT: &str = "high";
+/// `manager.max_turns` — the manager run's turn ceiling.
+const DEFAULT_MANAGER_MAX_TURNS: i64 = 1;
+/// `manager.run_timeout_ms` — 30 minutes; the manager run's wall-clock ceiling.
+const DEFAULT_MANAGER_RUN_TIMEOUT_MS: i64 = 1_800_000;
 /// `manager.timeout_ms` — exceeded ⇒ fall back to the deterministic answer.
 ///
 /// **60 seconds, raised from the 5000ms §2.2 specified (STUDIO-673).** A triage
@@ -160,6 +175,30 @@ pub const DEFAULT_PROMPT_BUDGET_BYTES: i64 = 16000;
 
 fn default_max_tokens() -> i64 {
     DEFAULT_MAX_TOKENS
+}
+
+fn default_max_interventions() -> i64 {
+    DEFAULT_MAX_INTERVENTIONS
+}
+
+fn default_max_runs_per_generation() -> i64 {
+    DEFAULT_MAX_RUNS_PER_GENERATION
+}
+
+fn default_max_concurrent() -> i64 {
+    DEFAULT_MAX_CONCURRENT
+}
+
+fn default_manager_effort() -> String {
+    DEFAULT_MANAGER_EFFORT.to_string()
+}
+
+fn default_manager_max_turns() -> i64 {
+    DEFAULT_MANAGER_MAX_TURNS
+}
+
+fn default_manager_run_timeout_ms() -> i64 {
+    DEFAULT_MANAGER_RUN_TIMEOUT_MS
 }
 
 fn default_timeout_ms() -> i64 {
@@ -242,6 +281,33 @@ pub struct Manager {
     /// [`Teams::manager_review_authority`], never raw — the accessor folds in the ticketless gate.
     #[serde(default)]
     pub review_authority: ReviewAuthority,
+    /// `manager.max_interventions` (STUDIO-1013, §7.3/§12): the post-threshold ceiling on
+    /// interventions for one pull request in one generation. Parsed and carried here; the M7/M8
+    /// activation transaction is what enforces it.
+    #[serde(default = "default_max_interventions")]
+    pub max_interventions: i64,
+    /// `manager.max_runs_per_generation` (STUDIO-1013, §7.3/§13): the hard bound on the manager's
+    /// own model runs for one pull request in one generation. Parsed and carried here; enforcement
+    /// is M7/M8's.
+    #[serde(default = "default_max_runs_per_generation")]
+    pub max_runs_per_generation: i64,
+    /// `manager.max_concurrent` (STUDIO-1013, §12): how many manager runs may be in flight at once,
+    /// outside the review slots. Parsed and carried here; enforcement is M7/M8's.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: i64,
+    /// `manager.effort` (STUDIO-1013, §12): the reasoning effort a manager run asks its harness for.
+    /// Default `high`; empty means the harness's own default, exactly as an unset profile effort
+    /// does.
+    #[serde(default = "default_manager_effort")]
+    pub effort: String,
+    /// `manager.max_turns` (STUDIO-1013, §12): the manager run's turn ceiling.
+    #[serde(default = "default_manager_max_turns")]
+    pub max_turns: i64,
+    /// `manager.run_timeout_ms` (STUDIO-1013, §12): the manager run's wall-clock ceiling, in
+    /// milliseconds. Distinct from [`timeout_ms`](Self::timeout_ms), which bounds the ROUTING
+    /// turn — a manager run is a whole agent session, not one arbitration turn.
+    #[serde(default = "default_manager_run_timeout_ms")]
+    pub run_timeout_ms: i64,
 }
 
 impl Default for Manager {
@@ -255,6 +321,12 @@ impl Default for Manager {
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             review_authority: ReviewAuthority::Off,
+            max_interventions: DEFAULT_MAX_INTERVENTIONS,
+            max_runs_per_generation: DEFAULT_MAX_RUNS_PER_GENERATION,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            effort: DEFAULT_MANAGER_EFFORT.to_string(),
+            max_turns: DEFAULT_MANAGER_MAX_TURNS,
+            run_timeout_ms: DEFAULT_MANAGER_RUN_TIMEOUT_MS,
         }
     }
 }
@@ -1084,6 +1156,24 @@ impl Teams {
         self.manager.review_authority
     }
 
+    /// The review authority **actually in force**, given whether the daemon has durable storage
+    /// (STUDIO-1013, design §12): anything but `off` requires durable storage. With the Noop store
+    /// the key is refused and reads as [`ReviewAuthority::Off`] — never silently accepted, and
+    /// never a crash.
+    ///
+    /// Separate from [`manager_review_authority`](Self::manager_review_authority) because storage
+    /// is a runtime fact the config file cannot know: `teams.yaml` is pure config, while whether
+    /// the daemon opened a real store is decided at boot (`rhapsodyd::bootcfg::open_store`). The
+    /// boot applies this and warns; a caller holding only the config keeps the raw answer.
+    pub fn effective_manager_review_authority(&self, durable_storage: bool) -> ReviewAuthority {
+        let authority = self.manager_review_authority();
+        if authority == ReviewAuthority::Off || durable_storage {
+            authority
+        } else {
+            ReviewAuthority::Off
+        }
+    }
+
     /// The number of COMPLETED review runs on a pull request that trips the runaway-loop breaker
     /// (STUDIO-1026), or `None` when the breaker is off.
     ///
@@ -1574,6 +1664,20 @@ impl Teams {
                 "manager.harness {:?} requires an explicit manager.provider and manager.model — a \
                  non-Claude manager cannot inherit a teammate's selection",
                 manager_harness
+            )));
+        }
+        // STUDIO-1013 (§4.1, §12): v1 manager runs are `claude`-harness only (D1 requires Opus
+        // 5.5). A config that would give the manager review authority on any other resolved
+        // harness is a TYPED REFUSAL at validation: the manager does not launch and items stay on
+        // the human feed, rather than running a gate on a harness whose tool contract §4.7 cannot
+        // verify. Setting the authority to `off` is the way to keep a non-Claude manager.
+        if self.manager.review_authority != ReviewAuthority::Off && manager_harness != "claude" {
+            return Err(TeamsError::Invalid(format!(
+                "manager.review_authority {:?} requires the `claude` harness, but the manager \
+                 resolves to {:?} — v1 manager runs are Claude-only, because the tool contract \
+                 §4.7 verifies is the pinned Claude CLI's. Set manager.review_authority: off, or \
+                 run the manager on claude",
+                self.manager.review_authority, manager_harness
             )));
         }
         // Every configured `review.provider` value must be a canonical operator-chosen id. A
@@ -3554,7 +3658,16 @@ mod tests {
                 provider: "fireworks".to_string(),
                 max_tokens: 1,
                 timeout_ms: 2,
-                review_authority: ReviewAuthority::Act,
+                // `off` with a non-Claude harness, because STUDIO-1013 makes any other authority
+                // a typed refusal on a non-Claude manager (the tuple itself still round-trips
+                // below; `other` carries the `Act` spelling).
+                review_authority: ReviewAuthority::Off,
+                max_interventions: 4,
+                max_runs_per_generation: 13,
+                max_concurrent: 2,
+                effort: "medium".to_string(),
+                max_turns: 3,
+                run_timeout_ms: 900_000,
             },
             memory: Memory {
                 backend: MemoryBackend::None,
@@ -3612,6 +3725,8 @@ mod tests {
         let other = Teams {
             manager: Manager {
                 mode: ManagerMode::LabelsModel,
+                // A default-Claude manager may carry `act` (STUDIO-1013); round-trip the enum.
+                review_authority: ReviewAuthority::Act,
                 ..Manager::default()
             },
             memory: Memory {
@@ -3624,6 +3739,110 @@ mod tests {
         assert!(yaml.contains("labels+model"), "wire spelling: {yaml}");
         assert!(yaml.contains("hindsight"), "wire spelling: {yaml}");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), other);
+    }
+
+    // ── STUDIO-1013: the manager identity's config keys ───────────────────────
+
+    /// Every `manager:` run key has the §12 default, and an explicit value parses. An install that
+    /// never wrote the block keeps the defaults, which is the byte-identical case.
+    #[test]
+    fn manager_run_keys_default_and_parse() {
+        let m = Manager::default();
+        assert_eq!(m.max_interventions, 3);
+        assert_eq!(m.max_runs_per_generation, 12);
+        assert_eq!(m.max_concurrent, 1);
+        assert_eq!(m.effort, "high");
+        assert_eq!(m.max_turns, 1);
+        assert_eq!(m.run_timeout_ms, 1_800_000);
+
+        // An absent `manager:` block (the shipped state) keeps every default.
+        let t = Teams::parse("enabled: true\n").expect("parse");
+        assert_eq!(t.manager, Manager::default());
+
+        let t = Teams::parse(
+            "manager:\n  max_interventions: 5\n  max_runs_per_generation: 20\n  \
+             max_concurrent: 2\n  effort: low\n  max_turns: 4\n  run_timeout_ms: 60000\n",
+        )
+        .expect("parse");
+        assert_eq!(t.manager.max_interventions, 5);
+        assert_eq!(t.manager.max_runs_per_generation, 20);
+        assert_eq!(t.manager.max_concurrent, 2);
+        assert_eq!(t.manager.effort, "low");
+        assert_eq!(t.manager.max_turns, 4);
+        assert_eq!(t.manager.run_timeout_ms, 60_000);
+    }
+
+    /// §4.1/§12: any authority but `off` requires the `claude` harness; a non-Claude resolved
+    /// manager is a typed refusal, not a silently-ignored key. The mutation this pins: dropping
+    /// the check lets an `act` manager be configured on opencode.
+    #[test]
+    fn review_authority_requires_the_claude_harness() {
+        let non_claude = "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  harness: opencode\n  \
+                          provider: fireworks\n  model: m\n  review_authority: act\n";
+        let err = Teams::parse(non_claude)
+            .expect("parse")
+            .validate()
+            .expect_err("a non-Claude manager with authority is refused");
+        assert!(
+            err.to_string().contains("requires the `claude` harness"),
+            "the refusal must name the harness requirement: {err}"
+        );
+
+        // The same tuple with `off` is allowed — the way to keep a non-Claude manager.
+        let off = non_claude.replace("review_authority: act", "review_authority: off");
+        Teams::parse(&off)
+            .expect("parse")
+            .validate()
+            .expect("off is allowed on any harness");
+
+        // `act` on the default Claude manager is valid.
+        let claude =
+            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: act\n";
+        Teams::parse(claude)
+            .expect("parse")
+            .validate()
+            .expect("act on the default Claude manager");
+    }
+
+    /// §12: anything but `off` requires durable storage. With the Noop store the key is refused and
+    /// reads as `off`. **Mutation: accepting `act` without durable storage turns this red.**
+    #[test]
+    fn review_authority_requires_durable_storage() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: act\n",
+        )
+        .expect("parse");
+        assert_eq!(t.manager_review_authority(), ReviewAuthority::Act);
+        assert_eq!(
+            t.effective_manager_review_authority(true),
+            ReviewAuthority::Act
+        );
+        assert_eq!(
+            t.effective_manager_review_authority(false),
+            ReviewAuthority::Off,
+            "act must be refused without durable storage"
+        );
+
+        // `advise` requires durable storage too.
+        let advise = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: advise\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            advise.effective_manager_review_authority(false),
+            ReviewAuthority::Off
+        );
+
+        // The default `off` is `off` either way — the byte-identical case.
+        let off = Teams::parse("enabled: true\n").expect("parse");
+        assert_eq!(
+            off.effective_manager_review_authority(false),
+            ReviewAuthority::Off
+        );
+        assert_eq!(
+            off.effective_manager_review_authority(true),
+            ReviewAuthority::Off
+        );
     }
 
     // ── STUDIO-985: provider selection fields ─────────────────────────────────

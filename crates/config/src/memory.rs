@@ -511,6 +511,16 @@ impl LocalBank {
                 "identity {identity:?} is not label-safe (must match ^[a-z][a-z0-9-]*$)"
             )));
         }
+        // `operator` is a human voice, not a teammate, and owns no bank (STUDIO-1013, §3.1).
+        // Refused here rather than left to a caller: a directory that nothing writes must not
+        // become an empty recall result that reads as "this identity remembers nothing".
+        if !identity_may_have_bank(identity) {
+            return Err(MemoryError::Invalid(format!(
+                "identity {identity:?} owns no memory bank: `{}` is the human's voice in the room, \
+                 not a teammate (STUDIO-1013)",
+                crate::room::OPERATOR_IDENTITY
+            )));
+        }
         // The roster's `bank:` override wins; every entry in the map was already
         // charset-checked by `with_bank_overrides`.
         let bank = match self.banks.get(identity) {
@@ -853,6 +863,21 @@ pub fn bank_id_for(
         Some(bank) => bank.clone(),
         None => format!("{bank_prefix}{identity}"),
     }
+}
+
+/// Whether `identity` may own a memory bank (STUDIO-1013; design record
+/// `manager-agent-design.md` §3.1).
+///
+/// A roster identity may, and so may the built-in [`MANAGER_IDENTITY`] — its
+/// bank is `agent-manager`. [`OPERATOR_IDENTITY`] may **not**: the operator is a
+/// human voice in the room and owns no bank, so a `teams_recall {identity:
+/// "operator"}` is refused rather than answered out of a directory nothing
+/// writes.
+///
+/// [`MANAGER_IDENTITY`]: crate::room::MANAGER_IDENTITY
+/// [`OPERATOR_IDENTITY`]: crate::room::OPERATOR_IDENTITY
+pub fn identity_may_have_bank(identity: &str) -> bool {
+    identity != crate::room::OPERATOR_IDENTITY
 }
 
 /// Whether a roster `bank:` override is HONOURED by a backend, or dropped in

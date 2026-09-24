@@ -228,6 +228,15 @@ impl HindsightBackend {
                 "identity {identity:?} is not label-safe (must match ^[a-z][a-z0-9-]*$)"
             )));
         }
+        // The same bank-eligibility rule the local backend applies (STUDIO-1013, §3.1): the
+        // operator is a human voice and owns no bank on any backend.
+        if !crate::memory::identity_may_have_bank(identity) {
+            return Err(MemoryError::Invalid(format!(
+                "identity {identity:?} owns no memory bank: `{}` is the human's voice in the room, \
+                 not a teammate (STUDIO-1013)",
+                crate::room::OPERATOR_IDENTITY
+            )));
+        }
         Ok(self.bank_id(identity))
     }
 

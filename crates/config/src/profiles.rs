@@ -296,6 +296,22 @@ const BUILTINS: &[BuiltinProfile] = &[
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v4.md"),
     },
+    // v1 (STUDIO-1013, M6): the built-in **manager** identity's profile. It is a
+    // genuine built-in, resolvable exactly like `swe`/`reviewer`/`sre`, but it is
+    // not a role a roster entry may wear: `manager` is reserved
+    // (`crate::room::RESERVED_IDENTITIES`), so this profile has exactly one
+    // identity, the daemon's own.
+    BuiltinProfile {
+        name: crate::room::MANAGER_IDENTITY,
+        version: 1,
+        model: "",
+        effort: "",
+        harness: "",
+        provider: "",
+        capabilities: &["code-review", "adversarial-verify"],
+        tools: &[],
+        body: include_str!("profiles/builtin/manager.v1.md"),
+    },
 ];
 
 /// The bundled default profiles, newest version last for any given name.
@@ -960,11 +976,19 @@ mod tests {
                 ("sre", 2),
                 ("reviewer", 3),
                 ("swe", 3),
-                ("reviewer", 4)
+                ("reviewer", 4),
+                // STUDIO-1013: the built-in manager identity's own profile.
+                ("manager", 1)
             ]
         );
-        // Every v2 teaches the retain half of §5.1, and every v1 predates it.
+        // Every v2 of a TEAMMATE role teaches the retain half of §5.1, and every v1 predates it.
+        // The manager is not a teammate and ships at v1; its body names `teams_retain` as the
+        // observation channel it may write and explicitly cannot make policy, so it is exempt
+        // from the teammate-role versioning rule.
         for b in builtin_profiles() {
+            if b.name == crate::room::MANAGER_IDENTITY {
+                continue;
+            }
             let teaches_retain = b.body.contains("teams_retain");
             assert_eq!(
                 teaches_retain,
