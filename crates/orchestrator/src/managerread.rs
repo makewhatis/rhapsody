@@ -127,28 +127,31 @@ pub fn manager_coordinate(run: &RunSummary) -> Result<ManagerCoordinate, Manager
 }
 
 impl crate::ControlHandle {
-    /// Resolves the run's manager coordinate and the live workspace manager. The workspace manager
-    /// is obtained through the SAME control round-trip the prune scheduler uses
-    /// ([`crate::ControlHandle::workspace_gc_plan`]), so a read always uses the live root rather
-    /// than a boot-time snapshot.
-    async fn manager_target(
+    /// Resolves a run's manager coordinate from its own row. Every manager route starts here, so a
+    /// review run's id can never be read through the manager's surface.
+    async fn manager_coordinate_for(
         &self,
         run_id: i64,
-    ) -> Result<(ManagerCoordinate, Arc<Manager>), ManagerReadError> {
+    ) -> Result<ManagerCoordinate, ManagerReadError> {
         let run = match self.store().get_run(run_id) {
             Ok(Some(run)) => run,
             Ok(None) => return Err(ManagerReadError::NoSuchRun),
             Err(e) => return Err(ManagerReadError::Store(e.to_string())),
         };
-        let coord = manager_coordinate(&run)?;
-        let mgr = self
-            .workspace_gc_plan()
+        manager_coordinate(&run)
+    }
+
+    /// The live workspace manager, obtained through the SAME control round-trip the prune scheduler
+    /// uses ([`crate::ControlHandle::workspace_gc_plan`]), so a read always uses the live root
+    /// rather than a boot-time snapshot. Only the REPOSITORY reads need this; the store-backed ones
+    /// do not, so they never fail merely because the workspace is not built yet.
+    async fn manager_workspace(&self) -> Result<Arc<Manager>, ManagerReadError> {
+        self.workspace_gc_plan()
             .await
             .and_then(|plan| plan.mgr)
             .ok_or(ManagerReadError::Unavailable(
                 "the workspace is not available yet",
-            ))?;
-        Ok((coord, mgr))
+            ))
     }
 
     /// `manager_file {sha, path}`: one blob at a commit sha. A symlink is returned as its blob
@@ -159,7 +162,8 @@ impl crate::ControlHandle {
         sha: &str,
         path: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let blob = mgr
             .read_blob(&coord.repo_url, sha, path)
             .await
@@ -179,7 +183,8 @@ impl crate::ControlHandle {
         sha: &str,
         path: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let tree = mgr
             .ls_tree(&coord.repo_url, sha, path)
             .await
@@ -212,7 +217,8 @@ impl crate::ControlHandle {
         pattern: &str,
         path: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let got = mgr
             .grep(&coord.repo_url, sha, pattern, path)
             .await
@@ -233,7 +239,8 @@ impl crate::ControlHandle {
         from: &str,
         to: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let patch = mgr
             .diff(&coord.repo_url, from, to)
             .await
@@ -250,7 +257,8 @@ impl crate::ControlHandle {
         from: &str,
         to: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let base = mgr
             .default_base_sha(&coord.repo_url)
             .await
@@ -275,7 +283,8 @@ impl crate::ControlHandle {
         run_id: i64,
         sha: &str,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
         let base = mgr
             .default_base_sha(&coord.repo_url)
             .await
@@ -294,12 +303,13 @@ impl crate::ControlHandle {
         Ok(serde_json::json!({ "sha": sha, "base": base, "patch_id": id }))
     }
 
-    /// `manager_findings`: the structured findings recorded for the run's pull request (§5.3).
+    /// `manager_findings`: the structured findings recorded for the run's pull request (§5.3). A
+    /// pure store read — it needs the coordinate, not the workspace.
     pub async fn manager_findings(
         &self,
         run_id: i64,
     ) -> Result<serde_json::Value, ManagerReadError> {
-        let (coord, _mgr) = self.manager_target(run_id).await?;
+        let coord = self.manager_coordinate_for(run_id).await?;
         let pr = coord.pr_slug();
         let rows = self
             .store()
