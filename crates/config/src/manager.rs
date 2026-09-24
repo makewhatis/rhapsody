@@ -70,6 +70,20 @@ pub enum ManagerRulesError {
     Io(String),
 }
 
+/// Why the manager's prompt could not be composed: an unreadable overlay/base ([`ProfileError`]),
+/// or a rules file that is present but cannot be read ([`ManagerRulesError`]).
+///
+/// A rules file that cannot be read is deliberately **not** swallowed into "no policy": the
+/// difference between "the maintainer wrote no rules" and "the maintainer wrote rules this daemon
+/// cannot read" is exactly the kind of silent failure the manager's containment must not have.
+#[derive(thiserror::Error, Debug)]
+pub enum ManagerPromptError {
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+    #[error(transparent)]
+    Rules(#[from] ManagerRulesError),
+}
+
 /// The maintainer's standing rules, trimmed. Empty means no file (or an
 /// effectively empty one), which is the off state and renders no policy section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -136,8 +150,8 @@ pub fn render_policy(text: &str) -> String {
 pub fn resolve_prompt(
     profiles_dir: &Path,
     rules_path: &Path,
-) -> Result<ResolvedProfile, ProfileError> {
-    let rules = load_rules(rules_path).unwrap_or_default();
+) -> Result<ResolvedProfile, ManagerPromptError> {
+    let rules = load_rules(rules_path)?;
     let mut resolved = profiles::resolve(profiles_dir, MANAGER_PROFILE)?;
     let policy = render_policy(rules.text());
     if !policy.is_empty() {
@@ -307,5 +321,23 @@ mod tests {
     fn an_empty_rules_file_renders_no_policy() {
         assert_eq!(render_policy(""), "");
         assert_eq!(render_policy("   \n\n  "), "");
+    }
+
+    /// A rules path that is present but cannot be read is an ERROR, not silently "no policy": the
+    /// manager's containment must distinguish "the maintainer wrote no rules" from "we could not
+    /// read them". An absent file stays the off state (see `an_absent_rules_file_adds_no_policy`).
+    #[test]
+    fn an_unreadable_rules_file_is_an_error_not_a_silent_no_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A DIRECTORY where the rules file belongs: `read_to_string` fails with a non-NotFound
+        // error, which must surface.
+        let rules = dir.path().join(MANAGER_RULES_FILENAME);
+        std::fs::create_dir(&rules).expect("create dir");
+        let err =
+            resolve_prompt(dir.path(), &rules).expect_err("unreadable rules must be an error");
+        assert!(
+            matches!(err, ManagerPromptError::Rules(_)),
+            "expected a rules error, got {err:?}"
+        );
     }
 }

@@ -211,8 +211,9 @@ fn show(
     // profile resolves unchanged.
     let resolved = if profile_name == rhapsody_config::manager::MANAGER_PROFILE {
         rhapsody_config::manager::resolve_prompt(profiles_dir, rules_path)
+            .map_err(|e| e.to_string())
     } else {
-        profiles::resolve(profiles_dir, &profile_name)
+        profiles::resolve(profiles_dir, &profile_name).map_err(|e| e.to_string())
     }
     .map_err(|e| format!("{name}: {e}"))?;
     // Teams off has no room to speak of, so its report is byte-identical to the
