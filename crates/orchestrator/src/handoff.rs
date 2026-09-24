@@ -618,6 +618,28 @@ impl ControlHandle {
             )),
         }
     }
+
+    /// The ticket's CURRENT tracker state, off-loop, for confirming a manager ticket move by
+    /// reading it back (§7.6, STUDIO-1016). Resolves the tracker exactly like
+    /// [`Self::move_issue_state`] (the `control()`-time snapshot, else the shared reads tracker) and
+    /// never holds the reads guard across the await. `None` means the state could not be read — the
+    /// caller treats that as UNCONFIRMED, the fail-closed direction.
+    pub(crate) async fn read_issue_state(&self, issue_id: &str) -> Option<String> {
+        let tracker = self.tracker.clone().or_else(|| {
+            self.reads
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tracker
+                .clone()
+        })?;
+        match tracker
+            .fetch_issue_states_by_ids(&[issue_id.to_string()])
+            .await
+        {
+            Ok(issues) => issues.into_iter().next().map(|i| i.state),
+            Err(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]

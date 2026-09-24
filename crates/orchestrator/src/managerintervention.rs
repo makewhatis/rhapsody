@@ -1001,10 +1001,12 @@ impl Orchestrator {
     /// (§7.5, §8.2). This is the same M3 [`managerdecision::revalidate`] the activation transaction
     /// (M9, §7.7) re-runs in full; M8 uses it to decide between `validated` and `stale`.
     ///
-    /// Two APPROVE inputs — `review_completed_since` and `finding_set_unchanged` — are not
-    /// revision-scoped on any M8 record, so they are carried as the permissive default here; the
-    /// activation transaction re-evaluates them before anything takes effect, which is the boundary
-    /// the design makes authoritative (§7.7).
+    /// `review_completed_since` and `finding_set_unchanged` (§8.2's APPROVE rule) are computed from
+    /// real state on EVERY call, exactly as the activation transaction needs them: the evidence
+    /// revision is the durable detector of a completion (a completed review is an evidence input,
+    /// §5.2, so any completion moves it), and the open-blocking set is compared with the revisions
+    /// the decision itself dismissed. This is the same computation M8 uses to decide `validated` vs
+    /// `stale`, so a decision cannot be `validated` by one rule and activated by another.
     pub(crate) fn revalidate_manager_decision(
         &self,
         row: &ManagerInterventionRow,
@@ -1032,6 +1034,17 @@ impl Orchestrator {
         let route_fix_still_open = self.manager_route_fix_still_open(pr, decision);
         let approval_still_eligible =
             self.manager_approval_still_eligible(row, decision, &rows, after_generation, &patch_id);
+        // §8.2's APPROVE inputs, evaluated NOW. A completion is an evidence input, so a moved
+        // evidence revision is the durable signal that one happened since the decision; the
+        // finding set is compared with the revisions the decision names in `dismiss` (for an
+        // APPROVE, §6.4 condition 4 makes that the whole open-blocking set). Conservative by
+        // construction: an evidence move refuses the APPROVE, the safe direction.
+        let review_completed_since = after_evidence_rev != row.decision_evidence_rev;
+        let finding_set_unchanged = if matches!(decision.kind, DecisionKind::Approve) {
+            self.manager_finding_set_unchanged(pr, decision)
+        } else {
+            true // unused for a non-APPROVE decision
+        };
         // §8.1: the decision is bound to (generation, evidence_rev, head). A moved head that is not
         // the decision's is a moved patch until proven otherwise.
         let patch_id_unchanged = self.manager_head_unchanged(pr, &decision.head);
@@ -1076,8 +1089,8 @@ impl Orchestrator {
             eligible_rows: eligible,
             all_rows_approved,
             route_fix_still_open,
-            review_completed_since: false,
-            finding_set_unchanged: true,
+            review_completed_since,
+            finding_set_unchanged,
             approval_still_eligible,
             phase_at_launch,
             answered_exchanges,
@@ -1158,6 +1171,33 @@ impl Orchestrator {
                     && f.status == REVIEW_FINDING_OPEN
             })
         })
+    }
+
+    /// §8.2 `finding_set_unchanged` for an APPROVE: the CURRENT open blocking finding revisions are
+    /// exactly the ones the decision itself dismissed. For an APPROVE, §6.4 condition 4 makes that
+    /// dismissed set the whole open-blocking set the decision was made against, so a new finding (or
+    /// a resolved one) changes it and the decision is `stale`. A store read that fails answers
+    /// `false` — fail closed against refusing to apply an approval whose finding set cannot be read.
+    pub(crate) fn manager_finding_set_unchanged(
+        &self,
+        pr: &str,
+        decision: &ManagerDecision,
+    ) -> bool {
+        let Ok(current) = self.store().open_blocking_findings(pr) else {
+            return false; // fail closed
+        };
+        let mut now: Vec<(String, i64)> = current
+            .iter()
+            .map(|f| (f.finding_id.clone(), f.revision))
+            .collect();
+        let mut then: Vec<(String, i64)> = decision
+            .dismiss
+            .iter()
+            .map(|d| (d.finding.finding.clone(), d.finding.revision))
+            .collect();
+        now.sort();
+        then.sort();
+        now == then
     }
 
     /// §6.4 re-evaluated now for an APPROVE decision's `approval_still_eligible` input.
@@ -1343,7 +1383,7 @@ mod tests {
     use rhapsody_config::teams::{Identity, Manager, Review, ReviewAuthority, ReviewMode, Teams};
     use rhapsody_store::{
         MANAGER_INTERVENTION_APPLY_FAILED, MANAGER_INTERVENTION_APPLYING,
-        MANAGER_INTERVENTION_AWAITING_EFFECT, Sqlite, StorePath,
+        MANAGER_INTERVENTION_AWAITING_EFFECT, MANAGER_INTERVENTION_ESCALATED, Sqlite, StorePath,
     };
     use rhapsody_tracker::fake::Fake;
 
@@ -1692,6 +1732,27 @@ mod tests {
         assert!(active(&o).is_none());
     }
 
+    // §7.9: with `review_authority: off` the new wake-skip is inert, so ordinary selection is
+    // unchanged even if a pending wake row somehow exists.
+    #[test]
+    fn off_leaves_the_wake_skip_inert() {
+        let (o, _) = orch(ReviewAuthority::Off);
+        o.store()
+            .save_manager_wake(rhapsody_store::ManagerWakeRow {
+                intervention_id: "iv-off".to_string(),
+                pr: PR_KEY.to_string(),
+                generation: 1,
+                issue_id: "STUDIO-1".to_string(),
+                state: rhapsody_store::MANAGER_WAKE_PENDING.to_string(),
+                ..rhapsody_store::ManagerWakeRow::default()
+            })
+            .expect("wake");
+        assert!(
+            !o.manager_wake_blocks_selection("STUDIO-1"),
+            "off never blocks ordinary selection"
+        );
+    }
+
     // --- the pump -----------------------------------------------------------------------------
 
     // A dead lease is recovered and never left blocking (§15.4). max_concurrent=0 keeps the pump
@@ -2020,6 +2081,72 @@ mod tests {
         )
     }
 
+    fn approve_json(finding: &str) -> String {
+        format!(
+            r#"{{"decision":"APPROVE","head":"deadbeef","evidence_rev":1,
+                "dismiss":[{{"finding":"{finding}","revision":1,"rationale":"settled"}}],
+                "rationale":"everyone read this code"}}"#
+        )
+    }
+
+    /// A live watch row for `alice` plus a completed review at `deadbeef`/`patch-1` — the state an
+    /// APPROVE is eligible against (§6.4). `verdict` lets a later same-head round replace it.
+    fn seed_approved_review(o: &Orchestrator, verdict: &str) {
+        seed_watch(o, "adopt:STUDIO-1");
+        o.store()
+            .record_review_completion(
+                &alice_key(),
+                "reviewed",
+                &rhapsody_store::ReviewCompleted {
+                    generation: 1,
+                    sha: "deadbeef".to_string(),
+                    patch_id: "patch-1".to_string(),
+                    verdict: verdict.to_string(),
+                },
+            )
+            .expect("review completion");
+    }
+
+    fn alice_key() -> rhapsody_store::ReviewWatchKey {
+        rhapsody_store::ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 12,
+            reviewer: "alice".to_string(),
+        }
+    }
+
+    /// Replace alice's watch-row status, simulating the watcher moving a re-requested round on.
+    fn set_alice_status(o: &Orchestrator, status: &str) {
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: alice_key(),
+                author: "bob".to_string(),
+                introduced_by: "adopt:STUDIO-1".to_string(),
+                requested_sha: "deadbeef".to_string(),
+                last_reviewed_sha: "deadbeef".to_string(),
+                status: status.to_string(),
+                open: true,
+            })
+            .expect("save watch");
+    }
+
+    /// Replace alice's completed review, simulating a fresh round at another patch.
+    fn set_alice_completion(o: &Orchestrator, patch_id: &str, verdict: &str) {
+        o.store()
+            .record_review_completion(
+                &alice_key(),
+                "reviewed",
+                &rhapsody_store::ReviewCompleted {
+                    generation: 1,
+                    sha: "deadbeef".to_string(),
+                    patch_id: patch_id.to_string(),
+                    verdict: verdict.to_string(),
+                },
+            )
+            .expect("review completion");
+    }
+
     // A RERUN_REVIEW with dismissals and NO note still plans and posts the mandatory explanation
     // (§15.4, "Mandatory explanations"). MUTATION: skip planning the explanation when the note is
     // absent and the request carries no explanation body.
@@ -2305,6 +2432,202 @@ mod tests {
                 .find(|f| f.finding_id == "alice:F1")
                 .map(|f| f.status),
             Some(rhapsody_store::REVIEW_FINDING_DISMISSED.to_string()),
+        );
+    }
+
+    // §15.4 / B1: an APPROVE refuses activation when a same-head blocking review completed between
+    // the decision and its acknowledgement. Alice changes her verdict at the SAME sha and patch and
+    // re-raises the finding the decision dismissed at the same revision, so §6.4 condition 4 still
+    // passes and the only signal is that a review COMPLETED since the decision. MUTATION: carry
+    // `review_completed_since` as the permissive default and the row activates instead of `stale`.
+    #[test]
+    fn an_approve_refuses_activation_after_a_same_head_blocking_review() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_approved_review(&o, "approve");
+        seed_open_finding(&o, "alice:F1");
+        install_applier(&mut o);
+        let id = launch_running(&mut o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        // At settle time the completion IS the decision's, so it validates.
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_VALIDATED);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLYING);
+
+        // Alice completes a CHANGES review at the same sha and patch, re-raising F1 unchanged. The
+        // evidence revision moves; the finding set and §6.4 are otherwise untouched.
+        seed_approved_review(&o, "changes");
+        o.store().set_review_evidence_rev(PR_KEY, 2).expect("ev");
+
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_INTERVENTION_STALE,
+            "a same-head blocking review between request and ack refuses activation"
+        );
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_OPEN.to_string()),
+            "the dismissal never became effective"
+        );
+    }
+
+    // §6.6: a RERUN_REVIEW completes once every re-requested row's round has finished, without
+    // waiting for the timeout. MUTATION: leave completion to the timeout alone and this reds (the
+    // row stays `awaiting_effect` after the round finishes).
+    #[test]
+    fn a_rerun_completes_when_every_rerequested_row_finished() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.rerequested,
+            vec!["alice".to_string()],
+            "the re-requested set is durable (§6.6)"
+        );
+        // The re-requested round has not finished (alice is `requested`): still awaiting effect.
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+
+        // Alice's re-requested round finishes.
+        set_alice_status(&o, "reviewed");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_COMPLETE);
+    }
+
+    // §6.6: a RERUN_REVIEW completes when the patch-id moves, even if a re-requested row has not
+    // answered — the code it was asked about no longer exists.
+    #[test]
+    fn a_rerun_completes_when_the_patch_id_moves() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_approved_review(&o, "changes");
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.activation_patch_id, "patch-1");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+
+        // A new patch-id lands (alice's completion moves to patch-2).
+        set_alice_completion(&o, "patch-2", "changes");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_COMPLETE);
+    }
+
+    // §6.6: a ROUTE_TO_AUTHOR completes when the author pushes a new patch-id AND the following
+    // review round completes at it.
+    #[test]
+    fn a_route_completes_when_the_author_pushes_and_the_round_finishes() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_approved_review(&o, "approve");
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[
+                crate::managerapply::MANAGER_EFFECT_EXPLANATION,
+                crate::managerapply::MANAGER_EFFECT_TICKET_MOVE,
+            ],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.activation_patch_id, "patch-1");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+
+        // The author pushes patch-2 and the review round answers it.
+        set_alice_completion(&o, "patch-2", "approve");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_COMPLETE);
+    }
+
+    // §6.6: an APPROVE still unmerged at its 2 h timeout with the approval still `effective` goes
+    // to the human feed and stops the generation (the D7-blocked signature). MUTATION: record a
+    // bare `effect_timeout` and the escalated/stopped asserts red.
+    #[test]
+    fn an_approve_timeout_with_a_still_effective_approval_escalates_and_stops() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_approved_review(&o, "approve");
+        seed_open_finding(&o, "alice:F1");
+        install_applier(&mut o);
+        let id = launch_running(&mut o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        o.pump_manager_interventions();
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+
+        // Three hours pass; the approval is still effective and the PR has not merged.
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                activated_at: "2020-01-01T00:00:00Z".to_string(),
+                ..row.clone()
+            })
+            .expect("age the activation");
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_ESCALATED);
+        assert!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "a D7-blocked APPROVE stops the generation for a human"
         );
     }
 

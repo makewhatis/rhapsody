@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -565,6 +565,20 @@ CREATE TABLE IF NOT EXISTS rhapsody_manager_wake (
 CREATE INDEX IF NOT EXISTS rhapsody_manager_wake_issue
   ON rhapsody_manager_wake(issue_id);
 "#,
+    // v23 -> v24: the ACTIVATION BOOKKEEPING columns on `rhapsody_manager_intervention`
+    // (STUDIO-1016, design record `manager-agent-design.md` §6.6, §7.7). Rhapsody-only columns on a
+    // Rhapsody-only table, so they stay gated out of the Go-recaptured schema golden by name.
+    //
+    // `activation_patch_id` is the patch-id current when the activation transaction committed, and
+    // `rerequested` is the reviewer rows a `RERUN_REVIEW` re-requested (newline-joined exactly as
+    // `stall_kinds`). §6.6's completion conditions need both: a decision completes when the patch-id
+    // moves, or when every re-requested row has finished — and an already-approved row must not hold
+    // it open, so the re-requested SET has to be durable. Both are written only inside the
+    // activation transaction, which is the only place they are meaningful.
+    r#"
+ALTER TABLE rhapsody_manager_intervention ADD COLUMN activation_patch_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE rhapsody_manager_intervention ADD COLUMN rerequested TEXT NOT NULL DEFAULT '';
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -700,7 +714,7 @@ fn map_manager_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerAppr
 const MANAGER_INTERVENTION_COLS: &str = "id, pr, generation, stall_kinds, mode, state, attempts, \
      phase_hint, final, lease_boot_id, lease_expires_at, run_id, decision_json, decision_head, \
      decision_evidence_rev, effects_json, activated_at, unapplied_explanation, outcome, outcome_at, \
-     memory_state";
+     memory_state, activation_patch_id, rerequested";
 
 /// Scan one `rhapsody_manager_intervention` row selected with [`MANAGER_INTERVENTION_COLS`]
 /// (positional, in DDL order). `stall_kinds` is the newline-joined TEXT column read back through
@@ -728,6 +742,8 @@ fn map_manager_intervention(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manager
         outcome: row.get(18)?,
         outcome_at: row.get(19)?,
         memory_state: row.get(20)?,
+        activation_patch_id: row.get(21)?,
+        rerequested: split_findings(&row.get::<_, String>(22)?),
     })
 }
 
@@ -3002,9 +3018,9 @@ impl Store for Sqlite {
                (id, pr, generation, stall_kinds, mode, state, attempts, phase_hint, final,
                 lease_boot_id, lease_expires_at, run_id, decision_json, decision_head,
                 decision_evidence_rev, effects_json, activated_at, unapplied_explanation,
-                outcome, outcome_at, memory_state)
+                outcome, outcome_at, memory_state, activation_patch_id, rerequested)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21)
+                     ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(id) DO UPDATE SET
                pr                    = excluded.pr,
                generation            = excluded.generation,
@@ -3025,7 +3041,9 @@ impl Store for Sqlite {
                unapplied_explanation = excluded.unapplied_explanation,
                outcome               = excluded.outcome,
                outcome_at            = excluded.outcome_at,
-               memory_state          = excluded.memory_state",
+               memory_state          = excluded.memory_state,
+               activation_patch_id   = excluded.activation_patch_id,
+               rerequested           = excluded.rerequested",
             params![
                 row.id,
                 row.pr,
@@ -3048,6 +3066,8 @@ impl Store for Sqlite {
                 row.outcome,
                 row.outcome_at,
                 row.memory_state,
+                row.activation_patch_id,
+                join_findings(&row.rerequested),
             ],
         )?;
         Ok(())
@@ -3729,12 +3749,15 @@ impl Store for Sqlite {
 
         tx.execute(
             "UPDATE rhapsody_manager_intervention \
-             SET state = ?2, activated_at = ?3, lease_boot_id = '', lease_expires_at = '' \
+             SET state = ?2, activated_at = ?3, lease_boot_id = '', lease_expires_at = '', \
+                 activation_patch_id = ?4, rerequested = ?5 \
              WHERE id = ?1",
             params![
                 request.intervention_id,
                 MANAGER_INTERVENTION_AWAITING_EFFECT,
-                request.now
+                request.now,
+                request.activation_patch_id,
+                join_findings(&request.rerequested),
             ],
         )?;
         tx.commit()?;
@@ -8703,6 +8726,8 @@ mod tests {
                     ..ManagerWakeRow::default()
                 }),
                 reserve_slot: true,
+                activation_patch_id: "p1".to_string(),
+                rerequested: vec!["alice".to_string()],
                 ..ManagerActivation::default()
             })
             .expect("activate");
@@ -8756,6 +8781,10 @@ mod tests {
         let row = st.manager_intervention("iv-1").expect("read").expect("row");
         assert_eq!(row.state, MANAGER_INTERVENTION_AWAITING_EFFECT);
         assert_eq!(row.activated_at, "2099-01-01T00:00:00Z");
+        // §6.6's completion bookkeeping is durable: the patch-id current at activation and the
+        // exact re-requested set.
+        assert_eq!(row.activation_patch_id, "p1");
+        assert_eq!(row.rerequested, vec!["alice".to_string()]);
     }
 
     // A REFUSED activation cancels every pending record, records `unapplied_explanation`, ends

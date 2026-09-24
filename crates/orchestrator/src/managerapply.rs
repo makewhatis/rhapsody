@@ -36,9 +36,10 @@ use rhapsody_store::{
     MANAGER_EXCHANGE_AUTHOR_ROUND, MANAGER_EXCHANGE_REVIEW_ROUND,
     MANAGER_INTERVENTION_APPLY_FAILED, MANAGER_INTERVENTION_APPLY_UNCERTAIN,
     MANAGER_INTERVENTION_APPLYING, MANAGER_INTERVENTION_AWAITING_EFFECT,
-    MANAGER_INTERVENTION_COMPLETE, MANAGER_INTERVENTION_EFFECT_TIMEOUT, MANAGER_WAKE_PENDING,
-    ManagerActivation, ManagerActivationOutcome, ManagerActivationVerdict, ManagerApprovalRow,
-    ManagerExchange, ManagerInterventionRow, ManagerWakeRow,
+    MANAGER_INTERVENTION_COMPLETE, MANAGER_INTERVENTION_EFFECT_TIMEOUT,
+    MANAGER_INTERVENTION_ESCALATED, MANAGER_WAKE_PENDING, ManagerActivation,
+    ManagerActivationOutcome, ManagerActivationVerdict, ManagerApprovalRow, ManagerExchange,
+    ManagerInterventionRow, ManagerWakeRow, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED,
 };
 use serde::{Deserialize, Serialize};
 
@@ -343,6 +344,12 @@ impl Orchestrator {
         else {
             return PreEffectCheck::Superseded;
         };
+        // A re-sent request for a row that has moved on (activated, refused, terminal) must not
+        // perform an effect. Only an `applying` row is mid-flight; a best-effort notice skips this
+        // check entirely (runmanagerapply.rs).
+        if row.state != MANAGER_INTERVENTION_APPLYING {
+            return PreEffectCheck::Superseded;
+        }
         let bound = self.store().review_bound(&row.pr).ok().flatten();
         let (labelled, hold_known) = self.human_holds.labelled_and_primed();
         let hold_applied = self.manager_pr_held(&row.pr, &labelled);
@@ -360,9 +367,19 @@ impl Orchestrator {
             })
             .unwrap_or(false);
         let manager_enabled = self.teams.as_ref().is_some_and(|t| t.enabled);
-        let evidence_stale = bound
-            .as_ref()
-            .is_some_and(|b| b.evidence_rev != row.decision_evidence_rev);
+        // §8.3 limits the evidence-staleness arm to APPROVE and ROUTE_TO_AUTHOR: a `RERUN_REVIEW`
+        // whose evidence moved (for example a finding resolved) is not stopped by this cheap check,
+        // and the decisive activation transaction is where it is judged.
+        let evidence_checked = self.manager_stored_decision(&row).is_some_and(|d| {
+            matches!(
+                d.kind,
+                DecisionKind::Approve | DecisionKind::RouteToAuthor { .. }
+            )
+        });
+        let evidence_stale = evidence_checked
+            && bound
+                .as_ref()
+                .is_some_and(|b| b.evidence_rev != row.decision_evidence_rev);
         pre_effect_check(PreEffectInputs {
             generation: row.generation,
             current_generation: bound.as_ref().map_or(row.generation, |b| b.generation),
@@ -427,11 +444,13 @@ impl Orchestrator {
                 "manager apply: writing the pending approval failed");
         }
         let request = self.manager_apply_request(row, &decision, &effects);
-        match &self.manager_apply {
-            Some(sink) => sink.submit(request),
-            None => tracing::warn!(pr = %row.pr, id = %row.id,
-                "manager apply: no applier is installed; the effects will be retried on recovery"),
+        if self.manager_apply.is_none() {
+            tracing::warn!(pr = %row.pr, id = %row.id,
+                "manager apply: no applier is installed; the effects will be retried on recovery");
         }
+        // Through the dedupe helper, so the next tick's `recover_manager_apply` does not submit the
+        // same mandatory effects a second time.
+        self.submit_manager_apply(request);
     }
 
     /// §7.5/§7.7 recovery: an `applying` row is reconciled and then run through THE SAME activation
@@ -575,7 +594,11 @@ impl Orchestrator {
                 tracing::warn!(pr = %row.pr, id = %row.id,
                     "manager apply: activation refused; the decision was not applied");
                 self.manager_record_unapplied(row, &decision);
-                self.record_manager_outcome_if_absent(row, "superseded");
+                // `superseded` is terminal (§7.2); a `stale` refusal re-queues, so recording an
+                // outcome for it would pin a row that is about to be re-planned.
+                if verdict == ManagerActivationVerdict::Superseded {
+                    self.record_manager_outcome_if_absent(row, "superseded");
+                }
             }
             Ok(ManagerActivationOutcome::Absent) => {}
             Err(e) => {
@@ -641,9 +664,8 @@ impl Orchestrator {
     }
 
     /// §6.6 completion: an `awaiting_effect` intervention completes when its effect condition is met
-    /// or its timeout passes. M9 owns the timeouts and the APPROVE expiry; the reviewer-driven
-    /// completion conditions for `RERUN_REVIEW`/`ROUTE_TO_AUTHOR` are the watcher's evidence and are
-    /// left to timeout until that wiring lands (noted in the PR body).
+    /// or its timeout passes. This owns every decision's completion: the APPROVE expiry, the
+    /// reviewer-driven `RERUN_REVIEW`/`ROUTE_TO_AUTHOR` conditions, and the APPROVE D7 timeout.
     fn check_manager_completion(&mut self, row: &ManagerInterventionRow) {
         let Some(decision) = self.manager_stored_decision(row) else {
             return;
@@ -660,6 +682,16 @@ impl Orchestrator {
                 Err(_) => return, // fail closed: do not complete on an unreadable store
             }
         }
+        // §6.6: a `RERUN_REVIEW`/`ROUTE_TO_AUTHOR` completes when its effect condition is met. An
+        // outcome is left unset for the PR-state watcher to record `merged`/`closed_unmerged`.
+        if matches!(
+            decision.kind,
+            DecisionKind::RerunReview { .. } | DecisionKind::RouteToAuthor { .. }
+        ) && self.manager_effect_complete(row, &decision)
+        {
+            self.set_manager_state(row, MANAGER_INTERVENTION_COMPLETE);
+            return;
+        }
         let timeout = manager_effect_timeout(&decision);
         let Some(activated) = DateTime::parse_from_rfc3339(&row.activated_at)
             .ok()
@@ -668,10 +700,79 @@ impl Orchestrator {
             return;
         };
         if (self.now)() - activated >= timeout {
+            // §6.6: an APPROVE still unmerged at its timeout WITH the approval still `effective` is
+            // the D7-blocked signature this control task can observe — the draft/conflict/CI gates
+            // live in the off-loop merge half, which read them from GitHub. The item goes to the
+            // human feed and the generation stops rather than recording a bare timeout.
+            if matches!(decision.kind, DecisionKind::Approve) {
+                self.finish_manager_apply_failure(
+                    row,
+                    MANAGER_INTERVENTION_ESCALATED,
+                    "manager approval did not merge before its 2 h timeout (a merge gate still \
+                     blocks); the generation is stopped for a human",
+                );
+                return;
+            }
             self.set_manager_state(row, MANAGER_INTERVENTION_EFFECT_TIMEOUT);
             self.record_manager_outcome_if_absent(row, "unconfirmed");
             tracing::warn!(pr = %row.pr, id = %row.id,
                 "manager apply: the decision's effect timed out");
+        }
+    }
+
+    /// §6.6's reviewer-driven completion. `RERUN_REVIEW` is complete when the patch-id moves, or
+    /// every re-requested row's round has finished (a completed verdict, `truncated` or `dropped`).
+    /// `ROUTE_TO_AUTHOR` is complete when the author pushes a new patch-id AND the following review
+    /// round completes at it.
+    ///
+    /// A re-requested row is `requested` when the activation transaction arms it, so "finished" is
+    /// the row having LEFT `requested`/`in_flight` — read from `status`, which the watcher moves as
+    /// the round actually runs. (`last_completed` alone cannot say: the row already carried a
+    /// completion for the same code from before the re-request.) The `ROUTE_TO_AUTHOR` half that
+    /// waits on "the author's run ends without a push" depends on the wake obligation's run, which
+    /// M10 owns; until then an un-pushed route is bounded by the 4 h timeout.
+    fn manager_effect_complete(
+        &self,
+        row: &ManagerInterventionRow,
+        decision: &ManagerDecision,
+    ) -> bool {
+        let rows = self.manager_review_rows(&row.pr);
+        let current_patch = crate::managerintervention::current_patch_id(&rows);
+        let patch_moved = !row.activation_patch_id.is_empty()
+            && !current_patch.is_empty()
+            && current_patch != row.activation_patch_id;
+        match &decision.kind {
+            DecisionKind::RerunReview { .. } => {
+                if patch_moved {
+                    return true;
+                }
+                if row.rerequested.is_empty() {
+                    return false;
+                }
+                row.rerequested.iter().all(|reviewer| {
+                    rows.iter()
+                        .find(|r| &r.reviewer == reviewer)
+                        .is_some_and(|r| {
+                            !matches!(
+                                r.status.as_str(),
+                                REVIEW_STATUS_REQUESTED | REVIEW_STATUS_IN_FLIGHT
+                            )
+                        })
+                })
+            }
+            DecisionKind::RouteToAuthor { .. } => {
+                if !patch_moved {
+                    return false;
+                }
+                let live = managerdecision::live_reviewer_rows(&rows);
+                !live.is_empty()
+                    && live.iter().all(|r| {
+                        r.completed
+                            .as_ref()
+                            .is_some_and(|c| !c.patch_id.is_empty() && c.patch_id == current_patch)
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -889,6 +990,9 @@ impl Orchestrator {
         }
         let rows = self.manager_review_rows(&row.pr);
         let patch_id = crate::managerintervention::current_patch_id(&rows);
+        // §6.6's completion reads both back: the patch-id to detect a move, and the exact
+        // re-requested set so an already-approved row cannot hold the decision open.
+        request.activation_patch_id = patch_id.clone();
         request.dismissals = decision
             .dismiss
             .iter()
@@ -907,6 +1011,7 @@ impl Orchestrator {
                         })
                         .map(|r| r.reviewer.clone())
                         .collect();
+                request.rerequested = request.rerequest.clone();
             }
             DecisionKind::RouteToAuthor { .. } => {
                 let body = manager_route_wake_body(decision);

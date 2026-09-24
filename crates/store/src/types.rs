@@ -1084,6 +1084,13 @@ pub struct ManagerInterventionRow {
     pub effects_json: String,
     /// When activation committed (§7.7). Empty until then.
     pub activated_at: String,
+    /// The patch-id current when activation committed (§7.7), or empty until then. §6.6's
+    /// completion reads it: a `RERUN_REVIEW`/`ROUTE_TO_AUTHOR` is complete when the patch-id moves.
+    pub activation_patch_id: String,
+    /// The reviewer rows a `RERUN_REVIEW` activation re-requested, in one newline-joined column
+    /// exactly as [`Self::stall_kinds`] is. Empty before activation or for another decision. §6.6's
+    /// completion reads it so an already-approved row cannot hold the decision open forever.
+    pub rerequested: Vec<String>,
     /// True when an already-posted explanation was refused at activation (§7.7).
     pub unapplied_explanation: bool,
     /// One of §11.1's outcomes, or empty. Set once per intervention id.
@@ -1236,6 +1243,12 @@ pub struct ManagerActivation {
     /// Whether this is a post-threshold decision that reserves an intervention slot (§7.3). The
     /// slot is reserved ONLY here, at activation.
     pub reserve_slot: bool,
+    /// The patch-id current at activation, written to `activation_patch_id`. §6.6's completion
+    /// reads it to detect the patch moving.
+    pub activation_patch_id: String,
+    /// The reviewer rows a `RERUN_REVIEW` re-requested, written to `rerequested`. §6.6's completion
+    /// reads it so an already-approved row cannot hold the decision open.
+    pub rerequested: Vec<String>,
     /// A refused activation's human-facing reason ("not applied: <reason>").
     pub rescind_reason: String,
 }
