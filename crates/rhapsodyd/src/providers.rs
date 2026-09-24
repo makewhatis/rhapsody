@@ -25,7 +25,9 @@ use rhapsody_orchestrator::{
     CredentialRevisionSource, OpenedProvider, PreparedProviderSource, ProviderRefusal,
     ProviderReloadSink, RefusalReason,
 };
-use rhapsody_provider_broker::{BrokerError, BrokerRegistrar, SessionPolicy};
+use rhapsody_provider_broker::{
+    BrokerError, BrokerRegistrar, CumulativeBudgetAuthority, SessionPolicy,
+};
 use rhapsody_provider_status::{
     CatalogError, CatalogSnapshot, CredentialReadSource, ObservedRead, ObservedState,
     OpenAiCompatibleDiscovery, ProviderConfig, ProviderStatusView, RefreshCoordinator,
@@ -271,14 +273,40 @@ impl CredentialRevisionSource for ResolverRevisionSource {
 pub struct DaemonProviderSource {
     resolver: Arc<CredentialResolver>,
     registrar: BrokerRegistrar,
+    /// The daemon's durable UTC-day budget authority (STUDIO-979). It is attached to a session's
+    /// policy ONLY when the resolved plan configures `max_reserved_token_units_per_utc_day`; an
+    /// absent cap keeps the exact `SessionPolicy::new` path, so a provider with no day cap behaves
+    /// byte-identically to before this feature.
+    day_authority: Arc<dyn CumulativeBudgetAuthority>,
 }
 
 impl DaemonProviderSource {
-    pub fn new(resolver: Arc<CredentialResolver>, registrar: BrokerRegistrar) -> Self {
+    pub fn new(
+        resolver: Arc<CredentialResolver>,
+        registrar: BrokerRegistrar,
+        day_authority: Arc<dyn CumulativeBudgetAuthority>,
+    ) -> Self {
         Self {
             resolver,
             registrar,
+            day_authority,
         }
+    }
+}
+
+/// Builds the session policy for one lowered limits block (STUDIO-979): a configured UTC-day cap
+/// attaches the durable authority, and an absent cap keeps the exact no-authority policy path. The
+/// broker itself refuses either mismatch (`DayCapWithoutAuthority` / `AuthorityWithoutDayCap`), so
+/// this is the ONE place the authority is attached — and the branch is what keeps a provider with
+/// no day cap byte-identical to before the feature.
+fn session_policy_for(
+    limits: rhapsody_provider_broker::BrokerLimits,
+    authority: &Arc<dyn CumulativeBudgetAuthority>,
+) -> Result<SessionPolicy, rhapsody_provider_broker::LimitViolation> {
+    if limits.max_reserved_token_units_per_utc_day.is_some() {
+        SessionPolicy::with_day_authority(limits, Arc::clone(authority))
+    } else {
+        SessionPolicy::new(limits)
     }
 }
 
@@ -342,7 +370,12 @@ impl PreparedProviderSource for DaemonProviderSource {
                         ));
                     }
                 };
-                let policy = match SessionPolicy::new(lower_provider_limits(&plan.limits)) {
+                // STUDIO-979: a configured UTC-day cap attaches the durable day authority; no cap
+                // keeps the exact no-authority policy path.
+                let policy = match session_policy_for(
+                    lower_provider_limits(&plan.limits),
+                    &self.day_authority,
+                ) {
                     Ok(policy) => policy,
                     Err(e) => {
                         return Err(provider_refusal(
@@ -605,7 +638,11 @@ mod tests {
     #[tokio::test]
     async fn prepared_source_refuses_when_the_owner_is_unavailable() {
         let runtime = crate::broker::BrokerRuntime::bind().expect("broker");
-        let source = DaemonProviderSource::new(unavailable_owner(), runtime.registrar());
+        let day_authority: Arc<dyn CumulativeBudgetAuthority> = Arc::new(
+            crate::providerbudget::StoreDayAuthority::new(Arc::new(rhapsody_store::Noop), false),
+        );
+        let source =
+            DaemonProviderSource::new(unavailable_owner(), runtime.registrar(), day_authority);
         let err = source
             .open_provider(&prepared_plan())
             .await
@@ -618,6 +655,39 @@ mod tests {
             err.revision.is_empty(),
             "a no-owner refusal must carry no owner revision, not the INITIAL sentinel: {}",
             err.revision
+        );
+    }
+
+    /// STUDIO-979: the policy branch. An absent day cap uses the no-authority policy, so a provider
+    /// with no cap behaves byte-identically to before the feature; a configured cap attaches the
+    /// authority. MUTATION: attach the authority unconditionally and the absent-cap assertion reds.
+    #[test]
+    fn a_day_cap_attaches_the_authority_and_an_absent_cap_does_not() {
+        let authority: Arc<dyn CumulativeBudgetAuthority> = Arc::new(
+            crate::providerbudget::StoreDayAuthority::new(Arc::new(rhapsody_store::Noop), false),
+        );
+
+        let no_cap = session_policy_for(
+            rhapsody_provider_broker::BrokerLimits::default(),
+            &authority,
+        )
+        .expect("no-cap policy");
+        assert!(
+            no_cap.day_authority().is_none(),
+            "an absent cap must not hold an authority"
+        );
+
+        let capped = session_policy_for(
+            rhapsody_provider_broker::BrokerLimits {
+                max_reserved_token_units_per_utc_day: Some(1_000),
+                ..Default::default()
+            },
+            &authority,
+        )
+        .expect("capped policy");
+        assert!(
+            capped.day_authority().is_some(),
+            "a configured cap must attach the authority"
         );
     }
 }

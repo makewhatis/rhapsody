@@ -172,7 +172,9 @@ pub struct IntroducedPr {
     /// The repository binding the coordinate came from, re-checked against the configured
     /// allowlist by the handler.
     pub repo_url: String,
-    /// One watch-set row is written per reviewer.
+    /// The reviewers to introduce. One watch-set row is written per reviewer — EXCEPT when this
+    /// pull request already has a live row, where continuity keeps the reviewer(s) it already has
+    /// and these are not consulted (STUDIO-1046; see [`Orchestrator::handle_review_introduce`]).
     pub reviewers: Vec<String>,
     /// The pull request's author, recorded on every row this introduction writes (STUDIO-721).
     pub author: String,
@@ -540,6 +542,17 @@ impl Orchestrator {
     /// `auto_merge_verdict` refused `RoundInFlight` until an operator cleared the pull request by
     /// hand. A row still OWING a round, or one that has never approved this head, is armed exactly
     /// as before; only a settled approval at the current change is left alone.
+    ///
+    /// **A handoff bringing back a pull request the watch set ALREADY holds keeps the reviewer it
+    /// already has** (STUDIO-1046), rather than introducing the reviewers a fresh selection names.
+    /// Selection is load-ranked, so a second round can name a different teammate; the new row then
+    /// sits beside the incumbent's, and the surplus reconciler retired whichever the roster-order
+    /// tie-break happened to lose — often the row holding the review history and its open findings,
+    /// so the pull request got a full cold read from somebody who had never seen it. The
+    /// `pr.reviewers` a handoff carries are therefore only used when this pull request has no live
+    /// row yet. A reviewer who has left the roster is still reassigned — by the watcher's dispatch
+    /// loop, under STUDIO-988's deferred-retirement protocol, which logs the swap — so continuity
+    /// never strands an obligation on somebody who can no longer serve it.
     pub(crate) fn handle_review_introduce(&mut self, pr: &IntroducedPr) -> ReviewIntroOutcome {
         if !self.review_ticketless_enabled() {
             return ReviewIntroOutcome::Dormant;
@@ -588,8 +601,38 @@ impl Orchestrator {
         // MUTATION: delete this check and `an_act_reintroduction_past_the_threshold_arms_nothing`
         // reds (the settled row is reset to `requested`).
         let gate_active = self.review_exchange_gate_active(&pr.pr);
+        // STUDIO-1046, reviewer continuity. A pull request the watch set already holds keeps the
+        // reviewer(s) it already has: selection is load-ranked, so re-running it on a handoff can
+        // name a different teammate each round, and the surplus reconciler then retired the
+        // incumbent — the row carrying the history and the open findings. Selection runs only when
+        // this pull request has no live row yet (a first handoff, or a rebuilt pull request whose
+        // old row is gone). The departed-reviewer case is deliberately NOT handled here: the
+        // dispatch loop reassigns it under STUDIO-988's deferred-retirement protocol and logs the
+        // swap (`commit_review_watch`), which is where the acceptance for that already lives.
+        let reviewers: Vec<String> = match self.existing_watch_reviewers(&pr.pr) {
+            Ok(existing) if !existing.is_empty() => {
+                tracing::debug!(
+                    pr = %pr.pr, reviewers = ?existing,
+                    "ticketless review: this pull request is already in the watch set, so its \
+                     existing reviewer(s) are kept and no new selection is made"
+                );
+                existing
+            }
+            Ok(_) => pr.reviewers.clone(),
+            Err(e) => {
+                // Fail CLOSED, exactly as the per-row read below does: a watch set that cannot be
+                // read might already hold a reviewer, and introducing a second one is the duplicate
+                // this ticket exists to prevent. The next handoff asks again.
+                tracing::warn!(
+                    pr = %pr.pr, err = %e,
+                    "ticketless review: the watch set could not be read, so no reviewer is \
+                     introduced for this pull request"
+                );
+                return ReviewIntroOutcome::Refused("the watch set could not be read");
+            }
+        };
         let mut written = 0usize;
-        for reviewer in pr.reviewers.iter().filter(|r| !r.trim().is_empty()) {
+        for reviewer in reviewers.iter().filter(|r| !r.trim().is_empty()) {
             let key = ReviewWatchKey {
                 owner: pr.pr.owner.clone(),
                 repo: pr.pr.repo.clone(),
@@ -847,6 +890,34 @@ impl Orchestrator {
             }
         }
         advance
+    }
+
+    /// The reviewers this watch set already holds for `pr`'s LIVE rows (STUDIO-1046) — the set a
+    /// re-introduction must keep rather than replace. Empty means the pull request has no reviewer
+    /// yet, so a fresh selection is the right answer.
+    ///
+    /// LIVE only ([`load_live_review_watch`](rhapsody_store::Store::load_live_review_watch)): a
+    /// merged, closed or dismissed row is not live and must not pin a reviewer, so a rebuilt pull
+    /// request under the same number starts over — the same rule
+    /// [`review_pr_is_watched`](Self::review_pr_is_watched) applies to a dropped row for adoption.
+    ///
+    /// Owner and repo are compared EXACTLY, not case-insensitively: `handle_review_introduce`
+    /// rebuilds the watch key from `pr`'s own spelling, so a case-insensitive match that returned a
+    /// differently-cased coordinate would be written back as a SECOND row rather than re-arming the
+    /// existing one. Every row for a coordinate is written from the same `pr_from_url` resolution,
+    /// so the spellings agree.
+    fn existing_watch_reviewers(
+        &self,
+        pr: &PrCoord,
+    ) -> Result<Vec<String>, rhapsody_store::StoreError> {
+        let rows = self.store().load_live_review_watch()?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                r.key.number == pr.number && r.key.owner == pr.owner && r.key.repo == pr.repo
+            })
+            .map(|r| r.key.reviewer)
+            .collect())
     }
 
     /// Whether the watch set holds ANY row for this pull request — live or retired, whoever the
@@ -1390,6 +1461,50 @@ mod tests {
         assert_eq!(row.requested_sha, HEAD_A);
         assert_eq!(row.last_reviewed_sha, HEAD_A);
         assert_eq!(row.status, REVIEW_STATUS_REQUESTED, "re-armed");
+    }
+
+    /// **STUDIO-1046 acceptance: a handoff keeps the pull request's existing reviewer.** The pull
+    /// request already has a watch row, so re-running selection — which is load-ranked and can name
+    /// a different teammate every round — must NOT create a second row. The existing reviewer's row
+    /// is re-armed for the next round instead, so it keeps the review history and the findings.
+    ///
+    /// MUTATION: iterate `pr.reviewers` instead of the existing rows and this reds — a row for
+    /// `alice` (the reviewer selection named) appears beside `bob`'s.
+    #[test]
+    fn a_re_introduction_keeps_the_existing_reviewer_instead_of_re_selecting() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        // `bob` reviewed and asked for changes at the current head.
+        o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"]));
+        o.store()
+            .mark_review_requested(&watch_key("bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
+            .expect("completed");
+
+        // The author hands off the fixes. Selection would name `alice`, but this pull request
+        // already has a reviewer, so no selection is made.
+        assert_eq!(
+            o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["alice"])),
+            ReviewIntroOutcome::Introduced(1),
+            "the existing reviewer's row is re-armed for the next round"
+        );
+
+        let rows = o.store().load_live_review_watch().expect("read");
+        assert_eq!(rows.len(), 1, "no second row is created: {rows:?}");
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(rows[0].status, REVIEW_STATUS_REQUESTED, "armed for round 2");
+        assert_eq!(
+            rows[0].last_reviewed_sha, HEAD_A,
+            "the history is preserved"
+        );
+        assert!(
+            o.store()
+                .get_review_watch(&watch_key("alice"))
+                .expect("read")
+                .is_none(),
+            "the reviewer selection named is never introduced"
+        );
     }
 
     /// A review of this exact (PR, reviewer) is LIVE. Re-arming its row would overwrite the

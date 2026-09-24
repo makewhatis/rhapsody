@@ -4,6 +4,7 @@
 //! presentation data (server port + storage + otel + resolved projects). Kept as pure functions over
 //! the workflow path / resolved config so the boot and the tests drive them the same way.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -97,6 +98,38 @@ pub fn open_store(
             (Arc::new(Noop), false)
         }
     }
+}
+
+/// The provider ids that configure a durable UTC-day budget cap
+/// (`max_reserved_token_units_per_utc_day`) — the startup refusal's input (STUDIO-979).
+///
+/// Scans the top-level `providers:` block AND every resolved project overlay, because a
+/// per-project provider definition can carry the cap too. A non-empty result combined with a
+/// NON-durable store (`--no-store`, `storage.path: off` / `:memory:`, or a failed open) is a
+/// configured cap the daemon cannot enforce: the cap is a hard boundary, so the boot refuses rather
+/// than running a best-effort one. Ordered by id for a stable message. `None` (a failed config load)
+/// has nothing to enforce and returns empty — the orchestrator's own Run reports that load error.
+pub fn providers_with_day_cap(cfg: Option<&Config>) -> Vec<String> {
+    let Some(cfg) = cfg else {
+        return Vec::new();
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    let mut collect = |providers: &BTreeMap<String, rhapsody_config::ProviderDefinition>| {
+        for (id, def) in providers {
+            if def
+                .broker_limits
+                .max_reserved_token_units_per_utc_day
+                .is_some()
+            {
+                ids.insert(id.clone());
+            }
+        }
+    };
+    collect(&cfg.providers);
+    for rp in resolve_projects(cfg) {
+        collect(&rp.eff.providers);
+    }
+    ids.into_iter().collect()
 }
 
 /// Resolves the path of the agent-capabilities registry file (`capabilities.yaml`, BO-12), colocated
@@ -388,6 +421,15 @@ mod tests {
 
     fn valid_wf(ws: &Path) -> String {
         VALID_WF.replace("{}", &ws.to_string_lossy())
+    }
+
+    /// The minimal valid workflow with an extra top-level block injected before the closing `---`,
+    /// for tests that need a `providers:` / `projects:` block (STUDIO-979).
+    fn day_cap_wf(ws: &Path, extra: &str) -> String {
+        format!(
+            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\n{extra}---\nDo it.\n",
+            ws = ws.display(),
+        )
     }
 
     // Mirrors Go `TestAssigneeLabel`.
@@ -796,5 +838,54 @@ mod tests {
             enabled && port == 9099,
             "server.port should enable: port={port} enabled={enabled}"
         );
+    }
+
+    /// STUDIO-979: the startup refusal's input. A day cap on a top-level provider AND on a
+    /// per-project provider overlay both count; a provider without one does not; no config at all
+    /// yields nothing. MUTATION: scan only `cfg.providers` and the per-project `projcap` assert
+    /// fails.
+    #[test]
+    fn providers_with_day_cap_scans_global_and_project_overlays() {
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let extra = concat!(
+            "repo: \"git@github.com:o/r.git\"\n",
+            "providers:\n",
+            "  globalcap:\n    protocol: openai-compatible\n    base_url: https://g.example/v1\n",
+            "    credential:\n      source: keychain\n",
+            "    broker_limits:\n      max_reserved_token_units_per_utc_day: 1000\n",
+            "  nopcap:\n    protocol: openai-compatible\n    base_url: https://n.example/v1\n",
+            "    credential:\n      source: keychain\n",
+            "projects:\n",
+            "  - slugs: [proj]\n    providers:\n      projcap:\n",
+            "        protocol: openai-compatible\n        base_url: https://p.example/v1\n",
+            "        credential:\n          source: keychain\n",
+            "        broker_limits:\n          max_reserved_token_units_per_utc_day: 2000\n",
+        );
+        let wf = write_wf(&dir, &day_cap_wf(&ws, extra));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let mut ids = providers_with_day_cap(Some(&cfg));
+        ids.sort();
+        assert_eq!(ids, vec!["globalcap".to_string(), "projcap".to_string()]);
+
+        // A provider with no day cap contributes nothing, and a failed load has nothing to enforce.
+        let wf2 = write_wf(
+            &dir,
+            &day_cap_wf(
+                &ws,
+                "providers:\n  p:\n    protocol: openai-compatible\n    base_url: https://x.example/v1\n    credential:\n      source: keychain\n",
+            ),
+        );
+        let cfg2 = resolve(
+            decode(&workflow::load(&wf2).expect("load")).expect("decode"),
+            &workflow_dir(&wf2),
+        )
+        .expect("resolve");
+        assert!(providers_with_day_cap(Some(&cfg2)).is_empty());
+        assert!(providers_with_day_cap(None).is_empty());
     }
 }

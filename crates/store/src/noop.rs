@@ -21,6 +21,9 @@ impl Store for Noop {
     fn update_run_progress(&self, _run_id: i64, _p: RunProgress) -> Result<(), StoreError> {
         Ok(())
     }
+    fn set_run_tokens(&self, _run_id: i64, _t: &RunTokens) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn append_events(&self, _run_id: i64, _ev: &[EventRow]) -> Result<(), StoreError> {
         Ok(())
     }
@@ -125,6 +128,23 @@ impl Store for Noop {
     }
     fn run_usage(&self, _run_id: i64) -> Result<Option<RunUsage>, StoreError> {
         Ok(None)
+    }
+    // Durable UTC-day provider budget (STUDIO-979). The disabled store has no counter to charge, so
+    // a charge is a refusal that changes nothing (`Ok(false)`) and the read is zero — never an
+    // error, exactly like every other Noop method. A configured day cap over this backend is
+    // refused at daemon startup, so this fail-closed answer is not a reachable production path; it
+    // exists to keep the guard-free Noop contract intact.
+    fn charge_provider_day_tokens(
+        &self,
+        _provider_id: &str,
+        _utc_day: i64,
+        _tokens: u64,
+        _cap: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn provider_day_tokens(&self, _provider_id: &str, _utc_day: i64) -> Result<u64, StoreError> {
+        Ok(0)
     }
     // Per-run review verdicts (STUDIO-1020) disappear with the rest of the history: a store that
     // holds nothing has no review run to attribute, so it answers "no verdict".
@@ -497,6 +517,19 @@ mod tests {
         )
         .expect("set_run_usage");
         assert!(st.run_usage(1).expect("run_usage").is_none());
+
+        // Durable UTC-day provider budget (STUDIO-979): the disabled store charges nothing and reads
+        // zero, and never errors.
+        assert!(
+            !st.charge_provider_day_tokens("p", 20_000, 1, 100)
+                .expect("charge_provider_day_tokens"),
+            "a disabled store refuses the day charge and charges nothing"
+        );
+        assert_eq!(
+            st.provider_day_tokens("p", 20_000)
+                .expect("provider_day_tokens"),
+            0
+        );
 
         st.prune(30).expect("prune");
         st.close().expect("close");

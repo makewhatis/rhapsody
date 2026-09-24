@@ -27,6 +27,7 @@ pub mod credential_client;
 pub mod logsource;
 pub mod mcp;
 pub mod otel;
+pub mod providerbudget;
 pub mod providers;
 pub mod prune;
 pub mod run;

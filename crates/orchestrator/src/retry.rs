@@ -422,6 +422,10 @@ impl Orchestrator {
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.review = review.clone();
+        // PB7 (STUDIO-1002, STUDIO-1047): a prepared dispatch's usage is settled from the broker
+        // receipt, so its child figure is excluded from the cumulative aggregate (`on_agent_update`)
+        // while still kept on the entry for the ceiling/floor. `false` on every legacy dispatch.
+        re.brokered = prepared.is_some();
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
@@ -1967,6 +1971,58 @@ mod tests {
             "issue should be claimed and running"
         );
         assert_eq!(*dispatched.lock().unwrap(), vec!["1".to_string()]);
+    }
+
+    /// MUTATION GUARD (STUDIO-1047, alice's blocking finding B1). `re.brokered = prepared.is_some()`
+    /// is PRODUCTION wiring — every other accounting test hand-builds an entry and sets the flag
+    /// itself, so nothing pinned the line that actually decides it. This drives the real
+    /// `dispatch_issue_prepared` through both halves: a legacy dispatch (`None`) folds its child's
+    /// committed figure into the cumulative aggregate, a prepared one (`Some`) does not, because its
+    /// usage is settled from the broker receipt instead. Flipping the assignment either way reds
+    /// this test: `= true` stops a legacy aggregate growing, `= false` folds a brokered child figure
+    /// in (which the receipt then adds on top of, double-counting).
+    #[test]
+    fn dispatch_wiring_decides_whether_a_child_figure_enters_the_aggregate() {
+        let spec = || rhapsody_agent::PreparedHarnessSpec {
+            harness: rhapsody_agent::HarnessId::Opencode,
+            model: Some("accounts/fireworks/models/x".to_string()),
+            provider: None,
+            knobs: rhapsody_agent::HarnessKnobs::Opencode(Default::default()),
+        };
+        for (prepared, want_brokered) in [(None, false), (Some(spec()), true)] {
+            let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+            o.dispatch_issue_prepared(
+                issue("1", "MT-1", "Todo"),
+                None,
+                None,
+                String::new(),
+                prepared,
+            );
+            assert_eq!(
+                o.running["1"].brokered, want_brokered,
+                "the flag must be stamped from prepared.is_some() at dispatch, not by a fixture"
+            );
+
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: "1".into(),
+                ev: rhapsody_agent::Event {
+                    event_type: rhapsody_agent::EVENT_TURN_COMPLETED.to_string(),
+                    usage: Some(rhapsody_agent::Usage {
+                        input_tokens: 700,
+                        output_tokens: 300,
+                        total_tokens: 1000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+
+            assert_eq!(
+                o.totals.total_tokens,
+                if want_brokered { 0 } else { 1000 },
+                "a brokered child figure must not enter the aggregate; a legacy one must"
+            );
+        }
     }
 
     /// STUDIO-880's backstop: a dispatch that reached here while draining says so.

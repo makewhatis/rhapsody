@@ -2570,6 +2570,13 @@ mod tests {
         ) -> Result<(), rhapsody_store::StoreError> {
             self.0.update_run_progress(a0, a1)
         }
+        fn set_run_tokens(
+            &self,
+            a0: i64,
+            a1: &rhapsody_store::RunTokens,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_run_tokens(a0, a1)
+        }
         fn append_events(
             &self,
             a0: i64,
@@ -2700,6 +2707,22 @@ mod tests {
             a0: i64,
         ) -> Result<Option<rhapsody_store::RunUsage>, rhapsody_store::StoreError> {
             self.0.run_usage(a0)
+        }
+        fn charge_provider_day_tokens(
+            &self,
+            a0: &str,
+            a1: i64,
+            a2: u64,
+            a3: u64,
+        ) -> Result<bool, rhapsody_store::StoreError> {
+            self.0.charge_provider_day_tokens(a0, a1, a2, a3)
+        }
+        fn provider_day_tokens(
+            &self,
+            a0: &str,
+            a1: i64,
+        ) -> Result<u64, rhapsody_store::StoreError> {
+            self.0.provider_day_tokens(a0, a1)
         }
         fn load_run_provenances(
             &self,

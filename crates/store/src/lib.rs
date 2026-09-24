@@ -130,6 +130,12 @@ pub trait Store {
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError>;
     fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError>;
     fn update_run_progress(&self, run_id: i64, p: RunProgress) -> Result<(), StoreError>;
+    /// Rewrites ONLY a run row's token tallies (+ the estimated flag), preserving its outcome,
+    /// timing, transcript and error (STUDIO-1047). It exists because a brokered run's finalized
+    /// receipt reaches the control task AFTER [`Store::end_run`] has already closed the row with the
+    /// child's own figures on a production cancellation; the receipt replaces those tallies without
+    /// re-writing — or racing — the terminal fields. A no-op on an unknown `run_id`.
+    fn set_run_tokens(&self, run_id: i64, t: &RunTokens) -> Result<(), StoreError>;
     fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError>;
 
     // --- restart-recovery ---
@@ -256,6 +262,33 @@ pub trait Store {
     fn set_run_usage(&self, run_id: i64, u: &RunUsage) -> Result<(), StoreError>;
     /// One run's broker usage record, or `Ok(None)` when the run recorded none.
     fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError>;
+
+    // --- durable UTC-day provider budget authority (STUDIO-979) ---
+    // Additive Rhapsody-only surface: the durable, atomic counter behind a brokered provider's
+    // optional `max_reserved_token_units_per_utc_day` cap (`provider-broker-design.md` §8.1). The
+    // frozen Go reference has no broker, so it holds no such budget. It is keyed by
+    // `(provider_id, utc_day)` — two providers have independent day budgets, and a charge made
+    // before UTC midnight never counts against the next UTC day — never one global bucket and never
+    // an ephemeral session key.
+    //
+    // [`Store::charge_provider_day_tokens`] is a SINGLE atomic conditional increment: it applies the
+    // charge and returns `Ok(true)`, or charges nothing and returns `Ok(false)` when the addition
+    // would exceed `cap`. A read-then-write pair across two calls would let concurrent runs
+    // oversubscribe the cap, so callers must not implement the authority as a read followed by a
+    // write. `utc_day` is whole days since the Unix epoch (`UtcDay` in the broker crate).
+    //
+    // The disabled backend answers `Ok(false)` / `Ok(0)`: it never errors, exactly like every other
+    // Noop method. A configured cap over unavailable durable storage is refused at startup, so a
+    // Noop day charge is never a reachable production path.
+    fn charge_provider_day_tokens(
+        &self,
+        provider_id: &str,
+        utc_day: i64,
+        tokens: u64,
+        cap: u64,
+    ) -> Result<bool, StoreError>;
+    /// The tokens already charged under `(provider_id, utc_day)`, or `Ok(0)` when none.
+    fn provider_day_tokens(&self, provider_id: &str, utc_day: i64) -> Result<u64, StoreError>;
 
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`
