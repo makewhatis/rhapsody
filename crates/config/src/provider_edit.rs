@@ -180,9 +180,13 @@ fn providers_entry_indent_in(front: &str) -> usize {
 }
 
 /// The byte span (within `front`) of ONE `<id>:` entry inside the `providers:` block: its key line
-/// and every following line indented deeper than the entry indent. A blank line or anything at the
-/// entry indent or less (a sibling entry, a section comment, the next top-level key) ends it, so a
-/// sibling provider and the comments around it stay byte-identical. `None` when `id` is not defined.
+/// and every following line indented deeper than the entry indent. Blank and comment lines are
+/// SKIPPED when deciding where the entry ends, so a blank line or a comment at the entry's own
+/// indent *inside* an entry does not truncate it (REVIEW A2) — the entry ends only at the next
+/// non-blank, non-comment line at the entry indent or less (a sibling entry, a section comment, the
+/// next top-level key). Splitting there keeps a sibling provider and the comments around it
+/// byte-identical, and leaves an orphaned tail (e.g. a `broker_limits:` block) attached to its own
+/// entry rather than handed to the previous provider. `None` when `id` is not defined.
 fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
     let lines = split_lines(front);
     let key_idx = lines
@@ -209,7 +213,14 @@ fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
             let mut j = i + 1;
             while j < lines.len() {
                 let n = &lines[j];
-                if n.content.trim().is_empty() || indent_of(n.content) <= entry_indent {
+                // A blank or comment line never ends the entry on its own: it may be a separator or
+                // an explanatory comment INSIDE the entry, with more indented fields after it. Skip
+                // it and let the next real content line decide.
+                if n.content.trim().is_empty() || n.content.trim_start().starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                if indent_of(n.content) <= entry_indent {
                     break;
                 }
                 end = n.end;
@@ -519,6 +530,32 @@ claude:
 Do the work for {{ issue.identifier }}.
 ";
 
+    /// A file whose SECOND entry carries a blank line and a comment at the entry indent *inside* it
+    /// (REVIEW A2). A span that stopped at the first blank/comment line would orphan `b`'s
+    /// `broker_limits:` tail onto `a` on a remove, or leave it behind on an edit.
+    const BLANK_INSIDE: &str = r"---
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+  project_slug: symphony
+providers:
+  a:
+    protocol: openai-compatible
+    base_url: https://a.example/v1
+  b:
+    protocol: openai-compatible
+  # b's own footing
+    base_url: https://b.example/v1
+
+    broker_limits:
+      max_reserved_token_units_per_utc_day: 5
+
+claude:
+  turn_timeout_ms: 1800000
+---
+Do the work.
+";
+
     /// A file with exactly one provider, so removing it must drop the `providers:` key as well.
     const SINGLE: &str = r"---
 tracker:
@@ -653,6 +690,67 @@ Do the work for {{ issue.identifier }}.
         assert_eq!(
             without_provider_entry(&text, "legacy"),
             without_provider_entry(COMMENT_RICH, "legacy")
+        );
+    }
+
+    /// REVIEW A2: a blank line or a comment at the entry indent inside an entry must not end its
+    /// span. A remove of `b` takes `b`'s whole tail (its `broker_limits` and its comment) with it, so
+    /// the previous provider `a` never silently inherits it.
+    #[test]
+    fn remove_spans_a_blank_line_and_comment_inside_the_entry() {
+        let text =
+            apply_provider_edit(BLANK_INSIDE, ProviderOp::Remove, "b", None, None).expect("remove");
+        assert!(!text.contains("b.example"), "b's fields survived:\n{text}");
+        assert!(
+            !text.contains("max_reserved_token_units_per_utc_day"),
+            "b's limits were orphaned onto a:\n{text}"
+        );
+        assert!(
+            !text.contains("# b's own footing"),
+            "b's comment was orphaned:\n{text}"
+        );
+        assert!(text.contains("a:"), "{text}");
+        assert!(text.contains("https://a.example/v1"), "{text}");
+        let providers = providers_of(&text);
+        let a = providers.get("a").expect("a survives");
+        assert_eq!(
+            a.broker_limits.max_reserved_token_units_per_utc_day, None,
+            "a silently gained b's daily cap"
+        );
+        assert!(!providers.contains_key("b"), "{providers:?}");
+    }
+
+    /// REVIEW A2: the same layout on an Edit replaces the WHOLE entry, so no fragment (a stray
+    /// comment or a duplicate key) is left behind.
+    #[test]
+    fn edit_spans_a_blank_line_and_comment_inside_the_entry() {
+        let text = apply_provider_edit(
+            BLANK_INSIDE,
+            ProviderOp::Edit,
+            "b",
+            None,
+            Some(&def("b", "https://b2.example/v1")),
+        )
+        .expect("edit");
+        assert!(text.contains("https://b2.example/v1"), "{text}");
+        assert!(!text.contains("https://b.example/v1"), "{text}");
+        assert!(
+            !text.contains("max_reserved_token_units_per_utc_day"),
+            "{text}"
+        );
+        assert!(!text.contains("# b's own footing"), "{text}");
+        // `a`'s entry is untouched, and the file still decodes to exactly two providers.
+        assert!(text.contains("https://a.example/v1"), "{text}");
+        let providers = providers_of(&text);
+        assert_eq!(providers.len(), 2, "{providers:?}");
+        assert!(
+            providers
+                .get("a")
+                .expect("a")
+                .broker_limits
+                .max_reserved_token_units_per_utc_day
+                .is_none(),
+            "{providers:?}"
         );
     }
 
@@ -832,6 +930,13 @@ Do the work.
 
         // A provider nothing selects has no references.
         assert!(provider_references("unused", &config, Some(&teams), &profiles).is_empty());
+    }
+
+    /// The decoded `providers:` map from an in-memory file — no disk write, so a test can inspect the
+    /// post-splice YAML directly through the real decode path.
+    fn providers_of(text: &str) -> BTreeMap<String, ProviderDefinition> {
+        let def = crate::workflow::parse(text).expect("parse the spliced YAML");
+        crate::decode::decode(&def).expect("decode").providers
     }
 
     fn load_from(text: &str) -> String {

@@ -1535,6 +1535,12 @@ export interface ProviderMutationRequest {
   provider_id: string;
   /** The id to rename FROM on an edit; omitted means "same id". */
   previous_id?: string;
+  /**
+   * Pre-flight only: run every check a real mutation would (reference refusal, validation) but do
+   * NOT write. The desktop Remove uses it to refuse a referenced provider BEFORE the stored key is
+   * removed (REVIEW A1).
+   */
+  dry_run?: boolean;
   definition?: {
     protocol?: string;
     display_name?: string;

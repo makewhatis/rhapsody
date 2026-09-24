@@ -343,12 +343,19 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
     setRemoving(true);
     setRemoveError(null);
     // The stored key must be removed WHILE the definition still exists (the desktop command derives
-    // the binding from it), so the credential goes first; a refusal to remove the definition then
-    // reveals that the key is already gone.
+    // the binding from it), so the credential goes first. But the definition removal can still be
+    // REFUSED (a provider something else selects), and that refusal must happen before the Keychain
+    // item is destroyed — otherwise a refused removal silently orphans every run's credential
+    // (REVIEW A1). So pre-flight the removal with the daemon's own reference check first.
     const alsoRemoveKey = removeHasStoredKey && removeKey;
     let keyRemoved = false;
     try {
       if (alsoRemoveKey) {
+        await saveProviderConfig({
+          op: "remove",
+          provider_id: removeTarget.provider_id,
+          dry_run: true,
+        });
         const prepared = await providerPrepare(removeTarget.provider_id, "remove");
         const result = await providerRemove(removeTarget.provider_id, prepared.nonce);
         keyRemoved = result.mutated;

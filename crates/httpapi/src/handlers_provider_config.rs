@@ -50,6 +50,10 @@ struct ProviderMutationReq {
     previous_id: Option<String>,
     /// The definition to write on add/edit.
     definition: Option<ProviderDefinitionReq>,
+    /// Pre-flight only: run every check a real mutation would (reference refusal, splice, validation)
+    /// but DO NOT write. Used by the desktop Remove before it destroys the stored key (REVIEW A1):
+    /// the reference check must be able to refuse the removal while the Keychain item still exists.
+    dry_run: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -282,6 +286,14 @@ pub(crate) async fn handle_provider_config(
             err.to_string(),
             None,
         );
+    }
+
+    // A dry run stops here: every refusal a real mutation would produce has already fired (the
+    // reference check above, the splice, and the daemon's own validation of the candidate), and the
+    // file is untouched. The desktop Remove uses this to learn whether a referenced provider would be
+    // refused BEFORE it removes the stored key.
+    if req.dry_run {
+        return write_json(StatusCode::OK, &serde_json::json!({ "ok": true }));
     }
 
     if let Err(err) = save_text(std::path::Path::new(path), &candidate) {
@@ -532,6 +544,63 @@ Do the work for {{ issue.identifier }}.
         );
     }
 
+    /// REVIEW A1: the desktop Remove pre-flights a `dry_run` removal so a referenced provider is
+    /// refused BEFORE the Keychain item is destroyed. The refusal must be identical to the real one
+    /// and must touch nothing on disk.
+    #[tokio::test]
+    async fn dry_run_remove_refuses_a_referenced_provider_without_writing() {
+        let wf = TempWorkflow::new(BASE);
+        let fake = FakeProvider::ok(empty_snapshot()).with_provider_references(
+            "fireworks",
+            vec![rhapsody_config::ProviderReference {
+                kind: "global".to_string(),
+                label: "the global default (agent.provider)".to_string(),
+            }],
+        );
+        let base = spawn(&wf.path(), fake).await;
+        let before = wf.read();
+        let (status, body) = post(
+            &base,
+            &json!({ "op": "remove", "provider_id": "fireworks", "dry_run": true }),
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "provider_in_use");
+        assert_eq!(wf.read(), before, "a dry run must not write");
+    }
+
+    /// A `dry_run` removal of an unreferenced provider reports success but leaves the file alone, so
+    /// the real removal can still run afterwards.
+    #[tokio::test]
+    async fn dry_run_remove_of_an_unreferenced_provider_succeeds_without_writing() {
+        let wf = TempWorkflow::new(BASE);
+        let base = spawn(&wf.path(), FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = post(
+            &base,
+            &add_body("fireworks", "https://api.fireworks.ai/inference/v1"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let before = wf.read();
+        let (status, body) = post(
+            &base,
+            &json!({ "op": "remove", "provider_id": "fireworks", "dry_run": true }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ok"], true, "{body}");
+        assert_eq!(wf.read(), before, "a dry run must not write");
+
+        // The real removal still lands, proving the dry run kept the provider in place.
+        let (status, body) = post(
+            &base,
+            &json!({ "op": "remove", "provider_id": "fireworks" }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!wf.read().contains("fireworks:"), "{}", wf.read());
+    }
+
     #[tokio::test]
     async fn edit_then_remove_round_trips_through_the_file() {
         let wf = TempWorkflow::new(BASE);
@@ -697,22 +766,21 @@ Do the work for {{ issue.identifier }}.
     }
 
     // ---------------------------------------------------------------------------------------------
-    // End-to-end: Settings add → reload → Not connected → (fake desktop connect) → Test connection
-    // → endpoint edit → binding_mismatch.
+    // End-to-end (daemon half): Settings add → reload → Not connected → credentialed refresh →
+    // endpoint edit → binding_mismatch.
     //
-    // SCOPE OF THE SUBSTITUTIONS (REVIEW B4) — this test runs inside the `rhapsody-httpapi` crate, so
-    // two of the five criterion steps are represented at their daemon boundary rather than driven
-    // through their real owners:
+    // This test runs inside `rhapsody-httpapi`, so it drives the SETTINGS ENDPOINT and the reload; the
+    // key store and "Test connection" are exercised for real by the desktop-workspace test
+    // `provider_commands::tests::settings_definition_round_trips_through_desktop_connect_and_test_connection`,
+    // which calls the real `commit(Connect)` and the real `HttpConnectionTester` over a loopback
+    // socket. Between the two, all five criterion steps are covered.
     //   * "the daemon reloads" — the file is decoded and the REAL `RefreshCoordinator` is reloaded
-    //     from it (`apply_reload`), not the daemon's file watcher. What is proven real is the written
-    //     file, its decode, and the coordinator's transform over it.
-    //   * "store a key through the desktop command" — an in-memory `CredentialReadSource` stores the
-    //     binding that `ProviderDefinition::credential_binding` derives, which is exactly the binding
-    //     the desktop `provider_connect` derives. The desktop command itself lives in the separate
-    //     `desktop/` workspace and cannot be invoked from here.
-    // The credential owner is an in-memory fake (no Keychain, no persistent test credential), and the
-    // "provider" is a loopback HTTP server the catalog refresh really contacts — so the credentialed
-    // leg is exercised over a socket, no paid provider involved.
+    //     from it (`apply_reload`), the same transform the daemon's file watcher feeds. The watcher
+    //     itself is not driven here.
+    //   * the credentialed leg — an in-memory `CredentialReadSource` stores the binding
+    //     `ProviderDefinition::credential_binding` derives, and the catalog refresh really contacts a
+    //     loopback HTTP server over a socket.
+    // No Keychain, no persistent test credential, no paid provider.
     // ---------------------------------------------------------------------------------------------
     mod e2e {
         use std::io::{Read, Write};

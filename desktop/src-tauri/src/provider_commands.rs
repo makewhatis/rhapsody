@@ -1288,6 +1288,138 @@ mod tests {
         assert_eq!(removed.status, "absent");
     }
 
+    // ---- Settings end-to-end: add → Not connected → Connect → Test connection → edit → mismatch ---
+
+    /// A loopback fake OpenAI-compatible provider: a real TCP server answering any request with an
+    /// empty model list, so the REAL [`HttpConnectionTester`] genuinely reaches a socket. Counts hits
+    /// so the test can prove Test connection actually contacted it.
+    struct LoopbackModels {
+        port: u16,
+        hits: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl LoopbackModels {
+        fn start() -> LoopbackModels {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("addr").port();
+            let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let hits_thread = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let _ = hits_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"data":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            LoopbackModels { port, hits }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://127.0.0.1:{}/v1", self.port)
+        }
+
+        fn hits(&self) -> u64 {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn loopback_definition(id: &str, base_url: &str) -> rhapsody_config::ProviderDefinition {
+        rhapsody_config::ProviderDefinition {
+            id: id.to_string(),
+            protocol: rhapsody_config::providers::PROTOCOL_OPENAI_COMPATIBLE.to_string(),
+            display_name: "Loopback".to_string(),
+            base_url: base_url.to_string(),
+            allow_insecure_http: true,
+            credential: rhapsody_config::providers::CredentialSource {
+                source: rhapsody_config::providers::CREDENTIAL_SOURCE_KEYCHAIN.to_string(),
+            },
+            broker_limits: rhapsody_config::providers::BrokerLimits::default(),
+        }
+    }
+
+    /// E2E (REVIEW A3): the WHOLE Settings → Connect → Test-connection → endpoint-edit path, driven
+    /// by the real desktop code. Step 1 splices the add with the very `apply_provider_edit` the
+    /// Settings route calls; step 3 stores a key through the real `commit(Connect)` into an in-memory
+    /// keychain; step 4 runs the REAL `HttpConnectionTester` against a loopback fake; step 5 edits the
+    /// URL through the same splice and the status reaches `binding_mismatch`. No Keychain, no paid
+    /// provider, no persistent credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settings_definition_round_trips_through_desktop_connect_and_test_connection() {
+        let server = LoopbackModels::start();
+        let dir = crate::testutil::TempDir::new("rd-pc-e2e");
+        let path = dir.join("WORKFLOW.md");
+        std::fs::write(
+            &path,
+            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\n---\nWork.\n",
+        )
+        .expect("write workflow");
+        let mut def = loopback_definition("loop", &server.base_url());
+
+        // 1. Add through the same config-edit path Settings uses.
+        let text = std::fs::read_to_string(&path).expect("read");
+        let spliced = rhapsody_config::apply_provider_edit(
+            &text,
+            rhapsody_config::ProviderOp::Add,
+            "loop",
+            None,
+            Some(&def),
+        )
+        .expect("add");
+        std::fs::write(&path, &spliced).expect("write add");
+
+        let service = ProviderCommandService::with_dependencies(
+            Some(path.clone()),
+            test_factory(),
+            Arc::new(HttpConnectionTester::new()),
+            FakeClock::new(),
+            Arc::new(|| "nonce-e2e".to_string()),
+            DEFAULT_NONCE_TTL,
+        );
+
+        // 2. The definition is on disk and reads Not connected.
+        assert_eq!(service.status("loop").expect("status").status, "absent");
+
+        // 3. Store a key through the REAL desktop Connect command (in-memory keychain).
+        let connected = connect(&service, "loop", "sk-fake-loopback");
+        assert!(connected.mutated, "{connected:?}");
+        assert_eq!(service.status("loop").expect("status").status, "configured");
+
+        // 4. Test connection succeeds over a real socket to the loopback fake.
+        let verdict = service
+            .test_connection("loop")
+            .await
+            .expect("test connection");
+        assert!(verdict.ok, "{verdict:?}");
+        assert_eq!(verdict.code, "ok", "{verdict:?}");
+        assert!(server.hits() >= 1, "the loopback fake was contacted");
+
+        // 5. Change the URL through the same edit path; the old key must not follow it.
+        let text = std::fs::read_to_string(&path).expect("read");
+        def.base_url = "http://127.0.0.1:1/v1".to_string();
+        let spliced = rhapsody_config::apply_provider_edit(
+            &text,
+            rhapsody_config::ProviderOp::Edit,
+            "loop",
+            None,
+            Some(&def),
+        )
+        .expect("edit");
+        std::fs::write(&path, &spliced).expect("write edit");
+        assert_eq!(
+            service.status("loop").expect("status").status,
+            "binding_mismatch",
+            "the old key must not follow the new URL"
+        );
+    }
+
     // ---- status: absent vs denied ---------------------------------------------------------------
 
     #[test]
