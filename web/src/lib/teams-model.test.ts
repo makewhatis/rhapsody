@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  CREDENTIAL_MUTATION_NOTE,
   DEFAULT_TIMEOUT_MS,
   MIN_MODEL_TIMEOUT_MS,
+  SELECTION_LIFECYCLES,
   draftErrors,
   effectiveReviewers,
   emptyDraft,
@@ -438,5 +440,32 @@ describe("teamsYamlSnippet", () => {
       roster: [{ name: "alice", profile: "swe", labels: "", bank: "", maxConcurrent: 0 }],
     });
     expect(yaml).toContain(`  api_key: ${MASKED_API_KEY}`);
+  });
+});
+
+// STUDIO-993 P12: the copy that distinguishes WHERE a teammate's harness/provider/model comes from
+// and WHEN an edit to each source takes effect. The mutation this guards: flattening all three into
+// "restart to apply", which is the exact misreading the ticket says Settings must not tell operators.
+describe("provider selection lifecycle copy", () => {
+  it("names the three sources and the boot/hot/dispatch distinction", () => {
+    const sources = SELECTION_LIFECYCLES.map((l) => l.source);
+    expect(sources).toEqual(["teams.yaml", "WORKFLOW.md `providers:`", "teams/profiles/*.md"]);
+    // Exactly one source is boot-loaded; the other two are not.
+    expect(SELECTION_LIFECYCLES.filter((l) => /boot-loaded/i.test(l.when))).toHaveLength(1);
+    expect(SELECTION_LIFECYCLES[1].when).toMatch(/hot-reload/);
+    expect(SELECTION_LIFECYCLES[2].when).toMatch(/dispatch/);
+    // The boot-loaded source is the one that costs a restart; the dispatch-resolved one does not.
+    expect(SELECTION_LIFECYCLES[0].detail).toMatch(/restart/);
+    expect(SELECTION_LIFECYCLES[2].detail).toMatch(/no restart/);
+  });
+
+  it("points operators at `teams show` for the resolved tuple and its origins", () => {
+    expect(SELECTION_LIFECYCLES[2].detail).toContain("rhapsodyd teams show");
+    expect(SELECTION_LIFECYCLES[2].detail).toMatch(/origin/i);
+  });
+
+  it("states that credential mutations are desktop-only", () => {
+    expect(CREDENTIAL_MUTATION_NOTE).toMatch(/desktop app/);
+    expect(CREDENTIAL_MUTATION_NOTE).toMatch(/credential/i);
   });
 });

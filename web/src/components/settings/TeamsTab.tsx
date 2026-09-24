@@ -2,6 +2,7 @@ import * as React from "react";
 import { Button, Collapsible, Field, SectionCard, Select, Sliders, Stepper, TextInput, Toggle } from "@/components/ui";
 import { useSaveTeamsConfig, useTeamsConfigQuery } from "@/hooks/useTeams";
 import {
+  CREDENTIAL_MUTATION_NOTE,
   draftErrors,
   emptyRow,
   errText,
@@ -12,6 +13,7 @@ import {
   MIN_MODEL_TIMEOUT_MS,
   MIN_QUORUM_REVIEWERS,
   quorumNote,
+  SELECTION_LIFECYCLES,
   teamsYamlSnippet,
   toConfig,
   toDraft,
@@ -115,7 +117,33 @@ export function TeamsTab() {
           <Path path={view?.path ?? ""} />
         </>
       )}
+      <SelectionLifecycles />
     </SectionCard>
+  );
+}
+
+// SelectionLifecycles — STUDIO-993 §P12's "UI/docs distinguish the three sources". The three inputs to
+// a teammate's harness/provider/model resolve at different times, and the recurring mistake is
+// assuming all of Teams needs a restart: only the boot-loaded teams.yaml does. The copy lives in
+// `lib/teams-model.ts` so this surface and the console's ManageTeamView cannot disagree.
+function SelectionLifecycles() {
+  return (
+    <>
+      <div style={{ paddingTop: 12, paddingBottom: 4, fontSize: 12.5, fontWeight: 600, color: "var(--tx)" }}>
+        Where provider &amp; model selection comes from
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {SELECTION_LIFECYCLES.map((l) => (
+          <div key={l.source} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--tx)" }}>
+              {l.source} — {l.when}
+            </span>
+            <span style={{ fontSize: 12, color: "var(--tx-3)", lineHeight: 1.5 }}>{l.detail}</span>
+          </div>
+        ))}
+        <Note>{CREDENTIAL_MUTATION_NOTE}</Note>
+      </div>
+    </>
   );
 }
 

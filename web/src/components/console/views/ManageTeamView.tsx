@@ -12,10 +12,12 @@ import {
   starvedTimeoutMs,
 } from "@/lib/console-manage";
 import {
+  CREDENTIAL_MUTATION_NOTE,
   MASKED_API_KEY,
   MEMORY_BACKENDS,
   MIN_MODEL_TIMEOUT_MS,
   MIN_QUORUM_REVIEWERS,
+  SELECTION_LIFECYCLES,
   draftErrors,
   emptyRow,
   errText,
@@ -126,6 +128,23 @@ export function ManageTeamView({ onNavigate }: ManageTeamViewProps) {
             unit="bytes"
           />
         </Field>
+      </Section>
+
+      <Section title="Where provider & model selection comes from">
+        <p className="lead">
+          Three inputs feed a teammate&apos;s harness/provider/model, and they resolve at different times.
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {SELECTION_LIFECYCLES.map((l) => (
+            <div key={l.source} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <strong style={{ fontSize: 12.5 }}>
+                {l.source} — {l.when}
+              </strong>
+              <span style={{ fontSize: 12, opacity: 0.75, lineHeight: 1.5 }}>{l.detail}</span>
+            </div>
+          ))}
+        </div>
+        <Note>{CREDENTIAL_MUTATION_NOTE}</Note>
       </Section>
 
       {errors.length > 0 ? (

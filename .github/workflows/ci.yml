@@ -48,6 +48,12 @@ jobs:
       # input) are pinned by a case table instead. Cheap and bash-only — it rides the existing `lint`
       # job rather than adding a branch-protection context that would not be required.
       - run: harness/prompt/prompt_test.sh
+      # STUDIO-993: check-plugin.sh compares the plugin version against the PR base to catch a
+      # plugin behaviour/doc change that forgot its version bump. The default depth-1 checkout does
+      # not carry the base branch, so fetch just that one ref — `origin/$GITHUB_BASE_REF`, which is
+      # what the check resolves. On a push to main there is no PR base, and the check skips itself.
+      - if: github.event_name == 'pull_request'
+        run: git fetch --no-tags --depth=1 origin "refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
       # STUDIO-867: same reasoning for the Claude Code plugin this repo ships — a marketplace
       # `source` that does not resolve installs nothing while adding cleanly, and the shipped files
       # are public. Bash + python3 only, so it rides `lint` rather than adding a required context.

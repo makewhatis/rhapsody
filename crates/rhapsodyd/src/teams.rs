@@ -24,9 +24,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::SecondsFormat;
 use rhapsody_config::profiles::{self, BodyOrigin, Origin, ResolvedProfile};
+use rhapsody_config::providers::provider_turn_deadline_ms;
 use rhapsody_config::room::{Cursor, LocalRoom, Message};
-use rhapsody_config::teams::{Review, Teams};
+use rhapsody_config::teams::{Identity, Review, Teams};
 use rhapsody_config::{Config, workflow};
+use rhapsody_orchestrator::selection::{
+    FieldSelection, SelectionOrigins, SelectionRequest, SelectionTiers, resolve_manager_selection,
+    resolve_selection,
+};
 
 use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
 
@@ -97,11 +102,10 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
     // always carries one.
     let cfg = load_config(getenv);
     let (teams_path, profiles_dir, room_dir) = resolve_paths(cfg.as_ref())?;
-    let backend = cfg.as_ref().map_or("", |c| c.agent.backend.as_str());
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
-        "show" => show(rest, &teams_path, &profiles_dir, &room_dir, backend),
+        "show" => show(rest, &teams_path, &profiles_dir, &room_dir, cfg.as_ref()),
         "fork" => fork(rest, &profiles_dir),
         "" => Err("usage: rhapsodyd teams <show|fork> <name>".to_string()),
         other => Err(format!(
@@ -163,9 +167,10 @@ fn show(
     teams_path: &Path,
     profiles_dir: &Path,
     room_dir: &Path,
-    backend: &str,
+    cfg: Option<&Config>,
 ) -> Result<String, String> {
     let (name, room_tail) = parse_show_args(args)?;
+    let backend = cfg.map_or("", |c| c.agent.backend.as_str());
     // Best-effort: a broken teams.yaml must not stop an operator inspecting a
     // profile, so `show` falls back to treating the arg as a profile name.
     //
@@ -210,6 +215,15 @@ fn show(
     // `teams.yaml` at all) prints no line this addition did not exist to add (the alignment fix
     // widened every label's gutter by one, so it is not byte-identical to pre-STUDIO-901 output).
     let review = teams.review_ticketless().then_some(&teams.review);
+    // The effective Teams/manager/review tuple and its per-tier origins (STUDIO-993, P12). Built
+    // from the SAME pure resolver the dispatch path consumes (`rhapsody_orchestrator::selection`),
+    // so `show` reports what a run would actually select rather than a second resolution algorithm
+    // that could disagree with it. Gated on `teams.enabled`: an installation with no Teams has no
+    // manager and no routing fields, and this section would be a claim about a feature that is off.
+    let effective = match cfg {
+        Some(cfg) if teams.enabled => render_effective(cfg, &teams, identity, &resolved),
+        _ => String::new(),
+    };
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
         &resolved,
@@ -217,6 +231,7 @@ fn show(
         &room,
         backend,
         &render_rejection_for(teams_path, &rejected),
+        &effective,
     ))
 }
 
@@ -365,6 +380,7 @@ fn render_show(
     room: &str,
     backend: &str,
     rejection: &str,
+    effective: &str,
 ) -> String {
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
@@ -405,6 +421,14 @@ fn render_show(
         "harness:       {}\n",
         harness_field(&r.harness, r.provenance.harness, backend)
     ));
+    // The provider this profile names, with the same base/overlay origin every sibling field
+    // carries (STUDIO-993, P12). It sits between `harness` and `model` because it is the middle
+    // field of the tuple: empty means "inherit the daemon's config" exactly as they do. What a run
+    // actually resolves to across ALL tiers is the `--- effective selection ---` block below.
+    out.push_str(&format!(
+        "provider:      {}\n",
+        field(&r.provider, r.provenance.provider)
+    ));
     out.push_str(&format!(
         "model:         {}\n",
         field(&r.model, r.provenance.model)
@@ -430,6 +454,17 @@ fn render_show(
         // scoped by harness, so the useful answer is this identity's own entry, not the raw map.
         // `backend` is also the fallback the legacy bare-scalar spelling resolves against.
         let review_harness = resolved_harness(&r.harness, backend);
+        out.push_str(&format!(
+            "review provider: {}\n",
+            review_field(
+                "provider",
+                &review.provider,
+                &review_harness,
+                backend,
+                &r.provider,
+                r.provenance.provider
+            )
+        ));
         out.push_str(&format!(
             "review model:  {}\n",
             review_field(
@@ -475,11 +510,155 @@ fn render_show(
                 "from the overlay; its {{ base }} spliced nothing, because a fork has no base",
         }
     ));
+    out.push_str(effective);
     out.push_str(room);
     out.push_str("\n--- resolved prompt ---\n");
     out.push_str(&r.prompt);
     out.push('\n');
     out
+}
+
+/// The effective Teams/manager tuples an operator cannot otherwise see (STUDIO-993, P12): what each
+/// of [`harness`](ResolvedProfile::harness), `provider` and `model` resolves to across the
+/// field-wise precedence chain `ticket > review > profile > identity > project > global`, with the
+/// ORIGIN of each, plus the manager's own independent tuple.
+///
+/// This consumes the SAME pure resolver ([`resolve_selection`]/[`resolve_manager_selection`]) the
+/// dispatch path uses, so `show` cannot disagree with what a run would select — the ticket's
+/// explicit rule ("do not recompute a second selection algorithm in UI/CLI"). Every input it needs
+/// is non-secret config already on this command's read-only path; the resolver performs no I/O and
+/// returns no credential.
+///
+/// ⚠️ The tiers fed here are the tiers the DISPATCH path actually builds
+/// (`Orchestrator::selection_inputs`): the CLI has no ticket and no target project, and dispatch
+/// does NOT yet feed the identity or review tier — a roster entry's own `harness:`/`provider:`/
+/// `model:` and `review.provider` are parsed and displayed but do not reach a run (PR #273 round 1).
+/// Feeding them here would print a tuple no dispatch would ever produce and state an override as
+/// fact; they are reported separately, labeled configured-only, below.
+///
+/// A typed refusal is rendered IN PLACE of the resolved fields and the profile report is still
+/// printed above it: an invalid provider refuses the RUN, never degrades the whole Teams feature to
+/// disabled — which is exactly the distinction P12 exists to make visible.
+fn render_effective(
+    cfg: &Config,
+    teams: &Teams,
+    identity: Option<&Identity>,
+    profile: &ResolvedProfile,
+) -> String {
+    let providers = &cfg.providers;
+    let deadline_ms = provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms);
+    let tiers = SelectionTiers {
+        // The CLI has no ticket and no target project, and — like `selection_inputs` — it feeds
+        // neither the identity nor the review tier, because dispatch does not. See the doc comment.
+        ticket: FieldSelection::default(),
+        review: None,
+        profile: FieldSelection {
+            harness: profile.harness.clone(),
+            provider: profile.provider.clone(),
+            model: profile.model.clone(),
+        },
+        identity: FieldSelection::default(),
+        project: FieldSelection::default(),
+        global: FieldSelection::from_agent(&cfg.agent),
+    };
+    let mut out = String::new();
+    out.push_str(
+        "\n--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope and dispatch feeds neither the review nor the identity tier) ---\n",
+    );
+    match resolve_selection(&SelectionRequest {
+        tiers,
+        providers,
+        turn_deadline_ms: deadline_ms,
+    }) {
+        Ok(sel) => {
+            out.push_str(&format!(
+                "harness:   {} [{}]\n",
+                sel.harness_name,
+                sel.origins.harness.as_str()
+            ));
+            out.push_str(&format!(
+                "provider:  {}\n",
+                resolved_provider_line(sel.provider_id.as_str(), &sel.origins)
+            ));
+            out.push_str(&format!(
+                "model:     {}\n",
+                resolved_model_line(sel.model.as_deref(), &sel.origins)
+            ));
+        }
+        Err(e) => out.push_str(&format!("REFUSED:   {e}\n")),
+    }
+    // A roster entry's own routing fields are parsed and shown, but dispatch does not feed the
+    // identity tier yet, so they must not be folded into the tuple above. Reported separately and
+    // labeled, rather than silently dropped or falsely claimed as applied (PR #273 round 1).
+    if let Some(i) = identity {
+        let configured = [
+            ("harness:", i.harness.as_str()),
+            ("provider:", i.provider.as_str()),
+            ("model:", i.model.as_str()),
+            ("effort:", i.effort.as_str()),
+        ];
+        if configured.iter().any(|(_, value)| !value.is_empty()) {
+            out.push_str(
+                "\n--- identity routing fields (configured on the roster entry, NOT yet applied at dispatch — a run still resolves from the profile tier and below) ---\n",
+            );
+            for (name, value) in configured {
+                if !value.is_empty() {
+                    out.push_str(&format!("{name:<10}{value}\n"));
+                }
+            }
+        }
+    }
+    // The manager's own tuple, which never borrows a teammate's (design §5 / parent D6) — the
+    // independent half an operator has no other command to ask about.
+    out.push_str("\n--- manager (independent of every teammate) ---\n");
+    let manager = FieldSelection {
+        harness: teams.manager.harness.clone(),
+        provider: teams.manager.provider.clone(),
+        model: teams.manager.model.clone(),
+    };
+    match resolve_manager_selection(&manager, providers, deadline_ms) {
+        Ok(sel) => {
+            out.push_str(&format!(
+                "harness:   {} [{}]\n",
+                sel.harness_name,
+                sel.origins.harness.as_str()
+            ));
+            out.push_str(&format!(
+                "provider:  {}\n",
+                resolved_provider_line(sel.provider_id.as_str(), &sel.origins)
+            ));
+            out.push_str(&format!(
+                "model:     {}\n",
+                resolved_model_line(sel.model.as_deref(), &sel.origins)
+            ));
+        }
+        Err(e) => out.push_str(&format!("REFUSED:   {e}\n")),
+    }
+    out
+}
+
+/// The `provider:` line of an effective/manager tuple: the stable canonical id with its origin, or
+/// the explicit "no Rhapsody provider" branch — the legacy native-login path, which is a real
+/// answer rather than a blank.
+fn resolved_provider_line(provider_id: &str, origins: &SelectionOrigins) -> String {
+    if provider_id.is_empty() {
+        return "(none — native login; no Rhapsody provider selected)".to_string();
+    }
+    match origins.provider {
+        Some(o) => format!("{provider_id} [{}]", o.as_str()),
+        None => provider_id.to_string(),
+    }
+}
+
+/// The `model:` line of an effective/manager tuple. An absent model is NOT unset for the manager:
+/// it preserves the harness CLI's own default, and saying so is the difference between a reported
+/// resolution and a blank.
+fn resolved_model_line(model: Option<&str>, origins: &SelectionOrigins) -> String {
+    match (model, origins.model) {
+        (Some(m), Some(o)) => format!("{m} [{}]", o.as_str()),
+        (Some(m), None) => m.to_string(),
+        (None, _) => "(the harness CLI's own default)".to_string(),
+    }
 }
 
 fn origin_tag(o: Origin) -> &'static str {
@@ -603,6 +782,17 @@ fn review_field(
         } else {
             format!("review.{name}.{harness}")
         };
+        if name == "provider" {
+            // `review.provider` is parsed, validated and harness-scoped, but dispatch does not yet
+            // feed the review tier (`selection_inputs` passes `review: None`), so a review run
+            // still takes its provider from the profile and global tiers. Report the configured
+            // value and say so, rather than claiming an override that never happens (PR #273
+            // round 1).
+            return format!(
+                "{value} [{key} — configured, but not yet applied at dispatch: a review run still \
+                 uses this profile's provider]"
+            );
+        }
         return format!("{value} [{key} — overrides this profile's {name} for a review run]");
     }
     let listed = scoped
@@ -611,7 +801,18 @@ fn review_field(
         .map(|(h, v)| format!("{h}: {v}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if name == "model" {
+    if name == "provider" {
+        // Nothing applies `review.provider` yet, so a value scoped to another harness is not the
+        // wrong-run refusal a `review.model` mismatch is: say exactly that instead of describing a
+        // refusal dispatch never performs.
+        format!(
+            "(unset for harness {harness} — review.provider names {listed}; it is not applied at \
+             dispatch yet, so no review is refused and a review on {harness} uses this profile's \
+             provider)"
+        )
+    } else if name == "model" {
+        // A model configured for another harness IS a refusal: handing a review a model its harness
+        // cannot honour would run it on the wrong model, which is the trap this closes.
         format!(
             "(unset for harness {harness} — review.model names {listed}, so a review on {harness} \
              is refused rather than run on the wrong model)"
@@ -1031,6 +1232,292 @@ mod tests {
             .find(|l| l.starts_with("harness:"))
             .unwrap_or_else(|| panic!("no harness line in {out}"));
         assert_eq!(line, "harness:       opencode [overlay]", "out = {out}");
+    }
+
+    // ── the review-scoped PROVIDER (STUDIO-993, P12) ──
+
+    /// `review.provider` is the review-tier sibling of `review.model`, and it is displayed the same
+    /// way: scoped to the harness the reviewer actually runs on, and naming that scope back to the
+    /// operator.
+    #[test]
+    fn show_reports_the_review_scoped_provider_when_set() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  provider:\n    opencode: fireworks\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review provider: fireworks [review.provider.opencode — configured, but not yet applied at dispatch: a review run still uses this profile's provider]"),
+            "out = {out}"
+        );
+    }
+
+    /// **The harness-scope mutation guard.** A `review.provider` configured for a harness the
+    /// reviewer does not run on is reported with the OTHER harness named — never silently applied
+    /// to the wrong run and never silently dropped. A display that read `review.provider` unscoped
+    /// would print `fireworks [review.provider — …]` here instead, turning this red.
+    #[test]
+    fn show_reports_a_review_provider_scoped_to_another_harness() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "claude");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  provider:\n    opencode: fireworks\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review provider: (unset for harness claude — review.provider names opencode: fireworks; it is not applied at dispatch yet, so no review is refused and a review on claude uses this profile's provider)"),
+            "out = {out}"
+        );
+    }
+
+    // ── the effective Teams/manager tuple and its origins (STUDIO-993, P12) ──
+    /// The two providers every effective-selection test below resolves against. A canonical id, an
+    /// `openai-compatible` protocol and a Keychain credential source — never a value.
+    const PROVIDERS: &str = "  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.fireworks.ai/inference/v1\n    credential:\n      source: keychain\n  openrouter:\n    protocol: openai-compatible\n    base_url: https://openrouter.ai/api/v1\n    credential:\n      source: keychain\n";
+
+    /// [`hermetic`] with an `agent.backend` and a `providers:` block, so the effective-selection
+    /// resolver has a real registry to select against.
+    fn hermetic_providers(dir: &TempDir, backend: &str) -> (Vec<String>, PathBuf) {
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(
+            &wf,
+            format!(
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nagent:\n  backend: {backend}\nproviders:\n{PROVIDERS}storage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
+                dir.path.display()
+            ),
+        )
+        .expect("write WORKFLOW.md");
+        let env = vec![wf.to_string_lossy().into_owned()];
+        (env, dir.path.join("teams").join("profiles"))
+    }
+
+    /// Write a profile overlay with the given routing front matter, so the profile tier can carry
+    /// each field independently.
+    fn write_profile(profiles_dir: &Path, name: &str, front_matter: &str) {
+        std::fs::create_dir_all(profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join(format!("{name}.md")),
+            format!("---\nextends: {name}\n{front_matter}---\n{{{{ base }}}}\n"),
+        )
+        .expect("write overlay");
+    }
+
+    /// The `provider:` line P12 exists to add, and the fresh `--- effective selection ---` block
+    /// that reports the SAME resolved values the dispatch path computes — from the profile tier
+    /// here, with that tier's origin. Before this ticket the provider was the one resolved field
+    /// `show` never printed at all.
+    #[test]
+    fn show_reports_the_profile_provider_and_the_effective_origin() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic_providers(&dir, "opencode");
+        write_profile(
+            &profiles_dir,
+            "swe",
+            "harness: opencode\nprovider: fireworks\nmodel: accounts/fireworks/models/deepseek-v4p1-flash\n",
+        );
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("provider:      fireworks [overlay]"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains(
+                "--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope and dispatch feeds neither the review nor the identity tier) ---"
+            ),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nharness:   opencode [profile]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nprovider:  fireworks [profile]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nmodel:     accounts/fireworks/models/deepseek-v4p1-flash [profile]\n"),
+            "out = {out}"
+        );
+    }
+
+    /// **The identity-tier disclosure guard** (PR #273 round 1). A roster entry's own routing fields
+    /// are NOT fed to dispatch — `Orchestrator::selection_inputs` passes `identity:
+    /// FieldSelection::default()` — so `show` must not report them as the effective tuple. They are
+    /// disclosed in their own labeled block instead. A CLI that folded the identity tier into the
+    /// effective tuple (the pre-round-1 behaviour) would print `openrouter [identity]` above and red
+    /// this.
+    #[test]
+    fn show_reports_identity_fields_as_configured_but_not_applied() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic_providers(&dir, "opencode");
+        write_profile(&profiles_dir, "swe", "harness: opencode\n");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n    provider: openrouter\n    model: anthropic/claude-sonnet-4-6\n    effort: xhigh\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        // The effective tuple is what dispatch would resolve: `swe` names no provider, so the global
+        // tier answers, and the identity's fields are nowhere in it.
+        assert!(
+            out.contains("\nprovider:  (none — native login; no Rhapsody provider selected)\n"),
+            "out = {out}"
+        );
+        assert!(
+            !out.contains("openrouter [identity]"),
+            "the identity tier must not be reported as applied: {out}"
+        );
+        // ...and the configured fields are disclosed separately, labeled as not applied.
+        assert!(
+            out.contains("--- identity routing fields (configured on the roster entry, NOT yet applied at dispatch"),
+            "out = {out}"
+        );
+        assert!(out.contains("\nprovider: openrouter\n"), "out = {out}");
+        assert!(
+            out.contains("\nmodel:    anthropic/claude-sonnet-4-6\n"),
+            "out = {out}"
+        );
+        assert!(out.contains("\neffort:   xhigh\n"), "out = {out}");
+        // The profile itself names no provider, so the top-level line stays the inherit marker.
+        assert!(
+            out.contains("provider:      [unset — inherits the daemon's config]"),
+            "out = {out}"
+        );
+    }
+
+    /// The lowest tier is still an origin: a profile that names neither harness nor provider
+    /// inherits `agent.backend` and reports it as the GLOBAL tier, never a blank.
+    #[test]
+    fn show_reports_the_global_tier_for_an_inheriting_teammate() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_providers(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("\nharness:   opencode [global]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nprovider:  (none — native login; no Rhapsody provider selected)\n"),
+            "out = {out}"
+        );
+    }
+
+    /// **An invalid provider refuses the RUN, never disables Teams** (P12's headline distinction).
+    /// The report still prints the profile and its resolved prompt; only the effective tuple is
+    /// replaced by the typed refusal, so an operator sees exactly which provider is unconfigured
+    /// without the whole command or the whole feature going dark.
+    #[test]
+    fn show_refuses_an_unconfigured_provider_without_disabling_teams() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic_providers(&dir, "opencode");
+        write_profile(
+            &profiles_dir,
+            "swe",
+            "harness: opencode\nprovider: bogus\nmodel: some-model\n",
+        );
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show must still succeed");
+        assert!(out.contains("REFUSED:   selection_refusal:"), "out = {out}");
+        assert!(
+            out.contains("provider \"bogus\" is not configured"),
+            "the refusal names the provider: {out}"
+        );
+        assert!(
+            out.contains("profile:       swe"),
+            "the profile is still shown: {out}"
+        );
+        assert!(
+            out.contains("--- resolved prompt ---"),
+            "the resolved prompt is still shown: {out}"
+        );
+        assert!(
+            !out.contains("Teams is OFF"),
+            "one invalid provider must not disable Teams: {out}"
+        );
+    }
+
+    /// The manager has its own tuple and its own origin, independent of every teammate (design §5,
+    /// parent D6). An absent tuple is the Claude + CLI-default-model manager, reported as
+    /// `[default]` rather than as an inherited teammate value.
+    #[test]
+    fn show_reports_the_default_manager_tuple_and_its_origin() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_providers(&dir, "opencode");
+        std::fs::write(dir.child("teams.yaml"), "enabled: true\n").expect("write teams.yaml");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("--- manager (independent of every teammate) ---"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nharness:   claude [default]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nprovider:  (none — native login; no Rhapsody provider selected)\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nmodel:     (the harness CLI's own default)\n"),
+            "out = {out}"
+        );
+    }
+
+    /// An explicit manager tuple reports `[manager]` for each field — the origin that distinguishes
+    /// the manager's own choice from anything a teammate selected.
+    #[test]
+    fn show_reports_an_explicit_manager_tuple() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_providers(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nmanager:\n  harness: opencode\n  provider: fireworks\n  model: accounts/fireworks/models/deepseek-v4p1-flash\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("\nharness:   opencode [manager]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nprovider:  fireworks [manager]\n"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("\nmodel:     accounts/fireworks/models/deepseek-v4p1-flash [manager]\n"),
+            "out = {out}"
+        );
+    }
+
+    /// Teams off has no manager and no routing fields, so the two new sections are suppressed
+    /// entirely — a Teams-off `show` stays the report it always was (aside from the `provider:`
+    /// line, which is an unconditional profile field like `harness:`/`model:`).
+    #[test]
+    fn show_prints_no_effective_sections_when_teams_is_off() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_providers(&dir, "opencode");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(!out.contains("effective selection"), "out = {out}");
+        assert!(!out.contains("--- manager"), "out = {out}");
     }
 
     /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only

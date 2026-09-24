@@ -127,6 +127,12 @@ daemon nobody drains behaves exactly as before.
 
 - **`teams.yaml` is boot-only.** `WORKFLOW.md` hot-reloads; `teams.yaml` does not. Every
   roster, `max_concurrent` or `review.mode` edit costs a daemon restart.
+- **The three provider-selection sources resolve at different times — don't restart for all of
+  them.** `teams.yaml` (roster, identity routing fields, manager tuple, review overrides) is
+  **boot-loaded**: restart to apply. `WORKFLOW.md`'s `providers:` definitions **hot-reload**. A
+  teammate's profile file is **resolved from disk at dispatch**, so a profile edit needs no
+  restart. `rhapsodyd teams show <name>` prints the effective harness/provider/model and each
+  field's origin tier, plus the manager's tuple.
 - ⚠️ **A rejected `teams.yaml` degrades to Teams-disabled** and reports Teams **off** — with
   **exit code 0 either way**. A config typo is indistinguishable from a deliberate Teams-off
   install. Verify with `rhapsodyd teams show <name>`: a resolved roster description means it
