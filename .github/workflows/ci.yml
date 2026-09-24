@@ -52,8 +52,14 @@ jobs:
       # plugin behaviour/doc change that forgot its version bump. The default depth-1 checkout does
       # not carry the base branch, so fetch just that one ref — `origin/$GITHUB_BASE_REF`, which is
       # what the check resolves. On a push to main there is no PR base, and the check skips itself.
+      #
+      # The refspec is FORCED (`+`): on a self-hosted runner the workspace's
+      # `refs/remotes/origin/<base>` can already exist at an older commit, and a shallow
+      # `--depth=1` fetch cannot prove the new tip descends from it, so the update is rejected as
+      # non-fast-forward and the whole job errors before the check runs. The force lets the base
+      # ref simply become the remote truth, which is exactly what the check wants.
       - if: github.event_name == 'pull_request'
-        run: git fetch --no-tags --depth=1 origin "refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
       # STUDIO-867: same reasoning for the Claude Code plugin this repo ships — a marketplace
       # `source` that does not resolve installs nothing while adding cleanly, and the shipped files
       # are public. Bash + python3 only, so it rides `lint` rather than adding a required context.
