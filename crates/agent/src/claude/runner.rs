@@ -186,7 +186,9 @@ impl Harness for Runner {
     /// posture — `--permission-mode default`, the manager MCP tools as the only allowlist, every
     /// built-in denied, `--mcp-config` + `--strict-mcp-config`, `--setting-sources user` — running in
     /// the empty daemon-owned cwd, with `CLAUDE_CONFIG_DIR` pointed at the dedicated manager
-    /// configuration directory and `GH_TOKEN`/`GITHUB_TOKEN` scrubbed.
+    /// configuration directory, the operator's model credential injected as `CLAUDE_CODE_OAUTH_TOKEN`
+    /// (the relocated root cannot authenticate from the credential file on macOS, §4.5), and
+    /// `GH_TOKEN`/`GITHUB_TOKEN` scrubbed.
     ///
     /// The model and effort come from the base config (`self.cfg`) and can be overridden via
     /// [`Session::set_model_override`], exactly as an ordinary run's can.

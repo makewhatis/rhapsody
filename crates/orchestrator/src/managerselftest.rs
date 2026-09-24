@@ -227,18 +227,18 @@ fn report_refused(report: Option<&serde_json::Map<String, serde_json::Value>>, k
 /// is the CLI reporting what it ACTUALLY loaded — authoritative for the built-in and MCP-server
 /// boundaries in a way the model's prose is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CanaryInitPosture {
+struct CanaryInitPosture {
     /// Every tool the session exposes, by name (built-ins bare, MCP tools `mcp__<server>__<tool>`).
-    pub tools: Vec<String>,
+    tools: Vec<String>,
     /// The MCP servers the session loaded, by name.
-    pub mcp_servers: Vec<String>,
+    mcp_servers: Vec<String>,
     /// The effective permission mode the CLI reports.
-    pub permission_mode: String,
+    permission_mode: String,
 }
 
 /// Finds and parses the FIRST `system/init` line in a raw stream-json capture. `None` when there is
 /// no init line or it is unparseable — the caller reads that as NOT refused (fail closed).
-pub fn parse_canary_init(raw: &str) -> Option<CanaryInitPosture> {
+fn parse_canary_init(raw: &str) -> Option<CanaryInitPosture> {
     for line in raw.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
@@ -341,15 +341,15 @@ fn init_contract(posture: Option<&CanaryInitPosture>) -> (bool, String) {
 }
 
 /// A `std::io::Write` sink over a shared buffer, so the canary can read the raw stream-json the
-/// session tees to its transcript (the `system/init` line the [`init_contract`] check needs).
+/// session tees to its transcript (the `system/init` line the init-contract check needs).
 #[derive(Clone)]
-pub struct SharedTranscriptBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+struct SharedTranscriptBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl SharedTranscriptBuf {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
     }
-    pub fn string(&self) -> String {
+    fn string(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
     }
 }
