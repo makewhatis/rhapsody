@@ -662,6 +662,34 @@ mod tests {
         script
     }
 
+    /// Warm-execs `script --version` until it stops failing with the Linux `ETXTBSY` ("Text file
+    /// busy") spawn race, then returns. A test that writes an executable and immediately execs it
+    /// races every sibling test thread: a `fork()` between our write and our own `execve` passes the
+    /// still-open-for-write fd to the child (`O_CLOEXEC` releases it at the child's NEXT exec, not at
+    /// fork), and our `execve` of that inode then fails with `ETXTBSY` — so retrying the exec is the
+    /// real guarantee, exactly as `rhapsody_agent::opencode::probe`'s `retry_etxtbsy` says. Once one
+    /// exec succeeds no later exec of the same inode can race it (we no longer hold a write handle),
+    /// so clearing the window here before the turn's own probe/spawn is sufficient. Production never
+    /// execs a file the same process just wrote, so this stays test-only.
+    fn warm_exec(script: &str) {
+        for _ in 0..50 {
+            match std::process::Command::new(script).arg("--version").output() {
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stderr.contains("Text file busy") {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    if !e.to_string().contains("Text file busy") {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Canonicalized path string (the launch containment invariant compares canonical paths; on
     /// macOS `/var` is a symlink to `/private/var`).
     fn canonical(path: &str) -> String {
@@ -1161,6 +1189,7 @@ printf '{{"type":"step_start","sessionID":"ses_manager_a","part":{{"type":"step-
             log1
         );
         let script1 = fake_opencode(&scripts, "one.sh", &body1);
+        warm_exec(&script1);
         let (opened_a, _broker_a) = opened_custody(&plan);
         let turn_a = PreparedManagerTurn {
             harness: HarnessId::Opencode,
@@ -1189,6 +1218,7 @@ printf '{{"type":"step_finish","sessionID":"ses_manager_b","part":{{"type":"step
             log2
         );
         let script2 = fake_opencode(&scripts, "two.sh", &body2);
+        warm_exec(&script2);
         let (opened_b, _broker_b) = opened_custody(&plan);
         let turn_b = PreparedManagerTurn {
             harness: HarnessId::Opencode,
