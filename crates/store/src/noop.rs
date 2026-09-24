@@ -233,6 +233,64 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    // The manager intervention lifecycle (STUDIO-1015) disappears with the rest of the durable
+    // state: with persistence off there is nowhere to hold an intervention, so every write is a
+    // silent success and every read is empty/None. A reservation against a Noop store is therefore
+    // `Absent` — nothing can be launched, which is the fail-closed direction, and the reason
+    // `review_authority` other than `off` requires durable storage (§7.6).
+    fn save_manager_intervention(&self, _row: ManagerInterventionRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_intervention(
+        &self,
+        _id: &str,
+    ) -> Result<Option<ManagerInterventionRow>, StoreError> {
+        Ok(None)
+    }
+    fn active_manager_intervention(
+        &self,
+        _pr: &str,
+    ) -> Result<Option<ManagerInterventionRow>, StoreError> {
+        Ok(None)
+    }
+    fn load_manager_interventions(&self) -> Result<Vec<ManagerInterventionRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn merge_manager_stall_kinds(
+        &self,
+        _id: &str,
+        _kinds: &[String],
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn set_manager_intervention_state(&self, _id: &str, _state: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn reserve_manager_run(
+        &self,
+        _id: &str,
+        _boot_id: &str,
+        _lease_expires_at: &str,
+        _max_runs: i64,
+        _max_attempts: i64,
+        _max_interventions: i64,
+    ) -> Result<ManagerReservation, StoreError> {
+        Ok(ManagerReservation::Absent)
+    }
+    fn expire_manager_leases(
+        &self,
+        _boot_id: &str,
+        _now: &str,
+    ) -> Result<Vec<ManagerInterventionRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn stop_manager_generation(&self, _pr: &str, _reason: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_budget(&self, _pr: &str) -> Result<Option<ManagerBudgetRow>, StoreError> {
+        Ok(None)
+    }
+
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }

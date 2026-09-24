@@ -950,3 +950,191 @@ pub struct ManagerApprovalRow {
     /// One of the four `MANAGER_APPROVAL_*` values above.
     pub state: String,
 }
+
+// --- the manager intervention lifecycle (STUDIO-1015) ------------------------------------------
+// The `state` column of `rhapsody_manager_intervention`, and the two budgets on
+// `rhapsody_review_bound`. NOT a Go port: the frozen reference has no manager. The set is closed:
+// an intervention is always in exactly one of these states, and the terminal half is what the
+// unique partial index excludes so at most one NON-terminal intervention exists per pull request.
+
+/// The sweep detected a stall on a pull request with no active intervention and no stopped
+/// generation; the intervention awaits a launch. Non-terminal.
+pub const MANAGER_INTERVENTION_QUEUED: &str = "queued";
+/// A launch gate refused (§10.2) — drain, provider budget or credential preflight. Non-terminal:
+/// it returns to `queued` once the gate clears. A deferral consumes no budget.
+pub const MANAGER_INTERVENTION_DEFERRED: &str = "deferred";
+/// A run was reserved and is being dispatched. Holds a lease. Non-terminal.
+pub const MANAGER_INTERVENTION_LAUNCHING: &str = "launching";
+/// The dispatched run is live. Holds a lease. Non-terminal.
+pub const MANAGER_INTERVENTION_RUNNING: &str = "running";
+/// A run ended without a valid decision (crash, lease expiry, run failure, invalid block), or an
+/// `APPROVE` was refused under §6.4. Non-terminal: it re-queues if the budgets allow.
+pub const MANAGER_INTERVENTION_FAILED_ATTEMPT: &str = "failed_attempt";
+/// A valid decision block was parsed. Non-terminal; revalidates without a new run.
+pub const MANAGER_INTERVENTION_DECIDED: &str = "decided";
+/// Revalidation needs a new run (§8.2). Non-terminal; re-queues if the budgets allow.
+pub const MANAGER_INTERVENTION_STALE: &str = "stale";
+/// The decision passed the deterministic checks, before the activation transaction (M9). Non-terminal.
+pub const MANAGER_INTERVENTION_VALIDATED: &str = "validated";
+/// The generation changed, `review_authority` changed, a hold was applied, or the PR closed; the
+/// decision is not applied. Terminal; nothing further is applied.
+pub const MANAGER_INTERVENTION_SUPERSEDED: &str = "superseded";
+/// The attempts or generation-run budget ran out. Terminal; the generation is stopped.
+pub const MANAGER_INTERVENTION_EXHAUSTED: &str = "exhausted";
+/// Every live row already satisfies approval and only a D7 gate blocks the merge, so no decision
+/// can help. Terminal; the generation is stopped and the stall goes to the human feed.
+pub const MANAGER_INTERVENTION_NO_REVIEW_GAP: &str = "no_review_gap";
+/// `ESCALATE` applied, or a refused `APPROVE` on the final intervention or last attempt. Terminal;
+/// the generation is stopped.
+pub const MANAGER_INTERVENTION_ESCALATED: &str = "escalated";
+/// `advise` mode: validated and recorded, never applied. Terminal (§9).
+pub const MANAGER_INTERVENTION_PROPOSED: &str = "proposed";
+/// Effects are being applied (M9). Non-terminal.
+pub const MANAGER_INTERVENTION_APPLYING: &str = "applying";
+/// The activation transaction committed (M9); the decision holds the PR until its effect completes.
+/// Non-terminal.
+pub const MANAGER_INTERVENTION_AWAITING_EFFECT: &str = "awaiting_effect";
+/// The effect completed (§6.6). Terminal.
+pub const MANAGER_INTERVENTION_COMPLETE: &str = "complete";
+/// The effect timed out (§6.6). Terminal.
+pub const MANAGER_INTERVENTION_EFFECT_TIMEOUT: &str = "effect_timeout";
+/// An effect failed definitively. Terminal; the generation is stopped.
+pub const MANAGER_INTERVENTION_APPLY_FAILED: &str = "apply_failed";
+/// An effect's outcome could not be confirmed within its bound. Terminal; the generation is stopped.
+pub const MANAGER_INTERVENTION_APPLY_UNCERTAIN: &str = "apply_uncertain";
+
+/// The `mode` column: the manager acts on the decision (§9).
+pub const MANAGER_MODE_ACT: &str = "act";
+/// The `mode` column: the manager proposes and records, never applies (§9).
+pub const MANAGER_MODE_ADVISE: &str = "advise";
+
+/// The `phase_hint` column: the stall check fired before the round threshold. A case-packet hint
+/// only — never used for charging (§7.8).
+pub const MANAGER_PHASE_PRE_THRESHOLD: &str = "pre_threshold";
+/// The `phase_hint` column: the round threshold had been reached at launch. A case-packet hint only.
+pub const MANAGER_PHASE_POST_THRESHOLD: &str = "post_threshold";
+
+/// The states in which an intervention is TERMINAL — the complement of the unique partial index's
+/// `WHERE`, and the set that no further effect touches. Kept as one list so the index DDL and every
+/// Rust predicate can never disagree.
+pub const MANAGER_INTERVENTION_TERMINAL_STATES: &[&str] = &[
+    MANAGER_INTERVENTION_COMPLETE,
+    MANAGER_INTERVENTION_EFFECT_TIMEOUT,
+    MANAGER_INTERVENTION_NO_REVIEW_GAP,
+    MANAGER_INTERVENTION_ESCALATED,
+    MANAGER_INTERVENTION_EXHAUSTED,
+    MANAGER_INTERVENTION_APPLY_FAILED,
+    MANAGER_INTERVENTION_APPLY_UNCERTAIN,
+    MANAGER_INTERVENTION_SUPERSEDED,
+    MANAGER_INTERVENTION_PROPOSED,
+];
+
+/// Whether `state` is one of [`MANAGER_INTERVENTION_TERMINAL_STATES`]. An unrecognised state reads
+/// as NON-terminal (the fail-closed direction for the unique index's membership).
+pub fn manager_intervention_is_terminal(state: &str) -> bool {
+    MANAGER_INTERVENTION_TERMINAL_STATES.contains(&state)
+}
+
+/// One manager INTERVENTION (STUDIO-1015, design record `manager-agent-design.md` §7.1–§7.5,
+/// §10.2). No Go counterpart.
+///
+/// It is the idempotency root of the whole lifecycle: one durable row per stall episode on a pull
+/// request, carrying the stall signals it covers, its budgets, its lease, its validated decision,
+/// and its terminal outcome. A unique partial index on `pr` over the non-terminal states makes
+/// "at most one active intervention per PR, across all stall kinds" a database invariant rather
+/// than an application convention.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagerInterventionRow {
+    /// UUID; the idempotency root. Primary key.
+    pub id: String,
+    /// `owner/repo#number`, case-folded — the same spelling [`ReviewBoundRow::pr`] carries.
+    pub pr: String,
+    /// The loop generation the intervention was created in (§5.1). A new generation supersedes it.
+    pub generation: i64,
+    /// The stall signals this intervention covers (§7.2 deduplication). Newline-joined in one
+    /// column, exactly as [`ReviewAdjudication::findings`] is — a stall-kind token never contains a
+    /// newline.
+    pub stall_kinds: Vec<String>,
+    /// [`MANAGER_MODE_ACT`] or [`MANAGER_MODE_ADVISE`], fixed at creation.
+    pub mode: String,
+    /// One of the `MANAGER_INTERVENTION_*` state values.
+    pub state: String,
+    /// Runs launched for this intervention.
+    pub attempts: i64,
+    /// [`MANAGER_PHASE_PRE_THRESHOLD`] or [`MANAGER_PHASE_POST_THRESHOLD`] at launch, for the case
+    /// packet only. The authoritative classification is made at activation (§7.8).
+    pub phase_hint: String,
+    /// The final intervention for the generation (§7.3): set at launch when
+    /// `manager_interventions_applied = max_interventions − 1`.
+    pub is_final: bool,
+    /// The boot that owns a `launching`/`running` lease; a lease from another boot is dead (§7.5).
+    pub lease_boot_id: String,
+    /// When the lease expires (§7.5), RFC3339 UTC seconds — the run timeout plus slack.
+    pub lease_expires_at: String,
+    /// The `runs.id` of the current run, or `None` before dispatch.
+    pub run_id: Option<i64>,
+    /// The validated decision block (M9 onward). Empty before a decision is parsed.
+    pub decision_json: String,
+    /// The head the validated decision was bound to.
+    pub decision_head: String,
+    /// The evidence revision the validated decision was bound to.
+    pub decision_evidence_rev: i64,
+    /// Per-effect status (`pending`, `done`, `cancelled`, `unknown`), M9 onward. Empty before
+    /// effects exist.
+    pub effects_json: String,
+    /// When activation committed (§7.7). Empty until then.
+    pub activated_at: String,
+    /// True when an already-posted explanation was refused at activation (§7.7).
+    pub unapplied_explanation: bool,
+    /// One of §11.1's outcomes, or empty. Set once per intervention id.
+    pub outcome: String,
+    /// When the outcome was recorded.
+    pub outcome_at: String,
+    /// The memory-mirror state (§11.3): `pending` until the best-effort mirror lands.
+    pub memory_state: String,
+}
+
+/// The outcome of an atomic manager-run reservation (§7.3): launching a run is one SQLite
+/// transaction that either charges the budgets and writes the lease, or refuses and marks the
+/// intervention and generation exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerReservation {
+    /// The reservation committed: both counters were incremented and the lease was written. The
+    /// intervention is `launching`.
+    Reserved,
+    /// A budget or cap check failed. The intervention is `exhausted` and the generation is stopped,
+    /// in the same transaction. **Nothing is refunded.**
+    Exhausted,
+    /// No intervention row exists for the id — a concurrent terminal write beat the reservation.
+    /// Nothing was changed.
+    Absent,
+}
+
+/// One pull request generation's manager BUDGETS, read from `rhapsody_review_bound`'s three
+/// manager columns (§7.1, §7.3). No Go counterpart.
+///
+/// `runs_used` counts every manager run launched for the generation, whatever the intervention or
+/// outcome; `interventions_applied` counts the POST-threshold interventions; `stopped` is empty
+/// while the generation is live and holds the reason once it is stopped. The two counters are
+/// charged only inside [`Store::reserve_manager_run`] and are never refunded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagerBudgetRow {
+    /// `owner/repo#number`, case-folded.
+    pub pr: String,
+    /// The generation these figures belong to.
+    pub generation: i64,
+    /// Manager runs launched for the generation so far.
+    pub runs_used: i64,
+    /// Post-threshold manager interventions applied so far.
+    pub interventions_applied: i64,
+    /// Empty while live; the human-readable reason once the generation is stopped.
+    pub stopped: String,
+}
+
+impl ManagerBudgetRow {
+    /// Whether the generation is stopped. A stopped generation is shown on the human feed with its
+    /// reason, and the sweep never creates another intervention for it (§7.2).
+    pub fn is_stopped(&self) -> bool {
+        !self.stopped.is_empty()
+    }
+}
