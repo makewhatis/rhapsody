@@ -1138,3 +1138,117 @@ impl ManagerBudgetRow {
         !self.stopped.is_empty()
     }
 }
+
+// --- the manager wake obligation (STUDIO-1016) -------------------------------------------------
+// The `state` column of `rhapsody_manager_wake` (design `manager-agent-design.md` §7.9). NOT a Go
+// port. The set is closed: a wake obligation is always in exactly one of these four states, and
+// only `pending`/`admitted` are unspent (M10's admission owns the admission/delivery transitions).
+
+/// A `ROUTE_TO_AUTHOR` activation wrote the obligation; the author has not yet been dispatched.
+/// Ordinary selection SKIPS the ticket while this holds, so no route-back dispatches without its
+/// seed (M9's interim guarantee until M10 lands the admission loop).
+pub const MANAGER_WAKE_PENDING: &str = "pending";
+/// The author was dispatched (or admitted to a live run's mailbox) and the obligation carries the
+/// `run_id`; delivery of the seed to that run is still outstanding.
+pub const MANAGER_WAKE_ADMITTED: &str = "admitted";
+/// The seed was written as the dispatched run's "sent" message. The obligation is SPENT.
+pub const MANAGER_WAKE_DELIVERED: &str = "delivered";
+/// A recheck at admission refused the wake (the intervention is no longer activated/current, a hold
+/// applied, or the PR closed). Terminal; the obligation wakes nobody.
+pub const MANAGER_WAKE_REFUSED: &str = "refused";
+
+/// One manager WAKE OBLIGATION (STUDIO-1016; design record `manager-agent-design.md` §7.9). No Go
+/// counterpart.
+///
+/// It is written ONLY by the activation transaction (§7.7), so a comment observed before activation
+/// cannot cause a manager-authorized dispatch. `body` is the route instructions and findings taken
+/// from the validated decision — never from a comment. M9 writes rows and makes ordinary selection
+/// skip a ticket whose obligation is still `pending`; M10 owns admission, delivery and recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagerWakeRow {
+    /// The manager intervention this obligation belongs to — the primary key.
+    pub intervention_id: String,
+    /// `owner/repo#number`, case-folded — the same spelling [`ReviewBoundRow::pr`] carries.
+    pub pr: String,
+    /// The loop generation the wake was written in (§5.1).
+    pub generation: i64,
+    /// The ticket's opaque tracker issue id the author is dispatched for. Ordinary selection keys
+    /// by this exact identity, so the skip matches the dispatch it guards.
+    pub issue_id: String,
+    /// The seed body (route instructions + findings) taken from the validated decision.
+    pub body: String,
+    /// One of the four `MANAGER_WAKE_*` states above.
+    pub state: String,
+    /// The `runs.id` of the dispatched author run, once `admitted`.
+    pub run_id: Option<i64>,
+    /// Why a refused obligation woke nobody.
+    pub reason: String,
+}
+
+/// The verdict of the §7.7 revalidation, given to [`Store::activate_manager_intervention`]. The
+/// orchestrator computes it against current loop-owned and durable state; the store applies the
+/// writes atomically only when it is [`ManagerActivationVerdict::Pass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManagerActivationVerdict {
+    /// Full revalidation passed: make the pending records effective.
+    #[default]
+    Pass,
+    /// The generation, authority, hold, open state or enablement changed. Cancel and end
+    /// `superseded` (§7.7).
+    Superseded,
+    /// The findings, membership, evidence or threshold classification changed. Cancel and end
+    /// `stale` (§7.7).
+    Stale,
+}
+
+/// Everything one activation transaction writes, gathered by the control task. Passing owned
+/// records rather than a closure keeps the whole effect set a single explicit value the store
+/// commits (or refuses) atomically.
+#[derive(Debug, Clone, Default)]
+pub struct ManagerActivation {
+    /// The intervention being activated.
+    pub intervention_id: String,
+    /// `owner/repo#number`, case-folded.
+    pub pr: String,
+    /// The generation the revalidation was made against; the transaction refuses if the durable
+    /// generation has since moved.
+    pub generation: i64,
+    /// RFC3339 UTC seconds, written to `activated_at`.
+    pub now: String,
+    /// The §7.7 revalidation verdict.
+    pub verdict: ManagerActivationVerdict,
+    /// True when a mandatory explanation was posted — recorded as `unapplied_explanation` on a
+    /// refused activation so the human feed can report the already-posted explanation as unapplied.
+    pub explanation_posted: bool,
+    /// `ESCALATE`: when `Some(reason)`, activation ends `escalated` and stops the generation
+    /// (nothing else is written).
+    pub escalate: Option<String>,
+    /// `APPROVE`: the approval record to write and make `effective`.
+    pub approval: Option<ManagerApprovalRow>,
+    /// `dismiss`: finding revisions to mark `dismissed`, by `(finding_id, revision)`.
+    pub dismissals: Vec<(String, i64)>,
+    /// `RERUN_REVIEW`: reviewers whose watch rows become `requested` (the eligible set).
+    pub rerequest: Vec<String>,
+    /// The exchange authorization to write for a non-final, post-threshold decision.
+    pub exchange: Option<ManagerExchange>,
+    /// The wake obligation to write for `ROUTE_TO_AUTHOR`.
+    pub wake: Option<ManagerWakeRow>,
+    /// Whether this is a post-threshold decision that reserves an intervention slot (§7.3). The
+    /// slot is reserved ONLY here, at activation.
+    pub reserve_slot: bool,
+    /// A refused activation's human-facing reason ("not applied: <reason>").
+    pub rescind_reason: String,
+}
+
+/// The outcome of [`Store::activate_manager_intervention`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerActivationOutcome {
+    /// The transaction committed: the pending records are effective and the intervention is
+    /// `awaiting_effect` (or `escalated`).
+    Activated,
+    /// Revalidation refused (or the durable generation moved inside the transaction): every pending
+    /// record was cancelled and the intervention ended `superseded`/`stale`/`escalated`.
+    Refused,
+    /// No row, or a terminal one: nothing was changed.
+    Absent,
+}

@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -540,6 +540,31 @@ ALTER TABLE rhapsody_review_bound ADD COLUMN manager_runs_used             INTEG
 ALTER TABLE rhapsody_review_bound ADD COLUMN manager_interventions_applied INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE rhapsody_review_bound ADD COLUMN manager_stopped               TEXT    NOT NULL DEFAULT '';
 "#,
+    // v22 -> v23: the MANAGER WAKE OBLIGATION (STUDIO-1016, design record
+    // `manager-agent-design.md` §7.9). Rhapsody-only, `rhapsody_`-prefixed, so it is gated out of
+    // the Go-recaptured schema golden by name exactly as steps 7-22 are.
+    //
+    // A `ROUTE_TO_AUTHOR` decision's wake-up is a durable obligation, NOT a comment: no manager
+    // comment carries a summon token (§7.9), so only a row in this table — written solely by the
+    // activation transaction (§7.7) — can cause a manager-authorized author dispatch. `state` is
+    // `pending`, `admitted`, `delivered` or `refused`; `body` is taken from the VALIDATED decision,
+    // never from a comment. Admission, delivery and recovery belong to M10; M9 creates the table,
+    // writes rows, and (until M10 lands) ensures ordinary selection SKIPS a ticket whose wake
+    // obligation is still `pending`, so no route-back dispatches without its seed.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_manager_wake (
+  intervention_id TEXT    NOT NULL PRIMARY KEY,
+  pr              TEXT    NOT NULL DEFAULT '',
+  generation      INTEGER NOT NULL DEFAULT 0,
+  issue_id        TEXT    NOT NULL DEFAULT '',
+  body            TEXT    NOT NULL DEFAULT '',
+  state           TEXT    NOT NULL DEFAULT 'pending',
+  run_id          INTEGER,
+  reason          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS rhapsody_manager_wake_issue
+  ON rhapsody_manager_wake(issue_id);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -706,6 +731,26 @@ fn map_manager_intervention(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manager
     })
 }
 
+/// The `rhapsody_manager_wake` columns, in DDL order — the single shared list for every wake query,
+/// read POSITIONALLY by [`map_manager_wake`].
+const MANAGER_WAKE_COLS: &str =
+    "intervention_id, pr, generation, issue_id, body, state, run_id, reason";
+
+/// Scan one `rhapsody_manager_wake` row selected with [`MANAGER_WAKE_COLS`] (positional, in DDL
+/// order). `run_id` is NULLable.
+fn map_manager_wake(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerWakeRow> {
+    Ok(ManagerWakeRow {
+        intervention_id: row.get(0)?,
+        pr: row.get(1)?,
+        generation: row.get(2)?,
+        issue_id: row.get(3)?,
+        body: row.get(4)?,
+        state: row.get(5)?,
+        run_id: row.get(6)?,
+        reason: row.get(7)?,
+    })
+}
+
 /// The literal SQL list of [`MANAGER_INTERVENTION_TERMINAL_STATES`], for the queries that must name
 /// the non-terminal set. Built from the Rust constant's string literals, which are trusted tokens
 /// (never user input), so no parameter binding is needed — and keeping the two in lockstep is the
@@ -716,6 +761,19 @@ fn manager_terminal_states_sql() -> String {
         .map(|s| format!("'{s}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Parse a case-folded pull-request key (`owner/repo#number`) into its watch-set coordinates.
+/// `None` for a malformed key, which the caller treats as "nothing to write" — a key that cannot be
+/// parsed names no watch row.
+fn split_pr_key(pr: &str) -> Option<(String, String, i64)> {
+    let (repo_part, number) = pr.rsplit_once('#')?;
+    let (owner, repo) = repo_part.split_once('/')?;
+    let number: i64 = number.parse().ok()?;
+    if owner.is_empty() || repo.is_empty() || number <= 0 {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string(), number))
 }
 
 /// Whether a lease whose `lease_expires_at` is `lease` has expired at `now`. Both are RFC3339 UTC
@@ -3358,6 +3416,359 @@ impl Store for Sqlite {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    fn save_manager_wake(&self, row: ManagerWakeRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Whole-row upsert keyed by the intervention id — the activation transaction is the single
+        // writer, so the row it last wrote is authoritative.
+        conn.execute(
+            "INSERT INTO rhapsody_manager_wake
+               (intervention_id, pr, generation, issue_id, body, state, run_id, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(intervention_id) DO UPDATE SET
+               pr         = excluded.pr,
+               generation = excluded.generation,
+               issue_id   = excluded.issue_id,
+               body       = excluded.body,
+               state      = excluded.state,
+               run_id     = excluded.run_id,
+               reason     = excluded.reason",
+            params![
+                row.intervention_id,
+                row.pr,
+                row.generation,
+                row.issue_id,
+                row.body,
+                row.state,
+                row.run_id,
+                row.reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn manager_wake(&self, intervention_id: &str) -> Result<Option<ManagerWakeRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_WAKE_COLS} FROM rhapsody_manager_wake WHERE intervention_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map(params![intervention_id], map_manager_wake)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_manager_wakes(&self) -> Result<Vec<ManagerWakeRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_WAKE_COLS} FROM rhapsody_manager_wake ORDER BY rowid"
+        ))?;
+        let rows = stmt.query_map([], map_manager_wake)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn set_manager_wake_state(
+        &self,
+        intervention_id: &str,
+        state: &str,
+        run_id: Option<i64>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_wake SET state = ?2, run_id = ?3, reason = ?4 \
+             WHERE intervention_id = ?1",
+            params![intervention_id, state, run_id, reason],
+        )?;
+        Ok(())
+    }
+
+    fn manager_wake_unspent_for_issue(&self, issue_id: &str) -> Result<bool, StoreError> {
+        if issue_id.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM rhapsody_manager_wake \
+             WHERE issue_id = ?1 AND state IN (?2, ?3)",
+            params![issue_id, MANAGER_WAKE_PENDING, MANAGER_WAKE_ADMITTED],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn activate_manager_intervention(
+        &self,
+        request: ManagerActivation,
+    ) -> Result<ManagerActivationOutcome, StoreError> {
+        use ManagerActivationOutcome::{Absent, Activated, Refused};
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+
+        let existing: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT pr, generation, state FROM rhapsody_manager_intervention WHERE id = ?1",
+                params![request.intervention_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((pr, generation, state)) = existing else {
+            return Ok(Absent);
+        };
+        if manager_intervention_is_terminal(&state) {
+            return Ok(Absent);
+        }
+
+        // The durable generation is re-read INSIDE the transaction (§7.7): even if the caller's
+        // snapshot passed, a generation that moved in the meantime refuses the activation rather than
+        // applying a decision bound to a superseded generation.
+        let durable_generation: i64 = tx
+            .query_row(
+                "SELECT generation FROM rhapsody_review_bound WHERE pr = ?1",
+                params![pr],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(generation);
+        let verdict = if durable_generation != generation {
+            ManagerActivationVerdict::Superseded
+        } else {
+            request.verdict
+        };
+
+        if verdict != ManagerActivationVerdict::Pass {
+            // Nothing takes effect. Cancel every pending local record, record the unapplied
+            // explanation, and end superseded or stale (§7.7).
+            tx.execute(
+                "UPDATE rhapsody_manager_approval SET state = ?2 \
+                 WHERE intervention_id = ?1 AND state = ?3",
+                params![
+                    request.intervention_id,
+                    MANAGER_APPROVAL_CANCELLED,
+                    MANAGER_APPROVAL_PENDING,
+                ],
+            )?;
+            let end_state = match verdict {
+                ManagerActivationVerdict::Superseded => MANAGER_INTERVENTION_SUPERSEDED,
+                _ => MANAGER_INTERVENTION_STALE,
+            };
+            tx.execute(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, unapplied_explanation = ?3, lease_boot_id = '', \
+                     lease_expires_at = '' \
+                 WHERE id = ?1",
+                params![
+                    request.intervention_id,
+                    end_state,
+                    request.explanation_posted as i64,
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(Refused);
+        }
+
+        // ESCALATE: the item goes to the human feed and the generation is stopped. Nothing else is
+        // written — an escalation activates nothing (§7.6).
+        if let Some(reason) = &request.escalate {
+            tx.execute(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, activated_at = ?3, lease_boot_id = '', lease_expires_at = '' \
+                 WHERE id = ?1",
+                params![
+                    request.intervention_id,
+                    MANAGER_INTERVENTION_ESCALATED,
+                    request.now
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1) \
+                 ON CONFLICT(pr) DO NOTHING",
+                params![pr],
+            )?;
+            tx.execute(
+                "UPDATE rhapsody_review_bound SET manager_stopped = ?2 WHERE pr = ?1",
+                params![pr, reason],
+            )?;
+            tx.commit()?;
+            return Ok(Activated);
+        }
+
+        // Make the pending approval effective (APPROVE).
+        if let Some(approval) = &request.approval {
+            tx.execute(
+                "INSERT INTO rhapsody_manager_approval
+                   (intervention_id, pr, generation, head, patch_id, evidence_rev, covered_reviewers,
+                    membership_hash, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(intervention_id) DO UPDATE SET
+                   pr                = excluded.pr,
+                   generation        = excluded.generation,
+                   head              = excluded.head,
+                   patch_id          = excluded.patch_id,
+                   evidence_rev      = excluded.evidence_rev,
+                   covered_reviewers = excluded.covered_reviewers,
+                   membership_hash   = excluded.membership_hash,
+                   state             = excluded.state",
+                params![
+                    approval.intervention_id,
+                    approval.pr,
+                    approval.generation,
+                    approval.head,
+                    approval.patch_id,
+                    approval.evidence_rev,
+                    join_findings(&approval.covered_reviewers),
+                    approval.membership_hash,
+                    MANAGER_APPROVAL_EFFECTIVE,
+                ],
+            )?;
+        }
+
+        // Dismissals take effect: bound to one finding revision, marked dismissed by this
+        // intervention (§6.3). A dismissal is never a decision on its own.
+        for (finding_id, revision) in &request.dismissals {
+            tx.execute(
+                "UPDATE rhapsody_review_finding SET status = ?4, dismissed_by = ?5 \
+                 WHERE pr = ?1 AND finding_id = ?2 AND revision = ?3",
+                params![
+                    request.pr,
+                    finding_id,
+                    revision,
+                    REVIEW_FINDING_DISMISSED,
+                    request.intervention_id,
+                ],
+            )?;
+        }
+
+        // Re-request the eligible rows (RERUN_REVIEW). Approved rows are never in the caller's set,
+        // so this cannot reset one (§6.2).
+        if let Some((owner, repo, number)) = split_pr_key(&request.pr) {
+            for reviewer in &request.rerequest {
+                tx.execute(
+                    "UPDATE rhapsody_review_watch SET status = ?5 \
+                     WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4",
+                    params![owner, repo, number, reviewer, REVIEW_STATUS_REQUESTED],
+                )?;
+            }
+        }
+
+        // The exchange authorization and the wake obligation are written ONLY here (§7.7, §7.9).
+        if let Some(exchange) = &request.exchange {
+            tx.execute(
+                "INSERT INTO rhapsody_manager_exchange
+                   (id, intervention_id, pr, generation, kind, authorized_head,
+                    authorized_patch_id, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                   intervention_id     = excluded.intervention_id,
+                   pr                  = excluded.pr,
+                   generation          = excluded.generation,
+                   kind                = excluded.kind,
+                   authorized_head     = excluded.authorized_head,
+                   authorized_patch_id = excluded.authorized_patch_id,
+                   state               = excluded.state",
+                params![
+                    exchange.id,
+                    exchange.intervention_id,
+                    exchange.pr,
+                    exchange.generation,
+                    exchange.kind,
+                    exchange.authorized_head,
+                    exchange.authorized_patch_id,
+                    exchange.state,
+                ],
+            )?;
+        }
+        if let Some(wake) = &request.wake {
+            tx.execute(
+                "INSERT INTO rhapsody_manager_wake
+                   (intervention_id, pr, generation, issue_id, body, state, run_id, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(intervention_id) DO UPDATE SET
+                   pr         = excluded.pr,
+                   generation = excluded.generation,
+                   issue_id   = excluded.issue_id,
+                   body       = excluded.body,
+                   state      = excluded.state,
+                   run_id     = excluded.run_id,
+                   reason     = excluded.reason",
+                params![
+                    wake.intervention_id,
+                    wake.pr,
+                    wake.generation,
+                    wake.issue_id,
+                    wake.body,
+                    wake.state,
+                    wake.run_id,
+                    wake.reason,
+                ],
+            )?;
+        }
+
+        // The post-threshold slot is reserved ONLY here (§7.3): a refused activation consumed none.
+        if request.reserve_slot {
+            // The bound row is the budget authority; create it if a fresh PR has none yet, so the
+            // reservation can always charge somewhere (the same upsert `reserve_manager_run` makes).
+            tx.execute(
+                "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, ?2) \
+                 ON CONFLICT(pr) DO NOTHING",
+                params![pr, generation],
+            )?;
+            tx.execute(
+                "UPDATE rhapsody_review_bound \
+                 SET manager_interventions_applied = manager_interventions_applied + 1 \
+                 WHERE pr = ?1",
+                params![pr],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE rhapsody_manager_intervention \
+             SET state = ?2, activated_at = ?3, lease_boot_id = '', lease_expires_at = '' \
+             WHERE id = ?1",
+            params![
+                request.intervention_id,
+                MANAGER_INTERVENTION_AWAITING_EFFECT,
+                request.now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Activated)
+    }
+
+    fn record_manager_outcome(
+        &self,
+        intervention_id: &str,
+        outcome: &str,
+        now: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Set ONCE per intervention id (§11.2): the `outcome IS NULL/''` guard makes a second call
+        // a no-op, so an outcome can never be overwritten.
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET outcome = ?2, outcome_at = ?3 \
+             WHERE id = ?1 AND outcome = ''",
+            params![intervention_id, outcome, now],
+        )?;
+        Ok(())
+    }
+
+    fn set_manager_memory_state(
+        &self,
+        intervention_id: &str,
+        memory_state: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET memory_state = ?2 WHERE id = ?1",
+            params![intervention_id, memory_state],
+        )?;
+        Ok(())
     }
 
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
@@ -7354,6 +7765,8 @@ mod tests {
                 "rhapsody_evidence_access".to_string(),
                 "rhapsody_manager_intervention".to_string(),
                 "rhapsody_manager_intervention_active".to_string(),
+                "rhapsody_manager_wake".to_string(),
+                "rhapsody_manager_wake_issue".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -8192,6 +8605,283 @@ mod tests {
                 .id,
             "iv-2"
         );
+    }
+
+    // --- STUDIO-1016: the activation transaction, wake rows, outcomes --------------------------
+
+    fn watch_row(reviewer: &str) -> ReviewWatchRow {
+        ReviewWatchRow {
+            key: ReviewWatchKey {
+                owner: "makewhatis".to_string(),
+                repo: "rhapsody".to_string(),
+                number: 12,
+                reviewer: reviewer.to_string(),
+            },
+            author: "bob".to_string(),
+            introduced_by: "adopt:STUDIO-1".to_string(),
+            requested_sha: "deadbeef".to_string(),
+            last_reviewed_sha: String::new(),
+            status: REVIEW_STATUS_APPROVED.to_string(),
+            open: true,
+        }
+    }
+
+    fn save_open_finding(st: &Sqlite, finding: &str) {
+        st.save_review_finding(ReviewFindingRow {
+            pr: PR.to_string(),
+            generation: 1,
+            reviewer: "alice".to_string(),
+            finding_id: finding.to_string(),
+            revision: 1,
+            review_run_id: 7,
+            raised_at_sha: "deadbeef".to_string(),
+            blocking: true,
+            status: REVIEW_FINDING_OPEN.to_string(),
+            ..ReviewFindingRow::default()
+        })
+        .expect("finding");
+    }
+
+    fn applying_row(st: &Sqlite, id: &str) {
+        save_queued(st, id, "review_escalated");
+        st.set_manager_intervention_state(id, MANAGER_INTERVENTION_APPLYING)
+            .expect("applying");
+    }
+
+    // A PASSING activation commits every effective record in ONE transaction: the approval becomes
+    // effective, the dismissal takes effect, the eligible row is re-requested, the exchange and wake
+    // are written, the slot is reserved, and the state is `awaiting_effect`.
+    //
+    // MUTATION: write the approval `effective` outside the transaction and the refused-activation
+    // test below finds it live.
+    #[test]
+    fn a_passing_activation_commits_every_effective_record() {
+        let st = open_mem();
+        applying_row(&st, "iv-1");
+        st.ensure_review_generation(PR).expect("generation");
+        save_open_finding(&st, "alice:F1");
+        st.save_review_watch(watch_row("alice")).expect("watch");
+
+        let outcome = st
+            .activate_manager_intervention(ManagerActivation {
+                intervention_id: "iv-1".to_string(),
+                pr: PR.to_string(),
+                generation: 1,
+                now: "2099-01-01T00:00:00Z".to_string(),
+                verdict: ManagerActivationVerdict::Pass,
+                explanation_posted: true,
+                approval: Some(ManagerApprovalRow {
+                    intervention_id: "iv-1".to_string(),
+                    pr: PR.to_string(),
+                    generation: 1,
+                    head: "deadbeef".to_string(),
+                    patch_id: "p1".to_string(),
+                    evidence_rev: 3,
+                    covered_reviewers: vec!["alice".to_string()],
+                    membership_hash: "mh".to_string(),
+                    state: MANAGER_APPROVAL_PENDING.to_string(),
+                }),
+                dismissals: vec![("alice:F1".to_string(), 1)],
+                rerequest: vec!["alice".to_string()],
+                exchange: Some(ManagerExchange {
+                    id: "ex-1".to_string(),
+                    intervention_id: "iv-1".to_string(),
+                    pr: PR.to_string(),
+                    generation: 1,
+                    kind: MANAGER_EXCHANGE_REVIEW_ROUND.to_string(),
+                    authorized_head: "deadbeef".to_string(),
+                    authorized_patch_id: "p1".to_string(),
+                    state: MANAGER_EXCHANGE_ACTIVE.to_string(),
+                }),
+                wake: Some(ManagerWakeRow {
+                    intervention_id: "iv-1".to_string(),
+                    pr: PR.to_string(),
+                    generation: 1,
+                    issue_id: "STUDIO-1".to_string(),
+                    body: "fix it".to_string(),
+                    state: MANAGER_WAKE_PENDING.to_string(),
+                    ..ManagerWakeRow::default()
+                }),
+                reserve_slot: true,
+                ..ManagerActivation::default()
+            })
+            .expect("activate");
+        assert_eq!(outcome, ManagerActivationOutcome::Activated);
+
+        assert_eq!(
+            st.manager_approval("iv-1")
+                .expect("approval")
+                .expect("row")
+                .state,
+            MANAGER_APPROVAL_EFFECTIVE
+        );
+        assert_eq!(
+            st.load_review_findings(PR)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(REVIEW_FINDING_DISMISSED.to_string())
+        );
+        assert_eq!(
+            st.get_review_watch(&watch_row("alice").key)
+                .expect("watch")
+                .expect("row")
+                .status,
+            REVIEW_STATUS_REQUESTED
+        );
+        assert_eq!(
+            st.manager_exchanges(PR)
+                .expect("exchanges")
+                .into_iter()
+                .find(|e| e.id == "ex-1")
+                .map(|e| e.state),
+            Some(MANAGER_EXCHANGE_ACTIVE.to_string())
+        );
+        let wake = st.manager_wake("iv-1").expect("wake").expect("row");
+        assert_eq!(wake.state, MANAGER_WAKE_PENDING);
+        assert!(
+            st.manager_wake_unspent_for_issue("STUDIO-1")
+                .expect("unspent"),
+            "a pending wake is unspent"
+        );
+        assert_eq!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .interventions_applied,
+            1,
+            "the post-threshold slot is reserved at activation"
+        );
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_AWAITING_EFFECT);
+        assert_eq!(row.activated_at, "2099-01-01T00:00:00Z");
+    }
+
+    // A REFUSED activation cancels every pending record, records `unapplied_explanation`, ends
+    // `superseded`, and reserves NOTHING (§7.3/§7.7).
+    #[test]
+    fn a_refused_activation_cancels_everything_and_reserves_nothing() {
+        let st = open_mem();
+        applying_row(&st, "iv-1");
+        st.ensure_review_generation(PR).expect("generation");
+        st.save_manager_approval(ManagerApprovalRow {
+            intervention_id: "iv-1".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            state: MANAGER_APPROVAL_PENDING.to_string(),
+            ..ManagerApprovalRow::default()
+        })
+        .expect("approval");
+
+        let outcome = st
+            .activate_manager_intervention(ManagerActivation {
+                intervention_id: "iv-1".to_string(),
+                pr: PR.to_string(),
+                generation: 1,
+                now: "2099-01-01T00:00:00Z".to_string(),
+                verdict: ManagerActivationVerdict::Superseded,
+                explanation_posted: true,
+                approval: Some(ManagerApprovalRow {
+                    intervention_id: "iv-1".to_string(),
+                    state: MANAGER_APPROVAL_EFFECTIVE.to_string(),
+                    ..ManagerApprovalRow::default()
+                }),
+                reserve_slot: true,
+                ..ManagerActivation::default()
+            })
+            .expect("activate");
+        assert_eq!(outcome, ManagerActivationOutcome::Refused);
+        assert_eq!(
+            st.manager_approval("iv-1")
+                .expect("approval")
+                .expect("row")
+                .state,
+            MANAGER_APPROVAL_CANCELLED,
+            "a refused activation leaves nothing pending"
+        );
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_SUPERSEDED);
+        assert!(row.unapplied_explanation);
+        assert_eq!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .interventions_applied,
+            0,
+            "a refused activation reserves no slot"
+        );
+    }
+
+    // The durable generation is re-read INSIDE the transaction: a snapshot that passed but whose
+    // generation moved refuses the activation.
+    #[test]
+    fn an_activation_refuses_when_the_durable_generation_moved() {
+        let st = open_mem();
+        applying_row(&st, "iv-1");
+        st.ensure_review_generation(PR).expect("generation");
+        st.increment_review_generation(PR).expect("clear"); // generation 2 now
+        let outcome = st
+            .activate_manager_intervention(ManagerActivation {
+                intervention_id: "iv-1".to_string(),
+                pr: PR.to_string(),
+                generation: 1,
+                verdict: ManagerActivationVerdict::Pass,
+                ..ManagerActivation::default()
+            })
+            .expect("activate");
+        // `increment_review_generation` already supersedes the non-terminal intervention, so the
+        // activation finds nothing live to apply; either way nothing takes effect.
+        assert_eq!(outcome, ManagerActivationOutcome::Absent);
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_SUPERSEDED
+        );
+    }
+
+    #[test]
+    fn the_wake_skip_tracks_the_obligation_state() {
+        let st = open_mem();
+        st.save_manager_wake(ManagerWakeRow {
+            intervention_id: "iv-1".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            issue_id: "STUDIO-1".to_string(),
+            state: MANAGER_WAKE_PENDING.to_string(),
+            ..ManagerWakeRow::default()
+        })
+        .expect("wake");
+        assert!(
+            st.manager_wake_unspent_for_issue("STUDIO-1")
+                .expect("unspent")
+        );
+        assert!(
+            !st.manager_wake_unspent_for_issue("STUDIO-2")
+                .expect("unspent")
+        );
+        st.set_manager_wake_state("iv-1", MANAGER_WAKE_DELIVERED, None, "")
+            .expect("deliver");
+        assert!(
+            !st.manager_wake_unspent_for_issue("STUDIO-1")
+                .expect("unspent")
+        );
+    }
+
+    // §11.2: an outcome is set ONCE per intervention id; a second call is a no-op.
+    #[test]
+    fn an_outcome_is_set_once() {
+        let st = open_mem();
+        applying_row(&st, "iv-1");
+        st.record_manager_outcome("iv-1", "superseded", "t1")
+            .expect("outcome");
+        st.record_manager_outcome("iv-1", "merged", "t2")
+            .expect("outcome");
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.outcome, "superseded");
+        assert_eq!(row.outcome_at, "t1");
     }
 
     // The 13th launch is refused and the generation stops (§7.3/§15.4). A permissive per-intervention
