@@ -645,7 +645,12 @@ impl Orchestrator {
             // TICKET dispatch; a review's is the one in `dispatch_review`.
             // No configured budget ⇒ nothing to check and no provider resolution is done, so the
             // dispatch is byte-identical to one built before this feature.
-            if review.is_none() && self.budgets_configured() {
+            //
+            // A MANAGER run is excluded for the same reason a review is (STUDIO-1049): the run is
+            // already staged in `pending_manager` and its own gate is `dispatch_manager`; a refusal
+            // at THIS point would strand it while the caller answered `Dispatched`. The design's
+            // §10.2 provider-budget deferral for a manager launch is M8's gate.
+            if review.is_none() && manager.is_none() && self.budgets_configured() {
                 let provider =
                     self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
                 if let Some((limit, spent)) = self.provider_budget_spent(&provider) {
@@ -674,7 +679,13 @@ impl Orchestrator {
             // reviewed carries no budget entry, so an ordinary first dispatch records nothing.
             // Placed after the provider-budget gate so a REFUSED dispatch does not record a round
             // that never ran.
-            self.note_author_round(&iss);
+            //
+            // Excluded for a MANAGER run (STUDIO-1049): it is not an author round, and recording one
+            // for a `pr:` manager key would charge the review↔author budget for a run that never
+            // worked a ticket. A review keeps the existing call byte-for-byte.
+            if manager.is_none() {
+                self.note_author_round(&iss);
+            }
         }
         // Arm the worker's cancellation before the spawn observes it (Go `wctx, cancel :=
         // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.
