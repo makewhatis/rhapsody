@@ -5,8 +5,9 @@
 //! hand-editing WORKFLOW.md. The operator's file carries dated explanatory comments and
 //! hot-reloads, so the write MUST NOT re-serialize it: `crate::encode` + `workflow::save` would
 //! reformat (and drop every comment in) the whole front matter. Instead [`apply_provider_edit`]
-//! splices ONLY the top-level `providers:` block, leaving every other byte of the file — body
-//! included — exactly as it was.
+//! splices ONLY the one `<id>:` entry being changed, leaving every other byte of the file —
+//! sibling providers, their comments, trailing blank lines, and the prompt body — exactly as it was.
+//! The `providers:` key itself is dropped only when the last entry is removed.
 //!
 //! The one YAML block written is produced by `encode::provider_definition_value`, i.e. the same
 //! emit-only-when-non-default rules a full `encode` uses, so an operator file edited here stays
@@ -98,56 +99,119 @@ fn front_matter_bounds(text: &str) -> Option<(usize, usize, usize)> {
     }
 }
 
-/// The byte span (within `front`) of the top-level `providers:` key plus its indented block. A
-/// column-0 `providers:` line starts the block; every following blank or indented line belongs to
-/// it; the first non-blank non-indented line ends it.
-fn providers_block_span(front: &str) -> Option<(usize, usize)> {
-    let mut start = None;
-    let mut end = 0usize;
-    let mut pos = 0usize;
-    for chunk in front.split_inclusive('\n') {
-        let content = chunk.trim_end_matches('\n').trim_end_matches('\r');
-        let next = pos + chunk.len();
-        match start {
-            None => {
-                if content.starts_with("providers:") {
-                    start = Some(pos);
-                    end = next;
-                }
-            }
-            Some(_) => {
-                let blank = content.trim().is_empty();
-                let indented = content.starts_with(' ') || content.starts_with('\t');
-                if blank || indented {
-                    end = next;
-                } else {
-                    return start.map(|s| (s, end));
-                }
-            }
-        }
-        pos = next;
-    }
-    start.map(|s| (s, end))
+/// One line of `text`, with the byte offsets that bound it (including its trailing `\n`).
+struct Line<'a> {
+    start: usize,
+    end: usize,
+    content: &'a str,
 }
 
-/// Serialize a provider map as a `providers:` block (two-space indented), or `""` for an empty map
-/// (the caller then drops the block entirely).
-fn serialize_providers_block(map: &BTreeMap<String, Value>) -> Result<String, EditError> {
-    if map.is_empty() {
-        return Ok(String::new());
+/// Split `text` into lines, each with the byte offsets that bound it.
+fn split_lines(text: &str) -> Vec<Line<'_>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for chunk in text.split_inclusive('\n') {
+        let content = chunk.trim_end_matches('\n').trim_end_matches('\r');
+        out.push(Line {
+            start: pos,
+            end: pos + chunk.len(),
+            content,
+        });
+        pos += chunk.len();
     }
+    out
+}
+
+/// The leading-space count of a YAML line. Anything else (a tab, a key) counts as column 0; the
+/// writer only ever emits spaces, so this is exact for anything it produces.
+fn indent_of(content: &str) -> usize {
+    content.chars().take_while(|c| *c == ' ').count()
+}
+
+/// The byte span (within `front`) of the whole top-level `providers:` block: the key line plus every
+/// following indented line. Trailing BLANK lines are deliberately excluded — they separate the block
+/// from the next section and belong to the operator's layout, so a write must leave them in place.
+fn providers_block_span(front: &str) -> Option<(usize, usize)> {
+    let lines = split_lines(front);
+    let idx = lines
+        .iter()
+        .position(|l| l.content.starts_with("providers:"))?;
+    let start = lines[idx].start;
+    let mut end = lines[idx].end;
+    for l in &lines[idx + 1..] {
+        if l.content.trim().is_empty() {
+            continue;
+        }
+        if indent_of(l.content) == 0 {
+            break;
+        }
+        end = l.end;
+    }
+    Some((start, end))
+}
+
+/// The byte span (within `front`) of ONE `  <id>:` entry inside the `providers:` block: its key line
+/// and every following line indented deeper than two spaces. A blank line or anything at two spaces
+/// or less (a sibling entry, a section comment, the next top-level key) ends it, so a sibling
+/// provider and the comments around it stay byte-identical. `None` when `id` is not defined.
+fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
+    let lines = split_lines(front);
+    let key_idx = lines
+        .iter()
+        .position(|l| l.content.starts_with("providers:"))?;
+    let needle = format!("{id}:");
+    let mut i = key_idx + 1;
+    while i < lines.len() {
+        let l = &lines[i];
+        if l.content.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = indent_of(l.content);
+        if indent == 0 {
+            return None; // the block ends before this entry
+        }
+        if indent == 2
+            && let Some(rest) = l.content[2..].strip_prefix(&needle)
+            && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('#'))
+        {
+            let mut end = l.end;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let n = &lines[j];
+                if n.content.trim().is_empty() || indent_of(n.content) <= 2 {
+                    break;
+                }
+                end = n.end;
+                j += 1;
+            }
+            return Some((l.start, end));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Serialize one provider entry as a two-space-indented `  <id>:` block (its mapping body indented
+/// four spaces), the exact fragment spliced into an operator's file.
+fn serialize_provider_entry(id: &str, value: &Value) -> Result<String, EditError> {
     let mut mapping = Mapping::new();
-    for (id, value) in map {
-        mapping.insert(Value::String(id.clone()), value.clone());
-    }
+    mapping.insert(Value::String(id.to_string()), value.clone());
     let inner = serde_yaml_ng::to_string(&Value::Mapping(mapping))
         .map_err(|e| EditError::Serialize(e.to_string()))?;
-    let mut out = String::from("providers:\n");
+    let mut out = String::new();
     for line in inner.lines() {
         out.push_str("  ");
         out.push_str(line);
         out.push('\n');
     }
+    Ok(out)
+}
+
+/// A fresh `providers:` key line plus one serialized entry, for a file that had no providers block.
+fn serialize_new_providers_block(id: &str, value: &Value) -> Result<String, EditError> {
+    let mut out = String::from("providers:\n");
+    out.push_str(&serialize_provider_entry(id, value)?);
     Ok(out)
 }
 
@@ -188,10 +252,12 @@ fn providers_map(front: &str) -> Result<BTreeMap<String, Value>, EditError> {
     }
 }
 
-/// Apply an add/edit/remove to `text`, returning the new file contents. Every byte outside the
-/// top-level `providers:` block is preserved exactly; a file with no front matter gains one whose
-/// body is the original text unchanged. `definition` is required for add/edit and ignored for
-/// remove. `previous_id` renames an existing key on edit (default: `id`).
+/// Apply an add/edit/remove to `text`, returning the new file contents. The write splices ONLY the
+/// one `<id>:` entry being changed (dropping the `providers:` key only when the last entry goes), so
+/// every other byte — comments, sibling providers, trailing blank lines, the prompt body — is
+/// preserved exactly. A file with no front matter gains one whose body is the original text
+/// unchanged. `definition` is required for add/edit and ignored for remove. `previous_id` renames an
+/// existing key on edit (default: `id`).
 pub fn apply_provider_edit(
     text: &str,
     op: ProviderOp,
@@ -206,29 +272,43 @@ pub fn apply_provider_edit(
     }
 
     let bounds = front_matter_bounds(text);
-    let front = match bounds {
-        Some((s, e, _)) => &text[s..e],
+    let (front_start, front_end) = match bounds {
+        Some((s, e, _)) => (s, e),
         // No front matter yet: an add can create one; anything else has nothing to edit.
         None => {
             if op == ProviderOp::Add {
-                let mut map = BTreeMap::new();
                 let def = definition.ok_or_else(|| EditError::NotFound(id.to_string()))?;
-                map.insert(id.to_string(), provider_value(def)?);
-                let block = serialize_providers_block(&map)?;
+                let block = serialize_new_providers_block(id, &provider_value(def)?)?;
                 return Ok(format!("---\n{block}---\n{text}"));
             }
             return Err(EditError::NotFound(key));
         }
     };
+    let front = &text[front_start..front_end];
 
+    // The map is validated for existence and uniqueness; the SPLICE target is computed from the raw
+    // text so only the touched entry's bytes change.
     let mut map = providers_map(front)?;
-    match op {
+    let (start, end, replacement) = match op {
         ProviderOp::Add => {
             if map.contains_key(id) {
                 return Err(EditError::AlreadyExists(id.to_string()));
             }
             let def = definition.ok_or_else(|| EditError::NotFound(id.to_string()))?;
-            map.insert(id.to_string(), provider_value(def)?);
+            let entry = serialize_provider_entry(id, &provider_value(def)?)?;
+            match providers_block_span(front) {
+                // Insert after the block's last non-blank line, before any trailing blank lines.
+                Some((_, block_end)) => (block_end, block_end, entry),
+                None => {
+                    let mut insertion = String::new();
+                    if !front.is_empty() && !front.ends_with('\n') {
+                        insertion.push('\n');
+                    }
+                    insertion.push_str("providers:\n");
+                    insertion.push_str(&entry);
+                    (front.len(), front.len(), insertion)
+                }
+            }
         }
         ProviderOp::Edit => {
             if !map.contains_key(&key) {
@@ -238,34 +318,32 @@ pub fn apply_provider_edit(
                 return Err(EditError::AlreadyExists(id.to_string()));
             }
             let def = definition.ok_or_else(|| EditError::NotFound(id.to_string()))?;
-            let value = provider_value(def)?;
-            map.remove(&key);
-            map.insert(id.to_string(), value);
+            let entry = serialize_provider_entry(id, &provider_value(def)?)?;
+            let (s, e) =
+                provider_entry_span(front, &key).ok_or_else(|| EditError::NotFound(key.clone()))?;
+            (s, e, entry)
         }
         ProviderOp::Remove => {
             if map.remove(&key).is_none() {
                 return Err(EditError::NotFound(key));
             }
-        }
-    }
-
-    let block = serialize_providers_block(&map)?;
-    let (front_start, front_end, _) = bounds.expect("bounds checked above");
-    let new_front = match providers_block_span(front) {
-        Some((bs, be)) => {
-            let mut s = String::with_capacity(front.len() + block.len());
-            s.push_str(&front[..bs]);
-            s.push_str(&block);
-            s.push_str(&front[be..]);
-            s
-        }
-        None => {
-            let mut s = String::with_capacity(front.len() + block.len());
-            s.push_str(front);
-            s.push_str(&block);
-            s
+            let (s, e) =
+                provider_entry_span(front, &key).ok_or_else(|| EditError::NotFound(key.clone()))?;
+            if map.is_empty() {
+                // The last provider is gone: drop the whole key (trailing blank lines stay).
+                let (bs, be) =
+                    providers_block_span(front).ok_or_else(|| EditError::NotFound(key.clone()))?;
+                (bs, be, String::new())
+            } else {
+                (s, e, String::new())
+            }
         }
     };
+
+    let mut new_front = String::with_capacity(front.len() + replacement.len());
+    new_front.push_str(&front[..start]);
+    new_front.push_str(&replacement);
+    new_front.push_str(&front[end..]);
     let mut out = String::with_capacity(text.len() + new_front.len());
     out.push_str(&text[..front_start]);
     out.push_str(&new_front);
@@ -362,7 +440,9 @@ mod tests {
     use crate::providers::BrokerLimits;
     use crate::workflow::load;
 
-    /// A comment-rich operator file — exactly the thing a re-serializing write would destroy.
+    /// A comment-rich operator file — exactly the thing a re-serializing write would destroy. It
+    /// carries two providers, a comment on each, a trailing blank line after the block, and a comment
+    /// on the next section, so a write that touches one provider must leave all of those untouched.
     /// A raw literal (NOT `\` line continuations, which strip the next line's indentation).
     const COMMENT_RICH: &str = r"---
 # why this file exists
@@ -381,8 +461,36 @@ providers:
     base_url: https://legacy.example/v1
     credential:
       source: keychain
+  # the account with the hard spend cap
+  fireworks:
+    protocol: openai-compatible
+    base_url: https://api.fireworks.ai/inference/v1
+    credential:
+      source: keychain
+    broker_limits:
+      max_reserved_token_units_per_utc_day: 1000000
+
+# a note between sections
 claude:
   # another dated note next to a tunable
+  turn_timeout_ms: 1800000
+---
+Do the work for {{ issue.identifier }}.
+";
+
+    /// A file with exactly one provider, so removing it must drop the `providers:` key as well.
+    const SINGLE: &str = r"---
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+  project_slug: symphony
+providers:
+  legacy:
+    protocol: openai-compatible
+    base_url: https://legacy.example/v1
+
+# a note between sections
+claude:
   turn_timeout_ms: 1800000
 ---
 Do the work for {{ issue.identifier }}.
@@ -400,63 +508,64 @@ Do the work for {{ issue.identifier }}.
         }
     }
 
-    /// The set of lines with the `providers:` block removed — the "everything else" a byte-preserving
-    /// write must leave untouched.
-    fn without_providers_block(text: &str) -> String {
-        let Some((front_start, front_end, body_start)) = front_matter_bounds(text) else {
+    /// The file with ONLY the one `<id>:` entry's bytes removed — the precise "everything else" a
+    /// byte-preserving write must leave untouched. Comparing this against the original minus the same
+    /// entry catches a write that drops a sibling comment, a sibling provider, or a trailing blank
+    /// line, none of which a whole-block strip on both sides can see.
+    fn without_provider_entry(text: &str, id: &str) -> String {
+        let Some((front_start, front_end, _)) = front_matter_bounds(text) else {
             return text.to_string();
         };
         let front = &text[front_start..front_end];
-        let stripped = match providers_block_span(front) {
-            Some((bs, be)) => {
-                let mut s = front.to_string();
-                s.replace_range(bs..be, "");
-                s
+        match provider_entry_span(front, id) {
+            Some((s, e)) => {
+                let mut out = String::with_capacity(text.len());
+                out.push_str(&text[..front_start + s]);
+                out.push_str(&text[front_start + e..]);
+                out
             }
-            None => front.to_string(),
-        };
-        format!(
-            "{}{}{}",
-            &text[..front_start],
-            stripped,
-            &text[body_start..]
-        )
+            None => text.to_string(),
+        }
     }
 
-    // MUTATION GUARD: if the write re-serializes the whole file (encode + workflow::save), the
+    // MUTATION GUARD: if the write re-serializes the whole file (encode + workflow::save), the dated
     // comments below vanish and this test turns red. It must stay red under that mutation.
     #[test]
     fn add_preserves_every_other_line_byte_for_byte() {
         let text = apply_provider_edit(
             COMMENT_RICH,
             ProviderOp::Add,
-            "fireworks",
+            "openai",
             None,
-            Some(&def("fireworks", "https://api.fireworks.ai/inference/v1")),
+            Some(&def("openai", "https://api.openai.com/v1")),
         )
         .expect("add");
         assert!(
             text.contains("# a dated note: this timeout was raised after the Oct incident"),
             "comment lost:\n{text}"
         );
-        // Comments OUTSIDE the edited block survive (the block itself is the thing being rewritten).
+        assert!(
+            text.contains("# the account with the hard spend cap"),
+            "sibling comment lost:\n{text}"
+        );
+        // Removing exactly the added entry must hand back the original file, byte for byte.
         assert_eq!(
-            without_providers_block(&text),
-            without_providers_block(COMMENT_RICH),
-            "the add rewrote bytes outside the providers block"
+            without_provider_entry(&text, "openai"),
+            COMMENT_RICH,
+            "the add rewrote bytes outside the added provider entry"
         );
         // The new definition is present and canonical.
         let reloaded = load_from(&text);
-        assert!(text.contains("fireworks:"), "{text}");
+        assert!(text.contains("openai:"), "{text}");
         assert!(
-            text.contains("base_url: https://api.fireworks.ai/inference/v1"),
+            text.contains("base_url: https://api.openai.com/v1"),
             "{text}"
         );
         assert!(!reloaded.is_empty());
     }
 
     #[test]
-    fn edit_rewrites_only_the_block() {
+    fn edit_rewrites_only_the_entry() {
         let text = apply_provider_edit(
             COMMENT_RICH,
             ProviderOp::Edit,
@@ -470,21 +579,53 @@ Do the work for {{ issue.identifier }}.
             "{text}"
         );
         assert!(!text.contains("https://legacy.example/v1"), "{text}");
+        // A sibling provider, its comment, the trailing blank line, and the next section all survive.
+        assert!(
+            text.contains("# the account with the hard spend cap"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1000000\n\n# a note between sections"),
+            "trailing blank line lost:\n{text}"
+        );
         assert_eq!(
-            without_providers_block(&text),
-            without_providers_block(COMMENT_RICH)
+            without_provider_entry(&text, "legacy"),
+            without_provider_entry(COMMENT_RICH, "legacy")
         );
     }
 
     #[test]
-    fn remove_drops_only_the_block() {
+    fn remove_drops_only_the_entry() {
         let text = apply_provider_edit(COMMENT_RICH, ProviderOp::Remove, "legacy", None, None)
             .expect("remove");
+        assert!(!text.contains("legacy.example"), "{text}");
+        // The sibling provider and every comment around it survive the removal.
+        assert!(text.contains("fireworks:"), "{text}");
+        assert!(
+            text.contains("# the account with the hard spend cap"),
+            "sibling comment lost:\n{text}"
+        );
+        assert!(
+            text.contains("1000000\n\n# a note between sections"),
+            "trailing blank line lost:\n{text}"
+        );
+        assert_eq!(
+            without_provider_entry(&text, "legacy"),
+            without_provider_entry(COMMENT_RICH, "legacy")
+        );
+    }
+
+    #[test]
+    fn remove_of_the_last_provider_drops_the_key_but_keeps_surroundings() {
+        let text =
+            apply_provider_edit(SINGLE, ProviderOp::Remove, "legacy", None, None).expect("remove");
         assert!(!text.contains("providers:"), "{text}");
         assert!(!text.contains("legacy.example"), "{text}");
-        assert_eq!(
-            without_providers_block(&text),
-            without_providers_block(COMMENT_RICH)
+        // The trailing blank line and the next section are untouched.
+        assert!(text.contains("\n\n# a note between sections"), "{text}");
+        assert!(
+            text.contains("claude:\n  turn_timeout_ms: 1800000"),
+            "{text}"
         );
     }
 
