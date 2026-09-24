@@ -207,9 +207,20 @@ async fn deliver_comment(request: &ManagerApplyRequest, deps: &ManagerApplyDeps)
 /// §7.6: confirm a ticket move by reading the state back, bounded by [`TICKET_MOVE_READS`]. A move
 /// is done only when the ticket's CURRENT state equals the moved-to state; anything else (including
 /// an unreadable tracker) is unconfirmed, and the caller reports `unknown`.
+///
+/// The comparison is on [`rhapsody_core::normalize_state`], not the raw strings: the tracker
+/// resolves a configured state NAME case-insensitively (`linear/move_state.rs`), so a config value
+/// like `in progress` moves to Linear's `In Progress` and the read-back returns the display name.
+/// Comparing raw strings would report every such successful move `unknown`.
 async fn confirm_ticket_move(deps: &ManagerApplyDeps, mv: &ManagerTicketMove) -> bool {
+    let want = rhapsody_core::normalize_state(&mv.state);
     for attempt in 0..TICKET_MOVE_READS {
-        if deps.control.read_issue_state(&mv.issue_id).await.as_deref() == Some(mv.state.as_str()) {
+        if deps
+            .control
+            .read_issue_state(&mv.issue_id)
+            .await
+            .is_some_and(|got| rhapsody_core::normalize_state(&got) == want)
+        {
             return true;
         }
         if attempt + 1 < TICKET_MOVE_READS {
@@ -452,6 +463,45 @@ mod tests {
                 MANAGER_EFFECT_DONE.to_string()
             )],
             "a move that landed is confirmed by the read-back even though the command errored"
+        );
+    }
+
+    // §7.6 (B6): the read-back compares NORMALIZED states, because the tracker resolves a
+    // configured state name case-insensitively. A config value `in progress` moves the ticket to
+    // Linear's `In Progress`, and the read-back returns the display name; a raw-string compare would
+    // report every such successful move `unknown` and stop the generation. MUTATION: compare the raw
+    // strings and this reds.
+    #[tokio::test]
+    async fn a_ticket_move_read_back_compares_normalized_states() {
+        let mut fake = rhapsody_tracker::fake::Fake::new();
+        fake.by_id.insert(
+            "uuid-1".to_string(),
+            rhapsody_core::Issue {
+                id: "uuid-1".to_string(),
+                state: "In Progress".to_string(),
+                ..Default::default()
+            },
+        );
+        let fake = Arc::new(fake);
+        let comments = Arc::new(RecordingComments::default());
+        let (deps, results) = deps(PreEffectCheck::Proceed, Some(Arc::clone(&fake)), comments);
+        let mut request = comment_request(MANAGER_EFFECT_TICKET_MOVE);
+        request.effects = vec![MANAGER_EFFECT_TICKET_MOVE.to_string()];
+        request.ticket_move = Some(ManagerTicketMove {
+            issue_id: "uuid-1".to_string(),
+            team_id: "team".to_string(),
+            state: "in progress".to_string(),
+        });
+        perform_manager_apply(request, &deps).await;
+        let results = take_results(&results).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].outcomes,
+            vec![(
+                MANAGER_EFFECT_TICKET_MOVE.to_string(),
+                MANAGER_EFFECT_DONE.to_string()
+            )],
+            "a name resolved case-insensitively is confirmed by the normalized read-back"
         );
     }
 
