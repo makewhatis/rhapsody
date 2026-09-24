@@ -1389,7 +1389,7 @@ mod tests {
 
     use super::*;
     use crate::managerselftest::{SelfTestRecord, SelfTestVerdict};
-    use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project};
+    use crate::testsupport::{DispatchedEntries, empty_effective, empty_resolved_project, issue};
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const PR_KEY: &str = "makewhatis/rhapsody#12";
@@ -2704,6 +2704,59 @@ mod tests {
             .set_manager_wake_state(&id, rhapsody_store::MANAGER_WAKE_DELIVERED, None, "")
             .expect("deliver");
         assert!(!o.manager_wake_blocks_selection(&wake.issue_id));
+    }
+
+    // §15.4 "Waking the author": a manager comment observed BEFORE activation has no effect — no
+    // wake obligation exists yet, so nothing can be admitted. MUTATION: write the wake at `applying`
+    // and the wake-absent assert reds.
+    #[test]
+    fn no_wake_obligation_exists_before_activation() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLYING);
+        assert!(
+            o.store().manager_wake(&id).expect("read").is_none(),
+            "the wake obligation is written only by the activation transaction"
+        );
+        let cand = issue("ID-1", "STUDIO-1", "In Progress");
+        o.pump_manager_wakes(&[(&cand, None)]);
+        assert!(
+            o.running.is_empty(),
+            "nothing wakes the author pre-activation"
+        );
+    }
+
+    // §15.4 "Waking the author": the explanation succeeds but the TICKET MOVE fails. There is no
+    // activation, no wake obligation and no wake-up. MUTATION: activate (and write the wake) before
+    // every mandatory effect is done and the apply_failed/wake-absent asserts red.
+    #[test]
+    fn a_failed_ticket_move_writes_no_wake_obligation() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        o.handle_manager_effect(&crate::managerapply::ManagerEffectResult {
+            intervention_id: id.clone(),
+            pr: PR_KEY.to_string(),
+            outcomes: vec![
+                (
+                    crate::managerapply::MANAGER_EFFECT_EXPLANATION.to_string(),
+                    crate::managerapply::MANAGER_EFFECT_DONE.to_string(),
+                ),
+                (
+                    crate::managerapply::MANAGER_EFFECT_TICKET_MOVE.to_string(),
+                    crate::managerapply::MANAGER_EFFECT_FAILED.to_string(),
+                ),
+            ],
+            reason: "the tracker refused the move".to_string(),
+            halted: None,
+        });
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLY_FAILED);
+        assert!(
+            o.store().manager_wake(&id).expect("read").is_none(),
+            "a failed mandatory effect writes no wake obligation"
+        );
+        assert!(o.running.is_empty(), "nobody was woken");
     }
 
     // §7.5/§7.7 recovery: a crash after the comment succeeded but BEFORE activation revalidates and

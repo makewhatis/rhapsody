@@ -338,7 +338,7 @@ impl Orchestrator {
     /// the absence of an open row is the control task's observable signal that the PR is no longer
     /// open. `None` when the store cannot be read: the caller must fail closed and must NOT treat an
     /// unreadable store as "closed".
-    fn manager_pr_open(&self, pr: &str) -> Option<bool> {
+    pub(crate) fn manager_pr_open(&self, pr: &str) -> Option<bool> {
         self.store().load_live_review_watch().ok().map(|rows| {
             rows.iter().any(|r| {
                 r.open

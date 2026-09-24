@@ -1071,6 +1071,14 @@ impl Orchestrator {
                     tagged.iter().map(|t| t.iss.id.clone()).collect();
                 self.cancel_dropped_preparations(&present);
             }
+            // STUDIO-1017 (§7.9): admit any pending manager wake obligation BEFORE ordinary
+            // selection, so the author is dispatched once, with its seed, and selection never sees
+            // the ticket as a fresh dispatch.
+            let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> = tagged
+                .iter()
+                .map(|t| (&t.iss, self.route_for(t.proj)))
+                .collect();
+            self.pump_manager_wakes(&wake_candidates);
             let (picked, reopen, held_for_capacity) =
                 self.select_dispatch_multi_after_fetch(tagged, read_the_board);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
@@ -1168,6 +1176,11 @@ impl Orchestrator {
                 issues.iter().map(|i| i.id.clone()).collect();
             self.cancel_dropped_preparations(&present);
         }
+        // STUDIO-1017 (§7.9): the legacy ladder's half of the wake admission — see the multi-project
+        // ladder above for why it runs before selection.
+        let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> =
+            issues.iter().map(|iss| (iss, None)).collect();
+        self.pump_manager_wakes(&wake_candidates);
         let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger

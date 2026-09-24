@@ -1053,6 +1053,12 @@ pub struct Orchestrator {
     /// exist until an asynchronous preparation is accepted, which can be several events later. Empty
     /// on every non-reopen dispatch.
     pub(crate) pending_reopen_summons: HashMap<String, (DateTime<Utc>, String)>,
+    /// A manager wake obligation whose author run does not exist yet, held from the admission
+    /// (`managerwake.rs`) until `dispatch_issue_prepared` makes the run live and seeds the body
+    /// (STUDIO-1017, §7.9). Needed because the run does not exist until an asynchronous
+    /// preparation is accepted, which can be several events later — and the obligation must not be
+    /// marked spent before the dispatch is recoverable. Empty on every non-wake dispatch.
+    pub(crate) pending_manager_wakes: HashMap<String, rhapsody_store::ManagerWakeRow>,
 
     // --- STUDIO-999 (PB4): the daemon's broker registration handle (Rhapsody-only). ---
     /// The cloneable provider-broker registration handle the composition root injects before
@@ -1227,6 +1233,7 @@ impl Orchestrator {
             prepare_expected_revisions: HashMap::new(),
             credential_revisions: None,
             pending_reopen_summons: HashMap::new(),
+            pending_manager_wakes: HashMap::new(),
             // STUDIO-999 (PB4): no broker handle by default. The daemon injects the real one after
             // construction and before `control()`; tests leave it `None`.
             provider_broker: None,

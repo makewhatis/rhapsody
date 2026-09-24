@@ -1261,8 +1261,11 @@ impl Orchestrator {
             PreparationOutcome::Refused(reason) => {
                 // A refusal never dispatches, so a reopening summons captured for this identity is
                 // dropped with it (a later run must not inherit a summons from a reopen that never
-                // happened).
+                // happened). The same holds for a held manager wake obligation (STUDIO-1017): its
+                // row stays `pending` and is re-planned by the wake admission, never seeded into
+                // this refused run.
                 self.pending_reopen_summons.remove(&id);
+                self.pending_manager_wakes.remove(&id);
                 let now = (self.now)();
                 // The key holds identity+selection; the revision and reason code are the episode
                 // identity. A changed revision OR reason code (or no prior entry) is a fresh episode
@@ -1566,6 +1569,9 @@ impl Orchestrator {
                     // the summons it captured: the reopen is re-offered on a later tick and will
                     // re-capture it then, and a lingering entry could seed an unrelated later run.
                     self.pending_reopen_summons.remove(&issue.id);
+                    // The same for a held manager wake obligation (STUDIO-1017): its row is still
+                    // `pending` and re-planned; the held entry must not seed a later run.
+                    self.pending_manager_wakes.remove(&issue.id);
                     tracing::debug!(
                         issue = %issue.identifier,
                         "preparation suppressed by the refusal gate until its next probe"
@@ -1849,8 +1855,10 @@ impl Orchestrator {
     /// genuinely gone. A fresh dispatch holds no claim and this is a no-op.
     fn abandon_prepared(&mut self, entry: PreparingEntry, cause: AbandonCause) {
         // A preparation that ended without dispatching must not leave a reopening summons behind for
-        // an unrelated later run to inherit.
+        // an unrelated later run to inherit — nor a held manager wake obligation (STUDIO-1017), whose
+        // row stays `pending` and is re-planned by the wake admission.
         self.pending_reopen_summons.remove(entry.key.id());
+        self.pending_manager_wakes.remove(entry.key.id());
         if !entry.claim_already_held {
             return;
         }

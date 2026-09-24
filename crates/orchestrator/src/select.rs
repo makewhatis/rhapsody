@@ -269,6 +269,20 @@ impl Orchestrator {
                 );
                 continue;
             }
+            // STUDIO-1017 (§7.8 path 3): after the round threshold, in `act` mode, a ticket whose
+            // pull request has passed the threshold is not dispatched without an active
+            // `author_round` authorization — the manager's next decision owns the exchange, and the
+            // human feed reports it as awaiting the manager. The wake admission is the authorized
+            // path; this is the safety net. A person's summons (the reopen ladder above) is an
+            // operator action and is deliberately NOT gated.
+            if !self.author_dispatch_authorized(&iss) {
+                tracing::info!(
+                    issue_identifier = %iss.identifier,
+                    "awaiting manager: a post-threshold author dispatch needs an author_round \
+                     authorization"
+                );
+                continue;
+            }
             // Work already materialized as a linked PR with no newer summons → don't fresh-dispatch
             // on a state flap. Info-level so a suppressed issue isn't an unexplained live-list hang.
             if self.pr_suppressed(&iss) {
@@ -575,6 +589,19 @@ impl Orchestrator {
                 if !self.review_reopen_eligible(&ti.iss, &running) {
                     continue;
                 }
+                // STUDIO-1017 (§7.9): the multi-project ladder's half of the wake-obligation
+                // guard — an author whose `ROUTE_TO_AUTHOR` wake obligation is still unspent is
+                // NOT dispatched by ordinary selection. Mirrored from the single-project reopen
+                // branch or the skip is silently absent on every `projects:` install.
+                if self.manager_wake_blocks_selection(&ti.iss.id)
+                    || self.manager_wake_blocks_selection(&ti.iss.identifier)
+                {
+                    tracing::debug!(
+                        issue_identifier = %ti.iss.identifier,
+                        "skipping reopen: a pending manager wake obligation owns this dispatch"
+                    );
+                    continue;
+                }
                 // STUDIO-956: the multi-project ladder's half of the author-side budget guard —
                 // mirrored here or the feature is silently absent on every `projects:` install.
                 if self.author_round_budget_spent(&ti.iss) {
@@ -638,6 +665,34 @@ impl Orchestrator {
                 } else {
                     self.log_blocked_skip(&ti.iss, &elig.blocked_by);
                 }
+                continue;
+            }
+            // STUDIO-1017 (§7.9): the multi-project ladder's half of the wake-obligation
+            // guard — a ticket with an unspent manager wake obligation is owned by the wake
+            // admission, so it is never dispatched twice. Mirrored from the single-project
+            // active branch or the skip is silently absent on every `projects:` install.
+            if self.manager_wake_blocks_selection(&ti.iss.id)
+                || self.manager_wake_blocks_selection(&ti.iss.identifier)
+            {
+                tracing::debug!(
+                    issue_identifier = %ti.iss.identifier,
+                    "skipping dispatch: a pending manager wake obligation owns this dispatch"
+                );
+                continue;
+            }
+            // STUDIO-1017 (§7.8 path 3): the multi-project ladder's half of the author gate.
+            // After the round threshold, in `act` mode, a ticket whose pull request has passed
+            // the threshold is not dispatched without an active `author_round` authorization —
+            // the manager's next decision owns the exchange, and the human feed reports it as
+            // awaiting the manager. The wake admission is the authorized path; this is the
+            // safety net. Mirrored from the single-project active branch (STUDIO-956 mirrored
+            // the budget guard here for the same reason).
+            if !self.author_dispatch_authorized(&ti.iss) {
+                tracing::info!(
+                    issue_identifier = %ti.iss.identifier,
+                    "awaiting manager: a post-threshold author dispatch needs an author_round \
+                     authorization"
+                );
                 continue;
             }
             if self.pr_suppressed(&ti.iss) {

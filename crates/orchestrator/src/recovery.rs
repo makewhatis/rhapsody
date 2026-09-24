@@ -51,6 +51,11 @@ impl Orchestrator {
         // rounds against a cap of 16, so this is as much a part of boot recovery as the retries are.
         self.rehydrate_review_bounds();
 
+        // STUDIO-1017 (§7.9): an `admitted` wake obligation whose seed was never delivered is a run
+        // that died with the daemon. Return it to `pending` so a later tick admits it again — the
+        // author is woken at most once per live run, and never lost.
+        self.recover_manager_wakes();
+
         let rec = match self.store.load_recovery() {
             Ok(r) => r,
             Err(e) => {
