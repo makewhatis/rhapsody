@@ -13,8 +13,12 @@
 //!   manager provider's own limits — no teammate lease or capability is borrowed;
 //! * the turn runs through the harness adapter contract (`build_dispatch_runner` →
 //!   `Session::run_turn_brokered`), not a second bespoke subprocess;
-//! * the WHOLE thing runs off the orchestrator control task (inside the off-loop triage task) and is
-//!   bounded by `manager.timeout_ms`, so a hung manager can never stall dispatch.
+//! * the WHOLE thing runs off the orchestrator control task — the off-loop triage task for
+//!   assignment and room turns, the review watcher's task for adjudication — and is bounded by
+//!   `manager.timeout_ms`, so a hung manager can never stall dispatch.
+//! * the manager never retains a session across invocations: each gets a fresh synthetic identity and
+//!   drops its own session state, so a timed-out turn cannot leak its OpenCode session into the next
+//!   decision.
 //!
 //! # The legacy lane is preserved, not re-implemented
 //!
@@ -70,7 +74,9 @@ fn manager_invocation_identifier() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("rhapsody-manager-{nanos:x}-{seq:x}")
+    // The pid, a monotonic clock and a per-process counter together: two invocations in one process
+    // can never collide, and two daemons sharing a state root are separated by pid.
+    format!("rhapsody-manager-{}-{nanos:x}-{seq:x}", std::process::id())
 }
 
 /// One manager invocation's fully prepared inputs, after the manager tuple resolved and (for the
