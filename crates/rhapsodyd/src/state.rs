@@ -20,6 +20,7 @@ use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
+use rhapsody_orchestrator::managerread::ManagerReadOutcome;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -447,6 +448,62 @@ impl StateProvider for DaemonState {
     /// control task to own (`rundiff`'s module doc).
     async fn run_diff(&self, run_id: i64) -> DiffOutcome {
         self.handle.run_diff(run_id).await
+    }
+
+    // --- the manager run's host-served reads (STUDIO-1014 §4.4) ---
+    //
+    // Each resolves the run's own coordinate on the handle and reads git objects from the live
+    // workspace mirror; `diff`/`interdiff` also record the evidence-access log (§5.5). No control
+    // round trip beyond the workspace manager lookup, and no claim taken — nothing here can stall
+    // dispatch.
+    async fn manager_file(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
+        self.handle.manager_file(run_id, &sha, &path).await
+    }
+
+    async fn manager_ls(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
+        self.handle.manager_ls(run_id, &sha, &path).await
+    }
+
+    async fn manager_grep(
+        &self,
+        run_id: i64,
+        sha: String,
+        pattern: String,
+        path: String,
+    ) -> ManagerReadOutcome {
+        self.handle
+            .manager_grep(run_id, &sha, &pattern, &path)
+            .await
+    }
+
+    async fn manager_diff(&self, run_id: i64, from: String, to: String) -> ManagerReadOutcome {
+        self.handle.manager_diff(run_id, &from, &to).await
+    }
+
+    async fn manager_interdiff(&self, run_id: i64, from: String, to: String) -> ManagerReadOutcome {
+        self.handle.manager_interdiff(run_id, &from, &to).await
+    }
+
+    async fn manager_patch_id(&self, run_id: i64, sha: String) -> ManagerReadOutcome {
+        self.handle.manager_patch_id(run_id, &sha).await
+    }
+
+    async fn manager_findings(&self, run_id: i64) -> ManagerReadOutcome {
+        self.handle.manager_findings(run_id).await
+    }
+
+    // The manager's pull-request reads run on the host's own off-loop `gh` (§4.4); the coordinate
+    // is the run's own, resolved on the handle exactly as the git reads' is.
+    async fn manager_pr(&self, run_id: i64) -> ManagerReadOutcome {
+        self.handle.manager_pr(run_id).await
+    }
+
+    async fn manager_pr_activity(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.handle.manager_pr_activity(run_id, &since).await
+    }
+
+    async fn manager_pr_commits(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.handle.manager_pr_commits(run_id, &since).await
     }
 
     fn teams_config_path(&self) -> &str {

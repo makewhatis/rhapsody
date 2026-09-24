@@ -26,6 +26,11 @@ discovery — the daemon stays the single source of truth for everything else.
 - `writes.rs` — the config-gated write tools (`symphony_send_message`, `_stop`, `_resume`,
   `_handoff`), registered via a second `#[tool_router(router = write_router)]` on the same `Facade`
   impl, then merged and pruned in `Facade::new`.
+- `manager.rs` — the manager ROLE (STUDIO-1014; design `manager-agent-design.md` §4.4): a third
+  router `manager_router` whose `MANAGER_TOOL_NAMES` is the FIXED manager set. `Facade::new` prunes
+  every route outside that set when `Options.role == Role::Manager` (independent of `cfg.mcp`/Teams)
+  and skips brand aliases. The `manager_*` tools proxy daemon `/api/v1/manager/*` reads. `--role` is
+  parsed by `rhapsodyd mcp`.
 - `testutil.rs` (`cfg(test)` only) — `spawn_router` (axum stub on an ephemeral port),
   `client_for_port`, `test_config`. Shared by every module's unit tests.
 - `tests/fixtures_stub.rs` — the crate's one integration test: drives the tools through an

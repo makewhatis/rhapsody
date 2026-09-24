@@ -13,6 +13,7 @@ use axum::routing::{MethodRouter, any};
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
+use rhapsody_orchestrator::managerread::{ManagerReadError, ManagerReadOutcome};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -39,6 +40,11 @@ use crate::handlers_history::{
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
+use crate::handlers_manager::{
+    handle_manager_diff, handle_manager_file, handle_manager_findings, handle_manager_grep,
+    handle_manager_interdiff, handle_manager_ls, handle_manager_patch_id, handle_manager_pr,
+    handle_manager_pr_activity, handle_manager_pr_commits,
+};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_provider_config::handle_provider_config;
@@ -528,6 +534,101 @@ pub trait StateProvider: Send + Sync {
     async fn run_diff(&self, _run_id: i64) -> DiffOutcome {
         DiffOutcome::Unavailable("this daemon cannot read a diff")
     }
+
+    // --- the manager run's host-served reads (STUDIO-1014; design §4.4, §5.5) ---
+    //
+    // The manager has no checkout, no `gh` and no `git`; these endpoints are the host's half of
+    // every `manager_*` MCP tool the `--role manager` facade proxies. The coordinate is resolved
+    // from the RUN (`run_id`), never the caller, so a manager can only read its own adjudication.
+    //
+    // They default to `Unavailable` rather than to an error, for the same reason `run_diff` above
+    // does: a provider with no manager subsystem genuinely has no answer to give, and the tool
+    // renders it as a stated reason rather than a fault.
+
+    /// `GET /api/v1/manager/file?run_id&sha&path` — one blob at a commit sha, from git objects.
+    async fn manager_file(&self, _run_id: i64, _sha: String, _path: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/ls?run_id&sha&path` — a tree listing at a commit sha.
+    async fn manager_ls(&self, _run_id: i64, _sha: String, _path: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/grep?run_id&sha&pattern&path` — a `git grep` at a commit sha.
+    async fn manager_grep(
+        &self,
+        _run_id: i64,
+        _sha: String,
+        _pattern: String,
+        _path: String,
+    ) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/diff?run_id&from&to` — the diff between two revisions; recorded in the
+    /// evidence-access log.
+    async fn manager_diff(&self, _run_id: i64, _from: String, _to: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/interdiff?run_id&from&to` — the difference between two PR patches
+    /// (`git range-diff`); recorded in the evidence-access log.
+    async fn manager_interdiff(
+        &self,
+        _run_id: i64,
+        _from: String,
+        _to: String,
+    ) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/patch-id?run_id&sha` — a stable patch-id over
+    /// `merge-base(base, sha)..sha`.
+    async fn manager_patch_id(&self, _run_id: i64, _sha: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager repository reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/findings?run_id` — the structured findings recorded for the run's PR.
+    async fn manager_findings(&self, _run_id: i64) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/pr?run_id` — the pull request's head/base/state/draft/mergeable/checks,
+    /// served by the host's own off-loop `gh`.
+    async fn manager_pr(&self, _run_id: i64) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager pull-request reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/pr/activity?run_id&since` — comments and reviews since a timestamp.
+    async fn manager_pr_activity(&self, _run_id: i64, _since: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager pull-request reads",
+        ))
+    }
+
+    /// `GET /api/v1/manager/pr/commits?run_id&since` — commits and messages since a sha.
+    async fn manager_pr_commits(&self, _run_id: i64, _since: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "this daemon cannot serve manager pull-request reads",
+        ))
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -716,6 +817,23 @@ where
             operator_write(handle_review_dismiss),
         )
         .route("/api/v1/reviews/clear", operator_write(handle_review_clear))
+        // The manager run's host-served reads (STUDIO-1014; Rhapsody-only, no Go v0.4.0
+        // counterpart). Read-only GETs the `--role manager` MCP facade proxies; the coordinate is
+        // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
+        // than `/pr`; axum's matchit dispatches them regardless of order.
+        .route("/api/v1/manager/file", any(handle_manager_file))
+        .route("/api/v1/manager/ls", any(handle_manager_ls))
+        .route("/api/v1/manager/grep", any(handle_manager_grep))
+        .route("/api/v1/manager/diff", any(handle_manager_diff))
+        .route("/api/v1/manager/interdiff", any(handle_manager_interdiff))
+        .route("/api/v1/manager/patch-id", any(handle_manager_patch_id))
+        .route("/api/v1/manager/findings", any(handle_manager_findings))
+        .route("/api/v1/manager/pr", any(handle_manager_pr))
+        .route(
+            "/api/v1/manager/pr/activity",
+            any(handle_manager_pr_activity),
+        )
+        .route("/api/v1/manager/pr/commits", any(handle_manager_pr_commits))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.

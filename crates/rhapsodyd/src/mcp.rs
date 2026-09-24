@@ -17,7 +17,7 @@ use std::path::Path;
 use tracing_subscriber::fmt::MakeWriter;
 
 use rhapsody_config::{decode, resolve, workflow};
-use rhapsody_mcp::{Client, Facade, Options, resolve_daemon_port};
+use rhapsody_mcp::{Client, Facade, Options, Role, resolve_daemon_port};
 use rhapsody_orchestrator::CancelWait;
 
 /// Serves the `rhapsodyd mcp` local MCP facade over stdio until the peer disconnects or `ctx` is
@@ -59,7 +59,10 @@ fn mcp_server_from_args(
     args: &[String],
     getenv: impl Fn(&str) -> String,
 ) -> Result<Facade, String> {
-    let path = resolve_mcp_workflow_path(args, &getenv);
+    // STUDIO-1014: `--role manager` selects the fixed manager tool set. The flag is stripped before
+    // workflow-path resolution, so a role flag is never mistaken for the WORKFLOW.md positional.
+    let (role, rest) = parse_mcp_role(args)?;
+    let path = resolve_mcp_workflow_path(&rest, &getenv);
     let def =
         workflow::load(Path::new(&path)).map_err(|e| format!("load workflow {path:?}: {e}"))?;
     let cfg = decode(&def).map_err(|e| format!("decode config from {path:?}: {e}"))?;
@@ -76,8 +79,36 @@ fn mcp_server_from_args(
         default_issue: first_set(&getenv, "ISSUE"),
         now: None,
         teams_enabled,
+        role,
     };
     Ok(Facade::new(&cfg, client, opts))
+}
+
+/// Parses the `--role` flag out of the `rhapsodyd mcp` args, returning the role and the remaining
+/// positional args (the workflow path). Accepts `--role value` and `--role=value`. An unknown role
+/// is an ERROR, not a silent downgrade to [`Role::Standard`]: a typo must never widen a manager
+/// run's tool set. The rest of the args are returned verbatim so the positional workflow path still
+/// resolves exactly as before.
+fn parse_mcp_role(args: &[String]) -> Result<(Role, Vec<String>), String> {
+    let mut role = Role::Standard;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--role=") {
+            role = Role::parse(v).ok_or_else(|| format!("invalid value {v:?} for flag -role"))?;
+        } else if a == "--role" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| "flag needs an argument: -role".to_string())?;
+            role = Role::parse(v).ok_or_else(|| format!("invalid value {v:?} for flag -role"))?;
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    Ok((role, rest))
 }
 
 /// Reads the "me" identity variable `suffix` under either brand prefix, preferring the `RHAPSODY_`
@@ -139,6 +170,34 @@ mod tests {
 
     fn no_env(_: &str) -> String {
         String::new()
+    }
+
+    // STUDIO-1014: `--role manager` is parsed out of the args and never mistaken for the workflow
+    // positional; an unknown role is a hard error (a typo must not widen the tool set).
+    #[test]
+    fn parse_mcp_role_accepts_manager_and_rejects_unknown() {
+        let (role, rest) = parse_mcp_role(&[
+            "--role".to_string(),
+            "manager".to_string(),
+            "WORKFLOW.md".to_string(),
+        ])
+        .expect("valid role");
+        assert_eq!(role, Role::Manager);
+        assert_eq!(rest, vec!["WORKFLOW.md".to_string()]);
+
+        let (role, rest) =
+            parse_mcp_role(&["--role=standard".to_string(), "a.md".to_string()]).expect("valid");
+        assert_eq!(role, Role::Standard);
+        assert_eq!(rest, vec!["a.md".to_string()]);
+
+        // No flag ⇒ standard, args untouched.
+        let (role, rest) = parse_mcp_role(&["a.md".to_string()]).expect("no flag");
+        assert_eq!(role, Role::Standard);
+        assert_eq!(rest, vec!["a.md".to_string()]);
+
+        assert!(parse_mcp_role(&["--role".to_string(), "wizard".to_string()]).is_err());
+        assert!(parse_mcp_role(&["--role=bogus".to_string()]).is_err());
+        assert!(parse_mcp_role(&["--role".to_string()]).is_err());
     }
 
     // Mirrors Go `TestResolveMCPWorkflowPath`: positional arg > SYMPHONY_WORKFLOW > default.

@@ -55,6 +55,8 @@ pub mod managerapproval;
 pub mod managerdecision;
 pub mod managerexchange;
 pub mod managerprep;
+pub mod managerread;
+pub mod managerselftest;
 pub mod mergeconsole;
 pub mod message;
 pub mod obslog;

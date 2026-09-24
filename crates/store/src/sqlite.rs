@@ -18,15 +18,17 @@
 //! step 17 (`rhapsody_run_provenance`'s
 //! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987), step 18
 //! (`rhapsody_manager_approval`, STUDIO-1011), step 19
-//! (`rhapsody_manager_exchange`, STUDIO-1012) and step 20
-//! (`rhapsody_provider_day_budget`, STUDIO-979) have no Go counterpart: they are
+//! (`rhapsody_manager_exchange`, STUDIO-1012), step 20
+//! (`rhapsody_provider_day_budget`, STUDIO-979) and step 21
+//! (`rhapsody_evidence_access`, STUDIO-1014) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
 //! ledger, the structured review-finding revisions, the runaway-loop breaker's crossings, the
 //! review evidence ledger's columns, the
 //! provider origin plus broker usage record, the manager approval record, the manager exchange
-//! authorizations and the durable UTC-day provider budget authority, none of which the frozen
+//! authorizations, the durable UTC-day provider budget authority and the manager evidence-access
+//! log, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -62,7 +64,7 @@ use std::sync::{Mutex, MutexGuard};
 /// provider origin + broker usage record, then the manager approval record, then the manager
 /// exchange authorizations, then the durable UTC-day provider budget authority) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -463,6 +465,23 @@ CREATE TABLE IF NOT EXISTS rhapsody_provider_day_budget (
   utc_day        INTEGER NOT NULL,
   charged_tokens INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (provider_id, utc_day)
+);
+"#,
+    // v20 -> v21: the EVIDENCE-ACCESS LOG (STUDIO-1014, design §5.5). The frozen Go reference has
+    // no manager and therefore no such log, so this is a Rhapsody-only table gated out of the
+    // Go-recaptured schema golden by the `rhapsody_` name prefix exactly as steps 7-20 are.
+    //
+    // It records every diff and interdiff the HOST served to a manager run, per run id. It is
+    // append-only and deliberately has NO primary key: a run served the same comparison twice has
+    // two rows, because M3's §6.4 condition 3 asks whether the run was GIVEN the covering diff, not
+    // how many times. `kind` is `diff` or `interdiff` (§5.5); `to_sha` is the head at serve time.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_evidence_access (
+  run_id      INTEGER NOT NULL,
+  kind        TEXT    NOT NULL DEFAULT '',
+  from_sha    TEXT    NOT NULL DEFAULT '',
+  to_sha      TEXT    NOT NULL DEFAULT '',
+  recorded_at TEXT    NOT NULL DEFAULT ''
 );
 "#,
 ];
@@ -2425,6 +2444,44 @@ impl Store for Sqlite {
             ],
         )?;
         Ok(())
+    }
+
+    fn record_evidence_access(&self, access: EvidenceAccess) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_evidence_access (run_id, kind, from_sha, to_sha, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                access.run_id,
+                access.kind,
+                access.from_sha,
+                access.to_sha,
+                access.recorded_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn evidence_accesses(&self, run_id: i64) -> Result<Vec<EvidenceAccess>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, kind, from_sha, to_sha, recorded_at \
+             FROM rhapsody_evidence_access WHERE run_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(EvidenceAccess {
+                run_id: row.get(0)?,
+                kind: row.get(1)?,
+                from_sha: row.get(2)?,
+                to_sha: row.get(3)?,
+                recorded_at: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn record_review_completion(
@@ -5114,6 +5171,55 @@ mod tests {
 
     // --- manager exchange authorizations (STUDIO-1012) ----------------------------------------
 
+    // --- evidence-access log (STUDIO-1014, §5.5) ---------------------------------------------
+
+    /// The log is append-only and keyed by run: two serves of the same comparison are two rows, and
+    /// another run's reads never appear.
+    #[test]
+    fn evidence_access_log_appends_per_run_and_survives_a_restart() {
+        let scratch = scratch_dir();
+        let db = scratch.join("evidence.db");
+        let access = |kind: &str, from: &str, to: &str| EvidenceAccess {
+            run_id: 7,
+            kind: kind.to_string(),
+            from_sha: from.to_string(),
+            to_sha: to.to_string(),
+            recorded_at: "2026-09-23T00:00:00Z".to_string(),
+        };
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            store
+                .record_evidence_access(access(EVIDENCE_ACCESS_DIFF, "aaa", "head"))
+                .expect("record diff");
+            // The same comparison served again appends rather than replacing.
+            store
+                .record_evidence_access(access(EVIDENCE_ACCESS_DIFF, "aaa", "head"))
+                .expect("record diff again");
+            store
+                .record_evidence_access(access(EVIDENCE_ACCESS_INTERDIFF, "old", "head"))
+                .expect("record interdiff");
+            store
+                .record_evidence_access(EvidenceAccess {
+                    run_id: 8,
+                    ..access(EVIDENCE_ACCESS_DIFF, "other", "other-head")
+                })
+                .expect("record other run");
+        }
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        let rows = store.evidence_accesses(7).expect("read");
+        assert_eq!(rows.len(), 3, "append-only: two diff rows + one interdiff");
+        assert_eq!(rows[0].kind, EVIDENCE_ACCESS_DIFF);
+        assert_eq!(rows[2].kind, EVIDENCE_ACCESS_INTERDIFF);
+        assert_eq!(rows[2].from_sha, "old");
+        assert!(
+            store.evidence_accesses(8).expect("read").len() == 1,
+            "another run's reads are keyed separately"
+        );
+        assert!(store.evidence_accesses(99).expect("read").is_empty());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// A manager exchange authorization round-trips across a restart, and invalidation moves only
     /// the LIVE states — a completed row is left exactly as it is.
     #[test]
@@ -6670,6 +6776,7 @@ mod tests {
                 "rhapsody_manager_approval".to_string(),
                 "rhapsody_manager_exchange".to_string(),
                 "rhapsody_provider_day_budget".to_string(),
+                "rhapsody_evidence_access".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

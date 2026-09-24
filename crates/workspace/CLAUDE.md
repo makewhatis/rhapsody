@@ -14,6 +14,11 @@ crate mirrors that by hanging most methods off the single `Manager` struct acros
   resolution — see Pitfalls below.
 - `repo.rs` — the git layer: `RepoKey` derivation, the bare-mirror cache, `ensure_from_repo`
   (worktree mode) and `ensure_clone_from_repo` (clone mode), `remove_worktree`.
+- `read.rs` — the manager's host-served object reads (STUDIO-1014; design `manager-agent-design.md`
+  §4.4); no Go counterpart. `Manager::read_blob`/`ls_tree`/`grep`/`merge_base`/`diff`/`patch_id`,
+  all against the bare mirror. A symlink is returned as its blob text and is NEVER followed; every
+  read is bounded. Reuses `repo::is_commit_sha` to keep a revision out of the git argument list's
+  revision-expression space.
 - `manager.rs` — `Manager` construction, the per-repo lock registry, the legacy (empty-`repo_url`)
   create/remove path, and the `before_run`/`after_run`/`after_create`/`before_remove` hook wiring.
 - `hooks.rs` — `HookRunner`: runs a hook via `bash -lc` with a timeout.

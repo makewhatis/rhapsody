@@ -1,0 +1,760 @@
+//! managerread — the host's half of the manager run's reads (STUDIO-1014; design record
+//! `~/.rhapsody/docs/manager-agent-design.md` §4.4, §5.5).
+//!
+//! **No Go v0.4.0 counterpart.** The manager run has no checkout, no `gh` and no `git`; the daemon
+//! serves every repository read. This module is the daemon-side plumbing behind the
+//! `/api/v1/manager/*` endpoints the manager MCP tools (the `mcp` crate's `manager_*`, role
+//! `manager`) proxy. It is deliberately off-loop and holds no `Orchestrator`, for [`crate::rundiff`]'s
+//! reason: everything here shells out (`git` through the workspace manager, `gh` through the read
+//! seams) and no read takes a claim, so nothing can stall dispatch.
+//!
+//! # The coordinate comes from the RUN, never the caller
+//!
+//! A manager run's key is `pr:<owner>/<repo>#<n>@manager`. Every endpoint takes only `run_id`; the
+//! coordinate is parsed from that run row's `issue_identifier` and the mirror URL from its `repo`.
+//! A run whose key does not end `@manager` is refused, so a review run's id can never be used to
+//! read through the manager's surface.
+//!
+//! # The evidence-access log (§5.5)
+//!
+//! Every `manager_diff`/`manager_interdiff` the host serves is recorded, per run id, in
+//! `rhapsody_evidence_access`. That log is what §6.4 condition 3 reads to prove the run was GIVEN
+//! the covering diffs — it cannot prove the model read them, and says so.
+
+use std::sync::Arc;
+
+use rhapsody_store::{EVIDENCE_ACCESS_DIFF, EVIDENCE_ACCESS_INTERDIFF, EvidenceAccess, RunSummary};
+use rhapsody_workspace::{Manager, ReadError};
+
+use crate::teamsknow::parse_pr_ref;
+
+/// The manager role token in a manager run's key (`pr:<owner>/<repo>#<n>@manager`).
+pub const MANAGER_ROLE_TOKEN: &str = "manager";
+
+/// A resolved manager-run coordinate: where to read, and from which mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerCoordinate {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    /// The clone URL whose bare mirror holds the objects (`runs.repo`).
+    pub repo_url: String,
+}
+
+impl ManagerCoordinate {
+    /// `owner/repo#number`, the findings table's key.
+    pub fn pr_slug(&self) -> String {
+        format!("{}/{}#{}", self.owner, self.repo, self.number)
+    }
+}
+
+/// A refused manager read. Typed so the HTTP layer can map each to a stable code without guessing.
+#[derive(Debug)]
+pub enum ManagerReadError {
+    /// No run has that id (404).
+    NoSuchRun,
+    /// The run exists but is not a manager run (`@manager` key) — a caller must never read another
+    /// kind of run through this surface.
+    NotAManagerRun,
+    /// The read cannot be served on this daemon/for this run, with a true reason.
+    Unavailable(&'static str),
+    /// The host's git read failed (`not_found`, `too_large`, `invalid_revision`, `git_failed`).
+    Read(ReadError),
+    /// The host's off-loop `gh` read failed (`gh_failed`) — a network/CLI failure, never a claim
+    /// that the read found nothing.
+    Gh(String),
+    /// A store read failed.
+    Store(String),
+}
+
+impl ManagerReadError {
+    /// The stable error code the endpoint renders.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ManagerReadError::NoSuchRun => "not_found",
+            ManagerReadError::NotAManagerRun => "not_a_manager_run",
+            ManagerReadError::Unavailable(_) => "unavailable",
+            ManagerReadError::Read(e) => read_error_code(e),
+            ManagerReadError::Gh(_) => "gh_failed",
+            ManagerReadError::Store(_) => "store_error",
+        }
+    }
+
+    /// The human-facing message.
+    pub fn message(&self) -> String {
+        match self {
+            ManagerReadError::NoSuchRun => "no such run".to_string(),
+            ManagerReadError::NotAManagerRun => "this run is not a manager run".to_string(),
+            ManagerReadError::Unavailable(why) => (*why).to_string(),
+            ManagerReadError::Read(e) => e.to_string(),
+            ManagerReadError::Gh(e) => e.clone(),
+            ManagerReadError::Store(e) => e.clone(),
+        }
+    }
+}
+
+/// The stable code for a host-served git read failure.
+pub fn read_error_code(e: &ReadError) -> &'static str {
+    match e {
+        ReadError::InvalidRevision => "invalid_revision",
+        ReadError::NotFound => "not_found",
+        ReadError::IsDirectory => "is_a_directory",
+        ReadError::TooLarge => "too_large",
+        ReadError::Git(_) => "git_failed",
+    }
+}
+
+/// The result of one manager read: the JSON body a tool returns, or a typed refusal. Defined here so
+/// the HTTP layer and the daemon share one shape.
+pub type ManagerReadOutcome = Result<serde_json::Value, ManagerReadError>;
+
+/// Resolves a manager run's coordinate from its own run row. Pure, so the refusal rules are testable
+/// without a daemon: the key must parse as a `pr:` coordinate carrying the `manager` role, and the
+/// row must name a repository for the mirror.
+pub fn manager_coordinate(run: &RunSummary) -> Result<ManagerCoordinate, ManagerReadError> {
+    let Some(pr) = parse_pr_ref(&run.issue_identifier) else {
+        return Err(ManagerReadError::NotAManagerRun);
+    };
+    if pr.reviewer != MANAGER_ROLE_TOKEN {
+        return Err(ManagerReadError::NotAManagerRun);
+    }
+    if run.repo.is_empty() {
+        return Err(ManagerReadError::Unavailable(
+            "this manager run has no repository to read",
+        ));
+    }
+    Ok(ManagerCoordinate {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        repo_url: run.repo.clone(),
+    })
+}
+
+impl crate::ControlHandle {
+    /// Resolves a run's manager coordinate from its own row. Every manager route starts here, so a
+    /// review run's id can never be read through the manager's surface.
+    async fn manager_coordinate_for(
+        &self,
+        run_id: i64,
+    ) -> Result<ManagerCoordinate, ManagerReadError> {
+        let run = match self.store().get_run(run_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => return Err(ManagerReadError::NoSuchRun),
+            Err(e) => return Err(ManagerReadError::Store(e.to_string())),
+        };
+        manager_coordinate(&run)
+    }
+
+    /// The live workspace manager, obtained through the SAME control round-trip the prune scheduler
+    /// uses ([`crate::ControlHandle::workspace_gc_plan`]), so a read always uses the live root
+    /// rather than a boot-time snapshot. Only the REPOSITORY reads need this; the store-backed ones
+    /// do not, so they never fail merely because the workspace is not built yet.
+    async fn manager_workspace(&self) -> Result<Arc<Manager>, ManagerReadError> {
+        self.workspace_gc_plan()
+            .await
+            .and_then(|plan| plan.mgr)
+            .ok_or(ManagerReadError::Unavailable(
+                "the workspace is not available yet",
+            ))
+    }
+
+    /// `manager_file {sha, path}`: one blob at a commit sha. A symlink is returned as its blob
+    /// text and is never followed.
+    pub async fn manager_file(
+        &self,
+        run_id: i64,
+        sha: &str,
+        path: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let blob = mgr
+            .read_blob(&coord.repo_url, sha, path)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        Ok(serde_json::json!({
+            "sha": sha,
+            "path": path,
+            "content": blob.content,
+            "symlink": blob.symlink,
+        }))
+    }
+
+    /// `manager_ls {sha, path}`: a tree listing at a commit sha.
+    pub async fn manager_ls(
+        &self,
+        run_id: i64,
+        sha: &str,
+        path: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let tree = mgr
+            .ls_tree(&coord.repo_url, sha, path)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        let entries: Vec<serde_json::Value> = tree
+            .entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "mode": e.mode,
+                    "kind": e.kind,
+                    "sha": e.sha,
+                    "path": e.path,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "sha": sha,
+            "path": path,
+            "entries": entries,
+            "truncated": tree.truncated,
+        }))
+    }
+
+    /// `manager_grep {sha, pattern, path}`: a `git grep` at a commit sha.
+    pub async fn manager_grep(
+        &self,
+        run_id: i64,
+        sha: &str,
+        pattern: &str,
+        path: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let got = mgr
+            .grep(&coord.repo_url, sha, pattern, path)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        Ok(serde_json::json!({
+            "sha": sha,
+            "pattern": pattern,
+            "path": path,
+            "text": got.text,
+            "truncated": got.truncated,
+        }))
+    }
+
+    /// `manager_diff {from, to}`: the diff between two revisions, recorded in the evidence log.
+    pub async fn manager_diff(
+        &self,
+        run_id: i64,
+        from: &str,
+        to: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let patch = mgr
+            .diff(&coord.repo_url, from, to)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        self.record_evidence(run_id, EVIDENCE_ACCESS_DIFF, from, to);
+        Ok(serde_json::json!({ "from": from, "to": to, "patch": patch }))
+    }
+
+    /// `manager_interdiff {from, to}`: the difference between the two pull-request patches (the
+    /// `git range-diff` comparison), recorded in the evidence log.
+    pub async fn manager_interdiff(
+        &self,
+        run_id: i64,
+        from: &str,
+        to: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let base = mgr
+            .default_base_sha(&coord.repo_url)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        let patch = mgr
+            .range_diff(&coord.repo_url, &base, from, to)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        self.record_evidence(run_id, EVIDENCE_ACCESS_INTERDIFF, from, to);
+        Ok(serde_json::json!({
+            "from": from,
+            "to": to,
+            "base": base,
+            "patch": patch,
+        }))
+    }
+
+    /// `manager_patch_id {sha}`: a stable patch-id over `merge-base(base, sha)..sha`, where `base`
+    /// is the mirror's default branch — the design's content identity (§5.5).
+    pub async fn manager_patch_id(
+        &self,
+        run_id: i64,
+        sha: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let mgr = self.manager_workspace().await?;
+        let base = mgr
+            .default_base_sha(&coord.repo_url)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        let mb = mgr
+            .merge_base(&coord.repo_url, &base, sha)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        if mb.is_empty() {
+            return Err(ManagerReadError::Read(ReadError::NotFound));
+        }
+        let id = mgr
+            .patch_id(&coord.repo_url, &mb, sha)
+            .await
+            .map_err(ManagerReadError::Read)?;
+        Ok(serde_json::json!({ "sha": sha, "base": base, "patch_id": id }))
+    }
+
+    /// The host's own off-loop `gh` seam, or a typed refusal when the daemon was built without one.
+    fn manager_gh(&self) -> Result<&Arc<dyn crate::ghsummons::ManagerGhSource>, ManagerReadError> {
+        self.manager_gh
+            .as_ref()
+            .ok_or(ManagerReadError::Unavailable(
+                "this daemon cannot serve manager pull-request reads",
+            ))
+    }
+
+    /// `manager_pr`: the pull request's head, base, state, draft, mergeable and the checks at head,
+    /// served by the host's own off-loop `gh` (§4.4).
+    pub async fn manager_pr(&self, run_id: i64) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr(&coord.owner, &coord.repo, coord.number)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
+    /// `manager_pr_activity`: comments and reviews since a timestamp, served by the host's `gh`.
+    pub async fn manager_pr_activity(
+        &self,
+        run_id: i64,
+        since: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr_activity(&coord.owner, &coord.repo, coord.number, since)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
+    /// `manager_pr_commits`: commits and their messages since a sha, served by the host's `gh`.
+    pub async fn manager_pr_commits(
+        &self,
+        run_id: i64,
+        since: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr_commits(&coord.owner, &coord.repo, coord.number, since)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
+    /// `manager_findings`: the structured findings recorded for the run's pull request (§5.3). A
+    /// pure store read — it needs the coordinate, not the workspace.
+    pub async fn manager_findings(
+        &self,
+        run_id: i64,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let pr = coord.pr_slug();
+        let rows = self
+            .store()
+            .load_review_findings(&pr)
+            .map_err(|e| ManagerReadError::Store(e.to_string()))?;
+        let findings: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "pr": f.pr,
+                    "generation": f.generation,
+                    "reviewer": f.reviewer,
+                    "finding_id": f.finding_id,
+                    "revision": f.revision,
+                    "review_run_id": f.review_run_id,
+                    "raised_at_sha": f.raised_at_sha,
+                    "raised_at_patch_id": f.raised_at_patch_id,
+                    "paths": f.paths,
+                    "summary_hash": f.summary_hash,
+                    "blocking": f.blocking,
+                    "new_evidence": f.new_evidence,
+                    "regression": f.regression,
+                    "status": f.status,
+                    "resolved_by": f.resolved_by,
+                    "dismissed_by": f.dismissed_by,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "pr": pr, "findings": findings }))
+    }
+
+    /// Appends one served diff/interdiff to the evidence-access log (§5.5). Best-effort: a store
+    /// failure is logged, never surfaced as a read failure — the diff was served regardless.
+    fn record_evidence(&self, run_id: i64, kind: &str, from: &str, to: &str) {
+        let access = EvidenceAccess {
+            run_id,
+            kind: kind.to_string(),
+            from_sha: from.to_string(),
+            to_sha: to.to_string(),
+            recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        };
+        if let Err(e) = self.store().record_evidence_access(access) {
+            tracing::warn!(run = run_id, kind, error = %e, "manager read: could not record evidence access");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rhapsody_store::{EVIDENCE_ACCESS_DIFF, RunStart, Sqlite, Store, StorePath};
+    use rhapsody_workspace::{Config as WsConfig, HookScripts, Manager};
+
+    use crate::control_loop::Event;
+    use crate::orchestrator::Orchestrator;
+    use crate::testsupport::TempDir;
+    use crate::workspace_gc::WorkspaceGcPlan;
+
+    fn run_row(key: &str, repo: &str) -> RunSummary {
+        RunSummary {
+            id: 7,
+            issue_identifier: key.to_string(),
+            repo: repo.to_string(),
+            ..RunSummary::default()
+        }
+    }
+
+    #[test]
+    fn a_manager_key_resolves_its_coordinate() {
+        let got = manager_coordinate(&run_row(
+            "pr:makewhatis/rhapsody#42@manager",
+            "git@github.com:makewhatis/rhapsody.git",
+        ))
+        .expect("a manager coordinate");
+        assert_eq!(got.owner, "makewhatis");
+        assert_eq!(got.repo, "rhapsody");
+        assert_eq!(got.number, 42);
+        assert_eq!(got.pr_slug(), "makewhatis/rhapsody#42");
+        assert_eq!(got.repo_url, "git@github.com:makewhatis/rhapsody.git");
+    }
+
+    // A review run's key (`@alice`) is NOT a manager run: the manager surface must refuse it.
+    #[test]
+    fn a_review_run_is_not_a_manager_run() {
+        assert!(matches!(
+            manager_coordinate(&run_row(
+                "pr:makewhatis/rhapsody#42@alice",
+                "git@github.com:makewhatis/rhapsody.git"
+            )),
+            Err(ManagerReadError::NotAManagerRun)
+        ));
+        assert!(matches!(
+            manager_coordinate(&run_row("STUDIO-1014", "git@github.com:x/y.git")),
+            Err(ManagerReadError::NotAManagerRun)
+        ));
+    }
+
+    #[test]
+    fn a_manager_run_without_a_repo_is_unavailable() {
+        assert!(matches!(
+            manager_coordinate(&run_row("pr:makewhatis/rhapsody#42@manager", "")),
+            Err(ManagerReadError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn read_errors_map_to_stable_codes() {
+        assert_eq!(
+            read_error_code(&ReadError::InvalidRevision),
+            "invalid_revision"
+        );
+        assert_eq!(read_error_code(&ReadError::NotFound), "not_found");
+        assert_eq!(read_error_code(&ReadError::TooLarge), "too_large");
+        assert_eq!(read_error_code(&ReadError::Git("x".into())), "git_failed");
+    }
+
+    // --- §5.5 evidence-access log: the host RECORDS every diff/interdiff it serves -------------
+
+    fn git_run(dir: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn rev_parse(dir: &str, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", rev])
+            .output()
+            .expect("rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Builds a control handle whose `Event::WorkspaceGc` round-trip answers with `mgr`, plus the
+    /// shared store. The handle is driven directly (no control loop), exactly as the HTTP task does.
+    fn handle_with_workspace(
+        mgr: Arc<Manager>,
+        store: Arc<dyn Store + Send + Sync>,
+    ) -> crate::stop::ControlHandle {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let mut handle = o.control();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        handle.events = tx;
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if let Event::WorkspaceGc { reply } = ev {
+                    let _ = reply.send(WorkspaceGcPlan {
+                        mgr: Some(Arc::clone(&mgr)),
+                        keep: Default::default(),
+                    });
+                }
+            }
+        });
+        handle
+    }
+
+    /// A bare mirror of a fresh origin that carries two divergent one-commit branches (`old`/`new`)
+    /// off a common base plus a two-commit `main`, and the shas the evidence tests compare. The
+    /// caller keeps the returned dirs alive.
+    async fn mirror_with_two_commits() -> (
+        Arc<Manager>,
+        TempDir,
+        TempDir,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let root = TempDir::new();
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").unwrap();
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        let base = rev_parse(&origin.path, "HEAD");
+        // Two divergent one-commit branches off the base — a rebase-like pair for the interdiff.
+        for (branch, body) in [("old", "old body\n"), ("new", "new body\n")] {
+            git_run(&origin.path, &["checkout", "-b", branch, &base]);
+            std::fs::write(origin.child("feature.txt"), body).unwrap();
+            git_run(&origin.path, &["add", "feature.txt"]);
+            git_run(&origin.path, &["commit", "-m", "feature"]);
+        }
+        git_run(&origin.path, &["checkout", "main"]);
+        std::fs::write(origin.child("second.txt"), "second\n").unwrap();
+        git_run(&origin.path, &["add", "second.txt"]);
+        git_run(&origin.path, &["commit", "-m", "second"]);
+
+        let mgr = Arc::new(
+            Manager::new(WsConfig {
+                root: root.path.clone(),
+                hooks: HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("manager"),
+        );
+        mgr.ensure_from_repo(&origin.path, "", "AIE-1")
+            .await
+            .expect("provision mirror");
+        let head = rev_parse(&origin.path, "HEAD");
+        let old = rev_parse(&origin.path, "old");
+        let new = rev_parse(&origin.path, "new");
+        (mgr, root, origin, base, head, old, new)
+    }
+
+    fn manager_run_id(store: &dyn Store, repo: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_id: "pr:o/r#1@manager".to_string(),
+                issue_identifier: "pr:o/r#1@manager".to_string(),
+                title: "manager".to_string(),
+                repo: repo.to_string(),
+                ..RunStart::default()
+            })
+            .expect("start_run")
+    }
+
+    // Mutation discipline (§15.4 / review): deleting the `record_evidence` call from `manager_diff`
+    // must turn this red. It drives the real ControlHandle surface against a real store and mirror,
+    // so it cannot pass by testing `record_evidence` in isolation.
+    #[tokio::test]
+    async fn manager_diff_records_evidence_access() {
+        let (mgr, _root, origin, base, head, _old, _new) = mirror_with_two_commits().await;
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let handle = handle_with_workspace(mgr, Arc::clone(&store));
+        let run_id = manager_run_id(store.as_ref(), &origin.path);
+
+        handle
+            .manager_diff(run_id, &base, &head)
+            .await
+            .expect("diff served");
+
+        let rows = store.evidence_accesses(run_id).expect("evidence_accesses");
+        assert_eq!(rows.len(), 1, "the served diff must be recorded: {rows:?}");
+        assert_eq!(rows[0].kind, EVIDENCE_ACCESS_DIFF);
+        assert_eq!(rows[0].from_sha, base);
+        assert_eq!(rows[0].to_sha, head);
+        assert_eq!(rows[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn manager_interdiff_records_evidence_access() {
+        let (mgr, _root, origin, _base, _head, old, new) = mirror_with_two_commits().await;
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let handle = handle_with_workspace(mgr, Arc::clone(&store));
+        let run_id = manager_run_id(store.as_ref(), &origin.path);
+
+        // `old` and `new` are divergent one-commit branches off the same base — the rebase pair the
+        // interdiff exists to compare.
+        handle
+            .manager_interdiff(run_id, &old, &new)
+            .await
+            .expect("interdiff served");
+
+        let rows = store.evidence_accesses(run_id).expect("evidence_accesses");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the served interdiff must be recorded: {rows:?}"
+        );
+        assert_eq!(rows[0].kind, rhapsody_store::EVIDENCE_ACCESS_INTERDIFF);
+        assert_eq!(rows[0].from_sha, old);
+        assert_eq!(rows[0].to_sha, new);
+        assert_eq!(rows[0].run_id, run_id);
+    }
+
+    // --- the manager's pull-request reads (§4.4): the run's coordinate, never the caller's -------
+
+    #[derive(Default)]
+    struct FakeManagerGh {
+        seen: std::sync::Mutex<Vec<(String, String, i64, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::ManagerGhSource for FakeManagerGh {
+        async fn manager_pr(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                "pr".to_string(),
+            ));
+            Ok(serde_json::json!({ "head": "abc" }))
+        }
+        async fn manager_pr_activity(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            since: &str,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                since.to_string(),
+            ));
+            Ok(serde_json::json!({ "comments": [] }))
+        }
+        async fn manager_pr_commits(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            since: &str,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                since.to_string(),
+            ));
+            Ok(serde_json::json!({ "commits": [] }))
+        }
+    }
+
+    fn handle_with_gh(
+        source: Arc<dyn crate::ghsummons::ManagerGhSource>,
+        store: Arc<dyn Store + Send + Sync>,
+    ) -> crate::stop::ControlHandle {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let mut handle = o.control();
+        handle.manager_gh = Some(source);
+        handle
+    }
+
+    #[tokio::test]
+    async fn manager_pr_is_unavailable_without_a_gh_seam() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let handle = o.control();
+        let run_id = manager_run_id(store.as_ref(), "git@github.com:o/r.git");
+        assert!(matches!(
+            handle.manager_pr(run_id).await,
+            Err(ManagerReadError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_pr_reads_the_runs_own_coordinate() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let src = Arc::new(FakeManagerGh::default());
+        let handle = handle_with_gh(
+            Arc::clone(&src) as Arc<dyn crate::ghsummons::ManagerGhSource>,
+            Arc::clone(&store),
+        );
+        let run_id = manager_run_id(store.as_ref(), "git@github.com:o/r.git");
+
+        let pr = handle.manager_pr(run_id).await.expect("pr");
+        assert_eq!(pr["head"], "abc");
+        handle
+            .manager_pr_activity(run_id, "2026-06-25T00:00:00Z")
+            .await
+            .expect("activity");
+        handle
+            .manager_pr_commits(run_id, "1111")
+            .await
+            .expect("commits");
+
+        let seen = src.seen.lock().expect("lock").clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("o".to_string(), "r".to_string(), 1, "pr".to_string()),
+                (
+                    "o".to_string(),
+                    "r".to_string(),
+                    1,
+                    "2026-06-25T00:00:00Z".to_string()
+                ),
+                ("o".to_string(), "r".to_string(), 1, "1111".to_string()),
+            ],
+            "every read must resolve the coordinate from the RUN, never a caller value"
+        );
+    }
+}

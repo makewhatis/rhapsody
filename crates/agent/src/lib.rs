@@ -23,6 +23,7 @@ pub mod dispatch;
 pub mod fake;
 pub mod harness;
 pub mod humanize;
+pub mod manager;
 pub mod opencode;
 pub mod proctree;
 

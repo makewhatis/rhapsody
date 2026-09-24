@@ -1311,6 +1311,36 @@ STUDIO-967 per-run token ceiling exactly as before; the UTC-day authority is onl
 brokered provider with a configured cap. The `rhapsody_` prefix keeps the new table out of the
 Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the twelfth name.
 
+### The manager run's host-served reads — no checkout, no `gh`, no `git` (STUDIO-1014)
+
+The manager adjudicates a stalled review loop, and the security boundary is that its agent run gets
+**no filesystem, no shell, no network and no repository checkout**: the daemon serves every read.
+Rhapsody adds a `manager` MCP role, a set of `/api/v1/manager/*` read endpoints, and one new
+`rhapsody_`-prefixed table:
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_evidence_access` | — | one row per `(run_id, kind, from_sha, to_sha)` diff/interdiff the host served a manager run |
+| `PRAGMA user_version` | 6 | **21** |
+
+| Endpoint | Serves |
+| --- | --- |
+| `GET /api/v1/manager/file?run_id&sha&path` | one blob at a commit sha, from the bare mirror's git objects. A symlink is returned as its link text and is **never followed** |
+| `GET /api/v1/manager/ls?run_id&sha&path` | a tree listing (cut-and-flagged past a bound) |
+| `GET /api/v1/manager/grep?run_id&sha&pattern&path` | a `git grep` at a commit sha (cut-and-flagged) |
+| `GET /api/v1/manager/diff?run_id&from&to` | the diff between two revisions; **recorded** in `rhapsody_evidence_access` |
+| `GET /api/v1/manager/interdiff?run_id&from&to` | the difference between two pull-request patches (`git range-diff`); recorded likewise |
+| `GET /api/v1/manager/patch-id?run_id&sha` | a stable patch-id over `merge-base(base, sha)..sha` |
+| `GET /api/v1/manager/findings?run_id` | the structured findings recorded for the run's pull request |
+| `GET /api/v1/manager/pr`, `/pr/activity`, `/pr/commits` | the pull request's state and its activity/commits, served by the host's own off-loop `gh` |
+
+Every route resolves its coordinate from the **run** (`run_id`): a manager run's id is a
+`pr:<owner>/<repo>#<n>@manager` key, and a run whose key does not end `@manager` is refused. The MCP
+tools the manager run calls (`manager_*`, role `manager`) are the only callers, and an ordinary
+facade registers none of them — the manager surface is opt-in via `rhapsodyd mcp --role manager`.
+The `rhapsody_` prefix keeps the evidence table out of the Go-recaptured schema golden;
+`divergent_objects_are_gated_by_name_only` pins the thirteenth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so

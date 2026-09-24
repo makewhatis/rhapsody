@@ -203,6 +203,13 @@ the `Orchestrator` struct itself. Concretely:
   reopen rule. It is pure — the worker parses the block and carries it on `EvWorkerExit`
   (`review_verdict`), and `review.rs::on_review_exit` applies the plan to the store. `generation` is
   a documented `0` and `raised_at_patch_id` empty until M2 tracks them; don't invent either here.
+  `managerread.rs` (STUDIO-1014; Rhapsody-only) is the host's half of the manager run's reads
+  (design `manager-agent-design.md` §4.4, §5.5): `ControlHandle::manager_file/ls/grep/diff/
+  interdiff/patch_id/findings/pr/pr_activity/pr_commits`, backing `/api/v1/manager/*`. It is
+  off-loop and holds no `Orchestrator`; the coordinate is parsed from the RUN (`pr:…#n@manager`),
+  the live workspace `Manager` comes through the existing `workspace_gc_plan()` round-trip, and the
+  three `manager_pr*` reads go through the `ghsummons::ManagerGhSource` seam on the handle (bounded
+  by `GH_EXEC_TIMEOUT`). `diff`/`interdiff` append a row to `rhapsody_evidence_access`.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
   Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still

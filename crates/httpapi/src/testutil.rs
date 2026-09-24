@@ -13,6 +13,7 @@ use rhapsody_agent::LogEntry;
 use rhapsody_config::workflow::Definition;
 use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
+use rhapsody_orchestrator::managerread::{ManagerReadError, ManagerReadOutcome};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -126,6 +127,10 @@ pub(crate) struct FakeProvider {
     /// (STUDIO-749).
     diff_outcome: Option<DiffOutcome>,
     diff_asked: Mutex<Option<i64>>,
+    /// The canned outcome the manager read methods return, taken on first use, and the last manager
+    /// call's signature (`"file:7:sha:path"`) (STUDIO-1014).
+    manager_outcome: Mutex<Option<ManagerReadOutcome>>,
+    manager_asked: Mutex<Option<String>>,
     /// Every [`StateProvider`] call made on this fake, of any kind. The operator-write guard's tests
     /// (STUDIO-982) assert a refused request leaves this at zero, i.e. the guard ran before any
     /// read or side effect.
@@ -198,6 +203,8 @@ impl FakeProvider {
             mergeability_asked: Mutex::new(None),
             diff_outcome: None,
             diff_asked: Mutex::new(None),
+            manager_outcome: Mutex::new(None),
+            manager_asked: Mutex::new(None),
             calls: AtomicUsize::new(0),
             provider_statuses: Vec::new(),
             provider_catalog: None,
@@ -520,6 +527,36 @@ impl FakeProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Set the canned outcome every manager read method returns (taken on first use; unset ⇒ the
+    /// trait's `Unavailable`). STUDIO-1014.
+    pub(crate) fn with_manager_outcome(mut self, outcome: ManagerReadOutcome) -> Self {
+        self.manager_outcome = Mutex::new(Some(outcome));
+        self
+    }
+
+    /// The last manager call's signature, e.g. `"diff:7:aaa:bbb"` — `None` proves no manager read
+    /// reached the provider. STUDIO-1014.
+    pub(crate) fn manager_asked(&self) -> Option<String> {
+        self.manager_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn take_manager(&self, sig: String) -> ManagerReadOutcome {
+        *self
+            .manager_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sig);
+        self.manager_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or(Err(ManagerReadError::Unavailable(
+                "this daemon cannot serve manager reads",
+            )))
+    }
 }
 
 #[async_trait]
@@ -798,6 +835,64 @@ impl StateProvider for FakeProvider {
         self.diff_outcome
             .clone()
             .unwrap_or(DiffOutcome::Unavailable("this daemon cannot read a diff"))
+    }
+
+    // The manager read methods (STUDIO-1014): record the call signature and return the canned
+    // outcome — one shape for every `manager_*` route.
+    async fn manager_file(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("file:{run_id}:{sha}:{path}"))
+    }
+
+    async fn manager_ls(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("ls:{run_id}:{sha}:{path}"))
+    }
+
+    async fn manager_grep(
+        &self,
+        run_id: i64,
+        sha: String,
+        pattern: String,
+        path: String,
+    ) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("grep:{run_id}:{sha}:{pattern}:{path}"))
+    }
+
+    async fn manager_diff(&self, run_id: i64, from: String, to: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("diff:{run_id}:{from}:{to}"))
+    }
+
+    async fn manager_interdiff(&self, run_id: i64, from: String, to: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("interdiff:{run_id}:{from}:{to}"))
+    }
+
+    async fn manager_patch_id(&self, run_id: i64, sha: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("patch-id:{run_id}:{sha}"))
+    }
+
+    async fn manager_findings(&self, run_id: i64) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("findings:{run_id}"))
+    }
+
+    async fn manager_pr(&self, run_id: i64) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("pr:{run_id}"))
+    }
+
+    async fn manager_pr_activity(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("pr-activity:{run_id}:{since}"))
+    }
+
+    async fn manager_pr_commits(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.touch();
+        self.take_manager(format!("pr-commits:{run_id}:{since}"))
     }
 
     async fn teams_recall(
