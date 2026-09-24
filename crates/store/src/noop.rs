@@ -550,7 +550,11 @@ mod tests {
             recorded_at: "2026-09-23T00:00:00Z".into(),
         })
         .expect("record_evidence_access");
-        assert!(st.evidence_accesses(1).expect("evidence_accesses").is_empty());
+        assert!(
+            st.evidence_accesses(1)
+                .expect("evidence_accesses")
+                .is_empty()
+        );
 
         st.prune(30).expect("prune");
         st.close().expect("close");

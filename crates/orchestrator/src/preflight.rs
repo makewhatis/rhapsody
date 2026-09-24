@@ -187,7 +187,12 @@ impl CredentialProbe for ClaudeCredentialProbe {
                 ));
             }
         };
-        let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key, false);
+        let env = scrub_child_env(
+            &process_env(),
+            req.billing_guard,
+            &req.tracker_api_key,
+            false,
+        );
 
         let mut cmd = tokio::process::Command::new(&name);
         cmd.args(&base_args);

@@ -1984,7 +1984,12 @@ pub(crate) async fn run_turn(req: &TriageRequest) -> Result<String, String> {
     {
         let (name, base_args) = rhapsody_agent::claude::split_command(&req.command)
             .map_err(|e| format!("invalid claude command {:?}: {e}", req.command))?;
-        let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key, false);
+        let env = scrub_child_env(
+            &process_env(),
+            req.billing_guard,
+            &req.tracker_api_key,
+            false,
+        );
 
         let mut cmd = tokio::process::Command::new(&name);
         cmd.args(&base_args);

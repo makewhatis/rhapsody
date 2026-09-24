@@ -73,11 +73,7 @@ impl BlobRead {
     /// misled into treating a link target as file content.
     pub fn render(&self) -> String {
         if self.symlink {
-            format!(
-                "[symlink -> {}]\n{}",
-                self.content.trim_end(),
-                self.content
-            )
+            format!("[symlink -> {}]\n{}", self.content.trim_end(), self.content)
         } else {
             self.content.clone()
         }
@@ -262,9 +258,7 @@ impl Manager {
             return Err(ReadError::InvalidRevision);
         }
         let mirror = self.mirror_dir(repo_url);
-        let (out, err) = self
-            .git(&mirror, &["diff", "--no-color", from, to])
-            .await;
+        let (out, err) = self.git(&mirror, &["diff", "--no-color", from, to]).await;
         if err.is_some() {
             return Err(ReadError::Git(out));
         }
@@ -286,9 +280,7 @@ impl Manager {
             return Err(ReadError::InvalidRevision);
         }
         let mirror = self.mirror_dir(repo_url);
-        let (out, err) = self
-            .git(&mirror, &["diff", "--no-color", base, sha])
-            .await;
+        let (out, err) = self.git(&mirror, &["diff", "--no-color", base, sha]).await;
         if err.is_some() {
             return Err(ReadError::Git(out));
         }
@@ -304,10 +296,9 @@ impl Manager {
     async fn patch_id_stdin(&self, mirror: &str, diff: &str) -> Result<String, ReadError> {
         let mirror = mirror.to_string();
         let diff = diff.to_string();
-        let joined = tokio::task::spawn_blocking(move || patch_id_blocking(&mirror, &diff))
+        tokio::task::spawn_blocking(move || patch_id_blocking(&mirror, &diff))
             .await
-            .map_err(|e| ReadError::Git(format!("patch-id task: {e}")))?;
-        joined
+            .map_err(|e| ReadError::Git(format!("patch-id task: {e}")))?
     }
 }
 
@@ -377,7 +368,10 @@ mod tests {
         git_run(&origin.path, &["commit", "-m", "add src"]);
         let sha = mirror_for(&m, &origin.path).await;
 
-        let got = m.read_blob(&origin.path, &sha, "src.rs").await.expect("read");
+        let got = m
+            .read_blob(&origin.path, &sha, "src.rs")
+            .await
+            .expect("read");
         assert_eq!(got.content, "fn main() {}\n");
         assert!(!got.symlink);
     }
@@ -452,13 +446,20 @@ mod tests {
         git_run(&origin.path, &["add", "a.rs"]);
         git_run(&origin.path, &["commit", "-m", "a"]);
         let sha = mirror_for(&m, &origin.path).await;
-        let hit = m.grep(&origin.path, &sha, "needle", "").await.expect("grep");
+        let hit = m
+            .grep(&origin.path, &sha, "needle", "")
+            .await
+            .expect("grep");
         assert!(hit.text.contains("a.rs"), "{}", hit.text);
         let miss = m
             .grep(&origin.path, &sha, "zzz-not-present", "")
             .await
             .expect("grep miss");
-        assert!(miss.text.is_empty(), "no match must be empty: {}", miss.text);
+        assert!(
+            miss.text.is_empty(),
+            "no match must be empty: {}",
+            miss.text
+        );
     }
 
     #[tokio::test]
@@ -485,10 +486,16 @@ mod tests {
             base
         );
 
-        let id1 = m.patch_id(&origin.path, &base, &head).await.expect("patch-id");
+        let id1 = m
+            .patch_id(&origin.path, &base, &head)
+            .await
+            .expect("patch-id");
         // Same content, different commits: a rebase onto an equivalent tree keeps the patch-id.
         assert!(!id1.is_empty());
-        let id2 = m.patch_id(&origin.path, &base, &head).await.expect("patch-id");
+        let id2 = m
+            .patch_id(&origin.path, &base, &head)
+            .await
+            .expect("patch-id");
         assert_eq!(id1, id2, "a stable patch-id is deterministic");
     }
 }

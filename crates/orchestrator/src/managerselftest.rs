@@ -268,10 +268,7 @@ mod tests {
     // A run that observed nothing at all is a failure, not a vacuous pass.
     #[test]
     fn no_observations_fails_closed() {
-        assert!(matches!(
-            evaluate("1.0.0", &[]),
-            SelfTestVerdict::Failed(_)
-        ));
+        assert!(matches!(evaluate("1.0.0", &[]), SelfTestVerdict::Failed(_)));
     }
 
     #[test]
@@ -292,7 +289,11 @@ mod tests {
         let mut auth = ReviewAuthority::Act;
         let verdict = evaluate("1.0.0", &[]);
         let reason = apply(&verdict, &mut auth).expect("failed");
-        assert_eq!(auth, ReviewAuthority::Off, "a failure must disable the manager");
+        assert_eq!(
+            auth,
+            ReviewAuthority::Off,
+            "a failure must disable the manager"
+        );
         assert!(reason.message().contains("version 1.0.0"));
 
         let mut auth = ReviewAuthority::Advise;
@@ -330,9 +331,11 @@ mod tests {
     #[tokio::test]
     async fn run_and_apply_leaves_act_enabled_when_all_refused() {
         let mut auth = ReviewAuthority::Act;
-        assert!(run_and_apply(&FakeCanary(all_refused()), "3.1.4", &mut auth)
-            .await
-            .is_none());
+        assert!(
+            run_and_apply(&FakeCanary(all_refused()), "3.1.4", &mut auth)
+                .await
+                .is_none()
+        );
         assert_eq!(auth, ReviewAuthority::Act);
     }
 }

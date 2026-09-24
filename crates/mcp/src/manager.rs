@@ -146,7 +146,10 @@ impl Facade {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
-        let path = format!("/api/v1/manager/pr{}", encode_query(vec![("run_id", run_id)]));
+        let path = format!(
+            "/api/v1/manager/pr{}",
+            encode_query(vec![("run_id", run_id)])
+        );
         match self.client.get(&path).await {
             Ok(body) => text_result(&body),
             Err(e) => err_result(&e),
@@ -320,7 +323,10 @@ impl Facade {
         name = "manager_patch_id",
         description = "A stable patch-id for a commit, computed over merge-base(base, sha)..sha — content, not commit identity. Proxies GET /api/v1/manager/patch-id."
     )]
-    async fn manager_patch_id(&self, Parameters(args): Parameters<ManagerShaArgs>) -> CallToolResult {
+    async fn manager_patch_id(
+        &self,
+        Parameters(args): Parameters<ManagerShaArgs>,
+    ) -> CallToolResult {
         let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
@@ -339,7 +345,10 @@ impl Facade {
         name = "manager_findings",
         description = "The structured findings recorded for this pull request, identified per revision. Proxies GET /api/v1/manager/findings."
     )]
-    async fn manager_findings(&self, Parameters(args): Parameters<ManagerRunArgs>) -> CallToolResult {
+    async fn manager_findings(
+        &self,
+        Parameters(args): Parameters<ManagerRunArgs>,
+    ) -> CallToolResult {
         let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
@@ -358,8 +367,8 @@ impl Facade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{client_for_port, spawn_router, test_config};
     use crate::server::{Options, Role};
+    use crate::testutil::{client_for_port, spawn_router, test_config};
     use axum::Router;
     use axum::routing::get;
     use rmcp::ServiceExt;

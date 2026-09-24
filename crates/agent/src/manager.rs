@@ -219,7 +219,8 @@ mod tests {
             .expect("--mcp-config present");
         assert_eq!(args[mi + 1], "/run/manager-mcp.json");
         assert_eq!(
-            args[mi + 2], "--strict-mcp-config",
+            args[mi + 2],
+            "--strict-mcp-config",
             "the strict flag must immediately follow the config: {args:?}"
         );
     }
@@ -321,8 +322,16 @@ mod tests {
     fn manager_mcp_config_single_server_with_role() {
         let raw = manager_mcp_config("/usr/bin/rhapsodyd", "/repo/WORKFLOW.md");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-        let servers = v.get("mcpServers").expect("mcpServers").as_object().unwrap();
-        assert_eq!(servers.len(), 1, "manager config must not merge operator servers");
+        let servers = v
+            .get("mcpServers")
+            .expect("mcpServers")
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            servers.len(),
+            1,
+            "manager config must not merge operator servers"
+        );
         let entry = servers.get("symphony").expect("symphony server");
         assert_eq!(entry["command"], "/usr/bin/rhapsodyd");
         let args: Vec<String> = entry["args"]

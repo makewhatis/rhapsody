@@ -4916,7 +4916,10 @@ mod tests {
         fn record_evidence_access(&self, access: rs::EvidenceAccess) -> Result<(), rs::StoreError> {
             self.0.record_evidence_access(access)
         }
-        fn evidence_accesses(&self, run_id: i64) -> Result<Vec<rs::EvidenceAccess>, rs::StoreError> {
+        fn evidence_accesses(
+            &self,
+            run_id: i64,
+        ) -> Result<Vec<rs::EvidenceAccess>, rs::StoreError> {
             self.0.evidence_accesses(run_id)
         }
         fn record_review_completion(
