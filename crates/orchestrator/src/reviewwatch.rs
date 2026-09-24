@@ -4604,6 +4604,106 @@ mod tests {
     struct FailingLiveWatchStore(rs::Noop);
 
     impl rs::Store for FailingLiveWatchStore {
+        fn save_manager_intervention(
+            &self,
+            row: rs::ManagerInterventionRow,
+        ) -> Result<(), rs::StoreError> {
+            self.0.save_manager_intervention(row)
+        }
+        fn manager_intervention(
+            &self,
+            id: &str,
+        ) -> Result<Option<rs::ManagerInterventionRow>, rs::StoreError> {
+            self.0.manager_intervention(id)
+        }
+        fn active_manager_intervention(
+            &self,
+            pr: &str,
+        ) -> Result<Option<rs::ManagerInterventionRow>, rs::StoreError> {
+            self.0.active_manager_intervention(pr)
+        }
+        fn load_manager_interventions(
+            &self,
+        ) -> Result<Vec<rs::ManagerInterventionRow>, rs::StoreError> {
+            self.0.load_manager_interventions()
+        }
+        fn merge_manager_stall_kinds(
+            &self,
+            id: &str,
+            kinds: &[String],
+        ) -> Result<bool, rs::StoreError> {
+            self.0.merge_manager_stall_kinds(id, kinds)
+        }
+        fn set_manager_intervention_state(
+            &self,
+            id: &str,
+            state: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_intervention_state(id, state)
+        }
+        fn set_manager_intervention_phase_hint(
+            &self,
+            id: &str,
+            phase_hint: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_intervention_phase_hint(id, phase_hint)
+        }
+        fn mark_manager_intervention_running(
+            &self,
+            id: &str,
+            run_id: Option<i64>,
+        ) -> Result<(), rs::StoreError> {
+            self.0.mark_manager_intervention_running(id, run_id)
+        }
+        fn record_manager_decision(
+            &self,
+            id: &str,
+            decision_json: &str,
+            decision_head: &str,
+            decision_evidence_rev: i64,
+        ) -> Result<(), rs::StoreError> {
+            self.0
+                .record_manager_decision(id, decision_json, decision_head, decision_evidence_rev)
+        }
+        fn stop_manager_intervention(
+            &self,
+            id: &str,
+            terminal_state: &str,
+            reason: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.stop_manager_intervention(id, terminal_state, reason)
+        }
+        fn reserve_manager_run(
+            &self,
+            id: &str,
+            boot_id: &str,
+            lease_expires_at: &str,
+            max_runs: i64,
+            max_attempts: i64,
+            max_interventions: i64,
+        ) -> Result<rs::ManagerReservation, rs::StoreError> {
+            self.0.reserve_manager_run(
+                id,
+                boot_id,
+                lease_expires_at,
+                max_runs,
+                max_attempts,
+                max_interventions,
+            )
+        }
+        fn expire_manager_leases(
+            &self,
+            boot_id: &str,
+            now: &str,
+        ) -> Result<Vec<rs::ManagerInterventionRow>, rs::StoreError> {
+            self.0.expire_manager_leases(boot_id, now)
+        }
+        fn stop_manager_generation(&self, pr: &str, reason: &str) -> Result<(), rs::StoreError> {
+            self.0.stop_manager_generation(pr, reason)
+        }
+        fn manager_budget(&self, pr: &str) -> Result<Option<rs::ManagerBudgetRow>, rs::StoreError> {
+            self.0.manager_budget(pr)
+        }
         fn load_live_review_watch(&self) -> Result<Vec<rs::ReviewWatchRow>, rs::StoreError> {
             Err(rs::StoreError::Disabled)
         }
@@ -9355,6 +9455,7 @@ mod tests {
                 // The max_turns backstop, not a declared hand-off.
                 declared_handoff: false,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             },
         );
@@ -9414,6 +9515,7 @@ mod tests {
                 last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
                 declared_handoff: true,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             },
         );

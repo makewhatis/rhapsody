@@ -52,6 +52,9 @@ pub struct ManagerCheckout {
     pub key: String,
     /// `manager.run_timeout_ms` (§10.1), the run's wall-clock ceiling.
     pub run_timeout_ms: i64,
+    /// The case packet (§7.2, §8) the host assembles at launch and hands the run as DATA. Empty
+    /// means no packet (an older code path); the worker then sends only [`MANAGER_BASE_PROMPT`].
+    pub case_packet: String,
 }
 
 /// The dispatch-time coordinates of one manager run: WHICH pull request it is convened for, and the
@@ -68,6 +71,9 @@ pub struct ManagerRun {
     /// The reviewer's team id, carried onto the synthetic issue. Empty is valid (a manager run is
     /// not a tracker issue).
     pub team_id: String,
+    /// The rendered case packet (§7.2, §8) the launch assembled. Emptied by the launch when the
+    /// caller supplies none; see [`ManagerCheckout::case_packet`].
+    pub case_packet: String,
 }
 
 impl ManagerRun {
@@ -81,6 +87,7 @@ impl ManagerRun {
         ManagerCheckout {
             key: self.key(),
             run_timeout_ms,
+            case_packet: self.case_packet.clone(),
         }
     }
 
@@ -253,6 +260,10 @@ impl Orchestrator {
         self.persist_end_run(re, outcome, reason);
         self.persist_complete(&re.issue.identifier);
         self.persist_totals();
+        // M8: settle the intervention the run belonged to (§7.2). The run has ended, so the
+        // intervention must not stay `running` until its lease expires — a clean exit with a valid
+        // decision becomes `decided`/`validated`, and anything else a `failed_attempt`.
+        self.settle_manager_intervention(&re.issue.id, e);
     }
 }
 
@@ -340,6 +351,7 @@ mod tests {
             number: 12,
             repo_url: REPO_URL.to_string(),
             team_id: String::new(),
+            case_packet: String::new(),
         }
     }
 
@@ -557,6 +569,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert!(!o.running.contains_key(key));

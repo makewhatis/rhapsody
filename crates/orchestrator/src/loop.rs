@@ -915,6 +915,12 @@ impl Orchestrator {
         // has quietly stopped, and that is when this report is worth the most. It also runs before
         // the publish so the snapshot below carries the same tick's verdict.
         self.reconcile_review_divergence();
+        // STUDIO-1015: the manager intervention pass. The sweep above has just enqueued or merged
+        // any stall signal the manager owns; this recovers dead leases (§7.5) and tries to launch
+        // every candidate whose §10.2 gates pass, each at its own entry point. Local writes only —
+        // the launch itself rides the existing dispatch funnel. A no-op while
+        // `manager.review_authority` is `off`.
+        self.pump_manager_interventions();
         // STUDIO-1026: the runaway-loop breaker — hold a ticket and notify the operator when its
         // completed-review-round count or its per-ticket spend crosses a configured limit. Beside the
         // sweep and above the same early returns, for the same reason: a daemon whose dispatch is
@@ -1910,6 +1916,7 @@ impl Orchestrator {
                 last_state: final_state,
                 declared_handoff: declared.declared_handoff,
                 review_verdict: declared.review_verdict,
+                manager_text: declared.manager_text,
                 refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
@@ -2313,6 +2320,7 @@ mod tests {
                 last_state: String::new(),
                 declared_handoff: false,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             }));
         }));

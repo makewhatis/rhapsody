@@ -521,6 +521,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -576,6 +577,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         // The reopen ladder is the unit under test; drop the dispatch's claim so

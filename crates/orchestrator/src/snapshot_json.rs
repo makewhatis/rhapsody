@@ -152,6 +152,15 @@ pub fn render(s: &Snapshot) -> Value {
                                 json!(d.supersession().unwrap_or_default()),
                             );
                         }
+                        // STUDIO-1015: a manager-owned stall the manager could not adopt keeps its
+                        // row and carries the §10.2 human-feed sentence (`manager deferred: drain`,
+                        // `manager unavailable: CLI contract`, …). Conditional on the kind, so every
+                        // other row shape (and the healthy payload) is untouched.
+                        if d.kind == crate::reviewreconcile::DivergenceKind::ManagerDeferred
+                            && let Some(obj) = row.as_object_mut()
+                        {
+                            obj.insert("reason".to_string(), json!(d.reason));
+                        }
                         row
                     })
                     .collect::<Vec<_>>(),
@@ -519,6 +528,43 @@ mod tests {
             rows[0].get("capacity_unreadable").is_none(),
             "a readable coordinate must not carry the denial, got: {}",
             rows[0]
+        );
+    }
+
+    // STUDIO-1015 (§10.2): a manager-owned stall the manager could NOT adopt (a deferred launch, or
+    // an unavailable manager) reaches the console as a `manager_deferred` row carrying the manager's
+    // own sentence. MUTATION: drop the conditional `reason` insert and the operator sees the generic
+    // detail with no way to tell why the manager did not act.
+    #[test]
+    fn a_manager_deferred_divergence_carries_its_reason_on_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.review_divergence = vec![crate::reviewreconcile::Divergence {
+            pr: "makewhatis/rhapsody#164".to_string(),
+            kind: crate::reviewreconcile::DivergenceKind::ManagerDeferred,
+            ticket: "STUDIO-1015".to_string(),
+            reviewer: "alice".to_string(),
+            stale_secs: 0,
+            auto_merge_reason: None,
+            capacity_held: None,
+            capacity_unreadable: None,
+            adjudicated_head: String::new(),
+            current_head: String::new(),
+            rounds: 0,
+            findings: Vec::new(),
+            reason: "manager deferred: drain".to_string(),
+        }];
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["review_divergence"]
+            .as_array()
+            .expect("review_divergence is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "manager_deferred");
+        assert_eq!(
+            rows[0]["reason"], "manager deferred: drain",
+            "the manager's own wording reaches the operator"
         );
     }
 

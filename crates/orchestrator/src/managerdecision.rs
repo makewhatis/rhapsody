@@ -385,6 +385,26 @@ pub fn parse_decision(
     result_text: &str,
     known: &[KnownFinding],
 ) -> Result<ManagerDecision, DecisionError> {
+    parse_decision_with(result_text, known, true)
+}
+
+/// Re-parse a decision block that was ALREADY validated before it was stored (§7.5). The §6.1
+/// open-status requirement is SKIPPED: a `route.fix` or `dismiss` revision that has since been
+/// resolved is exactly the evidence movement §8.2 exists to judge, not a parse failure. Enforcing
+/// it here would leave the intervention pinned to the active index forever, because the stored
+/// body never changes while the ledger does — the loop would `continue` on every sweep.
+pub fn parse_stored_decision(
+    result_text: &str,
+    known: &[KnownFinding],
+) -> Result<ManagerDecision, DecisionError> {
+    parse_decision_with(result_text, known, false)
+}
+
+fn parse_decision_with(
+    result_text: &str,
+    known: &[KnownFinding],
+    require_open: bool,
+) -> Result<ManagerDecision, DecisionError> {
     let blocks = fenced_blocks(result_text, MANAGER_DECISION_TAG);
     let [body] = blocks.as_slice() else {
         return Err(DecisionError::ZeroOrManyBlocks);
@@ -457,7 +477,7 @@ pub fn parse_decision(
     let rationale = required_text(&root, "rationale", "rationale")?;
 
     let dismiss = match root.get("dismiss") {
-        Some(v) => parse_dismissals(v, known)?,
+        Some(v) => parse_dismissals(v, known, require_open)?,
         None => Vec::new(),
     };
 
@@ -473,7 +493,7 @@ pub fn parse_decision(
             let route = root
                 .get("route")
                 .ok_or(DecisionError::MissingField("route"))?;
-            let (fix, instructions) = parse_route(route, known)?;
+            let (fix, instructions) = parse_route(route, known, require_open)?;
             DecisionKind::RouteToAuthor { fix, instructions }
         }
         "APPROVE" => DecisionKind::Approve,
@@ -604,6 +624,7 @@ fn parse_rerun(rerun: &StrictJson) -> Result<(Vec<String>, Option<String>), Deci
 fn parse_route(
     route: &StrictJson,
     known: &[KnownFinding],
+    require_open: bool,
 ) -> Result<(Vec<FindingRef>, String), DecisionError> {
     let entries = route.object().ok_or(DecisionError::FieldNotAllowed {
         field: "route",
@@ -625,7 +646,7 @@ fn parse_route(
                     refs.push(parse_finding_ref(item)?);
                 }
                 for r in &refs {
-                    require_open_blocking(r, known)?;
+                    require_open_blocking(r, known, require_open)?;
                 }
                 fix = Some(refs);
             }
@@ -713,6 +734,7 @@ fn parse_escalate(escalate: &StrictJson) -> Result<(String, String), DecisionErr
 fn parse_dismissals(
     dismiss: &StrictJson,
     known: &[KnownFinding],
+    require_open: bool,
 ) -> Result<Vec<Dismissal>, DecisionError> {
     let StrictJson::Array(items) = dismiss else {
         return Err(DecisionError::EmptyList("dismiss"));
@@ -753,7 +775,7 @@ fn parse_dismissals(
         }
         let finding = finding.ok_or(DecisionError::MissingField("dismiss.finding"))?;
         let rationale = rationale.ok_or(DecisionError::MissingField("dismiss.rationale"))?;
-        require_open_blocking(&finding, known)?;
+        require_open_blocking(&finding, known, require_open)?;
         out.push(Dismissal { finding, rationale });
     }
     Ok(out)
@@ -818,7 +840,14 @@ fn parse_finding_ref(item: &StrictJson) -> Result<FindingRef, DecisionError> {
 /// A `route.fix` or a `dismiss` must name an existing revision that is `open` and blocking (§6.1,
 /// §6.3). A resolved, settled or dismissed revision is the wrong status; an unknown one does not
 /// exist.
-fn require_open_blocking(r: &FindingRef, known: &[KnownFinding]) -> Result<(), DecisionError> {
+fn require_open_blocking(
+    r: &FindingRef,
+    known: &[KnownFinding],
+    require_open: bool,
+) -> Result<(), DecisionError> {
+    if !require_open {
+        return Ok(()); // a stored, already-validated decision: §8.2 judges status, not this parser
+    }
     let id = format!("{}@r{}", r.finding, r.revision);
     match known
         .iter()

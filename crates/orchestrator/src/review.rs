@@ -2543,6 +2543,7 @@ mod tests {
             // The unstructured fallback: these tests predate the structured contract and emit no
             // block (STUDIO-1008). `exit_review_with_verdict` below carries a parsed one.
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         run_id
@@ -2566,6 +2567,7 @@ mod tests {
             last_state: last_state.to_string(),
             declared_handoff: true,
             review_verdict: Some(verdict),
+            manager_text: None,
             refused: false,
         });
         run_id
@@ -3401,6 +3403,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -3570,6 +3573,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 

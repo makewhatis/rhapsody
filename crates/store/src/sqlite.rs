@@ -49,7 +49,7 @@
 
 use crate::*;
 use rusqlite::types::Value;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -62,9 +62,10 @@ use std::sync::{Mutex, MutexGuard};
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
 /// review evidence ledger, then the
 /// provider origin + broker usage record, then the manager approval record, then the manager
-/// exchange authorizations, then the durable UTC-day provider budget authority) and are
+/// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
+/// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -484,6 +485,61 @@ CREATE TABLE IF NOT EXISTS rhapsody_evidence_access (
   recorded_at TEXT    NOT NULL DEFAULT ''
 );
 "#,
+    // v21 -> v22: the MANAGER INTERVENTION LIFECYCLE (STUDIO-1015, design record
+    // `manager-agent-design.md` §7.1-§7.5, §10.2). Rhapsody-only, on Rhapsody-only objects, so the
+    // `rhapsody_` prefix gates every one out of the Go-recaptured schema golden by name exactly as
+    // steps 7-21 are.
+    //
+    // `rhapsody_manager_intervention` is the durable idempotency root: one row per stall episode,
+    // carrying the stall signals it merges, its attempt and generation budgets, its lease, its
+    // validated decision and its terminal outcome. `id` is a UUID primary key (SQLite's implicit
+    // auto-index, whose `sqlite_master.sql IS NULL`, so no explicit index for it reaches the
+    // golden).
+    //
+    // The UNIQUE PARTIAL INDEX on `pr` over the non-terminal states is the load-bearing constraint
+    // (§7.1): **at most one active intervention per pull request, across all stall kinds.** It is
+    // named with the `rhapsody_` prefix (not `idx_...`) so the name rule excludes its DDL from the
+    // golden, and its terminal-state list is the literal complement of
+    // `MANAGER_INTERVENTION_TERMINAL_STATES`.
+    //
+    // The three new `rhapsody_review_bound` columns are the per-(PR, generation) manager counters:
+    // `manager_runs_used` (every manager run launched for the generation) and
+    // `manager_interventions_applied` (post-threshold interventions) are charged only inside the
+    // atomic reservations of §7.3 and are NEVER refunded; `manager_stopped` is empty while the
+    // generation is live and holds a reason once it is stopped, which is what stops the sweep from
+    // ever creating another intervention for that generation (§7.2).
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_manager_intervention (
+  id                    TEXT    NOT NULL PRIMARY KEY,
+  pr                    TEXT    NOT NULL DEFAULT '',
+  generation            INTEGER NOT NULL DEFAULT 0,
+  stall_kinds           TEXT    NOT NULL DEFAULT '',
+  mode                  TEXT    NOT NULL DEFAULT '',
+  state                 TEXT    NOT NULL DEFAULT '',
+  attempts              INTEGER NOT NULL DEFAULT 0,
+  phase_hint            TEXT    NOT NULL DEFAULT '',
+  final                 INTEGER NOT NULL DEFAULT 0,
+  lease_boot_id         TEXT    NOT NULL DEFAULT '',
+  lease_expires_at      TEXT    NOT NULL DEFAULT '',
+  run_id                INTEGER,
+  decision_json         TEXT    NOT NULL DEFAULT '',
+  decision_head         TEXT    NOT NULL DEFAULT '',
+  decision_evidence_rev INTEGER NOT NULL DEFAULT 0,
+  effects_json          TEXT    NOT NULL DEFAULT '',
+  activated_at          TEXT    NOT NULL DEFAULT '',
+  unapplied_explanation INTEGER NOT NULL DEFAULT 0,
+  outcome               TEXT    NOT NULL DEFAULT '',
+  outcome_at            TEXT    NOT NULL DEFAULT '',
+  memory_state          TEXT    NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rhapsody_manager_intervention_active
+  ON rhapsody_manager_intervention(pr)
+  WHERE state NOT IN ('complete', 'effect_timeout', 'no_review_gap', 'escalated', 'exhausted',
+                      'apply_failed', 'apply_uncertain', 'superseded', 'proposed');
+ALTER TABLE rhapsody_review_bound ADD COLUMN manager_runs_used             INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_bound ADD COLUMN manager_interventions_applied INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_bound ADD COLUMN manager_stopped               TEXT    NOT NULL DEFAULT '';
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -611,6 +667,66 @@ fn map_manager_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerAppr
         membership_hash: row.get(7)?,
         state: row.get(8)?,
     })
+}
+
+/// The `rhapsody_manager_intervention` columns, in DDL order — the single shared list for every
+/// intervention query, read POSITIONALLY by [`map_manager_intervention`] exactly as
+/// [`MANAGER_APPROVAL_COLS`] is by [`map_manager_approval`].
+const MANAGER_INTERVENTION_COLS: &str = "id, pr, generation, stall_kinds, mode, state, attempts, \
+     phase_hint, final, lease_boot_id, lease_expires_at, run_id, decision_json, decision_head, \
+     decision_evidence_rev, effects_json, activated_at, unapplied_explanation, outcome, outcome_at, \
+     memory_state";
+
+/// Scan one `rhapsody_manager_intervention` row selected with [`MANAGER_INTERVENTION_COLS`]
+/// (positional, in DDL order). `stall_kinds` is the newline-joined TEXT column read back through
+/// [`split_findings`]; `final`/`unapplied_explanation` read as INTEGER 0/1; `run_id` is NULLable.
+fn map_manager_intervention(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerInterventionRow> {
+    Ok(ManagerInterventionRow {
+        id: row.get(0)?,
+        pr: row.get(1)?,
+        generation: row.get(2)?,
+        stall_kinds: split_findings(&row.get::<_, String>(3)?),
+        mode: row.get(4)?,
+        state: row.get(5)?,
+        attempts: row.get(6)?,
+        phase_hint: row.get(7)?,
+        is_final: row.get::<_, i64>(8)? != 0,
+        lease_boot_id: row.get(9)?,
+        lease_expires_at: row.get(10)?,
+        run_id: row.get(11)?,
+        decision_json: row.get(12)?,
+        decision_head: row.get(13)?,
+        decision_evidence_rev: row.get(14)?,
+        effects_json: row.get(15)?,
+        activated_at: row.get(16)?,
+        unapplied_explanation: row.get::<_, i64>(17)? != 0,
+        outcome: row.get(18)?,
+        outcome_at: row.get(19)?,
+        memory_state: row.get(20)?,
+    })
+}
+
+/// The literal SQL list of [`MANAGER_INTERVENTION_TERMINAL_STATES`], for the queries that must name
+/// the non-terminal set. Built from the Rust constant's string literals, which are trusted tokens
+/// (never user input), so no parameter binding is needed — and keeping the two in lockstep is the
+/// reason the list lives in [`rhapsody_store::MANAGER_INTERVENTION_TERMINAL_STATES`].
+fn manager_terminal_states_sql() -> String {
+    MANAGER_INTERVENTION_TERMINAL_STATES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether a lease whose `lease_expires_at` is `lease` has expired at `now`. Both are RFC3339 UTC
+/// strings; a value that does not parse is treated as EXPIRED, the fail-closed direction for
+/// recovery (§7.5) — an unreadable lease must never block the loop forever.
+fn lease_expired(lease: &str, now: &str) -> bool {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (parse(lease), parse(now)) {
+        (Some(lease), Some(now)) => lease <= now,
+        _ => true,
+    }
 }
 
 /// SQLite-backed durable history + recovery store (the parity port of Go's `sqliteStore`).
@@ -2236,14 +2352,28 @@ impl Store for Sqlite {
     }
 
     fn clear_review_bound(&self, pr: &str) -> Result<(), StoreError> {
-        let conn = self.lock();
+        let mut conn = self.lock();
         // A DELETE rather than a zeroing UPDATE: "no row" is what a pull request nobody has
         // reviewed looks like, and a re-introduced, reopened or rebuilt pull request must be
         // indistinguishable from one the daemon has never seen.
-        conn.execute(
+        //
+        // A pull request leaving the watch set also SUPERSEDES its active manager intervention
+        // (§7.2/§7.4), so a rebuilt or re-introduced pull request never inherits one — and the
+        // unique partial index is released.
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM rhapsody_review_bound WHERE pr = ?1",
             params![pr],
         )?;
+        tx.execute(
+            &format!(
+                "UPDATE rhapsody_manager_intervention SET state = ?2 \
+                 WHERE pr = ?1 AND state NOT IN ({})",
+                manager_terminal_states_sql()
+            ),
+            params![pr, MANAGER_INTERVENTION_SUPERSEDED],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2298,12 +2428,18 @@ impl Store for Sqlite {
     }
 
     fn increment_review_generation(&self, pr: &str) -> Result<(), StoreError> {
-        let conn = self.lock();
+        let mut conn = self.lock();
         // The operator's `/clear`: generation +1 AND the counter/decision zeroed, in one statement so
         // the two halves of the reset can never come apart. A row that does not exist is created at
         // generation 1 — a clear on a watched pull request the daemon never charged still leaves a
         // generation behind, which is what makes "a clear increments the generation" true for it too.
-        conn.execute(
+        //
+        // §7.4: a clear also RESETS both manager budgets and clears `manager_stopped`, and
+        // SUPERSEDES the active intervention (so the unique partial index is released and the next
+        // sweep may create a fresh one). All of it is one transaction, so a clear can never leave a
+        // new generation beside a stale active intervention that blocks it.
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1)
              ON CONFLICT(pr) DO UPDATE SET
                generation = generation + 1,
@@ -2312,9 +2448,21 @@ impl Store for Sqlite {
                head       = '',
                rounds     = 0,
                findings   = '',
-               reason     = ''",
+               reason     = '',
+               manager_runs_used             = 0,
+               manager_interventions_applied = 0,
+               manager_stopped               = ''",
             params![pr],
         )?;
+        tx.execute(
+            &format!(
+                "UPDATE rhapsody_manager_intervention SET state = ?2 \
+                 WHERE pr = ?1 AND state NOT IN ({})",
+                manager_terminal_states_sql()
+            ),
+            params![pr, MANAGER_INTERVENTION_SUPERSEDED],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2783,6 +2931,433 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn save_manager_intervention(&self, row: ManagerInterventionRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A whole-row upsert keyed by the id (the idempotency root). The CREATE path is what the
+        // unique partial index guards: a second NON-terminal row for the same `pr` is refused by
+        // SQLite rather than silently merged, which is the invariant the caller must read
+        // `active_manager_intervention` against first.
+        conn.execute(
+            "INSERT INTO rhapsody_manager_intervention
+               (id, pr, generation, stall_kinds, mode, state, attempts, phase_hint, final,
+                lease_boot_id, lease_expires_at, run_id, decision_json, decision_head,
+                decision_evidence_rev, effects_json, activated_at, unapplied_explanation,
+                outcome, outcome_at, memory_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20, ?21)
+             ON CONFLICT(id) DO UPDATE SET
+               pr                    = excluded.pr,
+               generation            = excluded.generation,
+               stall_kinds           = excluded.stall_kinds,
+               mode                  = excluded.mode,
+               state                 = excluded.state,
+               attempts              = excluded.attempts,
+               phase_hint            = excluded.phase_hint,
+               final                 = excluded.final,
+               lease_boot_id         = excluded.lease_boot_id,
+               lease_expires_at      = excluded.lease_expires_at,
+               run_id                = excluded.run_id,
+               decision_json         = excluded.decision_json,
+               decision_head         = excluded.decision_head,
+               decision_evidence_rev = excluded.decision_evidence_rev,
+               effects_json          = excluded.effects_json,
+               activated_at          = excluded.activated_at,
+               unapplied_explanation = excluded.unapplied_explanation,
+               outcome               = excluded.outcome,
+               outcome_at            = excluded.outcome_at,
+               memory_state          = excluded.memory_state",
+            params![
+                row.id,
+                row.pr,
+                row.generation,
+                join_findings(&row.stall_kinds),
+                row.mode,
+                row.state,
+                row.attempts,
+                row.phase_hint,
+                row.is_final as i64,
+                row.lease_boot_id,
+                row.lease_expires_at,
+                row.run_id,
+                row.decision_json,
+                row.decision_head,
+                row.decision_evidence_rev,
+                row.effects_json,
+                row.activated_at,
+                row.unapplied_explanation as i64,
+                row.outcome,
+                row.outcome_at,
+                row.memory_state,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn manager_intervention(&self, id: &str) -> Result<Option<ManagerInterventionRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_INTERVENTION_COLS} FROM rhapsody_manager_intervention WHERE id = ?1"
+        ))?;
+        let mut rows = stmt.query_map(params![id], map_manager_intervention)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn active_manager_intervention(
+        &self,
+        pr: &str,
+    ) -> Result<Option<ManagerInterventionRow>, StoreError> {
+        let conn = self.lock();
+        // One row by the unique partial index; LIMIT 1 makes the intent explicit and cannot hide a
+        // second row, because the index makes a second row impossible.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_INTERVENTION_COLS} FROM rhapsody_manager_intervention \
+             WHERE pr = ?1 AND state NOT IN ({}) LIMIT 1",
+            manager_terminal_states_sql()
+        ))?;
+        let mut rows = stmt.query_map(params![pr], map_manager_intervention)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_manager_interventions(&self) -> Result<Vec<ManagerInterventionRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MANAGER_INTERVENTION_COLS} FROM rhapsody_manager_intervention ORDER BY rowid"
+        ))?;
+        let rows = stmt.query_map([], map_manager_intervention)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn merge_manager_stall_kinds(&self, id: &str, kinds: &[String]) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT state, stall_kinds FROM rhapsody_manager_intervention WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, stored)) = existing else {
+            return Ok(false);
+        };
+        // Only a NOT-YET-LAUNCHED intervention merges (§7.2): `queued` and `deferred` have not
+        // spent a run, so adding a signal cannot change a decision already in flight. Anything
+        // else drops the signal, to be re-detected once the intervention is terminal.
+        if state != MANAGER_INTERVENTION_QUEUED && state != MANAGER_INTERVENTION_DEFERRED {
+            return Ok(false);
+        }
+        let mut merged = split_findings(&stored);
+        for kind in kinds {
+            if !kind.is_empty() && !merged.contains(kind) {
+                merged.push(kind.clone());
+            }
+        }
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET stall_kinds = ?2 WHERE id = ?1",
+            params![id, join_findings(&merged)],
+        )?;
+        Ok(true)
+    }
+
+    fn set_manager_intervention_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    fn set_manager_intervention_phase_hint(
+        &self,
+        id: &str,
+        phase_hint: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET phase_hint = ?2 WHERE id = ?1",
+            params![id, phase_hint],
+        )?;
+        Ok(())
+    }
+
+    fn mark_manager_intervention_running(
+        &self,
+        id: &str,
+        run_id: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET state = ?2, run_id = ?3 WHERE id = ?1",
+            params![id, MANAGER_INTERVENTION_RUNNING, run_id],
+        )?;
+        Ok(())
+    }
+
+    fn record_manager_decision(
+        &self,
+        id: &str,
+        decision_json: &str,
+        decision_head: &str,
+        decision_evidence_rev: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // A parsed decision ends the run: `decided` carries no lease, so the recovery sweep can
+        // revalidate it without a model run (§7.5).
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention \
+             SET state = ?2, decision_json = ?3, decision_head = ?4, decision_evidence_rev = ?5, \
+                 lease_boot_id = '', lease_expires_at = '' \
+             WHERE id = ?1",
+            params![
+                id,
+                MANAGER_INTERVENTION_DECIDED,
+                decision_json,
+                decision_head,
+                decision_evidence_rev,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn stop_manager_intervention(
+        &self,
+        id: &str,
+        terminal_state: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if reason.is_empty() {
+            return Ok(()); // an empty reason never stops a generation
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let pr: Option<String> = tx
+            .query_row(
+                "SELECT pr FROM rhapsody_manager_intervention WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pr) = pr else {
+            return Ok(()); // no row, nothing to end
+        };
+        // Both writes in ONE transaction, so a terminal row can never coexist with a live
+        // generation — the window in which the next sweep would recreate the intervention (§7.2).
+        tx.execute(
+            "UPDATE rhapsody_manager_intervention \
+             SET state = ?2, lease_boot_id = '', lease_expires_at = '' WHERE id = ?1",
+            params![id, terminal_state],
+        )?;
+        tx.execute(
+            "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1) \
+             ON CONFLICT(pr) DO NOTHING",
+            params![pr],
+        )?;
+        tx.execute(
+            "UPDATE rhapsody_review_bound SET manager_stopped = ?2 WHERE pr = ?1",
+            params![pr, reason],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn reserve_manager_run(
+        &self,
+        id: &str,
+        boot_id: &str,
+        lease_expires_at: &str,
+        max_runs: i64,
+        max_attempts: i64,
+        max_interventions: i64,
+    ) -> Result<ManagerReservation, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Read the intervention inside the transaction so a concurrent terminal write cannot race
+        // the charge. A missing row means the reservation loses and charges nothing.
+        let existing: Option<(String, i64, i64, String)> = tx
+            .query_row(
+                "SELECT pr, generation, attempts, state FROM rhapsody_manager_intervention \
+                 WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((pr, generation, attempts, state)) = existing else {
+            return Ok(ManagerReservation::Absent);
+        };
+        if manager_intervention_is_terminal(&state) {
+            // A terminal intervention is never resurrected; nothing was charged.
+            return Ok(ManagerReservation::Absent);
+        }
+        // The bound row is the budget authority. Created at the intervention's generation when
+        // absent, so a reservation can always charge somewhere.
+        tx.execute(
+            "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, ?2) \
+             ON CONFLICT(pr) DO NOTHING",
+            params![pr, generation],
+        )?;
+        let (runs_used, applied, stopped): (i64, i64, String) = tx.query_row(
+            "SELECT manager_runs_used, manager_interventions_applied, manager_stopped \
+             FROM rhapsody_review_bound WHERE pr = ?1",
+            params![pr],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        // THE checks of §7.3. A generation already stopped, the run budget spent, or this
+        // intervention's attempt cap reached all refuse — and, in the SAME transaction, terminalise
+        // the intervention and stop the generation, so the bound is never silently released.
+        if !stopped.is_empty() || runs_used >= max_runs || attempts >= max_attempts {
+            let reason = if !stopped.is_empty() {
+                stopped
+            } else if runs_used >= max_runs {
+                "manager generation run budget exhausted".to_string()
+            } else {
+                "manager intervention attempt cap reached".to_string()
+            };
+            tx.execute(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, lease_boot_id = '', lease_expires_at = '' WHERE id = ?1",
+                params![id, MANAGER_INTERVENTION_EXHAUSTED],
+            )?;
+            tx.execute(
+                "UPDATE rhapsody_review_bound SET manager_stopped = ?2 WHERE pr = ?1",
+                params![pr, reason],
+            )?;
+            tx.commit()?;
+            return Ok(ManagerReservation::Exhausted);
+        }
+
+        // Charge both budgets and write the lease. `final` is set here (not at activation) when the
+        // next post-threshold slot would be the last one (§7.3).
+        let is_final = applied >= max_interventions - 1;
+        tx.execute(
+            "UPDATE rhapsody_manager_intervention \
+             SET state = ?2, attempts = attempts + 1, final = ?3, \
+                 lease_boot_id = ?4, lease_expires_at = ?5 \
+             WHERE id = ?1",
+            params![
+                id,
+                MANAGER_INTERVENTION_LAUNCHING,
+                is_final as i64,
+                boot_id,
+                lease_expires_at,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE rhapsody_review_bound SET manager_runs_used = manager_runs_used + 1 \
+             WHERE pr = ?1",
+            params![pr],
+        )?;
+        tx.commit()?;
+        Ok(ManagerReservation::Reserved)
+    }
+
+    fn expire_manager_leases(
+        &self,
+        boot_id: &str,
+        now: &str,
+    ) -> Result<Vec<ManagerInterventionRow>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let live: Vec<ManagerInterventionRow> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {MANAGER_INTERVENTION_COLS} FROM rhapsody_manager_intervention \
+                 WHERE state IN (?1, ?2)",
+            ))?;
+            let rows = stmt.query_map(
+                params![MANAGER_INTERVENTION_LAUNCHING, MANAGER_INTERVENTION_RUNNING],
+                map_manager_intervention,
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        let mut recovered = Vec::new();
+        for mut row in live {
+            // A lease from another boot is dead (its owner ran in a past process), and a lease at or
+            // before `now` has expired. Either way it becomes a `failed_attempt` with no lease, so it
+            // can never block forever.
+            if row.lease_boot_id == boot_id && !lease_expired(&row.lease_expires_at, now) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, lease_boot_id = '', lease_expires_at = '' WHERE id = ?1",
+                params![row.id, MANAGER_INTERVENTION_FAILED_ATTEMPT],
+            )?;
+            row.state = MANAGER_INTERVENTION_FAILED_ATTEMPT.to_string();
+            row.lease_boot_id.clear();
+            row.lease_expires_at.clear();
+            recovered.push(row);
+        }
+        tx.commit()?;
+        Ok(recovered)
+    }
+
+    fn stop_manager_generation(&self, pr: &str, reason: &str) -> Result<(), StoreError> {
+        if reason.is_empty() {
+            return Ok(()); // an empty reason never stops a generation
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO rhapsody_review_bound (pr, generation) VALUES (?1, 1) \
+             ON CONFLICT(pr) DO NOTHING",
+            params![pr],
+        )?;
+        tx.execute(
+            "UPDATE rhapsody_review_bound SET manager_stopped = ?2 WHERE pr = ?1",
+            params![pr, reason],
+        )?;
+        // The doc promises this: a stopping stop also ENDS any non-terminal intervention for the PR,
+        // in the same transaction, so the unique partial index is released and the next sweep cannot
+        // see a live row beside a stopped generation (§7.2).
+        tx.execute(
+            &format!(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, lease_boot_id = '', lease_expires_at = '' \
+                 WHERE pr = ?1 AND state NOT IN ({})",
+                manager_terminal_states_sql()
+            ),
+            params![pr, MANAGER_INTERVENTION_EXHAUSTED],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn manager_budget(&self, pr: &str) -> Result<Option<ManagerBudgetRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT pr, generation, manager_runs_used, manager_interventions_applied, \
+                    manager_stopped \
+             FROM rhapsody_review_bound WHERE pr = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![pr], |row| {
+            Ok(ManagerBudgetRow {
+                pr: row.get(0)?,
+                generation: row.get(1)?,
+                runs_used: row.get(2)?,
+                interventions_applied: row.get(3)?,
+                stopped: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
@@ -6777,6 +7352,8 @@ mod tests {
                 "rhapsody_manager_exchange".to_string(),
                 "rhapsody_provider_day_budget".to_string(),
                 "rhapsody_evidence_access".to_string(),
+                "rhapsody_manager_intervention".to_string(),
+                "rhapsody_manager_intervention_active".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -7488,6 +8065,582 @@ mod tests {
                 .charge_provider_day_tokens("p", DAY, 10, 100)
                 .expect("charge"),
             "the upgraded store accepts a day charge"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // --- manager intervention lifecycle (STUDIO-1015) ------------------------------------------
+
+    fn intervention(id: &str, pr: &str, state: &str) -> ManagerInterventionRow {
+        ManagerInterventionRow {
+            id: id.to_string(),
+            pr: pr.to_string(),
+            generation: 1,
+            stall_kinds: vec!["review_escalated".to_string()],
+            mode: MANAGER_MODE_ACT.to_string(),
+            state: state.to_string(),
+            attempts: 0,
+            phase_hint: MANAGER_PHASE_POST_THRESHOLD.to_string(),
+            ..ManagerInterventionRow::default()
+        }
+    }
+
+    const PR: &str = "makewhatis/rhapsody#12";
+
+    fn save_queued(st: &Sqlite, id: &str, kind: &str) {
+        st.save_manager_intervention(ManagerInterventionRow {
+            id: id.to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            stall_kinds: vec![kind.to_string()],
+            mode: MANAGER_MODE_ACT.to_string(),
+            state: MANAGER_INTERVENTION_QUEUED.to_string(),
+            ..ManagerInterventionRow::default()
+        })
+        .expect("save");
+    }
+
+    // A whole row round-trips, including the newline-joined stall kinds and the 0/1 flags.
+    #[test]
+    fn a_manager_intervention_round_trips() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            id: "iv-1".to_string(),
+            pr: PR.to_string(),
+            generation: 3,
+            stall_kinds: vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string(),
+            ],
+            mode: MANAGER_MODE_ACT.to_string(),
+            state: MANAGER_INTERVENTION_RUNNING.to_string(),
+            attempts: 2,
+            phase_hint: MANAGER_PHASE_POST_THRESHOLD.to_string(),
+            is_final: true,
+            lease_boot_id: "boot-a".to_string(),
+            lease_expires_at: "2026-09-24T00:00:00Z".to_string(),
+            run_id: Some(7),
+            unapplied_explanation: true,
+            memory_state: "pending".to_string(),
+            ..ManagerInterventionRow::default()
+        })
+        .expect("save");
+        let got = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(got.generation, 3);
+        assert_eq!(
+            got.stall_kinds,
+            vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string()
+            ]
+        );
+        assert_eq!(got.state, MANAGER_INTERVENTION_RUNNING);
+        assert_eq!(got.attempts, 2);
+        assert!(got.is_final);
+        assert_eq!(got.lease_boot_id, "boot-a");
+        assert_eq!(got.run_id, Some(7));
+        assert!(got.unapplied_explanation);
+        assert_eq!(got.memory_state, "pending");
+        assert!(st.load_manager_interventions().expect("load").len() == 1);
+    }
+
+    // THE invariant (mutation: key uniqueness per stall kind): a second NON-terminal intervention
+    // for the same PR is refused by the database even when its stall kinds DIFFER, so at most one
+    // active intervention exists per PR across all stall kinds.
+    #[test]
+    fn only_one_active_intervention_per_pr_across_stall_kinds() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        let second = st.save_manager_intervention(ManagerInterventionRow {
+            id: "iv-2".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            stall_kinds: vec!["approved_still_open".to_string()],
+            mode: MANAGER_MODE_ACT.to_string(),
+            state: MANAGER_INTERVENTION_QUEUED.to_string(),
+            ..ManagerInterventionRow::default()
+        });
+        assert!(
+            second.is_err(),
+            "a second active intervention for the same PR must be refused (keyed per PR, not per \
+             (pr, stall_kind)): {second:?}"
+        );
+    }
+
+    // A terminal transition releases the PR, so the next sweep can create a fresh intervention.
+    #[test]
+    fn a_terminal_intervention_releases_the_pr() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_some()
+        );
+        st.set_manager_intervention_state("iv-1", MANAGER_INTERVENTION_EXHAUSTED)
+            .expect("exhaust");
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none()
+        );
+        save_queued(&st, "iv-2", "round_budget_exhausted");
+        assert_eq!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .expect("row")
+                .id,
+            "iv-2"
+        );
+    }
+
+    // The 13th launch is refused and the generation stops (§7.3/§15.4). A permissive per-intervention
+    // attempt cap isolates the generation-run budget as the binding check.
+    #[test]
+    fn the_thirteenth_launch_is_refused_and_stops_the_generation() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        for n in 0..12 {
+            let r = st
+                .reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                .expect("reserve");
+            assert_eq!(
+                r,
+                ManagerReservation::Reserved,
+                "launch {n} is within budget"
+            );
+        }
+        let r = st
+            .reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+            .expect("reserve");
+        assert_eq!(
+            r,
+            ManagerReservation::Exhausted,
+            "the 13th launch is refused"
+        );
+        let budget = st.manager_budget(PR).expect("budget").expect("row");
+        assert_eq!(
+            budget.runs_used, 12,
+            "12 runs charged, none for the refused 13th"
+        );
+        assert!(budget.is_stopped(), "the generation stops");
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_EXHAUSTED
+        );
+    }
+
+    // Nothing is refunded (mutation: refund a crashed run → this test reds): a run charged at
+    // launch still counts after its lease dies and it becomes a `failed_attempt`.
+    #[test]
+    fn a_crashed_run_stays_charged() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        assert_eq!(
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                .expect("reserve"),
+            ManagerReservation::Reserved
+        );
+        // The daemon restarts: the lease from `boot-a` is dead.
+        let recovered = st
+            .expire_manager_leases("boot-b", "2026-09-24T00:00:00Z")
+            .expect("recover");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].state, MANAGER_INTERVENTION_FAILED_ATTEMPT);
+        let budget = st.manager_budget(PR).expect("budget").expect("row");
+        assert_eq!(budget.runs_used, 1, "the crashed run is NOT refunded");
+        // A later attempt charges the budget again.
+        assert_eq!(
+            st.reserve_manager_run("iv-1", "boot-b", "2099-01-01T00:00:00Z", 12, 100, 3)
+                .expect("reserve"),
+            ManagerReservation::Reserved
+        );
+        assert_eq!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            2
+        );
+    }
+
+    // The per-intervention attempt cap (3) refuses the 4th launch and stops the generation.
+    #[test]
+    fn the_fourth_attempt_is_refused_and_stops_the_generation() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        for n in 0..3 {
+            assert_eq!(
+                st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                    .expect("reserve"),
+                ManagerReservation::Reserved,
+                "attempt {n} is within the cap"
+            );
+        }
+        assert_eq!(
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                .expect("reserve"),
+            ManagerReservation::Exhausted
+        );
+        assert!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
+        );
+    }
+
+    // A dead lease is recovered and never left blocking: a lease from another boot becomes a
+    // `failed_attempt` with its lease cleared.
+    #[test]
+    fn a_dead_lease_from_another_boot_is_recovered() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            state: MANAGER_INTERVENTION_LAUNCHING.to_string(),
+            lease_boot_id: "boot-old".to_string(),
+            lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            ..intervention("iv-1", PR, MANAGER_INTERVENTION_LAUNCHING)
+        })
+        .expect("save");
+        let recovered = st
+            .expire_manager_leases("boot-new", "2026-09-24T00:00:00Z")
+            .expect("recover");
+        assert_eq!(recovered.len(), 1);
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_FAILED_ATTEMPT);
+        assert!(row.lease_boot_id.is_empty() && row.lease_expires_at.is_empty());
+    }
+
+    // An expired lease on the CURRENT boot is recovered the same way.
+    #[test]
+    fn an_expired_lease_is_recovered_while_running() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            state: MANAGER_INTERVENTION_RUNNING.to_string(),
+            lease_boot_id: "boot-a".to_string(),
+            lease_expires_at: "2026-09-24T00:00:00Z".to_string(),
+            ..intervention("iv-1", PR, MANAGER_INTERVENTION_RUNNING)
+        })
+        .expect("save");
+        let recovered = st
+            .expire_manager_leases("boot-a", "2026-09-24T00:00:01Z")
+            .expect("recover");
+        assert_eq!(recovered.len(), 1, "an expired lease is dead");
+    }
+
+    // A live lease (same boot, future expiry) is left alone.
+    #[test]
+    fn a_live_lease_is_not_recovered() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            state: MANAGER_INTERVENTION_RUNNING.to_string(),
+            lease_boot_id: "boot-a".to_string(),
+            lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            ..intervention("iv-1", PR, MANAGER_INTERVENTION_RUNNING)
+        })
+        .expect("save");
+        let recovered = st
+            .expire_manager_leases("boot-a", "2026-09-24T00:00:00Z")
+            .expect("recover");
+        assert!(recovered.is_empty());
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_RUNNING
+        );
+    }
+
+    // Signals merge into a not-yet-launched intervention, and are DROPPED once it has launched.
+    #[test]
+    fn stall_kinds_merge_before_launch_and_drop_after() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        assert!(
+            st.merge_manager_stall_kinds("iv-1", &["approved_still_open".to_string()])
+                .expect("merge")
+        );
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .stall_kinds,
+            vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string()
+            ]
+        );
+        // After a reservation (launching), a further signal is dropped.
+        st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
+            .expect("reserve");
+        assert!(
+            !st.merge_manager_stall_kinds("iv-1", &["review_shipped".to_string()])
+                .expect("merge")
+        );
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_LAUNCHING
+        );
+    }
+
+    // `final` is set at launch when the next post-threshold intervention would be the last one.
+    #[test]
+    fn final_is_set_at_launch_on_the_last_allocation() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        // Move the counter to 2 by direct SQL (there is no public charge for it in M8; activation
+        // in M9 is its writer).
+        st.lock()
+            .execute(
+                "INSERT INTO rhapsody_review_bound (pr, generation, manager_interventions_applied) \
+                 VALUES (?1, 1, 2) ON CONFLICT(pr) DO UPDATE SET manager_interventions_applied = 2",
+                params![PR],
+            )
+            .expect("seed applied");
+        st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
+            .expect("reserve");
+        assert!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .is_final,
+            "the last post-threshold allocation launches final"
+        );
+    }
+
+    // A blank reason never stops a generation (a caller cannot clear a stop by accident).
+    #[test]
+    fn a_blank_reason_never_stops_a_generation() {
+        let st = open_mem();
+        st.stop_manager_generation(PR, "").expect("no-op");
+        assert!(
+            st.manager_budget(PR).expect("budget").is_none(),
+            "a blank reason writes no row at all"
+        );
+    }
+
+    // An operator `/clear` resets both manager budgets, clears the stop and supersedes the active
+    // intervention, so the next generation starts fresh.
+    #[test]
+    fn a_clear_resets_manager_budgets_and_supersedes() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
+            .expect("reserve");
+        st.stop_manager_generation(PR, "manager generation run budget exhausted")
+            .expect("stop");
+        assert!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
+        );
+        st.increment_review_generation(PR).expect("clear");
+        let budget = st.manager_budget(PR).expect("budget").expect("row");
+        assert_eq!(budget.runs_used, 0);
+        assert_eq!(budget.interventions_applied, 0);
+        assert!(!budget.is_stopped(), "a clear lifts the stop");
+        assert_eq!(budget.generation, 2);
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
+            "the old intervention is terminal and releases the PR"
+        );
+        // A NON-terminal intervention is SUPERSEDED by the clear (§7.4): created in the new
+        // generation and then cleared again.
+        save_queued(&st, "iv-2", "review_escalated");
+        st.increment_review_generation(PR).expect("clear again");
+        assert_eq!(
+            st.manager_intervention("iv-2")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_SUPERSEDED
+        );
+    }
+
+    // A STOPPING terminal transition is atomic: the intervention's terminal state and the
+    // generation's `manager_stopped` are written in ONE transaction. A repeated `apply_failed` —
+    // the first one stops the generation — then leaves nothing to create a new intervention from
+    // (§15.4). MUTATION: write the terminal state without the stop and the budget assert reds.
+    #[test]
+    fn a_stopping_terminal_state_and_the_stop_commit_together() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        st.stop_manager_intervention(
+            "iv-1",
+            MANAGER_INTERVENTION_APPLY_FAILED,
+            "an effect failed",
+        )
+        .expect("stop");
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_APPLY_FAILED);
+        assert!(row.lease_boot_id.is_empty() && row.lease_expires_at.is_empty());
+        assert!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "the same transaction stops the generation"
+        );
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
+            "the terminal row releases the unique index"
+        );
+    }
+
+    // `stop_manager_generation` ends any NON-terminal intervention for the PR in the same
+    // transaction, exactly as its doc promises. MUTATION: set only `manager_stopped` and the active
+    // read still returns the live row, so a replication sweep would recreate the stall.
+    #[test]
+    fn stop_manager_generation_terminalises_a_non_terminal_intervention() {
+        let st = open_mem();
+        save_queued(&st, "iv-1", "review_escalated");
+        st.stop_manager_generation(PR, "manager generation run budget exhausted")
+            .expect("stop");
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_EXHAUSTED
+        );
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
+            "the live row is terminalised, so nothing is left active"
+        );
+    }
+
+    // A parsed decision moves the intervention to `decided`, stores the decision and clears the
+    // lease — so recovery can revalidate it without a model run (§7.5).
+    #[test]
+    fn record_manager_decision_moves_to_decided_and_clears_the_lease() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            state: MANAGER_INTERVENTION_RUNNING.to_string(),
+            lease_boot_id: "boot-a".to_string(),
+            lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            ..intervention("iv-1", PR, MANAGER_INTERVENTION_RUNNING)
+        })
+        .expect("save");
+        st.record_manager_decision("iv-1", "{\"decision\":\"ESCALATE\"}", "head-1", 4)
+            .expect("record");
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_DECIDED);
+        assert_eq!(row.decision_json, "{\"decision\":\"ESCALATE\"}");
+        assert_eq!(row.decision_head, "head-1");
+        assert_eq!(row.decision_evidence_rev, 4);
+        assert!(row.lease_boot_id.is_empty() && row.lease_expires_at.is_empty());
+    }
+
+    // A dispatched run is marked `running` with its run id, still holding its lease.
+    #[test]
+    fn mark_manager_running_records_the_run_id_and_keeps_the_lease() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            state: MANAGER_INTERVENTION_LAUNCHING.to_string(),
+            lease_boot_id: "boot-a".to_string(),
+            lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            ..intervention("iv-1", PR, MANAGER_INTERVENTION_LAUNCHING)
+        })
+        .expect("save");
+        st.mark_manager_intervention_running("iv-1", Some(42))
+            .expect("running");
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_RUNNING);
+        assert_eq!(row.run_id, Some(42));
+        assert_eq!(
+            row.lease_boot_id, "boot-a",
+            "a running run still holds its lease"
+        );
+    }
+
+    // The stop survives a restart because it is on disk: reopening the same on-disk database reads
+    // the same `manager_stopped`. MUTATION: persist the stop in memory only and this reds.
+    #[test]
+    fn a_stopped_generation_survives_a_restart() {
+        let dir = scratch_dir();
+        let db = dir.join("stopped.db");
+        {
+            let st = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            save_queued(&st, "iv-1", "review_escalated");
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                .expect("reserve");
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                .expect("reserve");
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                .expect("reserve");
+            assert_eq!(
+                st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                    .expect("reserve"),
+                ManagerReservation::Exhausted
+            );
+        }
+        // Reopen the SAME file — a restart.
+        let st = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "the stop persists across a restart"
+        );
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
+            "the exhausted intervention stays terminal, so no stall can be recreated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A v21 database upgrades forward to the intervention table, which starts empty; a reservation
+    // against a store with no intervention row charges nothing. MUTATION: reuse a step index or skip
+    // the SCHEMA_VERSION bump and the version assert reds.
+    #[test]
+    fn a_v21_database_gains_the_manager_intervention_table_empty() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v21.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..21] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 21")
+                .expect("stamp v21");
+            tx.commit().expect("commit");
+        }
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            store
+                .active_manager_intervention(PR)
+                .expect("active")
+                .is_none()
+        );
+        assert!(store.manager_budget(PR).expect("budget").is_none());
+        assert_eq!(
+            store
+                .reserve_manager_run("absent", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
+                .expect("reserve"),
+            ManagerReservation::Absent
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

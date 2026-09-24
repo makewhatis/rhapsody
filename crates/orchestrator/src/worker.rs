@@ -146,6 +146,11 @@ pub struct WorkerDeclaration {
     /// every non-review run and on any review whose block is absent, ambiguous or unparseable —
     /// which is the unstructured fallback the review path records.
     pub review_verdict: Option<ReviewVerdictBlock>,
+    /// A MANAGER run's final result text, carried verbatim so the exit path can parse the
+    /// `rhapsody-manager-decision` block against the daemon's finding ledger (STUDIO-1015, §6.1).
+    /// `None` on every non-manager run. Carried rather than re-read: the worker still holds the
+    /// final text when it builds this, exactly as `review_verdict` is.
+    pub manager_text: Option<String>,
 }
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
@@ -548,10 +553,22 @@ async fn run_manager_attempt(
     session.set_run_id(deps.run_id);
     session.set_model_override(deps.model_override.clone());
 
+    // §8: the case packet is the host's own record of the stall, rendered as DATA, and it
+    // accompanies the base prompt rather than replacing it. An empty packet (an older path) sends
+    // the base prompt alone, byte-identical to M7.
+    let prompt = if mgr.case_packet.is_empty() {
+        crate::managerrun::MANAGER_BASE_PROMPT.to_string()
+    } else {
+        format!(
+            "{}\n\n{}",
+            crate::managerrun::MANAGER_BASE_PROMPT,
+            mgr.case_packet
+        )
+    };
     let (final_state, result_text, loop_err) = deps
         .run_turns(
             session.as_ref(),
-            crate::managerrun::MANAGER_BASE_PROMPT,
+            &prompt,
             issue.clone(),
             None,
             messages,
@@ -564,6 +581,9 @@ async fn run_manager_attempt(
         WorkerDeclaration {
             declared_handoff: has_handoff_marker(&result_text),
             review_verdict: None,
+            // The manager's final text is parsed at the exit path, where the finding ledger is in
+            // hand: the decision's dismissals name finding revisions only the daemon knows.
+            manager_text: Some(result_text),
         },
         loop_err,
     )
@@ -1069,6 +1089,7 @@ pub async fn run_agent_attempt(
         WorkerDeclaration {
             declared_handoff: has_handoff_marker(&result_text),
             review_verdict,
+            manager_text: None,
         },
         loop_err,
     )
@@ -3878,6 +3899,7 @@ mod tests {
         d.manager = Some(crate::managerrun::ManagerCheckout {
             key: "pr:o/r#1@manager".to_string(),
             run_timeout_ms: 1234,
+            case_packet: String::new(),
         });
         let key = "pr:o/r#1@manager";
         let iss = Issue {

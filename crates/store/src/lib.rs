@@ -714,6 +714,134 @@ pub trait Store {
     /// rehydrated from.
     fn load_manager_approvals(&self) -> Result<Vec<ManagerApprovalRow>, StoreError>;
 
+    // --- manager intervention lifecycle (STUDIO-1015; no Go counterpart — see
+    // [`ManagerInterventionRow`]) ---------------------------------------------------------------
+    // The durable idempotency root of the manager's lifecycle (§7.1-§7.5, §10.2). A unique partial
+    // index on `pr` over the non-terminal states makes "at most one active intervention per PR,
+    // across all stall kinds" a database invariant; the atomic reservations (§7.3) and the stopped
+    // generation (§7.2) are what bound model spend even across restarts.
+
+    /// Writes `row` as one manager intervention, replacing the row with the same `id` if one exists.
+    ///
+    /// A whole-row upsert because the control task is the single writer. The CREATE path is what the
+    /// unique partial index guards: a second non-terminal row for the same `pr` is refused by SQLite
+    /// with a constraint error, never silently merged — the caller must have read the active row
+    /// first ([`Store::active_manager_intervention`]).
+    fn save_manager_intervention(&self, row: ManagerInterventionRow) -> Result<(), StoreError>;
+
+    /// One intervention by id, or `None`.
+    fn manager_intervention(&self, id: &str) -> Result<Option<ManagerInterventionRow>, StoreError>;
+
+    /// The single NON-terminal intervention for `pr`, or `None`. The read at the top of every sweep:
+    /// an active intervention is merged into (before launch) or dropped (after launch), and a
+    /// stopped generation is what stops a new one existing at all.
+    fn active_manager_intervention(
+        &self,
+        pr: &str,
+    ) -> Result<Option<ManagerInterventionRow>, StoreError>;
+
+    /// Every intervention, oldest first — the boot snapshot the lifecycle is rehydrated from.
+    fn load_manager_interventions(&self) -> Result<Vec<ManagerInterventionRow>, StoreError>;
+
+    /// Unions `kinds` into `id`'s `stall_kinds`, but ONLY while the intervention has not launched
+    /// (its state is `queued` or `deferred`). Returns whether the merge happened: `false` means the
+    /// intervention already launched and the signals are dropped, to be re-detected once it is
+    /// terminal (§7.2). Idempotent; a no-op when `id` names no row.
+    fn merge_manager_stall_kinds(&self, id: &str, kinds: &[String]) -> Result<bool, StoreError>;
+
+    /// Moves one intervention to `state`. Idempotent, and a no-op when `id` names no row. The
+    /// terminal states are what release the unique partial index, so a terminal transition is the
+    /// only way the next intervention for the PR can exist.
+    fn set_manager_intervention_state(&self, id: &str, state: &str) -> Result<(), StoreError>;
+
+    /// Writes the case-packet PHASE HINT (`pre_threshold`/`post_threshold`) recorded at launch
+    /// (§7.1). A hint only — the authoritative classification is made at activation (§7.8) — so it
+    /// carries no charging semantics. Idempotent; a no-op when `id` names no row.
+    fn set_manager_intervention_phase_hint(
+        &self,
+        id: &str,
+        phase_hint: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Marks a dispatched intervention `running` and records its run id (§7.2 `launching` →
+    /// `running`). The lease is KEPT — a running run still holds it. Idempotent; a no-op when `id`
+    /// names no row.
+    fn mark_manager_intervention_running(
+        &self,
+        id: &str,
+        run_id: Option<i64>,
+    ) -> Result<(), StoreError>;
+
+    /// Records the decision a run produced and moves the intervention to `decided` (§7.2), clearing
+    /// the lease. `decision_json` is the extracted `rhapsody-manager-decision` block body;
+    /// `decision_head`/`decision_evidence_rev` are what revalidation binds against (§8.1). Idempotent;
+    /// a no-op when `id` names no row.
+    fn record_manager_decision(
+        &self,
+        id: &str,
+        decision_json: &str,
+        decision_head: &str,
+        decision_evidence_rev: i64,
+    ) -> Result<(), StoreError>;
+
+    /// ATOMICALLY ends `id` in a STOPPING terminal state and stops `pr`'s generation, in ONE
+    /// transaction (§7.2). The intervention moves to `terminal_state` with its lease cleared and
+    /// `rhapsody_review_bound.manager_stopped` is set to `reason`, so no crash between the two
+    /// writes can leave a terminal row with a live generation — the window that would let the next
+    /// sweep recreate the intervention. `reason` empty is a no-op. A no-op when `id` names no row.
+    fn stop_manager_intervention(
+        &self,
+        id: &str,
+        terminal_state: &str,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// ATOMICALLY reserves one manager run (§7.3) — the one place model spend is charged.
+    ///
+    /// In ONE SQLite transaction it: refuses when `id` names no row ([`ManagerReservation::Absent`]);
+    /// refuses when the generation is already stopped, when `manager_runs_used >= max_runs`, or when
+    /// the intervention's `attempts >= max_attempts` — marking the intervention `exhausted` AND the
+    /// generation stopped in the same transaction ([`ManagerReservation::Exhausted`]); otherwise
+    /// increments both the intervention's `attempts` and the generation's `manager_runs_used`, sets
+    /// `final` when `manager_interventions_applied >= max_interventions - 1`, writes the lease and
+    /// moves the state to `launching` ([`ManagerReservation::Reserved`]).
+    ///
+    /// **Nothing is refunded:** a run charged here is spent even if it crashes, which is what makes
+    /// the 12-run bound true by construction.
+    fn reserve_manager_run(
+        &self,
+        id: &str,
+        boot_id: &str,
+        lease_expires_at: &str,
+        max_runs: i64,
+        max_attempts: i64,
+        max_interventions: i64,
+    ) -> Result<ManagerReservation, StoreError>;
+
+    /// Recovers dead manager leases (§7.5): every `launching`/`running` intervention whose
+    /// `lease_boot_id` is not `boot_id` (its owner died with a previous daemon) OR whose
+    /// `lease_expires_at` is at or before `now` becomes `failed_attempt` with its lease cleared. One
+    /// transaction; returns the recovered rows, oldest first, for the caller to report.
+    ///
+    /// This is what keeps a saved in-flight marker from blocking forever: a lease always has a live
+    /// owner or an expiry, and a stopped generation is a visible operator-cleared stop rather than an
+    /// unowned freeze.
+    fn expire_manager_leases(
+        &self,
+        boot_id: &str,
+        now: &str,
+    ) -> Result<Vec<ManagerInterventionRow>, StoreError>;
+
+    /// Stops `pr`'s generation with `reason` (§7.2): sets `manager_stopped` so the sweep never
+    /// creates another intervention for it. Also moves any NON-terminal intervention for the PR to
+    /// `exhausted`, releasing the unique index. Empty `reason` never stops a generation — it is a
+    /// no-op, so a caller cannot accidentally clear a stop with a blank string. Idempotent.
+    fn stop_manager_generation(&self, pr: &str, reason: &str) -> Result<(), StoreError>;
+
+    /// `pr`'s manager budgets (§7.1), or `None` when no bound row exists for it. The bounded
+    /// counters and the stopped reason, read together.
+    fn manager_budget(&self, pr: &str) -> Result<Option<ManagerBudgetRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

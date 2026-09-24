@@ -1388,6 +1388,7 @@ mod tests {
                 last_state: "Done".to_string(),
                 declared_handoff: true,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             }))
             .expect("worker-exit send");
