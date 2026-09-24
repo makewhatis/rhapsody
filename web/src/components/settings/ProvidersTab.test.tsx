@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { GlobalConfigDTO, ProviderCatalogDTO, ProviderConfigDTO } from "@/lib/api";
+import { ProviderConfigError } from "@/lib/api";
 import { toUiGlobal } from "@/lib/settings-model";
 
 const h = vi.hoisted(() => ({
@@ -11,6 +12,7 @@ const h = vi.hoisted(() => ({
   fetchProviderStatuses: vi.fn(),
   fetchProviderCatalog: vi.fn(),
   refreshProviderCatalog: vi.fn(),
+  saveProviderConfig: vi.fn(),
 }));
 
 vi.mock("@/lib/provider-credentials", async (orig) => {
@@ -29,6 +31,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchProviderStatuses: h.fetchProviderStatuses,
     fetchProviderCatalog: h.fetchProviderCatalog,
     refreshProviderCatalog: h.refreshProviderCatalog,
+    saveProviderConfig: h.saveProviderConfig,
   };
 });
 
@@ -232,5 +235,62 @@ describe("ProvidersTab", () => {
     expect(text).not.toContain(canary);
     expect(text).not.toContain("binding-FFFF");
     expect(text).not.toContain("rev-1234");
+  });
+
+  // ACCEPTANCE: definitions are non-secret configuration, so the browser dashboard can add/edit/remove
+  // them (only the KEY actions are desktop-only).
+  it("offers definition actions in browser-only mode", async () => {
+    h.hasProviderBridge.mockReturnValue(false);
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Add provider" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit fireworks" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove fireworks" })).toBeTruthy();
+  });
+
+  // ACCEPTANCE: a refused removal lists EVERY reference the daemon reported.
+  it("refuses to remove a referenced provider and lists every reference", async () => {
+    h.saveProviderConfig.mockRejectedValue(
+      new ProviderConfigError("provider \"fireworks\" is still selected", "provider_in_use", [
+        { kind: "global", label: "the global default (agent.provider)" },
+        { kind: "manager", label: "the manager (manager.provider)" },
+        { kind: "roster", label: "roster entry \"jerry\"" },
+      ]),
+    );
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    const confirm = await screen.findByRole("button", { name: "Remove provider" });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(screen.getByText(/the global default/)).toBeTruthy());
+    const body = screen.getByRole("dialog").textContent ?? "";
+    expect(body).toContain("the manager (manager.provider)");
+    expect(body).toContain('roster entry "jerry"');
+  });
+
+  // ACCEPTANCE: an unreferenced removal goes straight to the daemon and succeeds.
+  it("removes an unreferenced provider", async () => {
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+    const onDefinitionsChanged = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <ProvidersTab
+          value={toUiGlobal(makeGlobal())}
+          onChange={vi.fn()}
+          onDefinitionsChanged={onDefinitionsChanged}
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove provider" }));
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith({
+        op: "remove",
+        provider_id: "fireworks",
+      }),
+    );
+    await waitFor(() => expect(onDefinitionsChanged).toHaveBeenCalled());
   });
 });

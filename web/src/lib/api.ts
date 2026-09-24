@@ -1471,6 +1471,74 @@ export async function refreshProviderCatalog(providerId: string): Promise<Provid
   return (await res.json()) as ProviderCatalogDTO;
 }
 
+// --- Provider DEFINITION authoring (STUDIO-1048) ---
+
+/** One reference holding a provider id, as the daemon reports it on a refused removal. */
+export interface ProviderReferenceDTO {
+  kind: string;
+  label: string;
+}
+
+/** A refused provider-definition write. `references` is populated only for `provider_in_use`. */
+export class ProviderConfigError extends Error {
+  readonly code: string;
+  readonly references: ProviderReferenceDTO[];
+  constructor(message: string, code: string, references: ProviderReferenceDTO[] = []) {
+    super(message);
+    this.name = "ProviderConfigError";
+    this.code = code;
+    this.references = references;
+  }
+}
+
+/** The POST /api/v1/providers/config body: add, edit or remove one `providers.<id>` definition. */
+export interface ProviderMutationRequest {
+  op: "add" | "edit" | "remove";
+  provider_id: string;
+  /** The id to rename FROM on an edit; omitted means "same id". */
+  previous_id?: string;
+  definition?: {
+    protocol?: string;
+    display_name?: string;
+    base_url?: string;
+    allow_insecure_http?: boolean;
+    limits?: Record<string, number>;
+  };
+}
+
+/**
+ * saveProviderConfig POSTs a provider-definition mutation. Non-secret configuration, so it goes
+ * through the same operator-write path as every other Settings save. A refusal carries the daemon's
+ * own code/message; a `provider_in_use` refusal additionally lists every reference.
+ */
+export async function saveProviderConfig(
+  req: ProviderMutationRequest,
+): Promise<ConfigResponse> {
+  const res = await operatorPost("/api/v1/providers/config", req);
+  if (!res.ok) {
+    let message = res.statusText;
+    let code = `http_${res.status}`;
+    let references: ProviderReferenceDTO[] = [];
+    try {
+      const parsed = (await res.json()) as {
+        error?: { code?: string; message?: string; references?: ProviderReferenceDTO[] };
+      };
+      if (parsed?.error) {
+        message = parsed.error.message ?? message;
+        code = parsed.error.code ?? code;
+        references = parsed.error.references ?? [];
+      }
+    } catch {
+      /* non-JSON body */
+    }
+    throw new ProviderConfigError(message, code, references);
+  }
+  const saved = (await res.json()) as ConfigResponse;
+  saved.config ??= {};
+  saved.prompt_body ??= "";
+  return saved;
+}
+
 // --- Linear identity + project listing (INF-224) ---
 
 // LinearIdentity is GET /api/v1/linear/identity: the connected-as account. `token` is already

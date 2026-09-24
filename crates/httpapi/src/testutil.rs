@@ -140,6 +140,8 @@ pub(crate) struct FakeProvider {
     /// handler forwarded is recorded in `provider_refresh_asked`.
     provider_refresh_result: Option<CatalogSnapshot>,
     provider_refresh_asked: Mutex<Option<String>>,
+    /// Canned provider references the removal check sees (STUDIO-1048), keyed by provider id.
+    provider_references: HashMap<String, Vec<rhapsody_config::ProviderReference>>,
 }
 
 impl FakeProvider {
@@ -201,6 +203,7 @@ impl FakeProvider {
             provider_catalog: None,
             provider_refresh_result: None,
             provider_refresh_asked: Mutex::new(None),
+            provider_references: HashMap::new(),
         }
     }
 
@@ -479,6 +482,16 @@ impl FakeProvider {
     /// unknown-provider `404`.
     pub(crate) fn with_provider_refresh_result(mut self, snapshot: CatalogSnapshot) -> Self {
         self.provider_refresh_result = Some(snapshot);
+        self
+    }
+
+    /// Canned references the provider-removal check sees for `id` (STUDIO-1048).
+    pub(crate) fn with_provider_references(
+        mut self,
+        id: &str,
+        references: Vec<rhapsody_config::ProviderReference>,
+    ) -> Self {
+        self.provider_references.insert(id.to_string(), references);
         self
     }
 
@@ -962,6 +975,14 @@ impl StateProvider for FakeProvider {
             Some(snapshot) => Ok(snapshot.clone()),
             None => Err(CatalogError::Unsupported),
         }
+    }
+
+    fn provider_references(&self, provider_id: &str) -> Vec<rhapsody_config::ProviderReference> {
+        self.touch();
+        self.provider_references
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
