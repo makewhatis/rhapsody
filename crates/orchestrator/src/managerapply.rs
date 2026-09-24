@@ -591,12 +591,15 @@ impl Orchestrator {
         let body = strip_summon_tokens(&format!(
             "Manager escalation.\nQuestion: {question}\nChecked: {checked}\n\n{marker}"
         ));
+        let (owner, repo, number) = crate::managerintervention::parse_pr_key(&row.pr)
+            .map(|c| (c.owner, c.repo, c.number))
+            .unwrap_or_default();
         let escalate_request = ManagerApplyRequest {
             intervention_id: row.id.clone(),
             pr: row.pr.clone(),
-            owner: String::new(),
-            repo: String::new(),
-            number: 0,
+            owner,
+            repo,
+            number,
             effects: vec![MANAGER_EFFECT_ESCALATION.to_string()],
             explanation: body,
             marker,
@@ -746,12 +749,15 @@ impl Orchestrator {
             "Not applied: {reason}\n(decision {})\n\n{marker}",
             decision.variant()
         ));
+        let (owner, repo, number) = crate::managerintervention::parse_pr_key(&row.pr)
+            .map(|c| (c.owner, c.repo, c.number))
+            .unwrap_or_default();
         let unapplied_request = ManagerApplyRequest {
             intervention_id: row.id.clone(),
             pr: row.pr.clone(),
-            owner: String::new(),
-            repo: String::new(),
-            number: 0,
+            owner,
+            repo,
+            number,
             effects: vec![MANAGER_EFFECT_UNAPPLIED.to_string()],
             explanation: body,
             marker,
@@ -902,7 +908,15 @@ impl Orchestrator {
             }
             DecisionKind::RouteToAuthor { .. } => {
                 let body = manager_route_wake_body(decision);
-                let issue_id = self.manager_pr_ticket(&row.pr).unwrap_or_default();
+                // Prefer the OPAQUE tracker issue id (what ordinary selection keys by), resolved
+                // from the ticket's own run history; fall back to the identifier, which selection
+                // also checks and which is all a daemon with no run row in history can name.
+                let issue_id = self
+                    .manager_ticket_move(row)
+                    .map(|m| m.issue_id)
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| self.manager_pr_ticket(&row.pr))
+                    .unwrap_or_default();
                 request.wake = Some(ManagerWakeRow {
                     intervention_id: row.id.clone(),
                     pr: row.pr.clone(),

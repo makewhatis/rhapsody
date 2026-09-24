@@ -190,7 +190,9 @@ impl Orchestrator {
                 // STUDIO-1016 (§7.9): an author whose `ROUTE_TO_AUTHOR` wake obligation is still
                 // unspent is NOT dispatched by ordinary selection — the wake admission owns that
                 // dispatch, so it is never duplicated or dispatched without its seed.
-                if self.manager_wake_blocks_selection(&iss.id) {
+                if self.manager_wake_blocks_selection(&iss.id)
+                    || self.manager_wake_blocks_selection(&iss.identifier)
+                {
                     tracing::debug!(
                         issue_identifier = %iss.identifier,
                         "skipping reopen: a pending manager wake obligation owns this dispatch"
@@ -258,7 +260,9 @@ impl Orchestrator {
             }
             // STUDIO-1016 (§7.9): a ticket with an unspent manager wake obligation is owned by the
             // wake admission, not ordinary selection, so it is never dispatched twice.
-            if self.manager_wake_blocks_selection(&iss.id) {
+            if self.manager_wake_blocks_selection(&iss.id)
+                || self.manager_wake_blocks_selection(&iss.identifier)
+            {
                 tracing::debug!(
                     issue_identifier = %iss.identifier,
                     "skipping dispatch: a pending manager wake obligation owns this dispatch"
