@@ -560,7 +560,7 @@ fn render_effective(
     };
     let mut out = String::new();
     out.push_str(
-        "\n--- effective selection (field-wise: ticket > review > profile > identity > project > global) ---\n",
+        "\n--- effective selection (field-wise: ticket > review > profile > identity > project > global; this command has no ticket or project in scope) ---\n",
     );
     match resolve_selection(&SelectionRequest {
         tiers,
@@ -1288,7 +1288,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "--- effective selection (field-wise: ticket > review > profile > identity > project > global) ---"
+                "--- effective selection (field-wise: ticket > review > profile > identity > project > global; this command has no ticket or project in scope) ---"
             ),
             "out = {out}"
         );
