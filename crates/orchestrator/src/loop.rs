@@ -3565,6 +3565,57 @@ mod tests {
             _ => panic!("expected a BrokerUsage event"),
         }
     }
+
+    // STUDIO-1047 acceptance: the `Event::BrokerUsage` arm in `handle` must actually RUN the
+    // handler. The sender-side test above pins that the event is emitted; this one drives the same
+    // event through `handle` and asserts its effect, so turning the arm into a no-op reds here —
+    // no usage row is written and the closed run row keeps the child's 1000.
+    #[tokio::test]
+    async fn the_broker_usage_handler_replaces_a_closed_runs_tallies() {
+        use crate::testsupport::{issue, orch_with_store, running_entry};
+        let (mut o, st) = orch_with_store();
+        let mut re = running_entry(issue("ID-1", "MT-1", "In Progress"), "", "");
+        re.brokered = true; // a prepared (brokered) dispatch
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        re.total_tokens = 1_000;
+        o.running.insert("ID-1".to_string(), re);
+        // A production cancellation closes the row with the child's figure before the event arrives.
+        let re = o.terminate("ID-1").expect("running");
+        o.persist_end_run(&re, rhapsody_store::OUTCOME_STOPPED, "stopped by user");
+        assert_eq!(
+            st.list_runs(rhapsody_store::RunFilter::default())
+                .expect("list runs")[0]
+                .total_tokens,
+            1_000,
+            "the child figure is recorded before the receipt"
+        );
+
+        let usage = rhapsody_store::RunUsage {
+            provider_reported_tokens: Some(42),
+            reserved_tokens: 900,
+            ..Default::default()
+        };
+        o.handle(Event::BrokerUsage {
+            issue_id: "ID-1".to_string(),
+            run_id,
+            usage: Box::new(usage.clone()),
+        })
+        .await;
+
+        assert_eq!(
+            st.run_usage(run_id).expect("read usage"),
+            Some(usage),
+            "the handler must persist the usage row"
+        );
+        let runs = st
+            .list_runs(rhapsody_store::RunFilter::default())
+            .expect("list runs");
+        assert_eq!(
+            runs[0].total_tokens, 42,
+            "the handler must rewrite the closed run row from the receipt"
+        );
+    }
 }
 
 // The loop-level github-summons enrichment tests (Go `ghenrich_loop_test.go`) + the STUDIO-574

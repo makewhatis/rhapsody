@@ -361,7 +361,7 @@ mod tests {
     use rhapsody_core::{BlockerRef, Issue};
     use rhapsody_store::{
         DayRollup, EventHit, EventQuery, EventRow, Noop, Recovery, RunEnd, RunFilter, RunMessage,
-        RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError, StorePath, Totals,
+        RunProgress, RunStart, RunSummary, RunTokens, Sqlite, Store, StoreError, StorePath, Totals,
     };
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::{BranchInfo, Fake};
@@ -849,6 +849,9 @@ mod tests {
         }
         fn update_run_progress(&self, run_id: i64, p: RunProgress) -> Result<(), StoreError> {
             self.0.update_run_progress(run_id, p)
+        }
+        fn set_run_tokens(&self, run_id: i64, t: &RunTokens) -> Result<(), StoreError> {
+            self.0.set_run_tokens(run_id, t)
         }
         fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError> {
             self.0.append_events(run_id, ev)

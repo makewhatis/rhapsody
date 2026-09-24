@@ -195,6 +195,21 @@ pub struct RunningEntry {
     /// `reconcile`'s cleanup never fires for one. `pub(crate)` like `cancel`: it is dispatch
     /// machinery, not part of the entry's observable shape.
     pub(crate) review: Option<crate::review::ReviewRun>,
+
+    /// Whether this run is a BROKERED dispatch — one prepared through the private provider broker
+    /// (STUDIO-1002). `false` for every legacy native-login dispatch, which is byte-identical to
+    /// before the feature.
+    ///
+    /// **In memory only, and deliberately narrow.** It is NOT the broker session (design §10.3 keeps
+    /// that out of `RunningEntry`); it is the single boolean the token accounting needs, because the
+    /// broker's finalized receipt is the run's authoritative usage while the child's own figures are
+    /// comparison-only diagnostics (design §7.3). [`Orchestrator::on_agent_update`] therefore keeps
+    /// the child's committed total on the ENTRY (the per-run token ceiling and the INF-208 floor
+    /// still read it) but does NOT fold it into the cumulative `totals`, which is settled from the
+    /// receipt alone. That is what makes the cancellation correction exact (STUDIO-1047): a run whose
+    /// entry has already been terminated can be reconciled from the receipt without needing to know
+    /// what the child had contributed, because it contributed nothing to the aggregate.
+    pub(crate) brokered: bool,
 }
 
 impl RunningEntry {
@@ -223,6 +238,7 @@ impl RunningEntry {
             model_origin: String::new(),
             last_delivered_summon_at: zero_time(),
             review: None,
+            brokered: false,
             thread_id: String::new(),
             session_id: String::new(),
             turn_count: 0,
