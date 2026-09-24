@@ -13,9 +13,11 @@
 //!
 //! [`Orchestrator::pump_manager_wakes`] runs on the control task, each tick, **before** ordinary
 //! selection. For each `pending` row it rechecks current state and then admits the wake through
-//! **today's path**: `dispatch_issue` followed by `seed_reopen_summons` for an author with no live
-//! run, or the existing mailbox admission for one with a live run. The row is marked `admitted` with
-//! the `run_id` synchronously, before the control task yields, and `delivered` once the seed is
+//! **today's path**: [`Orchestrator::dispatch_or_prepare`] (the same entry point ordinary
+//! selection uses, so a provider installation is PREPARED rather than silently dispatched on the
+//! native login) followed by the STUDIO-649 reopen seed for an author with no live run, or the
+//! existing mailbox admission for one with a live run. The row is marked `admitted` with the
+//! `run_id` synchronously, before the control task yields, and `delivered` the moment the seed is
 //! written as the run's "sent" `run_messages` row — only then is it spent.
 //!
 //! While any unspent obligation exists for a ticket, ordinary selection skips it
@@ -181,10 +183,17 @@ impl Orchestrator {
             .unwrap_or(false)
     }
 
-    /// §7.9 step 2: admit one pending obligation through today's path. No live author run ⇒
-    /// `dispatch_issue` + `seed_reopen_summons`; live author run ⇒ the existing mailbox admission.
-    /// The row is marked `admitted` with the `run_id` synchronously, then `delivered` once the seed
-    /// is written as the run's "sent" row.
+    /// §7.9 step 2: admit one pending obligation through today's path. No live author run ⇒ the
+    /// SAME dispatch entry point ordinary selection uses ([`Orchestrator::dispatch_or_prepare`],
+    /// so a provider install is PREPARED rather than silently dispatched on the native login —
+    /// STUDIO-1002 review B3), then the STUDIO-649 reopen seed with `body`; live author run ⇒ the
+    /// existing mailbox admission.
+    ///
+    /// The row is marked `admitted` with the `run_id` synchronously the moment the run becomes
+    /// live (inline here, or from [`Orchestrator::admit_pending_manager_wake`] when an
+    /// asynchronous preparation is accepted), and `delivered` in the same admission once the seed
+    /// is a "sent" `run_messages` row. A seed write that did not land leaves the row `admitted`
+    /// and boot recovery returns it to `pending`.
     fn admit_manager_wake(
         &mut self,
         row: &ManagerWakeRow,
@@ -192,6 +201,10 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
     ) {
         let key = iss.id.clone();
+        // Any obligation held for this ticket from a previous tick is superseded by this admission:
+        // it is either about to be admitted below, or the ticket already has a live run and the
+        // held copy is stale.
+        self.pending_manager_wakes.remove(&key);
         // The author already has a live run: reuse the INF-250 mailbox admission rather than a second
         // dispatch path. A full mailbox leaves the row `pending` for the next tick.
         if let Some(re) = self.running.get(&key) {
@@ -199,27 +212,60 @@ impl Orchestrator {
             let (_, ok) =
                 self.admit_to_mailbox(re, &crate::message::operator_wrap(&row.body), &row.body);
             if ok {
-                self.set_wake(row, MANAGER_WAKE_ADMITTED, Some(run_id), "");
-                // §7.8: the author dispatch consumes the author half of its exchange authorization;
-                // the review half answering the author's push is then covered by it.
-                self.consume_author_round_authorization(&row.pr);
-                if self.wake_seed_sent(run_id, &row.body) {
-                    self.set_wake(row, MANAGER_WAKE_DELIVERED, Some(run_id), "");
-                }
+                self.mark_wake_admitted(row, run_id);
             }
             return;
         }
-        // No live run: the SAME dispatch path ordinary selection uses, then the STUDIO-649 reopen
-        // seed with the obligation's body (never a comment).
-        self.dispatch_issue(iss, None, route, String::new());
-        let run_id = self.running.get(&key).map(|re| re.run_id);
-        self.seed_reopen_summons(&key, (self.now)(), &row.body);
-        if let Some(run_id) = run_id {
-            self.set_wake(row, MANAGER_WAKE_ADMITTED, Some(run_id), "");
-            self.consume_author_round_authorization(&row.pr);
-            if self.wake_seed_sent(run_id, &row.body) {
-                self.set_wake(row, MANAGER_WAKE_DELIVERED, Some(run_id), "");
-            }
+        // No live run: hold the obligation while the SAME dispatch path ordinary selection uses
+        // creates the run. `dispatch_or_prepare` either dispatches inline (the hook in
+        // `dispatch_issue_prepared` admits and seeds immediately) or begins a preparation, in which
+        // case the row stays `pending` and the hook runs when that preparation is accepted. Never a
+        // second dispatch path, and never marked spent before the dispatch is recoverable.
+        self.pending_manager_wakes.insert(key, row.clone());
+        self.dispatch_or_prepare(iss, None, route, String::new());
+    }
+
+    /// §7.9 step 2: the moment a wake-driven dispatch makes its author run live. Called from
+    /// `dispatch_issue_prepared` (after the running entry exists and the reopen seed point), it
+    /// writes the obligation's body as the run's STUDIO-649 seed and admits the row. A seed write
+    /// the mailbox rejects leaves the row `admitted` (with no "sent" row), so boot recovery can
+    /// return it to `pending` rather than losing it.
+    pub(crate) fn admit_pending_manager_wake(&mut self, row: &ManagerWakeRow, issue_id: &str) {
+        // The held copy is only admitted while the obligation is STILL `pending` in the store: a
+        // recheck since it was held may have `refused` it, or another path may have spent it. A
+        // stale entry therefore seeds nothing and changes no state.
+        if self
+            .store()
+            .manager_wake(&row.intervention_id)
+            .ok()
+            .flatten()
+            .is_none_or(|r| r.state != MANAGER_WAKE_PENDING)
+        {
+            tracing::debug!(
+                intervention_id = %row.intervention_id,
+                "manager wake: the held obligation is no longer pending; dropping the held admission"
+            );
+            return;
+        }
+        self.seed_reopen_summons(issue_id, (self.now)(), &row.body);
+        if let Some(run_id) = self.running.get(issue_id).map(|re| re.run_id) {
+            self.mark_wake_admitted(row, run_id);
+        }
+    }
+
+    /// Mark one obligation `admitted` with its run id, charge the author half of its exchange
+    /// authorization (§7.8), and spend it (`delivered`) the moment the seed is the run's "sent"
+    /// `run_messages` row. The seed is written in the same no-await admission — inline dispatch, or
+    /// the [`Orchestrator::admit_pending_manager_wake`] hook — so a healthy store marks it
+    /// `delivered` immediately; a seed write that did NOT land leaves the row `admitted`, and boot
+    /// recovery returns it to `pending` without the author being lost or woken twice.
+    fn mark_wake_admitted(&self, row: &ManagerWakeRow, run_id: i64) {
+        self.set_wake(row, MANAGER_WAKE_ADMITTED, Some(run_id), "");
+        // §7.8: the author dispatch consumes the author half of its exchange authorization;
+        // the review half answering the author's push is then covered by it.
+        self.consume_author_round_authorization(&row.pr);
+        if self.wake_seed_sent(run_id, &row.body) {
+            self.set_wake(row, MANAGER_WAKE_DELIVERED, Some(run_id), "");
         }
     }
 
@@ -304,7 +350,9 @@ mod tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::testsupport::{empty_effective, empty_resolved_project, issue, set_of};
+    use crate::testsupport::{
+        HangResolver, empty_effective, empty_resolved_project, issue, set_of,
+    };
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const PR_KEY: &str = "makewhatis/rhapsody#12";
@@ -319,6 +367,12 @@ mod tests {
         eff.max_concurrent = 10;
         let mut proj = empty_resolved_project("rhapsody", tracker);
         proj.repo = REPO_URL.to_string();
+        // The project's own scheduling sets, so the MULTI ladder (the one a real install runs) can
+        // be exercised beside the legacy one.
+        proj.active_states = set_of(&["todo", "in progress"]);
+        proj.terminal_states = set_of(&["done"]);
+        proj.review_states = set_of(&["in review"]);
+        proj.max_concurrent = 10;
         eff.projects = vec![proj];
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
@@ -416,8 +470,11 @@ mod tests {
 
         pump(&mut o);
 
-        let re = o.running.get("ID-1").expect("the author was dispatched");
-        let run_id = re.run_id;
+        let run_id = o
+            .running
+            .get("ID-1")
+            .expect("the author was dispatched")
+            .run_id;
         let w = wake(&o, "iv-1");
         assert_eq!(w.state, MANAGER_WAKE_DELIVERED);
         assert_eq!(w.run_id, Some(run_id));
@@ -430,6 +487,34 @@ mod tests {
         assert!(
             !o.manager_wake_blocks_selection("ID-1"),
             "a delivered obligation no longer blocks selection"
+        );
+    }
+
+    // §7.9 (STUDIO-1017 review B2): on a provider install the wake must dispatch through the SAME
+    // prepared-dispatch path ordinary selection uses, never inline on the native login — the
+    // STUDIO-1002 B3 defect. The row stays `pending` while the preparation is in flight.
+    // MUTATION: call `dispatch_issue` directly from `admit_manager_wake` and this reds (the run
+    // would be live and no preparation in flight).
+    #[tokio::test]
+    async fn the_wake_routes_through_prepared_dispatch() {
+        let (mut o, _) = wake_orch();
+        seed_pending_wake(&o, "iv-1", "route instructions", "STUDIO-1");
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+
+        pump(&mut o);
+
+        assert!(
+            o.running.is_empty(),
+            "a provider install must not dispatch the author inline"
+        );
+        assert!(
+            !o.preparing.is_empty(),
+            "the wake began a preparation instead"
+        );
+        assert_eq!(
+            wake(&o, "iv-1").state,
+            MANAGER_WAKE_PENDING,
+            "the obligation stays unspent while the preparation is in flight"
         );
     }
 
@@ -488,18 +573,38 @@ mod tests {
         assert_eq!(wake(&o, "iv-1").state, MANAGER_WAKE_REFUSED);
     }
 
-    // §7.9 crash recovery: an `admitted` obligation with no delivered seed goes back to `pending`
-    // and is admitted again in the new run — the author is woken at most once per live run, never
-    // lost. MUTATION: mark the row `delivered` at admission and this reds (it would never reset).
+    // §7.9 crash recovery: a real admission marks the obligation `admitted` — NOT `delivered` when
+    // the seed did not land — and a crash before delivery returns it to `pending` so the author is
+    // admitted again in the new run: woken at most once per live run, never lost.
+    // MUTATION: mark the row `delivered` at admission and the first assert reds (the obligation
+    // would never reset at boot).
     #[test]
     fn a_crash_between_admission_and_delivery_returns_the_wake_to_pending() {
         let (mut o, _) = wake_orch();
         seed_pending_wake(&o, "iv-1", "route instructions", "STUDIO-1");
-        // The crash window: the row is admitted with a run that no longer exists and no "sent" seed.
-        o.store()
-            .set_manager_wake_state("iv-1", MANAGER_WAKE_ADMITTED, Some(4242), "")
-            .expect("admit");
 
+        // Admission: the author is dispatched, then the REAL admission hook runs, but the run's
+        // mailbox is absent so the seed write does not land. The obligation is marked `admitted`
+        // with its run id and no "sent" row exists — exactly the crash window the boot recovery
+        // exists for.
+        o.dispatch_issue(candidate(), None, None, String::new());
+        let run_id = o.running.get("ID-1").expect("running").run_id;
+        o.mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove("ID-1");
+        let row = wake(&o, "iv-1");
+        o.admit_pending_manager_wake(&row, "ID-1");
+
+        let w = wake(&o, "iv-1");
+        assert_eq!(
+            w.state, MANAGER_WAKE_ADMITTED,
+            "a seed that did not land must leave the obligation `admitted`, never `delivered`"
+        );
+        assert_eq!(w.run_id, Some(run_id));
+
+        // The daemon crashes: the run died with it before the seed was delivered.
+        o.running.clear();
         o.recover_manager_wakes();
 
         let w = wake(&o, "iv-1");
@@ -615,6 +720,75 @@ mod tests {
             picked.is_empty(),
             "a pending wake obligation owns the dispatch: {picked:?}"
         );
+    }
+
+    /// The candidate tagged with the project at index 0, for the MULTI ladder — the pass a real
+    /// installation actually runs (`loop.rs` takes `select_dispatch_multi_after_fetch` whenever
+    /// `eff.projects` is non-empty, and `effective.rs` gives even a single-project WORKFLOW one
+    /// resolved project).
+    fn multi_candidate() -> crate::select::TaggedIssue {
+        crate::select::TaggedIssue {
+            iss: candidate(),
+            proj: Some(0),
+        }
+    }
+
+    fn pr_coord() -> crate::prstate::PrCoord {
+        crate::prstate::PrCoord::new("makewhatis", "rhapsody", 12)
+    }
+
+    // §15.4: ordinary selection skips a ticket with a pending wake obligation — on the MULTI ladder
+    // too, which is the one production runs. MUTATION: remove `manager_wake_blocks_selection` from
+    // the multi ladder's active branch and this reds.
+    #[test]
+    fn the_multi_ladder_skips_a_ticket_with_an_unspent_wake() {
+        let (o, _) = wake_orch();
+        seed_pending_wake(&o, "iv-1", "route instructions", "STUDIO-1");
+        let (picked, reopen, _) = o.select_dispatch_multi_with_reopens(vec![multi_candidate()]);
+        let identifiers: Vec<&str> = picked.iter().map(|t| t.iss.identifier.as_str()).collect();
+        assert!(
+            picked.is_empty(),
+            "a pending wake obligation owns the dispatch: {identifiers:?}"
+        );
+        assert!(reopen.is_empty());
+    }
+
+    // §7.8 path 3 (STUDIO-1017 review B1): after the threshold in `act` mode, the MULTI ladder — the
+    // one production runs — refuses an author dispatch with no `author_round` authorization, and
+    // permits it with one. MUTATION: drop the `author_dispatch_authorized` gate from
+    // `select_dispatch_multi_after_fetch` and the first assert reds.
+    #[test]
+    fn the_multi_ladder_gates_a_post_threshold_author_dispatch() {
+        let (mut o, _) = wake_orch();
+        seed_watch(&o, "adopt:STUDIO-1", true);
+        o.store()
+            .ensure_review_generation(PR_KEY)
+            .expect("generation");
+        o.review_rounds
+            .insert(crate::reviewwatch::churn_key(&pr_coord()), 1);
+
+        let (picked, _, _) = o.select_dispatch_multi_with_reopens(vec![multi_candidate()]);
+        let identifiers: Vec<&str> = picked.iter().map(|t| t.iss.identifier.as_str()).collect();
+        assert!(
+            picked.is_empty(),
+            "no authorization, so the post-threshold author must not be dispatched: {identifiers:?}"
+        );
+
+        o.store()
+            .save_manager_exchange(ManagerExchange {
+                id: "iv-1-author_round".to_string(),
+                intervention_id: "iv-1".to_string(),
+                pr: PR_KEY.to_string(),
+                generation: 1,
+                kind: MANAGER_EXCHANGE_AUTHOR_ROUND.to_string(),
+                authorized_head: "deadbeef".to_string(),
+                authorized_patch_id: "patch-1".to_string(),
+                state: MANAGER_EXCHANGE_ACTIVE.to_string(),
+            })
+            .expect("exchange");
+
+        let (picked, _, _) = o.select_dispatch_multi_with_reopens(vec![multi_candidate()]);
+        assert_eq!(picked.len(), 1, "the authorization permits the dispatch");
     }
 
     // `off`/`advise` never admit anything (byte-identical): no expense is charged.

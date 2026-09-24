@@ -753,6 +753,13 @@ impl Orchestrator {
         if let Some((summon_at, body)) = reopen_summons {
             self.seed_reopen_summons(&iss.id, summon_at, &body);
         }
+        // STUDIO-1017 (§7.9): a manager wake obligation held while this run did not yet exist is
+        // admitted HERE — the exact point the run becomes live — via the STUDIO-649 reopen seed,
+        // and marked `admitted` with the run id (and `delivered` once that seed is the run's "sent"
+        // row). The row is not spent before the dispatch is recoverable.
+        if let Some(row) = self.pending_manager_wakes.remove(&iss.id) {
+            self.admit_pending_manager_wake(&row, &iss.id);
+        }
         if production {
             self.spawn_worker(
                 cancel,
