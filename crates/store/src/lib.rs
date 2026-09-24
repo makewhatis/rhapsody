@@ -130,6 +130,12 @@ pub trait Store {
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError>;
     fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError>;
     fn update_run_progress(&self, run_id: i64, p: RunProgress) -> Result<(), StoreError>;
+    /// Rewrites ONLY a run row's token tallies (+ the estimated flag), preserving its outcome,
+    /// timing, transcript and error (STUDIO-1047). It exists because a brokered run's finalized
+    /// receipt reaches the control task AFTER [`Store::end_run`] has already closed the row with the
+    /// child's own figures on a production cancellation; the receipt replaces those tallies without
+    /// re-writing — or racing — the terminal fields. A no-op on an unknown `run_id`.
+    fn set_run_tokens(&self, run_id: i64, t: &RunTokens) -> Result<(), StoreError>;
     fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError>;
 
     // --- restart-recovery ---

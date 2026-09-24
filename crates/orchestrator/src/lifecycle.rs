@@ -2570,6 +2570,13 @@ mod tests {
         ) -> Result<(), rhapsody_store::StoreError> {
             self.0.update_run_progress(a0, a1)
         }
+        fn set_run_tokens(
+            &self,
+            a0: i64,
+            a1: &rhapsody_store::RunTokens,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_run_tokens(a0, a1)
+        }
         fn append_events(
             &self,
             a0: i64,

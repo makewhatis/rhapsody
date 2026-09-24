@@ -960,6 +960,26 @@ impl Store for Sqlite {
         Ok(())
     }
 
+    fn set_run_tokens(&self, run_id: i64, t: &RunTokens) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Only the tally columns: the run's outcome/ended_at/error/transcript are untouched, so a
+        // receipt that arrives after `end_run` closed the row corrects the tokens without re-ending
+        // it (STUDIO-1047).
+        conn.execute(
+            "UPDATE runs
+                SET input_tokens = ?1, output_tokens = ?2, total_tokens = ?3, usage_estimated = ?4
+              WHERE id = ?5",
+            params![
+                t.input_tokens,
+                t.output_tokens,
+                t.total_tokens,
+                t.usage_estimated,
+                run_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError> {
         if ev.is_empty() {
             return Ok(());
