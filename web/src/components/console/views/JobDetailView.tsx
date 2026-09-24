@@ -331,7 +331,7 @@ function RunTrace({
   const entries = useMemo(() => transcript.data?.entries ?? [], [transcript.data]);
   const trace = useMemo(() => buildTrace(entries), [entries]);
   const result = useMemo(() => buildResult(entries, live), [entries, live]);
-  const vitals = runVitals(live, trace.phases);
+  const vitals = runVitals(live, trace.phases, provenance.data);
   const batons = useMemo(
     () => relayBatons(runs, run, identities, assignee),
     [runs, run, identities, assignee],

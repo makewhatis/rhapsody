@@ -65,15 +65,34 @@ export interface RunVitals {
   tools: number;
 }
 
-export function runVitals(run: RunSummary, phases: readonly TracePhase[]): RunVitals {
+export function runVitals(
+  run: RunSummary,
+  phases: readonly TracePhase[],
+  provenance?: RunProvenance,
+): RunVitals {
   const branch = runBranch(run);
   return {
     duration: runDuration(run.started_at, run.ended_at),
     turns: `${run.turns} ${run.turns === 1 ? "turn" : "turns"}`,
-    tokens: `${run.usage_estimated ? "~" : ""}${formatTokens(run.total_tokens)}`,
+    // The "~" floor marker and the provider-reported note are DIFFERENT signals: a floored total is
+    // the daemon's own best-available estimate, while a generic provider report is measurement the
+    // provider supplied and Rhapsody never verified (design §7.3). Either one means the figure is
+    // not exact measured usage, so both suppress an authoritative reading; the note names the
+    // stronger one explicitly rather than presenting the report as a measured total.
+    tokens: `${run.usage_estimated ? "~" : ""}${formatTokens(run.total_tokens)}${
+      providerReportedUnverified(provenance) ? " provider-reported" : ""
+    }`,
     branch: branch === "" ? DASH : branch,
     tools: phases.reduce((n, phase) => n + phase.did.length, 0),
   };
+}
+
+/** Whether a run's token figure is the provider's own UNVERIFIED report (design §7.3): the broker
+ *  collected it from a generic OpenAI-compatible endpoint, so it is measurement, not authority. The
+ *  console must label it rather than present it as exact measured usage. Absent provenance, or a
+ *  non-brokered run with no usage row, is `false` — the label is never invented. */
+export function providerReportedUnverified(p?: RunProvenance): boolean {
+  return p?.usage?.usage_authority === "provider_reported_unverified";
 }
 
 /** The label the run detail gives the ledger's empty-provider bucket (STUDIO-975). */

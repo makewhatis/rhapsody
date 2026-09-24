@@ -51,6 +51,6 @@ pub use discovery::OpenAiCompatibleDiscovery;
 pub use discovery::{DiscoveredCatalog, DiscoveryRequest, ModelDiscovery};
 pub use error::CatalogError;
 pub use status::{
-    CredentialStatus, ObservedStatus, ProviderBinding, ProviderStatusCache, ProviderStatusView,
-    RefreshIntent, RefreshToken,
+    BROKER_UNAVAILABLE, CredentialStatus, ObservedStatus, ProviderBinding, ProviderStatusCache,
+    ProviderStatusView, RefreshIntent, RefreshToken,
 };
