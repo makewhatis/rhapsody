@@ -632,11 +632,16 @@ impl Orchestrator {
             };
             let key = run.key();
 
-            // The pre-launch classification with no model call (§7.2): an `approved_still_open`
-            // stall is exactly "every live row is satisfied, and only a merge gate blocks", so no
-            // manager decision can help.
-            let approved_still_open = row.stall_kinds.iter().any(|k| k == "approved_still_open");
-            if classifies_no_review_gap(approved_still_open, approved_still_open) {
+            // The pre-launch classification with no model call (§7.2): ONLY a stall that is purely
+            // "approved still open" qualifies — an intervention that merged a `review_escalated`
+            // into it still needs the manager. The "every live row is satisfied" fact is read from
+            // the rows, not inferred from the stall kind.
+            let only_approved_still_open = !row.stall_kinds.is_empty()
+                && row.stall_kinds.iter().all(|k| k == "approved_still_open");
+            if classifies_no_review_gap(
+                self.manager_all_rows_satisfied(&row.pr),
+                only_approved_still_open,
+            ) {
                 // ONE transaction: the intervention ends `no_review_gap` AND the generation is
                 // stopped, so a crash between the two writes can never leave a terminal row with a
                 // live generation for the next sweep to recreate (§7.2, §15.4).
@@ -1211,6 +1216,31 @@ impl Orchestrator {
             }
         }
         observed.is_empty() || observed.iter().any(|h| h == head)
+    }
+
+    /// §7.2's `no_review_gap` fact read from the rows: every live reviewer row is approved at the
+    /// current generation and patch. An empty live set is NOT satisfied (fail closed — a stall with
+    /// no reviewer row is not "every row is satisfied").
+    fn manager_all_rows_satisfied(&self, pr: &str) -> bool {
+        let rows = self.manager_review_rows(pr);
+        let live = managerdecision::live_reviewer_rows(&rows);
+        if live.is_empty() {
+            return false;
+        }
+        let patch_id = current_patch_id(&rows);
+        let generation = self
+            .store()
+            .review_bound(pr)
+            .ok()
+            .flatten()
+            .map_or(0, |b| b.generation);
+        live.iter().all(|r| {
+            crate::reviewevidence::completion_approved_at_current_patch(
+                r.completed.as_ref(),
+                generation,
+                &patch_id,
+            )
+        })
     }
 
     /// The daemon's finding ledger for `pr`, as M3's parser needs it (§6.1).
@@ -2252,6 +2282,83 @@ mod tests {
             dispatched.lock().expect("lock").len(),
             1,
             "max_concurrent = 1"
+        );
+    }
+
+    // --- no_review_gap (§7.2) ------------------------------------------------------------------
+
+    fn record_approved(o: &Orchestrator) {
+        o.store()
+            .record_review_completion(
+                &rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".to_string(),
+                    repo: "rhapsody".to_string(),
+                    number: 12,
+                    reviewer: "alice".to_string(),
+                },
+                "reviewed",
+                &rhapsody_store::ReviewCompleted {
+                    generation: 1,
+                    sha: "deadbeef".to_string(),
+                    patch_id: "patch-1".to_string(),
+                    verdict: rhapsody_store::REVIEW_COMPLETION_APPROVE.to_string(),
+                },
+            )
+            .expect("completion");
+    }
+
+    // A purely `approved_still_open` stall, with every live row approved at the current patch, is
+    // `no_review_gap`: the generation is stopped and nothing is launched (§7.2). MUTATION: stop
+    // reading the rows and a PR with no approved row would stop too.
+    #[test]
+    fn a_purely_approved_still_open_stall_is_no_review_gap() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        record_approved(&o);
+        o.route_stalls_to_manager(&[divergence(DivergenceKind::ApprovedStillOpen, PR_DISPLAY)]);
+        o.pump_manager_interventions();
+        assert!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "the generation is stopped"
+        );
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "no manager run is spent on a no_review_gap stall"
+        );
+    }
+
+    // An intervention that MERGED a `review_escalated` into an `approved_still_open` is NOT a
+    // no_review_gap — the escalation still needs the manager (§7.2). MUTATION: classify from
+    // `contains("approved_still_open")` and this reds (nothing launches).
+    #[test]
+    fn a_merged_escalation_is_not_no_review_gap() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        record_approved(&o);
+        o.route_stalls_to_manager(&[
+            divergence(DivergenceKind::ApprovedStillOpen, PR_DISPLAY),
+            divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY),
+        ]);
+        o.pump_manager_interventions();
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            1,
+            "the merged escalation still launches the manager"
+        );
+        assert!(
+            !o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
         );
     }
 }
