@@ -2708,6 +2708,22 @@ mod tests {
         ) -> Result<Option<rhapsody_store::RunUsage>, rhapsody_store::StoreError> {
             self.0.run_usage(a0)
         }
+        fn charge_provider_day_tokens(
+            &self,
+            a0: &str,
+            a1: i64,
+            a2: u64,
+            a3: u64,
+        ) -> Result<bool, rhapsody_store::StoreError> {
+            self.0.charge_provider_day_tokens(a0, a1, a2, a3)
+        }
+        fn provider_day_tokens(
+            &self,
+            a0: &str,
+            a1: i64,
+        ) -> Result<u64, rhapsody_store::StoreError> {
+            self.0.provider_day_tokens(a0, a1)
+        }
         fn load_run_provenances(
             &self,
             a0: &[i64],
