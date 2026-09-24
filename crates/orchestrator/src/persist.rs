@@ -240,6 +240,12 @@ impl Orchestrator {
             );
         }
         self.replace_child_usage_with_broker(issue_id, run_id, usage);
+        // Converge the DURABLE cumulative tally too. On a cancellation the caller already ran
+        // `persist_totals` BEFORE this receipt arrived, so without this the corrected aggregate
+        // would sit only in memory until the next run teardown; on a normal exit the later
+        // worker-exit `persist_totals` would cover it, and this write is simply an idempotent
+        // earlier one (STUDIO-1047).
+        self.persist_totals();
     }
 
     /// Replace a run's committed token tallies with the finalized broker receipt (design §7.3) and
@@ -1210,6 +1216,11 @@ mod tests {
         assert_eq!(
             o.totals.total_tokens, 42,
             "the aggregate follows the receipt"
+        );
+        assert_eq!(
+            st.load_totals().expect("load totals").total_tokens,
+            42,
+            "the durable aggregate is converged at receipt time, not deferred"
         );
     }
 
