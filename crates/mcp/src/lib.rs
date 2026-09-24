@@ -17,6 +17,7 @@
 
 mod client;
 mod discovery;
+mod manager;
 mod server;
 mod status;
 mod teams;
@@ -28,5 +29,5 @@ mod testutil;
 
 pub use client::{Client, FacadeError};
 pub use discovery::resolve_daemon_port;
-pub use server::{Facade, Options, VERSION};
+pub use server::{Facade, Options, Role, VERSION};
 pub use verdict::Status;

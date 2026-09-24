@@ -26,10 +26,33 @@ use serde::Deserialize;
 /// Reported in the MCP server implementation handshake (server.go's `Version`).
 pub const VERSION: &str = "0.1.0";
 
-/// Per-process defaults for "me" resolution (server.go's `Options`). A dispatched worker's env
-/// injection (SYMPHONY_RUN_ID / SYMPHONY_ISSUE, wired by the cmd layer) is threaded here so
-/// `symphony_run` / `symphony_ticket` / `symphony_run_status` default to the worker's own run. A
-/// coordinator session (no such env) leaves these empty and must pass an explicit id.
+/// The role a facade process is started with (STUDIO-1014, design §4.4). A `Manager` role registers
+/// the FIXED manager tool set ([`crate::manager::MANAGER_TOOL_NAMES`]) and nothing else, regardless
+/// of `cfg.mcp` or the Teams toggle. Carried on [`Options`] rather than `Config`, like
+/// [`Options::teams_enabled`]: a role is a per-process launch parameter, not a `WORKFLOW.md` key, so
+/// it must not appear in the parity-checked config view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Role {
+    /// The ordinary agent-facing facade (every gated tool as configured).
+    #[default]
+    Standard,
+    /// The manager run's facade: no filesystem, no shell, no network — only the manager tool set.
+    Manager,
+}
+
+impl Role {
+    /// Parses the `--role` value. An unknown role is an error rather than a silent downgrade to
+    /// [`Role::Standard`]: a typo must never widen a manager run's tool set.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "" | "standard" | "agent" => Some(Role::Standard),
+            "manager" => Some(Role::Manager),
+            _ => None,
+        }
+    }
+}
+
+/// The `rhapsodyd mcp` process options.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub default_run_id: String,
@@ -46,6 +69,9 @@ pub struct Options {
     /// (§6.7, §2.4 row 7). This lives on `Options` rather than `Config` deliberately: Teams is not
     /// a `WORKFLOW.md` key, and adding one would put a new field in a parity-checked view.
     pub teams_enabled: bool,
+    /// The process role (STUDIO-1014). [`Role::Standard`] for every ordinary dispatch; the manager
+    /// run passes `--role manager` and gets the fixed manager tool set.
+    pub role: Role,
 }
 
 impl Options {
@@ -72,13 +98,36 @@ impl Facade {
     /// and — when enabled in `cfg.mcp` — the opt-in write tools (`registerWriteTools`). The mirror of
     /// Go's `NewServer(cfg, c, opts)`. A disabled write tool is not registered at all (invisible, per
     /// the design's "the gate is the enabled-tool set").
+    ///
+    /// STUDIO-1014: when [`Options::role`] is [`Role::Manager`], the router is instead pruned to the
+    /// FIXED manager tool set ([`crate::manager::MANAGER_TOOL_NAMES`]) and no brand aliases are
+    /// registered; `cfg.mcp` and the Teams toggle do not apply to that role.
     pub fn new(cfg: &Config, client: Client, opts: Options) -> Self {
-        // Reads are always present; the writes (registered by [`crate::writes`]) are gated per
-        // `cfg.mcp` by REMOVING each disabled tool from the merged router — so a disabled tool is
-        // absent from `list_tools` and rejected on call (writes.go: "not registered at all"), rather
-        // than surfacing a runtime permission-denied.
         let mut tool_router = Self::read_router();
         tool_router.merge(Self::write_router());
+        tool_router.merge(Self::teams_router());
+        tool_router.merge(Self::manager_router());
+        // STUDIO-1014: the manager role is a FIXED tool set (§4.4) — every route not in
+        // `MANAGER_TOOL_NAMES` is removed, independent of `cfg.mcp` and the Teams toggle, so the
+        // manager run's surface is exactly what the design lists and nothing else. Brand aliases are
+        // deliberately NOT registered for the manager: the set is exact, and an alias would add a
+        // name the design did not list. This branch returns before the ordinary gating below.
+        if opts.role == Role::Manager {
+            let drop: Vec<String> = tool_router
+                .map
+                .keys()
+                .filter(|n| !crate::manager::MANAGER_TOOL_NAMES.contains(&n.as_ref()))
+                .map(|n| n.to_string())
+                .collect();
+            for name in drop {
+                tool_router.remove_route(&name);
+            }
+            return Self {
+                client,
+                opts,
+                tool_router,
+            };
+        }
         if !cfg.mcp.allow_send_message {
             tool_router.remove_route("symphony_send_message");
         }
@@ -96,7 +145,6 @@ impl Facade {
         // Rhapsody Teams (STUDIO-645, T4): the same removal mechanism, gated on the toggle rather
         // than on an `mcp:` key. Teams off ⇒ not one `teams_*` tool is registered, so the feature
         // is invisible rather than merely inert and `list_tools` is byte-identical (§6.7).
-        tool_router.merge(Self::teams_router());
         if !opts.teams_enabled {
             for name in [
                 "teams_roster",
@@ -375,7 +423,7 @@ fn query_escape(s: &str) -> String {
 /// Builds the query string for a set of `key=value` pairs like Go's `url.Values.Encode` +
 /// `encodeQuery` (server.go): drops empty values (`setIf`), sorts by key, query-escapes each, and
 /// prefixes `?` — or the empty string when nothing remains.
-fn encode_query(pairs: Vec<(&str, String)>) -> String {
+pub(crate) fn encode_query(pairs: Vec<(&str, String)>) -> String {
     let mut pairs: Vec<(&str, String)> = pairs.into_iter().filter(|(_, v)| !v.is_empty()).collect();
     if pairs.is_empty() {
         return String::new();

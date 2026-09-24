@@ -87,7 +87,7 @@ fn git_env_from(mut env: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)>
 }
 
 /// The hardened git environment layered on the current process environment.
-fn git_env() -> Vec<(OsString, OsString)> {
+pub(crate) fn git_env() -> Vec<(OsString, OsString)> {
     git_env_from(std::env::vars_os().collect())
 }
 
@@ -146,8 +146,9 @@ fn git_path_absent(cat_file_output: &str) -> bool {
 /// Reports whether `s` is a plausible git commit SHA — 7 to 64 hex digits, the range that spans an
 /// abbreviated SHA-1 through a full SHA-256 object id. The review-mode checkout interpolates the
 /// value into a git argument list, so this is what makes it impossible for a head SHA to name a
-/// branch, a flag, or a revision expression rather than one commit.
-fn is_commit_sha(s: &str) -> bool {
+/// branch, a flag, or a revision expression rather than one commit. `pub(crate)` so the manager's
+/// object reads ([`crate::read`]) reuse the exact same guard.
+pub(crate) fn is_commit_sha(s: &str) -> bool {
     (7..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
