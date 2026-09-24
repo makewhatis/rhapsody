@@ -454,21 +454,23 @@ impl Orchestrator {
             return;
         };
         let request = self.manager_apply_request(row, &decision, &effects);
-        self.submit_manager_apply(&row.id, request);
+        self.submit_manager_apply(request);
     }
 
-    /// Submit one request to the off-loop applier, at most once per process per intervention, so an
-    /// `applying` row is not re-posted on every tick while its effects are in flight. A restart
-    /// starts with an empty set, which is how recovery re-submits after a crash (the applier's
-    /// marker search makes the duplicate harmless).
-    fn submit_manager_apply(&mut self, id: &str, request: ManagerApplyRequest) {
-        if self.manager_apply_submitted.contains(id) {
+    /// Submit one request to the off-loop applier, at most once per process per (intervention,
+    /// effect-set), so an `applying` row is not re-posted on every tick while its effects are in
+    /// flight. A restart starts with an empty set, which is how recovery re-submits after a crash
+    /// (the applier's marker search makes the duplicate harmless). Keying on the effect set keeps a
+    /// best-effort escalation/unapplied notice distinct from the mandatory effects.
+    fn submit_manager_apply(&mut self, request: ManagerApplyRequest) {
+        let key = format!("{}:{}", request.intervention_id, request.effects.join(","));
+        if self.manager_apply_submitted.contains(&key) {
             return;
         }
         let Some(sink) = &self.manager_apply else {
             return; // no applier: effects are retried on a later recovery, never inline
         };
-        self.manager_apply_submitted.insert(id.to_string());
+        self.manager_apply_submitted.insert(key);
         sink.submit(request);
     }
 
@@ -605,7 +607,7 @@ impl Orchestrator {
             marker,
             ticket_move: None,
         };
-        self.submit_manager_apply(&row.id.clone(), escalate_request);
+        self.submit_manager_apply(escalate_request);
         let request = ManagerActivation {
             intervention_id: row.id.clone(),
             pr: row.pr.clone(),
@@ -763,7 +765,7 @@ impl Orchestrator {
             marker,
             ticket_move: None,
         };
-        self.submit_manager_apply(&row.id.clone(), unapplied_request);
+        self.submit_manager_apply(unapplied_request);
     }
 
     // --- request builders ------------------------------------------------------------------------

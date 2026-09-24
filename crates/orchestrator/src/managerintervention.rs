@@ -2063,7 +2063,7 @@ mod tests {
     fn a_hold_between_request_and_ack_refuses_activation() {
         let (mut o, _) = orch(ReviewAuthority::Act);
         seed_open_finding(&o, "alice:F1");
-        let (id, _) = validated_then_applying(
+        let (id, requests) = validated_then_applying(
             &mut o,
             &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
         );
@@ -2083,6 +2083,13 @@ mod tests {
         assert!(
             row.unapplied_explanation,
             "the posted explanation is unapplied"
+        );
+        // The human feed's reporting is paired with a best-effort "not applied" notice on the PR.
+        assert!(
+            requests.lock().expect("apply lock").iter().any(|r| r
+                .effects
+                .contains(&crate::managerapply::MANAGER_EFFECT_UNAPPLIED.to_string())),
+            "a refused activation posts a best-effort not-applied notice"
         );
         // The dismissal never became effective.
         assert_eq!(
