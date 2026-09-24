@@ -331,6 +331,38 @@ async fn a_silent_client_is_closed_at_the_header_read_timeout() {
     harness.shutdown().await;
 }
 
+/// §14.2 + mutation "serve HTTP/2": the listener speaks HTTP/1 only, so an HTTP/2 prior-knowledge
+/// preface is never served as a request. Mutating `.http1_only()` to an h2-capable builder would let
+/// the preface negotiate a stream, reddening the "no HTTP/1 response / connection closed" assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_http2_preface_is_not_served_as_a_request() {
+    let harness = LimitsHarness::new().await;
+    let mut stream = TcpStream::connect(harness.addr)
+        .await
+        .expect("connect the listener");
+    // The connection preface a client with prior knowledge of HTTP/2 sends first.
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("write the HTTP/2 preface");
+    stream.flush().await.expect("flush");
+
+    let mut buffer = [0u8; 128];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+        .await
+        .expect("an HTTP/1-only listener must terminate an HTTP/2 preface, not hang");
+    let served = match read {
+        Ok(0) => String::new(),
+        Ok(n) => String::from_utf8_lossy(&buffer[..n]).to_string(),
+        Err(_) => String::new(),
+    };
+    assert!(
+        !served.starts_with("HTTP/1.1 2"),
+        "an HTTP/2 preface must not be served as a successful HTTP/1 request: {served}"
+    );
+    harness.shutdown().await;
+}
+
 /// §5.1 + mutation "multiply the per-connection request ceiling": one keep-alive connection is
 /// served at most `MAX_REQUESTS_PER_CONNECTION` requests, and the last response tells the client the
 /// connection is closing.
