@@ -1393,7 +1393,8 @@ transaction commits it:
 | --- | --- | --- |
 | `rhapsody_manager_wake` | — | one wake OBLIGATION per `ROUTE_TO_AUTHOR` intervention (`state` pending/admitted/delivered/refused), written only by the activation transaction |
 | `rhapsody_manager_wake_issue` | — | plain index on `rhapsody_manager_wake(issue_id)` |
-| `PRAGMA user_version` | 6 | **23** |
+| `rhapsody_manager_intervention.activation_patch_id`, `.rerequested` | — | §6.6 completion bookkeeping, written only by the activation transaction: the patch-id current at activation, and the reviewer rows a `RERUN_REVIEW` re-requested |
+| `PRAGMA user_version` | 6 | **24** |
 
 Every decision except `ESCALATE` posts one **mandatory explanation** comment; `ROUTE_TO_AUTHOR`
 additionally moves the ticket to `changes_state`. Effects run on an off-loop applier task
@@ -1419,6 +1420,14 @@ admission, a ticket with an unspent `pending` wake obligation is SKIPPED by ordi
 no route-back dispatches without its seed. The memory mirror is written last, best effort: a memory
 failure leaves the decision applied and `memory_state = pending`, and never re-runs or reverts
 anything.
+
+**Completion is per decision (§6.6).** An `APPROVE` completes when its approval expires or is
+cancelled, or — if it is still `effective` at its 2 h timeout — goes to the human feed and stops the
+generation (the observable D7-blocked signature on the control task). A `RERUN_REVIEW` completes
+when the patch-id moves or every re-requested row's round finishes; a `ROUTE_TO_AUTHOR` when the
+author pushes a new patch-id and the following review round completes at it. A `RERUN_REVIEW`/
+`ROUTE_TO_AUTHOR` that never completes ends `effect_timeout` (`ROUTE_TO_AUTHOR` at 4 h; the rest at
+2 h).
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
