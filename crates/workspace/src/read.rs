@@ -553,42 +553,69 @@ mod tests {
     async fn range_diff_shows_the_change_between_two_patches() {
         let (m, _root) = repo_test_manager(HookScripts::default());
         let origin = init_local_origin();
-        let base = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["-C", &origin.path, "rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        // A first patch (v1) and a rebased/amended second patch (v2) that changes the file again.
-        std::fs::write(origin.child("b.rs"), "v1\n").unwrap();
+        let rev = |rev: &str| {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["-C", &origin.path, "rev-parse", rev])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+        let lines = |seven: &str| {
+            (1..=20)
+                .map(|i| {
+                    if i == 7 {
+                        seven.to_string()
+                    } else {
+                        format!("line{i}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        // `b.rs` exists in the BASE, so the two patches MODIFY it rather than create it; that is
+        // what makes git pair the two commits and emit the interdiff body.
+        std::fs::write(origin.child("b.rs"), lines("x")).unwrap();
         git_run(&origin.path, &["add", "b.rs"]);
-        git_run(&origin.path, &["commit", "-m", "v1"]);
-        let from = mirror_for(&m, &origin.path).await;
-        std::fs::write(origin.child("b.rs"), "v2\n").unwrap();
-        git_run(&origin.path, &["add", "b.rs"]);
-        git_run(&origin.path, &["commit", "-m", "v2"]);
-        let to = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["-C", &origin.path, "rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
+        git_run(&origin.path, &["commit", "-m", "base b.rs"]);
+        let base = rev("HEAD");
+        for (branch, body, msg) in [
+            ("old", lines("v1"), "change to v1"),
+            ("new", lines("v2"), "change to v2"),
+        ] {
+            git_run(&origin.path, &["checkout", "-b", branch, &base]);
+            std::fs::write(origin.child("b.rs"), body).unwrap();
+            git_run(&origin.path, &["add", "b.rs"]);
+            git_run(&origin.path, &["commit", "-m", msg]);
+        }
+        git_run(&origin.path, &["checkout", "main"]);
         m.ensure_from_repo(&origin.path, "", "AIE-2")
             .await
-            .expect("refresh mirror");
+            .expect("provision mirror");
+        let from = rev("old");
+        let to = rev("new");
         let rd = m
             .range_diff(&origin.path, &base, &from, &to)
             .await
             .expect("range-diff");
         assert!(
+            rd.contains("v1"),
+            "range-diff should name the old patch: {rd}"
+        );
+        assert!(
             rd.contains("v2"),
-            "range-diff should name the added patch: {rd}"
+            "range-diff should name the new patch: {rd}"
+        );
+        // The commit SUBJECT alone would satisfy `contains("v2")`; the point of a range-diff is the
+        // inner patch BODY. These lines (`-+v1` / `++v2`) appear only when the two patches' bodies
+        // are actually compared.
+        assert!(
+            rd.contains("-+v1") && rd.contains("++v2"),
+            "range-diff must compare the patch body, not just name the commits: {rd}"
         );
         assert!(!rd.trim().is_empty(), "range-diff must not be empty");
     }

@@ -140,7 +140,14 @@ pub fn manager_mcp_config(daemon_bin: &str, workflow_path: &str) -> String {
             }
         }
     });
-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|e| {
+        // Unreachable for this literal document, but if it ever happens the run must fail CLOSED:
+        // paired with `--strict-mcp-config`, an empty config registers no server and no tool, so
+        // the manager gets no reads rather than someone else's. Say so rather than swallow it.
+        tracing::warn!(error = %e, "manager: could not serialize the manager MCP config; \
+                                    serving an empty server set (strict-mcp-config fails closed)");
+        "{}".to_string()
+    })
 }
 
 /// The manager's `claude` argv posture, derived from a base config (which supplies the command,
