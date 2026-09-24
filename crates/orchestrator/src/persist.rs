@@ -221,11 +221,13 @@ impl Orchestrator {
     /// the run's committed token tallies are replaced from the drained ledgers, so the `runs` row and
     /// the per-provider budget see the broker's numbers, not the child's (design §7.3: "replaces
     /// brokered-turn token/cache counts with broker-collected provider reports"; child values are
-    /// comparison-only diagnostics). The committed total is the provider-reported total, or the
-    /// conservative reservation when the broker could not report — never the child's figure, so an
-    /// unknown request is not filled from a child value. The input/output split is not part of the
-    /// broker receipt, so those are zeroed for the brokered run; the usage row keeps the reported and
-    /// reserved totals separately.
+    /// comparison-only diagnostics). When it is NOT live — every production cancellation, where
+    /// `terminate` + `persist_end_run` closed the row with the child's figures first — the closed
+    /// row's tallies are rewritten from the receipt instead (STUDIO-1047). The committed total is the
+    /// provider-reported total, or the conservative reservation when the broker could not report —
+    /// never the child's figure, so an unknown request is not filled from a child value. The
+    /// input/output split is not part of the broker receipt, so those are zeroed for the brokered
+    /// run; the usage row keeps the reported and reserved totals separately.
     pub(crate) fn on_broker_usage(&mut self, issue_id: &str, run_id: i64, usage: &store::RunUsage) {
         if run_id != 0
             && let Err(e) = self.store.set_run_usage(run_id, usage)
@@ -237,39 +239,83 @@ impl Orchestrator {
                 "broker usage persistence failed; the run's own history is unaffected"
             );
         }
-        self.replace_child_usage_with_broker(issue_id, usage);
+        self.replace_child_usage_with_broker(issue_id, run_id, usage);
     }
 
-    /// Replace a live run's committed token tallies with the finalized broker receipt (design §7.3)
-    /// and correct the aggregate totals by the delta the child had contributed. A no-op when the
-    /// entry is already gone (the cancellation path, where the run row is closed by `terminate`'s
-    /// caller).
+    /// Replace a run's committed token tallies with the finalized broker receipt (design §7.3) and
+    /// settle the cumulative aggregate from that receipt.
     ///
-    /// The committed total is the provider-reported total; when the broker could not report, it is the
-    /// conservative reservation, so an unknown/aborted request stays charged and is never filled from
-    /// the child's figure. The input/output split is not part of the broker receipt, so those are
-    /// zeroed for the brokered run (the usage row keeps reported and reserved separately).
-    fn replace_child_usage_with_broker(&mut self, issue_id: &str, usage: &store::RunUsage) {
+    /// The LIVE path is the ordinary teardown: the worker sends the receipt before its exit, so the
+    /// running entry is still present and its committed figures are replaced in place, then
+    /// `persist_end_run` writes the broker figures to the run row.
+    ///
+    /// The NO-LIVE path is every production cancellation, and it is the one STUDIO-1002 left broken:
+    /// `terminate` removes the entry and its caller closes the run row SYNCHRONOUSLY (operator Stop,
+    /// stall kill, terminal reconcile, per-run token ceiling), all before the worker's
+    /// `Event::BrokerUsage` arrives. The child's figure is therefore already on the `runs` row — and
+    /// `tokens_by_provider`, the per-provider budget, reads that row. So when there is no live entry
+    /// and the event carries a run id, the row's tallies are rewritten from the receipt too, using
+    /// the same "reported total, else the conservative reservation" rule as the live path. A zero run
+    /// id (store disabled) has no row to correct.
+    ///
+    /// Neither path subtracts a child contribution from the aggregate, and that is deliberate: a
+    /// brokered run's child figure is never folded into `totals` in the first place (see
+    /// `RunningEntry::brokered` and `on_agent_update`), so the settlement is a single addition in
+    /// BOTH cases — which is exactly why the cancelled case needs no record of what the child
+    /// reported. The committed total is the provider-reported total; when the broker could not
+    /// report, it is the conservative reservation, so an unknown/aborted request stays charged and
+    /// is never filled from the child's figure. The input/output split is not part of the broker
+    /// receipt, so those are zeroed for the brokered run (the usage row keeps reported and reserved
+    /// separately).
+    fn replace_child_usage_with_broker(
+        &mut self,
+        issue_id: &str,
+        run_id: i64,
+        usage: &store::RunUsage,
+    ) {
         let broker_total = usage
             .provider_reported_tokens
             .unwrap_or(usage.reserved_tokens);
-        let Some(re) = self.running.get_mut(issue_id) else {
+        if let Some(re) = self.running.get_mut(issue_id) {
+            re.input_tokens = 0;
+            re.output_tokens = 0;
+            re.total_tokens = broker_total;
+            re.cur_input_tokens = 0;
+            re.cur_output_tokens = 0;
+            re.cur_total_tokens = 0;
+            self.settle_broker_total_in_totals(broker_total);
             return;
-        };
-        let old = (re.input_tokens, re.output_tokens, re.total_tokens);
-        re.input_tokens = 0;
-        re.output_tokens = 0;
-        re.total_tokens = broker_total;
-        re.cur_input_tokens = 0;
-        re.cur_output_tokens = 0;
-        re.cur_total_tokens = 0;
-        self.totals.input_tokens = self.totals.input_tokens.saturating_sub(old.0);
-        self.totals.output_tokens = self.totals.output_tokens.saturating_sub(old.1);
-        self.totals.total_tokens = self
-            .totals
-            .total_tokens
-            .saturating_sub(old.2)
-            .saturating_add(broker_total);
+        }
+        // No live entry: a cancellation already closed the row. A zero run id (store disabled) has
+        // no row to correct; the rewrite is best-effort like every other persist call.
+        if run_id == 0 {
+            return;
+        }
+        if let Err(e) = self.store.set_run_tokens(
+            run_id,
+            &store::RunTokens {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: broker_total,
+                usage_estimated: false,
+            },
+        ) {
+            tracing::warn!(
+                issue_id = %issue_id,
+                run_id,
+                err = %e,
+                "broker usage run-row rewrite failed; the run's own history is unaffected"
+            );
+        }
+        self.settle_broker_total_in_totals(broker_total);
+    }
+
+    /// Adds a brokered run's finalized figure to the cumulative aggregate. Shared by the live and
+    /// cancelled paths of
+    /// [`replace_child_usage_with_broker`](Orchestrator::replace_child_usage_with_broker); since the
+    /// child's own tokens were never counted for a brokered run, there is nothing to subtract first.
+    fn settle_broker_total_in_totals(&mut self, broker_total: i64) {
+        self.totals.total_tokens = self.totals.total_tokens.saturating_add(broker_total);
     }
 
     // --- synchronous write-through helpers ----------------------------------------------------
@@ -635,8 +681,8 @@ fn flush_events(
 mod tests {
     use rhapsody_agent::{EVENT_NOTIFICATION, EVENT_TURN_COMPLETED, Event, Usage};
     use rhapsody_store::{
-        CLAIM_RETRY_QUEUED, CLAIM_RUNNING, OUTCOME_COMPLETED, OUTCOME_CONTINUED, OUTCOME_RUNNING,
-        OUTCOME_STOPPED, RUN_MESSAGE_EXPIRED, RunFilter,
+        CLAIM_RETRY_QUEUED, CLAIM_RUNNING, OUTCOME_COMPLETED, OUTCOME_CONTINUED, OUTCOME_FAILED,
+        OUTCOME_RUNNING, OUTCOME_STOPPED, OUTCOME_TOKEN_CEILING, RUN_MESSAGE_EXPIRED, RunFilter,
     };
 
     use super::*;
@@ -947,11 +993,13 @@ mod tests {
     fn on_broker_usage_writes_a_usage_row_and_replaces_child_usage() {
         let (mut o, st) = orch_with_store();
         let mut re = re_for("ID-1", "MT-1", "In Progress");
+        re.brokered = true; // the fixture must model a prepared (brokered) dispatch
         o.persist_start_run(&mut re, 0);
         let run_id = re.run_id;
         let issue_id = re.issue.id.clone();
         o.running.insert(issue_id.clone(), re);
-        // The child's turn_completed result commits its own token figure.
+        // The child's turn_completed result commits its own token figure — on the ENTRY and, being
+        // brokered, deliberately NOT into the cumulative aggregate (STUDIO-1047).
         o.on_agent_update(AgentUpdate {
             issue_id: issue_id.clone(),
             ev: Event {
@@ -967,7 +1015,11 @@ mod tests {
         });
         assert_eq!(
             o.running[&issue_id].total_tokens, 1000,
-            "the child usage is committed before the receipt arrives"
+            "the child usage is committed on the entry before the receipt arrives"
+        );
+        assert_eq!(
+            o.totals.total_tokens, 0,
+            "a brokered run's child figure is not folded into the aggregate"
         );
 
         let usage = store::RunUsage {
@@ -1042,5 +1094,220 @@ mod tests {
         let (mut o, _st) = orch_with_store();
         let usage = store::RunUsage::default();
         o.on_broker_usage("ghost", 0, &usage); // must not panic
+    }
+
+    // LEGACY accounting is unchanged (STUDIO-1047 acceptance): a non-brokered run never receives an
+    // `Event::BrokerUsage`, so its child figures stand on both the run row and the aggregate exactly
+    // as before the broker feature existed.
+    #[test]
+    fn legacy_run_accounting_is_unchanged() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "Todo");
+        o.persist_start_run(&mut re, 0);
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+        o.on_agent_update(AgentUpdate {
+            issue_id: issue_id.clone(),
+            ev: Event {
+                event_type: EVENT_TURN_COMPLETED.to_string(),
+                usage: Some(Usage {
+                    input_tokens: 700,
+                    output_tokens: 300,
+                    total_tokens: 1000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            o.totals.total_tokens, 1000,
+            "a legacy run's child figure IS folded into the aggregate"
+        );
+
+        let re = o.terminate(&issue_id).expect("running");
+        o.persist_end_run(&re, OUTCOME_COMPLETED, "");
+
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        assert_eq!(
+            runs[0].total_tokens, 1000,
+            "legacy row keeps the child total"
+        );
+        assert_eq!(runs[0].input_tokens, 700);
+        assert_eq!(runs[0].output_tokens, 300);
+        assert_eq!(o.totals.total_tokens, 1000, "legacy aggregate is unchanged");
+    }
+
+    // alice's STUDIO-1002 round-3 reproduction, as a real test (STUDIO-1047). A production
+    // cancellation (`terminate` + `persist_end_run`) closes the run row with the CHILD's committed
+    // figure synchronously, before the worker's `Event::BrokerUsage` arrives. The receipt must still
+    // replace that figure on the row — which the per-provider budget (`tokens_by_provider`) reads —
+    // and correct the aggregate. MUTATION GUARD: reverting `replace_child_usage_with_broker` to its
+    // live-entry-only form leaves the row at 1000 and reds this test.
+    #[test]
+    fn a_cancelled_brokered_run_records_the_receipt_not_the_child_usage() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "In Progress");
+        re.brokered = true; // alice's reproduction is a prepared (brokered) run
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+        // The child's turn_completed commits its own token figure into the entry.
+        o.on_agent_update(AgentUpdate {
+            issue_id: issue_id.clone(),
+            ev: Event {
+                event_type: EVENT_TURN_COMPLETED.to_string(),
+                usage: Some(Usage {
+                    input_tokens: 700,
+                    output_tokens: 300,
+                    total_tokens: 1000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            o.totals.total_tokens, 0,
+            "a brokered child figure never enters the aggregate"
+        );
+
+        // operator Stop: terminate then persist_end_run, all before the receipt arrives.
+        let re = o.terminate(&issue_id).expect("running");
+        o.persist_end_run(&re, OUTCOME_STOPPED, "stopped by user");
+        assert_eq!(
+            st.list_runs(RunFilter::default()).expect("list runs")[0].total_tokens,
+            1000,
+            "the child figure is what the closed run row records first"
+        );
+
+        let usage = store::RunUsage {
+            provider_reported_tokens: Some(42),
+            reserved_tokens: 900,
+            usage_authority: store::USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.to_string(),
+            usage_incomplete: true,
+            unknown_usage_requests: 2,
+        };
+        o.on_broker_usage(&issue_id, run_id, &usage);
+
+        assert_eq!(st.run_usage(run_id).expect("read usage"), Some(usage));
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        assert_eq!(
+            runs[0].total_tokens, 42,
+            "the closed run row records the broker receipt, not the child's 1000"
+        );
+        assert_eq!(
+            runs[0].input_tokens, 0,
+            "the receipt carries no input split"
+        );
+        assert_eq!(
+            runs[0].output_tokens, 0,
+            "the receipt carries no output split"
+        );
+        assert!(
+            !runs[0].usage_estimated,
+            "a broker receipt is authoritative"
+        );
+        assert_eq!(
+            o.totals.total_tokens, 42,
+            "the aggregate follows the receipt"
+        );
+    }
+
+    // The same correction on EVERY production cancellation path, each of which does exactly what
+    // `stop.rs` / `reconcile_run.rs` / `agentupdate.rs` do: `terminate` then `persist_end_run` with
+    // that path's outcome, before the receipt arrives (STUDIO-1047 acceptance).
+    #[test]
+    fn every_cancellation_path_records_the_receipt_not_the_child_usage() {
+        for (outcome, reason) in [
+            (OUTCOME_STOPPED, "stopped by user"),
+            (OUTCOME_FAILED, "stalled"),
+            (
+                OUTCOME_TOKEN_CEILING,
+                "stopped at its per-run token ceiling",
+            ),
+        ] {
+            let (mut o, st) = orch_with_store();
+            let mut re = re_for("ID-1", "MT-1", "In Progress");
+            re.brokered = true;
+            o.persist_start_run(&mut re, 0);
+            let run_id = re.run_id;
+            let issue_id = re.issue.id.clone();
+            o.running.insert(issue_id.clone(), re);
+            o.on_agent_update(AgentUpdate {
+                issue_id: issue_id.clone(),
+                ev: Event {
+                    event_type: EVENT_TURN_COMPLETED.to_string(),
+                    usage: Some(Usage {
+                        total_tokens: 1000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+
+            let re = o.terminate(&issue_id).expect("running");
+            o.persist_end_run(&re, outcome, reason);
+            o.on_broker_usage(
+                &issue_id,
+                run_id,
+                &store::RunUsage {
+                    provider_reported_tokens: Some(42),
+                    reserved_tokens: 900,
+                    ..Default::default()
+                },
+            );
+
+            let runs = st.list_runs(RunFilter::default()).expect("list runs");
+            assert_eq!(
+                runs[0].total_tokens, 42,
+                "{outcome}/{reason}: the row must record the receipt, not the child's 1000"
+            );
+            assert_eq!(runs[0].outcome, outcome, "{outcome}: outcome is preserved");
+            assert_eq!(o.totals.total_tokens, 42, "{outcome}: aggregate");
+        }
+    }
+
+    // The receipt's fallback rule is unchanged on the cancelled path too: with the broker unable to
+    // report, the run is charged the conservative RESERVATION, never left at the child's figure and
+    // never zeroed. The row is rewritten even though it was already closed.
+    #[test]
+    fn a_cancelled_broker_receipt_with_no_report_charges_the_reservation() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "In Progress");
+        re.brokered = true;
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+        o.on_agent_update(AgentUpdate {
+            issue_id: issue_id.clone(),
+            ev: Event {
+                event_type: EVENT_TURN_COMPLETED.to_string(),
+                usage: Some(Usage {
+                    total_tokens: 1000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        let re = o.terminate(&issue_id).expect("running");
+        o.persist_end_run(&re, OUTCOME_STOPPED, "stopped by user");
+
+        o.on_broker_usage(
+            &issue_id,
+            run_id,
+            &store::RunUsage {
+                provider_reported_tokens: None,
+                reserved_tokens: 900,
+                usage_incomplete: true,
+                ..Default::default()
+            },
+        );
+
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        assert_eq!(
+            runs[0].total_tokens, 900,
+            "an unreported receipt charges the reservation, not the child figure or zero"
+        );
     }
 }

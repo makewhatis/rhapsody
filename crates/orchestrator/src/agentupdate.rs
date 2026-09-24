@@ -131,9 +131,17 @@ impl Orchestrator {
                     re.input_tokens += u.input_tokens;
                     re.output_tokens += u.output_tokens;
                     re.total_tokens += u.total_tokens;
-                    self.totals.input_tokens += u.input_tokens;
-                    self.totals.output_tokens += u.output_tokens;
-                    self.totals.total_tokens += u.total_tokens;
+                    // A BROKERED run's child figure is a comparison-only diagnostic (design §7.3):
+                    // keep it on the entry — the per-run token ceiling and the INF-208 floor read
+                    // `re` — but do NOT fold it into the cumulative aggregate, which the broker's
+                    // finalized receipt settles (STUDIO-1047). Doing so is what lets a cancelled
+                    // brokered run (entry already gone when the receipt arrives) correct the
+                    // aggregate from the receipt alone, with no child figure to subtract.
+                    if !re.brokered {
+                        self.totals.input_tokens += u.input_tokens;
+                        self.totals.output_tokens += u.output_tokens;
+                        self.totals.total_tokens += u.total_tokens;
+                    }
                     // Go emits `o.metrics.Tokens(...)` here; the token metric export is P6.
                 }
                 _ => {
@@ -1053,6 +1061,52 @@ mod tests {
             o.dispatch_review(run),
             crate::review::ReviewDispatchOutcome::AlreadyInFlight,
             "a held review key must refuse the next dispatch, not re-run it"
+        );
+    }
+
+    // STUDIO-1047: the per-run token ceiling is one of the production cancellations that closes the
+    // run row with the CHILD's figure before the worker's broker receipt arrives. This drives the
+    // REAL `enforce_run_token_ceiling` (not just `terminate` + `persist_end_run`) and then applies
+    // the receipt, asserting the already-closed row is corrected. MUTATION GUARD: without the
+    // no-live-entry branch in `on_broker_usage` the row stays at the ceiling's floored 5000.
+    #[test]
+    fn a_token_ceiling_stop_records_the_broker_receipt_not_the_child_usage() {
+        let (mut o, st) = orch_with_ceiling(1_000);
+        let mut re = armed(running_entry(issue("ID-1", "MT-1", "In Progress"), "", ""));
+        re.brokered = true; // a prepared (brokered) run: its usage settles from the receipt
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        o.running.insert("ID-1".into(), re);
+
+        update(&mut o, "ID-1", live_usage(5_000));
+
+        assert!(!o.running.contains_key("ID-1"), "the ceiling stops the run");
+        let stopped = first_run(st.as_ref());
+        assert_eq!(stopped.outcome, store::OUTCOME_TOKEN_CEILING);
+        assert_eq!(
+            stopped.total_tokens, 5_000,
+            "the ceiling records the child's live figure first"
+        );
+
+        o.on_broker_usage(
+            "ID-1",
+            run_id,
+            &store::RunUsage {
+                provider_reported_tokens: Some(42),
+                reserved_tokens: 900,
+                ..Default::default()
+            },
+        );
+
+        let run = first_run(st.as_ref());
+        assert_eq!(
+            run.total_tokens, 42,
+            "the closed row records the finalized broker receipt, not the child's 5000"
+        );
+        assert!(!run.usage_estimated, "a broker receipt is authoritative");
+        assert_eq!(
+            o.totals.total_tokens, 42,
+            "the aggregate follows the receipt"
         );
     }
 }

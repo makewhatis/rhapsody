@@ -422,6 +422,10 @@ impl Orchestrator {
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.review = review.clone();
+        // PB7 (STUDIO-1002, STUDIO-1047): a prepared dispatch's usage is settled from the broker
+        // receipt, so its child figure is excluded from the cumulative aggregate (`on_agent_update`)
+        // while still kept on the entry for the ceiling/floor. `false` on every legacy dispatch.
+        re.brokered = prepared.is_some();
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
