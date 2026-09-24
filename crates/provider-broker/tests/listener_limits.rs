@@ -351,14 +351,18 @@ async fn an_http2_preface_is_not_served_as_a_request() {
     let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
         .await
         .expect("an HTTP/1-only listener must terminate an HTTP/2 preface, not hang");
+    // A correct HTTP/1-only listener either closes the connection (no bytes) or answers a bounded
+    // HTTP/1 rejection. It must NEVER emit an HTTP/2 frame (binary) or a successful response; an
+    // h2-capable builder would send a SETTINGS frame here, which is neither empty nor `HTTP/1.1 `.
     let served = match read {
         Ok(0) => String::new(),
         Ok(n) => String::from_utf8_lossy(&buffer[..n]).to_string(),
         Err(_) => String::new(),
     };
+    let is_http1_rejection = served.starts_with("HTTP/1.1 ") && !served.starts_with("HTTP/1.1 2");
     assert!(
-        !served.starts_with("HTTP/1.1 2"),
-        "an HTTP/2 preface must not be served as a successful HTTP/1 request: {served}"
+        served.is_empty() || is_http1_rejection,
+        "an HTTP/2 preface must not be served as a request; got: {served:?}"
     );
     harness.shutdown().await;
 }
