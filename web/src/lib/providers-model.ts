@@ -158,6 +158,13 @@ export function isCredentialBlocked(status: string): boolean {
   return credentialTone(status) === "blocked";
 }
 
+/** Whether the provider is known to hold a STORED key (STUDIO-1048). A change to its base URL or
+ *  protocol then needs an explicit desktop Rebind. `absent` plainly has none, and
+ *  `unknown_refreshing` is unknown — neither is treated as "has a key". */
+export function hasStoredKey(status: string): boolean {
+  return status !== "" && status !== "absent" && status !== "unknown_refreshing";
+}
+
 /** The human label for a credential status. Every member of the daemon's closed set is named. */
 export function credentialStatusLabel(status: string): string {
   switch (status) {

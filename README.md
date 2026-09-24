@@ -3140,6 +3140,65 @@ Preserved-code surfaces are unchanged: `effective_json` emits the provider block
 own provider definitions entry-by-entry through the existing decode→validate→effective→encode
 pipeline.
 
+### Providers are authored from Settings, not by hand-editing `WORKFLOW.md` (STUDIO-1048)
+
+Settings → Providers adds, edits and removes `providers:` definitions in place, so an operator never
+has to hand-write YAML to set one up. Adding, editing and removing a definition is **non-secret
+configuration** and works in both the desktop app and the browser dashboard, behind the same
+operator-write guard as every other local write; the KEY actions (Connect, Replace, Rebind, Remove
+credential, Test connection) stay desktop-only.
+
+- **`POST /api/v1/providers/config`** (Rhapsody-only, operator-guarded) carries
+  `{op: add|edit|remove, provider_id, definition}` and answers the same `effective_json::render`
+  view `POST /api/v1/config` does. It is **not** the typed config POST: that path decodes to a typed
+  `Config` and re-encodes the whole file, which would reformat — and drop every comment in — the
+  operator's `WORKFLOW.md`.
+- **The write is a byte-preserving splice.** `rhapsody_config::apply_provider_edit` rewrites ONLY
+  the one `<id>:` entry being changed — dropping the `providers:` key itself only when the last entry
+  is removed — using `encode`'s own emit-only-when-non-default rules. Every other byte of the front
+  matter and the prompt body — sibling providers, their comments, trailing blank lines — is left
+  exactly as it was; a `WORKFLOW.md` with no front matter gains one around the untouched original
+  text. An entry's span is bounded only by the next non-blank, non-comment line at the entry indent,
+  so a blank line or a comment *inside* an entry does not truncate it. A round-trip test asserts
+  every other line is byte-identical and turns red if the write re-serializes the file.
+- **The daemon validates, not the form.** The spliced candidate runs through the daemon's own
+  load pipeline (`decode` → `resolve` → `validate`) before it is written, so a bad `base_url`, an
+  unsupported protocol, a non-canonical id or a plaintext-`http` endpoint without the typed
+  `allow_insecure_http` opt-in is refused with the daemon's own error text, and the on-disk file is
+  left untouched. `WORKFLOW.md` hot-reloads, so a change shows up in status within seconds.
+- **Presets are verified.** The Add form offers OpenAI-compatible presets — Fireworks, OpenRouter,
+  OpenAI, Together and Groq — whose base URLs are pinned by a test to join to exactly one
+  `chat/completions` suffix (design §14.2); a custom endpoint is always available beside them. Only
+  the OpenAI-compatible protocol is offered, because it is the only one v1's broker speaks.
+- **Removal refuses a provider still selected.** The daemon computes the references from the resolved
+  workflow plus `teams.yaml` and the profile files (the global default, the manager, roster entries,
+  the review override, profiles) and returns `409 provider_in_use` listing every one; only an
+  unreferenced provider is removed. On desktop the confirm dialog also offers to delete the stored
+  Keychain item; the daemon's reference check runs FIRST as a `dry_run` (the same route, `dry_run:
+  true`, refuses without writing), so a referenced provider is refused **before** the Keychain item is
+  touched — a refused removal never orphans the credential. Only then is the key removed (while the
+  definition still exists to derive the binding) and the definition posted. A browser has no
+  Keychain, so it says the key stays.
+- **The form carries the limits.** The Add/Edit sheet shows the provider's `broker_limits` prefilled
+  with the stored values (the V1 defaults for an Add) and writes back what it shows, so an edit can
+  never silently drop the daily spend cap. An edit request that omits `limits` keeps the stored block;
+  a blank daily cap clears it. An unchanged capability lifetime is not written back (it is derived
+  from the turn deadline), so an edit does not pin today's default.
+- **Editing a keyed provider warns before saving.** Changing the base URL or protocol of a provider
+  with a stored credential shows the explicit-rebind warning in the form; after saving, status moves
+  through `unknown/refreshing` to `binding_mismatch`, as the credential feed already reports — the
+  old key never follows the new URL.
+- **An end-to-end test covers the whole path** with a fake credential and a loopback fake provider
+  (no paid provider, no persistent credential), split across the two workspaces that own each half.
+  In `rhapsody-httpapi` the add goes through the real Settings endpoint, the written file is decoded
+  and the real `RefreshCoordinator` reloads it, status reads `absent` ("Not connected"), a credential
+  is stored at the binding `credential_binding` derives, a real credentialed catalog refresh succeeds
+  over the loopback, and a URL edit through the Settings path reaches `binding_mismatch`. In the
+  `desktop` workspace the SAME `apply_provider_edit` splice drives add → `absent` → the real desktop
+  `commit(Connect)` into an in-memory keychain → the real `HttpConnectionTester` succeeding over a
+  loopback socket → an edit → `binding_mismatch`. The file watcher itself is not driven (a reload is
+  the coordinator/watcher's shared transform), but the desktop command and Test connection now are.
+
 ### Every loopback write passes an operator-write guard (STUDIO-982)
 
 Go v0.4.0 accepts any `POST` that reaches its loopback listener. Binding to `127.0.0.1` keeps other

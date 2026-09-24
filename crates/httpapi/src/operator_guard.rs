@@ -368,6 +368,8 @@ mod router_tests {
         "/api/v1/runs/7/message",
         // STUDIO-990: the ONE credentialed provider operation — the catalog refresh POST.
         "/api/v1/providers/7/models/refresh",
+        // STUDIO-1048: authoring a provider DEFINITION (non-secret config, but still a local write).
+        "/api/v1/providers/config",
     ];
 
     /// Every path `build_router` registers, read from its source so a new route cannot be missed
@@ -631,6 +633,9 @@ mod router_tests {
         match path {
             "/api/v1/drain" => r#"{"active":false}"#,
             "/api/v1/runs/7/message" => r#"{"text":"hi"}"#,
+            // A remove reaches the provider's reference check (the definition never exists here,
+            // so it answers 404 — past the guard and past body validation).
+            "/api/v1/providers/config" => r#"{"op":"remove","provider_id":"unknown"}"#,
             _ => "{}",
         }
     }

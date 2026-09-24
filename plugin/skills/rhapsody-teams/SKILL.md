@@ -110,7 +110,7 @@ few reviewers configured a required verdict can become unobtainable. This is exa
 `review.model`/`review.effort` below are scoped per harness rather than a single string.
 
 **`provider:` names the credential-backed inference provider a run uses.** It is the same shape on a
-profile and on the `manager:` block: an operator-chosen canonical provider id
+profile, a roster identity, and the `manager:` block: an operator-chosen canonical provider id
 (`fireworks`, `openrouter`, …) declared in `WORKFLOW.md`'s `providers:`. It is **never a
 credential** — the value is a plain id, and anything that is not a canonical id is refused, so a
 secret has no field to travel in. Empty inherits (profile → the daemon's configured selection). A
@@ -119,6 +119,16 @@ dispatch **refusal** — never a silent fallback to another provider or to `agen
 identity may also carry its own `harness:`/`provider:`/`model:`/`effort:`; those identity-tier
 fields are parsed and displayed but **not yet applied to a run** — see "Where the
 harness/provider/model comes from" below.
+
+**Define providers from Settings → Providers, not by hand-editing `WORKFLOW.md`.** The screen
+offers OpenAI-compatible presets (Fireworks, OpenRouter, OpenAI, Together, Groq) plus a custom
+endpoint, and adds, edits and removes the `providers:` entries in place — only the entry being changed
+is rewritten, so every other line of `WORKFLOW.md`, comments included, is left byte-for-byte
+untouched, and the change hot-reloads
+within seconds. A provider that is still selected (the global default, a profile, a roster entry,
+the review override or the manager) is **refused removal**, with every reference listed. Living
+definitions remain visible in `WORKFLOW.md` — the screen is a safe editor for them, not a second
+source of truth. Storing, replacing, rebinding and removing a provider's KEY stays desktop-only.
 
 The **manager** carries its own tuple (`manager.harness` / `manager.provider` / `manager.model`)
 and never borrows a teammate's. An absent `manager.harness` means `claude` (independent of

@@ -54,7 +54,13 @@ pub fn load(path: &Path) -> Result<Definition, WorkflowError> {
     // Any read failure (missing, permission, is-a-dir, ...) maps to
     // MissingWorkflowFile, exactly as loader.go wraps every os.ReadFile error.
     let data = fs::read_to_string(path).map_err(|_| WorkflowError::MissingWorkflowFile)?;
-    let Some((front, body)) = split_front_matter(&data) else {
+    parse(&data)
+}
+
+/// Parses WORKFLOW.md TEXT (the in-memory half of [`load`], STUDIO-1048). Splitting it out lets the
+/// provider-definition editor validate a CANDIDATE file it has not yet written to disk.
+pub fn parse(data: &str) -> Result<Definition, WorkflowError> {
+    let Some((front, body)) = split_front_matter(data) else {
         // No front matter: the whole (trimmed) file is the prompt body.
         return Ok(Definition {
             config: YamlMap::new(),
@@ -161,6 +167,28 @@ pub fn save(path: &Path, def: &Definition) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) => {
             // Best-effort cleanup if we bailed before the rename succeeded.
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+/// Writes already-marshalled WORKFLOW.md TEXT to `path`, atomically, with the same temp-file +
+/// rename + permission-preserving convention [`save`] uses (STUDIO-1048). Used by the
+/// provider-definition editor, which splices only the `providers:` block and must not re-serialize
+/// (and thus reformat) the rest of the operator's file.
+pub fn save_text(path: &Path, text: &str) -> io::Result<()> {
+    let perm = fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let (file, tmp_path) = create_temp(dir, "workflow")?;
+    match write_temp_and_rename(file, &tmp_path, text.as_bytes(), perm, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
             let _ = fs::remove_file(&tmp_path);
             Err(e)
         }

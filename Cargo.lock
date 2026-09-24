@@ -1675,6 +1675,7 @@ dependencies = [
  "rhapsody-agent",
  "rhapsody-config",
  "rhapsody-core",
+ "rhapsody-credential-ipc",
  "rhapsody-orchestrator",
  "rhapsody-provider-status",
  "rhapsody-store",

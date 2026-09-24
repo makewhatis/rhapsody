@@ -8,6 +8,8 @@ export interface ConfirmDialogProps {
   confirmLabel: string;
   danger?: boolean;
   busy?: boolean;
+  /** Optional extra content (e.g. a checkbox) rendered under the body copy. */
+  children?: React.ReactNode;
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -15,7 +17,7 @@ export interface ConfirmDialogProps {
 // ConfirmDialog — a minimal centered modal (no shared primitive existed). Escape / overlay click
 // cancels; the confirm button is danger-tinted when `danger`. Rendered only when `open`. Styled
 // with the shell's inline CSS-var idiom (mirrors AddAgentSheet's overlay + card surface vars).
-export function ConfirmDialog({ open, title, body, confirmLabel, danger, busy, onConfirm, onClose }: ConfirmDialogProps) {
+export function ConfirmDialog({ open, title, body, confirmLabel, danger, busy, children, onConfirm, onClose }: ConfirmDialogProps) {
   React.useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -50,6 +52,7 @@ export function ConfirmDialog({ open, title, body, confirmLabel, danger, busy, o
       >
         <div style={{ fontSize: 16, fontWeight: 600, color: "var(--tx)" }}>{title}</div>
         {body ? <div style={{ fontSize: 13, color: "var(--tx-3)", lineHeight: 1.5 }}>{body}</div> : null}
+        {children}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel

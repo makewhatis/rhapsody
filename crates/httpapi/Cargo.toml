@@ -98,6 +98,11 @@ chrono = "0.4"
 # multi-threaded runtime, so a test's client request and the spawned server task make progress
 # concurrently (the same flavor `linear-stub`'s server tests use). Already in Cargo.lock.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# rhapsody-credential-ipc (test-only, STUDIO-1048): the provider-settings e2e builds a real
+# `RefreshCoordinator` over an in-memory `CredentialReadSource`, whose `BoundCredentialLease`/
+# `Binding`/`Revision` live here. Workspace crate, already in Cargo.lock via provider-status — no
+# new external crate enters.
+rhapsody-credential-ipc = { path = "../credential-ipc" }
 
 [lints]
 workspace = true

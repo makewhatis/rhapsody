@@ -346,6 +346,38 @@ impl StateProvider for DaemonState {
         }
     }
 
+    /// Every place `provider_id` is still selected (STUDIO-1048), computed from the on-disk workflow
+    /// plus `teams.yaml` and the profile files beside it. Read-only and best-effort: an unreadable
+    /// workflow or a malformed `teams.yaml` contributes no references rather than failing the check
+    /// (a removal the operator plainly is not blocked from should not be refused by a parse hiccup),
+    /// while the actual write path still validates the whole config against the daemon's load
+    /// pipeline.
+    fn provider_references(&self, provider_id: &str) -> Vec<rhapsody_config::ProviderReference> {
+        let config =
+            rhapsody_config::workflow::load(std::path::Path::new(self.handle.workflow_path()))
+                .ok()
+                .and_then(|def| rhapsody_config::decode::decode(&def).ok());
+        let Some(config) = config else {
+            return Vec::new();
+        };
+        let teams = if self.teams_config_path.is_empty() {
+            None
+        } else {
+            rhapsody_config::teams::Teams::try_load(std::path::Path::new(&self.teams_config_path))
+                .ok()
+        };
+        let profiles = if self.teams_config_path.is_empty() {
+            Vec::new()
+        } else {
+            let teams_dir = std::path::Path::new(&self.teams_config_path)
+                .parent()
+                .map(|p| p.join("teams").join("profiles"))
+                .unwrap_or_else(|| std::path::PathBuf::from("teams/profiles"));
+            rhapsody_config::profile_providers(&teams_dir)
+        };
+        rhapsody_config::provider_references(provider_id, &config, teams.as_ref(), &profiles)
+    }
+
     /// The four Rhapsody Teams memory surfaces (STUDIO-645, T4). Each delegates straight to the
     /// `Arc`-shared [`TeamsMemory`] the control handle carries, so the request is served **entirely
     /// on this HTTP task**: no control-channel round-trip, and therefore no way for a `teams_retain`

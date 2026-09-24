@@ -90,7 +90,11 @@ export function ProvidersView({ onNavigate }: SettingsTabViewProps) {
       ) : !cfg.uiGlobal ? (
         <p style={{ fontSize: 13, color: "var(--tx-3)" }}>Loading configuration…</p>
       ) : (
-        <ProvidersTab value={cfg.uiGlobal} onChange={cfg.onGlobalChange} />
+        <ProvidersTab
+          value={cfg.uiGlobal}
+          onChange={cfg.onGlobalChange}
+          onDefinitionsChanged={cfg.reload}
+        />
       )}
     </Page>
   );

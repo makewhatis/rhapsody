@@ -256,7 +256,13 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
       />
     );
   } else if (tab === "providers") {
-    body = <ProvidersTab value={cfg.uiGlobal} onChange={cfg.onGlobalChange} />;
+    body = (
+      <ProvidersTab
+        value={cfg.uiGlobal}
+        onChange={cfg.onGlobalChange}
+        onDefinitionsChanged={cfg.reload}
+      />
+    );
   } else {
     body = (
       <ProjectsTab
