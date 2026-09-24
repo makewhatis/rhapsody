@@ -25,8 +25,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use rhapsody_config::provider_edit::{EditError, ProviderOp};
 use rhapsody_config::providers::{
-    BrokerLimits, CREDENTIAL_SOURCE_KEYCHAIN, CredentialSource, PROTOCOL_OPENAI_COMPATIBLE,
-    ProviderDefinition,
+    CREDENTIAL_SOURCE_KEYCHAIN, CredentialSource, PROTOCOL_OPENAI_COMPATIBLE, ProviderDefinition,
 };
 use rhapsody_config::workflow::{load, parse, save_text};
 use serde::Deserialize;
@@ -82,11 +81,17 @@ struct LimitsReq {
 }
 
 impl ProviderDefinitionReq {
-    /// The typed definition to write. `id` is stamped from the request key. The credential source
-    /// is DERIVED here as the config layer derives it (the one v1 storage kind) — the client never
-    /// sends a credential, and WORKFLOW.md never stores a value.
-    fn to_definition(&self, id: &str) -> ProviderDefinition {
-        let mut limits = BrokerLimits::default();
+    /// The typed definition to write. `id` is stamped from the request key. `existing` is the
+    /// provider's CURRENT decoded definition on an edit: the limits block is layered over it, so a
+    /// request that omits `limits` (a rename or a URL change) can never silently drop a stored
+    /// `broker_limits` — most importantly the daily spend cap. On an add there is no `existing`, so
+    /// the V1 defaults apply. The credential source is DERIVED here as the config layer derives it
+    /// (the one v1 storage kind) — the client never sends a credential, and WORKFLOW.md never stores
+    /// a value.
+    fn to_definition(&self, id: &str, existing: Option<&ProviderDefinition>) -> ProviderDefinition {
+        let mut limits = existing
+            .map(|d| d.broker_limits.clone())
+            .unwrap_or_default();
         if let Some(l) = &self.limits {
             if let Some(v) = l.forwarded_requests_per_turn {
                 limits.forwarded_requests_per_turn = v;
@@ -118,8 +123,14 @@ impl ProviderDefinitionReq {
             if let Some(v) = l.reserved_token_units_per_session {
                 limits.reserved_token_units_per_session = v;
             }
-            limits.capability_lifetime_ms = l.capability_lifetime_ms;
-            limits.max_reserved_token_units_per_utc_day = l.max_reserved_token_units_per_utc_day;
+            if let Some(v) = l.capability_lifetime_ms {
+                limits.capability_lifetime_ms = Some(v);
+            }
+            if let Some(v) = l.max_reserved_token_units_per_utc_day {
+                // The UI's blank daily-cap field arrives as 0, its explicit "no Rhapsody daily cap".
+                // `BrokerLimits::validate` forbids 0 as a cap, so 0 can only mean "unset" here.
+                limits.max_reserved_token_units_per_utc_day = if v == 0 { None } else { Some(v) };
+            }
         }
         ProviderDefinition {
             id: id.to_string(),
@@ -230,7 +241,14 @@ pub(crate) async fn handle_provider_config(
                 None,
             );
         };
-        Some(def_req.to_definition(&req.provider_id))
+        // On an edit, layer the request over the provider's CURRENT definition so a field the
+        // client does not send (notably `broker_limits`) is preserved rather than reset.
+        let existing = if op == ProviderOp::Edit {
+            decode_provider_from(&text, &req.provider_id)
+        } else {
+            None
+        };
+        Some(def_req.to_definition(&req.provider_id, existing.as_ref()))
     };
 
     let candidate = match rhapsody_config::apply_provider_edit(
@@ -286,6 +304,15 @@ pub(crate) async fn handle_provider_config(
             None,
         ),
     }
+}
+
+/// The provider's CURRENT decoded definition from the on-disk workflow, or `None` when the file (or
+/// the provider) cannot be read. Best-effort: a decode failure falls back to the request's own
+/// values, which is the pre-STUDIO-1048 behaviour.
+fn decode_provider_from(text: &str, id: &str) -> Option<ProviderDefinition> {
+    let def = parse(text).ok()?;
+    let config = rhapsody_config::decode::decode(&def).ok()?;
+    config.providers.get(id).cloned()
 }
 
 /// Map an [`EditError`] to the wire envelope: a missing provider is 404, a duplicate 409, an
@@ -549,6 +576,113 @@ Do the work for {{ issue.identifier }}.
     }
 
     #[tokio::test]
+    async fn edit_preserves_a_stored_broker_limits_block() {
+        // REVIEW B1 guard: an edit whose request omits `limits` (a rename, a URL change) must keep
+        // the stored `broker_limits` — a re-serializing replace would erase the daily spend cap.
+        const WITH_LIMITS: &str = r#"---
+tracker:
+  kind: linear
+  api_key: $HOME
+  project_slug: symphony
+agent:
+  backend: opencode
+providers:
+  fireworks:
+    protocol: openai-compatible
+    base_url: https://api.fireworks.ai/inference/v1
+    credential:
+      source: keychain
+    broker_limits:
+      max_reserved_token_units_per_utc_day: 1000000
+      forwarded_requests_per_turn: 5
+---
+Do the work for {{ issue.identifier }}.
+"#;
+        let wf = TempWorkflow::new(WITH_LIMITS);
+        let base = spawn(&wf.path(), FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = post(
+            &base,
+            &json!({
+                "op": "edit",
+                "provider_id": "fireworks",
+                "definition": {
+                    "protocol": "openai-compatible",
+                    "display_name": "Renamed",
+                    "base_url": "https://api.fireworks.ai/inference/v1",
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let text = wf.read();
+        assert!(
+            text.contains("max_reserved_token_units_per_utc_day: 1000000"),
+            "the daily cap was erased:\n{text}"
+        );
+        assert!(
+            text.contains("forwarded_requests_per_turn: 5"),
+            "the limits block was erased:\n{text}"
+        );
+        let limits = &body["global"]["providers"]["fireworks"]["broker_limits"];
+        assert_eq!(
+            limits["max_reserved_token_units_per_utc_day"], 1000000,
+            "{body}"
+        );
+        assert_eq!(limits["forwarded_requests_per_turn"], 5, "{body}");
+    }
+
+    #[tokio::test]
+    async fn edit_overlays_explicit_limits_and_can_clear_the_daily_cap() {
+        // A request that DOES set limits overrides the stored block; a 0 daily cap is the UI's
+        // explicit "no daily cap" and removes it.
+        const WITH_LIMITS: &str = r#"---
+tracker:
+  kind: linear
+  api_key: $HOME
+  project_slug: symphony
+agent:
+  backend: opencode
+providers:
+  fireworks:
+    protocol: openai-compatible
+    base_url: https://api.fireworks.ai/inference/v1
+    credential:
+      source: keychain
+    broker_limits:
+      max_reserved_token_units_per_utc_day: 1000000
+---
+Do the work for {{ issue.identifier }}.
+"#;
+        let wf = TempWorkflow::new(WITH_LIMITS);
+        let base = spawn(&wf.path(), FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = post(
+            &base,
+            &json!({
+                "op": "edit",
+                "provider_id": "fireworks",
+                "definition": {
+                    "protocol": "openai-compatible",
+                    "display_name": "Fireworks",
+                    "base_url": "https://api.fireworks.ai/inference/v1",
+                    "limits": { "max_reserved_token_units_per_utc_day": 0 },
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !wf.read().contains("max_reserved_token_units_per_utc_day"),
+            "the daily cap was not cleared:\n{}",
+            wf.read()
+        );
+        assert_eq!(
+            body["global"]["providers"]["fireworks"]["broker_limits"]["max_reserved_token_units_per_utc_day"],
+            Value::Null,
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_op_and_unknown_remove_are_rejected() {
         let wf = TempWorkflow::new(BASE);
         let base = spawn(&wf.path(), FakeProvider::ok(empty_snapshot())).await;
@@ -566,11 +700,19 @@ Do the work for {{ issue.identifier }}.
     // End-to-end: Settings add → reload → Not connected → (fake desktop connect) → Test connection
     // → endpoint edit → binding_mismatch.
     //
-    // The desktop half is represented at its daemon boundary: the desktop command stores the key and
-    // the daemon observes a new bound owner revision (the coordinator's `begin_mutation_refresh` +
-    // a `Present` read). The credential owner here is an in-memory fake (no Keychain, no persistent
-    // test credential), and the "provider" is a loopback HTTP server the catalog refresh really
-    // contacts — so the credentialed leg is exercised over a socket, no paid provider involved.
+    // SCOPE OF THE SUBSTITUTIONS (REVIEW B4) — this test runs inside the `rhapsody-httpapi` crate, so
+    // two of the five criterion steps are represented at their daemon boundary rather than driven
+    // through their real owners:
+    //   * "the daemon reloads" — the file is decoded and the REAL `RefreshCoordinator` is reloaded
+    //     from it (`apply_reload`), not the daemon's file watcher. What is proven real is the written
+    //     file, its decode, and the coordinator's transform over it.
+    //   * "store a key through the desktop command" — an in-memory `CredentialReadSource` stores the
+    //     binding that `ProviderDefinition::credential_binding` derives, which is exactly the binding
+    //     the desktop `provider_connect` derives. The desktop command itself lives in the separate
+    //     `desktop/` workspace and cannot be invoked from here.
+    // The credential owner is an in-memory fake (no Keychain, no persistent test credential), and the
+    // "provider" is a loopback HTTP server the catalog refresh really contacts — so the credentialed
+    // leg is exercised over a socket, no paid provider involved.
     // ---------------------------------------------------------------------------------------------
     mod e2e {
         use std::io::{Read, Write};
@@ -739,7 +881,8 @@ Do the work for {{ issue.identifier }}.
             let (status, body) = post(&base, &add).await;
             assert_eq!(status, 200, "{body}");
 
-            // 2. The daemon reloads; the definition is now on disk and decodes.
+            // 2. The daemon reloads; the definition is now on disk and decodes. (See the module
+            //    comment: the reload below is the real `RefreshCoordinator`, not the file watcher.)
             assert!(wf.read().contains("loop:"), "{}", wf.read());
 
             // 3. Status reads Not connected (absent) before any key is stored.
@@ -751,7 +894,9 @@ Do the work for {{ issue.identifier }}.
             let view = coordinator.status_view("loop", true).expect("tracked");
             assert_eq!(view.status, "absent", "Not connected");
 
-            // 4. Store a key through the desktop command (its daemon-visible effect: a bound owner).
+            // 4. Store a key through the desktop command (represented at its daemon boundary: the
+            //    binding `ProviderDefinition::credential_binding` derives, which is exactly what the
+            //    desktop `provider_connect` derives).
             owner.store(binding_of(&wf.path(), "loop"));
             let intent = coordinator.begin_mutation_refresh("loop").expect("known");
             coordinator.refresh_status(&intent).await;
