@@ -456,11 +456,16 @@ pub enum Event {
     },
     /// A worker's finalized broker usage for one run (PB7, STUDIO-1002; NEW beyond Go v0.4.0). The
     /// worker's spawn closure sends this after the run future has fully dropped, BEFORE its
-    /// `WorkerExit`, so the control task still has the running entry to resolve the store run id.
-    /// `usage` is already summed from the run's finalized turn receipts; a cancelled turn's
-    /// zero-usage receipt is included rather than dropped.
+    /// `WorkerExit`. It carries the run's store row id directly because a production cancellation
+    /// (`terminate`) removes the running entry BEFORE the worker's future drops, so this event can
+    /// arrive with no live entry to resolve a run id from — and the cancellation receipt must still be
+    /// persisted (STUDIO-1002 review A2). `usage` is already summed from the run's finalized turn
+    /// receipts; a cancelled turn's zero-usage receipt is included rather than dropped.
     BrokerUsage {
         issue_id: String,
+        /// The dispatching store run id (0 when the store is off), carried so persistence never
+        /// depends on the live entry surviving to this event.
+        run_id: i64,
         /// Boxed so this variant does not pad every other control event to the usage record's size.
         usage: Box<rhapsody_store::RunUsage>,
     },
@@ -680,7 +685,11 @@ impl Orchestrator {
                 self.on_tick().await;
             }
             Event::WorkerExit(e) => self.on_worker_exit(e),
-            Event::BrokerUsage { issue_id, usage } => self.on_broker_usage(&issue_id, &usage),
+            Event::BrokerUsage {
+                issue_id,
+                run_id,
+                usage,
+            } => self.on_broker_usage(&issue_id, run_id, &usage),
             Event::AgentUpdate(e) => self.on_agent_update(e),
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
@@ -1815,7 +1824,7 @@ impl Orchestrator {
             // Drain the broker supervisor after the run future is fully dropped and report the usage
             // (PB7, STUDIO-1002; design §10.3). BEFORE the exit event, so the control task still has
             // the running entry to resolve the store run id from.
-            finalize_broker_usage(broker_slots.as_ref(), &events_exit, &issue_id);
+            finalize_broker_usage(broker_slots.as_ref(), &events_exit, &issue_id, run_id);
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
@@ -1842,10 +1851,15 @@ impl Orchestrator {
 /// first (taking the in-flight `BrokerTurnAttempt` with it), and this then takes the now-finalized
 /// zero-usage receipt — so a cancelled brokered turn is accounted rather than silently lost. `None`
 /// for a non-brokered run, so no usage row or event is ever produced for a legacy dispatch.
+///
+/// `run_id` is carried on the event rather than looked up from the live entry: a production
+/// cancellation removes the entry before this closure runs, and the receipt must be persisted anyway
+/// (STUDIO-1002 review A2).
 pub(crate) fn finalize_broker_usage(
     slots: Option<&Arc<std::sync::Mutex<crate::worker::BrokerTurnSlots>>>,
     events: &tokio::sync::mpsc::UnboundedSender<Event>,
     issue_id: &str,
+    run_id: i64,
 ) {
     let Some(usage) = slots.and_then(|slots| {
         let mut guard = slots
@@ -1858,6 +1872,7 @@ pub(crate) fn finalize_broker_usage(
     };
     let _ = events.send(Event::BrokerUsage {
         issue_id: issue_id.to_string(),
+        run_id,
         usage: Box::new(usage),
     });
 }
@@ -3359,10 +3374,15 @@ mod tests {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        finalize_broker_usage(Some(&slots), &tx, "1");
+        finalize_broker_usage(Some(&slots), &tx, "1", 42);
         match rx.try_recv().expect("a BrokerUsage event must be emitted") {
-            Event::BrokerUsage { issue_id, usage } => {
+            Event::BrokerUsage {
+                issue_id,
+                run_id,
+                usage,
+            } => {
                 assert_eq!(issue_id, "1");
+                assert_eq!(run_id, 42, "the run id rides on the event, not a live lookup");
                 assert_eq!(usage.reserved_tokens, 0);
                 assert_eq!(usage.provider_reported_tokens, None);
                 assert!(usage.usage_authority.is_empty());

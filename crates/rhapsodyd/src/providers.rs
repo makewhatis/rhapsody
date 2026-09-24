@@ -303,7 +303,17 @@ impl PreparedProviderSource for DaemonProviderSource {
         let account = CredentialRef::for_provider(&plan.stable_id)
             .map_or_else(|_| String::new(), |r| r.account().to_string());
         let observed = self.resolver.read_bound(account, binding).await;
-        let revision = observed.read.revision.0.to_string();
+        // Only a read the owner ANSWERED carries an owner revision. An unreachable owner
+        // (`OwnerUnavailable`/`OwnerUnauthorized`) has none, so this stamps an EMPTY revision — the
+        // `ProviderRefusal` contract's "empty only when a read never reached the owner". Stamping the
+        // resolver's `Revision::INITIAL` sentinel (`"0"`) here made the control loop compare a number
+        // no owner ever produced against the observed watermark and drop the refusal as stale, so a
+        // wedged owner produced no refusal row and no gate and was re-probed every tick (STUDIO-1002
+        // review A1).
+        let revision = match &observed.read.state {
+            CredentialState::OwnerUnavailable | CredentialState::OwnerUnauthorized => String::new(),
+            _ => observed.read.revision.0.to_string(),
+        };
         match observed.read.state {
             CredentialState::Present(lease) => {
                 // Move the value into the broker's own move-only lease. A shape violation is a
@@ -587,6 +597,11 @@ mod tests {
     /// PB7: with no credential owner channel, the prepared-provider source refuses with the typed
     /// `owner_unavailable` rather than ever reaching for a direct key. The mutation guard is
     /// inventing a lease for an owner that never answered.
+    ///
+    /// STUDIO-1002 review A1: the refusal must carry an EMPTY revision. A no-owner read has no owner
+    /// revision, and stamping the resolver's `Revision::INITIAL` sentinel (`"0"`) made the loop's
+    /// watermark check drop the refusal as stale once the owner had ever answered (≥ 1), so the typed
+    /// refusal never armed its gate. This reds if the source stringifies `Revision::INITIAL` again.
     #[tokio::test]
     async fn prepared_source_refuses_when_the_owner_is_unavailable() {
         let runtime = crate::broker::BrokerRuntime::bind().expect("broker");
@@ -598,6 +613,11 @@ mod tests {
         assert_eq!(
             err.reason,
             rhapsody_orchestrator::RefusalReason::OwnerUnavailable
+        );
+        assert!(
+            err.revision.is_empty(),
+            "a no-owner refusal must carry no owner revision, not the INITIAL sentinel: {}",
+            err.revision
         );
     }
 }

@@ -4404,6 +4404,81 @@ mod tests {
         );
     }
 
+    // STUDIO-1002 review A1: a refusal from an UNREACHABLE owner carries NO owner revision
+    // (`observed_revision` empty), and must still arm its gate and write its zero-turn row even after
+    // a later read has raised the provider's watermark. The pre-fix source stamped the resolver's
+    // `Revision::INITIAL` sentinel (`"0"`), which the watermark check read as "older than the
+    // watermark" and dropped as stale, so a wedged owner was re-probed every tick with no row and no
+    // gate. This reds if an empty-revision refusal is ever treated as a watermark mismatch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_owner_refusal_at_the_watermark_still_arms_its_gate() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Ready);
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        // The owner has answered at some point (a Connect/Replace/Remove), so the watermark is ≥ 1.
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 3)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            refused_completion(RefusalReason::OwnerUnavailable),
+        )
+        .await;
+
+        assert_eq!(
+            o.refusal_gate.len(),
+            1,
+            "an unreachable-owner refusal must arm the refusal gate even at a raised watermark"
+        );
+        let runs = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert_eq!(
+            runs.len(),
+            1,
+            "an unreachable-owner refusal must record its zero-turn refusal row"
+        );
+        assert_eq!(runs[0].outcome, rhapsody_store::OUTCOME_REFUSED);
+    }
+
+    // STUDIO-1002 review A1 (the other half): a REFUSAL that DID reach the owner carries the owner's
+    // revision, and one read at an older revision than the observed watermark is the §12 race and must
+    // be dropped. Without this, removing the watermark comparison from the `Refused` branch stays
+    // green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_older_than_the_observed_watermark_is_dropped() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 3)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: "1".to_string(),
+                resolved: fake_selection(),
+            },
+        )
+        .await;
+        assert_eq!(
+            o.refusal_gate.len(),
+            0,
+            "a refusal read at an older revision than the observed watermark must not arm the gate"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
     // B1 (STUDIO-1002 review): the revision expectation is PER PROVIDER, so an installed revision
     // (or an observed watermark) for one provider must not cross-drop another provider's completion.
     // The mutation guard is reverting the map to one daemon-wide `Option` keyed by nothing.
