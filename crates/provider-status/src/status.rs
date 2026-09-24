@@ -100,6 +100,11 @@ pub struct ProviderBinding {
     pub binding: Binding,
 }
 
+/// The one closed reason code a provider status may carry for an unavailable broker: the design's
+/// typed `provider_broker_unavailable` refusal (design §11.2, §13). No other value is ever produced,
+/// and it carries no listener address, capability, credential, or upstream body.
+pub const BROKER_UNAVAILABLE: &str = "provider_broker_unavailable";
+
 /// The non-secret status view a `GET` observes. Serialized straight to the API body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderStatusView {
@@ -114,6 +119,10 @@ pub struct ProviderStatusView {
     /// PB4's live broker availability (the daemon's one private broker). `false` means credentialed
     /// dispatch is currently refused with `provider_broker_unavailable`.
     pub broker_available: bool,
+    /// The closed reason the broker is unavailable, or `None` when it is available (design §13).
+    /// Only [`BROKER_UNAVAILABLE`] can ever appear — never an endpoint, capability, credential, or
+    /// raw provider response. Derived from `broker_available`, so the two cannot disagree.
+    pub broker_reason: Option<&'static str>,
     pub recovery: Option<&'static str>,
 }
 
@@ -388,6 +397,11 @@ impl ProviderStatusCache {
             cache_age_ms,
             refreshing: entry.refreshing,
             broker_available,
+            broker_reason: if broker_available {
+                None
+            } else {
+                Some(BROKER_UNAVAILABLE)
+            },
             recovery: entry.status.recovery(),
         })
     }
@@ -539,6 +553,27 @@ mod tests {
         assert_eq!(view.cache_age_ms, Some(250));
         assert!(!view.refreshing);
         assert_eq!(view.recovery, None);
+    }
+
+    // MUTATION GUARD (closed broker reason code): an unavailable broker reports exactly the closed
+    // `provider_broker_unavailable` code and an available one reports none. Deriving the code from a
+    // hardcoded `Some`/`None` (or dropping the field) reds this.
+    #[test]
+    fn broker_reason_is_a_closed_code_derived_from_availability() {
+        let mut cache = ProviderStatusCache::new();
+        let intents = cache.apply_reload(1, &[provider("https://api.example/v1")], 0);
+        let _ = cache.publish(
+            &intents[0].token,
+            &observed(CredentialStatus::Configured, 1),
+            10,
+        );
+        let down = cache.read("fireworks", 10, false).expect("tracked");
+        assert!(!down.broker_available);
+        assert_eq!(down.broker_reason, Some(BROKER_UNAVAILABLE));
+        assert_eq!(down.broker_reason, Some("provider_broker_unavailable"));
+        let up = cache.read("fireworks", 10, true).expect("tracked");
+        assert!(up.broker_available);
+        assert_eq!(up.broker_reason, None);
     }
 
     // MUTATION GUARD (reordered completion must not overwrite newer state): a mutation after the

@@ -153,6 +153,7 @@ mod tests {
             cache_age_ms: Some(42),
             refreshing: false,
             broker_available: true,
+            broker_reason: None,
             recovery: None,
         }
     }
@@ -328,6 +329,34 @@ mod tests {
             .await
             .expect("refresh");
         scan(refreshed).await;
+    }
+
+    // The status wire carries the non-secret broker availability and its CLOSED reason code, and
+    // nothing else about the broker (no listener address, capability, or credential). An
+    // unavailable broker is `broker_available: false` + `provider_broker_unavailable`.
+    #[tokio::test]
+    async fn the_status_body_carries_broker_availability_and_a_closed_reason() {
+        let down = ProviderStatusView {
+            broker_available: false,
+            broker_reason: Some(rhapsody_provider_status::BROKER_UNAVAILABLE),
+            ..status_view("fireworks", "configured")
+        };
+        let fake =
+            FakeProvider::ok(crate::testutil::empty_snapshot()).with_provider_statuses(vec![down]);
+        let (base, _provider) = serve(fake).await;
+        let body: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/api/v1/providers"))
+            .send()
+            .await
+            .expect("list")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(body["providers"][0]["broker_available"], false);
+        assert_eq!(
+            body["providers"][0]["broker_reason"],
+            "provider_broker_unavailable"
+        );
     }
 
     async fn scan(resp: reqwest::Response) {
