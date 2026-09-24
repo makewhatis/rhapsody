@@ -9,6 +9,8 @@ import { toUiGlobal } from "@/lib/settings-model";
 const h = vi.hoisted(() => ({
   hasProviderBridge: vi.fn(() => false),
   providerStatuses: vi.fn(),
+  providerPrepare: vi.fn(),
+  providerRemove: vi.fn(),
   fetchProviderStatuses: vi.fn(),
   fetchProviderCatalog: vi.fn(),
   refreshProviderCatalog: vi.fn(),
@@ -21,6 +23,8 @@ vi.mock("@/lib/provider-credentials", async (orig) => {
     ...actual,
     hasProviderBridge: h.hasProviderBridge,
     providerStatuses: h.providerStatuses,
+    providerPrepare: h.providerPrepare,
+    providerRemove: h.providerRemove,
   };
 });
 
@@ -318,5 +322,72 @@ describe("ProvidersTab", () => {
     expect(text).toContain("provider_broker_unavailable");
     expect(text).not.toContain("127.0.0.1:54321");
     expect(text).not.toContain("cap-CANARY");
+  });
+
+  // ACCEPTANCE (REVIEW B3): on desktop the removal dialog offers to delete the stored key, and the
+  // key is removed BEFORE the definition (the desktop command derives the binding from the
+  // definition, which must still exist).
+  it("offers to remove the stored key on desktop and does so before the definition", async () => {
+    h.hasProviderBridge.mockReturnValue(true);
+    h.providerStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        display_name: "Fireworks",
+        endpoint: "https://api.fireworks.ai/inference/v1",
+        adapter: "openai-chat-completions-bearer-v1",
+        insecure_http: false,
+        status: "configured",
+        recovery: null,
+        can_connect: false,
+        can_replace: true,
+        can_rebind: false,
+        can_remove: true,
+      },
+    ]);
+    h.providerPrepare.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      endpoint: "https://api.fireworks.ai/inference/v1",
+      insecure_http: false,
+      nonce: "nonce-1",
+      expires_in_ms: 1000,
+    });
+    h.providerRemove.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      mutated: true,
+      status: "absent",
+      sync: "synchronized",
+    });
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    // Wait for the desktop status feed so the card's can_remove is known before opening the dialog.
+    await waitFor(() => expect(screen.getAllByText("Connected").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    fireEvent.click(await screen.findByLabelText("Also remove the stored key"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove provider" }));
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith({
+        op: "remove",
+        provider_id: "fireworks",
+      }),
+    );
+    expect(h.providerPrepare).toHaveBeenCalledWith("fireworks", "remove");
+    expect(h.providerRemove).toHaveBeenCalledWith("fireworks", "nonce-1");
+    expect(h.providerRemove.mock.invocationCallOrder[0]).toBeLessThan(
+      h.saveProviderConfig.mock.invocationCallOrder[0],
+    );
+  });
+
+  // MUTATION GUARD: a browser has no Keychain, so the dialog must NOT offer to remove a stored key.
+  it("never offers to remove a stored key in browser-only mode", async () => {
+    h.hasProviderBridge.mockReturnValue(false);
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    await screen.findByRole("button", { name: "Remove provider" });
+    expect(screen.queryByLabelText("Also remove the stored key")).toBeNull();
   });
 });

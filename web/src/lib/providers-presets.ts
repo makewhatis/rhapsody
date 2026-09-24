@@ -8,7 +8,7 @@
 // `chatCompletionsUrl` mirrors `chat_completions_url` (append the fixed relative `chat/completions`).
 // design §14.2: base `/v1` and `/inference/v1` must map to exactly ONE `chat/completions` suffix.
 
-import type { ProviderConfigDTO } from "@/lib/api";
+import type { ProviderConfigDTO, ProviderLimitsDTO } from "@/lib/api";
 
 /** One Add-provider preset: a name, the protocol v1 supports, and the protocol base URL. */
 export interface ProviderPreset {
@@ -22,6 +22,49 @@ export interface ProviderPreset {
 
 /** The protocol v1 supports. Mirrors `rhapsody_config::providers::PROTOCOL_OPENAI_COMPATIBLE`. */
 export const PROTOCOL_OPENAI_COMPATIBLE = "openai-compatible";
+
+/** The V1 default broker limits, mirroring `rhapsody_config::providers::BrokerLimits::default` (the
+ *  `DEFAULT_*` constants in `providers.rs`). Shown when Add creates a provider so the operator sees
+ *  today's values; because the writer prunes a field equal to its default, writing them back leaves
+ *  the file untouched. */
+export const DEFAULT_PROVIDER_LIMITS: ProviderLimitsDTO = {
+  forwarded_requests_per_turn: 64,
+  denied_requests_before_revocation: 16,
+  concurrent_upstream_requests_per_turn: 4,
+  json_request_bytes: 8 * 1024 * 1024,
+  aggregate_request_bytes_per_turn: 32 * 1024 * 1024,
+  response_bytes_per_request: 16 * 1024 * 1024,
+  aggregate_response_bytes_per_turn: 64 * 1024 * 1024,
+  requested_output_tokens_per_request: 32_000,
+  reserved_token_units_per_turn: 1_000_000,
+  reserved_token_units_per_session: 20_000_000,
+  capability_lifetime_ms: 3_600_000,
+  max_reserved_token_units_per_utc_day: null,
+};
+
+/** The broker-limit fields the editor exposes, in wire-key order. `capability_lifetime_ms` is shown
+ *  (it is part of the definition) but only sent when the operator changes it — it is derived from the
+ *  turn deadline when unset, and writing back an unchanged effective value would pin today's default. */
+export const PROVIDER_LIMIT_FIELDS: { key: keyof ProviderLimitsDTO; label: string }[] = [
+  { key: "forwarded_requests_per_turn", label: "Forwarded requests per turn" },
+  { key: "denied_requests_before_revocation", label: "Denied requests before revocation" },
+  { key: "concurrent_upstream_requests_per_turn", label: "Concurrent upstream requests per turn" },
+  { key: "json_request_bytes", label: "JSON request bytes" },
+  { key: "aggregate_request_bytes_per_turn", label: "Aggregate request bytes per turn" },
+  { key: "response_bytes_per_request", label: "Response bytes per request" },
+  { key: "aggregate_response_bytes_per_turn", label: "Aggregate response bytes per turn" },
+  { key: "requested_output_tokens_per_request", label: "Requested output tokens per request" },
+  { key: "reserved_token_units_per_turn", label: "Reserved token units per turn" },
+  { key: "reserved_token_units_per_session", label: "Reserved token units per session" },
+  { key: "capability_lifetime_ms", label: "Capability lifetime (ms)" },
+];
+
+/** The limits block the editor starts from: the provider's own, or the V1 defaults for an Add. */
+export function providerLimitsOf(
+  provider: Pick<ProviderConfigDTO, "broker_limits"> | null | undefined,
+): ProviderLimitsDTO {
+  return provider?.broker_limits ?? DEFAULT_PROVIDER_LIMITS;
+}
 
 /**
  * The shipped presets. Every one speaks OpenAI Chat Completions and is verified against the

@@ -1243,6 +1243,27 @@ export interface ProviderConfigDTO {
   base_url: string;
   allow_insecure_http: boolean;
   credential: { source: string };
+  /** The validated broker limits (STUDIO-1048). Every value is the materialized V1 default when the
+   *  operator omitted the block, so the editor can prefill and write back what it shows. The
+   *  capability lifetime is the EFFECTIVE value (`min(1h, turn deadline)` when unset). Rhapsody-only. */
+  broker_limits?: ProviderLimitsDTO;
+}
+
+/** One provider's validated broker limits as the daemon's view emits them. */
+export interface ProviderLimitsDTO {
+  forwarded_requests_per_turn: number;
+  denied_requests_before_revocation: number;
+  concurrent_upstream_requests_per_turn: number;
+  json_request_bytes: number;
+  aggregate_request_bytes_per_turn: number;
+  response_bytes_per_request: number;
+  aggregate_response_bytes_per_turn: number;
+  requested_output_tokens_per_request: number;
+  reserved_token_units_per_turn: number;
+  reserved_token_units_per_session: number;
+  capability_lifetime_ms: number;
+  /** The optional durable UTC-day cap; `null` means "no Rhapsody daily cap". */
+  max_reserved_token_units_per_utc_day: number | null;
 }
 
 // ClaudeOverridesDTO is the sparse per-agent override map. A field is present (non-null) only

@@ -30,6 +30,8 @@ import {
 } from "@/lib/api";
 import {
   hasProviderBridge,
+  providerPrepare,
+  providerRemove,
   providerStatuses as desktopProviderStatuses,
   type ProviderStatus,
 } from "@/lib/provider-credentials";
@@ -83,6 +85,8 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
     references: ProviderReferenceDTO[];
   } | null>(null);
   const [removing, setRemoving] = React.useState(false);
+  // On desktop, the removal dialog offers to also delete the stored Keychain item (REVIEW B3).
+  const [removeKey, setRemoveKey] = React.useState(false);
 
   const statuses = useQuery({
     queryKey: [STATUS_QUERY_KEY, bridged],
@@ -140,6 +144,14 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
     provider: value.provider,
     model: value.agentModel,
   });
+
+  // Whether the removal dialog should offer the desktop credential deletion: only when a key is
+  // actually stored and the desktop owner says it can remove it.
+  const removeStatus =
+    removeTarget == null
+      ? ""
+      : (statuses.data?.find((s) => s.provider_id === removeTarget.provider_id)?.status ?? "");
+  const removeHasStoredKey = bridged && removeTarget?.can_remove === true && hasStoredKey(removeStatus);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -261,6 +273,7 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
                 }}
                 onRemove={() => {
                   setRemoveError(null);
+                  setRemoveKey(false);
                   setRemoveTarget(view);
                 }}
               />
@@ -296,7 +309,9 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
             ? `${removeError.message}\n\nStill selected by:\n${removeError.references
                 .map((r) => `• ${r.label}`)
                 .join("\n")}`
-            : `This removes the providers: definition from WORKFLOW.md. A stored key, if any, is not removed — use the desktop app's Remove on the card.`
+            : bridged
+              ? "This removes the providers: definition from WORKFLOW.md. The credential lives in the Keychain; remove it too if you no longer need it."
+              : "This removes the providers: definition from WORKFLOW.md. A stored key, if any, is not removed — use the desktop app's Remove on the card."
         }
         confirmLabel="Remove provider"
         danger
@@ -305,8 +320,21 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
         onClose={() => {
           setRemoveTarget(null);
           setRemoveError(null);
+          setRemoveKey(false);
         }}
-      />
+      >
+        {removeTarget != null && removeHasStoredKey && !removeError ? (
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+            <input
+              type="checkbox"
+              aria-label="Also remove the stored key"
+              checked={removeKey}
+              onChange={(e) => setRemoveKey(e.target.checked)}
+            />
+            Also remove the stored key from this device
+          </label>
+        ) : null}
+      </ConfirmDialog>
     </div>
   );
 
@@ -314,14 +342,30 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
     if (removeTarget == null) return;
     setRemoving(true);
     setRemoveError(null);
+    // The stored key must be removed WHILE the definition still exists (the desktop command derives
+    // the binding from it), so the credential goes first; a refusal to remove the definition then
+    // reveals that the key is already gone.
+    const alsoRemoveKey = removeHasStoredKey && removeKey;
+    let keyRemoved = false;
     try {
+      if (alsoRemoveKey) {
+        const prepared = await providerPrepare(removeTarget.provider_id, "remove");
+        const result = await providerRemove(removeTarget.provider_id, prepared.nonce);
+        keyRemoved = result.mutated;
+      }
       await saveProviderConfig({ op: "remove", provider_id: removeTarget.provider_id });
       setRemoveTarget(null);
+      setRemoveKey(false);
       void statuses.refetch();
       onDefinitionsChanged?.();
     } catch (e) {
       if (e instanceof ProviderConfigError && e.references.length > 0) {
-        setRemoveError({ message: e.message, references: e.references });
+        setRemoveError({
+          message: keyRemoved
+            ? `${e.message} — the stored key was already removed`
+            : e.message,
+          references: e.references,
+        });
       } else {
         setRemoveError({
           message: e instanceof Error ? e.message : "the provider could not be removed",

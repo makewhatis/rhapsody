@@ -118,8 +118,9 @@ selection). A provider reference the config does not define, or an explicit prov
 
 **Define providers from Settings → Providers, not by hand-editing `WORKFLOW.md`.** The screen
 offers OpenAI-compatible presets (Fireworks, OpenRouter, OpenAI, Together, Groq) plus a custom
-endpoint, and adds, edits and removes the `providers:` entries in place — every other line of
-`WORKFLOW.md`, comments included, is left byte-for-byte untouched, and the change hot-reloads
+endpoint, and adds, edits and removes the `providers:` entries in place — only the entry being changed
+is rewritten, so every other line of `WORKFLOW.md`, comments included, is left byte-for-byte
+untouched, and the change hot-reloads
 within seconds. A provider that is still selected (the global default, a profile, a roster entry,
 the review override or the manager) is **refused removal**, with every reference listed. Living
 definitions remain visible in `WORKFLOW.md` — the screen is a safe editor for them, not a second

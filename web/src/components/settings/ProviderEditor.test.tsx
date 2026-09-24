@@ -13,6 +13,7 @@ vi.mock("@/lib/api", async (orig) => {
 });
 
 import { ProviderEditor } from "@/components/settings/ProviderEditor";
+import { DEFAULT_PROVIDER_LIMITS } from "@/lib/providers-presets";
 
 const PROVIDER: ProviderConfigDTO = {
   id: "fireworks",
@@ -21,7 +22,24 @@ const PROVIDER: ProviderConfigDTO = {
   base_url: "https://api.fireworks.ai/inference/v1",
   allow_insecure_http: false,
   credential: { source: "keychain" },
+  broker_limits: {
+    ...DEFAULT_PROVIDER_LIMITS,
+    forwarded_requests_per_turn: 5,
+    max_reserved_token_units_per_utc_day: 1_000_000,
+  },
 };
+
+/** The limits block an Add posts: every visible field at its default, capability omitted (unchanged),
+ *  and a blank daily cap encoded as 0 (the wire's "no cap"). */
+function defaultAddLimits(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(DEFAULT_PROVIDER_LIMITS)) {
+    if (key === "capability_lifetime_ms" || key === "max_reserved_token_units_per_utc_day") continue;
+    out[key] = value as number;
+  }
+  out.max_reserved_token_units_per_utc_day = 0;
+  return out;
+}
 
 function renderEditor(props: Partial<React.ComponentProps<typeof ProviderEditor>> = {}) {
   return render(
@@ -70,6 +88,7 @@ describe("ProviderEditor", () => {
           display_name: "Fireworks",
           base_url: "https://api.fireworks.ai/inference/v1",
           allow_insecure_http: false,
+          limits: defaultAddLimits(),
         },
       }),
     );
@@ -130,5 +149,60 @@ describe("ProviderEditor", () => {
     renderEditor({ editing: PROVIDER, hasStoredKey: true });
     fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Renamed" } });
     expect(screen.queryByText(/rebind required/i)).toBeNull();
+  });
+
+  // ACCEPTANCE (REVIEW B5): the form shows the provider's limits and sends them back on save, so an
+  // edit cannot erase the daily spend cap.
+  it("prefills the stored limits and sends them back", async () => {
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+    renderEditor({ editing: PROVIDER, hasStoredKey: true });
+    expect((screen.getByLabelText("forwarded_requests_per_turn") as HTMLInputElement).value).toBe("5");
+    expect(
+      (screen.getByLabelText("max_reserved_token_units_per_utc_day") as HTMLInputElement).value,
+    ).toBe("1000000");
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          definition: expect.objectContaining({
+            limits: expect.objectContaining({
+              forwarded_requests_per_turn: 5,
+              max_reserved_token_units_per_utc_day: 1_000_000,
+            }),
+          }),
+        }),
+      ),
+    );
+  });
+
+  // ACCEPTANCE (REVIEW B5): clearing the daily cap posts 0 (the wire's "no cap") so the daemon drops
+  // it; a non-numeric field is refused locally.
+  it("clears the daily cap and refuses a non-numeric limit", async () => {
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+    renderEditor({ editing: PROVIDER, hasStoredKey: true });
+    fireEvent.change(screen.getByLabelText("max_reserved_token_units_per_utc_day"), {
+      target: { value: "" },
+    });
+    fireEvent.change(screen.getByLabelText("forwarded_requests_per_turn"), {
+      target: { value: "abc" },
+    });
+    // The invalid value blocks the save and is reported.
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/must be a positive whole number/)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("forwarded_requests_per_turn"), {
+      target: { value: "5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          definition: expect.objectContaining({
+            limits: expect.objectContaining({ max_reserved_token_units_per_utc_day: 0 }),
+          }),
+        }),
+      ),
+    );
   });
 });

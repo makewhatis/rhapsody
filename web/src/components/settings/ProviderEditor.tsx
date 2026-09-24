@@ -13,12 +13,14 @@ import * as React from "react";
 import { Button, Field, FieldError, Select, TextInput, X } from "@/components/ui";
 import { saveProviderConfig, type ProviderConfigDTO } from "@/lib/api";
 import {
+  PROVIDER_LIMIT_FIELDS,
   PROVIDER_PRESETS,
   PROTOCOL_OPENAI_COMPATIBLE,
   chatCompletionsUrl,
   endpointChanged,
   endpointJoinsCleanly,
   normalizeProviderBaseUrl,
+  providerLimitsOf,
   type ProviderPreset,
 } from "@/lib/providers-presets";
 
@@ -41,6 +43,52 @@ function isInsecureUrl(baseUrl: string): boolean {
   return baseUrl.trim().toLowerCase().startsWith("http://");
 }
 
+/** The editor's working state for the broker limits: every visible field as its raw input string, so
+ *  an empty/invalid entry is refused locally without coercing it to 0. */
+interface LimitsDraft {
+  fields: Record<string, string>;
+  dailyCap: string;
+  /** The capability lifetime as it was prefilled; an unchanged value is not sent (it is derived). */
+  initialCapability: string;
+}
+
+function limitsDraftOf(editing: ProviderConfigDTO | null): LimitsDraft {
+  const limits = providerLimitsOf(editing);
+  const fields: Record<string, string> = {};
+  for (const { key } of PROVIDER_LIMIT_FIELDS) {
+    fields[key] = String(limits[key]);
+  }
+  return {
+    fields,
+    dailyCap:
+      limits.max_reserved_token_units_per_utc_day == null
+        ? ""
+        : String(limits.max_reserved_token_units_per_utc_day),
+    initialCapability: String(limits.capability_lifetime_ms),
+  };
+}
+
+/** A positive integer, or null when the string is not one. */
+function parsePositive(raw: string): number | null {
+  if (!/^\d+$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** The local limits gate: every visible field must be a positive whole number, and the daily cap is
+ *  either blank (no cap) or positive. The daemon still validates the full block (ceilings, ordering). */
+function limitsDraftError(limits: LimitsDraft): string | null {
+  for (const { key } of PROVIDER_LIMIT_FIELDS) {
+    if (parsePositive(limits.fields[key] ?? "") == null) {
+      return `${key} must be a positive whole number.`;
+    }
+  }
+  if (limits.dailyCap.trim() !== "" && parsePositive(limits.dailyCap) == null) {
+    return "The daily cap must be blank (no cap) or a positive whole number.";
+  }
+  return null;
+}
+
 export function ProviderEditor({
   open,
   editing,
@@ -55,6 +103,7 @@ export function ProviderEditor({
   const [protocol, setProtocol] = React.useState(PROTOCOL_OPENAI_COMPATIBLE);
   const [allowInsecure, setAllowInsecure] = React.useState(false);
   const [presetId, setPresetId] = React.useState("");
+  const [limits, setLimits] = React.useState<LimitsDraft>(() => limitsDraftOf(null));
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
 
@@ -62,6 +111,7 @@ export function ProviderEditor({
     if (!open) return;
     setError(null);
     setBusy(false);
+    setLimits(limitsDraftOf(editing));
     if (editing) {
       setId(editing.id);
       setLabel(editing.display_name ?? "");
@@ -121,7 +171,23 @@ export function ProviderEditor({
     hasStoredKey &&
     endpointChanged(editing, { base_url: baseUrl, protocol });
   const insecureWarning = isInsecureUrl(baseUrl);
-  const canSave = idError == null && urlError == null && !busy;
+  const limitsError = limitsDraftError(limits);
+  const canSave = idError == null && urlError == null && limitsError == null && !busy;
+
+  /** The wire `limits` block: the visible fields (all but capability, always sent — the writer drops
+   *  a value equal to its default) plus the daily cap (blank ⇒ 0, the wire's "no daily cap"). The
+   *  capability lifetime is sent only when the operator changed it, so an edit does not pin the
+   *  deadline-derived default. */
+  const limitsPayload = (): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const { key } of PROVIDER_LIMIT_FIELDS) {
+      const raw = limits.fields[key] ?? "";
+      if (key === "capability_lifetime_ms" && raw === limits.initialCapability) continue;
+      out[key] = Number(raw);
+    }
+    out.max_reserved_token_units_per_utc_day = limits.dailyCap.trim() === "" ? 0 : Number(limits.dailyCap);
+    return out;
+  };
 
   const save = async () => {
     setError(null);
@@ -136,6 +202,7 @@ export function ProviderEditor({
             display_name: label.trim(),
             base_url: baseUrl.trim(),
             allow_insecure_http: allowInsecure,
+            limits: limitsPayload(),
           },
         });
       } else {
@@ -147,6 +214,7 @@ export function ProviderEditor({
             display_name: label.trim(),
             base_url: baseUrl.trim(),
             allow_insecure_http: allowInsecure,
+            limits: limitsPayload(),
           },
         });
       }
@@ -295,6 +363,67 @@ export function ProviderEditor({
               This endpoint uses plaintext HTTP. Enable the opt-in above, or the daemon will refuse it.
             </p>
           ) : null}
+
+          <Field
+            label="Broker limits"
+            hint="The daemon's finite per-turn and per-session guards, prefilled with the V1 defaults. Leave the daily cap blank for no Rhapsody daily cap."
+            error={limitsError ?? undefined}
+          >
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: "10px 12px",
+              }}
+            >
+              {PROVIDER_LIMIT_FIELDS.map(({ key, label: fieldLabel }) => (
+                <label
+                  key={key}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                    fontSize: 11.5,
+                    color: "var(--tx-3)",
+                  }}
+                >
+                  <span>{fieldLabel}</span>
+                  <TextInput
+                    mono
+                    inputMode="numeric"
+                    aria-label={key}
+                    value={limits.fields[key] ?? ""}
+                    invalid={limitsError != null}
+                    onChange={(e) =>
+                      setLimits((l) => ({
+                        ...l,
+                        fields: { ...l.fields, [key]: e.target.value },
+                      }))
+                    }
+                  />
+                </label>
+              ))}
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  fontSize: 11.5,
+                  color: "var(--tx-3)",
+                }}
+              >
+                <span>Daily token-unit cap (blank = none)</span>
+                <TextInput
+                  mono
+                  inputMode="numeric"
+                  aria-label="max_reserved_token_units_per_utc_day"
+                  value={limits.dailyCap}
+                  invalid={limitsError != null}
+                  onChange={(e) => setLimits((l) => ({ ...l, dailyCap: e.target.value }))}
+                />
+              </label>
+            </div>
+          </Field>
 
           {rebindWarning ? (
             <p role="alert" style={{ fontSize: 12.5, color: "var(--amber)" }}>

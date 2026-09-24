@@ -3154,11 +3154,12 @@ credential, Test connection) stay desktop-only.
   `Config` and re-encodes the whole file, which would reformat — and drop every comment in — the
   operator's `WORKFLOW.md`.
 - **The write is a byte-preserving splice.** `rhapsody_config::apply_provider_edit` rewrites ONLY
-  the top-level `providers:` block (produced with `encode`'s own emit-only-when-non-default rules)
-  and leaves every other byte of the front matter and the prompt body — comments included — exactly
-  as it was; a `WORKFLOW.md` with no front matter gains one around the untouched original text. A
-  round-trip test asserts every other line is byte-identical and turns red if the write re-serializes
-  the file.
+  the one `<id>:` entry being changed — dropping the `providers:` key itself only when the last entry
+  is removed — using `encode`'s own emit-only-when-non-default rules. Every other byte of the front
+  matter and the prompt body — sibling providers, their comments, trailing blank lines — is left
+  exactly as it was; a `WORKFLOW.md` with no front matter gains one around the untouched original
+  text. A round-trip test asserts every other line is byte-identical and turns red if the write
+  re-serializes the file.
 - **The daemon validates, not the form.** The spliced candidate runs through the daemon's own
   load pipeline (`decode` → `resolve` → `validate`) before it is written, so a bad `base_url`, an
   unsupported protocol, a non-canonical id or a plaintext-`http` endpoint without the typed
@@ -3171,7 +3172,14 @@ credential, Test connection) stay desktop-only.
 - **Removal refuses a provider still selected.** The daemon computes the references from the resolved
   workflow plus `teams.yaml` and the profile files (the global default, the manager, roster entries,
   the review override, profiles) and returns `409 provider_in_use` listing every one; only an
-  unreferenced provider is removed.
+  unreferenced provider is removed. On desktop the confirm dialog also offers to delete the stored
+  Keychain item (the credential is removed first, while the definition still exists to derive the
+  binding); a browser has no Keychain, so it says the key stays.
+- **The form carries the limits.** The Add/Edit sheet shows the provider's `broker_limits` prefilled
+  with the stored values (the V1 defaults for an Add) and writes back what it shows, so an edit can
+  never silently drop the daily spend cap. An edit request that omits `limits` keeps the stored block;
+  a blank daily cap clears it. An unchanged capability lifetime is not written back (it is derived
+  from the turn deadline), so an edit does not pin today's default.
 - **Editing a keyed provider warns before saving.** Changing the base URL or protocol of a provider
   with a stored credential shows the explicit-rebind warning in the form; after saving, status moves
   through `unknown/refreshing` to `binding_mismatch`, as the credential feed already reports — the
@@ -3179,7 +3187,10 @@ credential, Test connection) stay desktop-only.
 - **An end-to-end test covers the whole path** with an in-memory credential owner and a loopback
   fake provider (no paid provider, no persistent credential): add through the Settings endpoint →
   daemon reload → `absent` ("Not connected") → store a key → a real credentialed catalog refresh
-  succeeds over the loopback → change the URL → `binding_mismatch`.
+  succeeds over the loopback → change the URL → `binding_mismatch`. The reload and the key store are
+  represented at their daemon boundary (the real `RefreshCoordinator` reloaded from the written file;
+  the binding `credential_binding` derives) rather than through the file watcher and the desktop
+  command, which live outside this crate.
 
 ### Every loopback write passes an operator-write guard (STUDIO-982)
 
