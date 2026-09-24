@@ -750,14 +750,15 @@ impl Orchestrator {
                     return false;
                 }
                 row.rerequested.iter().all(|reviewer| {
-                    rows.iter()
-                        .find(|r| &r.reviewer == reviewer)
-                        .is_some_and(|r| {
-                            !matches!(
-                                r.status.as_str(),
-                                REVIEW_STATUS_REQUESTED | REVIEW_STATUS_IN_FLIGHT
-                            )
-                        })
+                    // A row absent from the live watch set is dropped or otherwise gone — finished
+                    // for this purpose (§6.6 counts `dropped`).
+                    match rows.iter().find(|r| &r.reviewer == reviewer) {
+                        None => true,
+                        Some(r) => !matches!(
+                            r.status.as_str(),
+                            REVIEW_STATUS_REQUESTED | REVIEW_STATUS_IN_FLIGHT
+                        ),
+                    }
                 })
             }
             DecisionKind::RouteToAuthor { .. } => {
