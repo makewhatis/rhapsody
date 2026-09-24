@@ -1195,6 +1195,36 @@ the Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins
 | `rhapsody_manager_exchange` | — | one row per manager exchange authorization |
 | `PRAGMA user_version` | 6 | **19** |
 
+### A twelfth schema table with no Go counterpart — `rhapsody_provider_day_budget`, and a durable UTC-day broker budget (STUDIO-979)
+
+The provider broker enforces finite per-turn and per-session token reservations on every brokered
+request. A provider definition may additionally set
+`broker_limits.max_reserved_token_units_per_utc_day`; when it does, the daemon injects a durable
+**UTC-day** budget authority into the broker session, and every admission is charged atomically under
+`(stable_provider_id, UTC day)` before egress — across concurrent runs and daemon restarts, so a
+read-then-write counter can never oversubscribe the cap. The counter is the new
+`rhapsody_provider_day_budget` table:
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_provider_day_budget` | — | one row per `(provider_id, UTC day)`, charging the broker's admission reservation |
+| `PRAGMA user_version` | 6 | **20** |
+
+The daily cap has **no implicit default**: an absent value means no Rhapsody daily cap, no row is
+ever written, and a provider without one behaves byte-identically to before this feature (the
+session policy is built with no authority at all). Configuring the cap while durable storage is
+unavailable (`--no-store`, `storage.path: off`/`:memory:`, or a failed open) is a **startup
+refusal** naming the providers, never a best-effort or fail-open cap. A store error during a charge
+is a typed refusal (`Unavailable`), so even a cap introduced by a later hot reload fails closed.
+
+**Not a dollar cap.** There is no provider pricing table and no trusted-settlement identity, so this
+is a *token-unit* budget, deliberately over-reserving rather than pretending a universal tokenizer or
+exact cost. Restricted/prepaid provider keys remain the universal hard dollar boundary. **Native,
+non-brokered harnesses are unchanged**: they keep the STUDIO-957 local-day dispatch meter and the
+STUDIO-967 per-run token ceiling exactly as before; the UTC-day authority is only attached to a
+brokered provider with a configured cap. The `rhapsody_` prefix keeps the new table out of the
+Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the twelfth name.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
