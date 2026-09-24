@@ -17,15 +17,16 @@
 //! `generation`/`evidence_rev` columns and the watch rows' `last_completed_*` columns, STUDIO-1009),
 //! step 17 (`rhapsody_run_provenance`'s
 //! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987), step 18
-//! (`rhapsody_manager_approval`, STUDIO-1011) and step 19
-//! (`rhapsody_manager_exchange`, STUDIO-1012) have no Go counterpart: they are
+//! (`rhapsody_manager_approval`, STUDIO-1011), step 19
+//! (`rhapsody_manager_exchange`, STUDIO-1012) and step 20
+//! (`rhapsody_provider_day_budget`, STUDIO-979) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
 //! ledger, the structured review-finding revisions, the runaway-loop breaker's crossings, the
 //! review evidence ledger's columns, the
-//! provider origin plus broker usage record, the manager approval record and the manager exchange
-//! authorizations, none of which the frozen
+//! provider origin plus broker usage record, the manager approval record, the manager exchange
+//! authorizations and the durable UTC-day provider budget authority, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -53,15 +54,15 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 19 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 20 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
 /// review evidence ledger, then the
 /// provider origin + broker usage record, then the manager approval record, then the manager
-/// exchange authorizations) and are
+/// exchange authorizations, then the durable UTC-day provider budget authority) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -443,6 +444,25 @@ CREATE TABLE IF NOT EXISTS rhapsody_manager_exchange (
   authorized_head     TEXT    NOT NULL DEFAULT '',
   authorized_patch_id TEXT    NOT NULL DEFAULT '',
   state               TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v19 -> v20: the durable UTC-DAY PROVIDER BUDGET AUTHORITY (STUDIO-979, design §8.1). The
+    // frozen Go reference has no broker and therefore no such budget, so this is a Rhapsody-only
+    // table gated out of the Go-recaptured schema golden by the `rhapsody_` name prefix exactly as
+    // steps 7-19 are.
+    //
+    // It is the durable backing of the broker's optional `max_reserved_token_units_per_utc_day` cap:
+    // one row per `(provider_id, UTC day)` — never one global bucket (providers have independent
+    // budgets) and never an ephemeral session key. `utc_day` is whole days since the Unix epoch, so
+    // a charge made before UTC midnight cannot count against the next day. The composite PRIMARY KEY
+    // gives SQLite an implicit auto-index (`sqlite_master.sql IS NULL`), so no explicit index
+    // reaches the golden comparison. An absent cap writes no row at all.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_provider_day_budget (
+  provider_id    TEXT    NOT NULL,
+  utc_day        INTEGER NOT NULL,
+  charged_tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (provider_id, utc_day)
 );
 "#,
 ];
@@ -1624,6 +1644,48 @@ impl Store for Sqlite {
         }
     }
 
+    fn charge_provider_day_tokens(
+        &self,
+        provider_id: &str,
+        utc_day: i64,
+        tokens: u64,
+        cap: u64,
+    ) -> Result<bool, StoreError> {
+        // SQLite integers are signed 64-bit. A charge or cap that cannot be represented is refused
+        // rather than truncated or saturated: `Ok(false)` charges nothing, the fail-closed answer.
+        let (Ok(tokens), Ok(cap)) = (i64::try_from(tokens), i64::try_from(cap)) else {
+            return Ok(false);
+        };
+        let conn = self.lock();
+        // ONE statement, so the cap check and the increment cannot be split by a concurrent run.
+        // The `SELECT ... WHERE ?3 <= ?4` refuses a FRESH-day charge larger than the cap — no row is
+        // produced, so no insert happens and the DO UPDATE `WHERE` is never consulted. The DO UPDATE
+        // `WHERE` refuses an ACCUMULATION that would cross the same cap. `execute` returns the
+        // changed-row count: 0 means nothing was charged (refused), 1 means charged.
+        let changed = conn.execute(
+            "INSERT INTO rhapsody_provider_day_budget (provider_id, utc_day, charged_tokens)
+             SELECT ?1, ?2, ?3 WHERE ?3 <= ?4
+             ON CONFLICT(provider_id, utc_day) DO UPDATE SET
+               charged_tokens = charged_tokens + excluded.charged_tokens
+             WHERE charged_tokens + excluded.charged_tokens <= ?4",
+            params![provider_id, utc_day, tokens, cap],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn provider_day_tokens(&self, provider_id: &str, utc_day: i64) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT charged_tokens FROM rhapsody_provider_day_budget \
+              WHERE provider_id = ?1 AND utc_day = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![provider_id, utc_day], |row| row.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(u64::try_from(r?).unwrap_or_default()),
+            None => Ok(0),
+        }
+    }
+
     fn metrics_by_provider(
         &self,
         since_days: i64,
@@ -2721,7 +2783,9 @@ mod tests {
     use rusqlite::{Connection, params};
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     /// The scratch directory's name. `nonce` distinguishes otherwise-identical `(pid, seq)` pairs,
     /// so a name never depends on pid + counter alone — the reused-pid collision (STUDIO-1027): two
@@ -6533,6 +6597,7 @@ mod tests {
                 "rhapsody_run_usage".to_string(),
                 "rhapsody_manager_approval".to_string(),
                 "rhapsody_manager_exchange".to_string(),
+                "rhapsody_provider_day_budget".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -7032,5 +7097,219 @@ mod tests {
             st.manager_approval("iv-1").expect("read").unwrap().state,
             "rubber-stamped"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // STUDIO-979: the durable UTC-day provider budget authority.
+    // ---------------------------------------------------------------------------------------------
+
+    const DAY: i64 = 20_000;
+
+    // The one admission transaction, distilled: a fresh-day charge larger than the cap is refused
+    // with nothing recorded, and an accumulation that would cross the cap is refused while the
+    // existing charge stands. MUTATION: make the fresh-day overshoot insert unconditionally and the
+    // first assert reds (an oversubscribed day).
+    #[test]
+    fn provider_day_budget_charges_are_atomic_and_capped() {
+        let st = open_mem();
+
+        // A single charge larger than the cap on an EMPTY day is refused and records nothing: the
+        // `SELECT ... WHERE ?3 <= ?4` gate, not the DO UPDATE `WHERE`, is what stops this.
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, 200, 100)
+                .expect("charge"),
+            "a first charge above the cap must be refused"
+        );
+        assert_eq!(st.provider_day_tokens("p", DAY).expect("read"), 0);
+
+        assert!(
+            st.charge_provider_day_tokens("p", DAY, 60, 100)
+                .expect("charge"),
+            "60 fits under 100"
+        );
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, 50, 100)
+                .expect("charge")
+        );
+        assert_eq!(
+            st.provider_day_tokens("p", DAY).expect("read"),
+            60,
+            "a refused accumulation charges nothing"
+        );
+        assert!(
+            st.charge_provider_day_tokens("p", DAY, 40, 100)
+                .expect("charge")
+        );
+        assert_eq!(st.provider_day_tokens("p", DAY).expect("read"), 100);
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, 1, 100)
+                .expect("charge"),
+            "the day is now at its cap"
+        );
+    }
+
+    // Reservations are keyed by `(stable_provider_id, UTC day)`: one provider's spend never counts
+    // against another's, and a new UTC day starts from zero. MUTATION: key a single global bucket
+    // and the provider/day isolation asserts red.
+    #[test]
+    fn provider_day_budget_is_keyed_by_provider_and_utc_day() {
+        let st = open_mem();
+        assert!(
+            st.charge_provider_day_tokens("a", DAY, 100, 100)
+                .expect("charge")
+        );
+        assert!(
+            st.charge_provider_day_tokens("b", DAY, 100, 100)
+                .expect("charge")
+        );
+        assert!(
+            st.charge_provider_day_tokens("a", DAY + 1, 100, 100)
+                .expect("charge")
+        );
+
+        assert_eq!(st.provider_day_tokens("a", DAY).expect("read"), 100);
+        assert_eq!(st.provider_day_tokens("b", DAY).expect("read"), 100);
+        assert_eq!(
+            st.provider_day_tokens("a", DAY + 1).expect("read"),
+            100,
+            "a new UTC day resets the bucket"
+        );
+        assert_eq!(
+            st.provider_day_tokens("a", DAY + 2).expect("read"),
+            0,
+            "an untouched day reads zero"
+        );
+        assert!(
+            !st.charge_provider_day_tokens("a", DAY, 1, 100)
+                .expect("charge"),
+            "provider a's bucket is at its own cap"
+        );
+    }
+
+    // A charge (and its refusal) survives reopening the database: a restarted daemon reads the same
+    // authority rather than starting the day over. MUTATION: keep the counter in process memory and
+    // the reopen assert reds.
+    #[test]
+    fn provider_day_budget_survives_reopen() {
+        let scratch = scratch_dir();
+        let db = scratch.join("day.db");
+        {
+            let st = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            assert!(
+                st.charge_provider_day_tokens("p", DAY, 100, 100)
+                    .expect("charge")
+            );
+            st.close().expect("close");
+        }
+        let st = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            st.provider_day_tokens("p", DAY).expect("read"),
+            100,
+            "the durable charge survives a restart"
+        );
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, 1, 100)
+                .expect("charge"),
+            "the restarted authority still enforces the cap"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // Concurrent charges against one shared, file-backed store can never oversubscribe the cap.
+    // MUTATION: replace the single-statement charge with a read-then-write pair and more than ten
+    // threads succeed.
+    #[test]
+    fn concurrent_day_charges_cannot_oversubscribe() {
+        let (_dir, st) = open_temp();
+        let st = Arc::new(st);
+        let cost = 100u64;
+        let cap = 1_000u64;
+        let threads = 40usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let successes = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let st = Arc::clone(&st);
+            let barrier = Arc::clone(&barrier);
+            let successes = Arc::clone(&successes);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                if st
+                    .charge_provider_day_tokens("p", DAY, cost, cap)
+                    .expect("charge")
+                {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Acquire),
+            cap / cost,
+            "exactly cap/cost charges may succeed"
+        );
+        assert_eq!(
+            st.provider_day_tokens("p", DAY).expect("read"),
+            cap,
+            "the shared cap is never oversubscribed"
+        );
+    }
+
+    // A charge or cap that SQLite cannot represent as a signed 64-bit integer is refused rather
+    // than saturated, so a runaway value can never wrap into a small charge.
+    #[test]
+    fn provider_day_budget_refuses_unrepresentable_values() {
+        let st = open_mem();
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, u64::MAX, 100)
+                .expect("charge")
+        );
+        assert!(
+            !st.charge_provider_day_tokens("p", DAY, 1, u64::MAX)
+                .expect("charge")
+        );
+        assert_eq!(st.provider_day_tokens("p", DAY).expect("read"), 0);
+    }
+
+    // A database written by the v19 build upgrades forward to the day-budget table, which starts
+    // empty (no fabricated spend) and accepts charges. MUTATION: reuse a step index or skip the
+    // SCHEMA_VERSION bump and the version assert reds.
+    #[test]
+    fn a_v19_database_gains_the_provider_day_budget_table_empty() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v19.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..19] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 19")
+                .expect("stamp v19");
+            tx.commit().expect("commit");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            store.provider_day_tokens("p", DAY).expect("read"),
+            0,
+            "the day-budget table starts empty for every pre-existing provider"
+        );
+        assert!(
+            store
+                .charge_provider_day_tokens("p", DAY, 10, 100)
+                .expect("charge"),
+            "the upgraded store accepts a day charge"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

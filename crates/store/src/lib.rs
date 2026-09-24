@@ -257,6 +257,33 @@ pub trait Store {
     /// One run's broker usage record, or `Ok(None)` when the run recorded none.
     fn run_usage(&self, run_id: i64) -> Result<Option<RunUsage>, StoreError>;
 
+    // --- durable UTC-day provider budget authority (STUDIO-979) ---
+    // Additive Rhapsody-only surface: the durable, atomic counter behind a brokered provider's
+    // optional `max_reserved_token_units_per_utc_day` cap (`provider-broker-design.md` §8.1). The
+    // frozen Go reference has no broker, so it holds no such budget. It is keyed by
+    // `(provider_id, utc_day)` — two providers have independent day budgets, and a charge made
+    // before UTC midnight never counts against the next UTC day — never one global bucket and never
+    // an ephemeral session key.
+    //
+    // [`Store::charge_provider_day_tokens`] is a SINGLE atomic conditional increment: it applies the
+    // charge and returns `Ok(true)`, or charges nothing and returns `Ok(false)` when the addition
+    // would exceed `cap`. A read-then-write pair across two calls would let concurrent runs
+    // oversubscribe the cap, so callers must not implement the authority as a read followed by a
+    // write. `utc_day` is whole days since the Unix epoch (`UtcDay` in the broker crate).
+    //
+    // The disabled backend answers `Ok(false)` / `Ok(0)`: it never errors, exactly like every other
+    // Noop method. A configured cap over unavailable durable storage is refused at startup, so a
+    // Noop day charge is never a reachable production path.
+    fn charge_provider_day_tokens(
+        &self,
+        provider_id: &str,
+        utc_day: i64,
+        tokens: u64,
+        cap: u64,
+    ) -> Result<bool, StoreError>;
+    /// The tokens already charged under `(provider_id, utc_day)`, or `Ok(0)` when none.
+    fn provider_day_tokens(&self, provider_id: &str, utc_day: i64) -> Result<u64, StoreError>;
+
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`
     /// is the operator's ORIGINAL (unwrapped) text.

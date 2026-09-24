@@ -4688,6 +4688,23 @@ mod tests {
         fn run_usage(&self, run_id: i64) -> Result<Option<rs::RunUsage>, rs::StoreError> {
             self.0.run_usage(run_id)
         }
+        fn charge_provider_day_tokens(
+            &self,
+            provider_id: &str,
+            utc_day: i64,
+            tokens: u64,
+            cap: u64,
+        ) -> Result<bool, rs::StoreError> {
+            self.0
+                .charge_provider_day_tokens(provider_id, utc_day, tokens, cap)
+        }
+        fn provider_day_tokens(
+            &self,
+            provider_id: &str,
+            utc_day: i64,
+        ) -> Result<u64, rs::StoreError> {
+            self.0.provider_day_tokens(provider_id, utc_day)
+        }
         fn load_run_provenances(
             &self,
             run_ids: &[i64],

@@ -290,7 +290,34 @@ where
     // Open the durable store from the resolved config + --db / --no-store, and inject it before Run
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
+    // Opened BEFORE the provider-prep source below so the source can carry the store-backed UTC-day
+    // budget authority (STUDIO-979).
     let resolved = load_resolved(&flags.path);
+    let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
+    // STUDIO-979: a configured UTC-day provider budget cap is a hard boundary the broker enforces
+    // through the durable authority, so it CANNOT be served by a best-effort or fail-open counter.
+    // With durable storage unavailable it is a startup refusal naming the offending providers — never
+    // a silently unbounded lane.
+    if !durable_store {
+        let capped = crate::bootcfg::providers_with_day_cap(resolved.as_ref());
+        if !capped.is_empty() {
+            let _ = writeln!(
+                stderr.make_writer(),
+                "symphony: providers {} configure max_reserved_token_units_per_utc_day but durable \
+                 provider-budget storage is unavailable; refusing to start",
+                capped.join(", ")
+            );
+            return 1;
+        }
+    }
+    // Cloned rather than moved: the adjudication ledger below is built with the SAME handle, so the
+    // manager's decision and the round counter it belongs beside land in one row (STUDIO-956).
+    o.set_store(Arc::clone(&store));
+    // The daemon-injected durable UTC-day budget authority (STUDIO-979). It is attached to a
+    // session's policy only when the resolved plan configures a day cap.
+    let day_authority: Arc<dyn rhapsody_provider_broker::CumulativeBudgetAuthority> = Arc::new(
+        crate::providerbudget::StoreDayAuthority::new(Arc::clone(&store), durable_store),
+    );
     // PB7 (STUDIO-1002): install the prepared-dispatch resolver UNCONDITIONALLY, not only when the
     // startup workflow already configures a provider (B3). The broker itself is bound unconditionally
     // above (§11.1) for the same reason a hot reload must not discover a missing listener: a
@@ -312,17 +339,15 @@ where
     let prep_source = Arc::new(crate::providers::DaemonProviderSource::new(
         prep_owner,
         broker_runtime.registrar(),
+        day_authority,
     ));
     o.set_preparation_resolver(Arc::new(
         rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
     ));
     // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
-    // failed open. Only the one reader that would ACT on an absence uses it (the Teams
-    // identity-label reconcile, STUDIO-672); everything else is guard-free by design.
-    let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
-    // Cloned rather than moved: the adjudication ledger below is built with the SAME handle, so the
-    // manager's decision and the round counter it belongs beside land in one row (STUDIO-956).
-    o.set_store(Arc::clone(&store));
+    // failed open. Only the readers that would ACT on an absence use it (the Teams identity-label
+    // reconcile, STUDIO-672, and the STUDIO-979 startup refusal above); everything else is
+    // guard-free by design.
     // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
     // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
     // failure — or no on-disk store home (--no-store / off / :memory:) — leaves the registry `None`, so
@@ -2947,6 +2972,51 @@ mod tests {
             run_now(&[&wf.to_string_lossy()], &buf).await,
             0,
             "validation failure must exit non-zero"
+        );
+    }
+
+    /// The provider block the STUDIO-979 startup-refusal tests share: one provider that configures
+    /// a durable UTC-day budget cap.
+    const DAY_CAP_PROVIDER: &str = "providers:\n  fireworks:\n    protocol: openai-compatible\n    base_url: https://api.example/v1\n    credential:\n      source: keychain\n    broker_limits:\n      max_reserved_token_units_per_utc_day: 2000\n";
+
+    /// STUDIO-979: a configured UTC-day provider budget cap needs the durable authority to enforce
+    /// it, so with durable storage unavailable the daemon REFUSES to start rather than running a
+    /// best-effort cap. MUTATION: drop the boot refusal and this exits 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_refuses_a_day_cap_without_durable_storage() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, OFF_STORAGE, DAY_CAP_PROVIDER);
+        let buf = SharedBuf::new();
+        assert_ne!(
+            run_now(&[&wf.to_string_lossy()], &buf).await,
+            0,
+            "a day cap over a disabled store must refuse; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            buf.contents()
+                .contains("durable provider-budget storage is unavailable"),
+            "the refusal must name the missing durable storage; stderr={}",
+            buf.contents()
+        );
+    }
+
+    /// The counterpart: the same day cap over an on-disk store boots and stops cleanly. Together
+    /// with the refusal test this pins the refusal to durability, not to the cap itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_with_a_day_cap_when_storage_is_durable() {
+        let dir = TempDir::new();
+        let storage = format!(
+            "storage:\n  path: \"{}\"\n",
+            dir.child("rhapsody.db").display()
+        );
+        let wf = write_wf(&dir, &storage, DAY_CAP_PROVIDER);
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(&[&wf.to_string_lossy()], &buf).await,
+            0,
+            "a day cap over durable storage should start; stderr={}",
+            buf.contents()
         );
     }
 

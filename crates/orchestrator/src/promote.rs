@@ -931,6 +931,19 @@ mod tests {
         fn run_usage(&self, id: i64) -> Result<Option<rhapsody_store::RunUsage>, StoreError> {
             self.0.run_usage(id)
         }
+        fn charge_provider_day_tokens(
+            &self,
+            provider_id: &str,
+            utc_day: i64,
+            tokens: u64,
+            cap: u64,
+        ) -> Result<bool, StoreError> {
+            self.0
+                .charge_provider_day_tokens(provider_id, utc_day, tokens, cap)
+        }
+        fn provider_day_tokens(&self, provider_id: &str, utc_day: i64) -> Result<u64, StoreError> {
+            self.0.provider_day_tokens(provider_id, utc_day)
+        }
         fn load_run_provenances(
             &self,
             ids: &[i64],
