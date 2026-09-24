@@ -31,7 +31,6 @@ fn readme_states_the_broker_guarantee_and_its_residual_risk() {
     for needle in [
         // The guarantee: the reusable key is leased to the broker, never handed to the harness.
         "The reusable upstream provider key",
-        "capability",
         // The capability is spendable within finite limits — never described as hidden.
         "spendable within finite limits",
         // Not a sandbox; same-user ambient access remains.

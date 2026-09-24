@@ -261,6 +261,10 @@ identity encoding, Bearer-only, exact-secret redaction) and never mints an agent
 `providers:` block every route serves an empty/unknown answer, so legacy Claude and native-login
 OpenCode behavior is byte-identical.
 
+Each status row also carries `broker_available` and, when the broker is down, a CLOSED
+`broker_reason` code (`provider_broker_unavailable`) — never a listener address, capability,
+credential, or raw provider response (STUDIO-1003, design §13).
+
 The provider set is applied from the resolved workflow at boot, and a `WORKFLOW.md` hot-reload
 re-applies it: the orchestrator's reload path hands the new set to the runtime through a
 Rhapsody-only `ProviderReloadSink`, so a reload marks the affected status `unknown/refreshing` and
