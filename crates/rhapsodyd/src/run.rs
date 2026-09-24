@@ -2074,8 +2074,10 @@ fn enforce_manager_storage_requirement(
     teams: &mut rhapsody_config::teams::Teams,
     durable_store: bool,
 ) {
-    use rhapsody_config::teams::ReviewAuthority;
-    if durable_store || teams.manager.review_authority == ReviewAuthority::Off {
+    // The decision itself lives on `Teams` (`effective_manager_review_authority`), so the boot and
+    // the config can never disagree about whether a given authority is acceptable.
+    let effective = teams.effective_manager_review_authority(durable_store);
+    if effective == teams.manager.review_authority {
         return;
     }
     tracing::warn!(
@@ -2085,7 +2087,7 @@ fn enforce_manager_storage_requirement(
          persisted, so the authority is refused and falls back to `off`. Point storage.path at an \
          on-disk database to use it."
     );
-    teams.manager.review_authority = ReviewAuthority::Off;
+    teams.manager.review_authority = effective;
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
