@@ -14,6 +14,7 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/fake.rs` | `internal/agent/fake` | scriptable in-process backend, the orchestrator's test double |
 | `src/proctree.rs` | — | harness-agnostic process-TREE kill (`kill_tree`, `KillTreeOnDrop`); no Go counterpart |
 | `src/harness.rs` | — | the pluggable-harnesses contract (`HarnessSpec`/`HarnessCapabilities`/`Harness`, STUDIO-900); no Go counterpart — the frozen reference runs one backend. `Harness: Runner`, so `Runner`/`Session` stay the only traits the orchestrator schedules against |
+| `src/manager.rs` | — | the manager run's isolated startup posture (STUDIO-1014; design `manager-agent-design.md` §4.2–§4.4); no Go counterpart. Pure: `manager_config`/`manager_args` (permission-mode `default`, allowlist = manager MCP tools only, deny-list = every built-in, `--mcp-config` + `--strict-mcp-config`, `--setting-sources user`, operator `extra_args` dropped) and `manager_mcp_config` (one server, `--role manager`). Never inherit `bypassPermissions` |
 | `src/claude/mod.rs` | `internal/agent/claude` | re-exports; module doc lists the five submodules' Go files 1:1 |
 | `src/claude/args.rs` | `args.go` | `Config` + `build_args`/`split_command` |
 | `src/claude/billing.rs` | `billing.go` | env-scrub name sets + billing-guard decisions |

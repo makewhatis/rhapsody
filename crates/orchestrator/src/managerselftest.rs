@@ -101,7 +101,7 @@ impl ManagerUnavailable {
     }
 }
 
-/// The outcome of one startupp self-test.
+/// The outcome of one startup self-test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfTestVerdict {
     /// Every required attempt was exercised AND refused.

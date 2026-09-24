@@ -18,15 +18,17 @@
 //! step 17 (`rhapsody_run_provenance`'s
 //! `provider_origin` column plus `rhapsody_run_usage`, STUDIO-987), step 18
 //! (`rhapsody_manager_approval`, STUDIO-1011), step 19
-//! (`rhapsody_manager_exchange`, STUDIO-1012) and step 20
-//! (`rhapsody_provider_day_budget`, STUDIO-979) have no Go counterpart: they are
+//! (`rhapsody_manager_exchange`, STUDIO-1012), step 20
+//! (`rhapsody_provider_day_budget`, STUDIO-979) and step 21
+//! (`rhapsody_evidence_access`, STUDIO-1014) have no Go counterpart: they are
 //! the ticketless
 //! PR-review watch set, the per-ticket summons watermark, the per-run harness/model/provider record,
 //! the per-pull-request review bound, the per-review-run verdict, the durable terminal-move
 //! ledger, the structured review-finding revisions, the runaway-loop breaker's crossings, the
 //! review evidence ledger's columns, the
 //! provider origin plus broker usage record, the manager approval record, the manager exchange
-//! authorizations and the durable UTC-day provider budget authority, none of which the frozen
+//! authorizations, the durable UTC-day provider budget authority and the manager evidence-access
+//! log, none of which the frozen
 //! v0.4.0 reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
