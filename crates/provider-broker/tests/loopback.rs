@@ -679,6 +679,89 @@ async fn host_origin_method_query_and_path_variants_are_refused() {
     harness.shutdown().await;
 }
 
+/// §14.2 + mutation "weaken the content-type/server guards": a declared non-JSON `Content-Type`, a
+/// non-identity `Content-Encoding`, a CORS preflight header, and an absolute-form (proxy) target all
+/// fail closed before any upstream contact. A JSON `Content-Type` with parameters is accepted, and
+/// an ABSENT `Content-Type` is tolerated (the closed schema still parses the body).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_content_type_encoding_and_preflight_violations_fail_closed() {
+    let harness = Harness::with(FakeResponse::json("{\"ok\":true}"), default_limits(), true).await;
+    let port = harness.api_port;
+    let capability = harness.capability.clone();
+    let body = chat_body(MODEL, false);
+
+    // A non-JSON declared type is 415, before auth or upstream.
+    for bad in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "application/json-ish",
+        "text/json",
+    ] {
+        let resp = harness
+            .post(Some(&capability), &[("content-type", bad)], &body)
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type {bad:?} must be refused"
+        );
+    }
+
+    // A non-identity Content-Encoding is 415 too.
+    let gzip = harness
+        .post(Some(&capability), &[("content-encoding", "gzip")], &body)
+        .await;
+    assert_eq!(gzip.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // A CORS preflight header on an otherwise valid POST is 403.
+    for header in [
+        "access-control-request-method",
+        "access-control-request-headers",
+    ] {
+        let preflight = harness
+            .post(Some(&capability), &[(header, "POST")], &body)
+            .await;
+        assert_eq!(
+            preflight.status(),
+            StatusCode::FORBIDDEN,
+            "preflight header {header:?} must be refused"
+        );
+    }
+
+    // An absolute-form target (a forward-proxy request) is 400, never routed upstream.
+    let absolute = raw(
+        port,
+        &format!(
+            "POST http://127.0.0.1:{port}/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {capability}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+        &body,
+    )
+    .await;
+    assert_eq!(absolute.status, 400);
+
+    assert_eq!(
+        harness.upstream.count(),
+        0,
+        "no violation may reach upstream"
+    );
+
+    // The measured client's `application/json; charset=utf-8` is accepted.
+    let ok = harness
+        .post(
+            Some(&capability),
+            &[("content-type", "application/json; charset=utf-8")],
+            &body,
+        )
+        .await;
+    assert_ne!(
+        ok.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "a JSON content type with parameters must be accepted"
+    );
+    harness.shutdown().await;
+}
+
 /// §6.1 + mutation "insecure HTTP without resolved opt-in": a plaintext upstream is refused before
 /// any contact unless the plan carries `allow_insecure_http: true`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1246,6 +1329,44 @@ async fn retry_after_is_clamped_and_reflecting_headers_are_dropped() {
             .is_none(),
         "a header reflecting the key is dropped, not rewritten"
     );
+    harness.shutdown().await;
+}
+
+/// §6.3 + §14.2 bullet 13: an upstream's `Set-Cookie`, `Location`, auth and forwarding headers never
+/// reach the child. Only the bounded whitelist (content-type, retry-after) crosses the boundary.
+/// A broker that copied the upstream header block would leak these.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_cookie_location_and_auth_headers_never_reach_the_child() {
+    let response = FakeResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        chunks: vec![b"data: [DONE]\n\n".to_vec()],
+        chunk_delay: Duration::ZERO,
+        extra_headers: vec![
+            ("set-cookie", "session=canary; HttpOnly"),
+            ("location", "http://evil.example/redirect"),
+            ("www-authenticate", "Bearer realm=canary"),
+            ("authorization", "Bearer canary"),
+            ("x-forwarded-for", "203.0.113.9"),
+        ],
+    };
+    let harness = Harness::with(response, default_limits(), true).await;
+    let capability = harness.capability.clone();
+    let resp = harness
+        .post(Some(&capability), &[], &chat_body(MODEL, true))
+        .await;
+    for header in [
+        "set-cookie",
+        "location",
+        "www-authenticate",
+        "authorization",
+        "x-forwarded-for",
+    ] {
+        assert!(
+            resp.headers().get(header).is_none(),
+            "upstream header {header:?} must not reach the child"
+        );
+    }
     harness.shutdown().await;
 }
 

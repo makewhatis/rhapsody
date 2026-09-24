@@ -152,6 +152,76 @@ fn consecutive_turns_use_distinct_tokens_and_one_live_turn_at_a_time() {
     assert_eq!(ledger2.turn_ordinal(), 2);
 }
 
+/// §14.4 bullet 8: two concurrent sessions have independent state, credentials, limits, and
+/// revocation. Revoking one session deadens only ITS capability: the other session's capability
+/// still resolves, the broker tracks both live sessions, and the surviving turn completes normally.
+/// A broker that keyed the registry or revocation by provider (not by session) would cross the two.
+#[test]
+fn two_concurrent_sessions_have_independent_credentials_and_revocation() {
+    let clock = Arc::new(ManualClock::new());
+    let rng = Arc::new(ScriptedRandom::new());
+    let broker = broker_with(Arc::clone(&clock), Arc::clone(&rng));
+    let mut a = register(&broker, "provider-a");
+    let mut b = register(&broker, "provider-b");
+    assert_eq!(broker.live_session_count(), 2, "both sessions are live");
+
+    let (attempt_a, receipt_a) = a
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm a");
+    let access_a = attempt_a.mint_access().expect("mint a");
+    let token_a = access_a.api_key.expose_for_child(str::to_owned);
+
+    let (attempt_b, receipt_b) = b
+        .ledgers
+        .arm_turn(TurnMeta::without_deadline())
+        .expect("arm b");
+    let access_b = attempt_b.mint_access().expect("mint b");
+    let token_b = access_b.api_key.expose_for_child(str::to_owned);
+
+    assert_ne!(token_a, token_b, "each session mints its own capability");
+    assert_eq!(
+        broker
+            .lookup_capability(&token_a)
+            .expect("a live")
+            .stable_provider_id(),
+        "provider-a"
+    );
+    assert_eq!(
+        broker
+            .lookup_capability(&token_b)
+            .expect("b live")
+            .stable_provider_id(),
+        "provider-b"
+    );
+
+    // Revoke A. A's capability dies; B's is untouched and B's session is not revoked.
+    a.session.revoke();
+    assert!(a.session.is_revoked());
+    assert!(
+        !b.session.is_revoked(),
+        "revoking one session must not revoke another"
+    );
+    assert_eq!(
+        broker.lookup_capability(&token_a).unwrap_err(),
+        BrokerError::Unauthorized
+    );
+    assert!(
+        broker.lookup_capability(&token_b).is_ok(),
+        "session B's capability survives session A's revocation"
+    );
+
+    // B's live turn still completes normally.
+    access_b.finish();
+    let ledger_b = receipt_b.take().expect("receipt b");
+    assert_eq!(ledger_b.outcome(), TurnOutcome::Completed);
+
+    // A's revoked turn finalizes as revoked when its access drops.
+    drop(access_a);
+    let ledger_a = receipt_a.take().expect("receipt a");
+    assert_eq!(ledger_a.outcome(), TurnOutcome::Revoked);
+}
+
 #[test]
 fn a_dropped_attempt_finalizes_a_no_capability_receipt() {
     let clock = Arc::new(ManualClock::new());
