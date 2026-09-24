@@ -1589,6 +1589,21 @@ impl Teams {
                     entry.name
                 )));
             }
+            // ── STUDIO-1013: the manager's bank is not a teammate's ────────────
+            // `manager` is reserved as a roster NAME, so `<bank_prefix>manager`
+            // cannot arise through the default path — but a `bank:` OVERRIDE can
+            // name the manager's bank, and then this teammate's ordinary retain
+            // would land in the bank the manager recalls as its own observations.
+            // The manager's bank is writable only through the manager identity.
+            let resolved =
+                crate::memory::resolve_bank_id(&self.memory.bank_prefix, &entry.bank, &entry.name);
+            if resolved == crate::manager::manager_bank_id(&self.memory.bank_prefix) {
+                return Err(TeamsError::Invalid(format!(
+                    "roster identity {:?} resolves to bank {resolved:?}, which is the manager's own \
+                     bank — the manager's bank is writable only through the manager identity",
+                    entry.name
+                )));
+            }
         }
         if !self.manager.default_identity.is_empty()
             && !seen.contains(self.manager.default_identity.as_str())
@@ -1610,6 +1625,15 @@ impl Teams {
                 return Err(TeamsError::Invalid(format!(
                     "memory.team_bank {bank:?} is not label-safe (must match ^[a-z][a-z0-9-]*$; \
                      it becomes a bank id and a directory name)"
+                )));
+            }
+            // The manager's own bank is not the shared bank either (STUDIO-1013): a shared retain
+            // would otherwise land in the bank the manager recalls as its own observations.
+            let manager_bank = crate::manager::manager_bank_id(&self.memory.bank_prefix);
+            if bank == manager_bank {
+                return Err(TeamsError::Invalid(format!(
+                    "memory.team_bank {bank:?} is the manager's own bank — the manager's bank is \
+                     writable only through the manager identity"
                 )));
             }
             for entry in &self.roster {
@@ -4105,6 +4129,69 @@ roster:
                 ..Memory::default()
             },
             ..base
+        };
+        ok.validate().expect("a distinct shared bank is valid");
+    }
+
+    // ── STUDIO-1013: the manager's own bank is not a run-writable surface ─────
+
+    /// **Mutation discipline:** a roster `bank:` override naming the manager's bank is refused,
+    /// so a teammate's ordinary `teams_retain` can never land in `agent-manager`. Dropping the
+    /// roster-side guard turns this red. The default `<bank_prefix><name>` path cannot collide
+    /// (`manager` is reserved as a roster NAME); only an override can.
+    #[test]
+    fn validate_rejects_a_roster_bank_override_colliding_with_the_manager_bank() {
+        let t = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                bank: "agent-manager".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        let err = t
+            .validate()
+            .expect_err("a roster override naming the manager's bank must refuse");
+        assert!(err.to_string().contains("manager's own bank"), "{err}");
+
+        // A distinct override is fine — the guard is about the manager's bank, not overrides.
+        let ok = Teams {
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                bank: "custom-bank".to_string(),
+                ..Identity::default()
+            }],
+            ..t
+        };
+        ok.validate().expect("a distinct override is valid");
+    }
+
+    /// **Mutation discipline:** `memory.team_bank` set to the manager's bank is refused, so a
+    /// teammate's shared `teams_retain` can never write into the bank the manager recalls as its
+    /// own. Dropping the shared-bank guard turns this red.
+    #[test]
+    fn validate_rejects_a_team_bank_that_is_the_manager_bank() {
+        let t = Teams {
+            enabled: true,
+            memory: Memory {
+                team_bank: "agent-manager".to_string(),
+                ..Memory::default()
+            },
+            ..Teams::disabled()
+        };
+        let err = t
+            .validate()
+            .expect_err("a shared bank naming the manager's bank must refuse");
+        assert!(err.to_string().contains("manager's own bank"), "{err}");
+
+        // A distinct shared bank still validates.
+        let ok = Teams {
+            memory: Memory {
+                team_bank: "agent-team".to_string(),
+                ..Memory::default()
+            },
+            ..t
         };
         ok.validate().expect("a distinct shared bank is valid");
     }
