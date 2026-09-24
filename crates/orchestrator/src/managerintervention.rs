@@ -653,10 +653,12 @@ impl Orchestrator {
             .and_then(|r| crate::reviewdone::origin_ticket(&r.introduced_by).map(str::to_string))
     }
 
-    /// Whether any live watch row for `pr` has an origin ticket wearing the hold.
+    /// Whether any live watch row for `pr` has an origin ticket wearing the hold. Fails CLOSED on a
+    /// store read error (`true`), because an unreadable watch set cannot show that the pull request
+    /// is free of a hold — the direction §10.2 requires.
     fn manager_pr_held(&self, pr: &str, labelled: &std::collections::HashSet<String>) -> bool {
         let Ok(rows) = self.store().load_live_review_watch() else {
-            return false;
+            return true;
         };
         rows.iter().any(|r| {
             format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).to_ascii_lowercase() == pr
