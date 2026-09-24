@@ -92,6 +92,11 @@ struct Recorded {
     /// — including on a review run, which reaches the worker by a different dispatch path
     /// (STUDIO-868).
     last_model_override: Option<crate::ModelOverride>,
+    /// The [`crate::manager::ManagerSessionStart`] the most recent `start_manager_session` was
+    /// given, or `None` when the fake was never asked to run a manager session. Recorded so a worker
+    /// test can assert the manager provisioning produced the expected empty cwd / config dir / run
+    /// timeout (STUDIO-1049).
+    last_manager_start: Option<crate::manager::ManagerSessionStart>,
 }
 
 impl Fake {
@@ -137,6 +142,12 @@ impl Fake {
     /// [`Session::set_model_override`]; `None` when the caller never called it (STUDIO-868).
     pub fn last_model_override(&self) -> Option<crate::ModelOverride> {
         self.lock().last_model_override.clone()
+    }
+
+    /// The manager session start the most recent `start_manager_session` was given; `None` when the
+    /// fake never ran one (STUDIO-1049).
+    pub fn last_manager_start(&self) -> Option<crate::manager::ManagerSessionStart> {
+        self.lock().last_manager_start.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Recorded> {
@@ -200,6 +211,19 @@ impl Harness for Fake {
 
     fn capabilities(&self) -> &HarnessCapabilities {
         &self.capabilities
+    }
+
+    /// Answers a manager session exactly like an ordinary one, recording the request so a worker
+    /// test can assert the manager provisioning (STUDIO-1049). The fake stands in for the `claude`
+    /// harness the manager is pinned to.
+    fn start_manager_session(
+        &self,
+        req: crate::manager::ManagerSessionStart,
+        _issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.lock().last_manager_start = Some(req);
+        self.start_session_sync(transcript)
     }
 }
 

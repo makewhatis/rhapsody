@@ -544,6 +544,10 @@ fn worker_deps_for(
         // Per-dispatch and review-only (STUDIO-715): `spawn_worker` stamps it, and `None` keeps the
         // two existing provisioning paths exactly as they were.
         review: None,
+        // Per-dispatch and manager-only (STUDIO-1049): `spawn_worker` stamps both, and `None` keeps
+        // every existing provisioning path exactly as it was.
+        manager: None,
+        manager_root: String::new(),
         // Review-only (STUDIO-959): `spawn_worker` stamps the `gh` reads a delta round needs, and
         // `None` keeps every non-review run — and every delta-less review — byte-identical.
         review_delta: None,
@@ -1732,6 +1736,7 @@ impl Orchestrator {
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
+        manager: Option<crate::managerrun::ManagerCheckout>,
         prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
@@ -1751,6 +1756,18 @@ impl Orchestrator {
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
+        // Manager mode (STUDIO-1049): `Some` makes the worker provision an empty daemon-owned cwd
+        // and the isolated manager session posture instead of any checkout, and runs
+        // `manager.max_turns` turns on `manager.model`/`manager.effort`. `None` for every other run,
+        // which is byte-identical.
+        deps.manager_root = eff.cfg.workspace.root.clone();
+        if manager.is_some() {
+            deps.max_turns = self
+                .teams
+                .as_ref()
+                .map_or(deps.max_turns, |t| t.manager.max_turns);
+        }
+        deps.manager = manager;
         // A delta review round's `gh` reads (STUDIO-959), built only for a review dispatch and
         // handed to the worker's own off-loop task. The summon token is `GH::new`'s only
         // construction input and the compare/comments reads do not use it, so a daemon with no

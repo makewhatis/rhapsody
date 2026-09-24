@@ -43,6 +43,34 @@ pub const MANAGER_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// contract; §4.7's self-test verifies the CLI honours it).
 pub const MANAGER_SETTING_SOURCES: &str = "user";
 
+/// The extra env vars a manager run scrubs in addition to the tracker credential (§4.5):
+/// `GH_TOKEN` and `GITHUB_TOKEN` are dropped by name. This is additive to `scrub_child_env`'s
+/// tracker-credential scrub, which every run already applies.
+pub const MANAGER_DROP_ENV_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
+
+/// The three daemon-owned paths a manager run needs beyond the ordinary session start: the empty
+/// per-run working directory (§4.2 — there is no repository), the dedicated manager configuration
+/// directory (only the model credential), and the manager-only MCP config file. All three are
+/// provisioned by the worker and handed to [`crate::harness::Harness::start_manager_session`]; none
+/// of them is derived here, because provisioning them is the impure half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerSessionStart {
+    /// The empty, daemon-owned, per-run working directory (no repository, no checkout).
+    pub cwd: String,
+    /// The dedicated manager configuration directory: only the model credential, none of the
+    /// operator's user-level configuration. The adapter writes the manager-only MCP config file into
+    /// this directory (it owns the daemon binary and workflow paths the config names).
+    pub config_dir: String,
+    /// `manager.run_timeout_ms` (§10.1): the run's wall-clock ceiling, applied as the session's turn
+    /// timeout. Zero is the ordinary configured turn timeout.
+    pub run_timeout_ms: u64,
+}
+
+/// The manager-only MCP config file's path inside the dedicated manager configuration directory
+/// (§4.2). [`crate::harness::Harness::start_manager_session`]'s claude implementation writes it;
+/// nothing else writes or reads it, and only this file name is ever passed to `--mcp-config`.
+pub const MANAGER_MCP_CONFIG_FILE: &str = "manager-mcp.json";
+
 /// Every MCP tool a manager run may call (§4.4). This is exactly [`MANAGER_MCP_TOOLS`]; a tool
 /// absent from this list is not registered by the manager role and is rejected on call.
 ///

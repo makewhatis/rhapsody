@@ -405,6 +405,9 @@ impl Orchestrator {
         // consumed the way a graphite stacking hint is. `None` for every ticket dispatch, which
         // leaves the rest of this function byte-identical to a daemon built before review mode.
         let review = self.pending_review.remove(&iss.id);
+        // Manager-run coordinates staged by `dispatch_manager` for THIS dispatch (STUDIO-1049),
+        // consumed exactly as a review's are. `None` for every ticket/review dispatch.
+        let manager = self.pending_manager.remove(&iss.id);
         // A review key without its coordinates must never be dispatched. It would take the ordinary
         // provisioning path — a `symphony/pr_owner_repo_n_reviewer` BRANCH worktree off the default
         // branch, which is the one thing review mode exists to avoid — and the agent would review
@@ -412,7 +415,10 @@ impl Orchestrator {
         // caller that can supply them, so this makes "a `pr:` id is dispatched as a review or not at
         // all" structural rather than a property of who happens to call. Unreachable from any Go
         // path: a tracker identifier can never carry the prefix, so parity is untouched.
-        if review.is_none() && crate::review::is_review_key(&iss.id) {
+        //
+        // A MANAGER key is also a `pr:` key, so its own coordinates (`pending_manager`) satisfy this
+        // guard the same way. A key with neither is refused.
+        if review.is_none() && manager.is_none() && crate::review::is_review_key(&iss.id) {
             tracing::warn!(
                 issue_id = %iss.id,
                 "refusing to dispatch a review key with no review coordinates"
@@ -532,6 +538,23 @@ impl Orchestrator {
                 re.model_override.identity = String::new();
             }
         }
+        // The manager run's model/effort come from M6's config (`manager.model` / `manager.effort`)
+        // and its harness is always `claude` (design §4.1 — config validation refuses any other while
+        // authority is not off). `manager` is `Some` only for a run `dispatch_manager` staged in
+        // `pending_manager`, so no other dispatch reaches this. The base model/effort are landed as a
+        // model_override, exactly as a routed profile's would be, so the session's argv and the run's
+        // provenance both describe what actually ran.
+        if manager.is_some() {
+            if let Some(teams) = self.teams.as_ref() {
+                if !teams.manager.model.is_empty() {
+                    re.model_override.model = teams.manager.model.clone();
+                }
+                if !teams.manager.effort.is_empty() {
+                    re.model_override.effort = teams.manager.effort.clone();
+                }
+            }
+            re.harness = "claude".to_string();
+        }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {
@@ -560,7 +583,9 @@ impl Orchestrator {
         // that never happened. Only an EMPTY name — a dispatch routed to a profile that names none —
         // resolves to the configured backend.
         let actual_harness = self.effective_harness(&re.harness);
-        re.harness_origin = if re.harness.is_empty() {
+        re.harness_origin = if manager.is_some() {
+            "manager.harness".to_string()
+        } else if re.harness.is_empty() {
             "agent.backend".to_string()
         } else {
             "profile".to_string()
@@ -573,6 +598,8 @@ impl Orchestrator {
                 Some(_) => "review.model".to_string(),
                 None => format!("review.model.{actual_harness}"),
             }
+        } else if manager.is_some() && !re.model_override.model.is_empty() {
+            "manager.model".to_string()
         } else if !re.model_override.model.is_empty() {
             "profile".to_string()
         } else {
@@ -684,6 +711,12 @@ impl Orchestrator {
         let model_override = re.model_override.clone();
         let harness = re.harness.clone();
         let review_checkout = review.as_ref().map(crate::review::ReviewRun::checkout);
+        // The manager run's worker-facing coordinates (STUDIO-1049), snapshotted like the review's.
+        // The run timeout comes from M6's config; `None` for every non-manager dispatch.
+        let manager_checkout = manager.as_ref().map(|m| {
+            let run_timeout_ms = self.teams.as_ref().map_or(0, |t| t.manager.run_timeout_ms);
+            m.checkout(run_timeout_ms)
+        });
         // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
         // the runner treats as "unknown" and emits no env for (STUDIO-675).
         let run_id = re.run_id;
@@ -718,6 +751,7 @@ impl Orchestrator {
                 run_id,
                 started_at,
                 review_checkout,
+                manager_checkout,
                 prepared,
             );
         }
@@ -889,6 +923,15 @@ impl Orchestrator {
         // path does the bookkeeping instead — for a failed exit as well as a clean one.
         if let Some(run) = re.review.as_ref() {
             self.on_review_exit(&re, run, &e);
+            self.rearm_tick_for_held_capacity();
+            return;
+        }
+        // A manager run's `pr:` key resolves to no ticket either, so `classify_clean_exit` cannot
+        // serve it for the same reason (STUDIO-1049). Its own exit path ends the run and schedules no
+        // retry; M8 owns the decision effects. Detected by the key, which only a manager launch can
+        // mint.
+        if crate::managerrun::is_manager_key(&re.issue.id) {
+            self.on_manager_exit(&re, &e);
             self.rearm_tick_for_held_capacity();
             return;
         }

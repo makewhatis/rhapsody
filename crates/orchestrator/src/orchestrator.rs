@@ -614,6 +614,14 @@ pub struct Orchestrator {
     /// `pending_stack` is). The worker spawn happens inside `dispatch_issue`, so the pinned head has
     /// to be in place before the call rather than stamped on afterwards. STUDIO-715.
     pub(crate) pending_review: crate::review::PendingReviews,
+    /// Manager-run coordinates carried from [`Orchestrator::dispatch_manager`] to the
+    /// `dispatch_issue` it makes (written and consumed on the control task, exactly as
+    /// `pending_review` is). STUDIO-1049.
+    pub(crate) pending_manager: crate::managerrun::PendingManagers,
+    /// The §4.7 startup self-test's recorded verdict (STUDIO-1049), behind a lock because the boot
+    /// gate (off the control task) writes it and [`Orchestrator::manager_launch_permitted`] reads it.
+    /// A version change invalidates it; see [`crate::managerselftest::ManagerSelfTestState`].
+    pub(crate) manager_selftest: crate::managerselftest::ManagerSelfTestState,
     /// How many review ROUNDS each watched pull request has been given this daemon lifetime — the
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
@@ -1135,6 +1143,8 @@ impl Orchestrator {
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
+            pending_manager: HashMap::new(),
+            manager_selftest: crate::managerselftest::ManagerSelfTestState::default(),
             review_rounds: HashMap::new(),
             author_rounds_pending: HashMap::new(),
             auto_merge_announced: HashMap::new(),

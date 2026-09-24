@@ -136,6 +136,7 @@ impl crate::Runner for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            manager_config_dir: None,
         }))
     }
 }
@@ -178,6 +179,58 @@ impl Harness for Runner {
     fn capabilities(&self) -> &HarnessCapabilities {
         &CAPABILITIES
     }
+
+    /// The manager run's isolated launch (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3):
+    /// a session whose every security-relevant flag is the [`crate::manager::manager_config`]
+    /// posture — `--permission-mode default`, the manager MCP tools as the only allowlist, every
+    /// built-in denied, `--mcp-config` + `--strict-mcp-config`, `--setting-sources user` — running in
+    /// the empty daemon-owned cwd, with `CLAUDE_CONFIG_DIR` pointed at the dedicated manager
+    /// configuration directory and `GH_TOKEN`/`GITHUB_TOKEN` scrubbed.
+    ///
+    /// The model and effort come from the base config (`self.cfg`) and can be overridden via
+    /// [`Session::set_model_override`], exactly as an ordinary run's can.
+    fn start_manager_session(
+        &self,
+        req: crate::manager::ManagerSessionStart,
+        issue: rhapsody_core::Issue,
+        transcript: Option<crate::Transcript>,
+    ) -> Result<Box<dyn crate::Session>, crate::AgentError> {
+        let (name, base_args) = split_command(&self.cfg.command)?;
+        // Write the manager-only MCP config (§4.2) into the dedicated config dir. The adapter owns
+        // the daemon binary and workflow paths the document names, so it is the one place that can
+        // build it. A write failure is a typed startup failure — the run must not start against a
+        // config the operator's own servers could leak into.
+        let mcp_path = std::path::Path::new(&req.config_dir)
+            .join(crate::manager::MANAGER_MCP_CONFIG_FILE)
+            .to_string_lossy()
+            .into_owned();
+        let doc = crate::manager::manager_mcp_config(&self.cfg.daemon_bin, &self.cfg.workflow_path);
+        if let Err(e) = std::fs::write(&mcp_path, doc) {
+            return Err(crate::AgentError::Other(format!(
+                "manager_mcp_config_write_failed: {e}"
+            )));
+        }
+        let cfg = crate::manager::manager_config(&self.cfg, &mcp_path);
+        let mut cfg = cfg;
+        if req.run_timeout_ms > 0 {
+            cfg.turn_timeout = std::time::Duration::from_millis(req.run_timeout_ms);
+        }
+        Ok(Box::new(ClaudeSession {
+            cfg,
+            cmd_name: name,
+            cmd_args: base_args,
+            ws_path: req.cwd,
+            issue,
+            thread_id: Mutex::new(String::new()),
+            turn_n: AtomicI64::new(0),
+            transcript: Mutex::new(transcript),
+            transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
+            manager_config_dir: Some(req.config_dir),
+        }))
+    }
 }
 
 /// One live Claude conversation for one issue (Go `session`). Per-turn state that Go mutates on the
@@ -218,6 +271,12 @@ struct ClaudeSession {
     /// nobody or whose profile names neither, which leaves the argv byte-identical (STUDIO-868).
     /// Behind a `Mutex` for the same reason `review_head` is.
     model_override: Mutex<crate::ModelOverride>,
+    /// The dedicated manager configuration directory (STUDIO-1049; design
+    /// `manager-agent-design.md` §4.2, §4.5). `Some` makes THIS session a manager run: every turn
+    /// drops `GH_TOKEN`/`GITHUB_TOKEN` in addition to the tracker credential, and injects
+    /// `CLAUDE_CONFIG_DIR` pointing here so none of the operator's user-level hooks, plugins, MCP
+    /// servers or permission rules load. `None` on every non-manager run, which is byte-identical.
+    manager_config_dir: Option<String>,
 }
 
 impl ClaudeSession {
@@ -419,6 +478,15 @@ impl Session for ClaudeSession {
         } else {
             TRACKER_ENV_VARS.to_vec()
         };
+        // §4.5: a manager run also drops GH_TOKEN and GITHUB_TOKEN, in addition to the tracker
+        // credential the scrub below withholds by name AND value. Additive; `None` for every
+        // non-manager run, so their env is byte-identical.
+        let mut drop_names = drop_names;
+        if self.manager_config_dir.is_some() {
+            for name in crate::manager::MANAGER_DROP_ENV_VARS {
+                drop_names.push(name);
+            }
+        }
         let base_env: Vec<String> = std::env::vars_os()
             .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
             .collect();
@@ -429,7 +497,13 @@ impl Session for ClaudeSession {
             self.run_id.load(Ordering::SeqCst),
         );
         // Review-mode only, and additive: empty (every non-review run) emits nothing (STUDIO-715).
-        let env = append_review_env(env, &self.locked_review_head());
+        let mut env = append_review_env(env, &self.locked_review_head());
+        // §4.2: a manager run relocates Claude Code's config root to the dedicated directory, so
+        // none of the operator's user-level hooks, plugins, MCP servers or permission rules load.
+        // `None` for every non-manager run, so its env is byte-identical.
+        if let Some(dir) = &self.manager_config_dir {
+            env.push(format!("{}={dir}", crate::manager::MANAGER_CONFIG_DIR_ENV));
+        }
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -1669,6 +1743,78 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
             std::env::remove_var("LINEAR_API_KEY");
             std::env::remove_var("MY_CUSTOM_TRACKER");
+            std::env::remove_var("KEEP_ME");
+        }
+    }
+
+    // STUDIO-1049 §4.2/§4.5: a MANAGER session relocates the config root, drops GH_TOKEN /
+    // GITHUB_TOKEN in addition to the tracker credential, and runs the manager argv posture.
+    //
+    // Mutation: drop the `manager_config_dir` branch in `run_turn` and GH_TOKEN/GITHUB_TOKEN survive
+    // (the test reds); drop the CLAUDE_CONFIG_DIR push and the config-root assertion reds.
+    #[tokio::test]
+    async fn manager_session_scrubs_github_env_and_sets_the_config_dir() {
+        let _env = ENV_GUARD.write().await; // exclusive: mutates the process environment
+        let tracker_secret = "lin_api_value_secret_mgr";
+        unsafe {
+            std::env::set_var("GH_TOKEN", "gh-should-be-scrubbed");
+            std::env::set_var("GITHUB_TOKEN", "ghs-should-be-scrubbed");
+            std::env::set_var("LINEAR_API_KEY", tracker_secret);
+            std::env::set_var("KEEP_ME", "ok");
+        }
+        let root = TempDir::new();
+        let cwd = make_ws(&root, "MT-MGR");
+        let config_dir = make_ws(&root, "MT-MGR-config");
+        let (_s, script) = env_dump_script();
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(5),
+            tracker_api_key: tracker_secret.to_string(),
+            ..Default::default()
+        });
+        let req = crate::manager::ManagerSessionStart {
+            cwd: cwd.clone(),
+            config_dir: config_dir.clone(),
+            run_timeout_ms: 0,
+        };
+        let sess = r
+            .start_manager_session(req, issue("m1", "MT-MGR"), None)
+            .expect("start manager session");
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "run_turn err = {err:?}");
+        let env = read_env_dump(&format!("{cwd}/env.dump"));
+        for name in crate::manager::MANAGER_DROP_ENV_VARS {
+            assert!(
+                !env.contains_key(*name),
+                "manager run: {name} must be scrubbed"
+            );
+        }
+        assert!(
+            !env.contains_key("LINEAR_API_KEY"),
+            "manager run: the tracker key must still be scrubbed"
+        );
+        assert_eq!(
+            env.get(crate::manager::MANAGER_CONFIG_DIR_ENV)
+                .map(String::as_str),
+            Some(config_dir.as_str()),
+            "the dedicated manager config dir must be exported"
+        );
+        assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("ok"));
+        // The manager-only MCP config file was written, and it names the manager role.
+        let mcp = std::fs::read_to_string(
+            std::path::Path::new(&config_dir).join(crate::manager::MANAGER_MCP_CONFIG_FILE),
+        )
+        .expect("manager mcp config written");
+        assert!(
+            mcp.contains("\"manager\""),
+            "mcp config names the role: {mcp}"
+        );
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("LINEAR_API_KEY");
             std::env::remove_var("KEEP_ME");
         }
     }

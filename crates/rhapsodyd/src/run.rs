@@ -415,6 +415,18 @@ where
         // BEFORE the config is injected/cloned anywhere, so every consumer sees the effective
         // authority and the Noop store can never accept `act`.
         enforce_manager_storage_requirement(&mut teams_cfg, durable_store);
+        // STUDIO-1049 (§4.7/§10.2): before any authority other than `off` takes effect, verify the
+        // installed `claude` CLI honours the manager tool contract with a canary launch. Fail closed:
+        // any successful attempt, an unexercised attempt, or a canary that cannot run forces the
+        // authority back to `off` and records the typed reason. The recorded verdict is what
+        // `manager_launch_permitted()` (and M8's launch gate) reads.
+        apply_manager_self_test(
+            &mut teams_cfg,
+            o.manager_selftest_state(),
+            resolved.as_ref(),
+            &flags.path.to_string_lossy(),
+        )
+        .await;
         o.teams = Some(teams_cfg.clone());
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
@@ -2109,6 +2121,65 @@ fn enforce_manager_storage_requirement(
          on-disk database to use it."
     );
     teams.manager.review_authority = effective;
+}
+
+/// STUDIO-1049 (§4.7/§10.2): before `manager.review_authority` other than `off` takes effect, run the
+/// startup self-test against the installed `claude` CLI. Fail closed — any successful attempt, an
+/// attempt not exercised, or a canary that cannot run (including an unprobeable CLI version) forces
+/// the authority back to `off` and records the typed reason, which items go to the human feed with.
+///
+/// `off` is skipped entirely, so a default installation boots without a model launch and is
+/// byte-identical.
+async fn apply_manager_self_test(
+    teams: &mut rhapsody_config::teams::Teams,
+    selftest: &rhapsody_orchestrator::managerselftest::ManagerSelfTestState,
+    resolved: Option<&rhapsody_config::Config>,
+    workflow_path: &str,
+) {
+    use rhapsody_config::teams::ReviewAuthority;
+    if teams.manager.review_authority == ReviewAuthority::Off {
+        return;
+    }
+    let command = resolved.map_or_else(|| "claude".to_string(), |c| c.claude.command.clone());
+    let workspace_root = resolved.map_or_else(String::new, |c| c.workspace.root.clone());
+    let cli_version = match rhapsody_orchestrator::managerselftest::probe_cli_version(&command) {
+        Ok(v) => v,
+        Err(e) => {
+            // No version ⇒ no passing record ⇒ the gate refuses. Typed reason to the human feed.
+            selftest.set_installed_version(None);
+            teams.manager.review_authority = ReviewAuthority::Off;
+            tracing::warn!(
+                reason = %format!("manager unavailable: cannot determine the claude CLI version: {e}"),
+                "manager self-test could not run; manager disabled"
+            );
+            return;
+        }
+    };
+    let daemon_bin = std::env::current_exe()
+        .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
+    let runner = rhapsody_orchestrator::managerselftest::CliCanaryRunner {
+        command,
+        workspace_root,
+        daemon_bin,
+        workflow_path: workflow_path.to_string(),
+    };
+    let mut authority = teams.manager.review_authority;
+    let reason = rhapsody_orchestrator::managerselftest::run_boot_self_test(
+        &runner,
+        selftest,
+        &mut authority,
+        &cli_version,
+    )
+    .await;
+    teams.manager.review_authority = authority;
+    if let Some(reason) = reason {
+        tracing::warn!(
+            reason = %reason.message(),
+            "manager self-test failed; manager disabled and its items go to the human feed"
+        );
+    } else {
+        tracing::info!(cli_version = %cli_version, "manager self-test passed");
+    }
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
