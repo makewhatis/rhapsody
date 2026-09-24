@@ -54,6 +54,7 @@ pub mod liveness;
 pub mod managerapproval;
 pub mod managerdecision;
 pub mod managerexchange;
+pub mod managerprep;
 pub mod mergeconsole;
 pub mod message;
 pub mod obslog;
@@ -127,6 +128,7 @@ pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use handoff::HandoffResult;
 pub use lifecycle::{IssueKey, IssueLifecycle, IssueLifecycleRow, LIFECYCLE_TTL};
+pub use managerprep::ManagerArbiter;
 pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
 pub use preflight::{
