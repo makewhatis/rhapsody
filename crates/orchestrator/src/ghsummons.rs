@@ -546,6 +546,65 @@ impl PrCommentSink for GH {
     }
 }
 
+/// The result of reading a pull request's comment bodies (STUDIO-1016).
+pub type PrCommentSearchResult = Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Reads a pull request's existing comment bodies, so the manager applier can reconcile a comment
+/// request that timed out or errored by searching for its hidden marker (§7.6). `PrCommentSink`
+/// only writes; this is the read half, kept separate for that trait's reason — a capability is a
+/// separate trait so a task handed only one of them cannot do the other.
+#[async_trait]
+pub trait PrCommentSearch: Send + Sync {
+    /// Every comment body on `owner/repo#number` (issue comments, oldest first).
+    async fn pr_comment_bodies(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> PrCommentSearchResult;
+}
+
+#[async_trait]
+impl PrCommentSearch for GH {
+    /// One `gh api --paginate --slurp repos/<owner>/<repo>/issues/<number>/comments`.
+    async fn pr_comment_bodies(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> PrCommentSearchResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh api comments: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        let ep = format!("repos/{owner}/{repo}/issues/{number}/comments?per_page=100");
+        let body = self
+            .run_off_task(vec![
+                "api".to_string(),
+                "--paginate".to_string(),
+                "--slurp".to_string(),
+                ep.clone(),
+            ])
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh api {ep}: {e}").into()
+            })?;
+        let pages: Vec<Vec<serde_json::Value>> = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("decode {ep}: {e}").into() },
+        )?;
+        let mut out = Vec::new();
+        for page in pages {
+            for c in page {
+                if let Some(b) = c.get("body").and_then(|v| v.as_str()) {
+                    out.push(b.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// How a pull request is merged — the three strategies `gh pr merge` offers, as a CLOSED enum.
 ///
 /// A closed enum rather than a string is the point. The argv this feeds is assembled from these

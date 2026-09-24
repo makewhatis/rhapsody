@@ -547,6 +547,68 @@ pub trait Store {
     /// Idempotent.
     fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError>;
 
+    // --- manager wake obligations (STUDIO-1016; no Go counterpart — see [`ManagerWakeRow`]) --------
+
+    /// Writes one wake obligation, replacing the row with the same `intervention_id` if one exists.
+    /// The writer is the manager's activation transaction; M9 writes rows only, and M10 owns
+    /// admission and delivery.
+    fn save_manager_wake(&self, row: ManagerWakeRow) -> Result<(), StoreError>;
+
+    /// One intervention's wake obligation, or `None`.
+    fn manager_wake(&self, intervention_id: &str) -> Result<Option<ManagerWakeRow>, StoreError>;
+
+    /// Every wake obligation, oldest first (boot snapshot).
+    fn load_manager_wakes(&self) -> Result<Vec<ManagerWakeRow>, StoreError>;
+
+    /// Moves one obligation to `state`, recording `run_id` and `reason` (either may be empty/None).
+    /// Idempotent, and a no-op when `intervention_id` names no row.
+    fn set_manager_wake_state(
+        &self,
+        intervention_id: &str,
+        state: &str,
+        run_id: Option<i64>,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Whether `issue_id` has an UNSPENT wake obligation (`pending` — or `admitted` and not yet
+    /// `delivered`) for the generation it names. Ordinary selection skips such a ticket, so no
+    /// route-back dispatches without its seed while M10's admission loop is not yet in place.
+    fn manager_wake_unspent_for_issue(&self, issue_id: &str) -> Result<bool, StoreError>;
+
+    // --- the manager activation transaction (STUDIO-1016, §7.7) ----------------------------------
+
+    /// The ONE rule for every decision variant: nothing a decision grants takes effect until this
+    /// single SQLite transaction commits. On a passing verdict it atomically makes the pending
+    /// records effective, writes the exchange authorization and wake obligation, reserves the
+    /// post-threshold slot, sets `activated_at` and moves the state to `awaiting_effect` (or
+    /// `escalated`). On a refused verdict it cancels every pending record, records
+    /// `unapplied_explanation` and moves to `superseded`/`stale`.
+    ///
+    /// A confirmed external effect is one prerequisite, never permission to activate: the caller
+    /// computes [`ManagerActivationVerdict`] against current state, and the transaction re-reads the
+    /// durable generation and refuses when it has moved. A no-op store activates nothing.
+    fn activate_manager_intervention(
+        &self,
+        request: ManagerActivation,
+    ) -> Result<ManagerActivationOutcome, StoreError>;
+
+    /// Sets one intervention's §11 outcome, ONCE (`UPDATE … WHERE outcome IS NULL`). A second call
+    /// is a no-op, so an outcome can never be overwritten (§11.2).
+    fn record_manager_outcome(
+        &self,
+        intervention_id: &str,
+        outcome: &str,
+        now: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Sets one intervention's memory-mirror state (§11.3). Never fails the decision: a memory
+    /// failure leaves the decision applied and the state `pending` for a retry.
+    fn set_manager_memory_state(
+        &self,
+        intervention_id: &str,
+        memory_state: &str,
+    ) -> Result<(), StoreError>;
+
     // --- evidence-access log (STUDIO-1014, §5.5; no Go counterpart — see [`EvidenceAccess`]) ---
 
     /// Appends one host-served evidence read (a diff or interdiff served to a manager run). The

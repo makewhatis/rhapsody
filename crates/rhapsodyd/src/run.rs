@@ -1317,6 +1317,41 @@ where
         )
     });
     o.adjudication_ledger = adjudication_ledger.clone();
+
+    // The manager APPLIER task (STUDIO-1016, §7.6): the off-loop half that performs a validated
+    // decision's external effects — the mandatory explanation comment and the `ROUTE_TO_AUTHOR`
+    // ticket move — behind the control task's cheap §8.3 check before each one. Built on
+    // `spawn_watcher`'s condition like the ledgers above: with no review watcher there is no manager
+    // run, so no decision is ever validated and the task has nothing to do.
+    //
+    // The control-task sender rides on `o.manager_apply`; the receiver is this task's. `None` would
+    // simply mean effects are retried on recovery rather than applied, which is safe (they are
+    // idempotent by marker), but on a review-enabled install the real task is installed here.
+    let manager_apply_task = spawn_watcher.then(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        o.manager_apply = Some(Arc::new(
+            rhapsody_orchestrator::runmanagerapply::ManagerApplyChannel(tx),
+        ));
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
+        let deps = rhapsody_orchestrator::runmanagerapply::ManagerApplyDeps {
+            control: handle.clone(),
+            comments: Some(
+                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrCommentSink>
+            ),
+            search: Some(
+                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrCommentSearch>
+            ),
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::runmanagerapply::run_manager_apply_task(rx, deps).await;
+        })
+    });
     // One room handle for this process (see `triage_room` above): the adjudication posts its
     // decision there, and a second `LocalRoom` over the same directory would mint a second append
     // lock. Taken before `o` moves into the control task.
@@ -1554,6 +1589,12 @@ where
     // The breaker task is cancelled by the same signal and checks it on both sides of its receive,
     // so the wait is bounded by whatever tracker write or notification is already in flight.
     if let Some(t) = breaker_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The manager applier task (STUDIO-1016) is drained last of the review tasks: its receive ends
+    // when the control task drops the orchestrator (and with it the sender), so the wait is bounded
+    // by whatever `gh pr comment` or ticket move is already in flight.
+    if let Some(t) = manager_apply_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as

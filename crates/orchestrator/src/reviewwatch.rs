@@ -4610,6 +4610,56 @@ mod tests {
         ) -> Result<(), rs::StoreError> {
             self.0.save_manager_intervention(row)
         }
+
+        fn save_manager_wake(&self, row: rs::ManagerWakeRow) -> Result<(), rs::StoreError> {
+            self.0.save_manager_wake(row)
+        }
+
+        fn manager_wake(&self, id: &str) -> Result<Option<rs::ManagerWakeRow>, rs::StoreError> {
+            self.0.manager_wake(id)
+        }
+
+        fn load_manager_wakes(&self) -> Result<Vec<rs::ManagerWakeRow>, rs::StoreError> {
+            self.0.load_manager_wakes()
+        }
+
+        fn set_manager_wake_state(
+            &self,
+            id: &str,
+            state: &str,
+            run_id: Option<i64>,
+            reason: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_wake_state(id, state, run_id, reason)
+        }
+
+        fn manager_wake_unspent_for_issue(&self, issue_id: &str) -> Result<bool, rs::StoreError> {
+            self.0.manager_wake_unspent_for_issue(issue_id)
+        }
+
+        fn activate_manager_intervention(
+            &self,
+            request: rs::ManagerActivation,
+        ) -> Result<rs::ManagerActivationOutcome, rs::StoreError> {
+            self.0.activate_manager_intervention(request)
+        }
+
+        fn record_manager_outcome(
+            &self,
+            id: &str,
+            outcome: &str,
+            now: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.record_manager_outcome(id, outcome, now)
+        }
+
+        fn set_manager_memory_state(
+            &self,
+            id: &str,
+            memory_state: &str,
+        ) -> Result<(), rs::StoreError> {
+            self.0.set_manager_memory_state(id, memory_state)
+        }
         fn manager_intervention(
             &self,
             id: &str,

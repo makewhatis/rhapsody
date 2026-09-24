@@ -229,7 +229,11 @@ impl Orchestrator {
     /// The shared resolution both triggers end in: the configured state NAME plus the opaque
     /// tracker ids the move needs, resolved BEFORE it leaves the control task so the off-loop half
     /// makes one call and has no decision left to get wrong.
-    fn resolve_route_back(&self, pr: &str, identifier: &str) -> Option<ReviewChangesPlan> {
+    pub(crate) fn resolve_route_back(
+        &self,
+        pr: &str,
+        identifier: &str,
+    ) -> Option<ReviewChangesPlan> {
         let state = self.teams.as_ref()?.review_changes_state()?.to_string();
         // The opaque tracker ids the move needs live on the run that produced the pull request. The
         // LATEST run of that ticket, because a retried ticket has several and they all carry the

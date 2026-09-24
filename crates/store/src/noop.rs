@@ -418,6 +418,51 @@ impl Store for Noop {
     fn invalidate_manager_exchanges(&self, _pr: &str) -> Result<(), StoreError> {
         Ok(())
     }
+    // STUDIO-1016: with persistence off there is nowhere to remember a wake obligation, and
+    // `review_authority` other than `off` already requires durable storage. The fail-closed
+    // direction: no wake rows exist, and `activate_manager_intervention` activates nothing.
+    fn save_manager_wake(&self, _row: ManagerWakeRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_wake(&self, _intervention_id: &str) -> Result<Option<ManagerWakeRow>, StoreError> {
+        Ok(None)
+    }
+    fn load_manager_wakes(&self) -> Result<Vec<ManagerWakeRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn set_manager_wake_state(
+        &self,
+        _intervention_id: &str,
+        _state: &str,
+        _run_id: Option<i64>,
+        _reason: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn manager_wake_unspent_for_issue(&self, _issue_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn activate_manager_intervention(
+        &self,
+        _request: ManagerActivation,
+    ) -> Result<ManagerActivationOutcome, StoreError> {
+        Ok(ManagerActivationOutcome::Absent)
+    }
+    fn record_manager_outcome(
+        &self,
+        _intervention_id: &str,
+        _outcome: &str,
+        _now: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_manager_memory_state(
+        &self,
+        _intervention_id: &str,
+        _memory_state: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
     // STUDIO-1014: with persistence off the host has nowhere to record what it served, so M3's §6.4
     // condition 3 finds no evidence coverage — the fail-closed direction, and why `review_authority`
     // other than `off` requires durable storage.
