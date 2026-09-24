@@ -1105,4 +1105,32 @@ mod tests {
             "an ambiguous midnight must resolve to the earlier instant (-04), not the later (-05)"
         );
     }
+
+    /// STUDIO-979 introduces a brokered provider day budget keyed by the UTC day, DELIBERATELY
+    /// separate from this meter's LOCAL-day view. This pins that separation for one instant:
+    /// 2024-01-01T10:30:00Z is 2024-01-01 in UTC, but the +14 zone's local day has already rolled to
+    /// 2024-01-02 (its midnight is 2024-01-01T10:00:00Z) while the -11 zone is still on 2023-12-31
+    /// (its day started at 2023-12-31T11:00:00Z). `providerbudget.rs`'s
+    /// `the_day_key_is_the_utc_day_not_the_callers_zone` asserts the SAME instant buckets to the UTC
+    /// day — so the two quantities are proven distinct, and this local view is unchanged by the new
+    /// authority.
+    #[test]
+    fn the_local_day_view_stays_local_for_the_brokered_authoritys_instant() {
+        use chrono::{FixedOffset, Utc};
+
+        // 2024-01-01T10:30:00Z.
+        let instant = DateTime::<Utc>::from_timestamp(1_704_105_000, 0).expect("valid instant");
+        let east = FixedOffset::east_opt(14 * 3_600).expect("valid +14");
+        let west = FixedOffset::west_opt(11 * 3_600).expect("valid -11");
+        assert_eq!(
+            day_start(instant.with_timezone(&east)),
+            "2024-01-01T10:00:00Z",
+            "the +14 local day starts at its own midnight, one calendar day later than UTC"
+        );
+        assert_eq!(
+            day_start(instant.with_timezone(&west)),
+            "2023-12-31T11:00:00Z",
+            "the -11 local day started a calendar day earlier than UTC"
+        );
+    }
 }

@@ -2987,8 +2987,14 @@ mod tests {
         let dir = TempDir::new();
         let wf = write_wf(&dir, OFF_STORAGE, DAY_CAP_PROVIDER);
         let buf = SharedBuf::new();
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_now(&[&wf.to_string_lossy()], &buf),
+        )
+        .await
+        .expect("a missing boot refusal must fail this assertion, not hang the test binary");
         assert_ne!(
-            run_now(&[&wf.to_string_lossy()], &buf).await,
+            code,
             0,
             "a day cap over a disabled store must refuse; stderr={}",
             buf.contents()
@@ -3008,8 +3014,14 @@ mod tests {
         let dir = TempDir::new();
         let wf = write_wf(&dir, "storage:\n  path: \":memory:\"\n", DAY_CAP_PROVIDER);
         let buf = SharedBuf::new();
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_now(&[&wf.to_string_lossy()], &buf),
+        )
+        .await
+        .expect("a missing boot refusal must fail this assertion, not hang the test binary");
         assert_ne!(
-            run_now(&[&wf.to_string_lossy()], &buf).await,
+            code,
             0,
             "a day cap over an in-memory store must refuse; stderr={}",
             buf.contents()
