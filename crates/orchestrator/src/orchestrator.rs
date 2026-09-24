@@ -622,6 +622,16 @@ pub struct Orchestrator {
     /// gate (off the control task) writes it and [`Orchestrator::manager_launch_permitted`] reads it.
     /// A version change invalidates it; see [`crate::managerselftest::ManagerSelfTestState`].
     pub(crate) manager_selftest: std::sync::Arc<crate::managerselftest::ManagerSelfTestState>,
+    /// The off-loop manager APPLIER's inbox (STUDIO-1016, design §7.6): the control task hands it
+    /// [`ManagerApplyRequest`](crate::managerapply::ManagerApplyRequest)s and folds the results back
+    /// in through [`Orchestrator::handle_manager_effect`]. `None` in tests and whenever the manager
+    /// never applies (the composition root installs the real task). A missing applier means effects
+    /// are retried on recovery rather than applied inline on the control task.
+    pub manager_apply: Option<std::sync::Arc<dyn crate::managerapply::ManagerApplySink>>,
+    /// Intervention ids already handed to the off-loop applier THIS PROCESS, so a `validated` or
+    /// `applying` row is not re-submitted on every tick while its effects are in flight. A restart
+    /// starts empty, which is exactly how recovery re-submits after a crash. Control-task-confined.
+    pub(crate) manager_apply_submitted: std::collections::HashSet<String>,
     /// How many review ROUNDS each watched pull request has been given this daemon lifetime — the
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
@@ -1147,6 +1157,8 @@ impl Orchestrator {
             manager_selftest: std::sync::Arc::new(
                 crate::managerselftest::ManagerSelfTestState::default(),
             ),
+            manager_apply: None,
+            manager_apply_submitted: std::collections::HashSet::new(),
             review_rounds: HashMap::new(),
             author_rounds_pending: HashMap::new(),
             auto_merge_announced: HashMap::new(),

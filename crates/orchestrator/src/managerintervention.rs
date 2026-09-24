@@ -326,7 +326,7 @@ fn is_launch_candidate(state: &str) -> bool {
 
 /// Parse a lowercased store key (`owner/repo#number`) back into coordinates. `None` for a
 /// malformed key, which is a caller bug rather than a launch.
-fn parse_pr_key(key: &str) -> Option<PrCoord> {
+pub(crate) fn parse_pr_key(key: &str) -> Option<PrCoord> {
     let (repo_part, number) = key.rsplit_once('#')?;
     let (owner, repo) = repo_part.split_once('/')?;
     let number: i64 = number.parse().ok()?;
@@ -338,7 +338,7 @@ fn parse_pr_key(key: &str) -> Option<PrCoord> {
 
 /// The lowercased pull-request key a manager run's issue id names (`pr:owner/repo#n@manager` →
 /// `owner/repo#n`), or `None` for any other key.
-fn manager_pr_key(issue_id: &str) -> Option<String> {
+pub(crate) fn manager_pr_key(issue_id: &str) -> Option<String> {
     let rest = issue_id.strip_prefix(crate::review::REVIEW_KEY_PREFIX)?;
     let rest = rest.strip_suffix(crate::managerrun::MANAGER_KEY_SUFFIX)?;
     let coord = parse_pr_key(rest)?;
@@ -354,7 +354,7 @@ fn is_in_flight(state: &str) -> bool {
 /// recorded completions: the shared non-empty patch id when every completed row agrees, else empty.
 /// Empty never matches a stored completion (fail closed in `completion_approved_at_current_patch`),
 /// which is the cautious direction for a process with no `gh` read on this path.
-fn current_patch_id(rows: &[ManagerReviewRow]) -> String {
+pub(crate) fn current_patch_id(rows: &[ManagerReviewRow]) -> String {
     let mut seen: Option<String> = None;
     for r in rows {
         let Some(c) = r.completed.as_ref() else {
@@ -379,7 +379,7 @@ impl Orchestrator {
         self.manager_review_authority() != ReviewAuthority::Off
     }
 
-    fn manager_mode_token(&self) -> &'static str {
+    pub(crate) fn manager_mode_token(&self) -> &'static str {
         if self.manager_review_authority() == ReviewAuthority::Act {
             MANAGER_MODE_ACT
         } else {
@@ -535,7 +535,7 @@ impl Orchestrator {
     /// The §10.2 human-feed sentence for a pull request whose manager launch is refused by a
     /// deferral (drain/budget/credentials) or by the §4.7 CLI self-test, or `None` when the launch
     /// is not refused by one of those gates.
-    fn manager_surface_reason(&self, env: LaunchGateEnv) -> Option<String> {
+    pub(crate) fn manager_surface_reason(&self, env: LaunchGateEnv) -> Option<String> {
         match evaluate_launch_gates(env) {
             LaunchGate::Deferred(reason) => Some(reason.human().to_string()),
             LaunchGate::Unavailable => Some("manager unavailable: CLI contract".to_string()),
@@ -558,6 +558,11 @@ impl Orchestrator {
         // same tick, and before the lease sweep so the ordering matches the design (both are pure
         // control-task work).
         self.revalidate_saved_manager_decisions();
+
+        // §7.6/§7.7 (STUDIO-1016): begin applying validated decisions, recover `applying` rows, and
+        // complete or time out `awaiting_effect` rows. Local records are written here; the external
+        // effects run off-loop through the applier.
+        self.pump_manager_applying();
 
         // §7.5 recovery: any `launching`/`running` lease from another boot, or one that has
         // expired, becomes a `failed_attempt`. Fail CLOSED on a store read error — nothing is
@@ -744,14 +749,14 @@ impl Orchestrator {
     }
 
     /// The `manager.run_timeout_ms` default when Teams is absent.
-    fn manager_run_timeout_ms(&self) -> i64 {
+    pub(crate) fn manager_run_timeout_ms(&self) -> i64 {
         self.teams
             .as_ref()
             .map_or(1_800_000, |t| t.manager.run_timeout_ms)
     }
 
     /// Gather the §10.2 gate inputs for `pr`. Pure, synchronous reads of loop-owned state.
-    fn manager_gate_env(&self, pr: &str) -> LaunchGateEnv {
+    pub(crate) fn manager_gate_env(&self, pr: &str) -> LaunchGateEnv {
         let (labelled, primed) = self.human_holds.labelled_and_primed();
         let hold_active = self.manager_pr_held(pr, &labelled);
         let ticket = self.manager_pr_ticket(pr).unwrap_or_default();
@@ -769,7 +774,7 @@ impl Orchestrator {
 
     /// The origin ticket of the first live watch row for `pr`, if any (used by the hold and budget
     /// gates). `None` when the watch set cannot be read or holds no row for the pull request.
-    fn manager_pr_ticket(&self, pr: &str) -> Option<String> {
+    pub(crate) fn manager_pr_ticket(&self, pr: &str) -> Option<String> {
         let rows = self.store().load_live_review_watch().ok()?;
         rows.into_iter()
             .find(|r| {
@@ -782,7 +787,11 @@ impl Orchestrator {
     /// Whether any live watch row for `pr` has an origin ticket wearing the hold. Fails CLOSED on a
     /// store read error (`true`), because an unreadable watch set cannot show that the pull request
     /// is free of a hold — the direction §10.2 requires.
-    fn manager_pr_held(&self, pr: &str, labelled: &std::collections::HashSet<String>) -> bool {
+    pub(crate) fn manager_pr_held(
+        &self,
+        pr: &str,
+        labelled: &std::collections::HashSet<String>,
+    ) -> bool {
         let Ok(rows) = self.store().load_live_review_watch() else {
             return true;
         };
@@ -925,7 +934,7 @@ impl Orchestrator {
     }
 
     /// Advance a PARSED decision through the deterministic checks and the `decided` state (§7.2).
-    fn advance_manager_decision(
+    pub(crate) fn advance_manager_decision(
         &mut self,
         row: &ManagerInterventionRow,
         decision: &ManagerDecision,
@@ -996,7 +1005,7 @@ impl Orchestrator {
     /// revision-scoped on any M8 record, so they are carried as the permissive default here; the
     /// activation transaction re-evaluates them before anything takes effect, which is the boundary
     /// the design makes authoritative (§7.7).
-    fn revalidate_manager_decision(
+    pub(crate) fn revalidate_manager_decision(
         &self,
         row: &ManagerInterventionRow,
         decision: &ManagerDecision,
@@ -1083,7 +1092,7 @@ impl Orchestrator {
     /// NO model call. A `decided` row that revalidates to `validated` advances; one that no longer
     /// holds becomes `stale` (re-queued by the pump while the budgets allow) or `superseded`/`complete`.
     /// `advise` decisions are recorded, never applied, and end `proposed`.
-    fn revalidate_saved_manager_decisions(&self) {
+    pub(crate) fn revalidate_saved_manager_decisions(&self) {
         let Ok(rows) = self.store().load_manager_interventions() else {
             return;
         };
@@ -1131,7 +1140,11 @@ impl Orchestrator {
     }
 
     /// §6.2/§8.2: every `route.fix` revision the decision names is still an open finding.
-    fn manager_route_fix_still_open(&self, pr: &str, decision: &ManagerDecision) -> bool {
+    pub(crate) fn manager_route_fix_still_open(
+        &self,
+        pr: &str,
+        decision: &ManagerDecision,
+    ) -> bool {
         let DecisionKind::RouteToAuthor { fix, .. } = &decision.kind else {
             return true; // not a ROUTE_TO_AUTHOR decision; the input is unused for it
         };
@@ -1148,7 +1161,7 @@ impl Orchestrator {
     }
 
     /// §6.4 re-evaluated now for an APPROVE decision's `approval_still_eligible` input.
-    fn manager_approval_still_eligible(
+    pub(crate) fn manager_approval_still_eligible(
         &self,
         _row: &ManagerInterventionRow,
         decision: &ManagerDecision,
@@ -1203,7 +1216,7 @@ impl Orchestrator {
 
     /// §8.2: whether the decision's head is still one of the pull request's observed heads. With no
     /// observed head the answer is `true` — a head this process cannot read is not evidence it moved.
-    fn manager_head_unchanged(&self, pr: &str, head: &str) -> bool {
+    pub(crate) fn manager_head_unchanged(&self, pr: &str, head: &str) -> bool {
         if head.is_empty() {
             return true;
         }
@@ -1229,7 +1242,7 @@ impl Orchestrator {
     /// §7.2's `no_review_gap` fact read from the rows: every live reviewer row is approved at the
     /// current generation and patch. An empty live set is NOT satisfied (fail closed — a stall with
     /// no reviewer row is not "every row is satisfied").
-    fn manager_all_rows_satisfied(&self, pr: &str) -> bool {
+    pub(crate) fn manager_all_rows_satisfied(&self, pr: &str) -> bool {
         let rows = self.manager_review_rows(pr);
         let live = managerdecision::live_reviewer_rows(&rows);
         if live.is_empty() {
@@ -1252,7 +1265,7 @@ impl Orchestrator {
     }
 
     /// The daemon's finding ledger for `pr`, as M3's parser needs it (§6.1).
-    fn manager_known_findings(&self, pr: &str) -> Vec<KnownFinding> {
+    pub(crate) fn manager_known_findings(&self, pr: &str) -> Vec<KnownFinding> {
         self.store()
             .load_review_findings(pr)
             .unwrap_or_default()
@@ -1269,7 +1282,7 @@ impl Orchestrator {
     /// The pull request's live watch rows as approval/precondition eligibility sees them (§6.2,
     /// §6.4). `diff_covered` is carried `true`: M8 has no evidence-access reader, and the activation
     /// transaction re-evaluates §6.4 condition 3 against the real ledger before anything applies.
-    fn manager_review_rows(&self, pr: &str) -> Vec<ManagerReviewRow> {
+    pub(crate) fn manager_review_rows(&self, pr: &str) -> Vec<ManagerReviewRow> {
         let mut out = Vec::new();
         let Ok(watch) = self.store().load_live_review_watch() else {
             return out;
@@ -1292,14 +1305,14 @@ impl Orchestrator {
     }
 
     /// Record a `failed_attempt` (with its reason logged) so the pump may re-queue it (§7.2).
-    fn record_manager_failed_attempt(&self, row: &ManagerInterventionRow, reason: &str) {
+    pub(crate) fn record_manager_failed_attempt(&self, row: &ManagerInterventionRow, reason: &str) {
         tracing::warn!(pr = %row.pr, id = %row.id, reason = reason,
             "manager: recording a failed attempt");
         self.set_manager_state(row, MANAGER_INTERVENTION_FAILED_ATTEMPT);
     }
 
     /// Idempotent state write with a warn on failure.
-    fn set_manager_state(&self, row: &ManagerInterventionRow, state: &str) {
+    pub(crate) fn set_manager_state(&self, row: &ManagerInterventionRow, state: &str) {
         if let Err(e) = self.store().set_manager_intervention_state(&row.id, state) {
             tracing::warn!(pr = %row.pr, id = %row.id, err = %e,
                 "manager: writing the intervention state failed");
@@ -1328,7 +1341,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use rhapsody_config::teams::{Identity, Manager, Review, ReviewAuthority, ReviewMode, Teams};
-    use rhapsody_store::{Sqlite, StorePath};
+    use rhapsody_store::{
+        MANAGER_INTERVENTION_APPLY_FAILED, MANAGER_INTERVENTION_APPLYING,
+        MANAGER_INTERVENTION_AWAITING_EFFECT, Sqlite, StorePath,
+    };
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
@@ -1888,6 +1904,483 @@ mod tests {
         o.running.remove("pr:makewhatis/rhapsody#12@manager");
         o.claimed.remove("pr:makewhatis/rhapsody#12@manager");
         id
+    }
+
+    // --- STUDIO-1016: applying a decision ------------------------------------------------------
+
+    /// A recording applier: captures the requests the control task hands out and lets a test drive
+    /// the results back in, exactly as the real off-loop task would.
+    struct RecordingApply(
+        std::sync::Arc<std::sync::Mutex<Vec<crate::managerapply::ManagerApplyRequest>>>,
+    );
+    impl crate::managerapply::ManagerApplySink for RecordingApply {
+        fn submit(&self, request: crate::managerapply::ManagerApplyRequest) {
+            self.0.lock().expect("apply lock").push(request);
+        }
+    }
+
+    type ApplyRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<crate::managerapply::ManagerApplyRequest>>>;
+
+    fn install_applier(o: &mut Orchestrator) -> ApplyRequests {
+        let sink: ApplyRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        o.manager_apply = Some(std::sync::Arc::new(RecordingApply(std::sync::Arc::clone(
+            &sink,
+        ))));
+        sink
+    }
+
+    fn last_request(requests: &ApplyRequests) -> crate::managerapply::ManagerApplyRequest {
+        requests
+            .lock()
+            .expect("apply lock")
+            .last()
+            .cloned()
+            .expect("an apply request")
+    }
+
+    /// The `(effect, state)` result the real applier would send for every planned effect.
+    fn effect_result(
+        id: &str,
+        effects: &[&str],
+        state: &str,
+    ) -> crate::managerapply::ManagerEffectResult {
+        crate::managerapply::ManagerEffectResult {
+            intervention_id: id.to_string(),
+            pr: PR_KEY.to_string(),
+            outcomes: effects
+                .iter()
+                .map(|e| ((*e).to_string(), state.to_string()))
+                .collect(),
+            reason: String::new(),
+            halted: None,
+        }
+    }
+
+    fn seed_open_finding(o: &Orchestrator, finding: &str) {
+        // A test may seed before the intervention's launch created the generation row.
+        o.store()
+            .ensure_review_generation(PR_KEY)
+            .expect("generation");
+        let generation = o
+            .store()
+            .review_bound(PR_KEY)
+            .expect("bound")
+            .expect("row")
+            .generation;
+        o.store()
+            .save_review_finding(rhapsody_store::ReviewFindingRow {
+                pr: PR_KEY.to_string(),
+                generation,
+                reviewer: "alice".to_string(),
+                finding_id: finding.to_string(),
+                revision: 1,
+                review_run_id: 7,
+                raised_at_sha: "deadbeef".to_string(),
+                blocking: true,
+                status: rhapsody_store::REVIEW_FINDING_OPEN.to_string(),
+                ..rhapsody_store::ReviewFindingRow::default()
+            })
+            .expect("finding");
+        o.store().set_review_evidence_rev(PR_KEY, 1).expect("ev");
+    }
+
+    /// Drive a decision to `validated` (settle a clean exit), then through `begin_manager_apply`
+    /// (a pump), returning the intervention id and the requests the applier saw.
+    fn validated_then_applying(o: &mut Orchestrator, json: &str) -> (String, ApplyRequests) {
+        pass_self_test(o);
+        prime_holds(o);
+        seed_watch(o, "adopt:STUDIO-1");
+        let requests = install_applier(o);
+        let id = launch_running(o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(json))),
+        );
+        assert_eq!(state_of(o, &id), MANAGER_INTERVENTION_VALIDATED);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(o, &id), MANAGER_INTERVENTION_APPLYING);
+        (id, requests)
+    }
+
+    fn rerun_json(dismiss: &str) -> String {
+        format!(
+            r#"{{"decision":"RERUN_REVIEW","head":"deadbeef","evidence_rev":1,
+                "rerun":{{}},
+                "dismiss":[{dismiss}],
+                "rationale":"both reviewers need another look"}}"#
+        )
+    }
+
+    fn route_json(finding: &str) -> String {
+        format!(
+            r#"{{"decision":"ROUTE_TO_AUTHOR","head":"deadbeef","evidence_rev":1,
+                "route":{{"fix":[{{"finding":"{finding}","revision":1}}],"instructions":"fix it"}},
+                "rationale":"the finding needs code"}}"#
+        )
+    }
+
+    // A RERUN_REVIEW with dismissals and NO note still plans and posts the mandatory explanation
+    // (§15.4, "Mandatory explanations"). MUTATION: skip planning the explanation when the note is
+    // absent and the request carries no explanation body.
+    #[test]
+    fn a_rerun_with_dismissals_and_no_note_still_posts_the_explanation() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (_, requests) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        let req = last_request(&requests);
+        assert!(
+            req.effects
+                .contains(&crate::managerapply::MANAGER_EFFECT_EXPLANATION.to_string()),
+            "the explanation is mandatory: {:?}",
+            req.effects
+        );
+        assert!(
+            req.explanation.contains("RERUN_REVIEW"),
+            "{}",
+            req.explanation
+        );
+        assert!(req.explanation.contains("alice:F1"), "{}", req.explanation);
+        assert!(
+            req.explanation.contains("<!-- rhapsody-manager:"),
+            "{}",
+            req.explanation
+        );
+        assert!(
+            !req.explanation
+                .contains(rhapsody_core::SUMMON_TOKEN_SYMPHONY),
+            "no manager comment carries a summon token"
+        );
+    }
+
+    // A HOLD arriving after the explanation request starts but before it is acknowledged refuses
+    // activation (§15.4, "Activation boundary"). MUTATION: activate on the comment acknowledgement
+    // alone and this test goes green where it must refuse.
+    #[test]
+    fn a_hold_between_request_and_ack_refuses_activation() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        // The explanation request is out; a hold lands before the acknowledgement.
+        o.human_holds.note_human_label("STUDIO-1");
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_SUPERSEDED);
+        assert!(
+            row.unapplied_explanation,
+            "the posted explanation is unapplied"
+        );
+        // The dismissal never became effective.
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_OPEN.to_string()),
+        );
+    }
+
+    // An authority change in that same interval refuses activation (`superseded`).
+    #[test]
+    fn an_authority_change_between_request_and_ack_refuses_activation() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.teams.as_mut().expect("teams").manager.review_authority = ReviewAuthority::Off;
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_SUPERSEDED);
+    }
+
+    // Evidence moving at the same head — the `route.fix` revision the decision named is resolved —
+    // refuses activation as `stale` (§15.4, "Activation boundary": a same-head blocking review).
+    #[test]
+    fn a_route_whose_fix_revision_resolved_refuses_activation_as_stale() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        // The author resolves the finding while the explanation is in flight.
+        let generation = o
+            .store()
+            .review_bound(PR_KEY)
+            .expect("bound")
+            .expect("row")
+            .generation;
+        o.store()
+            .resolve_review_findings(PR_KEY, generation, "alice", "run-9")
+            .expect("resolve");
+        o.store().set_review_evidence_rev(PR_KEY, 2).expect("ev");
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[
+                crate::managerapply::MANAGER_EFFECT_EXPLANATION,
+                crate::managerapply::MANAGER_EFFECT_TICKET_MOVE,
+            ],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_STALE);
+    }
+
+    // §7.6: a DEFINITIVELY failed explanation leaves the dismissals ineffective and ends the
+    // generation (§15.4, "Mandatory explanations"). MUTATION: apply the dismissals without the
+    // explanation and the status assert reds.
+    #[test]
+    fn a_failed_explanation_leaves_the_dismissals_ineffective() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_FAILED,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLY_FAILED);
+        assert!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "a terminal effect failure stops the generation"
+        );
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_OPEN.to_string()),
+            "a failed explanation leaves the dismissal ineffective"
+        );
+    }
+
+    // §11.3: a memory failure leaves the decision APPLIED and `memory_state = pending` — it never
+    // re-runs or reverts. No memory backend is configured here, so the mirror fails.
+    #[test]
+    fn a_memory_failure_leaves_the_decision_applied_and_pending() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.state, MANAGER_INTERVENTION_AWAITING_EFFECT,
+            "the decision is applied"
+        );
+        assert_ne!(row.activated_at, "", "activation committed");
+        assert_eq!(
+            row.memory_state, "pending",
+            "the failed mirror stays pending"
+        );
+        // And the dismissal DID take effect — a memory failure reverts nothing.
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_DISMISSED.to_string()),
+        );
+    }
+
+    // §7.3: the post-threshold slot is reserved ONLY at activation. A REFUSED activation consumes
+    // none. MUTATION: reserve the slot at `applying` and this budget assert reds.
+    #[test]
+    fn a_refused_activation_reserves_no_slot() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        // Post-threshold: a configured threshold with one answered exchange charged, so the
+        // decision WOULD reserve a slot if it activated.
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 1;
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 12)),
+            1,
+        );
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .interventions_applied,
+            0,
+            "nothing is reserved while applying"
+        );
+        o.human_holds.note_human_label("STUDIO-1");
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_SUPERSEDED);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .interventions_applied,
+            0,
+            "a refused activation reserves no post-threshold slot"
+        );
+    }
+
+    // A successful activation writes the pending records effective atomically: the dismissal takes
+    // effect, the eligible row is re-requested, and the state is `awaiting_effect`.
+    #[test]
+    fn a_passing_activation_applies_the_decision() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_AWAITING_EFFECT);
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_DISMISSED.to_string()),
+        );
+    }
+
+    // §7.9: a `ROUTE_TO_AUTHOR` activation writes a wake obligation for the ticket, and ordinary
+    // selection skips it until the obligation is spent.
+    #[test]
+    fn a_route_activation_writes_a_wake_obligation_that_blocks_selection() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[
+                crate::managerapply::MANAGER_EFFECT_EXPLANATION,
+                crate::managerapply::MANAGER_EFFECT_TICKET_MOVE,
+            ],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+        let wake = o.store().manager_wake(&id).expect("wake").expect("row");
+        assert_eq!(wake.state, rhapsody_store::MANAGER_WAKE_PENDING);
+        assert_eq!(wake.issue_id, "STUDIO-1", "the origin ticket owns the wake");
+        assert_eq!(wake.pr, PR_KEY);
+        assert!(
+            o.manager_wake_blocks_selection(&wake.issue_id),
+            "a pending wake blocks ordinary selection"
+        );
+        o.store()
+            .set_manager_wake_state(&id, rhapsody_store::MANAGER_WAKE_DELIVERED, None, "")
+            .expect("deliver");
+        assert!(!o.manager_wake_blocks_selection(&wake.issue_id));
+    }
+
+    // §7.5/§7.7 recovery: a crash after the comment succeeded but BEFORE activation revalidates and
+    // refuses when current evidence invalidates the decision. MUTATION: skip revalidation in
+    // recovery and this test reds (the decision activates).
+    #[test]
+    fn a_restart_after_the_comment_revalidates_and_refuses() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(&mut o, &route_json("alice:F1"));
+        // The comment succeeded, but the daemon crashed before activation: mark the effect done
+        // locally, exactly as a recovery would find it.
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                effects_json: crate::managerapply::render_effects(&[
+                    crate::managerapply::ManagerEffect {
+                        effect: crate::managerapply::MANAGER_EFFECT_EXPLANATION.to_string(),
+                        state: crate::managerapply::MANAGER_EFFECT_DONE.to_string(),
+                    },
+                    crate::managerapply::ManagerEffect {
+                        effect: crate::managerapply::MANAGER_EFFECT_TICKET_MOVE.to_string(),
+                        state: crate::managerapply::MANAGER_EFFECT_DONE.to_string(),
+                    },
+                ]),
+                ..row.clone()
+            })
+            .expect("save effects");
+        // Meanwhile the evidence invalidates the decision: the named fix is resolved.
+        let generation = o
+            .store()
+            .review_bound(PR_KEY)
+            .expect("bound")
+            .expect("row")
+            .generation;
+        o.store()
+            .resolve_review_findings(PR_KEY, generation, "alice", "run-9")
+            .expect("resolve");
+        o.store().set_review_evidence_rev(PR_KEY, 2).expect("ev");
+        // Recovery runs on the next tick through the SAME activation path. No concurrent slot, so
+        // the stale row is not immediately relaunched and its state is observable.
+        o.teams.as_mut().expect("teams").manager.max_concurrent = 0;
+        o.pump_manager_interventions();
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_INTERVENTION_STALE,
+            "recovery refuses activation when current evidence invalidates the decision"
+        );
     }
 
     // A clean exit with a VALID decision moves the intervention to `decided` → `validated` via M3,

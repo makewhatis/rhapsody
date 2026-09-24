@@ -841,6 +841,55 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.save_manager_intervention(row)
         }
+
+        fn save_manager_wake(&self, row: rhapsody_store::ManagerWakeRow) -> Result<(), StoreError> {
+            self.0.save_manager_wake(row)
+        }
+
+        fn manager_wake(
+            &self,
+            id: &str,
+        ) -> Result<Option<rhapsody_store::ManagerWakeRow>, StoreError> {
+            self.0.manager_wake(id)
+        }
+
+        fn load_manager_wakes(&self) -> Result<Vec<rhapsody_store::ManagerWakeRow>, StoreError> {
+            self.0.load_manager_wakes()
+        }
+
+        fn set_manager_wake_state(
+            &self,
+            id: &str,
+            state: &str,
+            run_id: Option<i64>,
+            reason: &str,
+        ) -> Result<(), StoreError> {
+            self.0.set_manager_wake_state(id, state, run_id, reason)
+        }
+
+        fn manager_wake_unspent_for_issue(&self, issue_id: &str) -> Result<bool, StoreError> {
+            self.0.manager_wake_unspent_for_issue(issue_id)
+        }
+
+        fn activate_manager_intervention(
+            &self,
+            request: rhapsody_store::ManagerActivation,
+        ) -> Result<rhapsody_store::ManagerActivationOutcome, StoreError> {
+            self.0.activate_manager_intervention(request)
+        }
+
+        fn record_manager_outcome(
+            &self,
+            id: &str,
+            outcome: &str,
+            now: &str,
+        ) -> Result<(), StoreError> {
+            self.0.record_manager_outcome(id, outcome, now)
+        }
+
+        fn set_manager_memory_state(&self, id: &str, memory_state: &str) -> Result<(), StoreError> {
+            self.0.set_manager_memory_state(id, memory_state)
+        }
         fn manager_intervention(
             &self,
             id: &str,

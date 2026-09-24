@@ -444,6 +444,18 @@ pub enum Event {
         evidence_rev: i64,
         reply: oneshot::Sender<bool>,
     },
+    /// The §8.3 cheap check the manager applier makes before EACH external effect (STUDIO-1016). The
+    /// control task answers whether the decision still holds; anything but `Proceed` stops the
+    /// effect early. Loop-confined because the answer reads loop-owned state (the generation, the
+    /// hold set, the authority).
+    ManagerApplyCheck {
+        intervention_id: String,
+        reply: oneshot::Sender<crate::managerapply::PreEffectCheck>,
+    },
+    /// The off-loop applier's report of the effects it performed for one intervention (STUDIO-1016).
+    /// The control task folds the states into `effects_json` and, when every mandatory effect is
+    /// done, runs the activation transaction.
+    ManagerEffect(Box<crate::managerapply::ManagerEffectResult>),
     /// An off-loop preparation's completion (STUDIO-988, P6; NEW beyond Go v0.4.0). The resolver task
     /// sends this back; the control task accepts it only for the CURRENT token/config generation and
     /// drops a stale payload without touching loop state.
@@ -824,6 +836,15 @@ impl Orchestrator {
                     generation,
                     evidence_rev,
                 ));
+            }
+            Event::ManagerApplyCheck {
+                intervention_id,
+                reply,
+            } => {
+                let _ = reply.send(self.manager_pre_effect_check(&intervention_id));
+            }
+            Event::ManagerEffect(result) => {
+                self.handle_manager_effect(&result);
             }
         }
     }
@@ -2142,6 +2163,41 @@ impl ControlHandle {
         tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, reply)
             .await
             .unwrap_or(false)
+    }
+
+    /// The §8.3 cheap check the manager applier makes before EACH external effect (STUDIO-1016):
+    /// does the decision still hold? Round-trips the control channel because the answer reads
+    /// loop-owned state. **Fails closed**: a gone loop, a dropped reply or a timed-out wait all
+    /// answer `Superseded`, so an effect is never performed against a decision this process can no
+    /// longer confirm.
+    pub async fn manager_apply_check(
+        &self,
+        intervention_id: &str,
+    ) -> crate::managerapply::PreEffectCheck {
+        let (tx, rx) = oneshot::channel();
+        let ev = Event::ManagerApplyCheck {
+            intervention_id: intervention_id.to_string(),
+            reply: tx,
+        };
+        if self.events.send(ev).is_err() {
+            return crate::managerapply::PreEffectCheck::Superseded;
+        }
+        let mut lifetime = self.ctx.clone();
+        let reply = async {
+            tokio::select! {
+                r = rx => r.unwrap_or(crate::managerapply::PreEffectCheck::Superseded),
+                _ = lifetime.cancelled() => crate::managerapply::PreEffectCheck::Superseded,
+            }
+        };
+        tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, reply)
+            .await
+            .unwrap_or(crate::managerapply::PreEffectCheck::Superseded)
+    }
+
+    /// Reports the manager applier's effect results to the control task (STUDIO-1016). Best effort:
+    /// a gone loop costs nothing, and recovery re-submits the unresolved effects.
+    pub fn manager_effect_result(&self, result: crate::managerapply::ManagerEffectResult) {
+        let _ = self.events.send(Event::ManagerEffect(Box::new(result)));
     }
 
     /// Requests a coalesced poll+reconcile tick (Go's non-blocking `evTick` send), backing the P6

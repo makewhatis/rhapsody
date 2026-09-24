@@ -187,6 +187,16 @@ impl Orchestrator {
                 if !self.review_reopen_eligible(&iss, &running) {
                     continue;
                 }
+                // STUDIO-1016 (§7.9): an author whose `ROUTE_TO_AUTHOR` wake obligation is still
+                // unspent is NOT dispatched by ordinary selection — the wake admission owns that
+                // dispatch, so it is never duplicated or dispatched without its seed.
+                if self.manager_wake_blocks_selection(&iss.id) {
+                    tracing::debug!(
+                        issue_identifier = %iss.identifier,
+                        "skipping reopen: a pending manager wake obligation owns this dispatch"
+                    );
+                    continue;
+                }
                 // STUDIO-956: a summons re-engages a review-state ticket, which is the author's
                 // half of the review↔author loop. A spent shared budget refuses it here, BEFORE the
                 // promote write below, so the ticket is not moved out of review for a run that will
@@ -244,6 +254,15 @@ impl Orchestrator {
                     // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
                     self.log_blocked_skip(&iss, &elig.blocked_by);
                 }
+                continue;
+            }
+            // STUDIO-1016 (§7.9): a ticket with an unspent manager wake obligation is owned by the
+            // wake admission, not ordinary selection, so it is never dispatched twice.
+            if self.manager_wake_blocks_selection(&iss.id) {
+                tracing::debug!(
+                    issue_identifier = %iss.identifier,
+                    "skipping dispatch: a pending manager wake obligation owns this dispatch"
+                );
                 continue;
             }
             // Work already materialized as a linked PR with no newer summons → don't fresh-dispatch
