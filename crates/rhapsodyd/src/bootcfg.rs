@@ -180,6 +180,23 @@ pub fn resolve_profiles_dir(
     resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("profiles"))
 }
 
+/// Resolves the manager's maintainer-owned standing-rules file
+/// (`teams/manager-rules.md`, STUDIO-1013; design record `manager-agent-design.md` §3.2/§12),
+/// colocated with `teams.yaml` and `teams/profiles/` by the same rule every other Teams sidecar
+/// follows.
+///
+/// It is OPTIONAL: `None` (a disabled / in-memory store, or a failed config load) simply means
+/// there is nowhere to look, and an absent file means no policy. Naming it never creates it — only
+/// the maintainer writes this file, by hand.
+pub fn resolve_manager_rules_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams")
+        .map(|d| rhapsody_config::manager::rules_path(&d))
+}
+
 /// Resolves the marker file the one-time Teams identity-label reconcile records its retirement in
 /// (`teams/reconcile.json`, STUDIO-672), colocated with `teams.yaml` and `teams/profiles/` by the
 /// same rule every other Teams sidecar follows.

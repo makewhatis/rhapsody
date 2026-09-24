@@ -16,6 +16,7 @@ pub mod effective_json;
 pub mod encode;
 pub mod harness;
 pub mod hindsight;
+pub mod manager;
 pub mod memory;
 pub mod model;
 pub mod profiles;

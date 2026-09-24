@@ -114,11 +114,22 @@ pub const AUDIENCE_ROOM: &str = "*";
 /// is reserved in [`RESERVED_IDENTITIES`] rather than left to a sigil.
 pub const OPERATOR_IDENTITY: &str = "operator";
 
+/// The reserved name of the built-in **manager** identity (STUDIO-1013, design
+/// record `manager-agent-design.md` §3.1).
+///
+/// It is the unsigil'd spelling of the `@manager` the routing function speaks as.
+/// Unlike [`OPERATOR_IDENTITY`] it is a **built-in identity**: it wears the
+/// built-in `manager` profile and owns the `agent-manager` memory bank, so a
+/// `teams_retain` a manager run makes is attributed to it. It is still reserved,
+/// because a teammate literally named `manager` would be indistinguishable from
+/// the daemon's own voice in every catch-up line.
+pub const MANAGER_IDENTITY: &str = "manager";
+
 /// Names no roster identity may take, because the daemon stamps them itself
 /// (STUDIO-661).
 ///
 /// * `operator` — [`OPERATOR_IDENTITY`], the human's own voice in the room.
-/// * `manager` — the routing function's voice. Triage stamps `@manager` today,
+/// * `manager` — [`MANAGER_IDENTITY`], the routing function's voice. Triage stamps `@manager` today,
 ///   which `is_label_safe` already puts out of a roster's reach; `manager` is
 ///   reserved beside it so the *unsigil'd* spelling cannot be taken either. A
 ///   teammate literally named `manager` would render as one in every catch-up
@@ -127,7 +138,7 @@ pub const OPERATOR_IDENTITY: &str = "operator";
 ///
 /// Existing configs are unaffected unless they already commit the sin, in which
 /// case failing validation loudly is the correct outcome.
-pub const RESERVED_IDENTITIES: [&str; 2] = [OPERATOR_IDENTITY, "manager"];
+pub const RESERVED_IDENTITIES: [&str; 2] = [OPERATOR_IDENTITY, MANAGER_IDENTITY];
 
 /// The most a single post may store, in bytes. §0.5's room "carries decisions
 /// and hand-offs, not chatter"; this is the backstop that keeps a caller from
