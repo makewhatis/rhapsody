@@ -15,12 +15,13 @@
 //!
 //! The manager has no checkout, no `gh` and no `git` (§4). The `manager_*` tools below are thin
 //! proxies of NEW daemon endpoints under `/api/v1/manager/…`; the daemon — not the run — owns the
-//! bare mirror and the off-loop `gh` execution. Each tool passes the run's own id (defaulted from
+//! bare mirror and the off-loop `gh` execution. Each tool passes **only** the run's own id (from
 //! `SYMPHONY_RUN_ID`) so the daemon resolves the pull-request coordinate from the RUN, never from a
-//! caller-supplied owner/repo.
+//! caller-supplied owner/repo — and there is deliberately no `run_id` argument, so a manager can
+//! never be pointed at another adjudication.
 
 use crate::client::FacadeError;
-use crate::server::{Facade, encode_query, err_result, or_default, text_result};
+use crate::server::{Facade, encode_query, err_result, text_result};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
@@ -57,22 +58,12 @@ pub(crate) const MANAGER_TOOL_NAMES: &[&str] = &[
     "manager_findings",
 ];
 
-/// `manager_pr` / `manager_findings` args: just the run whose PR coordinate to resolve.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(crate) struct ManagerRunArgs {
-    /// the manager run id; defaults to `SYMPHONY_RUN_ID` (the worker's own run).
-    #[serde(default)]
-    run_id: String,
-}
-
 /// `manager_pr_activity` / `manager_pr_commits` args.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct ManagerSinceArgs {
     /// only items since this timestamp (RFC3339 / ISO-8601), or a sha for commits.
     #[serde(default)]
     since: String,
-    #[serde(default)]
-    run_id: String,
 }
 
 /// `manager_file` / `manager_ls` args.
@@ -83,8 +74,6 @@ pub(crate) struct ManagerPathArgs {
     /// the repository-relative path.
     #[serde(default)]
     path: String,
-    #[serde(default)]
-    run_id: String,
 }
 
 /// `manager_grep` args.
@@ -97,8 +86,6 @@ pub(crate) struct ManagerGrepArgs {
     /// restrict the search to this subpath; omit for the whole tree.
     #[serde(default)]
     path: String,
-    #[serde(default)]
-    run_id: String,
 }
 
 /// `manager_diff` / `manager_interdiff` args.
@@ -108,8 +95,6 @@ pub(crate) struct ManagerRangeArgs {
     from: String,
     /// the target revision (the current head).
     to: String,
-    #[serde(default)]
-    run_id: String,
 }
 
 /// `manager_patch_id` args.
@@ -117,22 +102,22 @@ pub(crate) struct ManagerRangeArgs {
 pub(crate) struct ManagerShaArgs {
     /// the commit sha whose patch-id (against its merge-base with the PR base) to compute.
     sha: String,
-    #[serde(default)]
-    run_id: String,
 }
 
 /// Reads the manager run id for a call, refusing with the mcp crate's usual `bad_request` envelope
-/// when neither an explicit id nor `SYMPHONY_RUN_ID` is available. Mirrors `teams_retain`'s rule: a
-/// manager read is only meaningful for a dispatched run.
-fn manager_run_id<'a>(explicit: &'a str, default: &'a str) -> Result<String, FacadeError> {
-    let id = or_default(explicit, default);
-    if id.is_empty() {
+/// when `SYMPHONY_RUN_ID` is not available. Mirrors `teams_retain`'s rule: a manager read is only
+/// meaningful for a dispatched run. There is deliberately **no argument** a caller could use to name
+/// a different run: the daemon always resolves the coordinate from the manager's OWN run, so a
+/// manager can never read another adjudication's pull request (§4.4's `manager_file {sha, path}`
+/// has no run id for exactly this reason).
+fn manager_run_id(default: &str) -> Result<String, FacadeError> {
+    if default.is_empty() {
         return Err(FacadeError::new(
             "bad_request",
             "SYMPHONY_RUN_ID is not set: only a dispatched manager run can serve reads",
         ));
     }
-    Ok(id)
+    Ok(default.to_string())
 }
 
 #[tool_router(router = manager_router, vis = "pub(crate)")]
@@ -141,8 +126,8 @@ impl Facade {
         name = "manager_pr",
         description = "The pull request a manager run is adjudicating: head, base, state, draft, mergeable, and the checks at head. Served by the host's own off-loop gh. Proxies GET /api/v1/manager/pr. Defaults to your own run via SYMPHONY_RUN_ID."
     )]
-    async fn manager_pr(&self, Parameters(args): Parameters<ManagerRunArgs>) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+    async fn manager_pr(&self) -> CallToolResult {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -164,7 +149,7 @@ impl Facade {
         &self,
         Parameters(args): Parameters<ManagerSinceArgs>,
     ) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -186,7 +171,7 @@ impl Facade {
         &self,
         Parameters(args): Parameters<ManagerSinceArgs>,
     ) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -205,7 +190,7 @@ impl Facade {
         description = "Read one file's content at a commit sha, from the repository's git objects — no checkout runs. A symlink is returned as its blob text and is never followed. Proxies GET /api/v1/manager/file."
     )]
     async fn manager_file(&self, Parameters(args): Parameters<ManagerPathArgs>) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -228,7 +213,7 @@ impl Facade {
         description = "List a directory tree at a commit sha, from the repository's git objects. Proxies GET /api/v1/manager/ls."
     )]
     async fn manager_ls(&self, Parameters(args): Parameters<ManagerPathArgs>) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -251,7 +236,7 @@ impl Facade {
         description = "Search the repository's git objects at a commit sha for a pattern. Proxies GET /api/v1/manager/grep."
     )]
     async fn manager_grep(&self, Parameters(args): Parameters<ManagerGrepArgs>) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -275,7 +260,7 @@ impl Facade {
         description = "The diff between two revisions (from..to), served from the host's git. Every diff served is recorded in the evidence-access log. Proxies GET /api/v1/manager/diff."
     )]
     async fn manager_diff(&self, Parameters(args): Parameters<ManagerRangeArgs>) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -301,7 +286,7 @@ impl Facade {
         &self,
         Parameters(args): Parameters<ManagerRangeArgs>,
     ) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -327,7 +312,7 @@ impl Facade {
         &self,
         Parameters(args): Parameters<ManagerShaArgs>,
     ) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -345,11 +330,8 @@ impl Facade {
         name = "manager_findings",
         description = "The structured findings recorded for this pull request, identified per revision. Proxies GET /api/v1/manager/findings."
     )]
-    async fn manager_findings(
-        &self,
-        Parameters(args): Parameters<ManagerRunArgs>,
-    ) -> CallToolResult {
-        let run_id = match manager_run_id(&args.run_id, &self.opts.default_run_id) {
+    async fn manager_findings(&self) -> CallToolResult {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
             Ok(id) => id,
             Err(e) => return err_result(&e),
         };
@@ -467,9 +449,9 @@ mod tests {
         let _ = client.cancel().await;
     }
 
-    // An explicit run id wins over the env default.
+    // The declared args are passed through; the run id is ALWAYS the manager's own (SYMPHONY_RUN_ID).
     #[tokio::test]
-    async fn manager_file_passes_explicit_args() {
+    async fn manager_file_passes_declared_args_and_its_own_run_id() {
         let router = Router::new().route(
             "/api/v1/manager/file",
             get(|uri: axum::http::Uri| async move { format!("got {}", uri.query().unwrap_or("")) }),
@@ -486,6 +468,31 @@ mod tests {
         assert!(text.contains("sha=abc123"), "{text}");
         assert!(text.contains("path=src%2Flib.rs"), "{text}");
         assert!(text.contains("run_id=42"), "{text}");
+        let _ = client.cancel().await;
+    }
+
+    // A manager read cannot be pointed at another run: a caller-supplied `run_id` is ignored and
+    // the request still carries the manager's OWN run id.
+    #[tokio::test]
+    async fn manager_read_ignores_a_caller_supplied_run_id() {
+        let router = Router::new().route(
+            "/api/v1/manager/file",
+            get(|uri: axum::http::Uri| async move { format!("got {}", uri.query().unwrap_or("")) }),
+        );
+        let port = spawn_router(router).await;
+        let facade = Facade::new(&test_config(), client_for_port(port), manager_options());
+        let client = connect(facade).await;
+        let mut req = CallToolRequestParams::new("manager_file");
+        req.arguments = serde_json::json!({"sha": "abc123", "run_id": "999"})
+            .as_object()
+            .cloned();
+        let res = client.call_tool(req).await.expect("call manager_file");
+        let text = result_text(&res);
+        assert!(
+            text.contains("run_id=42"),
+            "the manager's own run id must win over a caller-supplied one: {text}"
+        );
+        assert!(!text.contains("run_id=999"), "{text}");
         let _ = client.cancel().await;
     }
 
