@@ -89,6 +89,65 @@ PY
     echo "ok: plugin '$name' -> $dir ($found skill(s)), manifests agree at v$version"
 done <<< "$SOURCES"
 
+# --- 2b. both shipped Teams skills document the three selection lifecycles (STUDIO-993) -------
+# A plugin version bump ships documentation, so the doc is part of the deliverable. A skill that
+# describes provider/harness/model selection but NOT when each source takes effect is exactly the
+# release defect P12 names ("a partial docs copy is a release defect"). Both Teams skills must carry
+# all three markers, so changing one without the other — or bumping the version without the
+# behaviour documentation — fails here. check-plugin_test.sh proves this reds by stripping a marker
+# from one copy.
+LIFECYCLE_MARKERS=("boot-loaded" "hot-reload" "resolved from disk at dispatch")
+for skill in plugin/skills/rhapsody-teams/SKILL.md plugin/skills/rhapsody-team-setup/SKILL.md; do
+    [ -f "$skill" ] || fail "$skill is missing (STUDIO-993 expects both shipped Teams skills)"
+    for marker in "${LIFECYCLE_MARKERS[@]}"; do
+        grep -qF -- "$marker" "$skill" \
+            || fail "$skill must document the boot/hot-reload/dispatch selection lifecycles (STUDIO-993): missing '$marker'"
+    done
+done
+echo "ok: both shipped Teams skills document the boot/hot-reload/dispatch selection lifecycles"
+
+# --- 2c. a change to a shipped plugin path bumps the version (STUDIO-993) ----------------------
+# The ticket names "omit version bump" as a mutation this check must catch, and a MISSING bump is
+# only checkable against a BASELINE — a PR has one, a plain local run does not. This compares the
+# plugin version on the base ref against the working tree whenever the shipped paths differ, so a
+# behaviour or docs change that forgot its bump fails instead of shipping. It is SKIPPED, with a
+# note, when no base ref is resolvable (a local run with no remote) — an honest skip, never a false
+# green. CI's `lint` job fetches the PR base for exactly this (see `.github/workflows/ci.yml`);
+# `check-plugin_test.sh` builds a scratch repo and points RHAPSODY_PLUGIN_BASE_REF at it to prove the
+# red, because a guard nobody has watched fire is not a guard.
+base_ref="${RHAPSODY_PLUGIN_BASE_REF:-${GITHUB_BASE_REF:-}}"
+if [ -z "$base_ref" ]; then
+    echo "note: plugin version-bump check skipped: no base ref (set RHAPSODY_PLUGIN_BASE_REF or GITHUB_BASE_REF)"
+else
+    base_commit=""
+    for candidate in "origin/$base_ref" "refs/remotes/origin/$base_ref" "$base_ref"; do
+        if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null 2>&1; then
+            base_commit="$candidate"
+            break
+        fi
+    done
+    bumped_paths=(".claude-plugin")
+    while IFS=$'\t' read -r _ src _; do
+        [ -n "$src" ] && bumped_paths+=("${src#./}")
+    done <<< "$SOURCES"
+    if [ -z "$base_commit" ]; then
+        echo "note: plugin version-bump check skipped: base ref '$base_ref' is not resolvable here"
+    elif git diff --quiet "$base_commit" -- "${bumped_paths[@]}"; then
+        echo "ok: plugin files unchanged since $base_ref — no version bump required"
+    else
+        base_version="$(git show "$base_commit:.claude-plugin/marketplace.json" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version") or "")' 2>/dev/null || true)"
+        head_version="$(python3 -c 'import json; print(json.load(open(".claude-plugin/marketplace.json")).get("version") or "")')"
+        if [ -z "$base_version" ]; then
+            echo "note: plugin version-bump check skipped: no base marketplace version at '$base_ref'"
+        elif [ "$base_version" = "$head_version" ]; then
+            fail "plugin files changed since $base_ref but the plugin version did not (still v$head_version): a behaviour or docs change ships with a version bump (STUDIO-993)"
+        else
+            echo "ok: plugin files changed and the version bumped v$base_version -> v$head_version"
+        fi
+    fi
+fi
+
 # --- 3. nothing machine-local or private leaks into a public, installable artefact ------------
 # Each entry is "<what it is>|<extended regex>", matched case-INSENSITIVELY, because the forms these
 # strings actually travel in are not the ones a human writing a checklist would think of first: the
