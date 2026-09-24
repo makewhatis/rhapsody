@@ -348,11 +348,32 @@ export function mergeIssueRows<T extends { issue_identifier: string; id: number 
 const TERMINAL_STATES: readonly string[] = ["done", "canceled", "cancelled"];
 
 /**
- * The lane a card belongs in. The tracker decides DONE; otherwise the run status does, so a `Todo`
- * ticket with a live run lands in Running. A `blocked` card (a failed run, or a held dependent) is
- * not moving and not finished: it waits in Queued, still wearing its blocked pill and blocker chip.
+ * The lane a card belongs in, or `undefined` when the card's state is not known well enough to draw
+ * it in one. The tracker decides DONE; otherwise the run status does, so a `Todo` ticket with a live
+ * run lands in Running. A `blocked` card (a failed run, or a held dependent) is not moving and not
+ * finished: it waits in Queued, still wearing its blocked pill and blocker chip.
+ *
+ * WHY A BLANK TRACKER STATE IS NOT QUEUED (STUDIO-1039). The daemon resolves `tracker_state` live
+ * per request off a TTL cache, so on the first render after a restart it has answered nothing yet
+ * and the field is absent. Without it the run status is a FALLBACK, not a fact: a merged ticket
+ * whose newest run ended `stopped`/`failed` then reads `queued`/`blocked`, and the old default arm
+ * folded every such non-live card into Queued — painting merged tickets into the lane beside a
+ * header the store tally had already counted correctly (the header/body disagreement STUDIO-965
+ * exists to prevent). The run statuses that answer on their own are unchanged: a live run is
+ * Running, and `review` is still the run's own "handed to a reviewer". Only the default arm, which
+ * was guessing a TICKET state from an unresolved one, now returns no lane so the card is held out
+ * until tracker states arrive.
+ *
+ * THE DELIBERATE HOLDS ARE NOT GUESSES. A `heldForHuman` or `budgetHeld` card's lane comes from the
+ * live snapshot (STUDIO-949/970), not the tracker, so it keeps Queued even with a blank state —
+ * and it must, or the very restart window this fires in would erase every hold from the board.
  */
-export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerState">): BoardLaneId {
+export function boardLaneOf(
+  card: Pick<BoardCard, "status" | "live" | "trackerState"> & {
+    heldForHuman?: boolean;
+    budgetHeld?: string;
+  },
+): BoardLaneId | undefined {
   if (TERMINAL_STATES.includes(card.trackerState.trim().toLowerCase())) return "done";
   switch (card.status) {
     case "run":
@@ -364,7 +385,11 @@ export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerSt
       return "done";
     default:
       // A live run outranks a stale status word: an agent on the ticket IS running.
-      return card.live ? "running" : "queued";
+      if (card.live) return "running";
+      // A hold is a live-snapshot fact, not a tracker answer, so it speaks for the lane regardless.
+      if (card.heldForHuman || card.budgetHeld !== undefined) return "queued";
+      // No tracker answer and no live run: the lane would be a guess. Hold the card out.
+      return card.trackerState.trim() === "" ? undefined : "queued";
   }
 }
 
@@ -532,6 +557,10 @@ export function buildConsoleBoard(
   const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));
   for (const card of cards) {
     const id = boardLaneOf(card);
+    // `undefined` is "no lane is known" (STUDIO-1039): the card is held out of the board until the
+    // tracker answers, rather than guessed into Queued. It is not silently rendered nowhere else —
+    // the caller gets exactly the four fixed lanes it always did.
+    if (id === undefined) continue;
     lanes.find((lane) => lane.id === id)?.cards.push(card);
   }
   return lanes;

@@ -200,11 +200,30 @@ describe("the board regroup (STUDIO-925)", () => {
     expect(laneIssues(board, "done")).toEqual(["D", "C"]);
   });
 
-  it("keeps a ticket with no resolved tracker state on the board", () => {
+  // STUDIO-1039 — a blank tracker state is NOT a Queued ticket. On the first render after a restart
+  // the daemon has not answered a lifecycle yet, so a merged ticket whose newest run ended
+  // `stopped`/`failed` reads `queued`/`blocked` off the run outcome alone and used to be painted
+  // into Queued beside a header the store tally had already counted correctly. The board must hold
+  // such a card out of the lanes until the tracker answers, rather than guess a lane for it.
+  it("holds a card with a blank tracker state and no live run out of every lane", () => {
     const board = buildConsoleBoard([
-      row({ issue: "LEGACY", trackerState: "", status: "queued", statusLabel: "queued" }),
+      row({
+        issue: "STUDIO-1028",
+        trackerState: "",
+        status: "queued",
+        statusLabel: "queued",
+        runOutcome: "stopped",
+      }),
+      row({
+        issue: "STUDIO-1007",
+        trackerState: "",
+        status: "blocked",
+        statusLabel: "blocked",
+        runOutcome: "failed",
+      }),
     ]);
-    expect(laneIssues(board, "queued")).toEqual(["LEGACY"]);
+    expect(cards(board)).toEqual([]);
+    expect(laneIssues(board, "queued")).toEqual([]);
   });
 
   // STUDIO-966 — a parked ticket keeps its own pill but rides in the Queued lane (it is not
@@ -440,6 +459,20 @@ describe("boardLaneOf", () => {
   // is what distinguishes them, and the lane is not a fifth axis.
   it("waits a parked ticket in Queued", () => {
     expect(boardLaneOf({ status: "parked", live: false, trackerState: "Backlog" })).toBe("queued");
+  });
+
+  // STUDIO-1039 — a blank tracker state is the daemon saying "no answer yet", not a ticket that
+  // belongs in Queued. The default arm used to fold every non-live unknown into Queued; it now
+  // returns no lane, so the card is held out until tracker states arrive. Restoring the
+  // `default → queued` fallback turns this red.
+  it("refuses to guess a lane for a blank tracker state with no live run", () => {
+    expect(boardLaneOf({ status: "blocked", live: false, trackerState: "" })).toBeUndefined();
+    expect(boardLaneOf({ status: "queued", live: false, trackerState: "" })).toBeUndefined();
+    expect(boardLaneOf({ status: "parked", live: false, trackerState: "" })).toBeUndefined();
+    // A live run still outranks the blank state, exactly as it outranks a stale status word.
+    expect(boardLaneOf({ status: "queued", live: true, trackerState: "" })).toBe("running");
+    // A known state is unaffected: only the blank fallback is neutral.
+    expect(boardLaneOf({ status: "blocked", live: false, trackerState: "Todo" })).toBe("queued");
   });
 });
 
