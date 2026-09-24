@@ -280,11 +280,15 @@ enum Reachability {
 
 /// One credential account's availability state. `generation` is the daemon-visible revision used
 /// ONLY for the availability transitions of reads the owner did not answer; `last` is the previous
-/// reachability class, so the next class change is a transition.
+/// reachability class, so the next class change is a transition; `high_water` is the highest OWNER
+/// revision an answered read has observed for this account (PB7, STUDIO-1002; design §12), or `None`
+/// until the owner first answers. It is kept separate from `generation` because the two live on
+/// different number lines (see [`CredentialResolver`]).
 #[derive(Debug)]
 struct AvailabilityState {
     generation: Revision,
     last: Option<Reachability>,
+    high_water: Option<Revision>,
 }
 
 impl Default for AvailabilityState {
@@ -292,6 +296,7 @@ impl Default for AvailabilityState {
         AvailabilityState {
             generation: Revision::INITIAL,
             last: None,
+            high_water: None,
         }
     }
 }
@@ -339,6 +344,19 @@ impl CredentialResolver {
         self.observe(&account, read)
     }
 
+    /// The highest OWNER revision an answered read has observed for `account`, or `None` when the
+    /// owner has never answered for it (PB7, STUDIO-1002; design §12). A mutation the desktop makes
+    /// while the daemon runs is observed by the next read through this same boundary, so this
+    /// monotonic watermark is what lets the control loop drop a blocked read that finishes holding a
+    /// revision the owner has already moved past.
+    pub fn high_water(&self, account: &str) -> Option<Revision> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .and_then(|state| state.high_water)
+    }
+
     /// Folds one raw read into the tracked state for `account`. The class and generation are read and
     /// written under one lock, so a caller can never observe the generation of one transition paired
     /// with the class of another. The two returned counters are independent: `read.revision` is the
@@ -357,6 +375,15 @@ impl CredentialResolver {
                 state.generation = state.generation.next();
             }
             state.last = Some(class);
+            // Only an ANSWERED read carries an owner revision; an unavailable/unauthorized read
+            // manufactures none. The high-water is monotonic, so a later read at an older revision
+            // (a blocked read finishing after a mutation was observed) stays below it.
+            if class == Reachability::Answered {
+                state.high_water = Some(match state.high_water {
+                    Some(previous) => previous.max(read.revision),
+                    None => read.revision,
+                });
+            }
             state.generation
         };
         let revision = match class {
@@ -969,6 +996,43 @@ mod tests {
 
         accept.abort();
         std::fs::remove_file(&path).ok();
+    }
+
+    // PB7 (STUDIO-1002 review B1): the per-account observed-revision watermark. An answered read
+    // advances it monotonically; a later read at an OLDER revision (a blocked read finishing after a
+    // mutation was observed) must not lower it; an unavailable/unauthorized read carries no owner
+    // revision and must not touch it; accounts are independent. The mutation guard is keying the
+    // watermark to `generation` (a different number line) or letting an unavailable read reset it.
+    #[test]
+    fn high_water_tracks_answered_reads_monotonically_and_per_account() {
+        let resolver = CredentialResolver::new();
+        let account = "v1:p".to_string();
+        assert_eq!(
+            resolver.high_water(&account),
+            None,
+            "no answered read yet means no opinion"
+        );
+        let answered = |rev: u64| CredentialRead {
+            revision: Revision(rev),
+            state: CredentialState::Present(
+                rhapsody_credential_ipc::domain::BoundCredentialLease::new(
+                    a_binding(),
+                    "sk-fake".into(),
+                ),
+            ),
+        };
+        resolver.observe(&account, answered(9));
+        assert_eq!(resolver.high_water(&account), Some(Revision(9)));
+        resolver.observe(&account, answered(12));
+        assert_eq!(resolver.high_water(&account), Some(Revision(12)));
+        // An older answered read must not lower the watermark.
+        resolver.observe(&account, answered(5));
+        assert_eq!(resolver.high_water(&account), Some(Revision(12)));
+        // An unavailable read carries no owner revision; it must not touch the watermark.
+        resolver.observe(&account, unavailable_read());
+        assert_eq!(resolver.high_water(&account), Some(Revision(12)));
+        // A different account is independent.
+        assert_eq!(resolver.high_water("v1:q"), None);
     }
 
     #[tokio::test]

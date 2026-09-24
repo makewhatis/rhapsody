@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rhapsody_agent::{HarnessId, PreparedHarnessSpec, PreparedProvider, ResolvedProviderPlan};
 use rhapsody_core::{Issue, normalize_state};
 
 use crate::control_loop::{CancelSignal, Event};
@@ -97,8 +98,15 @@ pub enum RefusalReason {
     OwnerUnavailable,
     /// The credential owner refused this daemon instance.
     OwnerUnauthorized,
+    /// The provider broker is unavailable (its serving task failed, or registration was refused
+    /// because the broker is down). A typed refusal, never a direct-key fallback.
+    ProviderBrokerUnavailable,
     /// The resolver exceeded the preparation timeout.
     ResolverTimedOut,
+    /// The pure harness/provider/model selection refused this candidate (an unsupported protocol, a
+    /// missing model, an unconfigured provider). Carries the selection refusal's actionable text;
+    /// never a fall back to another harness/provider/model/auth source.
+    SelectionRefused(String),
     /// The resolver failed for a reason it could not classify (already an actionable string).
     ResolverFailed(String),
 }
@@ -113,7 +121,9 @@ impl RefusalReason {
             RefusalReason::BindingMismatch => "binding_mismatch",
             RefusalReason::OwnerUnavailable => "owner_unavailable",
             RefusalReason::OwnerUnauthorized => "owner_unauthorized",
+            RefusalReason::ProviderBrokerUnavailable => "provider_broker_unavailable",
             RefusalReason::ResolverTimedOut => "resolver_timed_out",
+            RefusalReason::SelectionRefused(_) => "selection_refused",
             RefusalReason::ResolverFailed(_) => "resolver_failed",
         }
     }
@@ -137,9 +147,13 @@ impl RefusalReason {
             RefusalReason::OwnerUnauthorized => {
                 "the provider credential owner refused this daemon instance".to_string()
             }
+            RefusalReason::ProviderBrokerUnavailable => {
+                "the provider broker is unavailable".to_string()
+            }
             RefusalReason::ResolverTimedOut => {
                 "provider preparation did not answer before its timeout".to_string()
             }
+            RefusalReason::SelectionRefused(why) => why.clone(),
             RefusalReason::ResolverFailed(why) => why.clone(),
         }
     }
@@ -164,6 +178,15 @@ pub struct PreparedDispatch {
     pub provider: String,
     /// The opaque credential revision this preparation read; empty in P6's injected-resolver tests.
     pub credential_revision: String,
+    /// The move-only broker custody for an explicit-provider dispatch (PB7, STUDIO-1002). `None` on
+    /// the legacy/native-login branch. It is never cloned: dropping this dispatch drops the custody
+    /// and revokes the broker session immediately, which is what makes a stale/cancelled completion
+    /// release its credential promptly.
+    custody: Option<PreparedProvider>,
+    /// The pure, non-secret provider plan the custody was opened against, carried so the
+    /// dispatch-time factory can build the adapter's knob block without re-deriving it. `None` on the
+    /// legacy branch.
+    plan: Option<ResolvedProviderPlan>,
 }
 
 impl PreparedDispatch {
@@ -178,7 +201,63 @@ impl PreparedDispatch {
             model: model.into(),
             provider: provider.into(),
             credential_revision: credential_revision.into(),
+            custody: None,
+            plan: None,
         }
+    }
+
+    /// Attach move-only broker custody and the pure plan it was opened against (PB7). Consuming, so
+    /// a dispatch's custody is set exactly once and cannot be duplicated.
+    pub fn with_provider(mut self, custody: PreparedProvider, plan: ResolvedProviderPlan) -> Self {
+        self.custody = Some(custody);
+        self.plan = Some(plan);
+        self
+    }
+
+    /// The harness the selection resolved to, typed, or `None` when the recorded name is not one
+    /// this build implements (a resolver defect, never a fallback).
+    pub fn harness_id(&self) -> Option<HarnessId> {
+        rhapsody_agent::harness_id_for_name(&self.harness)
+    }
+
+    /// Whether this dispatch carries move-only broker custody (an explicit-provider run).
+    pub fn has_custody(&self) -> bool {
+        self.custody.is_some()
+    }
+
+    /// Build the dispatch-time `PreparedHarnessSpec` this completion will run on, consuming the
+    /// move-only custody exactly once. `Ok(None)` is the legacy/native-login branch: no custody, so
+    /// the caller keeps the ordinary shared runner and the dispatch is byte-identical to a daemon
+    /// built before this feature. `Some` is a brokered run whose factory will own the custody.
+    ///
+    /// `cfg` is the target project's materialized config (its knobs build the adapter). The model
+    /// comes from the pure plan the custody was opened against, falling back to the recorded model.
+    pub fn into_harness_spec(
+        mut self,
+        cfg: &rhapsody_config::Config,
+    ) -> Result<Option<PreparedHarnessSpec>, rhapsody_agent::DispatchRefusal> {
+        let Some(custody) = self.custody.take() else {
+            return Ok(None);
+        };
+        let Some(harness) = self.harness_id() else {
+            return Err(rhapsody_agent::DispatchRefusal::Broker(format!(
+                "prepared harness {:?} is not implemented by this build",
+                self.harness
+            )));
+        };
+        let model = self
+            .plan
+            .take()
+            .map(|p| p.model)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.model.clone());
+        let knobs = crate::effective::knobs_for_harness(cfg, harness);
+        Ok(Some(PreparedHarnessSpec {
+            harness,
+            model: (!model.is_empty()).then_some(model),
+            provider: Some(custody),
+            knobs,
+        }))
     }
 
     /// The selection half of the payload, without the move-only credential lease.
@@ -193,7 +272,14 @@ impl PreparedDispatch {
 
 /// A resolver's verdict: an accepted success carries the move-only prepared payload, an accepted
 /// refusal carries the typed reason.
+///
+/// `Ready` is much the larger variant (the move-only [`PreparedDispatch`] carries the resolved plan
+/// and, for an explicit provider, the opaque broker custody). Boxing it would add an allocation and
+/// an indirection to the ONE path that must stay allocation-light and move-only, so the size
+/// difference is accepted deliberately rather than laundered behind a `Box`; the enum is created
+/// once per preparation and consumed immediately on the control task.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PreparationOutcome {
     Ready(PreparedDispatch),
     Refused(RefusalReason),
@@ -251,8 +337,25 @@ pub trait PreparationResolver: Send + Sync {
     ) -> PreparationCompletion;
 }
 
+/// The daemon's per-credential observed-revision watermark (PB7, STUDIO-1002; design §12). The
+/// composition root installs its adapter over the one shared credential boundary; the control loop
+/// consults it when accepting a prepared completion. It is the production half of the §12 race: an
+/// operator Replace advances the owner's revision, the next read through the same boundary (a
+/// provider-status refresh or another dispatch) records the new high-water, and the older
+/// completion — still in flight — is then dropped before it can become a session. Keyed by the
+/// non-secret provider stable id a completion carries; never a binding, fingerprint or revision
+/// exposed anywhere else.
+pub trait CredentialRevisionSource: Send + Sync {
+    /// The highest owner revision observed so far for `provider`, or `None` when no owner read has
+    /// answered for it. `None` is "no opinion", not a zero revision.
+    fn high_water(&self, provider: &str) -> Option<u64>;
+}
+
 /// The inputs a resolver needs. Deliberately minimal and secret-free: the resolved tuple and the
-/// expected binding are derived by the resolver itself in PB7.
+/// expected binding are derived by the resolver itself in PB7. There is deliberately no
+/// `expected_revision`: the provider is resolved OFF the control task, so the loop cannot name one
+/// at begin time — the revision race is arbitrated at completion against
+/// [`CredentialRevisionSource`] instead.
 #[derive(Debug, Clone)]
 pub struct PreparationRequest {
     /// What is being prepared (a ticket or a review).
@@ -261,8 +364,19 @@ pub struct PreparationRequest {
     pub selection: String,
     /// The config generation the loop began this preparation under.
     pub config_generation: u64,
-    /// The credential revision the loop expects, empty in P6 (PB7 supplies it).
-    pub expected_revision: String,
+    /// The candidate's raw labels, parsed by the resolver's pure selection call (the ticket tier).
+    pub labels: Vec<String>,
+    /// The pure harness/provider/model selection tiers the loop resolved for this candidate
+    /// (PB7, STUDIO-1002). The resolver runs [`crate::selection::resolve_ticket_labels`] off the
+    /// control task on these and derives the canonical provider plan from them, so no config read
+    /// and no credential work ever blocks the loop.
+    pub tiers: crate::selection::SelectionTiers,
+    /// The target project's effective provider registry (after the per-project overlay), keyed by
+    /// canonical provider id — the registry the pure resolver looks the selected provider up in.
+    pub providers: std::collections::BTreeMap<String, rhapsody_config::ProviderDefinition>,
+    /// The selected harness's effective turn deadline, used only to lower the provider's configured
+    /// broker limits into the plan's explicit values.
+    pub turn_deadline_ms: u64,
 }
 
 /// The deferred promote a REVIEW-REOPEN dispatch carries (STUDIO-988 review round 4, jimmy #3 /
@@ -770,11 +884,29 @@ impl Orchestrator {
         self.prepare_resolver = Some(resolver);
     }
 
-    /// Installs the credential revision the loop currently expects (STUDIO-988, the PB7 credential
-    /// mutation hook). `None` means "no opinion" — the P6 default — and a completion whose observed
-    /// revision differs from a `Some` value is dropped as stale before it can mutate state.
-    pub fn set_prepare_expected_revision(&mut self, revision: Option<String>) {
-        self.prepare_expected_revision = revision;
+    /// Installs the credential revision the loop currently expects for ONE provider (STUDIO-988 /
+    /// PB7, the credential mutation hook; design §12). `None` clears the provider's entry. An
+    /// accepted completion whose observed revision for that provider differs is dropped as stale
+    /// before it can mutate state. Per-provider rather than daemon-wide so two providers' completions
+    /// cannot cross-drop each other.
+    pub fn set_prepare_expected_revision(&mut self, provider: &str, revision: Option<u64>) {
+        match revision {
+            Some(revision) => {
+                self.prepare_expected_revisions
+                    .insert(provider.to_string(), revision);
+            }
+            None => {
+                self.prepare_expected_revisions.remove(provider);
+            }
+        }
+    }
+
+    /// Installs the daemon's per-credential observed-revision watermark (PB7, STUDIO-1002; design
+    /// §12). The composition root injects the adapter over the shared credential resolver before the
+    /// orchestrator moves into the control task; absent (the default for tests) leaves the check
+    /// inert, exactly as a daemon with no provider subsystem.
+    pub fn set_credential_revision_source(&mut self, source: Arc<dyn CredentialRevisionSource>) {
+        self.credential_revisions = Some(source);
     }
 
     /// Whether asynchronous preparation is active for this daemon.
@@ -792,17 +924,94 @@ impl Orchestrator {
         issue: &Issue,
         route: Option<&DispatchRoute>,
     ) -> bool {
-        if self.prepare_resolver.is_none() {
+        if self.prepare_resolver.is_none() || !self.config_defines_any_provider() {
             return false;
         }
         self.refusal_gate
             .suppressed(&ticket_gate_key(issue, route), (self.now)())
     }
 
+    /// Whether the CURRENT effective config defines any explicit provider — globally or in any
+    /// project overlay (PB7, STUDIO-1002; B3). The preparation resolver is installed
+    /// unconditionally so a hot reload or a project-only provider is honoured, but a daemon that
+    /// defines none must keep the legacy inline dispatch path byte-identical, so this is the
+    /// effective-config gate `begin_preparation` consults rather than the boot-time provider map.
+    fn config_defines_any_provider(&self) -> bool {
+        // No loaded config is "no opinion", not "no provider": every real dispatch path already
+        // requires `eff` (it early-returns without one), so only test/embedding builds reach this
+        // with `None`, and they must keep the generic preparation machinery reachable.
+        let Some(eff) = self.eff.as_ref() else {
+            return true;
+        };
+        !eff.cfg.providers.is_empty() || eff.projects.iter().any(|p| !p.mcfg.providers.is_empty())
+    }
+
     /// The current preparation config generation, bumped on every reload so a completion minted
     /// under an older config can never mutate state.
     pub fn prepare_generation(&self) -> u64 {
         self.prepare_generation
+    }
+
+    /// The pure selection inputs for one candidate: its raw labels, the six field-wise tiers, the
+    /// target project's provider registry, and the selected harness's turn deadline (PB7,
+    /// STUDIO-1002). Pure and local — the only I/O is the profile resolve `route_teams` already
+    /// performs on the dispatch path, so this adds no network or credential work to the control task.
+    fn selection_inputs(
+        &self,
+        target: &PreparedTarget,
+    ) -> (
+        Vec<String>,
+        crate::selection::SelectionTiers,
+        std::collections::BTreeMap<String, rhapsody_config::ProviderDefinition>,
+        u64,
+    ) {
+        use crate::selection::{FieldSelection, SelectionTiers};
+
+        let Some(eff) = self.eff.as_ref() else {
+            return (
+                Vec::new(),
+                SelectionTiers::default(),
+                std::collections::BTreeMap::new(),
+                0,
+            );
+        };
+        let (issue, route) = match target {
+            PreparedTarget::Ticket { issue, route, .. } => {
+                (issue, route.as_ref().map(|r| r.slug.as_str()))
+            }
+            PreparedTarget::Review { issue, route, .. } => (issue, Some(route.slug.as_str())),
+        };
+        let project = route.and_then(|slug| eff.project_by_slug(slug));
+        let project_cfg = project.map_or(&eff.cfg, |p| &p.mcfg);
+        // The project tier is only distinct from the global one on a multi-project install; on the
+        // legacy single-project path the global tier carries the whole configured default, exactly
+        // as `SelectionTiers`'s precedence chain intends.
+        let project_tier = project.map_or_else(FieldSelection::default, |p| {
+            FieldSelection::from_agent(&p.mcfg.agent)
+        });
+        // The routed teammate's resolved profile contributes the profile tier (harness/provider/
+        // model), from the SAME resolve the dispatch uses, so the two cannot disagree.
+        let profile_tier = self
+            .route_teams(issue)
+            .map_or_else(FieldSelection::default, |td| FieldSelection {
+                harness: td.harness,
+                provider: td.provider,
+                model: td.model_override.model,
+            });
+        let tiers = SelectionTiers {
+            ticket: FieldSelection::default(),
+            review: None,
+            profile: profile_tier,
+            identity: FieldSelection::default(),
+            project: project_tier,
+            global: FieldSelection::from_agent(&eff.cfg.agent),
+        };
+        let labels = issue.labels.clone().unwrap_or_default();
+        let providers = project_cfg.providers.clone();
+        let turn_deadline_ms = rhapsody_config::providers::provider_turn_deadline_ms(
+            project_cfg.opencode.turn_timeout_ms,
+        );
+        (labels, tiers, providers, turn_deadline_ms)
     }
 
     /// Begins an asynchronous preparation for `target`, or reports why it should not dispatch. When
@@ -822,6 +1031,16 @@ impl Orchestrator {
         let Some(resolver) = self.prepare_resolver.clone() else {
             return BeginPreparation::NoResolver;
         };
+        // B3 (STUDIO-1002 review): the resolver is installed unconditionally at boot so a workflow
+        // hot reload that ADDS a `providers:` block — or a config with only a per-project overlay —
+        // is prepared rather than silently dispatched on the native login. But an installation that
+        // defines no provider AT ALL must keep the original inline path byte-for-byte: preparation
+        // here would add a reservation and an off-loop spawn for a candidate that can only resolve
+        // the legacy branch. So the gate is the CURRENT effective config (global plus every project
+        // overlay), recomputed on each call, not the boot-time top-level map.
+        if !self.config_defines_any_provider() {
+            return BeginPreparation::NoResolver;
+        }
         let key = match &target {
             PreparedTarget::Ticket { issue, .. } => PreparationKey::Ticket {
                 issue_id: issue.id.clone(),
@@ -842,6 +1061,9 @@ impl Orchestrator {
             return BeginPreparation::AlreadyPreparing;
         }
         let selection = target.selection();
+        // The pure selection inputs the resolver consumes off the control task (PB7). Computed here,
+        // while `target` is still borrowed, and owned before the reservation moves it.
+        let (labels, tiers, providers, turn_deadline_ms) = self.selection_inputs(&target);
         let fingerprint = RefusalGate::key(key.kind(), &id, &selection);
         let now = (self.now)();
         if self.refusal_gate.suppressed(&fingerprint, now) {
@@ -887,8 +1109,10 @@ impl Orchestrator {
             key,
             selection,
             config_generation: token.generation,
-            // The revision the loop currently expects; empty in P6 (PB7 supplies it).
-            expected_revision: self.prepare_expected_revision.clone().unwrap_or_default(),
+            labels,
+            tiers,
+            providers,
+            turn_deadline_ms,
         };
         tokio::spawn(async move {
             let _guard = wg;
@@ -935,7 +1159,7 @@ impl Orchestrator {
                 let _ = events.send(Event::DispatchPrepared {
                     id,
                     token,
-                    completion,
+                    completion: Box::new(completion),
                 });
             }
         });
@@ -968,39 +1192,28 @@ impl Orchestrator {
             }
             return;
         }
-        // A completion whose credential revision is not the one the loop currently expects is stale:
-        // a credential mutation advanced the loop's revision while this resolver read the old one, so
-        // its result must not become a session (STUDIO-988 review round 4, sol #3). The check is inert
-        // in P6 (no provider subsystem ⇒ `None`), and PB7 advances the field on a mutation which
-        // `abandon_prepared` re-parks/releases exactly as any supersession.
+        // A completion whose credential revision is not the one the loop currently expects — or is
+        // OLDER than a revision another read has since observed on the same provider — is stale: a
+        // credential mutation advanced the owner's revision while this resolver read the old one, so
+        // its result must not become a session (STUDIO-988 review round 4, sol #3 / PB7 §12,
+        // STUDIO-1002 review B1). The check is inert with no provider subsystem (empty map, no
+        // watermark), and `abandon_prepared` re-parks/releases exactly as any supersession.
         //
         // Two refinements from STUDIO-988 review round 5 (sol #1 / alice C): a typed timeout/failure
         // that never reached a credential carries an EMPTY observed revision, so it must NOT be read
         // as a mismatch — otherwise a hung resolver would never arm its gate and the same locked
         // credential would be re-probed every tick. And a READY completion's move-only payload must
-        // carry the expected revision AND agree with the envelope that delivered it, so a stale
-        // payload cannot ride a fresh-looking envelope (or vice versa) into a session.
-        if let Some(expected) = self.prepare_expected_revision.as_deref() {
-            let stale = match &completion.outcome {
-                PreparationOutcome::Ready(prepared) => {
-                    prepared.credential_revision != expected
-                        || completion.observed_revision != prepared.credential_revision
-                }
-                PreparationOutcome::Refused(_) => {
-                    !completion.observed_revision.is_empty()
-                        && completion.observed_revision != expected
-                }
-            };
-            if stale {
-                tracing::info!(
-                    id = %id,
-                    "prepared completion carries a stale credential revision; dropping it"
-                );
-                if let Some(entry) = self.preparing.take(&id) {
-                    self.abandon_prepared(entry, AbandonCause::Superseded);
-                }
-                return;
+        // agree with the envelope that delivered it, so a stale payload cannot ride a fresh-looking
+        // envelope (or vice versa) into a session.
+        if self.completion_carries_a_stale_revision(&completion) {
+            tracing::info!(
+                id = %id,
+                "prepared completion carries a stale credential revision; dropping it"
+            );
+            if let Some(entry) = self.preparing.take(&id) {
+                self.abandon_prepared(entry, AbandonCause::Superseded);
             }
+            return;
         }
         // Revalidate current eligibility: an armed drain defers without refusing (the work may be
         // re-offered after the drain), and a live run/claim means this completion is moot.
@@ -1082,6 +1295,69 @@ impl Orchestrator {
                         "repeat refusal; backoff advanced without a second history row"
                     );
                 }
+            }
+        }
+    }
+
+    /// Whether a completion is stale against the loop's installed expected revision for its provider
+    /// and the daemon's observed-revision watermark (PB7, STUDIO-1002; design §12).
+    ///
+    /// The two checks are deliberately different comparisons. The installed expected revision is an
+    /// authoritative snapshot the loop holds: any completion that does not agree with it is stale,
+    /// newer or older alike. The watermark is a monotonic counter of what reads have OBSERVED: a
+    /// completion read at an OLDER revision than a later read is the §12 race (a blocked read
+    /// finishing after the mutation was observed), so it is stale; a read at or above the watermark
+    /// is current.
+    fn completion_carries_a_stale_revision(&self, completion: &PreparationCompletion) -> bool {
+        let provider = match &completion.outcome {
+            PreparationOutcome::Ready(prepared) => prepared.provider.as_str(),
+            PreparationOutcome::Refused(_) => completion.resolved.provider.as_str(),
+        };
+        let expected = self.prepare_expected_revisions.get(provider).copied();
+        let watermark = self
+            .credential_revisions
+            .as_ref()
+            .and_then(|source| source.high_water(provider));
+        let observed = || completion.observed_revision.parse::<u64>().ok();
+        match &completion.outcome {
+            PreparationOutcome::Ready(prepared) => {
+                // The move-only payload must agree with the envelope that delivered it, whatever
+                // either revision means.
+                if completion.observed_revision != prepared.credential_revision {
+                    return true;
+                }
+                if let Some(expected) = expected
+                    && observed() != Some(expected)
+                {
+                    // A Ready completion always carries the numeric owner revision its read
+                    // produced; one that cannot be parsed against a known revision is unverifiable
+                    // and must not become a session.
+                    return true;
+                }
+                if let (Some(observed), Some(watermark)) = (observed(), watermark)
+                    && observed < watermark
+                {
+                    return true;
+                }
+                false
+            }
+            PreparationOutcome::Refused(_) => {
+                // A typed timeout/failure that never reached a credential carries an EMPTY observed
+                // revision: it is not a mismatch, and must still arm its gate.
+                if completion.observed_revision.is_empty() {
+                    return false;
+                }
+                if let Some(expected) = expected
+                    && observed() != Some(expected)
+                {
+                    return true;
+                }
+                if let (Some(observed), Some(watermark)) = (observed(), watermark)
+                    && observed < watermark
+                {
+                    return true;
+                }
+                false
             }
         }
     }
@@ -1347,6 +1623,30 @@ impl Orchestrator {
     /// Runs the ordinary dispatch side effects for an accepted successful preparation. A pool pick
     /// runs its cross-daemon claim election HERE — after preparation, so a refusal never claims — and
     /// dispatches only if it won.
+    /// Build the dispatch-time [`PreparedHarnessSpec`] this accepted completion will run on, or
+    /// `Ok(None)` on the legacy branch. `Err(())` is a refusal: a completion that carries custody
+    /// but cannot produce a spec must NOT fall back to the shared runner, so the caller drops the
+    /// completion without dispatching (the custody is revoked by the drop).
+    fn prepared_spec(
+        &self,
+        prepared: PreparedDispatch,
+        slug: Option<&str>,
+    ) -> Result<Option<PreparedHarnessSpec>, ()> {
+        let Some(eff) = self.eff.as_ref() else {
+            return Ok(None);
+        };
+        let cfg = slug
+            .and_then(|s| eff.project_by_slug(s).map(|p| &p.mcfg))
+            .unwrap_or(&eff.cfg);
+        prepared.into_harness_spec(cfg).map_err(|e| {
+            tracing::error!(
+                err = %e,
+                "a prepared dispatch's spec could not be built; refusing the dispatch rather than \
+                 falling back to the shared runner"
+            );
+        })
+    }
+
     async fn finish_prepared(
         &mut self,
         _id: String,
@@ -1407,7 +1707,12 @@ impl Orchestrator {
                         promote_state = %promote.state,
                         "review-reopen: summoned ticket promoted and dispatched"
                     );
-                    self.dispatch_issue(iss, attempt, route, stack_context);
+                    let slug = route.as_ref().map(|r| r.slug.as_str());
+                    let spec = match self.prepared_spec(prepared, slug) {
+                        Ok(spec) => spec,
+                        Err(()) => return,
+                    };
+                    self.dispatch_issue_prepared(iss, attempt, route, stack_context, spec);
                     return;
                 }
                 if pool {
@@ -1416,13 +1721,36 @@ impl Orchestrator {
                         harness = %prepared.harness,
                         "preparation accepted; running the pool claim election"
                     );
+                    let pool_slug = pool_proj.and_then(|i| {
+                        self.eff
+                            .as_ref()
+                            .and_then(|e| e.projects.get(i))
+                            .map(|p| p.slug.clone())
+                    });
+                    let mut spec = match self.prepared_spec(prepared, pool_slug.as_deref()) {
+                        Ok(spec) => spec,
+                        Err(()) => return,
+                    };
                     let pick = crate::select::TaggedIssue {
                         iss: issue,
                         proj: pool_proj,
                     };
                     for winner in self.claim_winners(vec![pick]).await {
                         let winner_route = self.route_for(winner.proj);
-                        self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                        if spec.is_some() {
+                            // Custody is one-shot: only the elected winner may carry it. Any further
+                            // winner dispatches on the legacy runner, which cannot happen for a
+                            // brokered pool pick because there is exactly one custody to hand out.
+                            self.dispatch_issue_prepared(
+                                winner.iss,
+                                None,
+                                winner_route,
+                                String::new(),
+                                spec.take(),
+                            );
+                        } else {
+                            self.dispatch_issue(winner.iss, None, winner_route, String::new());
+                        }
                     }
                     return;
                 }
@@ -1433,7 +1761,12 @@ impl Orchestrator {
                     provider = %prepared.provider,
                     "preparation accepted; dispatching"
                 );
-                self.dispatch_issue(issue, attempt, route, stack_context);
+                let slug = route.as_ref().map(|r| r.slug.as_str());
+                let spec = match self.prepared_spec(prepared, slug) {
+                    Ok(spec) => spec,
+                    Err(()) => return,
+                };
+                self.dispatch_issue_prepared(issue, attempt, route, stack_context, spec);
             }
             PreparedTarget::Review {
                 issue,
@@ -1446,8 +1779,12 @@ impl Orchestrator {
                     harness = %prepared.harness,
                     "review preparation accepted; dispatching"
                 );
+                let spec = match self.prepared_spec(prepared, Some(route.slug.as_str())) {
+                    Ok(spec) => spec,
+                    Err(()) => return,
+                };
                 let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
-                self.finish_review_dispatch(*run, route, issue);
+                self.finish_review_dispatch_prepared(*run, route, issue, spec);
                 // The watcher bookkeeping the synchronous arm applies in `reviewwatch`: a prepared
                 // review must charge the same churn budget and retire the same reassigned incumbent
                 // once its dispatch is accepted (STUDIO-988 review round 7, sol #1).
@@ -1970,6 +2307,64 @@ mod tests {
         assert!(o.preparing.is_empty());
     }
 
+    // --- B3 (STUDIO-1002 review): a resolver is installed once, but the CURRENT effective config
+    // decides whether preparation runs, so a hot reload that adds a provider is honoured while a
+    // provider-less installation stays byte-identical. The mutation guard is dropping the config
+    // gate: a no-provider config would then take the async path (and a per-project-only provider
+    // would fall back to the native login).
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_without_a_provider_keeps_preparation_inert_even_with_a_resolver() {
+        use crate::testsupport::HangResolver;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.cfg.providers.clear();
+        o.eff = Some(eff);
+        // The composition root installs the resolver unconditionally (run.rs); the gate is the
+        // config, not the presence of a resolver.
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        assert_eq!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::NoResolver,
+            "a config with no provider must keep the inline dispatch path"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_only_provider_opens_the_preparation_gate() {
+        use crate::testsupport::HangResolver;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.cfg.providers.clear();
+        let mut project = crate::testsupport::empty_resolved_project("a", Arc::new(Fake::new()));
+        project.mcfg.providers.insert(
+            "fireworks".to_string(),
+            rhapsody_config::ProviderDefinition {
+                id: "fireworks".to_string(),
+                protocol: rhapsody_config::PROTOCOL_OPENAI_COMPATIBLE.to_string(),
+                display_name: String::new(),
+                base_url: "https://api.fireworks.ai/inference/v1".to_string(),
+                allow_insecure_http: false,
+                credential: rhapsody_config::CredentialSource {
+                    source: rhapsody_config::providers::CREDENTIAL_SOURCE_KEYCHAIN.to_string(),
+                },
+                broker_limits: rhapsody_config::BrokerLimits::default(),
+            },
+        );
+        eff.projects = vec![project];
+        o.eff = Some(eff);
+        o.prepare_resolver = Some(Arc::new(HangResolver));
+        assert!(
+            matches!(
+                o.begin_preparation(ticket_target("Todo"), false),
+                BeginPreparation::Started(_)
+            ),
+            "a provider defined only in a project overlay must be prepared, not silently run on the \
+             native login"
+        );
+    }
+
     // --- the loop-owned reservation dedupes concurrent paths --------------------------------------
 
     // MUTATION GUARD: remove the `preparing` reservation (or its dedupe) and a second concurrent
@@ -2350,7 +2745,7 @@ mod tests {
                     PreparationOutcome::Refused(RefusalReason::ResolverTimedOut) => {}
                     other => panic!("expected a typed timeout refusal, got {other:?}"),
                 }
-                o.handle_dispatch_prepared(id, token, completion).await;
+                o.handle_dispatch_prepared(id, token, *completion).await;
             }
             _ => panic!("expected DispatchPrepared"),
         }
@@ -3456,15 +3851,83 @@ mod tests {
         (o, shared, sink)
     }
 
+    /// A custody-bearing `PreparedDispatch` (PB7, STUDIO-1002): a real broker registration for the
+    /// `opencode`/`fireworks` selection, so the completion path actually has move-only custody to
+    /// carry through `finish_prepared`.
+    fn custody_dispatch() -> PreparedDispatch {
+        use rhapsody_provider_broker::{
+            BoundCredentialLease, Broker, OsRandom, SessionPolicy, SystemClock,
+        };
+        let broker = Broker::new(
+            "http://127.0.0.1:0/v1",
+            Arc::new(SystemClock::new()),
+            Arc::new(OsRandom::new()),
+        )
+        .expect("broker");
+        let plan = ResolvedProviderPlan {
+            stable_id: "fireworks".to_string(),
+            protocol: rhapsody_agent::ProviderProtocol::OpenAiCompatible,
+            normalized_endpoint: "https://api.fireworks.ai/inference/v1".to_string(),
+            allow_insecure_http: false,
+            credential_binding: "fireworks\u{1f}openai-chat-completions-bearer-v1\u{1f}https://api.fireworks.ai/inference/v1".to_string(),
+            credential_ref: "keychain".to_string(),
+            limits: rhapsody_agent::ProviderLimits::default(),
+            model: "accounts/fireworks/models/x".to_string(),
+            origins: rhapsody_agent::ProviderOrigins {
+                provider: "ticket".to_string(),
+                model: "ticket".to_string(),
+            },
+        };
+        // Lower and register against the broker's OWN plan so the binding matches exactly.
+        let lowered = rhapsody_agent::lower_provider_plan(&plan).expect("lowered");
+        let binding = lowered.binding().expect("binding");
+        let lease =
+            BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+        let policy = SessionPolicy::new(*lowered.limits()).expect("policy");
+        let registration = broker
+            .registrar()
+            .register_session(lowered, lease, policy)
+            .expect("register");
+        let provider = PreparedProvider::from_registration(
+            "fireworks".to_string(),
+            rhapsody_agent::ProviderProtocol::OpenAiCompatible,
+            registration,
+        );
+        PreparedDispatch::new("opencode", "accounts/fireworks/models/x", "fireworks", "7")
+            .with_provider(provider, plan)
+    }
+
+    /// A per-provider observed-revision watermark stand-in for the daemon's credential boundary
+    /// (B1, STUDIO-1002). One entry is enough for every test here.
+    struct FakeWatermark {
+        provider: String,
+        revision: u64,
+    }
+
+    impl FakeWatermark {
+        fn new(provider: &str, revision: u64) -> Self {
+            Self {
+                provider: provider.to_string(),
+                revision,
+            }
+        }
+    }
+
+    impl CredentialRevisionSource for FakeWatermark {
+        fn high_water(&self, provider: &str) -> Option<u64> {
+            (provider == self.provider).then_some(self.revision)
+        }
+    }
+
     fn ready_completion() -> PreparationCompletion {
         PreparationCompletion {
             outcome: PreparationOutcome::Ready(PreparedDispatch::new(
                 "claude",
                 "opus",
                 "anthropic",
-                "rev-1",
+                "1",
             )),
-            observed_revision: "rev-1".to_string(),
+            observed_revision: "1".to_string(),
             resolved: fake_selection(),
         }
     }
@@ -3857,7 +4320,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_completion_with_a_stale_credential_revision_is_dropped() {
         let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
-        o.set_prepare_expected_revision(Some("rev-1".to_string()));
+        o.set_prepare_expected_revision("anthropic", Some(1));
         assert!(matches!(
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Started(_)
@@ -3873,9 +4336,9 @@ mod tests {
                     "claude",
                     "opus",
                     "anthropic",
-                    "rev-2",
+                    "2",
                 )),
-                observed_revision: "rev-2".to_string(),
+                observed_revision: "2".to_string(),
                 resolved: fake_selection(),
             },
         )
@@ -3901,6 +4364,245 @@ mod tests {
         );
     }
 
+    // B1 (STUDIO-1002 review): the §12 credential-revision race. A preparation read the credential
+    // at the OLD revision and stalled; the operator's Replace advanced the owner revision, and the
+    // next read through the same boundary (a provider-status refresh) recorded the new watermark. The
+    // stalled completion must be dropped before it becomes a session. The mutation guard is ignoring
+    // the watermark (the reviewers' "expected is None so it is accepted" hole).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completion_older_than_the_observed_watermark_is_dropped() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        // The completion's own read observed revision 1; a later read observed 2.
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 2)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a completion read at an older revision than the observed watermark must not become a \
+             session"
+        );
+        assert!(o.preparing.is_empty());
+
+        // Positive control: a read AT the current watermark is current, and still dispatches.
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 1)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a completion read at the current watermark still dispatches"
+        );
+    }
+
+    // STUDIO-1002 review A1: a refusal from an UNREACHABLE owner carries NO owner revision
+    // (`observed_revision` empty), and must still arm its gate and write its zero-turn row even after
+    // a later read has raised the provider's watermark. The pre-fix source stamped the resolver's
+    // `Revision::INITIAL` sentinel (`"0"`), which the watermark check read as "older than the
+    // watermark" and dropped as stale, so a wedged owner was re-probed every tick with no row and no
+    // gate. This reds if an empty-revision refusal is ever treated as a watermark mismatch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_owner_refusal_at_the_watermark_still_arms_its_gate() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Ready);
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        o.set_store(Arc::clone(&store));
+        o.now = Box::new(fixed_now);
+        // The owner has answered at some point (a Connect/Replace/Remove), so the watermark is ≥ 1.
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 3)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            refused_completion(RefusalReason::OwnerUnavailable),
+        )
+        .await;
+
+        assert_eq!(
+            o.refusal_gate.len(),
+            1,
+            "an unreachable-owner refusal must arm the refusal gate even at a raised watermark"
+        );
+        let runs = store
+            .runs_for_issues(&["MT-1".to_string()], 10)
+            .expect("runs query");
+        assert_eq!(
+            runs.len(),
+            1,
+            "an unreachable-owner refusal must record its zero-turn refusal row"
+        );
+        assert_eq!(runs[0].outcome, rhapsody_store::OUTCOME_REFUSED);
+    }
+
+    // STUDIO-1002 review A1 (the other half): a REFUSAL that DID reach the owner carries the owner's
+    // revision, and one read at an older revision than the observed watermark is the §12 race and must
+    // be dropped. Without this, removing the watermark comparison from the `Refused` branch stays
+    // green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_older_than_the_observed_watermark_is_dropped() {
+        let (mut o, _sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("anthropic", 3)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
+                observed_revision: "1".to_string(),
+                resolved: fake_selection(),
+            },
+        )
+        .await;
+        assert_eq!(
+            o.refusal_gate.len(),
+            0,
+            "a refusal read at an older revision than the observed watermark must not arm the gate"
+        );
+        assert!(o.preparing.is_empty());
+    }
+
+    // B1 (STUDIO-1002 review): the revision expectation is PER PROVIDER, so an installed revision
+    // (or an observed watermark) for one provider must not cross-drop another provider's completion.
+    // The mutation guard is reverting the map to one daemon-wide `Option` keyed by nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revision_expectation_for_one_provider_does_not_drop_another() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        o.set_prepare_expected_revision("fireworks", Some(99));
+        o.set_credential_revision_source(Arc::new(FakeWatermark::new("fireworks", 99)));
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        // The completion is for `anthropic`, a DIFFERENT provider.
+        o.handle_dispatch_prepared("1".to_string(), token, ready_completion())
+            .await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "another provider's revision expectation must not drop this completion"
+        );
+    }
+
+    // B2 (STUDIO-1002 review): a custody-bearing TICKET completion must reach dispatch on the
+    // harness the selection resolved — not fall back to the legacy shared runner — and the move-only
+    // custody must survive `finish_prepared`. The mutation guard is dropping the `.with_provider(..)`
+    // half (then `prepared_spec` returns no custody and this dispatch is byte-identical to legacy,
+    // losing the brokered session).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_custody_bearing_ticket_completion_dispatches_on_the_selected_harness() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(custody_dispatch()),
+                observed_revision: "7".to_string(),
+                resolved: PreparedSelection {
+                    harness: "opencode".to_string(),
+                    model: "accounts/fireworks/models/x".to_string(),
+                    provider: "fireworks".to_string(),
+                },
+            },
+        )
+        .await;
+        let entries = sink.lock().expect("dispatch sink");
+        assert_eq!(
+            entries.len(),
+            1,
+            "an accepted custody-bearing completion dispatches exactly once"
+        );
+        assert_eq!(
+            entries[0].harness, "opencode",
+            "the run records the selection's harness, not the legacy backend"
+        );
+        assert_eq!(
+            entries[0].model_override.model, "accounts/fireworks/models/x",
+            "the selection's model is carried onto the run"
+        );
+    }
+
+    // B2 (STUDIO-1002 review): the same custody-bearing acceptance through the REVIEW path, which
+    // shares the dispatch tail. The mutation guard is dropping the prepared spec on the review arm of
+    // `finish_prepared`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_custody_bearing_review_completion_dispatches_on_the_selected_harness() {
+        let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
+        let run = crate::review::ReviewRun {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+            reviewer: "alice".to_string(),
+            head_sha: "abc".to_string(),
+            ..Default::default()
+        };
+        // The watcher observed the pull request open at this head before the reservation, so the
+        // completion revalidation is Current.
+        o.review_observed_head.insert(
+            crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number),
+            ReviewHeadObservation {
+                open: true,
+                head: "abc".to_string(),
+            },
+        );
+        let target = PreparedTarget::Review {
+            issue: run.synthetic_issue(),
+            run: Box::new(run.clone()),
+            route: sample_route(),
+            commit: None,
+        };
+        assert!(matches!(
+            o.begin_preparation(target, false),
+            BeginPreparation::Started(_)
+        ));
+        let key = run.key();
+        let token = o.preparing.get(&key).map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            key,
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(custody_dispatch()),
+                observed_revision: "7".to_string(),
+                resolved: PreparedSelection {
+                    harness: "opencode".to_string(),
+                    model: "accounts/fireworks/models/x".to_string(),
+                    provider: "fireworks".to_string(),
+                },
+            },
+        )
+        .await;
+        let entries = sink.lock().expect("dispatch sink");
+        assert_eq!(
+            entries.len(),
+            1,
+            "an accepted custody-bearing review completion dispatches exactly once"
+        );
+        assert_eq!(entries[0].harness, "opencode");
+    }
+
     // MUTATION GUARD (STUDIO-988 review round 5, sol #1): compare only the ENVELOPE revision and a
     // Ready payload carrying a different revision than the envelope is accepted — the move-only
     // payload must agree with the envelope that delivered it, not merely be wrapped by it. This test
@@ -3908,7 +4610,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ready_payload_must_agree_with_its_envelope_revision() {
         let (mut o, sink, _calls) = orch_with_resolver(Scripted::Ready);
-        o.set_prepare_expected_revision(Some("rev-2".to_string()));
+        o.set_prepare_expected_revision("anthropic", Some(2));
         assert!(matches!(
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Started(_)
@@ -3924,9 +4626,9 @@ mod tests {
                     "claude",
                     "opus",
                     "anthropic",
-                    "rev-2",
+                    "2",
                 )),
-                observed_revision: "rev-1".to_string(),
+                observed_revision: "1".to_string(),
                 resolved: fake_selection(),
             },
         )
@@ -3947,7 +4649,7 @@ mod tests {
     async fn a_refusal_at_a_stale_credential_revision_is_dropped() {
         let (mut o, _sink, _calls) =
             orch_with_resolver(Scripted::Refused(RefusalReason::CredentialAbsent));
-        o.set_prepare_expected_revision(Some("rev-2".to_string()));
+        o.set_prepare_expected_revision("anthropic", Some(2));
         assert!(matches!(
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Started(_)
@@ -3958,7 +4660,7 @@ mod tests {
             token,
             PreparationCompletion {
                 outcome: PreparationOutcome::Refused(RefusalReason::CredentialAbsent),
-                observed_revision: "rev-1".to_string(),
+                observed_revision: "1".to_string(),
                 resolved: fake_selection(),
             },
         )
@@ -3983,7 +4685,7 @@ mod tests {
         );
         o.set_store(Arc::clone(&store));
         o.now = Box::new(fixed_now);
-        o.set_prepare_expected_revision(Some("rev-1".to_string()));
+        o.set_prepare_expected_revision("anthropic", Some(1));
         assert!(matches!(
             o.begin_preparation(ticket_target("Todo"), false),
             BeginPreparation::Started(_)
