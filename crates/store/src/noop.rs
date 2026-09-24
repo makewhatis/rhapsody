@@ -256,14 +256,17 @@ impl Store for Noop {
     fn load_manager_interventions(&self) -> Result<Vec<ManagerInterventionRow>, StoreError> {
         Ok(Vec::new())
     }
-    fn merge_manager_stall_kinds(
-        &self,
-        _id: &str,
-        _kinds: &[String],
-    ) -> Result<bool, StoreError> {
+    fn merge_manager_stall_kinds(&self, _id: &str, _kinds: &[String]) -> Result<bool, StoreError> {
         Ok(false)
     }
     fn set_manager_intervention_state(&self, _id: &str, _state: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_manager_intervention_phase_hint(
+        &self,
+        _id: &str,
+        _phase_hint: &str,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
     fn reserve_manager_run(

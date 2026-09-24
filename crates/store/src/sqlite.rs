@@ -3079,6 +3079,19 @@ impl Store for Sqlite {
         Ok(())
     }
 
+    fn set_manager_intervention_phase_hint(
+        &self,
+        id: &str,
+        phase_hint: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE rhapsody_manager_intervention SET phase_hint = ?2 WHERE id = ?1",
+            params![id, phase_hint],
+        )?;
+        Ok(())
+    }
+
     fn reserve_manager_run(
         &self,
         id: &str,
@@ -3183,10 +3196,7 @@ impl Store for Sqlite {
                  WHERE state IN (?1, ?2)",
             ))?;
             let rows = stmt.query_map(
-                params![
-                    MANAGER_INTERVENTION_LAUNCHING,
-                    MANAGER_INTERVENTION_RUNNING
-                ],
+                params![MANAGER_INTERVENTION_LAUNCHING, MANAGER_INTERVENTION_RUNNING],
                 map_manager_intervention,
             )?;
             let mut out = Vec::new();
@@ -8004,7 +8014,10 @@ mod tests {
             id: "iv-1".to_string(),
             pr: PR.to_string(),
             generation: 3,
-            stall_kinds: vec!["review_escalated".to_string(), "approved_still_open".to_string()],
+            stall_kinds: vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string(),
+            ],
             mode: MANAGER_MODE_ACT.to_string(),
             state: MANAGER_INTERVENTION_RUNNING.to_string(),
             attempts: 2,
@@ -8022,7 +8035,10 @@ mod tests {
         assert_eq!(got.generation, 3);
         assert_eq!(
             got.stall_kinds,
-            vec!["review_escalated".to_string(), "approved_still_open".to_string()]
+            vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string()
+            ]
         );
         assert_eq!(got.state, MANAGER_INTERVENTION_RUNNING);
         assert_eq!(got.attempts, 2);
@@ -8062,10 +8078,18 @@ mod tests {
     fn a_terminal_intervention_releases_the_pr() {
         let st = open_mem();
         save_queued(&st, "iv-1", "review_escalated");
-        assert!(st.active_manager_intervention(PR).expect("active").is_some());
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_some()
+        );
         st.set_manager_intervention_state("iv-1", MANAGER_INTERVENTION_EXHAUSTED)
             .expect("exhaust");
-        assert!(st.active_manager_intervention(PR).expect("active").is_none());
+        assert!(
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none()
+        );
         save_queued(&st, "iv-2", "round_budget_exhausted");
         assert_eq!(
             st.active_manager_intervention(PR)
@@ -8086,17 +8110,31 @@ mod tests {
             let r = st
                 .reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
                 .expect("reserve");
-            assert_eq!(r, ManagerReservation::Reserved, "launch {n} is within budget");
+            assert_eq!(
+                r,
+                ManagerReservation::Reserved,
+                "launch {n} is within budget"
+            );
         }
         let r = st
             .reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
             .expect("reserve");
-        assert_eq!(r, ManagerReservation::Exhausted, "the 13th launch is refused");
+        assert_eq!(
+            r,
+            ManagerReservation::Exhausted,
+            "the 13th launch is refused"
+        );
         let budget = st.manager_budget(PR).expect("budget").expect("row");
-        assert_eq!(budget.runs_used, 12, "12 runs charged, none for the refused 13th");
+        assert_eq!(
+            budget.runs_used, 12,
+            "12 runs charged, none for the refused 13th"
+        );
         assert!(budget.is_stopped(), "the generation stops");
         assert_eq!(
-            st.manager_intervention("iv-1").expect("read").expect("row").state,
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
             MANAGER_INTERVENTION_EXHAUSTED
         );
     }
@@ -8126,7 +8164,13 @@ mod tests {
                 .expect("reserve"),
             ManagerReservation::Reserved
         );
-        assert_eq!(st.manager_budget(PR).expect("budget").expect("row").runs_used, 2);
+        assert_eq!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            2
+        );
     }
 
     // The per-intervention attempt cap (3) refuses the 4th launch and stops the generation.
@@ -8147,7 +8191,12 @@ mod tests {
                 .expect("reserve"),
             ManagerReservation::Exhausted
         );
-        assert!(st.manager_budget(PR).expect("budget").expect("row").is_stopped());
+        assert!(
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
+        );
     }
 
     // A dead lease is recovered and never left blocking: a lease from another boot becomes a
@@ -8204,7 +8253,10 @@ mod tests {
             .expect("recover");
         assert!(recovered.is_empty());
         assert_eq!(
-            st.manager_intervention("iv-1").expect("read").expect("row").state,
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
             MANAGER_INTERVENTION_RUNNING
         );
     }
@@ -8219,8 +8271,14 @@ mod tests {
                 .expect("merge")
         );
         assert_eq!(
-            st.manager_intervention("iv-1").expect("read").expect("row").stall_kinds,
-            vec!["review_escalated".to_string(), "approved_still_open".to_string()]
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .stall_kinds,
+            vec![
+                "review_escalated".to_string(),
+                "approved_still_open".to_string()
+            ]
         );
         // After a reservation (launching), a further signal is dropped.
         st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
@@ -8230,7 +8288,10 @@ mod tests {
                 .expect("merge")
         );
         assert_eq!(
-            st.manager_intervention("iv-1").expect("read").expect("row").state,
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
             MANAGER_INTERVENTION_LAUNCHING
         );
     }
@@ -8252,7 +8313,10 @@ mod tests {
         st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 3, 3)
             .expect("reserve");
         assert!(
-            st.manager_intervention("iv-1").expect("read").expect("row").is_final,
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .is_final,
             "the last post-threshold allocation launches final"
         );
     }
@@ -8291,11 +8355,16 @@ mod tests {
         assert!(!budget.is_stopped(), "a clear lifts the stop");
         assert_eq!(budget.generation, 2);
         assert!(
-            st.active_manager_intervention(PR).expect("active").is_none(),
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
             "the old intervention is superseded and releases the PR"
         );
         assert_eq!(
-            st.manager_intervention("iv-1").expect("read").expect("row").state,
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
             MANAGER_INTERVENTION_SUPERSEDED
         );
     }
@@ -8324,11 +8393,16 @@ mod tests {
         // Reopen the SAME file — a restart.
         let st = Sqlite::open(StorePath::Disk(db)).expect("reopen");
         assert!(
-            st.manager_budget(PR).expect("budget").expect("row").is_stopped(),
+            st.manager_budget(PR)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
             "the stop persists across a restart"
         );
         assert!(
-            st.active_manager_intervention(PR).expect("active").is_none(),
+            st.active_manager_intervention(PR)
+                .expect("active")
+                .is_none(),
             "the exhausted intervention stays terminal, so no stall can be recreated"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -8357,7 +8431,12 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert!(store.active_manager_intervention(PR).expect("active").is_none());
+        assert!(
+            store
+                .active_manager_intervention(PR)
+                .expect("active")
+                .is_none()
+        );
         assert!(store.manager_budget(PR).expect("budget").is_none());
         assert_eq!(
             store

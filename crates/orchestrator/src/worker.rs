@@ -548,10 +548,22 @@ async fn run_manager_attempt(
     session.set_run_id(deps.run_id);
     session.set_model_override(deps.model_override.clone());
 
+    // §8: the case packet is the host's own record of the stall, rendered as DATA, and it
+    // accompanies the base prompt rather than replacing it. An empty packet (an older path) sends
+    // the base prompt alone, byte-identical to M7.
+    let prompt = if mgr.case_packet.is_empty() {
+        crate::managerrun::MANAGER_BASE_PROMPT.to_string()
+    } else {
+        format!(
+            "{}\n\n{}",
+            crate::managerrun::MANAGER_BASE_PROMPT,
+            mgr.case_packet
+        )
+    };
     let (final_state, result_text, loop_err) = deps
         .run_turns(
             session.as_ref(),
-            crate::managerrun::MANAGER_BASE_PROMPT,
+            &prompt,
             issue.clone(),
             None,
             messages,
@@ -3878,6 +3890,7 @@ mod tests {
         d.manager = Some(crate::managerrun::ManagerCheckout {
             key: "pr:o/r#1@manager".to_string(),
             run_timeout_ms: 1234,
+            case_packet: String::new(),
         });
         let key = "pr:o/r#1@manager";
         let iss = Issue {

@@ -835,6 +835,80 @@ mod tests {
     struct ErrHistStore(Noop);
 
     impl Store for ErrHistStore {
+        fn save_manager_intervention(
+            &self,
+            row: rhapsody_store::ManagerInterventionRow,
+        ) -> Result<(), StoreError> {
+            self.0.save_manager_intervention(row)
+        }
+        fn manager_intervention(
+            &self,
+            id: &str,
+        ) -> Result<Option<rhapsody_store::ManagerInterventionRow>, StoreError> {
+            self.0.manager_intervention(id)
+        }
+        fn active_manager_intervention(
+            &self,
+            pr: &str,
+        ) -> Result<Option<rhapsody_store::ManagerInterventionRow>, StoreError> {
+            self.0.active_manager_intervention(pr)
+        }
+        fn load_manager_interventions(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ManagerInterventionRow>, StoreError> {
+            self.0.load_manager_interventions()
+        }
+        fn merge_manager_stall_kinds(
+            &self,
+            id: &str,
+            kinds: &[String],
+        ) -> Result<bool, StoreError> {
+            self.0.merge_manager_stall_kinds(id, kinds)
+        }
+        fn set_manager_intervention_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+            self.0.set_manager_intervention_state(id, state)
+        }
+        fn set_manager_intervention_phase_hint(
+            &self,
+            id: &str,
+            phase_hint: &str,
+        ) -> Result<(), StoreError> {
+            self.0.set_manager_intervention_phase_hint(id, phase_hint)
+        }
+        fn reserve_manager_run(
+            &self,
+            id: &str,
+            boot_id: &str,
+            lease_expires_at: &str,
+            max_runs: i64,
+            max_attempts: i64,
+            max_interventions: i64,
+        ) -> Result<rhapsody_store::ManagerReservation, StoreError> {
+            self.0.reserve_manager_run(
+                id,
+                boot_id,
+                lease_expires_at,
+                max_runs,
+                max_attempts,
+                max_interventions,
+            )
+        }
+        fn expire_manager_leases(
+            &self,
+            boot_id: &str,
+            now: &str,
+        ) -> Result<Vec<rhapsody_store::ManagerInterventionRow>, StoreError> {
+            self.0.expire_manager_leases(boot_id, now)
+        }
+        fn stop_manager_generation(&self, pr: &str, reason: &str) -> Result<(), StoreError> {
+            self.0.stop_manager_generation(pr, reason)
+        }
+        fn manager_budget(
+            &self,
+            pr: &str,
+        ) -> Result<Option<rhapsody_store::ManagerBudgetRow>, StoreError> {
+            self.0.manager_budget(pr)
+        }
         fn issue_history(&self, _: &str, _: &str, _: i64) -> Result<Vec<RunSummary>, StoreError> {
             Err(StoreError::Disabled)
         }

@@ -54,6 +54,7 @@ pub mod liveness;
 pub mod managerapproval;
 pub mod managerdecision;
 pub mod managerexchange;
+pub mod managerintervention;
 pub mod managerprep;
 pub mod managerread;
 pub mod managerrun;

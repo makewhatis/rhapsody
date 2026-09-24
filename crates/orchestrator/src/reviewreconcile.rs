@@ -1114,6 +1114,17 @@ impl Orchestrator {
         // owed-move row the merge wrote is the fact, read — not invented — exactly as this module's
         // contract requires: no `gh`, no tracker, local only.
         found.extend(done);
+        // STUDIO-1015: when the manager acts, the stall signals it owns go to the manager INSTEAD
+        // OF the human feed. Routing only enqueues an intervention — this sweep still acts on
+        // nothing (§7.2) — and the signal is dropped from the report only once the manager has
+        // adopted it. `off` is byte-identical: nothing is routed and nothing is dropped.
+        let adopted = self.route_stalls_to_manager(&found);
+        if !adopted.is_empty() {
+            found.retain(|d| {
+                let manager_owned = crate::managerintervention::stall_kind_for(d.kind).is_some();
+                !(manager_owned && adopted.iter().any(|k| k == &d.pr.to_ascii_lowercase()))
+            });
+        }
         self.set_review_divergences(found);
     }
 

@@ -1341,6 +1341,32 @@ facade registers none of them — the manager surface is opt-in via `rhapsodyd m
 The `rhapsody_` prefix keeps the evidence table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the thirteenth name.
 
+### The manager intervention lifecycle — one active per PR, leased runs, atomic budgets (STUDIO-1015)
+
+The manager's lifecycle (`manager-agent-design.md` §7.1–§7.5, §10.2) adds one table and three
+columns, all `rhapsody_`-prefixed so the Go-recaptured schema golden gates them out by name:
+
+| schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `rhapsody_manager_intervention` | — | one row per manager intervention (the idempotency root) |
+| unique partial index on `rhapsody_manager_intervention(pr)` | — | **at most one active intervention per pull request, across all stall kinds** — the index excludes the terminal states |
+| `rhapsody_review_bound.manager_runs_used` | — | manager runs launched for the generation, charged only by the atomic reservation |
+| `rhapsody_review_bound.manager_interventions_applied` | — | post-threshold interventions applied |
+| `rhapsody_review_bound.manager_stopped` | — | empty while live; a reason once the generation is stopped |
+| `PRAGMA user_version` | 6 | **22** |
+
+Launching a run is **one SQLite transaction** (§7.3): it checks the generation is not stopped, that
+`manager_runs_used < manager.max_runs_per_generation` (12) and the intervention's `attempts < 3`,
+then increments both counters and writes the lease. A failed check marks the intervention
+`exhausted` and stops the generation in the same transaction. **Nothing is refunded** — a charged
+run stays charged even if it crashes. `launching`/`running` hold a lease (`lease_boot_id` plus an
+expiry); at boot a lease from another boot, or one that has expired, becomes a `failed_attempt`
+(§7.5), so no saved in-flight marker can block forever. A stopped generation is stored on disk,
+shown on the human feed, and the sweep never creates another intervention for it; only an operator
+`/clear` (a new generation) resets it. With `manager.review_authority: off` none of this runs and
+the sweep's human feed is byte-identical. `divergent_objects_are_gated_by_name_only` pins the
+fourteenth and fifteenth names (the table and its partial index).
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so

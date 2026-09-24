@@ -754,6 +754,15 @@ pub trait Store {
     /// only way the next intervention for the PR can exist.
     fn set_manager_intervention_state(&self, id: &str, state: &str) -> Result<(), StoreError>;
 
+    /// Writes the case-packet PHASE HINT (`pre_threshold`/`post_threshold`) recorded at launch
+    /// (§7.1). A hint only — the authoritative classification is made at activation (§7.8) — so it
+    /// carries no charging semantics. Idempotent; a no-op when `id` names no row.
+    fn set_manager_intervention_phase_hint(
+        &self,
+        id: &str,
+        phase_hint: &str,
+    ) -> Result<(), StoreError>;
+
     /// ATOMICALLY reserves one manager run (§7.3) — the one place model spend is charged.
     ///
     /// In ONE SQLite transaction it: refuses when `id` names no row ([`ManagerReservation::Absent`]);
