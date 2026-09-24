@@ -1280,7 +1280,10 @@ mod tests {
         let rendered = o.manager_case_packet(&row).render();
         assert!(rendered.contains("reviewer: alice"), "{rendered}");
         assert!(rendered.contains("status: reviewed"), "{rendered}");
-        assert!(rendered.contains("last_completed_verdict: approve"), "{rendered}");
+        assert!(
+            rendered.contains("last_completed_verdict: approve"),
+            "{rendered}"
+        );
         assert!(rendered.contains("ticket: STUDIO-1"), "{rendered}");
     }
 
