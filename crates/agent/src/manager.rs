@@ -16,6 +16,9 @@
 //!   one implying the other.
 //! * **`--allowedTools` lists only the manager MCP tools**, and `--disallowedTools` names every
 //!   built-in (§4.3). The allowlist is the enforcement; the deny-list is belt-and-braces.
+//! * **The model credential is the operator's own OAuth token**, injected as
+//!   [`MANAGER_CREDENTIAL_ENV`] (§4.5). A relocated config root cannot authenticate from a copied
+//!   `.credentials.json` on macOS, where the CLI reads the login Keychain.
 //!
 //! Operator `extra_args` are deliberately NOT inherited: they are appended last by
 //! [`build_args`](crate::claude::build_args) precisely so an operator can override a managed flag,
@@ -48,6 +51,52 @@ pub const MANAGER_SETTING_SOURCES: &str = "user";
 /// tracker-credential scrub, which every run already applies.
 pub const MANAGER_DROP_ENV_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
 
+/// The env var the manager run's model credential is supplied through (§4.5): the operator's own
+/// OAuth access token, extracted from their Claude credential store and injected by name.
+///
+/// # Why an env var and not only the config directory (§4.2)
+///
+/// §4.2 relocates Claude Code's config root so none of the operator's user-level hooks, plugins, MCP
+/// servers or permission rules load. On macOS the CLI reads its OAuth credential from the login
+/// Keychain, keyed by the config root, so a relocated root cannot authenticate from a copied
+/// `~/.claude/.credentials.json` — the file is ignored and the run reports "Not logged in"
+/// (measured on `claude` 2.1.281). The credential is therefore ALSO handed to the run explicitly
+/// through [`MANAGER_CREDENTIAL_ENV`], which the CLI honours in a relocated root (measured:
+/// `authMethod: oauth_token`). It is one credential for the model and nothing else, the run has no
+/// tool that can act on it (§4.4), and it takes the place of no scrub — `GH_TOKEN`/`GITHUB_TOKEN`
+/// and the tracker key are still dropped.
+pub const MANAGER_CREDENTIAL_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Extracts the OAuth access token a Claude Code credential document holds, if any.
+///
+/// The document is the operator's `~/.claude/.credentials.json` (or the Keychain item of the same
+/// shape on macOS): `{"claudeAiOauth":{"accessToken":"…","refreshToken":"…",…}, "mcpOAuth":{…}}`.
+/// Only `claudeAiOauth.accessToken` is read — the `mcpOAuth` map holds unrelated third-party
+/// tokens and is deliberately never copied into a manager config directory.
+pub fn model_credential_from_config_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let token = v
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("accessToken"))
+        .and_then(|t| t.as_str())?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// The FILTERED `~/.claude/.credentials.json` a manager config directory carries: only
+/// `claudeAiOauth`, and only when it holds a non-empty access token. Returns `None` when the source
+/// document has no usable OAuth credential, in which case nothing is written (the config dir then
+/// carries no third-party credential at all, and the run authenticates through
+/// [`MANAGER_CREDENTIAL_ENV`] or not at all — fail closed).
+pub fn manager_credential_document(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let oauth = v.get("claudeAiOauth")?.clone();
+    model_credential_from_config_json(json)?;
+    Some(serde_json::json!({ "claudeAiOauth": oauth }).to_string())
+}
+
 /// The three daemon-owned paths a manager run needs beyond the ordinary session start: the empty
 /// per-run working directory (§4.2 — there is no repository), the dedicated manager configuration
 /// directory (only the model credential), and the manager-only MCP config file. All three are
@@ -64,6 +113,11 @@ pub struct ManagerSessionStart {
     /// `manager.run_timeout_ms` (§10.1): the run's wall-clock ceiling, applied as the session's turn
     /// timeout. Zero is the ordinary configured turn timeout.
     pub run_timeout_ms: u64,
+    /// The operator's model credential — an OAuth access token — injected as
+    /// [`MANAGER_CREDENTIAL_ENV`] for every turn (§4.5). `None` when the operator's credential store
+    /// held no usable token: the run then authenticates how the relocated config root can (not at
+    /// all, on macOS) and fails closed at the turn.
+    pub model_credential: Option<String>,
 }
 
 /// The manager-only MCP config file's path inside the dedicated manager configuration directory
@@ -104,8 +158,14 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
 ];
 
 /// Every built-in the pinned CLI exposes, named in `--disallowedTools` (§4.3). The allowlist is the
-/// actual enforcement; this list is the explicit denial the design requires, kept generous so a
-/// newly-exposed built-in is denied by NAME as well as by the allowlist.
+/// actual enforcement; this list is the explicit denial the design requires, kept complete for the
+/// CLI version the self-test measured (§4.7). A CLI that exposes a NEW built-in is caught by the
+/// canary, which reads the init `tools` array and refuses any entry that is not `mcp__*`
+/// ([`MANAGER_MCP_SERVER`]'s namespace): an unlisted built-in fails the self-test closed rather
+/// than silently running.
+///
+/// The list was completed against `claude` 2.1.281, whose init `tools` array under this posture
+/// named these plus the seventeen in [`MANAGER_DISALLOWED_EXTRA_BUILTINS`].
 pub const MANAGER_DISALLOWED_BUILTIN_TOOLS: &[&str] = &[
     "Bash",
     "BashOutput",
@@ -126,6 +186,29 @@ pub const MANAGER_DISALLOWED_BUILTIN_TOOLS: &[&str] = &[
     "AskUserQuestion",
 ];
 
+/// Built-ins the CLI exposed at the pinned version (2.1.281) that were NOT in the original
+/// STUDIO-1014 list. Kept as a separate constant so the two are still visibly ONE `--disallowedTools`
+/// value built by [`manager_disallowed_tools`]; the split is organizational, not behavioral.
+pub const MANAGER_DISALLOWED_EXTRA_BUILTINS: &[&str] = &[
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ListAgents",
+    "Monitor",
+    "PushNotification",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "TaskStop",
+    "ToolSearch",
+    "Workflow",
+];
+
 /// The fully-qualified (permission-rule) spelling of every manager MCP tool:
 /// `mcp__<server>__<tool>`. This is the value `--allowedTools` carries.
 pub fn manager_allowed_tools() -> String {
@@ -138,7 +221,12 @@ pub fn manager_allowed_tools() -> String {
 
 /// The comma-joined `--disallowedTools` value.
 pub fn manager_disallowed_tools() -> String {
-    MANAGER_DISALLOWED_BUILTIN_TOOLS.join(",")
+    MANAGER_DISALLOWED_BUILTIN_TOOLS
+        .iter()
+        .chain(MANAGER_DISALLOWED_EXTRA_BUILTINS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The manager-only MCP config document (§4.2): a single server — the daemon — started with the
@@ -320,6 +408,82 @@ mod tests {
                 "built-in {want} missing from disallowedTools: {denied}"
             );
         }
+    }
+
+    // §4.3 against the pinned CLI (2.1.281): EVERY built-in its init `tools` array exposed is named
+    // in `--disallowedTools`. The list is exhaustive for that version, so a name drifting out of the
+    // value reds this test rather than silently re-exposing a tool.
+    #[test]
+    fn manager_denies_every_builtin_the_pinned_cli_exposed() {
+        let denied = manager_disallowed_tools();
+        let names: Vec<&str> = denied.split(',').collect();
+        for want in [
+            // The original STUDIO-1014 list.
+            "Bash",
+            "BashOutput",
+            "KillShell",
+            "Read",
+            "Grep",
+            "Glob",
+            "Edit",
+            "MultiEdit",
+            "Write",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "TodoWrite",
+            "SlashCommand",
+            "ExitPlanMode",
+            "AskUserQuestion",
+            // Measured on 2.1.281 (alice's review B2).
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "DesignSync",
+            "EnterWorktree",
+            "ExitWorktree",
+            "ListAgents",
+            "Monitor",
+            "PushNotification",
+            "RemoteTrigger",
+            "ReportFindings",
+            "ScheduleWakeup",
+            "SendMessage",
+            "Skill",
+            "TaskStop",
+            "ToolSearch",
+            "Workflow",
+        ] {
+            assert!(
+                names.contains(&want),
+                "built-in {want} missing from disallowedTools: {denied}"
+            );
+        }
+    }
+
+    // §4.2/§4.5: the manager credential document is FILTERED to `claudeAiOauth` — the third-party
+    // `mcpOAuth` tokens the operator's file also carries are never copied into a manager config dir.
+    #[test]
+    fn the_manager_credential_document_drops_unrelated_tokens() {
+        let source = r#"{
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-model", "refreshToken": "r"},
+            "mcpOAuth": {"linear|x": {"accessToken": "third-party-secret"}}
+        }"#;
+        assert_eq!(
+            model_credential_from_config_json(source).as_deref(),
+            Some("sk-ant-oat01-model")
+        );
+        let filtered = manager_credential_document(source).expect("document");
+        assert!(
+            !filtered.contains("third-party-secret"),
+            "unrelated mcpOAuth tokens must not be copied: {filtered}"
+        );
+        assert!(filtered.contains("claudeAiOauth") && filtered.contains("sk-ant-oat01-model"));
+        // No OAuth credential: nothing to write, and no token to inject.
+        assert!(manager_credential_document(r#"{"mcpOAuth":{}}"#).is_none());
+        assert!(model_credential_from_config_json("not json").is_none());
+        assert!(manager_credential_document(r#"{"claudeAiOauth":{"accessToken":"  "}}"#).is_none());
     }
 
     // §4.2: project and local settings sources are excluded.

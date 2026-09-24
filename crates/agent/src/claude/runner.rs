@@ -137,6 +137,7 @@ impl crate::Runner for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             manager_config_dir: None,
+            manager_credential: None,
         }))
     }
 }
@@ -229,6 +230,7 @@ impl Harness for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             manager_config_dir: Some(req.config_dir),
+            manager_credential: req.model_credential,
         }))
     }
 }
@@ -277,6 +279,12 @@ struct ClaudeSession {
     /// `CLAUDE_CONFIG_DIR` pointing here so none of the operator's user-level hooks, plugins, MCP
     /// servers or permission rules load. `None` on every non-manager run, which is byte-identical.
     manager_config_dir: Option<String>,
+    /// The manager run's model credential (STUDIO-1049; design `manager-agent-design.md` §4.5): the
+    /// operator's OAuth access token, injected as `CLAUDE_CODE_OAUTH_TOKEN` on every turn so a
+    /// relocated `CLAUDE_CONFIG_DIR` can authenticate (on macOS the CLI reads the login Keychain, not
+    /// the relocated credential file). `None` on every non-manager run — and on a manager run whose
+    /// operator store had no usable token — leaving that run's env byte-identical.
+    manager_credential: Option<String>,
 }
 
 impl ClaudeSession {
@@ -503,6 +511,11 @@ impl Session for ClaudeSession {
         // `None` for every non-manager run, so its env is byte-identical.
         if let Some(dir) = &self.manager_config_dir {
             env.push(format!("{}={dir}", crate::manager::MANAGER_CONFIG_DIR_ENV));
+        }
+        // §4.5: the model credential the relocated config root needs. Injected by name; absent on a
+        // manager run whose operator store held no token, which leaves that run's env unchanged.
+        if let Some(cred) = &self.manager_credential {
+            env.push(format!("{}={cred}", crate::manager::MANAGER_CREDENTIAL_ENV));
         }
         cmd.env_clear();
         for kv in &env {
@@ -1777,6 +1790,7 @@ mod tests {
             cwd: cwd.clone(),
             config_dir: config_dir.clone(),
             run_timeout_ms: 0,
+            model_credential: Some("sk-ant-oat01-test".to_string()),
         };
         let sess = r
             .start_manager_session(req, issue("m1", "MT-MGR"), None)
@@ -1801,6 +1815,12 @@ mod tests {
             Some(config_dir.as_str()),
             "the dedicated manager config dir must be exported"
         );
+        assert_eq!(
+            env.get(crate::manager::MANAGER_CREDENTIAL_ENV)
+                .map(String::as_str),
+            Some("sk-ant-oat01-test"),
+            "the model credential must be injected so the relocated config root can authenticate"
+        );
         assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("ok"));
         // The manager-only MCP config file was written, and it names the manager role.
         let mcp = std::fs::read_to_string(
@@ -1816,6 +1836,105 @@ mod tests {
             std::env::remove_var("GITHUB_TOKEN");
             std::env::remove_var("LINEAR_API_KEY");
             std::env::remove_var("KEEP_ME");
+        }
+    }
+
+    // STUDIO-1049 §4.2/§4.3 — the LIVE launch's argv is the manager posture, not merely the pure
+    // `manager_args` helper. alice's review B4: a mutation clearing `permission_mode`/`allowed_tools`/
+    // `mcp_config`/`setting_sources` in `start_manager_session` stayed green because only the helper
+    // was pinned. This drives `start_manager_session` + a real turn against a fake `claude` that
+    // dumps its argv, so dropping ANY of the flags from the live launch reds this test.
+    #[tokio::test]
+    async fn manager_live_launch_argv_is_the_manager_posture() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let cwd = make_ws(&root, "MT-MGR-ARGV");
+        let config_dir = make_ws(&root, "MT-MGR-ARGV-config");
+        let (_s, script) = write_fake_claude(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$@\" > argv.dump\n\
+             head -n 1 >/dev/null\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+        );
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(5),
+            // The install's mode is `bypassPermissions`; the manager must override it.
+            permission_mode: "bypassPermissions".to_string(),
+            ..Default::default()
+        });
+        let req = crate::manager::ManagerSessionStart {
+            cwd: cwd.clone(),
+            config_dir: config_dir.clone(),
+            run_timeout_ms: 0,
+            model_credential: Some("sk-ant-oat01-argv".to_string()),
+        };
+        let sess = r
+            .start_manager_session(req, issue("ma", "MT-MGR-ARGV"), None)
+            .expect("start manager session");
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "run_turn err = {err:?}");
+
+        let argv: Vec<String> = std::fs::read_to_string(format!("{cwd}/argv.dump"))
+            .expect("argv.dump")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let after = |flag: &str| -> String {
+            let i = argv
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from the live manager argv: {argv:?}"));
+            argv.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| panic!("{flag} has no value: {argv:?}"))
+        };
+        // §4.3: never inherit the install's `bypassPermissions`.
+        assert_eq!(after("--permission-mode"), "default");
+        assert!(
+            !argv.iter().any(|a| a == "bypassPermissions"),
+            "bypassPermissions must never reach a manager argv: {argv:?}"
+        );
+        // §4.2: `--mcp-config <manager-only file>` AND `--strict-mcp-config`, both explicit.
+        assert_eq!(
+            after("--mcp-config"),
+            std::path::Path::new(&config_dir)
+                .join(crate::manager::MANAGER_MCP_CONFIG_FILE)
+                .to_string_lossy()
+                .into_owned()
+        );
+        let mi = argv
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("mcp-config");
+        assert_eq!(
+            argv[mi + 2],
+            "--strict-mcp-config",
+            "the strict flag must immediately follow the config: {argv:?}"
+        );
+        // §4.2: project/local setting sources are excluded.
+        assert_eq!(after("--setting-sources"), "user");
+        // §4.3: the allowlist is exactly the manager MCP tools, fully qualified.
+        let allowed = after("--allowedTools");
+        for name in allowed.split(',') {
+            assert!(
+                name.starts_with("mcp__symphony__"),
+                "the manager allowlist may carry only manager MCP tools, got {name}: {allowed}"
+            );
+        }
+        // §4.3: every built-in the pinned CLI exposes is denied.
+        let denied = after("--disallowedTools");
+        for b in crate::manager::MANAGER_DISALLOWED_BUILTIN_TOOLS
+            .iter()
+            .chain(crate::manager::MANAGER_DISALLOWED_EXTRA_BUILTINS)
+        {
+            assert!(
+                denied.split(',').any(|n| n == *b),
+                "built-in {b} missing from the LIVE launch's deny list: {denied}"
+            );
         }
     }
 
