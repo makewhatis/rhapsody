@@ -70,10 +70,11 @@ pub struct BlobRead {
 
 impl BlobRead {
     /// A one-line, model-facing rendering. A symlink is labelled as such so the manager can never be
-    /// misled into treating a link target as file content.
+    /// misled into treating a link target as file content. The target text is shown ONCE — the
+    /// label carries it — so the rendering never implies the link has content of its own.
     pub fn render(&self) -> String {
         if self.symlink {
-            format!("[symlink -> {}]\n{}", self.content.trim_end(), self.content)
+            format!("[symlink -> {}]", self.content.trim_end())
         } else {
             self.content.clone()
         }
@@ -91,6 +92,15 @@ pub struct TreeEntry {
     pub sha: String,
     /// The full repository-relative path.
     pub path: String,
+}
+
+/// A tree listing, possibly cut at [`MAX_TREE_ENTRIES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRead {
+    pub entries: Vec<TreeEntry>,
+    /// The listing was cut at the bound. Like [`GrepRead::truncated`], the manager must be told so a
+    /// cut listing is never read as a complete one.
+    pub truncated: bool,
 }
 
 /// A grep result, possibly cut at [`MAX_GREP_BYTES`].
@@ -170,13 +180,15 @@ impl Manager {
         Ok(BlobRead { content, symlink })
     }
 
-    /// Lists the tree at `sha:path` (or the root when `path` is empty) from the bare mirror.
+    /// Lists the tree at `sha:path` (or the root when `path` is empty) from the bare mirror. A
+    /// listing over [`MAX_TREE_ENTRIES`] is cut and flagged, so a truncated listing can never be
+    /// read as a complete one.
     pub async fn ls_tree(
         &self,
         repo_url: &str,
         sha: &str,
         path: &str,
-    ) -> Result<Vec<TreeEntry>, ReadError> {
+    ) -> Result<TreeRead, ReadError> {
         if !is_commit_sha(sha) {
             return Err(ReadError::InvalidRevision);
         }
@@ -194,10 +206,11 @@ impl Manager {
             return Err(ReadError::Git(out));
         }
         let mut entries: Vec<TreeEntry> = out.lines().filter_map(parse_ls_tree_line).collect();
-        if entries.len() > MAX_TREE_ENTRIES {
+        let truncated = entries.len() > MAX_TREE_ENTRIES;
+        if truncated {
             entries.truncate(MAX_TREE_ENTRIES);
         }
-        Ok(entries)
+        Ok(TreeRead { entries, truncated })
     }
 
     /// Searches the tree at `sha` for `pattern` (fixed regex, `git grep -e`), optionally restricted
@@ -259,6 +272,44 @@ impl Manager {
         }
         let mirror = self.mirror_dir(repo_url);
         let (out, err) = self.git(&mirror, &["diff", "--no-color", from, to]).await;
+        if err.is_some() {
+            return Err(ReadError::Git(out));
+        }
+        if out.len() > MAX_DIFF_BYTES {
+            return Err(ReadError::TooLarge);
+        }
+        Ok(out)
+    }
+
+    /// The difference between the two pull-request patches `merge-base(base, from)..from` and
+    /// `merge-base(base, to)..to` — the comparison `git range-diff` makes (§5.5). Used after a
+    /// rebase or force-push, where `from` is not an ancestor of `to`. Bounded by [`MAX_DIFF_BYTES`].
+    pub async fn range_diff(
+        &self,
+        repo_url: &str,
+        base: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<String, ReadError> {
+        if !is_commit_sha(base) || !is_commit_sha(from) || !is_commit_sha(to) {
+            return Err(ReadError::InvalidRevision);
+        }
+        let mirror = self.mirror_dir(repo_url);
+        let mb_from = self.merge_base(repo_url, base, from).await?;
+        let mb_to = self.merge_base(repo_url, base, to).await?;
+        if mb_from.is_empty() || mb_to.is_empty() {
+            return Err(ReadError::Git(
+                "no merge base with the pull request's base".to_string(),
+            ));
+        }
+        let range_from = format!("{mb_from}..{from}");
+        let range_to = format!("{mb_to}..{to}");
+        let (out, err) = self
+            .git(
+                &mirror,
+                &["range-diff", "--no-color", "-p", &range_from, &range_to],
+            )
+            .await;
         if err.is_some() {
             return Err(ReadError::Git(out));
         }
@@ -425,17 +476,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ls_tree_lists_entries() {
+    async fn ls_tree_lists_entries_not_truncated() {
         let (m, _root) = repo_test_manager(HookScripts::default());
         let origin = init_local_origin();
         std::fs::write(origin.child("a.rs"), "a\n").unwrap();
         git_run(&origin.path, &["add", "a.rs"]);
         git_run(&origin.path, &["commit", "-m", "a"]);
         let sha = mirror_for(&m, &origin.path).await;
-        let entries = m.ls_tree(&origin.path, &sha, "").await.expect("ls");
-        let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let got = m.ls_tree(&origin.path, &sha, "").await.expect("ls");
+        let names: Vec<&str> = got.entries.iter().map(|e| e.path.as_str()).collect();
         assert!(names.contains(&"README.md"), "{names:?}");
         assert!(names.contains(&"a.rs"), "{names:?}");
+        assert!(!got.truncated, "a small listing must not be flagged cut");
+    }
+
+    // review follow-up: a listing cut at MAX_TREE_ENTRIES must SAY so — a silently cut listing reads
+    // as complete.
+    #[tokio::test]
+    async fn ls_tree_flags_a_truncated_listing() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let origin = init_local_origin();
+        // One more entry than the bound, so the cut is observable.
+        for i in 0..=(MAX_TREE_ENTRIES) {
+            std::fs::write(origin.child(&format!("f{i:04}.rs")), "x\n").unwrap();
+        }
+        git_run(&origin.path, &["add", "-A"]);
+        git_run(&origin.path, &["commit", "-m", "many files"]);
+        let sha = mirror_for(&m, &origin.path).await;
+        let got = m.ls_tree(&origin.path, &sha, "").await.expect("ls");
+        assert_eq!(got.entries.len(), MAX_TREE_ENTRIES);
+        assert!(got.truncated, "an over-bound listing must be flagged cut");
+    }
+
+    // review follow-up: the symlink rendering names the target ONCE, never as both a label and a
+    // body.
+    #[test]
+    fn symlink_render_shows_the_target_once() {
+        let b = BlobRead {
+            content: "target/path".to_string(),
+            symlink: true,
+        };
+        assert_eq!(b.render(), "[symlink -> target/path]");
+        let plain = BlobRead {
+            content: "hello\n".to_string(),
+            symlink: false,
+        };
+        assert_eq!(plain.render(), "hello\n");
+    }
+
+    #[tokio::test]
+    async fn range_diff_shows_the_change_between_two_patches() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let origin = init_local_origin();
+        let base = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &origin.path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        // A first patch (v1) and a rebased/amended second patch (v2) that changes the file again.
+        std::fs::write(origin.child("b.rs"), "v1\n").unwrap();
+        git_run(&origin.path, &["add", "b.rs"]);
+        git_run(&origin.path, &["commit", "-m", "v1"]);
+        let from = mirror_for(&m, &origin.path).await;
+        std::fs::write(origin.child("b.rs"), "v2\n").unwrap();
+        git_run(&origin.path, &["add", "b.rs"]);
+        git_run(&origin.path, &["commit", "-m", "v2"]);
+        let to = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &origin.path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        m.ensure_from_repo(&origin.path, "", "AIE-2")
+            .await
+            .expect("refresh mirror");
+        let rd = m
+            .range_diff(&origin.path, &base, &from, &to)
+            .await
+            .expect("range-diff");
+        assert!(
+            rd.contains("v2"),
+            "range-diff should name the added patch: {rd}"
+        );
+        assert!(!rd.trim().is_empty(), "range-diff must not be empty");
     }
 
     #[tokio::test]

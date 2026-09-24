@@ -106,13 +106,19 @@ impl Facade {
         let mut tool_router = Self::read_router();
         tool_router.merge(Self::write_router());
         tool_router.merge(Self::teams_router());
-        tool_router.merge(Self::manager_router());
         // STUDIO-1014: the manager role is a FIXED tool set (§4.4) — every route not in
         // `MANAGER_TOOL_NAMES` is removed, independent of `cfg.mcp` and the Teams toggle, so the
         // manager run's surface is exactly what the design lists and nothing else. Brand aliases are
         // deliberately NOT registered for the manager: the set is exact, and an alias would add a
         // name the design did not list. This branch returns before the ordinary gating below.
+        //
+        // The `manager_*` routes are merged ONLY here. An ordinary (Standard) facade must never
+        // register them: they proxy `/api/v1/manager/*` endpoints that a non-manager run has no
+        // business reading, and registering them would grow every ordinary agent's `list_tools`
+        // (breaking `manager.review_authority: off` staying byte-identical). The manager role is
+        // opt-in via `--role`, and so is its tool surface.
         if opts.role == Role::Manager {
+            tool_router.merge(Self::manager_router());
             let drop: Vec<String> = tool_router
                 .map
                 .keys()
@@ -649,6 +655,36 @@ mod tests {
                 "read tool {want:?} not registered: {names:?}"
             );
         }
+        let _ = client.cancel().await;
+    }
+
+    // STUDIO-1014 (review B1): the ordinary (Standard) role must register NONE of the `manager_*`
+    // tools. They proxy `/api/v1/manager/*` and exist only for the `--role manager` run; leaking
+    // them into every worker/reviewer facade would grow `list_tools` and break the byte-identical
+    // `manager.review_authority: off` surface. MUTATION: merging `manager_router()` on the standard
+    // path (as an earlier revision did) reds this.
+    #[tokio::test]
+    async fn standard_role_registers_no_manager_tools() {
+        let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
+        let client = connect(facade).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        let manager_tools: Vec<&&str> = crate::manager::MANAGER_TOOL_NAMES
+            .iter()
+            .filter(|n| n.starts_with("manager_"))
+            .collect();
+        assert!(
+            !manager_tools.is_empty(),
+            "precondition: the manager set should name at least one manager_* tool"
+        );
+        for t in manager_tools {
+            assert!(
+                !names.contains(t),
+                "the standard role must not register {t}: {names:?}"
+            );
+        }
+        // A standard facade's read tools are still present (the removal is scoped to manager_*).
+        assert!(names.contains(&"symphony_state"), "{names:?}");
         let _ = client.cancel().await;
     }
 
