@@ -611,14 +611,16 @@ Do the work for {{ issue.identifier }}.
     }
 
     fn load_from(text: &str) -> String {
-        // Round-trip through the real loader so the spliced YAML is proven parseable.
+        // Round-trip through the real loader so the spliced YAML is proven parseable. The scratch
+        // dir is removed before returning — the CI temp-leak gate (STUDIO-1031) reds on any
+        // `rhapsody-*` dir a test leaves behind.
         let dir =
             std::env::temp_dir().join(format!("rhapsody-provider-edit-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("WORKFLOW.md");
         std::fs::write(&path, text).expect("write");
         let got = load(&path).map(|d| d.prompt_template).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         got
     }
 }
