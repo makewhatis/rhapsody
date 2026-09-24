@@ -150,15 +150,45 @@ fn providers_block_span(front: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// The byte span (within `front`) of ONE `  <id>:` entry inside the `providers:` block: its key line
-/// and every following line indented deeper than two spaces. A blank line or anything at two spaces
-/// or less (a sibling entry, a section comment, the next top-level key) ends it, so a sibling
-/// provider and the comments around it stay byte-identical. `None` when `id` is not defined.
+/// The indent (leading spaces) of the first mapping key directly under `providers:` — the one the
+/// operator used, so a hand-edited file at a non-2-space indent is spliced at its own indent rather
+/// than refused or reformatted. Comments and blanks are skipped; `2` when the block is empty.
+fn providers_entry_indent(lines: &[Line<'_>], key_idx: usize) -> usize {
+    for l in &lines[key_idx + 1..] {
+        if l.content.trim().is_empty() || l.content.trim_start().starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(l.content);
+        if ind == 0 {
+            break;
+        }
+        return ind;
+    }
+    2
+}
+
+/// The entry indent for `front`'s `providers:` block (2 when there is no block or it is empty).
+fn providers_entry_indent_in(front: &str) -> usize {
+    let lines = split_lines(front);
+    match lines
+        .iter()
+        .position(|l| l.content.starts_with("providers:"))
+    {
+        Some(i) => providers_entry_indent(&lines, i),
+        None => 2,
+    }
+}
+
+/// The byte span (within `front`) of ONE `<id>:` entry inside the `providers:` block: its key line
+/// and every following line indented deeper than the entry indent. A blank line or anything at the
+/// entry indent or less (a sibling entry, a section comment, the next top-level key) ends it, so a
+/// sibling provider and the comments around it stay byte-identical. `None` when `id` is not defined.
 fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
     let lines = split_lines(front);
     let key_idx = lines
         .iter()
         .position(|l| l.content.starts_with("providers:"))?;
+    let entry_indent = providers_entry_indent(&lines, key_idx);
     let needle = format!("{id}:");
     let mut i = key_idx + 1;
     while i < lines.len() {
@@ -171,15 +201,15 @@ fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
         if indent == 0 {
             return None; // the block ends before this entry
         }
-        if indent == 2
-            && let Some(rest) = l.content[2..].strip_prefix(&needle)
+        if indent == entry_indent
+            && let Some(rest) = l.content[entry_indent..].strip_prefix(&needle)
             && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('#'))
         {
             let mut end = l.end;
             let mut j = i + 1;
             while j < lines.len() {
                 let n = &lines[j];
-                if n.content.trim().is_empty() || indent_of(n.content) <= 2 {
+                if n.content.trim().is_empty() || indent_of(n.content) <= entry_indent {
                     break;
                 }
                 end = n.end;
@@ -192,16 +222,17 @@ fn provider_entry_span(front: &str, id: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Serialize one provider entry as a two-space-indented `  <id>:` block (its mapping body indented
-/// four spaces), the exact fragment spliced into an operator's file.
-fn serialize_provider_entry(id: &str, value: &Value) -> Result<String, EditError> {
+/// Serialize one provider entry as an `indent`-space-indented `  <id>:` block (its mapping body one
+/// level deeper), the exact fragment spliced into an operator's file.
+fn serialize_provider_entry(id: &str, value: &Value, indent: usize) -> Result<String, EditError> {
     let mut mapping = Mapping::new();
     mapping.insert(Value::String(id.to_string()), value.clone());
     let inner = serde_yaml_ng::to_string(&Value::Mapping(mapping))
         .map_err(|e| EditError::Serialize(e.to_string()))?;
+    let pad = " ".repeat(indent);
     let mut out = String::new();
     for line in inner.lines() {
-        out.push_str("  ");
+        out.push_str(&pad);
         out.push_str(line);
         out.push('\n');
     }
@@ -211,7 +242,7 @@ fn serialize_provider_entry(id: &str, value: &Value) -> Result<String, EditError
 /// A fresh `providers:` key line plus one serialized entry, for a file that had no providers block.
 fn serialize_new_providers_block(id: &str, value: &Value) -> Result<String, EditError> {
     let mut out = String::from("providers:\n");
-    out.push_str(&serialize_provider_entry(id, value)?);
+    out.push_str(&serialize_provider_entry(id, value, 2)?);
     Ok(out)
 }
 
@@ -295,11 +326,17 @@ pub fn apply_provider_edit(
                 return Err(EditError::AlreadyExists(id.to_string()));
             }
             let def = definition.ok_or_else(|| EditError::NotFound(id.to_string()))?;
-            let entry = serialize_provider_entry(id, &provider_value(def)?)?;
+            let value = provider_value(def)?;
             match providers_block_span(front) {
-                // Insert after the block's last non-blank line, before any trailing blank lines.
-                Some((_, block_end)) => (block_end, block_end, entry),
+                // Insert after the block's last non-blank line, before any trailing blank lines, at
+                // the block's own entry indent so the operator's layout is preserved.
+                Some((_, block_end)) => {
+                    let entry =
+                        serialize_provider_entry(id, &value, providers_entry_indent_in(front))?;
+                    (block_end, block_end, entry)
+                }
                 None => {
+                    let entry = serialize_provider_entry(id, &value, 2)?;
                     let mut insertion = String::new();
                     if !front.is_empty() && !front.ends_with('\n') {
                         insertion.push('\n');
@@ -318,7 +355,11 @@ pub fn apply_provider_edit(
                 return Err(EditError::AlreadyExists(id.to_string()));
             }
             let def = definition.ok_or_else(|| EditError::NotFound(id.to_string()))?;
-            let entry = serialize_provider_entry(id, &provider_value(def)?)?;
+            let entry = serialize_provider_entry(
+                id,
+                &provider_value(def)?,
+                providers_entry_indent_in(front),
+            )?;
             let (s, e) =
                 provider_entry_span(front, &key).ok_or_else(|| EditError::NotFound(key.clone()))?;
             (s, e, entry)
@@ -627,6 +668,48 @@ Do the work for {{ issue.identifier }}.
             text.contains("claude:\n  turn_timeout_ms: 1800000"),
             "{text}"
         );
+    }
+
+    /// A file using a non-2-space entry indent is spliced at its own indent, not refused or
+    /// reformatted.
+    #[test]
+    fn non_standard_indentation_is_respected() {
+        const FOUR_SPACE: &str = r"---
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+  project_slug: symphony
+providers:
+    legacy:
+        protocol: openai-compatible
+        base_url: https://legacy.example/v1
+
+claude:
+  turn_timeout_ms: 1800000
+---
+Do the work.
+";
+        let text = apply_provider_edit(
+            FOUR_SPACE,
+            ProviderOp::Edit,
+            "legacy",
+            None,
+            Some(&def("legacy", "https://new.example/v1")),
+        )
+        .expect("edit");
+        assert!(
+            text.contains("    legacy:"),
+            "entry indent changed:\n{text}"
+        );
+        // The entry's own body is rewritten one level below its key (the entry is what changed).
+        assert!(
+            text.contains("      base_url: https://new.example/v1"),
+            "{text}"
+        );
+        assert!(!text.contains("https://legacy.example/v1"), "{text}");
+        // The blank line and the next section are untouched.
+        assert!(text.contains("\n\nclaude:"), "{text}");
+        assert!(!load_from(&text).is_empty());
     }
 
     #[test]
