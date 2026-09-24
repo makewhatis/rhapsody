@@ -3001,6 +3001,25 @@ mod tests {
         );
     }
 
+    /// An in-memory store is NOT durable either, so a configured cap is refused there too — the
+    /// refusal is about durability, not about `storage.path: off` specifically.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_refuses_a_day_cap_with_only_in_memory_storage() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "storage:\n  path: \":memory:\"\n", DAY_CAP_PROVIDER);
+        let buf = SharedBuf::new();
+        assert_ne!(
+            run_now(&[&wf.to_string_lossy()], &buf).await,
+            0,
+            "a day cap over an in-memory store must refuse; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            buf.contents()
+                .contains("durable provider-budget storage is unavailable")
+        );
+    }
+
     /// The counterpart: the same day cap over an on-disk store boots and stops cleanly. Together
     /// with the refusal test this pins the refusal to durability, not to the cap itself.
     #[tokio::test(flavor = "multi_thread")]

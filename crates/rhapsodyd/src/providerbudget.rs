@@ -22,10 +22,18 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use rhapsody_provider_broker::{CumulativeBudgetAuthority, DayBudgetRefusal};
 use rhapsody_store::Store;
 
-/// Whole UTC days since the Unix epoch — the broker's `UtcDay` bucket key. Floor division is
-/// `div_euclid`, so a charge made before UTC midnight never counts against the next day.
+/// The UTC day bucket for a Unix timestamp — whole days since the epoch. Floor division is
+/// `div_euclid`, so an instant before UTC midnight stays on the previous day (and a pre-epoch
+/// instant floors down rather than toward zero).
+pub fn utc_day_of(unix_seconds: i64) -> i64 {
+    unix_seconds.div_euclid(86_400)
+}
+
+/// Whole UTC days since the Unix epoch — the broker's `UtcDay` bucket key. Uses the UTC clock, NOT
+/// the daemon host's local day: the brokered authority is deliberately UTC (STUDIO-957's local-day
+/// dispatch meter is the separate local view and is unchanged by this).
 pub fn utc_day_now() -> i64 {
-    chrono::Utc::now().timestamp().div_euclid(86_400)
+    utc_day_of(chrono::Utc::now().timestamp())
 }
 
 /// The daemon's durable, non-secret [`CumulativeBudgetAuthority`] over the history store.
@@ -310,12 +318,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // `utc_day_now` buckets whole UTC days since the epoch.
+    // The bucket is the UTC day: the boundary is exactly 86_400 seconds, and an instant just before
+    // it stays on the previous day. MUTATION: divide by the LOCAL day (or round instead of floor)
+    // and `utc_day_of(86_399)` becomes 1.
     #[test]
-    fn utc_day_now_is_days_since_the_epoch() {
-        let now = utc_day_now();
-        // 2024-01-01 is day 19_723 since the epoch; the clock only moves forward, so any real "now"
-        // is comfortably past it.
-        assert!(now > 19_723, "utc_day_now returned {now}");
+    fn utc_day_of_floors_at_the_utc_midnight_boundary() {
+        assert_eq!(utc_day_of(0), 0);
+        assert_eq!(utc_day_of(86_399), 0, "one second before the boundary");
+        assert_eq!(utc_day_of(86_400), 1, "the boundary itself is the next day");
+        assert_eq!(utc_day_of(2 * 86_400 + 5), 2);
+        assert_eq!(utc_day_of(-1), -1, "pre-epoch instants floor down");
+        // 2024-01-01T00:00:00Z is 1_704_067_200.
+        assert_eq!(utc_day_of(1_704_067_200), 19_723);
+        assert!(utc_day_now() > 19_723, "the clock only moves forward");
     }
 }
