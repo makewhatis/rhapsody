@@ -165,6 +165,79 @@ PY
     fi
 fi
 
+# --- 2c. a plugin change without a version bump must red (STUDIO-993) ------------------------------
+# "Omit the version bump" is a named mutation, and a MISSING bump is only checkable against a base
+# ref — so build a scratch git repo whose base commit carries the plugin at an OLD version, change a
+# shipped plugin file without bumping, and require the check to red. Bumping afterwards must green
+# it, proving the red is the version check and not some incidental failure of the scratch tree.
+# (The scratch repo is needed because check-plugin.sh resolves its root from its own path and the
+# copied `$work` tree above is deliberately NOT a git repo.)
+bump_repo="$work/bump-repo"
+mkdir -p "$bump_repo/.github/scripts"
+cp -R "$root/.claude-plugin" "$bump_repo/.claude-plugin"
+cp -R "$root/plugin" "$bump_repo/plugin"
+cp "$root/$check_rel" "$bump_repo/$check_rel"
+
+# set_version <repo> <version> — rewrites the version in all three shipped fields (marketplace top
+# level + its rhapsody entry + plugin/.claude-plugin/plugin.json), the same trio check-plugin.sh
+# already requires to agree.
+set_version() {
+    python3 - "$1" "$2" <<'PY'
+import json, pathlib, sys
+root, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+mp = root / ".claude-plugin/marketplace.json"
+m = json.loads(mp.read_text())
+m["version"] = version
+for p in m.get("plugins") or []:
+    if p.get("source") == "./plugin":
+        p["version"] = version
+mp.write_text(json.dumps(m, indent=2) + "\n")
+pj = root / "plugin/.claude-plugin/plugin.json"
+p = json.loads(pj.read_text())
+p["version"] = version
+pj.write_text(json.dumps(p, indent=2) + "\n")
+PY
+}
+
+run_bump_check() {
+    set +e
+    bump_out="$(cd "$bump_repo" && RHAPSODY_PLUGIN_BASE_REF="$base_sha" "$bump_repo/$check_rel" 2>&1)"
+    bump_status=$?
+    set -e
+}
+
+set_version "$bump_repo" "0.0.1"
+git -C "$bump_repo" init -q
+git -C "$bump_repo" config user.email test@example.com
+git -C "$bump_repo" config user.name test
+git -C "$bump_repo" add -A
+git -C "$bump_repo" commit -qm base
+base_sha="$(git -C "$bump_repo" rev-parse HEAD)"
+
+# A real plugin edit — a whole comment line appended to a SKILL.md body — with the version left at
+# 0.0.1. This is exactly the "omit version bump" mutation.
+printf '\n<!-- docs drift -->\n' >> "$bump_repo/plugin/skills/rhapsody-teams/SKILL.md"
+git -C "$bump_repo" add -A
+git -C "$bump_repo" commit -qm drift
+run_bump_check
+if [ "$bump_status" -eq 0 ] || ! grep -qF -- "the plugin version did not" <<<"$bump_out"; then
+    echo "FAIL - a plugin change without a version bump must red the check: exit $bump_status, $bump_out"
+    fail=1
+else
+    echo "ok   - reds when a shipped plugin file changes without a version bump"
+fi
+
+set_version "$bump_repo" "0.0.2"
+git -C "$bump_repo" add -A
+git -C "$bump_repo" commit -qm bump
+run_bump_check
+if [ "$bump_status" -ne 0 ]; then
+    echo "FAIL - bumping the plugin version must green the version-bump check: exit $bump_status, $bump_out"
+    fail=1
+else
+    echo "ok   - greens once the plugin version is bumped"
+fi
+
 # --- `.claude-plugin/` is scanned too, not just the plugin source dirs ------------------------------
 # The marketplace manifest is shipped and installable; a leak in its description is as public as one
 # in a skill. Injected through the JSON so the manifest stays parseable and only the scan can red.

@@ -116,9 +116,11 @@ but does not yet gate anything — do not rely on it to restrict a teammate.)
   use it, so do not set `provider` on a `claude` teammate — Claude uses its native login.
 
 The same `harness`/`provider`/`model`/`effort` fields may also be set directly on a **roster
-identity**, overriding whatever the profile names; and the `manager:` block has its own tuple
+identity**, but they are **not yet applied to a run**: a dispatched run resolves its tuple from the
+profile tier and below, and `rhapsodyd teams show <name>` lists any identity routing fields as
+*configured but not applied*. The `manager:` block has its own tuple
 (`manager.harness`/`manager.provider`/`manager.model`) that never borrows a teammate's — an absent
-`manager.harness` means `claude`.
+`manager.harness` means `claude` — and the manager tuple **is** applied.
 
 **When each source takes effect — don't tell anyone all three need a restart.** `teams.yaml`
 (roster, identity routing fields, manager tuple, review overrides) is **boot-loaded**: it is read

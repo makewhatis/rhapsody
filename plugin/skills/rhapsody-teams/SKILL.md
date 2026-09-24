@@ -110,13 +110,15 @@ few reviewers configured a required verdict can become unobtainable. This is exa
 `review.model`/`review.effort` below are scoped per harness rather than a single string.
 
 **`provider:` names the credential-backed inference provider a run uses.** It is the same shape on a
-profile, a roster identity, and the `manager:` block: an operator-chosen canonical provider id
+profile and on the `manager:` block: an operator-chosen canonical provider id
 (`fireworks`, `openrouter`, …) declared in `WORKFLOW.md`'s `providers:`. It is **never a
 credential** — the value is a plain id, and anything that is not a canonical id is refused, so a
-secret has no field to travel in. Empty inherits (profile → identity → the daemon's configured
-selection). A provider reference the config does not define, or an explicit provider on the
-`claude` harness, is a dispatch **refusal** — never a silent fallback to another provider or to
-`agent.backend`.
+secret has no field to travel in. Empty inherits (profile → the daemon's configured selection). A
+provider reference the config does not define, or an explicit provider on the `claude` harness, is a
+dispatch **refusal** — never a silent fallback to another provider or to `agent.backend`. A roster
+identity may also carry its own `harness:`/`provider:`/`model:`/`effort:`; those identity-tier
+fields are parsed and displayed but **not yet applied to a run** — see "Where the
+harness/provider/model comes from" below.
 
 The **manager** carries its own tuple (`manager.harness` / `manager.provider` / `manager.model`)
 and never borrows a teammate's. An absent `manager.harness` means `claude` (independent of
@@ -133,13 +135,20 @@ provider from below). Highest wins:
 ticket labels → review override (review runs) → profile → roster identity → project → global agent.*
 ```
 
-A roster identity may therefore override its profile with its own `harness:`, `provider:`, `model:`
-and `effort:`. An unset field inherits the next tier; an **invalid** one (unknown/non-canonical
+⚠️ **Only the profile, project and global tiers are applied to a dispatched run today.** A roster
+identity may carry its own `harness:`, `provider:`, `model:` and `effort:`, and `review.provider`
+may be configured, but neither the identity tier nor the review tier is fed at dispatch yet — a run
+still resolves its tuple from the profile tier and below, so an identity that names a provider does
+**not** yet change what its runs use. **`rhapsodyd teams show <name>`** prints the tuple a run would
+actually resolve, then lists any identity routing fields as *configured but not applied*, and
+reports a configured `review.provider` the same way, so you never mistake an unapplied override for
+a live one. (Wiring those tiers is tracked separately from this documentation change.)
+
+An unset field inherits the next tier; an **invalid** one in an applied tier (unknown/non-canonical
 provider, provider on `claude`, missing model for an explicit provider) refuses that RUN — it never
 degrades the whole Teams feature to disabled, and it never falls back to another provider, harness,
-model, or auth source. **`rhapsodyd teams show <name>`** prints the effective harness/provider/model
-and the **origin tier** each field came from, plus the manager's own tuple, so you never have to
-reconstruct the chain by hand.
+model, or auth source. The manager's own tuple **is** applied: `teams show` prints it with its
+origins, so you never have to reconstruct the chain by hand.
 
 The three sources take effect at **different times** — do not tell an operator all three need a
 restart:
@@ -312,11 +321,13 @@ reviewer's runs actually use, the review is **refused** rather than sent to the 
 silently downgraded to a cheaper model — this is the trap above, closed by config. `review.effort`
 in the same situation just inherits, since an effort value can't make a provider reject a model.
 
-**A review run can also use its own provider, scoped per harness the same way.** `review.provider`
-(`review.provider: { opencode: fireworks }`, or a legacy bare scalar) selects the provider a review
-run uses, overriding the routed reviewer's own selection — unset means inherit. Like `review.model`,
-a provider configured for a harness the routed reviewer does **not** use is **refused** rather than
-applied to the wrong run, and every value must be a canonical provider id.
+**`review.provider` is parsed and validated but not yet applied.** `review.provider`
+(`review.provider: { opencode: fireworks }`, or a legacy bare scalar) is harness-scoped like
+`review.model`, and every value must be a canonical provider id. It is **not yet applied at
+dispatch**: a review run still takes its provider from the profile and global tiers, so configuring
+it changes nothing yet, and `rhapsodyd teams show <name>` reports the configured value as *not yet
+applied*. Unlike `review.model`, a `review.provider` aimed at a harness the routed reviewer does not
+use is therefore **not** a refusal today — nothing consumes it yet.
 
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
