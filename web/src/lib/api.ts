@@ -241,6 +241,20 @@ export interface RunProvenance {
   model?: string;
   model_origin?: string;
   provider?: string;
+  /** The config key the provider came from (`providers.<id>`), when the run recorded one. */
+  provider_origin?: string;
+  /** The broker's usage record for a brokered run (STUDIO-987). ABSENT for a run with no broker
+   *  usage row (every legacy/Claude run). The two token figures are deliberately separate: the
+   *  provider report is UNVERIFIED measurement (`usage_authority` says so), the reservation is the
+   *  conservative admission charge. A client must never fold them into one "total". */
+  usage?: {
+    provider_reported_tokens?: number;
+    reserved_tokens: number;
+    /** Closed spelling; `provider_reported_unverified` for every generic provider report in v1. */
+    usage_authority?: string;
+    usage_incomplete: boolean;
+    unknown_usage_requests: number;
+  };
   /** OBSERVABILITY FIDELITY (STUDIO-978): whether this run's harness emits per-step events at all
    *  ("structured") or only a final result ("final_text_only"). Absent means the harness is unknown
    *  or unimplemented, so the console must say "unknown" rather than assume a shape. */
@@ -1410,6 +1424,9 @@ export interface ProviderStatusViewDTO {
   refreshing: boolean;
   /** The daemon broker's live availability; false means credentialed dispatch is refused. */
   broker_available: boolean;
+  /** The CLOSED reason the broker is unavailable (`provider_broker_unavailable`), or null when it is
+   *  available. Never a listener address, capability, credential, or raw provider response. */
+  broker_reason?: string | null;
   /** The one closed recovery action the UI may offer, or null when the credential is usable. */
   recovery: string | null;
 }

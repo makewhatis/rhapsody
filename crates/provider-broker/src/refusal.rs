@@ -47,6 +47,8 @@ pub enum PolicyRefusal {
     OriginRefused,
     /// A request `Content-Encoding` other than `identity`.
     ContentEncoding,
+    /// A request `Content-Type` that is not `application/json` (when one is declared at all).
+    ContentType,
     /// The upstream transport failed after admission.
     UpstreamUnavailable,
     /// The upstream response was unusable (encoding/media type/size).
@@ -145,6 +147,11 @@ pub(crate) fn pin(refusal: PolicyRefusal) -> (StatusCode, &'static str, &'static
             "content_encoding",
             "Rhapsody provider request content encoding is not supported",
         ),
+        PolicyRefusal::ContentType => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content_type",
+            "Rhapsody provider request content type is not supported",
+        ),
         PolicyRefusal::UpstreamUnavailable => (
             StatusCode::BAD_GATEWAY,
             "upstream_unavailable",
@@ -207,6 +214,7 @@ mod tests {
             PolicyRefusal::MethodNotAllowed,
             PolicyRefusal::OriginRefused,
             PolicyRefusal::ContentEncoding,
+            PolicyRefusal::ContentType,
         ] {
             let (status, code, message) = pin(refusal);
             assert!(

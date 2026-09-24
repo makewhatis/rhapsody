@@ -399,7 +399,9 @@ function ProviderCard({
       <div style={{ fontSize: 11.5, color: "var(--tx-faint)", marginTop: 6 }}>
         {view.protocol || "openai-compatible"}
         {view.credential_source ? ` · credential: ${view.credential_source}` : ""}
-        {!view.broker_available ? " · broker unavailable — credentialed dispatch is refused" : ""}
+        {!view.broker_available
+          ? ` · broker unavailable${view.broker_reason ? ` (${view.broker_reason})` : ""} — credentialed dispatch is refused`
+          : ""}
       </div>
 
       {/* Definition actions: NON-secret configuration, so they are available in the browser too. */}

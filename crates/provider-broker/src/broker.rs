@@ -229,6 +229,20 @@ impl Broker {
         Arc::clone(&self.inner.metrics)
     }
 
+    /// The number of LIVE sessions currently in the registry. A bare count: no session id,
+    /// capability, credential, or endpoint is exposed. It is deliberately on [`Broker`] (the daemon's
+    /// own shared handle), never on [`BrokerRegistrar`], which must stay enumeration-free so a
+    /// preparation holder cannot inspect unrelated sessions (design §3.3). A dead weak entry is not
+    /// counted, so a dropped registration reads as gone. Used to prove a refused preparation — e.g.
+    /// a confused-deputy launch with no credential owner — mints no broker session.
+    pub fn live_session_count(&self) -> usize {
+        lock(&self.inner.registry)
+            .sessions
+            .values()
+            .filter(|weak| weak.upgrade().is_some())
+            .count()
+    }
+
     /// Register a session from a bound credential lease.
     ///
     /// The plan's binding fingerprint must match the lease's, or the lease is dropped and no session

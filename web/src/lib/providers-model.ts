@@ -30,6 +30,8 @@ export interface ProviderStatusInput {
   cache_age_ms?: number | null;
   refreshing?: boolean;
   broker_available?: boolean;
+  /** The closed reason the broker is unavailable, when it is (`provider_broker_unavailable`). */
+  broker_reason?: string | null;
   display_name?: string;
   endpoint?: string;
   insecure_http?: boolean;
@@ -54,6 +56,7 @@ export interface ProviderView {
   cache_age_ms: number | null;
   refreshing: boolean;
   broker_available: boolean;
+  broker_reason: string | null;
   can_connect: boolean;
   can_replace: boolean;
   can_rebind: boolean;
@@ -81,6 +84,7 @@ function viewFromStatus(s: ProviderStatusInput): ProviderView {
     cache_age_ms: s.cache_age_ms ?? null,
     refreshing: Boolean(s.refreshing),
     broker_available: s.broker_available ?? true,
+    broker_reason: s.broker_reason ?? null,
     can_connect: Boolean(s.can_connect),
     can_replace: Boolean(s.can_replace),
     can_rebind: Boolean(s.can_rebind),

@@ -341,6 +341,11 @@ where
         broker_runtime.registrar(),
         day_authority,
     ));
+    // The SAME off-loop credential/broker source serves the Teams manager's model turn (STUDIO-989,
+    // P8): a manager with an explicit provider opens its OWN custody through this source, exactly as
+    // a ticket dispatch does. Cloned before `prep_source` moves into the dispatch resolver below.
+    let manager_source: Arc<dyn rhapsody_orchestrator::PreparedProviderSource> =
+        Arc::clone(&prep_source) as _;
     o.set_preparation_resolver(Arc::new(
         rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
     ));
@@ -827,6 +832,47 @@ where
     // it must serialize with every other appender's.
     let breaker_room = teams_room.clone();
     let quorum_room = teams_room;
+    // --- the manager's OWN resolved tuple (STUDIO-989, P8) ---
+    //
+    // Per parent decision D6 the manager's harness/provider/model are its own: an absent
+    // `manager.harness` means `claude` and an absent `manager.model` preserves the CLI default —
+    // never a teammate's tuple, never `claude.model`, never `agent.backend`. An explicit
+    // non-Claude harness must name provider and model, or the resolution refuses; every manager
+    // turn then fails and the ticket is assigned deterministically rather than falling back to
+    // another harness/provider/auth source. An explicit provider opens its OWN broker session
+    // through the SAME off-loop PB7 source ticket dispatch uses — never a teammate's grant.
+    //
+    // Built HERE, once, rather than inside the triage task: BOTH the assignment/room turns and the
+    // review adjudication turn (STUDIO-956) are manager turns, and routing adjudication through this
+    // same arbiter is what stops an explicit non-Claude manager from being decided by a hardcoded
+    // `claude --model <non-claude-model>` turn (STUDIO-989 review B3). The adjudication turn runs on
+    // the review watcher's own task, so it needs the arbiter even when `manager.mode` spawns no
+    // triage task.
+    let manager_arbiter: Arc<rhapsody_orchestrator::ManagerArbiter> = match resolved.as_ref() {
+        Some(cfg) => {
+            let manager = rhapsody_orchestrator::selection::FieldSelection {
+                harness: teams_cfg.manager.harness.clone(),
+                provider: teams_cfg.manager.provider.clone(),
+                model: teams_cfg.manager.model.clone(),
+            };
+            Arc::new(rhapsody_orchestrator::ManagerArbiter::from_config(
+                &manager,
+                &cfg.providers,
+                rhapsody_config::providers::provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
+                Some(Arc::clone(&manager_source)),
+                cfg,
+            ))
+        }
+        // Teams cannot be on without a readable workflow, so this arm is unreachable in
+        // production; it exists so the type is never built from an assumed config.
+        None => Arc::new(rhapsody_orchestrator::ManagerArbiter::new(
+            Err(rhapsody_orchestrator::selection::SelectionRefusal::MissingHarness),
+            Some(Arc::clone(&manager_source)),
+            None,
+            String::new(),
+        )),
+    };
+
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
@@ -873,7 +919,9 @@ where
                     snap, slugs,
                 ))
             },
-            arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+            // The manager's model turn now runs through its OWN resolved tuple and the shared
+            // provider-preparation path (STUDIO-989, P8) instead of the hardcoded Claude subprocess.
+            arbiter: Arc::clone(&manager_arbiter) as Arc<dyn rhapsody_orchestrator::TriageArbiter>,
             agent_command: command,
             billing_guard,
             tracker_api_key,
@@ -962,7 +1010,8 @@ where
                     Arc::new(
                         rhapsody_orchestrator::teamsears::Ears::new(
                             cursor,
-                            Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+                            Arc::clone(&manager_arbiter)
+                                as Arc<dyn rhapsody_orchestrator::teamsears::RoomArbiter>,
                         )
                         .with_github(Arc::clone(&gh) as _, gh as _)
                         // The live-run mailbox (§6.2). Through the `ControlHandle` seam, so the
@@ -1260,14 +1309,15 @@ where
             });
         // The manager adjudication turn (STUDIO-956), wired on its OWN gate —
         // `review.adjudicate_after_rounds` — and not on `manager.mode`, so a `labels`-mode install
-        // that asks for it still gets a decision. Its turn runs under `manager.model` /
-        // `manager.timeout_ms` through the daemon's one model-turn path.
+        // that asks for it still gets a decision. Its turn runs through the SAME manager arbiter the
+        // assignment and room turns use (STUDIO-989 review B3): an explicit OpenCode manager is
+        // adjudicated by its own provider session, and an empty manager tuple stays on the legacy
+        // `claude -p` lane with `manager.timeout_ms` and the `review.model` fallback resolved below.
         let sink = if teams_cfg.review_adjudicate_after_rounds().is_some() {
             let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
             sink.with_adjudication(rhapsody_orchestrator::reviewadjudicate::AdjudicationDeps {
-                adjudicator: Arc::new(
-                    rhapsody_orchestrator::reviewadjudicate::ClaudeReviewAdjudicator,
-                ),
+                adjudicator: Arc::clone(&manager_arbiter)
+                    as Arc<dyn rhapsody_orchestrator::reviewadjudicate::ReviewAdjudicator>,
                 room: adjudication_room
                     .clone()
                     .map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),

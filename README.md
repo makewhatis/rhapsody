@@ -261,6 +261,10 @@ identity encoding, Bearer-only, exact-secret redaction) and never mints an agent
 `providers:` block every route serves an empty/unknown answer, so legacy Claude and native-login
 OpenCode behavior is byte-identical.
 
+Each status row also carries `broker_available` and, when the broker is down, a CLOSED
+`broker_reason` code (`provider_broker_unavailable`) — never a listener address, capability,
+credential, or raw provider response (STUDIO-1003, design §13).
+
 The provider set is applied from the resolved workflow at boot, and a `WORKFLOW.md` hot-reload
 re-applies it: the orchestrator's reload path hands the new set to the runtime through a
 Rhapsody-only `ProviderReloadSink`, so a reload marks the affected status `unknown/refreshing` and
@@ -308,6 +312,43 @@ figures stay on the running entry for the ceiling/floor but are never folded int
 the receipt is its single source of truth. The frozen reference has no
 provider broker, so none of this exists in Go; with no `providers:` block the resolver is inert and
 legacy Claude and native-login OpenCode behavior is byte-identical.
+
+### The provider broker's security guarantee and its residual risk (STUDIO-1003)
+
+This is the operator-facing statement of exactly what the broker does and does not protect; the
+authoritative design is `~/.rhapsody/docs/provider-broker-design.md` §1.2/§9.4/§13/§17.
+
+- **What is protected.** The reusable upstream provider key is read by the credential owner (the
+  desktop app, over the P0c authenticated channel) and leased directly to the private loopback
+  broker. The harness never receives it: it gets a per-turn **capability** that authenticates *into*
+  the broker, and the broker attaches the leased key to its one fixed upstream request. Every
+  response body passes through exact-secret redaction, and the key never appears in the child's env,
+  argv, config, state directory, transcript, events, API JSON, logs, or errors.
+- **The capability is NOT hidden from the harness.** It is intentionally readable by OpenCode and
+  everything OpenCode starts, and can be used or copied while it remains valid. It is **spendable
+  within finite limits** — at most one live turn at a time, with per-turn/per-session request, byte,
+  token and concurrency ceilings (and an optional UTC-day cap). The broker cannot distinguish an
+  OpenCode model call from a shell tool that copied the same bearer token, so a test or a document
+  must never claim the harness cannot see or spend the capability.
+- **The broker is not a process sandbox, and same-user ambient access remains.** The harness still
+  runs as the daemon user with the real `HOME`; same-user files, SSH agents, local sockets, other
+  environment credentials, and any separately duplicated copy of the same provider key stay
+  reachable. Broker custody binds the *one copy* it obtained, and cannot make an independent copy
+  secret or budget its direct use. A same-UID process that can inspect or edit `rhapsodyd` memory, or
+  the ordinary loopback operator API, is outside this boundary.
+- **Exact-secret redaction cannot stop transformed exfiltration.** The configured provider
+  necessarily receives the upstream credential, so a malicious provider can return it — or an
+  encoded/transformed version of it — in model output. Exact-byte redaction prevents accidental
+  plaintext reflection, not deliberate exfiltration by the provider itself.
+- **There is no exact dollar guarantee for arbitrary providers.** Request and token limits constrain
+  spend, but providers differ in tokenization, pricing, cached-token treatment, and billing of failed
+  or cancelled requests, so no universal dollar ceiling can be inferred. Operators who need a hard
+  account-level loss limit should use provider-side restricted or prepaid keys.
+- **Status exposes only closed, non-secret diagnostics.** `GET /api/v1/providers` reports the closed
+  credential state, broker availability and its closed reason code, and effective limits — never the
+  stored binding, endpoint auth, capability, token hashes, credential metadata, or a raw provider
+  response. Generic provider usage is labelled `provider_reported_unverified` and is never presented
+  as exact measured usage.
 
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 

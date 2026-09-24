@@ -1081,6 +1081,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_value_count_over_limit() {
+        // MAX_JSON_VALUES elements + the enclosing array itself exceeds the value ceiling, so the
+        // parser refuses before building an unbounded tree (design §5.3 rule 8). An implementation
+        // that dropped `count_value` would allocate and parse this instead.
+        let mut body = String::from("[");
+        for index in 0..MAX_JSON_VALUES {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('0');
+        }
+        body.push(']');
+        assert_eq!(
+            parse_bounded(body.as_bytes()),
+            Err(SchemaError::ValueLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_messages() {
+        let messages = vec!["{\"role\":\"user\",\"content\":\"x\"}"; MAX_MESSAGES + 1];
+        let body = format!(
+            "{{\"model\":\"probe-model\",\"messages\":[{}]}}",
+            messages.join(",")
+        );
+        assert_eq!(
+            validate_chat_request(body.as_bytes(), policy()),
+            Err(RequestRejection::TooManyItems)
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_tools() {
+        let tools = vec![
+            "{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}";
+            MAX_TOOLS + 1
+        ];
+        let body = format!(
+            "{{\"model\":\"probe-model\",\"messages\":[],\"tools\":[{}]}}",
+            tools.join(",")
+        );
+        assert_eq!(
+            validate_chat_request(body.as_bytes(), policy()),
+            Err(RequestRejection::TooManyItems)
+        );
+    }
+
+    #[test]
     fn accepts_the_pinned_happy_shape_and_normalizes() {
         let body = br#"{"max_tokens":32000,"messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"model":"probe-model","stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":[{"type":"function","function":{"name":"bash","description":"run","parameters":{"type":"object"}}}]}"#;
         let request = validate_chat_request(body, policy()).expect("valid");

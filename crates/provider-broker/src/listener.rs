@@ -313,6 +313,17 @@ async fn handle_not_found() -> Response {
     refusal_response(PolicyRefusal::NotFound)
 }
 
+/// Whether a request `Content-Type` value is JSON: the media type (before any `;` parameters), ASCII
+/// whitespace-trimmed, case-insensitively `application/json`. Parameters like `; charset=utf-8` are
+/// tolerated; `text/plain`, `application/x-www-form-urlencoded`, a `+json` vendor type, and anything
+/// else are refused (only the measured client's exact type is accepted).
+fn is_json_content_type(bytes: &[u8]) -> bool {
+    let media = bytes.split(|b| *b == b';').next().unwrap_or(bytes);
+    std::str::from_utf8(media)
+        .map(str::trim)
+        .is_ok_and(|s| s.eq_ignore_ascii_case("application/json"))
+}
+
 /// The one exact Chat Completions route (design §5.3, §5.4, §6).
 async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -361,6 +372,15 @@ async fn handle_chat(State(state): State<BrokerState>, req: Request) -> Response
         && !encoding.as_bytes().eq_ignore_ascii_case(b"identity")
     {
         return refusal_response(PolicyRefusal::ContentEncoding);
+    }
+    // Content-Type: when the client declares one it must be JSON. A declared non-JSON type is
+    // refused rather than sniffed (design §14.2 "content-type violations fail closed"); the measured
+    // OpenCode client always sends `application/json`. An ABSENT header is tolerated — the closed
+    // schema still parses and validates the body as JSON, so there is nothing to trust the type for.
+    if let Some(content_type) = parts.headers.get(CONTENT_TYPE)
+        && !is_json_content_type(content_type.as_bytes())
+    {
+        return refusal_response(PolicyRefusal::ContentType);
     }
 
     // Authentication from the bounded header block, before any body allocation.
