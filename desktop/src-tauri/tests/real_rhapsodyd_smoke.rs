@@ -62,13 +62,19 @@ async fn smoke_supervises_real_release_rhapsodyd() {
     let resolved =
         resolve_binary(bin.to_str().expect("utf-8 path"), "").expect("resolve real rhapsodyd");
 
+    // STUDIO-1041: point the real daemon at a private HOME so the smoke run never publishes
+    // `~/.rhapsody/runtime.json` for, or writes logs into, the operator's live runtime home (which a
+    // self-hosted runner's daemon may own).
+    let home = std::env::temp_dir().join(format!("rhapsody-smoke-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("create smoke home");
+
     let sup = Supervisor::new(Options {
         binary_path: resolved,
         // Keep the real PATH so a healthz-serving daemon can find its tools.
-        base_env: Some(vec![format!(
-            "PATH={}",
-            std::env::var("PATH").unwrap_or_default()
-        )]),
+        base_env: Some(vec![
+            format!("PATH={}", std::env::var("PATH").unwrap_or_default()),
+            format!("HOME={}", home.display()),
+        ]),
         startup_timeout: Duration::from_secs(3),
         max_restarts: 1,
         ..Default::default()
@@ -110,4 +116,5 @@ async fn smoke_supervises_real_release_rhapsodyd() {
             );
         }
     }
+    std::fs::remove_dir_all(&home).ok();
 }

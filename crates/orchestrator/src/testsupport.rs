@@ -542,6 +542,30 @@ pub(crate) fn proj_with_tracker(slug: &str, tr: Arc<Fake>, prompt: &str) -> Reso
     p
 }
 
+/// Seeds a retained opencode session record and its managed state directory under `root`, returning
+/// `(directory, record_path)`. `saved_at_ms` is the record's retention clock, so a caller can seed an
+/// already-expired session. For STUDIO-1043's cleanup tests.
+pub(crate) fn seed_opencode_session(
+    root: &std::path::Path,
+    issue: &str,
+    saved_at_ms: i64,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = root.join(format!("rhapsody-opencode-{issue}-1-2-0"));
+    std::fs::create_dir_all(&dir).expect("mkdir retained session dir");
+    let root_s = root.to_string_lossy().into_owned();
+    let rec = agent::opencode::ResumeRecord {
+        harness: "opencode".to_string(),
+        model: "m".to_string(),
+        workspace: "/ws".to_string(),
+        session_id: "ses_kept".to_string(),
+        dir: dir.to_string_lossy().into_owned(),
+        saved_at_ms,
+    };
+    agent::opencode::resume::save(&root_s, issue, &rec).expect("save resume record");
+    let record = agent::opencode::resume::record_path(&root_s, issue).expect("record path");
+    (dir, record)
+}
+
 /// Builds a workspace [`Manager`] rooted at `root` (real filesystem, so create/remove actually touch
 /// disk). Mirrors Go `workspace.NewManager` / `mkWS`.
 pub(crate) fn mk_workspace(root: &str) -> Arc<Manager> {

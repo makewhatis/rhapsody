@@ -43,10 +43,21 @@ use support::SupervisorGuard;
 const GATE: &str = "RHAPSODY_PARITY_E2E";
 
 /// Total budget for `/api/v1/state` to answer 200 through the apiproxy once the daemon is healthy.
-const STATE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous per STUDIO-1030 — what it asserts is that the forward eventually succeeds, not its
+/// speed.
+const STATE_POLL_TIMEOUT: Duration = GENEROUS_TIMEOUT;
 /// Cadence of that poll — the same order as the supervisor's own 250ms `/healthz` readiness poll,
 /// short enough that the usual case (the snapshot lands almost immediately) costs one extra tick.
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The bound for every wait whose expected outcome is NOT a timeout — readiness, the credential
+/// channel, the stub's `LISTENING` line, the `/api/v1/state` forward. Generous on purpose: these e2e
+/// tests are the last gate of the `desktop` job, and on a loaded shared Mac (several jobs, `make app`
+/// building at the same time) the daemon's boot, its detached credential-bootstrap task, and a first
+/// snapshot can all stall past a tighter wall clock even though they succeed (STUDIO-1030 — the same
+/// rule the opencode-probe and toolcheck tests follow). The bound is not what these assertions check,
+/// so it sits far above any plausible stall; a genuine failure still reds, just later.
+const GENEROUS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
@@ -121,7 +132,8 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
             "FAKE_CLAUDE_SLEEP_S=0".to_string(),
         ]),
         linear_api_key: "stub-key".to_string(),
-        startup_timeout: Duration::from_secs(20),
+        // Generous per STUDIO-1030: readiness is not what this test measures.
+        startup_timeout: GENEROUS_TIMEOUT,
         max_restarts: 1,
         ..Default::default()
     });
@@ -130,7 +142,9 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
     let _sup_guard = SupervisorGuard::new(&sup);
 
     // --- start -> healthy ---
-    sup.start(tokio::time::sleep(Duration::from_secs(30)))
+    // The cancel bound must exceed the supervisor's own startup timeout, or a loaded run is
+    // abandoned before the daemon has had its full budget to become healthy.
+    sup.start(tokio::time::sleep(GENEROUS_TIMEOUT * 2))
         .await
         .expect("supervisor start: the packaged rhapsodyd must become healthy");
     assert_eq!(
@@ -268,7 +282,7 @@ fn build_linear_stub(root: &Path) -> PathBuf {
 
 /// Polls `log` until linear-stub announces `LISTENING <port>` on stdout, returning the port.
 fn wait_for_listening(log: &Path) -> u16 {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + GENEROUS_TIMEOUT;
     loop {
         if let Ok(mut f) = std::fs::File::open(log) {
             let mut s = String::new();
@@ -338,6 +352,24 @@ fn unique_tmp(prefix: &str) -> TempDir {
     TempDir::new(prefix)
 }
 
+/// A per-run token that is unique across concurrent AND sequential runs: pid + a nanosecond clock
+/// read + a process-local counter. `pid` alone is not enough — two runs over time can be handed the
+/// same pid — so the nonce and counter close that gap, exactly as [`TempDir::new`] does. Used to
+/// scope every provider id (and thus every credential/Keychain/observation key) to this run.
+fn unique_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{}-{nonce}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A scratch dir directly under `/tmp` (removed on drop), for the credential-listener socket: a Unix
 /// `sun_path` is capped at ~104 bytes, and the per-session `$TMPDIR` is long enough on its own to
 /// blow that budget. Not `rhapsody-`-prefixed for that reason; the drop guard is what keeps it tidy.
@@ -347,7 +379,20 @@ struct ShortDir {
 
 impl ShortDir {
     fn new(prefix: &str) -> ShortDir {
-        let path = PathBuf::from("/tmp").join(format!("{prefix}-{}", std::process::id()));
+        // pid + a nanosecond nonce + a process-local counter, so a concurrent run, or a later run
+        // that happens to draw the same pid, can never share this socket directory (and therefore
+        // the per-process socket `BootstrapListener::bind` places inside it).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = PathBuf::from("/tmp").join(format!(
+            "{prefix}-{}-{}-{nonce}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create short dir");
         ShortDir { path }
@@ -587,20 +632,33 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
     let work = unique_tmp("rhapsody-1035-e2e");
     let ws = work.join("ws");
     let logs = work.join("logs");
+    // The daemon's private runtime home. An absent `$HOME` would let a default-path fallback touch
+    // the real `~/.rhapsody` on the shared machine, so it is created here, under this run's own
+    // temp dir, before it is handed to the child.
+    let home = work.join("home");
     std::fs::create_dir_all(&ws).expect("mkdir ws");
     std::fs::create_dir_all(&logs).expect("mkdir logs");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+
+    // Per-run provider ids. The injected owner is in-memory, so this run never touches a Keychain —
+    // but scoping every provider id to this run keeps any future credential backend (and every
+    // log/observation key) from being shared with a concurrent copy of this e2e.
+    let run = unique_token();
+    let present_id = format!("packaged-e2e-{run}");
+    let absent_id = format!("packaged-e2e-absent-{run}");
+    let present_account = format!("v1:{present_id}");
+    let absent_account = format!("v1:{absent_id}");
+
     let workflow = work.join("WORKFLOW.md");
-    std::fs::write(
-        &workflow,
-        workflow_with_providers(&ws, &logs, &["packaged-e2e", "packaged-e2e-absent"]),
-    )
-    .expect("write WORKFLOW.md");
+    let providers = [present_id.as_str(), absent_id.as_str()];
+    std::fs::write(&workflow, workflow_with_providers(&ws, &logs, &providers))
+        .expect("write WORKFLOW.md");
 
     // Two desktop-owned credentials: one stored while the daemon is OFFLINE (the acceptance's
     // store-offline case), and one deliberately absent to exercise `already_absent` synchronization.
     let present = InMemoryOwner::new();
     let present_binding = Binding {
-        provider_id: "packaged-e2e".into(),
+        provider_id: present_id.clone(),
         adapter: "openai-chat-completions-bearer-v1".into(),
         base_url: "https://127.0.0.1:9/v1".into(),
     };
@@ -620,11 +678,11 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
     let shared = SharedOwners {
         owners: Arc::new(Mutex::new(BTreeMap::from([
             (
-                "packaged-e2e".to_string(),
+                present_id.clone(),
                 present.clone() as Arc<dyn CredentialOwner>,
             ),
             (
-                "packaged-e2e-absent".to_string(),
+                absent_id.clone(),
                 absent.clone() as Arc<dyn CredentialOwner>,
             ),
         ]))),
@@ -648,11 +706,12 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
         binary_path: sidecar,
         workflow_path: Some(workflow.clone()),
         base_env: Some(vec![
-            format!("HOME={}", work.join("home").display()),
+            format!("HOME={}", home.display()),
             format!("PATH={path}"),
         ]),
         linear_api_key: "stub-key".to_string(),
-        startup_timeout: Duration::from_secs(20),
+        // Generous per STUDIO-1030: readiness is not what this test measures.
+        startup_timeout: GENEROUS_TIMEOUT,
         max_restarts: 1,
         credential_bootstrap: Some(CredentialBootstrap {
             socket_dir: socket_dir.to_path_buf(),
@@ -665,34 +724,33 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
     // behind. Declared after `work` so it drops (kills the daemon) before the temp dir is removed.
     let _sup_guard = SupervisorGuard::new(&sup);
 
-    sup.start(tokio::time::sleep(Duration::from_secs(30)))
+    // The cancel bound must exceed the supervisor's own startup timeout, or a loaded run is
+    // abandoned before the daemon has had its full budget to become healthy.
+    sup.start(tokio::time::sleep(GENEROUS_TIMEOUT * 2))
         .await
         .expect("supervisor start: the packaged rhapsodyd must become healthy");
     assert_eq!(sup.status().state, State::Running);
 
     // Bullet 3: the credential stored while the daemon was offline is observed on this startup.
-    let observed = wait_observed(&observations, "v1:packaged-e2e", Duration::from_secs(10)).await;
+    // The wait is generous per STUDIO-1030 — what it measures is the daemon's observation, and on a
+    // loaded shared Mac the detached credential-bootstrap task can stall well past a tighter bound.
+    let observed = wait_observed(&observations, &present_account, GENEROUS_TIMEOUT).await;
     assert_eq!(
         observed, stored_revision,
         "the daemon must observe the revision stored while it was offline"
     );
-    let absent_observed = wait_observed(
-        &observations,
-        "v1:packaged-e2e-absent",
-        Duration::from_secs(10),
-    )
-    .await;
+    let absent_observed = wait_observed(&observations, &absent_account, GENEROUS_TIMEOUT).await;
     assert_eq!(absent_observed, Revision::INITIAL);
 
     // Bullet 2: a committed mutation reports `stored_unsynchronized` — never `synchronized` — while
     // the daemon's observed revision is older than the mutation's, then `synchronized` is reachable
     // once the daemon has observed the revision it is acknowledged against.
     let prepared = service
-        .prepare("packaged-e2e", ProviderOperation::Replace)
+        .prepare(&present_id, ProviderOperation::Replace)
         .expect("prepare replace");
     let stale = service
         .commit(
-            "packaged-e2e",
+            &present_id,
             ProviderOperation::Replace,
             &prepared.nonce,
             Some("sk-packaged-e2e-replaced".into()),
@@ -711,11 +769,11 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
     // `already_absent` on the other credential is acknowledged against the UNCHANGED revision it was
     // observed at, without a mutation — and IS synchronized because the daemon has observed it.
     let prepared = service
-        .prepare("packaged-e2e-absent", ProviderOperation::Remove)
+        .prepare(&absent_id, ProviderOperation::Remove)
         .expect("prepare remove");
     let acknowledged = service
         .commit(
-            "packaged-e2e-absent",
+            &absent_id,
             ProviderOperation::Remove,
             &prepared.nonce,
             None,
@@ -732,11 +790,11 @@ async fn packaged_supervisor_bootstraps_a_stored_credential_and_reports_the_sync
     sup.stop().await;
     assert_eq!(sup.status().state, State::Stopped);
     let prepared = service
-        .prepare("packaged-e2e", ProviderOperation::Replace)
+        .prepare(&present_id, ProviderOperation::Replace)
         .expect("prepare replace offline");
     let offline = service
         .commit(
-            "packaged-e2e",
+            &present_id,
             ProviderOperation::Replace,
             &prepared.nonce,
             Some("sk-packaged-e2e-offline".into()),

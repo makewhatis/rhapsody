@@ -896,6 +896,11 @@ impl Orchestrator {
     /// re-arming the poll timer at the end (Go's `defer scheduleTick`). Mirrors Go `onTick`.
     pub(crate) async fn on_tick(&mut self) {
         let poll = self.poll_interval();
+        // STUDIO-1043: the retained-session retention sweep. ABOVE every early return below, for the
+        // same reason as the review reconciliation sweep: a daemon held by a bad config, an armed
+        // drain or a dead credential is exactly one whose kept opencode sessions would otherwise
+        // never be bounded, because the per-issue retention check only fires on a redispatch.
+        self.sweep_retained_opencode_sessions();
         self.reconcile().await;
         // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
         // state against its activity and REPORT any that disagree. Local reads only (the watch set
@@ -1563,6 +1568,52 @@ impl Orchestrator {
         }
     }
 
+    /// The opencode state root the retained-session records and directories live under, when an
+    /// effective config is loaded. `None` before boot/reload, when there is nothing to sweep.
+    fn opencode_state_root(&self) -> Option<String> {
+        self.eff.as_ref().map(|e| e.cfg.opencode.state_root.clone())
+    }
+
+    /// The retention sweep for kept opencode sessions (STUDIO-1043). The per-issue check in
+    /// `resume::select` only runs when that SAME issue is dispatched again, so without a sweep an
+    /// issue that goes terminal, is cancelled, or simply never comes back keeps its state directory
+    /// forever — and in legacy mode that directory holds a copy of the operator's credential. Runs
+    /// from `on_tick` ABOVE every early return, so a daemon held by a bad config or an armed drain
+    /// still bounds its retained sessions.
+    ///
+    /// Every identifier with a LIVE run is passed as an exclusion set: `select` adopts a retained
+    /// session and leaves its record's original `saved_at_ms` in place, so a run can outlive the 24h
+    /// window it was retained under, and a sweep that ignored `self.running` would delete the live
+    /// session's `XDG_DATA_HOME` (and, in legacy mode, the seeded credential) mid-run (STUDIO-1043
+    /// review B2). The record is bounded the moment that issue stops running.
+    fn sweep_retained_opencode_sessions(&self) {
+        let Some(root) = self.opencode_state_root() else {
+            return;
+        };
+        let running: std::collections::HashSet<String> = self
+            .running
+            .values()
+            .map(|re| re.issue.identifier.clone())
+            .collect();
+        let discarded =
+            rhapsody_agent::opencode::resume::sweep(&root, Utc::now().timestamp_millis(), &running);
+        if discarded > 0 {
+            tracing::info!(
+                discarded,
+                "opencode: discarded retained sessions past their retention window"
+            );
+        }
+    }
+
+    /// Drops the retained opencode session (record + directory) of an issue that has reached a
+    /// terminal state, so a terminal ticket does not leave a kept session behind until the retention
+    /// sweep reaches it (STUDIO-1043 review B1).
+    pub(crate) fn discard_retained_opencode_session(&self, identifier: &str) {
+        if let Some(root) = self.opencode_state_root() {
+            rhapsody_agent::opencode::resume::discard(&root, identifier);
+        }
+    }
+
     /// Removes workspaces for issues already in terminal states at startup (§8.6). Per-project when
     /// projects are resolved (each project's slug-bound tracker + its own terminal-state list);
     /// single-project degenerates to today's behavior. Mirrors Go `startupCleanup`.
@@ -1615,6 +1666,9 @@ impl Orchestrator {
                 {
                     tracing::warn!(issue_identifier = %iss.identifier, project_slug = %g.slug, err = %e, "startup workspace cleanup failed");
                 }
+                // The ticket is terminal: its retained opencode session (if any) is dead weight,
+                // in legacy mode a copy of the operator's credential included (STUDIO-1043).
+                self.discard_retained_opencode_session(&iss.identifier);
             }
         }
     }
@@ -2163,6 +2217,49 @@ mod tests {
             );
         }
     }
+    /// STUDIO-1043's retention sweep has ONE production seam (`on_tick`) and, like the
+    /// reconciliation sweep, must run ABOVE the three early-return gates — a daemon held by one of
+    /// them is exactly one whose kept opencode sessions would otherwise never be bounded, because the
+    /// per-issue retention check only fires on a redispatch. Asserted on source because the property
+    /// is architectural and invisible at run time.
+    #[test]
+    fn on_tick_sweeps_retained_opencode_sessions_before_every_early_return() {
+        let src = include_str!("loop.rs");
+        // Assembled at run time so this test's own text is not an occurrence of what it checks for.
+        let call: String = ["self.", "sweep_retained_opencode_sessions", "()"].concat();
+
+        let start = src
+            .find("pub(crate) async fn on_tick(")
+            .expect("on_tick is still a method on this module");
+        let end = start
+            + src[start..]
+                .find("\n    }")
+                .expect("on_tick is still a braced method inside an impl block");
+        let body = &src[start..end];
+
+        let at = body.find(call.as_str()).unwrap_or_else(|| {
+            panic!(
+                "on_tick no longer runs the retained-opencode retention sweep; without that call \
+                 the 24h bound only fires on a redispatch, so a terminal issue keeps its state \
+                 directory (and, in legacy mode, a copy of the credential) forever (STUDIO-1043)"
+            )
+        });
+        for gate in [
+            "self.validate()",
+            "self.drain_preflight()",
+            "self.credential_preflight()",
+        ] {
+            let gate_at = body
+                .find(gate)
+                .unwrap_or_else(|| panic!("on_tick no longer consults {gate}"));
+            assert!(
+                at < gate_at,
+                "the retention sweep runs at byte {at} of on_tick, AFTER {gate} at {gate_at} — a \
+                 daemon held by that gate would stop bounding its kept sessions (STUDIO-1043)"
+            );
+        }
+    }
+
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
         DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
@@ -2618,7 +2715,9 @@ mod tests {
     // terminal-state list drive a per-project terminal-workspace cleanup.
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_cleanup_multi_per_project() {
-        use crate::testsupport::{TempDir, empty_resolved_project, mk_workspace};
+        use crate::testsupport::{
+            TempDir, empty_resolved_project, mk_workspace, seed_opencode_session,
+        };
         let mut fa = Fake::new();
         fa.by_state = std::collections::HashMap::from([(
             "done".to_string(),
@@ -2648,10 +2747,19 @@ mod tests {
         let mut eff = empty_effective(Arc::new(Fake::new()));
         eff.max_concurrent = 10;
         eff.projects = vec![pa, pb];
+        // A retained opencode session for the terminal issue A-1 must be discarded too (STUDIO-1043).
+        let state_root = TempDir::new();
+        eff.cfg.opencode.state_root = state_root.path.clone();
         o.eff = Some(eff);
 
         let wsa = ws_a.create_for_issue("", "A-1").await.expect("create A");
         let wsb = ws_b.create_for_issue("", "B-1").await.expect("create B");
+        let (kept_dir, rec) = seed_opencode_session(
+            std::path::Path::new(&state_root.path),
+            "A-1",
+            Utc::now().timestamp_millis(),
+        );
+        assert!(kept_dir.is_dir() && rec.is_file(), "seed sanity");
 
         o.startup_cleanup().await;
 
@@ -2663,6 +2771,11 @@ mod tests {
             std::fs::metadata(&wsb.path).is_err(),
             "project B terminal workspace should be removed"
         );
+        assert!(
+            !kept_dir.exists(),
+            "a terminal issue's retained opencode session directory must be discarded"
+        );
+        assert!(!rec.exists(), "and its record removed");
         assert_eq!(
             tr_a.by_state_calls(),
             1,
@@ -2681,6 +2794,63 @@ mod tests {
     // recording spawn that captures the dispatched running entries (Go `newMultiOrch`'s
     // `*[]*runningEntry`), asserting the project stamping / disabled-skip / per-project-error /
     // dedup / legacy-path semantics `dispatch_decisions` + `poll_all_projects` encode.
+
+    // STUDIO-1043: a tick sweeps an expired retained opencode session even though the issue it
+    // belongs to is never dispatched again — the whole point of the sweep (review B1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_sweeps_retained_opencode_sessions_without_a_redispatch() {
+        use crate::testsupport::{TempDir, seed_opencode_session};
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(Fake::new()), "p")], 10);
+        let state_root = TempDir::new();
+        o.eff.as_mut().expect("eff").cfg.opencode.state_root = state_root.path.clone();
+        // saved_at_ms at the epoch ⇒ far past the 24h retention window.
+        let (dir, rec) =
+            seed_opencode_session(std::path::Path::new(&state_root.path), "STUDIO-1043", 0);
+        assert!(dir.is_dir() && rec.is_file(), "seed sanity");
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            !dir.exists(),
+            "an expired retained session must be swept by a tick with no redispatch"
+        );
+        assert!(!rec.exists(), "and its record removed");
+    }
+
+    // STUDIO-1043 review B2: the sweep must NOT delete the state directory of a session whose issue
+    // is running. `select` adopts a retained session but leaves its record's ORIGINAL `saved_at_ms`
+    // in place, so a run can outlive the 24h window it was retained under; a sweep that ignored
+    // `self.running` would delete the live session's `XDG_DATA_HOME` (and, in legacy mode, the
+    // seeded credential) mid-run. Here the record is already expired AND its issue is running, so
+    // only the running-set exclusion can save it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_does_not_sweep_a_running_issues_session() {
+        use crate::testsupport::{TempDir, add_running, seed_opencode_session};
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(Fake::new()), "p")], 10);
+        let state_root = TempDir::new();
+        o.eff.as_mut().expect("eff").cfg.opencode.state_root = state_root.path.clone();
+        // saved_at_ms at the epoch ⇒ far past the 24h retention window.
+        let (dir, rec) =
+            seed_opencode_session(std::path::Path::new(&state_root.path), "STUDIO-1043", 0);
+        add_running(&mut o, "1", "STUDIO-1043", "In Progress", Utc::now());
+        assert!(dir.is_dir() && rec.is_file(), "seed sanity");
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            dir.exists(),
+            "a running issue's retained session directory must survive the tick sweep (B2)"
+        );
+        assert!(rec.exists(), "and its record must survive");
+    }
 
     // Mirrors Go `TestOnTickPollsAllProjectsAndDispatches`: onTick polls EVERY resolved project's
     // slug-bound tracker exactly once and dispatches each candidate stamped with its owning project.
