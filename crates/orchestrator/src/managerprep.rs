@@ -42,17 +42,36 @@ use rhapsody_agent::{
 use rhapsody_config::ProviderDefinition;
 use rhapsody_core::Issue;
 
+use crate::reviewadjudicate::{
+    AdjudicationRequest, ReviewAdjudicator, Verdict, adjudication_prompt, parse_verdict,
+};
 use crate::selection::{
     FieldSelection, ResolvedSelection, SelectionRefusal, resolve_manager_selection,
 };
 use crate::teamsears::{RoomArbiter, Target};
 use crate::triage::{TriageArbiter, TriageDecision, TriageRequest};
 
-/// The synthetic issue identifier a manager turn runs under. The manager has no ticket worktree, but
-/// the OpenCode adapter keys its private per-session state directory (and its resume record) on an
-/// issue identifier, so the manager gets one of its own — distinct from every real ticket, and stable
-/// across turns so a cut-off manager turn can resume rather than starting cold.
-const MANAGER_ISSUE_IDENTIFIER: &str = "rhapsody-manager";
+/// A synthetic issue identifier a SINGLE manager invocation runs under. The manager has no ticket
+/// worktree, but the OpenCode adapter keys its private per-session state directory (and its resume
+/// record) on an issue identifier, so the manager gets one of its own — distinct from every real
+/// ticket.
+///
+/// It is deliberately UNIQUE PER INVOCATION, not stable across turns (design §10.2: "an
+/// independently prepared broker session and synthetic operation identifier, and drop[s] it after
+/// the manager invocation"). A stable identifier let the resume machinery (`opencode::resume::select`,
+/// STUDIO-1043) hand a timed-out manager turn's retained session to the NEXT manager turn — a
+/// different ticket's assignment, or a room turn — which then resumed that session and was told to
+/// continue its work. Every invocation now mints a fresh identifier, so no record can ever match a
+/// later turn.
+fn manager_invocation_identifier() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("rhapsody-manager-{nanos:x}-{seq:x}")
+}
 
 /// One manager invocation's fully prepared inputs, after the manager tuple resolved and (for the
 /// explicit-provider lane) its custody was opened. Move-only: [`PreparedProvider`] is not `Clone`, so
@@ -107,6 +126,7 @@ impl ManagerTurnRunner for HarnessManagerTurn {
         }
         // The dispatch-time factory: it re-checks protocol compatibility, requires an exact model on
         // the provider branch, and moves the custody into an owned, non-Clone runner.
+        let state_root = manager_state_root(&knobs);
         let spec = PreparedHarnessSpec {
             harness,
             model: Some(model),
@@ -116,9 +136,14 @@ impl ManagerTurnRunner for HarnessManagerTurn {
         let runner =
             build_dispatch_runner(spec).map_err(|e| format!("manager_prepare_refused: {e}"))?;
 
+        // The manager never retains a session across invocations: a fresh synthetic identifier (so
+        // no earlier manager turn's resume record can match) is paired with a best-effort discard of
+        // this invocation's own record and state directory once the turn is done.
+        let identifier = manager_invocation_identifier();
+
         let start = rhapsody_agent::SessionStart {
             workspace_path,
-            issue: manager_issue(),
+            issue: manager_issue(identifier.clone()),
             transcript: None,
             // The manager has no store run row and no review head; the provider path freezes exactly
             // these values and calls no late identity setter.
@@ -147,6 +172,12 @@ impl ManagerTurnRunner for HarnessManagerTurn {
         .await;
         slots.finalize_armed();
         let _ = started.session.stop().await;
+        // Drop the manager's own session state. The session's `Drop` runs after this (the box is
+        // still alive), but by then the directory is gone and `persist_resume` refuses a missing
+        // directory, so nothing is re-written.
+        if !state_root.is_empty() {
+            rhapsody_agent::opencode::resume::discard(&state_root, &identifier);
+        }
 
         match outcome {
             Err(_) => Err(manager_timeout_reason(timeout)),
@@ -156,10 +187,20 @@ impl ManagerTurnRunner for HarnessManagerTurn {
     }
 }
 
-/// The synthetic, ticket-less issue a manager turn runs under (see [`MANAGER_ISSUE_IDENTIFIER`]).
-fn manager_issue() -> Issue {
+/// The manager's OpenCode state root, if its knobs are OpenCode. Empty for the (refused) Claude
+/// provider branch, where there is no session state to discard.
+fn manager_state_root(knobs: &HarnessKnobs) -> String {
+    match knobs {
+        HarnessKnobs::Opencode(cfg) => cfg.state_root.clone(),
+        HarnessKnobs::Claude(_) => String::new(),
+    }
+}
+
+/// The synthetic, ticket-less issue one manager invocation runs under (see
+/// [`manager_invocation_identifier`]).
+fn manager_issue(identifier: String) -> Issue {
     Issue {
-        identifier: MANAGER_ISSUE_IDENTIFIER.to_string(),
+        identifier,
         // A title so a harness that renders one has something honest to show; the manager's prompt
         // is the request, not this issue.
         title: "teams manager turn".to_string(),
@@ -320,6 +361,29 @@ impl TriageArbiter for ManagerArbiter {
 impl RoomArbiter for ManagerArbiter {
     async fn resolve(&self, req: &TriageRequest) -> Result<Vec<Target>, String> {
         crate::teamsears::parse_targets(&self.turn_text(req).await?)
+    }
+}
+
+/// Review adjudication (STUDIO-956) is a manager turn, so it runs through this SAME arbiter and its
+/// resolved tuple. Before this the adjudicator was a hardcoded `claude -p` turn that took
+/// `manager.model` verbatim, so an explicit OpenCode manager (whose model is an OpenCode model id)
+/// was adjudicated by `claude --model <opencode-model>` on native Claude auth — a silent fallback to
+/// another harness and auth source (STUDIO-989 review B3). Routing through `turn_text` gives an
+/// explicit manager its own provider session, limits and diagnostics, and leaves an EMPTY manager
+/// tuple on the legacy `claude -p` lane byte-for-byte as before (the request still carries the
+/// command/model the composition root resolved, including the `review.model` fallback).
+#[async_trait]
+impl ReviewAdjudicator for ManagerArbiter {
+    async fn adjudicate(&self, req: &AdjudicationRequest) -> Result<Verdict, String> {
+        let turn = TriageRequest {
+            command: req.command.clone(),
+            billing_guard: req.billing_guard,
+            tracker_api_key: req.tracker_api_key.clone(),
+            model: req.model.clone(),
+            timeout: req.timeout,
+            prompt: adjudication_prompt(req),
+        };
+        parse_verdict(&self.turn_text(&turn).await?)
     }
 }
 
@@ -542,6 +606,78 @@ mod tests {
         .expect("explicit manager resolves")
     }
 
+    /// An `AdjudicationRequest` shaped like the one the composition root builds: a Claude-lane
+    /// `command` and a resolved `model`, whose provider lane (when the manager tuple is explicit)
+    /// must ignore both.
+    fn adjudication_request(pr: &str) -> AdjudicationRequest {
+        AdjudicationRequest {
+            pr: pr.to_string(),
+            head: "be260a6b4366fac70fbc0e2dbabd9d51fe9d44e5".to_string(),
+            rounds: 3,
+            findings: vec!["alice asked for changes at a324d2d".to_string()],
+            command: "/nonexistent/rhapsody-manager-test-claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            model: "accounts/fireworks/models/x".to_string(),
+            timeout: Duration::from_millis(200),
+        }
+    }
+
+    /// Writes a fake `claude` that records its own argv to a log and prints `payload`. The command
+    /// is `bash <script>`, so the recorded `$*` is exactly the argument tail `run_turn` appended.
+    fn fake_claude(dir: &crate::testsupport::TempDir, payload: &str) -> (String, String) {
+        let script = dir.child("fake-claude.sh");
+        let log = dir.child("argv.txt");
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s' \"$*\" > {0:?}\nprintf '%s\\n' {1:?}\n",
+            log, payload,
+        );
+        std::fs::write(&script, body).expect("write fake claude");
+        (format!("bash {script}"), log)
+    }
+
+    /// Writes an executable fake `opencode` 1.18.30 whose body runs for turns. `#!/bin/sh` and an
+    /// absolute `/bin/sleep` keep it working under the probe's scrubbed (`env_clear`) environment.
+    fn fake_opencode(dir: &crate::testsupport::TempDir, name: &str, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.child(name);
+        let tmp = dir.child(&format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp).expect("create fake opencode");
+            writeln!(f, "#!/bin/sh").expect("shebang");
+            write!(f, "{body}").expect("body");
+            f.sync_all().expect("flush");
+        }
+        std::fs::rename(&tmp, &script).expect("publish");
+        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+        script
+    }
+
+    /// Canonicalized path string (the launch containment invariant compares canonical paths; on
+    /// macOS `/var` is a symlink to `/private/var`).
+    fn canonical(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// OpenCode knobs for a real brokered manager turn over `command`, with the manager's own
+    /// workspace and state roots.
+    fn opencode_knobs(command: &str, workspace_root: &str, state_root: &str) -> HarnessKnobs {
+        HarnessKnobs::Opencode(OpencodeConfig {
+            command: command.to_string(),
+            model: "accounts/fireworks/models/x".to_string(),
+            workspace_root: workspace_root.to_string(),
+            state_root: state_root.to_string(),
+            turn_timeout: Duration::from_secs(30),
+            ..Default::default()
+        })
+    }
+
     /// The legacy mutation guard: an EMPTY manager tuple must go straight to the native-login
     /// subprocess lane and consult NEITHER the provider source NOR the harness turn seam. A lane that
     /// treated an empty tuple as an explicit provider would open custody (or run the turn) here, and
@@ -706,9 +842,11 @@ mod tests {
     }
 
     /// Cancelling a pending manager turn (dropping the future) returns control promptly — a hung
-    /// manager can never stall the off-loop task, let alone the control task. This is the
-    /// dispatch-progress mutation guard: an implementation that awaited the turn on the control task
-    /// (or without a cancellable bound) would leave the spin below starved.
+    /// manager can never stall the off-loop task, and the manager turn stays genuinely PARKED (it is
+    /// not silently finished) while independent work proceeds. The deadline that makes even a
+    /// misbehaving runner future cancellable is pinned separately by
+    /// [`hanging_manager_turn_is_bounded_by_the_turn_timeout`]; the control-loop-level property that
+    /// a hung model turn never delays dispatch is `triage::tests::a_hung_model_turn_does_not_delay_dispatch`.
     #[tokio::test]
     async fn a_hung_manager_turn_does_not_block_concurrent_progress() {
         let selection = explicit_manager();
@@ -737,6 +875,10 @@ mod tests {
         assert!(
             ticks >= 50,
             "the concurrent task made progress while the manager hung"
+        );
+        assert!(
+            !task.is_finished(),
+            "the manager turn must still be parked, not silently finished"
         );
         task.abort();
         let _ = task.await;
@@ -837,6 +979,230 @@ mod tests {
             source.opens.load(Ordering::SeqCst),
             2,
             "each invocation opens its own custody"
+        );
+    }
+
+    // ── the legacy lane's argv is pinned (review B2) ─────────────────────────────────────────────
+
+    /// The empty manager tuple's ASSIGNMENT turn is the pre-P8 `claude -p <prompt>` subprocess, byte
+    /// for byte: the fake records its own argv, and an empty `manager.model` must add no `--model`.
+    ///
+    /// MUTATION: any change to the legacy lane's argv — a `--model`, an extra flag, a different
+    /// command — reds here. This replaced a test that used a `/nonexistent` command and so could not
+    /// see the argv at all (STUDIO-989 review B2).
+    #[tokio::test]
+    async fn empty_manager_legacy_lane_pins_the_claude_argv_for_a_decision() {
+        let selection =
+            resolve_manager_selection(&FieldSelection::default(), &registry(), DEADLINE)
+                .expect("the default manager resolves");
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(&dir, r#"{"identity":"jimmy","reason":"fits"}"#);
+        // No source, no knobs: the legacy lane must not need either.
+        let arbiter = ManagerArbiter::new(Ok(selection), None, None, String::from("/tmp"));
+        let mut req = request("assign this ticket");
+        req.command = command;
+
+        let decision = arbiter
+            .arbitrate(&req)
+            .await
+            .expect("the legacy lane decides");
+        assert_eq!(decision.identity, "jimmy");
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert_eq!(
+            argv, "-p assign this ticket",
+            "the empty tuple's assignment argv is the legacy `claude -p <prompt>`: {argv:?}"
+        );
+        assert!(
+            !argv.contains("--model"),
+            "an empty manager.model must add no --model: {argv:?}"
+        );
+    }
+
+    /// The same pin for the ROOM lane: an empty manager tuple's room reply goes through the same
+    /// legacy subprocess with the same argv shape.
+    #[tokio::test]
+    async fn empty_manager_legacy_lane_pins_the_claude_argv_for_a_room_reply() {
+        let selection =
+            resolve_manager_selection(&FieldSelection::default(), &registry(), DEADLINE)
+                .expect("the default manager resolves");
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(
+            &dir,
+            r#"{"targets":[{"ticket":"STUDIO-1","intent":"ask"}]}"#,
+        );
+        let arbiter = ManagerArbiter::new(Ok(selection), None, None, String::from("/tmp"));
+        let mut req = request("what is happening?");
+        req.command = command;
+
+        let targets = arbiter
+            .resolve(&req)
+            .await
+            .expect("the legacy lane replies");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].key, "STUDIO-1");
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert_eq!(
+            argv, "-p what is happening?",
+            "the empty tuple's room argv is the legacy `claude -p <prompt>`: {argv:?}"
+        );
+        assert!(!argv.contains("--model"), "{argv:?}");
+    }
+
+    // ── adjudication is a manager turn too (review B3) ───────────────────────────────────────────
+
+    /// An explicit OpenCode manager adjudicates through its OWN tuple and broker session — not the
+    /// hardcoded `claude --model <opencode-model>` turn the pre-fix adjudicator ran. The mutation
+    /// guard is any path that sends the request's model to a Claude turn instead of the manager's
+    /// resolved provider.
+    #[tokio::test]
+    async fn explicit_provider_manager_adjudicates_through_its_own_tuple() {
+        let selection = explicit_manager();
+        let plan = selection.provider.clone().expect("a plan");
+        let (opened, _broker) = opened_custody(&plan);
+        let source = Arc::new(ScriptedSource::answering(opened));
+        let turn = Arc::new(FakeTurn::answering("SHIP"));
+        let arbiter = ManagerArbiter::new(
+            Ok(selection),
+            Some(source.clone()),
+            Some(opcode_knobs()),
+            String::from("/tmp"),
+        )
+        .with_turn_runner(turn.clone());
+
+        let verdict = arbiter
+            .adjudicate(&adjudication_request("makewhatis/rhapsody#192"))
+            .await
+            .expect("the manager adjudicates");
+        assert_eq!(verdict, Verdict::Ship);
+        assert_eq!(
+            source.opens(),
+            1,
+            "adjudication opened the manager's own custody"
+        );
+        assert_eq!(turn.calls(), 1);
+        let seen = turn.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].harness, HarnessId::Opencode);
+        assert_eq!(seen[0].provider, "fireworks");
+        // The OpenCode manager's own resolved model — NOT the request's model handed to claude.
+        assert_eq!(seen[0].model, "accounts/fireworks/models/x");
+        assert!(
+            seen[0].prompt.contains("SHIP"),
+            "the adjudication prompt was what the turn was asked: {}",
+            seen[0].prompt
+        );
+    }
+
+    /// An EMPTY manager tuple's adjudication stays on the legacy `claude -p` lane, exactly as before
+    /// P8: the request's resolved command and model (including the `review.model` fallback computed
+    /// at the composition root) reach the subprocess unchanged.
+    #[tokio::test]
+    async fn empty_manager_adjudication_stays_on_the_legacy_claude_lane() {
+        let selection =
+            resolve_manager_selection(&FieldSelection::default(), &registry(), DEADLINE)
+                .expect("the default manager resolves");
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(&dir, "ESCALATE: a human must decide");
+        let arbiter = ManagerArbiter::new(Ok(selection), None, None, String::from("/tmp"));
+
+        let mut req = adjudication_request("makewhatis/rhapsody#192");
+        req.command = command;
+        req.model = "claude-opus-5".to_string();
+        let verdict = arbiter
+            .adjudicate(&req)
+            .await
+            .expect("the legacy adjudication decides");
+        assert_eq!(
+            verdict,
+            Verdict::Escalate {
+                reason: "a human must decide".to_string()
+            }
+        );
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert!(
+            argv.starts_with("--model claude-opus-5 -p "),
+            "the empty tuple's adjudication argv is the legacy `--model M -p <prompt>`: {argv:?}"
+        );
+    }
+
+    // ── a manager turn never resumes a prior manager invocation's session (review B1) ─────────────
+
+    /// **The end-to-end guard for B1.** Two manager invocations through the REAL
+    /// [`HarnessManagerTurn`] and a real broker custody: the first is cut off by `manager.timeout_ms`
+    /// after it announces a session id, and the second (a different decision) must start COLD. Before
+    /// the fix a stable `rhapsody-manager` identifier let `resolve_state` hand the first turn's
+    /// retained session to the second, which then carried `-s <session>` and the "resuming" note —
+    /// continuing ticket A's conversation while deciding ticket B. The fake `opencode` records the
+    /// argv of each turn, and the assertions are on the SECOND turn's argv.
+    #[tokio::test]
+    async fn a_manager_turn_never_resumes_a_previous_invocations_session() {
+        let selection = explicit_manager();
+        let plan = selection.provider.clone().expect("a plan");
+        let scripts = crate::testsupport::TempDir::new();
+        let state_root = crate::testsupport::TempDir::new();
+        let root = crate::testsupport::TempDir::new();
+        let ws = canonical(&root.path);
+        let state = canonical(&state_root.path);
+
+        // Attempt 1: announces a session id, then never returns — the common manager failure.
+        let log1 = scripts.child("argv-1.txt");
+        let body1 = format!(
+            r#"if [ "${{1:-}}" = "--version" ]; then printf '1.18.30\n'; exit 0; fi
+printf '%s' "$*" >> {0:?}
+printf '{{"type":"step_start","sessionID":"ses_manager_a","part":{{"type":"step-start"}}}}\n'
+/bin/sleep 5
+"#,
+            log1
+        );
+        let script1 = fake_opencode(&scripts, "one.sh", &body1);
+        let (opened_a, _broker_a) = opened_custody(&plan);
+        let turn_a = PreparedManagerTurn {
+            harness: HarnessId::Opencode,
+            model: "accounts/fireworks/models/x".to_string(),
+            provider: opened_a.provider,
+            knobs: opencode_knobs(&script1, &ws, &state),
+            workspace_path: ws.clone(),
+            prompt: "TRIAGE TICKET-A".to_string(),
+            timeout: Duration::from_millis(400),
+        };
+        let err = HarnessManagerTurn
+            .run(turn_a)
+            .await
+            .expect_err("the first turn is cut off by the deadline");
+        assert!(err.contains("manager.timeout_ms"), "{err}");
+
+        // Attempt 2: a normal, complete turn for a DIFFERENT manager decision.
+        let log2 = scripts.child("argv-2.txt");
+        let body2 = format!(
+            r#"if [ "${{1:-}}" = "--version" ]; then printf '1.18.30\n'; exit 0; fi
+printf '%s' "$*" >> {0:?}
+printf '{{"type":"step_start","sessionID":"ses_manager_b","part":{{"type":"step-start"}}}}\n'
+printf '{{"type":"text","sessionID":"ses_manager_b","part":{{"type":"text","text":"SHIP"}}}}\n'
+printf '{{"type":"step_finish","sessionID":"ses_manager_b","part":{{"type":"step-finish","reason":"stop","tokens":{{"total":1,"input":1,"output":0,"reasoning":0,"cache":{{"write":0,"read":0}}}}}}}}\n'
+"#,
+            log2
+        );
+        let script2 = fake_opencode(&scripts, "two.sh", &body2);
+        let (opened_b, _broker_b) = opened_custody(&plan);
+        let turn_b = PreparedManagerTurn {
+            harness: HarnessId::Opencode,
+            model: "accounts/fireworks/models/x".to_string(),
+            provider: opened_b.provider,
+            knobs: opencode_knobs(&script2, &ws, &state),
+            workspace_path: ws.clone(),
+            prompt: "TRIAGE TICKET-B".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        let _ = HarnessManagerTurn.run(turn_b).await;
+
+        let argv2 = std::fs::read_to_string(&log2).expect("attempt 2 reached its child");
+        assert!(
+            !argv2.contains("-s "),
+            "a manager turn must never resume a previous manager invocation's session: {argv2}"
+        );
+        assert!(
+            !argv2.contains("Resuming a cut-off attempt"),
+            "and must never be told it is resuming: {argv2}"
         );
     }
 }
