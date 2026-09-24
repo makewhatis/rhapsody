@@ -618,6 +618,10 @@ pub(crate) struct TeamsDispatch {
     /// means inherit the configured backend, so a dispatch that routed to nobody, or to a teammate
     /// whose profile is silent, uses exactly the runner it always did.
     pub harness: String,
+    /// The provider the routed identity's profile asks for (STUDIO-985): empty means inherit, the
+    /// case for every built-in profile. Carried so PB7's pure selection can fold the profile tier's
+    /// provider without a second `profiles::resolve` call that could disagree with this one.
+    pub provider: String,
     /// [`EVENT_ROUTE`] or [`EVENT_UNROUTED`].
     pub kind: &'static str,
     /// The event text: the reason, and the identity when there is one. Deliberately carries no
@@ -637,6 +641,9 @@ pub(crate) struct ResolvedTeammate {
     model_override: rhapsody_agent::ModelOverride,
     /// Empty ⇒ inherit the configured `agent.backend` (STUDIO-902).
     harness: String,
+    /// The provider the profile asks for (STUDIO-985); empty ⇒ inherit. Carried for PB7's pure
+    /// selection so the profile tier's provider comes from the same resolve as its harness/model.
+    provider: String,
 }
 
 impl ResolvedTeammate {
@@ -648,6 +655,7 @@ impl ResolvedTeammate {
             section,
             model_override: rhapsody_agent::ModelOverride::default(),
             harness: String::new(),
+            provider: String::new(),
         }
     }
 }
@@ -674,6 +682,7 @@ impl Orchestrator {
                 section: String::new(),
                 model_override: rhapsody_agent::ModelOverride::default(),
                 harness: String::new(),
+                provider: String::new(),
                 kind: EVENT_UNROUTED,
                 text: format!("reason={}", routed.reason.as_str()),
             });
@@ -693,6 +702,7 @@ impl Orchestrator {
             section: resolved.section,
             model_override: resolved.model_override,
             harness: resolved.harness,
+            provider: resolved.provider,
         })
     }
 
@@ -1079,6 +1089,8 @@ impl Orchestrator {
                 // terms as `model`/`effort` above and for the same reason: every built-in profile
                 // ships it empty, so this changes nothing until an operator writes one.
                 harness: p.harness,
+                // The profile tier's provider (STUDIO-985), same empty-inherits contract.
+                provider: p.provider,
             },
             Err(e) => {
                 tracing::error!(

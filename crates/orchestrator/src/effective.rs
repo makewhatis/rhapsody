@@ -237,6 +237,18 @@ fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Harness> {
     }
 }
 
+/// Build the per-harness knob block a dispatch-time factory wants for `harness` from a
+/// materialized [`Config`] (PB7, STUDIO-1002). It is the same mapping [`harness_spec_from_cfg`]
+/// already applies to the configured backend, fanned out over the harness a prepared provider
+/// selected — so a brokered dispatch builds its adapter from exactly the config the legacy runner
+/// would have used, just for the selected harness rather than `agent.backend`.
+pub(crate) fn knobs_for_harness(cfg: &Config, harness: HarnessId) -> HarnessKnobs {
+    match harness {
+        HarnessId::Claude => HarnessKnobs::Claude(claude_config_from_cfg(cfg)),
+        HarnessId::Opencode => HarnessKnobs::Opencode(opencode_config_from_cfg(cfg)),
+    }
+}
+
 /// Maps a (materialized) [`Config`] onto an [`Runner`] via the named backend, returning
 /// [`OrchestratorError::UnsupportedBackend`] for any backend this build does not implement. Both the
 /// top-level legacy runner and every per-project runner route through this single switch.

@@ -287,6 +287,22 @@ running daemon has not yet observed it — never a generic failure that invites 
 daemon observation over the P0c authenticated channel is wired by the prepared-dispatch slice; until
 then a running daemon honestly reports `stored_unsynchronized`.)
 
+### Prepared dispatch and credential custody (STUDIO-1002)
+
+When a run selects an explicit provider (a `providers:` block plus a
+`rhapsody:provider/…`/profile/project/global selection), dispatch is prepared off the control task:
+the daemon reads the bound credential through the P0c authenticated owner channel and registers the
+normalized plan with the private provider broker, then hands ONLY the opaque, move-only broker
+session through ticket and review dispatch. A successful preparation runs the turn loop through a
+dispatch-time runner that owns that custody; a refused one writes exactly one zero-turn history row
+and a refusal gate (`credential_absent`, `credential_denied_or_locked`, `credential_malformed`,
+`binding_mismatch`, `owner_unavailable`, `owner_unauthorized`, `provider_broker_unavailable`,
+`selection_refused`) and creates no workspace, claim, running entry, mailbox, or review-watch row.
+Each turn's usage is replaced from the broker's finalized receipt and persisted as a separate
+`rhapsody_run_usage` row (including a zero-usage cancellation receipt). The frozen reference has no
+provider broker, so none of this exists in Go; with no `providers:` block the resolver is inert and
+legacy Claude and native-login OpenCode behavior is byte-identical.
+
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 
 Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies

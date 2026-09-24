@@ -14,12 +14,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rhapsody_agent::{
+    PreparedProvider, ResolvedProviderPlan, lower_provider_limits, lower_provider_plan,
+};
 use rhapsody_config::{
     Config, ProviderDefinition, ProviderReload, providers::provider_turn_deadline_ms,
 };
-use rhapsody_credential_ipc::domain::{Binding, CredentialState};
-use rhapsody_orchestrator::ProviderReloadSink;
-use rhapsody_provider_broker::BrokerRegistrar;
+use rhapsody_credential_ipc::domain::{Binding, CredentialRef, CredentialState};
+use rhapsody_orchestrator::{
+    CredentialRevisionSource, OpenedProvider, PreparedProviderSource, ProviderRefusal,
+    ProviderReloadSink, RefusalReason,
+};
+use rhapsody_provider_broker::{BrokerError, BrokerRegistrar, SessionPolicy};
 use rhapsody_provider_status::{
     CatalogError, CatalogSnapshot, CredentialReadSource, ObservedRead, ObservedState,
     OpenAiCompatibleDiscovery, ProviderConfig, ProviderStatusView, RefreshCoordinator,
@@ -231,6 +237,170 @@ pub fn unavailable_owner() -> Arc<CredentialResolver> {
     Arc::new(CredentialResolver::new())
 }
 
+/// Adapts the daemon's authenticated [`CredentialResolver`] to the orchestrator's per-credential
+/// revision watermark (PB7, STUDIO-1002; design §12). The resolver is the ONE credential boundary —
+/// the provider-status runtime and the prepared dispatch both read through it — so its per-account
+/// high-water is exactly "the newest owner revision this daemon has observed" for that credential.
+/// A provider id maps to the resolver's versioned account (`v1:<id>`); an invalid provider id has no
+/// observable revision.
+pub struct ResolverRevisionSource {
+    resolver: Arc<CredentialResolver>,
+}
+
+impl ResolverRevisionSource {
+    pub fn new(resolver: Arc<CredentialResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+impl CredentialRevisionSource for ResolverRevisionSource {
+    fn high_water(&self, provider: &str) -> Option<u64> {
+        let account = CredentialRef::for_provider(provider).ok()?;
+        self.resolver.high_water(account.account()).map(|r| r.0)
+    }
+}
+
+/// The daemon's prepared-provider source (PB7, STUDIO-1002): the off-loop operation that reads the
+/// bound credential through the daemon's authenticated [`CredentialResolver`] and registers the
+/// pure plan with the live broker, returning the move-only [`PreparedProvider`].
+///
+/// It is the ONLY place the daemon's credential boundary and the broker meet, and every failure is
+/// mapped to a typed [`RefusalReason`] — a missing/locked/malformed credential, an owner that is
+/// unavailable or refuses us, a binding mismatch, or a broker that is down. It never reads the
+/// credential value itself beyond moving it into the broker, so no secret leaves this call.
+pub struct DaemonProviderSource {
+    resolver: Arc<CredentialResolver>,
+    registrar: BrokerRegistrar,
+}
+
+impl DaemonProviderSource {
+    pub fn new(resolver: Arc<CredentialResolver>, registrar: BrokerRegistrar) -> Self {
+        Self {
+            resolver,
+            registrar,
+        }
+    }
+}
+
+fn provider_refusal(reason: RefusalReason, revision: &str) -> ProviderRefusal {
+    ProviderRefusal {
+        reason,
+        revision: revision.to_string(),
+    }
+}
+
+#[async_trait]
+impl PreparedProviderSource for DaemonProviderSource {
+    async fn open_provider(
+        &self,
+        plan: &ResolvedProviderPlan,
+    ) -> Result<OpenedProvider, ProviderRefusal> {
+        let binding = Binding {
+            provider_id: plan.stable_id.clone(),
+            adapter: plan.protocol.adapter_id().to_string(),
+            base_url: plan.normalized_endpoint.clone(),
+        };
+        let account = CredentialRef::for_provider(&plan.stable_id)
+            .map_or_else(|_| String::new(), |r| r.account().to_string());
+        let observed = self.resolver.read_bound(account, binding).await;
+        // Only a read the owner ANSWERED carries an owner revision. An unreachable owner
+        // (`OwnerUnavailable`/`OwnerUnauthorized`) has none, so this stamps an EMPTY revision — the
+        // `ProviderRefusal` contract's "empty only when a read never reached the owner". Stamping the
+        // resolver's `Revision::INITIAL` sentinel (`"0"`) here made the control loop compare a number
+        // no owner ever produced against the observed watermark and drop the refusal as stale, so a
+        // wedged owner produced no refusal row and no gate and was re-probed every tick (STUDIO-1002
+        // review A1).
+        let revision = match &observed.read.state {
+            CredentialState::OwnerUnavailable | CredentialState::OwnerUnauthorized => String::new(),
+            _ => observed.read.revision.0.to_string(),
+        };
+        match observed.read.state {
+            CredentialState::Present(lease) => {
+                // Move the value into the broker's own move-only lease. A shape violation is a
+                // malformed stored credential, never a retried direct-key path.
+                let broker_lease = match lease.into_broker_lease() {
+                    Ok(lease) => lease,
+                    Err(BrokerError::InvalidCredential(_) | BrokerError::InvalidBinding) => {
+                        return Err(provider_refusal(
+                            RefusalReason::CredentialMalformed,
+                            &revision,
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(provider_refusal(
+                            RefusalReason::ResolverFailed(e.to_string()),
+                            &revision,
+                        ));
+                    }
+                };
+                let registration_plan = match lower_provider_plan(plan) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        return Err(provider_refusal(
+                            RefusalReason::ResolverFailed(e.to_string()),
+                            &revision,
+                        ));
+                    }
+                };
+                let policy = match SessionPolicy::new(lower_provider_limits(&plan.limits)) {
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        return Err(provider_refusal(
+                            RefusalReason::ResolverFailed(e.to_string()),
+                            &revision,
+                        ));
+                    }
+                };
+                match self
+                    .registrar
+                    .register_session(registration_plan, broker_lease, policy)
+                {
+                    Ok(registration) => Ok(OpenedProvider {
+                        provider: PreparedProvider::from_registration(
+                            plan.stable_id.clone(),
+                            plan.protocol,
+                            registration,
+                        ),
+                        revision,
+                    }),
+                    Err(BrokerError::Unavailable) => Err(provider_refusal(
+                        RefusalReason::ProviderBrokerUnavailable,
+                        &revision,
+                    )),
+                    Err(BrokerError::BindingMismatch) => {
+                        Err(provider_refusal(RefusalReason::BindingMismatch, &revision))
+                    }
+                    Err(e) => Err(provider_refusal(
+                        RefusalReason::ResolverFailed(e.to_string()),
+                        &revision,
+                    )),
+                }
+            }
+            CredentialState::Absent => {
+                Err(provider_refusal(RefusalReason::CredentialAbsent, &revision))
+            }
+            CredentialState::DeniedOrLocked => Err(provider_refusal(
+                RefusalReason::CredentialDeniedOrLocked,
+                &revision,
+            )),
+            CredentialState::Malformed => Err(provider_refusal(
+                RefusalReason::CredentialMalformed,
+                &revision,
+            )),
+            CredentialState::BindingMismatch => {
+                Err(provider_refusal(RefusalReason::BindingMismatch, &revision))
+            }
+            CredentialState::OwnerUnavailable => {
+                Err(provider_refusal(RefusalReason::OwnerUnavailable, &revision))
+            }
+            CredentialState::OwnerUnauthorized => Err(provider_refusal(
+                RefusalReason::OwnerUnauthorized,
+                &revision,
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +563,61 @@ mod tests {
         assert!(
             provider_runtime.catalog("fireworks").is_none(),
             "a removed provider must 404 its catalog, not serve a stale list"
+        );
+    }
+
+    fn prepared_plan() -> rhapsody_agent::ResolvedProviderPlan {
+        rhapsody_agent::ResolvedProviderPlan {
+            stable_id: "fireworks".to_string(),
+            protocol: rhapsody_agent::ProviderProtocol::OpenAiCompatible,
+            normalized_endpoint: "https://fireworks.example/v1".to_string(),
+            allow_insecure_http: false,
+            credential_binding: String::new(),
+            credential_ref: rhapsody_config::providers::CREDENTIAL_SOURCE_KEYCHAIN.to_string(),
+            limits: rhapsody_agent::ProviderLimits::default(),
+            model: "m".to_string(),
+            origins: rhapsody_agent::ProviderOrigins::default(),
+        }
+    }
+
+    /// PB7 (STUDIO-1002 review B1): the orchestrator's revision watermark is the daemon's resolver
+    /// keyed by the provider's versioned account. A provider with no answered read has no opinion,
+    /// and an invalid provider id maps to no account at all.
+    #[test]
+    fn revision_source_maps_a_provider_to_its_account_watermark() {
+        let source = ResolverRevisionSource::new(std::sync::Arc::new(CredentialResolver::new()));
+        assert_eq!(source.high_water("fireworks"), None);
+        assert_eq!(
+            source.high_water("Not A Valid Id"),
+            None,
+            "an invalid provider id maps to no account"
+        );
+    }
+
+    /// PB7: with no credential owner channel, the prepared-provider source refuses with the typed
+    /// `owner_unavailable` rather than ever reaching for a direct key. The mutation guard is
+    /// inventing a lease for an owner that never answered.
+    ///
+    /// STUDIO-1002 review A1: the refusal must carry an EMPTY revision. A no-owner read has no owner
+    /// revision, and stamping the resolver's `Revision::INITIAL` sentinel (`"0"`) made the loop's
+    /// watermark check drop the refusal as stale once the owner had ever answered (≥ 1), so the typed
+    /// refusal never armed its gate. This reds if the source stringifies `Revision::INITIAL` again.
+    #[tokio::test]
+    async fn prepared_source_refuses_when_the_owner_is_unavailable() {
+        let runtime = crate::broker::BrokerRuntime::bind().expect("broker");
+        let source = DaemonProviderSource::new(unavailable_owner(), runtime.registrar());
+        let err = source
+            .open_provider(&prepared_plan())
+            .await
+            .expect_err("no owner channel");
+        assert_eq!(
+            err.reason,
+            rhapsody_orchestrator::RefusalReason::OwnerUnavailable
+        );
+        assert!(
+            err.revision.is_empty(),
+            "a no-owner refusal must carry no owner revision, not the INITIAL sentinel: {}",
+            err.revision
         );
     }
 }

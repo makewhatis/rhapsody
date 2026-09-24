@@ -208,6 +208,70 @@ impl Orchestrator {
         }
     }
 
+    /// Persist a brokered run's finalized usage (PB7, STUDIO-1002; design §§7.3, 10.3) and REPLACE
+    /// the run's child-reported token tallies with the broker-collected figures.
+    ///
+    /// The run id is carried on the event rather than looked up from the live entry: a production
+    /// cancellation (`terminate`) removes the entry before the worker's future drops, so a
+    /// cancellation receipt would otherwise be lost here (STUDIO-1002 review A2). A zero run id
+    /// (store off) is a no-op; a store failure is logged, never fatal — accounting must never fail a
+    /// run.
+    ///
+    /// When the entry is still live (the ordinary path — the worker sends this before its exit),
+    /// the run's committed token tallies are replaced from the drained ledgers, so the `runs` row and
+    /// the per-provider budget see the broker's numbers, not the child's (design §7.3: "replaces
+    /// brokered-turn token/cache counts with broker-collected provider reports"; child values are
+    /// comparison-only diagnostics). The committed total is the provider-reported total, or the
+    /// conservative reservation when the broker could not report — never the child's figure, so an
+    /// unknown request is not filled from a child value. The input/output split is not part of the
+    /// broker receipt, so those are zeroed for the brokered run; the usage row keeps the reported and
+    /// reserved totals separately.
+    pub(crate) fn on_broker_usage(&mut self, issue_id: &str, run_id: i64, usage: &store::RunUsage) {
+        if run_id != 0
+            && let Err(e) = self.store.set_run_usage(run_id, usage)
+        {
+            tracing::warn!(
+                issue_id = %issue_id,
+                run_id,
+                err = %e,
+                "broker usage persistence failed; the run's own history is unaffected"
+            );
+        }
+        self.replace_child_usage_with_broker(issue_id, usage);
+    }
+
+    /// Replace a live run's committed token tallies with the finalized broker receipt (design §7.3)
+    /// and correct the aggregate totals by the delta the child had contributed. A no-op when the
+    /// entry is already gone (the cancellation path, where the run row is closed by `terminate`'s
+    /// caller).
+    ///
+    /// The committed total is the provider-reported total; when the broker could not report, it is the
+    /// conservative reservation, so an unknown/aborted request stays charged and is never filled from
+    /// the child's figure. The input/output split is not part of the broker receipt, so those are
+    /// zeroed for the brokered run (the usage row keeps reported and reserved separately).
+    fn replace_child_usage_with_broker(&mut self, issue_id: &str, usage: &store::RunUsage) {
+        let broker_total = usage
+            .provider_reported_tokens
+            .unwrap_or(usage.reserved_tokens);
+        let Some(re) = self.running.get_mut(issue_id) else {
+            return;
+        };
+        let old = (re.input_tokens, re.output_tokens, re.total_tokens);
+        re.input_tokens = 0;
+        re.output_tokens = 0;
+        re.total_tokens = broker_total;
+        re.cur_input_tokens = 0;
+        re.cur_output_tokens = 0;
+        re.cur_total_tokens = 0;
+        self.totals.input_tokens = self.totals.input_tokens.saturating_sub(old.0);
+        self.totals.output_tokens = self.totals.output_tokens.saturating_sub(old.1);
+        self.totals.total_tokens = self
+            .totals
+            .total_tokens
+            .saturating_sub(old.2)
+            .saturating_add(broker_total);
+    }
+
     // --- synchronous write-through helpers ----------------------------------------------------
 
     /// Inserts the run row (outcome `running`), records its id on `re` for later
@@ -569,7 +633,7 @@ fn flush_events(
 
 #[cfg(test)]
 mod tests {
-    use rhapsody_agent::{EVENT_NOTIFICATION, EVENT_TURN_COMPLETED, Event};
+    use rhapsody_agent::{EVENT_NOTIFICATION, EVENT_TURN_COMPLETED, Event, Usage};
     use rhapsody_store::{
         CLAIM_RETRY_QUEUED, CLAIM_RUNNING, OUTCOME_COMPLETED, OUTCOME_CONTINUED, OUTCOME_RUNNING,
         OUTCOME_STOPPED, RUN_MESSAGE_EXPIRED, RunFilter,
@@ -872,5 +936,111 @@ mod tests {
             msgs[0].status, RUN_MESSAGE_EXPIRED,
             "pending message must expire at run end"
         );
+    }
+
+    // PB7 (STUDIO-1002): a brokered run's finalized usage lands in its own `rhapsody_run_usage` row,
+    // keyed by the store run id, and REPLACES the run's child-reported token tallies with the broker
+    // figures (design §7.3). The child here reports 1000 tokens; the broker receipt reports 42, and
+    // the run must record 42. MUTATION GUARDS: dropping `set_run_usage` loses the usage row; not
+    // replacing leaves the child's 1000 in the run row and the per-provider budget path.
+    #[test]
+    fn on_broker_usage_writes_a_usage_row_and_replaces_child_usage() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "In Progress");
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+        // The child's turn_completed result commits its own token figure.
+        o.on_agent_update(AgentUpdate {
+            issue_id: issue_id.clone(),
+            ev: Event {
+                event_type: EVENT_TURN_COMPLETED.to_string(),
+                usage: Some(Usage {
+                    input_tokens: 700,
+                    output_tokens: 300,
+                    total_tokens: 1000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            o.running[&issue_id].total_tokens, 1000,
+            "the child usage is committed before the receipt arrives"
+        );
+
+        let usage = store::RunUsage {
+            provider_reported_tokens: Some(42),
+            reserved_tokens: 900,
+            usage_authority: store::USAGE_AUTHORITY_PROVIDER_REPORTED_UNVERIFIED.to_string(),
+            usage_incomplete: true,
+            unknown_usage_requests: 2,
+        };
+        o.on_broker_usage(&issue_id, run_id, &usage);
+
+        let got = st
+            .run_usage(run_id)
+            .expect("read usage")
+            .expect("a usage row");
+        assert_eq!(got, usage);
+        // The run's committed tally is the broker's report, not the child's 1000, and the aggregate
+        // follows the replacement.
+        assert_eq!(o.running[&issue_id].total_tokens, 42);
+        assert_eq!(o.totals.total_tokens, 42);
+
+        // End the run: the `runs` row (and thus the per-provider budget) records the broker figure.
+        let re = o.running.get(&issue_id).expect("live entry").clone();
+        o.persist_end_run(&re, OUTCOME_COMPLETED, "");
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        assert_eq!(
+            runs[0].total_tokens, 42,
+            "the run records the finalized broker receipt, not the child usage"
+        );
+    }
+
+    // STUDIO-1002 review A2: a production cancellation (`terminate`) removes the running entry
+    // BEFORE the worker's future drops, so the finalized receipt arrives with no live entry to
+    // resolve a run id from. Carrying the run id on the event persists the cancellation receipt
+    // anyway. This reds if `on_broker_usage` looks the run id up from `self.running`.
+    #[test]
+    fn a_cancelled_runs_broker_receipt_is_persisted_after_terminate() {
+        let (mut o, st) = orch_with_store();
+        let mut re = re_for("ID-1", "MT-1", "In Progress");
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        let issue_id = re.issue.id.clone();
+        o.running.insert(issue_id.clone(), re);
+
+        assert!(
+            o.terminate(&issue_id).is_some(),
+            "the fixture run must be running to cancel"
+        );
+        assert!(
+            !o.running.contains_key(&issue_id),
+            "terminate removed the entry"
+        );
+
+        let usage = store::RunUsage {
+            reserved_tokens: 0,
+            usage_incomplete: true,
+            ..Default::default()
+        };
+        o.on_broker_usage(&issue_id, run_id, &usage);
+
+        let got = st.run_usage(run_id).expect("read usage");
+        assert_eq!(
+            got,
+            Some(usage),
+            "a cancelled brokered run's finalized receipt must be persisted"
+        );
+    }
+
+    // A zero run id (store off / StartRun failed) is a no-op rather than a panic or a wrong-run write.
+    #[test]
+    fn on_broker_usage_with_a_zero_run_id_is_a_noop() {
+        let (mut o, _st) = orch_with_store();
+        let usage = store::RunUsage::default();
+        o.on_broker_usage("ghost", 0, &usage); // must not panic
     }
 }
