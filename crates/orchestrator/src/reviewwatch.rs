@@ -4620,6 +4620,9 @@ mod tests {
         ) -> Result<(), rs::StoreError> {
             self.0.update_run_progress(run_id, p)
         }
+        fn set_run_tokens(&self, run_id: i64, t: &rs::RunTokens) -> Result<(), rs::StoreError> {
+            self.0.set_run_tokens(run_id, t)
+        }
         fn append_events(&self, run_id: i64, ev: &[rs::EventRow]) -> Result<(), rs::StoreError> {
             self.0.append_events(run_id, ev)
         }
