@@ -270,21 +270,17 @@ mod tests {
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
 
-    /// The version the fake CLI below answers `--version` with. The launch gate re-probes the real
-    /// command, so tests point the routed project at this fake so the probe is hermetic.
-    const TEST_CLI_VERSION: &str = "9.9.9";
-
-    /// A `bash`-runnable fake `claude` that answers `--version` deterministically. Written once per
-    /// test process under the temp dir; the probe only reads the first non-empty line.
+    /// A hermetic stand-in for the `claude` command that answers `--version` with a deterministic
+    /// string and writes nothing (so the CI tmp-leak guard stays green). `echo 9.9.9 --version`
+    /// prints `9.9.9 --version`; [`test_cli_version`] reads back exactly that, so the recorded
+    /// verdict matches what the gate's re-probe will see.
     fn test_cli_command() -> String {
-        static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let path = SCRIPT.get_or_init(|| {
-            let p = std::env::temp_dir().join("rhapsody-manager-test-cli.sh");
-            std::fs::write(&p, format!("#!/bin/sh\necho {TEST_CLI_VERSION}\n"))
-                .expect("write test cli");
-            p.to_string_lossy().into_owned()
-        });
-        format!("bash {path}")
+        "/bin/echo 9.9.9".to_string()
+    }
+
+    /// The version [`test_cli_command`] actually reports, probed the same way the gate does.
+    fn test_cli_version() -> String {
+        crate::managerselftest::probe_cli_version(&test_cli_command()).expect("probe fake cli")
     }
 
     fn record_entries(sink: &DispatchedEntries) -> crate::orchestrator::SpawnFn {
@@ -416,7 +412,7 @@ mod tests {
     #[test]
     fn dispatch_refuses_when_authority_is_off() {
         let (mut o, dispatched) = orch(ReviewAuthority::Off);
-        pass_self_test(&o, TEST_CLI_VERSION); // even with a passing self-test, off means off
+        pass_self_test(&o, &test_cli_version()); // even with a passing self-test, off means off
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::AuthorityOff
@@ -454,7 +450,7 @@ mod tests {
     #[test]
     fn dispatch_manager_rides_the_shared_funnel_with_no_watch_row() {
         let (mut o, dispatched) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, TEST_CLI_VERSION);
+        pass_self_test(&o, &test_cli_version());
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
@@ -490,7 +486,7 @@ mod tests {
     #[test]
     fn dispatch_manager_refuses_an_already_in_flight_run() {
         let (mut o, dispatched) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, TEST_CLI_VERSION);
+        pass_self_test(&o, &test_cli_version());
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
@@ -507,7 +503,7 @@ mod tests {
     fn dispatch_manager_refuses_when_teams_is_off() {
         let (mut o, _) = orch(ReviewAuthority::Act);
         o.teams = Some(Teams::disabled());
-        pass_self_test(&o, TEST_CLI_VERSION);
+        pass_self_test(&o, &test_cli_version());
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::TeamsOff
@@ -525,7 +521,7 @@ mod tests {
             teams.manager.model = "claude-opus-5-5".to_string();
             teams.manager.effort = "high".to_string();
         }
-        pass_self_test(&o, TEST_CLI_VERSION);
+        pass_self_test(&o, &test_cli_version());
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
@@ -546,7 +542,7 @@ mod tests {
     #[test]
     fn a_manager_exit_ends_the_run_and_schedules_no_retry() {
         let (mut o, _) = orch(ReviewAuthority::Act);
-        pass_self_test(&o, TEST_CLI_VERSION);
+        pass_self_test(&o, &test_cli_version());
         assert_eq!(
             o.dispatch_manager(manager_run()),
             ManagerDispatchOutcome::Dispatched
