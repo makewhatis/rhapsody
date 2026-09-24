@@ -19,6 +19,7 @@ import {
   phaseGlyph,
   prSearchUrl,
   provenanceFields,
+  providerReportedUnverified,
   relayBatons,
   resultBanner,
   resultEyebrow,
@@ -126,6 +127,21 @@ describe("runVitals — the header's mono strip derives from RunSummary (§3A)",
 
   it("marks an estimated token total rather than presenting it as authoritative", () => {
     expect(runVitals(run({ usage_estimated: true }), []).tokens).toBe("~38.0k");
+  });
+
+  // MUTATION GUARD (design §7.3): a generic provider report is UNVERIFIED measurement, so the
+  // console labels it "provider-reported" rather than presenting it as exact measured usage. A view
+  // that rendered the plain total (or a verified label) reds here; one that invented the label for a
+  // non-brokered run also reds (`providerReportedUnverified` is false without a usage row).
+  it("labels a provider-reported (unverified) total instead of presenting it as exact", () => {
+    const brokered: RunProvenance = {
+      run_id: 1,
+      usage: { provider_reported_tokens: 38_000, reserved_tokens: 40_000, usage_authority: "provider_reported_unverified", usage_incomplete: false, unknown_usage_requests: 0 },
+    };
+    expect(providerReportedUnverified(brokered)).toBe(true);
+    expect(runVitals(run(), [], brokered).tokens).toBe("38.0k provider-reported");
+    expect(providerReportedUnverified(undefined)).toBe(false);
+    expect(runVitals(run(), [], { run_id: 1 }).tokens).toBe("38.0k");
   });
 
   it("shows a dash, never a fabricated 0s, while the run has not ended", () => {

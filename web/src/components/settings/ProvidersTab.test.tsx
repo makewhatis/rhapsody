@@ -233,4 +233,30 @@ describe("ProvidersTab", () => {
     expect(text).not.toContain("binding-FFFF");
     expect(text).not.toContain("rev-1234");
   });
+
+  // MUTATION GUARD: an unavailable broker renders the CLOSED reason code and nothing about the
+  // broker's internals (a listener address, capability, or credential). A view that rendered a
+  // raw address/capability here reds; one that hid the reason entirely reds the positive assert.
+  it("renders the closed broker-unavailable reason without internals", async () => {
+    h.fetchProviderStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        status: "configured",
+        cache_age_ms: 2,
+        refreshing: false,
+        broker_available: false,
+        broker_reason: "provider_broker_unavailable",
+        recovery: null,
+        // Hostile extras a real daemon never sends; the view must ignore them.
+        broker_address: "127.0.0.1:54321",
+        capability: "cap-CANARY",
+      } as never,
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByText(/broker unavailable/i)).toBeTruthy());
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("provider_broker_unavailable");
+    expect(text).not.toContain("127.0.0.1:54321");
+    expect(text).not.toContain("cap-CANARY");
+  });
 });

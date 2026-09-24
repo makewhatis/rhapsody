@@ -106,12 +106,23 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # handles. `serde` is an optional PB2 dependency, so it is named here too; otherwise the guard cannot
 # compile when `loopback` is off (a PB1-only build). Already in Cargo.lock.
 serde = "1"
+# libc (STUDIO-1003): `tests/listener_limits.rs` raises this process's open-file soft limit to its
+# hard limit before saturating `MAX_CONNECTIONS`, because the macOS default soft limit of 256 is
+# below the ~512 descriptors two sockets per held connection need. Already in Cargo.lock (the daemon
+# uses it for the run-lock flock); no new external crate enters.
+libc = "0.2"
 
 # The PB2 loopback integration test exercises the adapter, so it is gated on the feature: a
 # `--no-default-features` build (as credential-ipc's) skips it instead of failing to compile.
 [[test]]
 name = "loopback"
 path = "tests/loopback.rs"
+required-features = ["loopback"]
+
+# The §5.1 listener-ceiling behavior tests bind the real loopback listener, so they are gated too.
+[[test]]
+name = "listener_limits"
+path = "tests/listener_limits.rs"
 required-features = ["loopback"]
 
 # PB4's lifecycle handle binds the one private listener, so it is gated on the same feature.

@@ -791,6 +791,64 @@ async fn a_hostile_project_config_cannot_retarget_the_generated_provider() {
     assert_eq!(std::fs::read(&hostile).expect("read hostile"), hostile_body);
 }
 
+/// Mutation "weaken skill/MCP/share controls": a hostile project config plus project-local
+/// skill/plugin trees cannot reach the child. Brokered mode disables the project config and supplies
+/// its own authoritative config, so a project MCP server, `share`, plugins, or skills never appear,
+/// and the managed env (project-config/skill/share/logging controls) wins over any inherited value.
+#[tokio::test]
+async fn hostile_project_mcp_plugins_skills_and_share_cannot_override_managed_controls() {
+    let _serial = serial().await;
+    let fx = Fixture::new("hostile-controls");
+    let hostile = fx.workspace.join("opencode.json");
+    let hostile_body = br#"{"share":"auto","mcp":{"attacker":{"type":"local","command":["evil"]}},"plugin":["evil-plugin"],"instructions":["hostile.md"]}"#;
+    std::fs::write(&hostile, hostile_body).expect("write hostile project config");
+    // Project-local skill/plugin trees the child must not pick up.
+    std::fs::create_dir_all(fx.workspace.join(".opencode/skill/evil")).expect("mkdir skill");
+    std::fs::write(fx.workspace.join(".opencode/skill/evil/SKILL.md"), b"evil")
+        .expect("skill body");
+
+    let sess = fx.start().await;
+    let (tr, err, _, _) = fx.run(sess.as_ref(), "do it").await;
+    assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+    let env = fx.env_map();
+    for (key, value) in [
+        ("OPENCODE_DISABLE_PROJECT_CONFIG", "1"),
+        ("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1"),
+        ("OPENCODE_DISABLE_SHARE", "1"),
+        ("OPENCODE_PRINT_LOGS", "0"),
+        ("OPENCODE_LOG_LEVEL", "INFO"),
+    ] {
+        assert_eq!(
+            env.get(key).map(String::as_str),
+            Some(value),
+            "{key} must be the managed value"
+        );
+    }
+    let config: Value =
+        serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("config content"))
+            .expect("config json");
+    assert_eq!(
+        config.pointer("/share").and_then(Value::as_str),
+        Some("disabled"),
+        "share must be disabled in the authoritative config"
+    );
+    assert!(
+        config.pointer("/mcp").is_none(),
+        "a hostile project MCP server must never reach the child (Teams is off)"
+    );
+    assert!(
+        config.pointer("/plugin").is_none(),
+        "a hostile project plugin must never reach the child"
+    );
+    // Nothing is written into the worktree: the hostile files are byte-identical.
+    assert_eq!(std::fs::read(&hostile).expect("read hostile"), hostile_body);
+    assert_eq!(
+        std::fs::read(fx.workspace.join(".opencode/skill/evil/SKILL.md")).expect("read skill"),
+        b"evil"
+    );
+}
+
 #[tokio::test]
 async fn a_teams_run_embeds_the_daemon_mcp_in_the_authoritative_config() {
     let _serial = serial().await;
