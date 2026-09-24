@@ -173,6 +173,11 @@ export interface ReviewDivergence {
   adjudicated_head?: string;
   current_head?: string;
   superseded?: boolean;
+  // The manager's own operator sentence. Carried on TWO rows (STUDIO-1005, STUDIO-1015):
+  //   - a SUPERSEDED escalation (see above), where it is the manager's original reason; and
+  //   - a `manager_deferred` row (§10.2), where it is why the manager did not act — the feed text
+  //     `manager deferred: drain`/`: budget`/`: credentials`, or `manager unavailable: CLI contract`.
+  // DivergenceBanner renders it for a `manager_deferred` row in place of the generic `detail`.
   reason?: string;
   findings?: string[];
   supersession?: string;

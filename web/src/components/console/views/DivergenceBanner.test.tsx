@@ -75,6 +75,29 @@ describe("DivergenceBanner", () => {
     expect(container.innerHTML).toBe("");
   });
 
+  // STUDIO-1015 (§10.2): a manager-owned stall the manager could not adopt carries the manager's
+  // own sentence in `reason`; the banner shows it instead of the generic detail, so an operator sees
+  // WHY the manager did not act. MUTATION: render `detail` unconditionally and the manager wording
+  // never reaches the console.
+  it("shows the manager's own wording for a manager_deferred row", async () => {
+    h.fetchState.mockResolvedValue(
+      state({
+        review_divergence: [
+          divergence({
+            kind: "manager_deferred",
+            detail:
+              "the manager adopted this stall but its launch is deferred or the manager is unavailable; see the reason",
+            reason: "manager deferred: drain",
+          }),
+        ],
+      }),
+    );
+    renderBanner();
+    await waitFor(() =>
+      expect(screen.getByText(/manager deferred: drain/)).toBeTruthy(),
+    );
+  });
+
   // A reported divergence names the pull request, its ticket and how long — the three facts an
   // operator needs to decide whether to intervene. The wording comes from the daemon's own `detail`,
   // so the console cannot drift from it.
