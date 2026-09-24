@@ -49,8 +49,11 @@
 //!
 //! `manager.mode: labels` means there is no manager ASSIGNMENT turn today — assignment is
 //! deterministic and spends nothing. An adjudication needs a turn, so it must not silently inherit
-//! that mode. It does not: it is gated by `review.adjudicate_after_rounds` alone, and runs through
-//! the daemon's one model-turn path ([`crate::triage::run_turn`]) with `manager.model` /
+//! that mode. It does not: it is gated by `review.adjudicate_after_rounds` alone. Since STUDIO-989
+//! (P8) the turn runs through the SAME resolved manager tuple as every other manager turn — the
+//! composition root installs the manager arbiter ([`crate::managerprep::ManagerArbiter`]) as the
+//! [`ReviewAdjudicator`], so an explicit provider manager adjudicates on its own broker session and
+//! an empty manager tuple stays on the legacy `claude -p` lane with `manager.model` /
 //! `manager.timeout_ms`. A `labels`-mode install that sets the key gets adjudication; one that does
 //! not gets today's behaviour byte-for-byte.
 
@@ -150,7 +153,8 @@ pub struct AdjudicationRequest {
 }
 
 /// The injectable model-turn seam, exactly as [`crate::triage::TriageArbiter`] is for assignment:
-/// production installs [`ClaudeReviewAdjudicator`], tests inject a fake and never shell out.
+/// the composition root installs the manager arbiter (STUDIO-989), and tests inject a fake and
+/// never shell out.
 #[async_trait]
 pub trait ReviewAdjudicator: Send + Sync {
     /// Runs ONE bounded turn and returns the manager's decision. The implementation MUST bound
@@ -159,8 +163,12 @@ pub trait ReviewAdjudicator: Send + Sync {
     async fn adjudicate(&self, req: &AdjudicationRequest) -> Result<Verdict, String>;
 }
 
-/// The production adjudicator: the same `claude -p` turn [`crate::triage`] uses, differing only in
-/// prompt and answer shape.
+/// The LEGACY/lane-specific adjudicator: the same `claude -p` turn [`crate::triage`] uses, differing
+/// only in prompt and answer shape.
+///
+/// Since STUDIO-989 (P8) production does NOT install this directly — the composition root wires the
+/// manager arbiter ([`crate::managerprep::ManagerArbiter`]), whose empty-tuple lane delegates to this
+/// same `run_turn`. It is kept as the documented Claude-only turn and for tests.
 #[derive(Debug, Default, Clone)]
 pub struct ClaudeReviewAdjudicator;
 
@@ -483,12 +491,17 @@ pub struct AdjudicationDeps {
     pub turn: AdjudicationTurn,
 }
 
-/// The harness an adjudication turn actually runs on. [`ClaudeReviewAdjudicator`] reuses
-/// [`crate::triage::run_turn`], which spawns `claude -p`, so the model this turn may be given is a
-/// `claude` model and nothing else — see [`adjudication_model`].
+/// The harness the LEGACY adjudication lane runs on. The empty-manager-tuple lane reuses
+/// [`crate::triage::run_turn`], which spawns `claude -p`, so the model that lane may be given is a
+/// `claude` model and nothing else — see [`adjudication_model`]. An explicit provider manager does
+/// NOT use this constant: its harness/model come from its own resolved tuple (STUDIO-989).
 const ADJUDICATION_HARNESS: &str = "claude";
 
-/// The model an adjudication turn runs on (STUDIO-956, round-8 finding 4).
+/// The model the LEGACY (empty manager tuple) adjudication lane runs on (STUDIO-956, round-8
+/// finding 4).
+///
+/// This is the model the composition root puts on the [`AdjudicationRequest`]; the manager arbiter's
+/// explicit-provider lane ignores it in favour of the manager's own resolved model (STUDIO-989).
 ///
 /// `manager.model` defaults to empty and is empty on the installation that filed this, and
 /// [`crate::triage::run_turn`] passes `--model` only when the value is non-empty. So the turn that

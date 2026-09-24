@@ -2062,7 +2062,7 @@ fn turn_failure_reason(code: Option<i32>, stderr: &[u8]) -> String {
 /// it will NOT do is guess — an unparseable reply, or one with no `identity`, is an error, and the
 /// caller then leaves the ticket unlabeled. Pure, so the whole contract is tested without spawning
 /// a process.
-fn parse_decision(stdout: &str) -> Result<TriageDecision, String> {
+pub(crate) fn parse_decision(stdout: &str) -> Result<TriageDecision, String> {
     let start = stdout
         .find('{')
         .ok_or_else(|| format!("triage reply carried no JSON object: {}", snippet(stdout)))?;
