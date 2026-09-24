@@ -359,6 +359,23 @@ fn studio574_orch(
     crate::testsupport::DispatchedEntries,
     Arc<Mutex<Vec<String>>>,
 ) {
+    // The reported run ended a minute after it started, seven hours BEFORE the summons.
+    studio574_orch_windowed(
+        active_states,
+        studio574_run_start() + chrono::Duration::minutes(1),
+    )
+}
+
+/// [`studio574_orch`] with the prior author run's END chosen by the caller, so a test can put the
+/// summons inside or outside that run's live window (STUDIO-1045).
+fn studio574_orch_windowed(
+    active_states: &[&str],
+    run_ended_at: DateTime<Utc>,
+) -> (
+    Orchestrator,
+    crate::testsupport::DispatchedEntries,
+    Arc<Mutex<Vec<String>>>,
+) {
     let iss = normalized_in_review_issue();
     assert!(iss.linked_pr, "the attachment must register as a linked PR");
     let mut p = summon_project("studio-infra", "studio49dev", "studio-infra", vec![iss]);
@@ -375,12 +392,7 @@ fn studio574_orch(
     o.gh_source = Some(gh_source_for("@rhapsody", Arc::clone(&endpoints)));
     let store: Arc<dyn Store + Send + Sync> =
         Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
-    seed_run(
-        store.as_ref(),
-        "iss-569",
-        "STUDIO-569",
-        studio574_run_start() + chrono::Duration::minutes(1),
-    );
+    seed_run(store.as_ref(), "iss-569", "STUDIO-569", run_ended_at);
     o.set_store(store);
     (o, spawned, endpoints)
 }
@@ -548,6 +560,73 @@ async fn github_summons_reopen_seeds_the_fresh_runs_mailbox() {
             .expect("summon time"),
         "the seeded summons must advance the per-run delivery watermark"
     );
+}
+
+// STUDIO-1045 acceptance, and the reported STUDIO-1002 incident end to end: the author's own
+// token-bearing PR reply is created at 21:48:32, WHILE its run is still live. The poll must not
+// reopen or re-dispatch the author. Same comment, same ticket, same GH source as the STUDIO-574
+// reopen test above — only the run's window differs, which is exactly the boundary this fix moves.
+//
+// MUTATION: measure the summons against the run's START (the pre-STUDIO-1045 rule) and this reds —
+// the author is re-dispatched by its own comment, the duplicate run the ticket exists to stop.
+#[tokio::test]
+async fn a_summons_created_while_the_author_run_was_live_does_not_reopen_it() {
+    let summon_at = Utc
+        .with_ymd_and_hms(2026, 8, 24, 21, 48, 32)
+        .single()
+        .expect("summon instant");
+    // `seed_run` seeds the window `[end - 1m, end]`, so ending at 21:48:40 makes the window
+    // `[21:47:40, 21:48:40]` and puts the author's 21:48:32 comment 52s into its own run.
+    let (mut o, spawned, _eps) = studio574_orch_windowed(
+        &["todo", "in progress"],
+        summon_at + chrono::Duration::seconds(8),
+    );
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        entries.is_empty(),
+        "a summons created while the ticket's own author run was live must not re-dispatch the \
+         author, got {:?}",
+        entries
+            .iter()
+            .map(|e| &e.issue.identifier)
+            .collect::<Vec<_>>()
+    );
+}
+
+// The other half of the STUDIO-1045 rule, so the test above cannot pass by simply never opening the
+// ladder. The SAME comment and GH source, with the author run's window ending seven hours BEFORE it
+// (i.e. after that run handed off), still reopens the author — which is also the shape of the
+// daemon's own token-bearing review-completion comment (STUDIO-723): it is posted after the author's
+// run has ended, so the window rule leaves it working.
+#[tokio::test]
+async fn a_summons_after_the_author_run_window_still_reopens() {
+    let (mut o, spawned, _eps) = studio574_orch_windowed(
+        &["todo", "in progress"],
+        studio574_run_start() + chrono::Duration::minutes(1),
+    );
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        1,
+        "a summons after the author run's window must still re-engage the author"
+    );
+    assert_eq!(entries[0].issue.identifier, "STUDIO-569");
 }
 
 // --- STUDIO-811: the enrichment phase is bounded, rotated, and reported ------------------------
@@ -1088,7 +1167,7 @@ fn studio885_orch() -> (
     let store: Arc<dyn Store + Send + Sync> =
         Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
     // The last run ended four hours before the summons, so the summons is genuinely newer than the
-    // run start `pr_suppressed` compares it against — the suppression SHOULD lift.
+    // run's window `pr_suppressed` compares it against — the suppression SHOULD lift.
     seed_run(
         store.as_ref(),
         "iss-879",

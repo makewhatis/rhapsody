@@ -532,6 +532,64 @@ mod tests {
         );
     }
 
+    // STUDIO-1045 acceptance (the STUDIO-1002 incident, dropped-message half): the author's own
+    // token-bearing reply is routed into the LIVE run's mailbox (INF-448); opencode cannot steer a
+    // live turn (stdin is closed at start) so the runner drains it undelivered and logs `dropped=1`.
+    // When the run then ends, that undelivered self-summons must NOT re-dispatch the author: it was
+    // created inside the run's window, and the reopen ladder measures a summons against that window.
+    //
+    // MUTATION: measure the summons against the run's START (the pre-STUDIO-1045 rule) and this reds.
+    #[tokio::test]
+    async fn an_undelivered_self_summons_at_run_end_does_not_re_dispatch_the_author() {
+        let (mut o, base) = midrun_harness();
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+            eff.review_promote_state = "In Progress".to_string();
+        }
+
+        // The author's own comment lands while the run is live → the mid-run router admits it to
+        // the live run's mailbox (this is the message opencode then drops).
+        let summon = base + Duration::seconds(30);
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(summon),
+            latest_summon_body: "@rhapsody @jimmy fixed all three findings".into(),
+            ..Default::default()
+        };
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert!(
+            o.mailbox_try_recv("ID-1").is_some(),
+            "the self-summons must reach the live run's mailbox (then be dropped undelivered)"
+        );
+
+        // The run ends an hour later, with that message still undelivered (`dropped=1`).
+        o.now = Box::new(move || base + Duration::hours(1));
+        let started_at = o.running.get("ID-1").expect("running").started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "ID-1".into(),
+            failed: false,
+            started_at,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            refused: false,
+        });
+        // The reopen ladder is the unit under test; drop the dispatch's claim so
+        // `review_reopen_eligible` reaches its store half rather than being refused as "claimed".
+        o.claimed.clear();
+
+        let mut review = cand.clone();
+        review.state = "In Review".into();
+        assert!(
+            !o.review_reopen_eligible(&review, &std::collections::HashSet::new()),
+            "an undelivered self-summons created inside the run window must not re-dispatch the author"
+        );
+    }
+
     // TestDeliverToMailbox_SendsWrapsPersists: the extracted admission helper (shared by the HTTP path
     // and the mid-run summon router) sends the WRAPPED text, persists the ORIGINAL body (status sent)
     // returning its row id, and rejects on a full mailbox with no extra row.

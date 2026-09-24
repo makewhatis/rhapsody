@@ -2640,6 +2640,43 @@ owner/repo/number were written by this daemon from its own resolved repository b
 taken from room text (the review design's F-SEC rule); a tracker attachment can be written by anyone
 with tracker access. The daemon's own record is the stricter source, not the looser one.
 
+#### An author's own comment does not re-engage the author (STUDIO-1045)
+
+Every agent posts to GitHub under the operator's ONE account, so the daemon cannot tell an author's
+own PR comment from a human's by actor — see the memory `github-actor-cannot-identify-agents`. A
+summons is therefore judged by a fact the daemon *does* know: when each author run of the ticket was
+live. On [STUDIO-1002](https://linear.app/studio49/issue/STUDIO-1002) an author run was still going
+when the author posted its own reply — "Fixed all three blocking findings … **@rhapsody**" — and an
+opencode run cannot take a message mid-turn, so the daemon drained it undelivered (`dropped=1`) and
+the run ended. The summons was then newer than the run's *start*, so the reopen ladder fired a fresh
+author run whose only input was the author's own "I fixed it", racing the review it had just asked
+for.
+
+A summon-token comment created **inside** the ticket's own author-run window — at or after the run's
+start and at or before its end, i.e. while the run was live or before it handed off — is not a
+summons and does not reopen or re-dispatch the author. Both `pr_suppressed` and
+`review_reopen_eligible` now measure a summons against the last run's **END** rather than its start.
+
+| A summons on a ticket the daemon has worked | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| boundary it must beat | the last run's **start** | the last run's **end** (its live window) |
+| a comment created while that run was live | re-engages the author | **ignored** (logged once at `info`) |
+| a comment created after the run ended/handed off | re-engages the author | re-engages the author (unchanged) |
+| the daemon's own review-completion comment (STUDIO-723) | — | re-engages the author (it lands after the author's run) |
+
+**What still summons.** A genuine operator comment posted while no author run is live is after every
+window and reopens exactly as before; the daemon's own token-bearing review-completion comment is
+posted after the author's run has ended, so it is untouched; and a ticket nobody has ever worked
+still has no window and is never grabbed. A mid-run comment is delivered to the live run's mailbox
+as before (INF-448) — that route is unchanged — it simply no longer *also* arms a second run once
+the first ends. The suppression is not weakened the other way either: a merged or in-review ticket
+with an old summons stays suppressed, and dispatching the ticket advances its window past the
+summons.
+
+**Off is still off.** With `storage.path: off` there is no run history to read, so `last_run_window`
+is `None` and the pre-INF-448 PR-activity fallback applies — byte-identical to a daemon built before
+this change, and the reason the fallback was kept rather than removed.
+
 ### A second agent backend — `opencode` (STUDIO-902)
 
 The frozen reference runs exactly one coding-agent backend. Rhapsody now ships two: `claude` and

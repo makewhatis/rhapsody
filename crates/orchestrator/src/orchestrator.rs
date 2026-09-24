@@ -917,6 +917,11 @@ pub struct Orchestrator {
     /// as [`Self::gh_enrich_cursor`] is, and control-task-owned for the same reason: it is NOT a
     /// sixth off-loop seam.
     pub(crate) summon_drops: crate::ghenrich::SummonDropLog,
+    /// Which "a summon-token comment was created inside this ticket's own author-run window, so it
+    /// is not a summons" notices have already been logged (STUDIO-1045). Interior-mutable for the
+    /// `&self` predicates exactly as [`Self::summon_drops`] is, and control-task-owned for the same
+    /// reason: it is NOT an off-loop seam.
+    pub(crate) ignored_author_summons: crate::dispatch::IgnoredSummonLog,
     /// The effective `storage.retention_days` mirrored as an atomic so the daemon's prune scheduler
     /// (P6) reads it without racing the control task's reload (default 30 until the first reload).
     /// Mirrors Go `retentionDays`.
@@ -1136,6 +1141,7 @@ impl Orchestrator {
             gh_source: None,
             gh_enrich_cursor: AtomicUsize::new(0),
             summon_drops: crate::ghenrich::SummonDropLog::default(),
+            ignored_author_summons: crate::dispatch::IgnoredSummonLog::default(),
             retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
             pr_state_interval_ms: Arc::new(AtomicI64::new(
                 rhapsody_config::model::DEFAULT_PR_STATE_INTERVAL_MS,

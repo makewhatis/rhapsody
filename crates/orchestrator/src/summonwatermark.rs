@@ -22,13 +22,14 @@
 //! Remember the newest summons ever OBSERVED for a ticket, in the store
 //! ([`rhapsody_store::SummonWatermark`]), and put it back on the candidate when the live
 //! enrichment cannot see it any more. The comparison `pr_suppressed` actually makes is then
-//! between two durable facts — the summons and the ticket's last run START — so it keeps its
-//! meaning however long the ticket waits for a slot.
+//! between two durable facts — the summons and the ticket's last author-run window (its END, since
+//! STUDIO-1045) — so it keeps its meaning however long the ticket waits for a slot.
 //!
-//! The suppression rule itself is untouched, which is the point. A ticket does NOT become
+//! The suppression rule itself is otherwise untouched, which is the point. A ticket does NOT become
 //! permanently dispatchable because it was summoned once: the watermark only ever lifts the
-//! suppression while it is newer than the last run start, and dispatching the ticket advances that
-//! start past it. A merged pull request with an old summons stays suppressed exactly as before.
+//! suppression while it is newer than the last author run's window, and dispatching the ticket
+//! advances that window past it. A merged pull request with an old summons stays suppressed exactly
+//! as before.
 //!
 //! Widening the lookback instead was rejected: it converts "stranded after five minutes of
 //! contention" into "stranded after N minutes of contention" and closes nothing.
@@ -122,7 +123,7 @@ impl Orchestrator {
 
     /// Puts a remembered summons back on a candidate whose live view has lost it (or never had
     /// it). An unparseable stored timestamp leaves the candidate untouched — the same tolerance
-    /// `last_run_started_at` applies to a stored run start it cannot read.
+    /// `last_run_window` applies to a stored run start it cannot read.
     fn restore_summon(&self, iss: &mut Issue, w: SummonWatermark) {
         let Ok(at) = DateTime::parse_from_rfc3339(&w.at) else {
             tracing::warn!(
