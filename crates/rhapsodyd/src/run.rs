@@ -128,6 +128,15 @@ where
         return crate::teams::run_teams(&args[1..], std::io::stdout(), stderr.make_writer());
     }
 
+    // `rhapsodyd doctor [WORKFLOW.md]` prints migration diagnostics (legacy config warnings, the
+    // resolved provider registry and its non-secret canonical bindings, and the managed-OpenCode
+    // compatibility table) instead of running the daemon (STUDIO-994, provider-auth P13). Dispatched
+    // here for the same reason `mcp`/`teams` are, and READ-ONLY: it never rewrites the workflow
+    // (design §7). Rhapsody-only — Go v0.4.0 has no provider registry and therefore no counterpart.
+    if args.first().map(String::as_str) == Some("doctor") {
+        return crate::doctor::run_doctor(&args[1..], std::io::stdout(), stderr.make_writer());
+    }
+
     let flags = match parse_flags(args) {
         Ok(f) => f,
         Err(msg) => {
@@ -3890,6 +3899,22 @@ mod tests {
         assert!(
             buf.contents().contains("symphony teams:"),
             "stderr = {:?}, want the teams dispatch marker",
+            buf.contents()
+        );
+    }
+
+    // STUDIO-994 (provider-auth P13): `rhapsodyd doctor …` is dispatched at the very top of `run`,
+    // beside `mcp`/`teams`, so it never reaches flag parsing or the run-lock. A bad flag is the
+    // cheapest proof the branch was taken: it exits non-zero with the `symphony doctor:` marker
+    // rather than treating "doctor" as a workflow path. Rhapsody-only (no Go counterpart).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_dispatches_to_doctor() {
+        let buf = SharedBuf::new();
+        let code = run_now(&["doctor", "--bogus"], &buf).await;
+        assert_ne!(code, 0, "expected non-zero exit for a bad doctor flag");
+        assert!(
+            buf.contents().contains("symphony doctor:"),
+            "stderr = {:?}, want the doctor dispatch marker",
             buf.contents()
         );
     }
