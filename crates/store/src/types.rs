@@ -685,6 +685,32 @@ pub struct ManagerExchange {
     pub state: String,
 }
 
+/// One host-served evidence read (STUDIO-1014; design record `manager-agent-design.md` §5.5).
+/// No Go counterpart.
+///
+/// The host records every diff and interdiff it served a manager run, per run id, so M3's §6.4
+/// condition 3 can verify the run was **given** the covering diffs. It cannot verify the model read
+/// them, and says so. The log is append-only: a run served the same comparison twice has two rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EvidenceAccess {
+    /// The manager run the read was served to.
+    pub run_id: i64,
+    /// [`EVIDENCE_ACCESS_DIFF`] or [`EVIDENCE_ACCESS_INTERDIFF`].
+    pub kind: String,
+    /// The `from` revision of the served comparison.
+    pub from_sha: String,
+    /// The `to` revision (the current head at serve time).
+    pub to_sha: String,
+    /// RFC3339 timestamp of the serve.
+    pub recorded_at: String,
+}
+
+/// The `manager_diff {from, to}` evidence kind (§5.5): `from` is an ancestor of head.
+pub const EVIDENCE_ACCESS_DIFF: &str = "diff";
+/// The `manager_interdiff {from, to}` evidence kind (§5.5): `from` is NOT an ancestor of head (a
+/// rebase or force-push); the comparison is between the two PR patches.
+pub const EVIDENCE_ACCESS_INTERDIFF: &str = "interdiff";
+
 /// One completed review round's outcome, recorded against a watch row (STUDIO-1009; design record
 /// `manager-agent-design.md` §5.4). No Go counterpart.
 ///

@@ -333,6 +333,15 @@ impl Store for Noop {
     fn invalidate_manager_exchanges(&self, _pr: &str) -> Result<(), StoreError> {
         Ok(())
     }
+    // STUDIO-1014: with persistence off the host has nowhere to record what it served, so M3's §6.4
+    // condition 3 finds no evidence coverage — the fail-closed direction, and why `review_authority`
+    // other than `off` requires durable storage.
+    fn record_evidence_access(&self, _access: EvidenceAccess) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn evidence_accesses(&self, _run_id: i64) -> Result<Vec<EvidenceAccess>, StoreError> {
+        Ok(Vec::new())
+    }
     fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())
     }
@@ -530,6 +539,18 @@ mod tests {
                 .expect("provider_day_tokens"),
             0
         );
+
+        // Evidence-access log (STUDIO-1014, §5.5): the disabled store records nothing and reads
+        // empty, so §6.4 condition 3 never finds coverage — fail-closed, never an error.
+        st.record_evidence_access(EvidenceAccess {
+            run_id: 1,
+            kind: EVIDENCE_ACCESS_DIFF.into(),
+            from_sha: "a".into(),
+            to_sha: "b".into(),
+            recorded_at: "2026-09-23T00:00:00Z".into(),
+        })
+        .expect("record_evidence_access");
+        assert!(st.evidence_accesses(1).expect("evidence_accesses").is_empty());
 
         st.prune(30).expect("prune");
         st.close().expect("close");

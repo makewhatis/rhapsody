@@ -547,6 +547,16 @@ pub trait Store {
     /// Idempotent.
     fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError>;
 
+    // --- evidence-access log (STUDIO-1014, §5.5; no Go counterpart — see [`EvidenceAccess`]) ---
+
+    /// Appends one host-served evidence read (a diff or interdiff served to a manager run). The
+    /// log is append-only; the caller records each serve. A no-op store keeps none, so M3's §6.4
+    /// condition 3 never finds coverage under `storage.path: off` — the fail-closed direction.
+    fn record_evidence_access(&self, access: EvidenceAccess) -> Result<(), StoreError>;
+
+    /// Every evidence read recorded for `run_id`, oldest first.
+    fn evidence_accesses(&self, run_id: i64) -> Result<Vec<EvidenceAccess>, StoreError>;
+
     // --- durable terminal-move ledger (STUDIO-1007; no Go counterpart — see [`ReviewDoneRow`]) ---
 
     /// Records `row` as a terminal-state move owed to `row.identifier`'s merged pull request, or
