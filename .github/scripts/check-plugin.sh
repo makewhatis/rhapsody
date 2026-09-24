@@ -89,6 +89,23 @@ PY
     echo "ok: plugin '$name' -> $dir ($found skill(s)), manifests agree at v$version"
 done <<< "$SOURCES"
 
+# --- 2b. both shipped Teams skills document the three selection lifecycles (STUDIO-993) -------
+# A plugin version bump ships documentation, so the doc is part of the deliverable. A skill that
+# describes provider/harness/model selection but NOT when each source takes effect is exactly the
+# release defect P12 names ("a partial docs copy is a release defect"). Both Teams skills must carry
+# all three markers, so changing one without the other — or bumping the version without the
+# behaviour documentation — fails here. check-plugin_test.sh proves this reds by stripping a marker
+# from one copy.
+LIFECYCLE_MARKERS=("boot-loaded" "hot-reload" "resolved from disk at dispatch")
+for skill in plugin/skills/rhapsody-teams/SKILL.md plugin/skills/rhapsody-team-setup/SKILL.md; do
+    [ -f "$skill" ] || fail "$skill is missing (STUDIO-993 expects both shipped Teams skills)"
+    for marker in "${LIFECYCLE_MARKERS[@]}"; do
+        grep -qF -- "$marker" "$skill" \
+            || fail "$skill must document the boot/hot-reload/dispatch selection lifecycles (STUDIO-993): missing '$marker'"
+    done
+done
+echo "ok: both shipped Teams skills document the boot/hot-reload/dispatch selection lifecycles"
+
 # --- 3. nothing machine-local or private leaks into a public, installable artefact ------------
 # Each entry is "<what it is>|<extended regex>", matched case-INSENSITIVELY, because the forms these
 # strings actually travel in are not the ones a human writing a checklist would think of first: the

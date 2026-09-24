@@ -139,6 +139,32 @@ reds "a private tailnet hostname" "HTTPS://SOME-HOST.TS.NET"
 green "a bare ticket id" "Fixes STUDIO-491, and see STUDIO-867."
 green "an ordinary sentence" "Teams route work by label; the room is read back into future prompts."
 
+# --- both shipped Teams skills must document the selection lifecycles (STUDIO-993) ----------------
+# Stripping one marker from ONE skill copy must red the check: this is the "partial docs copy" defect
+# the ticket calls a release defect. The copy is restored before the next case runs.
+lifecycle_rel="plugin/skills/rhapsody-team-setup/SKILL.md"
+if [ ! -f "$work/$lifecycle_rel" ]; then
+    echo "FAIL - expected $lifecycle_rel in the copied tree"
+    fail=1
+else
+    set +e
+    python3 - "$work/$lifecycle_rel" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("hot-reload", "HOT-RELOAD")
+open(p, "w").write(s)
+PY
+    run_check
+    cp "$root/$lifecycle_rel" "$work/$lifecycle_rel"
+    set -e
+    if [ "$status" -eq 0 ] || ! grep -qF -- "boot/hot-reload/dispatch selection lifecycles" <<<"$out"; then
+        echo "FAIL - stripping a lifecycle marker from one skill must red the check: exit $status, $out"
+        fail=1
+    else
+        echo "ok   - reds when one shipped skill drops a lifecycle marker"
+    fi
+fi
+
 # --- `.claude-plugin/` is scanned too, not just the plugin source dirs ------------------------------
 # The marketplace manifest is shipped and installable; a leak in its description is as public as one
 # in a skill. Injected through the JSON so the manifest stays parseable and only the scan can red.

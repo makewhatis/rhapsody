@@ -93,13 +93,15 @@ wrap (never operator authority); to a sleeping one it waits in the room.
 ## Which CLI a teammate runs on
 
 A profile's **`harness:`** front-matter field picks the coding-agent backend that teammate's runs
-use — `claude` or `opencode` today (`codex` is a recognized name with no runner yet and falls back
-to the configured backend, with a warning). Empty — the shipped default for every built-in profile
-— inherits the daemon's configured `agent.backend`, so an installation that never writes `harness:`
-anywhere is unaffected. `rhapsodyd teams show <name>` renders the resolved value with its origin,
-and marks it when this build can't actually run it. (If you point a profile at `opencode`, set
-`opencode.command` to an **absolute path**: a bare `opencode` can resolve to a broken npm-global
-install ahead of a working one on `PATH`, exiting 1 without running anything.)
+use — `claude` or `opencode` today (`codex` is a recognized name this build has no runner for, and a
+run that resolves to it is **refused**, not silently rerun on `agent.backend`). Empty — the shipped
+default for every built-in profile — inherits the daemon's configured `agent.backend`, so an
+installation that never writes `harness:` anywhere is unaffected. A harness this build cannot run is
+refused, and a provider reference the config does not define is refused with it — never a fallback.
+`rhapsodyd teams show <name>` renders the resolved value with its origin, and marks it when this
+build can't actually run it. (If you point a profile at `opencode`, set `opencode.command` to an
+**absolute path**: a bare `opencode` can resolve to a broken npm-global install ahead of a working
+one on `PATH`, exiting 1 without running anything.)
 
 ⚠️ **A model name is meaningless without its harness.** `claude-opus-5` is a Claude model name;
 handed to an opencode teammate it reaches that provider as an unrecognized model, and the run fails
@@ -120,6 +122,38 @@ The **manager** carries its own tuple (`manager.harness` / `manager.provider` / 
 and never borrows a teammate's. An absent `manager.harness` means `claude` (independent of
 `agent.backend`), and an explicit non-Claude manager harness must name both its provider and its
 model.
+
+## Where the harness/provider/model comes from — and when an edit takes effect
+
+Three sources feed one teammate's `harness`/`provider`/`model`, and they resolve **field-wise** (each
+field walks the chain on its own, so a ticket that names only a model still inherits its harness and
+provider from below). Highest wins:
+
+```
+ticket labels → review override (review runs) → profile → roster identity → project → global agent.*
+```
+
+A roster identity may therefore override its profile with its own `harness:`, `provider:`, `model:`
+and `effort:`. An unset field inherits the next tier; an **invalid** one (unknown/non-canonical
+provider, provider on `claude`, missing model for an explicit provider) refuses that RUN — it never
+degrades the whole Teams feature to disabled, and it never falls back to another provider, harness,
+model, or auth source. **`rhapsodyd teams show <name>`** prints the effective harness/provider/model
+and the **origin tier** each field came from, plus the manager's own tuple, so you never have to
+reconstruct the chain by hand.
+
+The three sources take effect at **different times** — do not tell an operator all three need a
+restart:
+
+- **`teams.yaml`** (the roster, each identity's routing fields, the manager tuple, the review
+  overrides) is **boot-loaded**: read once at daemon start, no watcher. An edit costs a restart.
+- **`WORKFLOW.md`'s `providers:`** definitions **hot-reload** with the workflow. A definition
+  change moves a stored credential's status to refreshing, then to `binding_mismatch` when its
+  endpoint no longer matches — no dispatch and no restart needed.
+- **Profile files** (`~/.rhapsody/teams/profiles/*.md`) are **resolved from disk at dispatch**, so a
+  profile edit needs no restart at all.
+
+Credential mutations (Connect, Replace, Rebind, Remove) are the one thing the embedded browser
+dashboard cannot do: they write to the system credential store and are owned by the desktop app.
 
 ## The room
 

@@ -102,12 +102,12 @@ Optional front matter, all inherited from the built-in when omitted: `model`, `e
 but does not yet gate anything — do not rely on it to restrict a teammate.)
 
 - **`harness`** — which coding-agent backend this teammate's runs use: `claude` or `opencode`
-  today (`codex` is a recognized name with no runner yet, and falls back to the configured backend
-  with a warning rather than failing the run). Empty is the shipped default for every built-in and
-  means **inherit the daemon's configured `agent.backend`** — the same absent-means-inherit rule
-  `model`/`effort` already follow, *not* a fork the way an absent `extends:` is. `rhapsodyd teams
-  show <name>` renders the resolved value with its origin, and marks it when this build can't
-  actually run it.
+  today (`codex` is a recognized name this build has no runner for, and a run that resolves to it is
+  **refused** — it does not silently rerun on the configured backend). Empty is the shipped default
+  for every built-in and means **inherit the daemon's configured `agent.backend`** — the same
+  absent-means-inherit rule `model`/`effort` already follow, *not* a fork the way an absent
+  `extends:` is. `rhapsodyd teams show <name>` renders the resolved value with its origin, and marks
+  it when this build can't actually run it.
 
 - **`provider`** — the canonical id of a provider declared in `WORKFLOW.md`'s `providers:` block,
   selected for this teammate's runs (empty ⇒ inherit the daemon's configured selection). It is a
@@ -119,6 +119,13 @@ The same `harness`/`provider`/`model`/`effort` fields may also be set directly o
 identity**, overriding whatever the profile names; and the `manager:` block has its own tuple
 (`manager.harness`/`manager.provider`/`manager.model`) that never borrows a teammate's — an absent
 `manager.harness` means `claude`.
+
+**When each source takes effect — don't tell anyone all three need a restart.** `teams.yaml`
+(roster, identity routing fields, manager tuple, review overrides) is **boot-loaded**: it is read
+once at daemon start, so an edit costs a restart. `WORKFLOW.md`'s `providers:` definitions
+**hot-reload** with the workflow. Profile files are **resolved from disk at dispatch**, so editing a
+profile body needs no restart — just the next run. `rhapsodyd teams show <name>` prints the resolved
+harness/provider/model and the origin tier each field came from, plus the manager's tuple.
 
 ⚠️ **A model name means nothing without its harness.** Setting `model: claude-opus-5` on a profile
 that also sets `harness: opencode` hands that CLI a Claude model name — the provider rejects it

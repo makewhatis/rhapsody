@@ -47,6 +47,48 @@ export function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// --- provider/model selection lifecycle (STUDIO-993, P12) ---
+
+// One source of a teammate's harness/provider/model selection: what it is, and when an edit to it
+// takes effect. Exported as data rather than baked into markup so both Teams editors — the Podium
+// Settings tab and the console's ManageTeamView — render the SAME three lifecycles, and a test can
+// pin them without reading rendered DOM.
+export interface SelectionLifecycle {
+  source: string;
+  when: string;
+  detail: string;
+}
+
+// The three sources resolve at DIFFERENT times, and the recurring operator mistake P12 exists to
+// prevent is assuming all of Teams needs a restart. Only the boot-loaded file does.
+export const SELECTION_LIFECYCLES: SelectionLifecycle[] = [
+  {
+    source: "teams.yaml",
+    when: "boot-loaded — read once at daemon start",
+    detail:
+      "The roster, each identity's routing fields, the manager tuple and the review overrides are read once at daemon start. There is no watcher, so an edit here costs a restart.",
+  },
+  {
+    source: "WORKFLOW.md `providers:`",
+    when: "hot-reloads",
+    detail:
+      "Provider definitions reload with the workflow. A definition change immediately moves a stored credential's status to refreshing, then to binding mismatch when its endpoint no longer matches — no dispatch and no restart required.",
+  },
+  {
+    source: "teams/profiles/*.md",
+    when: "resolved at dispatch",
+    detail:
+      "A teammate's profile is read from disk when a run is dispatched, so a profile edit needs no restart. Run `rhapsodyd teams show <name>` to print the resolved harness/provider/model and the origin tier each field came from.",
+  },
+];
+
+// Why the credential lifecycle is separate: the browser dashboard can show provider status and
+// manual provider/model selection, but a credential mutation (Connect/Replace/Rebind/Remove) is a
+// Keychain write that only the desktop app owns. An embedded dashboard without that bridge must say
+// so rather than imply its controls could change a stored key.
+export const CREDENTIAL_MUTATION_NOTE =
+  "Connect, Replace, Rebind and Remove write to the system credential store and are available only in the desktop app. Here in the browser you can see each provider's status and choose the global provider/model, but you cannot change a stored credential.";
+
 // --- the enable flow's editor ---
 //
 // STUDIO-667 widened this from the STUDIO-652 v1 cut (enable, roster, manager mode, memory backend)
