@@ -246,6 +246,13 @@ pub enum DivergenceKind {
     /// durable owed-move row the merge itself wrote, which is why this report appears on the first
     /// sweep after the merge and survives a restart.
     MergedTicketNotTerminal,
+    /// The manager OWNS this pull request's stall but its launch is refused by a §10.2 gate — a
+    /// drain, the provider budget, the credential preflight — or the §4.7 CLI self-test has not
+    /// passed (STUDIO-1015, §10.2). The stall must NOT be swallowed by the manager hand-off: a
+    /// deferral is visible straight away and counts as "needs you" after 30 minutes, so the row
+    /// stays on the human feed with the manager's own words. `Divergence.reason` carries the exact
+    /// feed text (`manager deferred: drain`, `manager unavailable: CLI contract`, …).
+    ManagerDeferred,
 }
 
 impl DivergenceKind {
@@ -262,6 +269,7 @@ impl DivergenceKind {
             DivergenceKind::ReviewEscalated => "review_escalated",
             DivergenceKind::ReviewShipped => "review_shipped",
             DivergenceKind::MergedTicketNotTerminal => "merged_ticket_not_terminal",
+            DivergenceKind::ManagerDeferred => "manager_deferred",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -301,6 +309,10 @@ impl DivergenceKind {
             DivergenceKind::MergedTicketNotTerminal => {
                 "the pull request merged but the ticket is still not in its terminal state, so the \
                  auto-Done move is still owed and every dependent of the ticket is blocked by it"
+            }
+            DivergenceKind::ManagerDeferred => {
+                "the manager adopted this stall but its launch is deferred or the manager is \
+                 unavailable; see the reason"
             }
         }
     }
@@ -1115,15 +1127,32 @@ impl Orchestrator {
         // contract requires: no `gh`, no tracker, local only.
         found.extend(done);
         // STUDIO-1015: when the manager acts, the stall signals it owns go to the manager INSTEAD
-        // OF the human feed. Routing only enqueues an intervention — this sweep still acts on
-        // nothing (§7.2) — and the signal is dropped from the report only once the manager has
-        // adopted it. `off` is byte-identical: nothing is routed and nothing is dropped.
-        let adopted = self.route_stalls_to_manager(&found);
-        if !adopted.is_empty() {
+        // OF the human feed — but only once the manager has ADOPTED them. A stall whose launch a
+        // §10.2 gate defers, or whose manager is unavailable, must not be swallowed: it stays on the
+        // human feed wearing the manager's own wording (§10.2). `off` is byte-identical: nothing is
+        // routed and nothing is dropped.
+        let routing = self.route_stalls_to_manager(&found);
+        if !routing.adopted.is_empty() {
             found.retain(|d| {
                 let manager_owned = crate::managerintervention::stall_kind_for(d.kind).is_some();
-                !(manager_owned && adopted.iter().any(|k| k == &d.pr.to_ascii_lowercase()))
+                !(manager_owned
+                    && routing
+                        .adopted
+                        .iter()
+                        .any(|k| k == &d.pr.to_ascii_lowercase()))
             });
+        }
+        // The not-adopted manager stalls keep their row but carry the reason, and a distinct kind so
+        // the console renders the manager's sentence rather than the generic stall detail.
+        for d in found.iter_mut() {
+            if crate::managerintervention::stall_kind_for(d.kind).is_none() {
+                continue;
+            }
+            let pr = d.pr.to_ascii_lowercase();
+            if let Some((_, reason)) = routing.surfaced.iter().find(|(k, _)| k == &pr) {
+                d.kind = DivergenceKind::ManagerDeferred;
+                d.reason = reason.clone();
+            }
         }
         self.set_review_divergences(found);
     }
@@ -1481,6 +1510,24 @@ impl Orchestrator {
                          sweep only reports, so it needs a human.",
                         d.pr,
                         d.kind.detail()
+                    );
+                    continue;
+                }
+                // STUDIO-1015 §10.2: the manager adopted this stall but its launch is refused — a
+                // drain, provider budget, failed credentials or the CLI self-test. The manager's own
+                // wording is the news, so the line names it instead of the generic copy.
+                if d.kind == DivergenceKind::ManagerDeferred {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        reason = %d.reason,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. {}",
+                        d.pr,
+                        d.kind.detail(),
+                        d.reason
                     );
                     continue;
                 }
@@ -2387,7 +2434,7 @@ mod tests {
 mod store_tests {
     use std::sync::Arc;
 
-    use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
+    use rhapsody_config::teams::{Identity, Review, ReviewAuthority, ReviewMode, Teams};
     use rhapsody_store::{
         REVIEW_STATUS_REVIEWED, ReviewWatchKey, ReviewWatchRow, RunEnd, RunStart, Sqlite, StorePath,
     };
@@ -3325,6 +3372,47 @@ mod store_tests {
         assert_eq!(
             rendered["review_divergence"][0]["kind"],
             "round_budget_exhausted"
+        );
+    }
+
+    /// STUDIO-1015 (§10.2): when the manager adopts a stall but a gate defers the launch, the stall
+    /// must NOT vanish from the human feed — it stays, re-kinded `manager_deferred`, carrying the
+    /// manager's own wording on BOTH surfaces. MUTATION: adopt (drop) the signal while the gate
+    /// refuses and the divergence disappears.
+    #[test]
+    fn a_deferred_manager_stall_is_surfaced_on_both_surfaces() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        o.teams.as_mut().expect("teams").manager.review_authority = ReviewAuthority::Act;
+        reviewed_row(o, "alice", "STUDIO-170");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T21:10:00Z",
+            "2026-09-14T21:19:00Z",
+        );
+        // The loop has spent its whole shared budget, so the budget rule fires.
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 164)),
+            crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP,
+        );
+        // A drain is armed, so the manager launch defers.
+        o.drain.arm(
+            t("2026-09-14T21:20:00Z"),
+            crate::drain::DrainReason::Operator,
+        );
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "the stall stays on the feed, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::ManagerDeferred);
+        assert_eq!(found[0].reason, "manager deferred: drain");
+        // Surface two: /api/v1/state carries the manager's sentence.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(rendered["review_divergence"][0]["kind"], "manager_deferred");
+        assert_eq!(
+            rendered["review_divergence"][0]["reason"],
+            "manager deferred: drain"
         );
     }
 

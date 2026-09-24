@@ -260,6 +260,10 @@ impl Orchestrator {
         self.persist_end_run(re, outcome, reason);
         self.persist_complete(&re.issue.identifier);
         self.persist_totals();
+        // M8: settle the intervention the run belonged to (§7.2). The run has ended, so the
+        // intervention must not stay `running` until its lease expires — a clean exit with a valid
+        // decision becomes `decided`/`validated`, and anything else a `failed_attempt`.
+        self.settle_manager_intervention(&re.issue.id, e);
     }
 }
 
@@ -565,6 +569,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert!(!o.running.contains_key(key));

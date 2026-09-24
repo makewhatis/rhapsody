@@ -2591,6 +2591,31 @@ mod tests {
         ) -> Result<(), rhapsody_store::StoreError> {
             self.0.set_manager_intervention_phase_hint(id, phase_hint)
         }
+        fn mark_manager_intervention_running(
+            &self,
+            id: &str,
+            run_id: Option<i64>,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.mark_manager_intervention_running(id, run_id)
+        }
+        fn record_manager_decision(
+            &self,
+            id: &str,
+            decision_json: &str,
+            decision_head: &str,
+            decision_evidence_rev: i64,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0
+                .record_manager_decision(id, decision_json, decision_head, decision_evidence_rev)
+        }
+        fn stop_manager_intervention(
+            &self,
+            id: &str,
+            terminal_state: &str,
+            reason: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.stop_manager_intervention(id, terminal_state, reason)
+        }
         fn reserve_manager_run(
             &self,
             id: &str,

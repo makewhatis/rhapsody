@@ -763,6 +763,39 @@ pub trait Store {
         phase_hint: &str,
     ) -> Result<(), StoreError>;
 
+    /// Marks a dispatched intervention `running` and records its run id (§7.2 `launching` →
+    /// `running`). The lease is KEPT — a running run still holds it. Idempotent; a no-op when `id`
+    /// names no row.
+    fn mark_manager_intervention_running(
+        &self,
+        id: &str,
+        run_id: Option<i64>,
+    ) -> Result<(), StoreError>;
+
+    /// Records the decision a run produced and moves the intervention to `decided` (§7.2), clearing
+    /// the lease. `decision_json` is the extracted `rhapsody-manager-decision` block body;
+    /// `decision_head`/`decision_evidence_rev` are what revalidation binds against (§8.1). Idempotent;
+    /// a no-op when `id` names no row.
+    fn record_manager_decision(
+        &self,
+        id: &str,
+        decision_json: &str,
+        decision_head: &str,
+        decision_evidence_rev: i64,
+    ) -> Result<(), StoreError>;
+
+    /// ATOMICALLY ends `id` in a STOPPING terminal state and stops `pr`'s generation, in ONE
+    /// transaction (§7.2). The intervention moves to `terminal_state` with its lease cleared and
+    /// `rhapsody_review_bound.manager_stopped` is set to `reason`, so no crash between the two
+    /// writes can leave a terminal row with a live generation — the window that would let the next
+    /// sweep recreate the intervention. `reason` empty is a no-op. A no-op when `id` names no row.
+    fn stop_manager_intervention(
+        &self,
+        id: &str,
+        terminal_state: &str,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
     /// ATOMICALLY reserves one manager run (§7.3) — the one place model spend is charged.
     ///
     /// In ONE SQLite transaction it: refuses when `id` names no row ([`ManagerReservation::Absent`]);

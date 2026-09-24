@@ -27,14 +27,19 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rhapsody_config::teams::ReviewAuthority;
 use rhapsody_store::{
-    MANAGER_INTERVENTION_DEFERRED, MANAGER_INTERVENTION_FAILED_ATTEMPT,
-    MANAGER_INTERVENTION_LAUNCHING, MANAGER_INTERVENTION_NO_REVIEW_GAP,
-    MANAGER_INTERVENTION_QUEUED, MANAGER_INTERVENTION_RUNNING, MANAGER_INTERVENTION_STALE,
-    MANAGER_INTERVENTION_SUPERSEDED, MANAGER_MODE_ACT, MANAGER_MODE_ADVISE,
+    MANAGER_INTERVENTION_COMPLETE, MANAGER_INTERVENTION_DECIDED, MANAGER_INTERVENTION_DEFERRED,
+    MANAGER_INTERVENTION_FAILED_ATTEMPT, MANAGER_INTERVENTION_LAUNCHING,
+    MANAGER_INTERVENTION_NO_REVIEW_GAP, MANAGER_INTERVENTION_PROPOSED, MANAGER_INTERVENTION_QUEUED,
+    MANAGER_INTERVENTION_RUNNING, MANAGER_INTERVENTION_STALE, MANAGER_INTERVENTION_SUPERSEDED,
+    MANAGER_INTERVENTION_VALIDATED, MANAGER_MODE_ACT, MANAGER_MODE_ADVISE,
     MANAGER_PHASE_POST_THRESHOLD, MANAGER_PHASE_PRE_THRESHOLD, ManagerInterventionRow,
-    ManagerReservation,
+    ManagerReservation, REVIEW_FINDING_OPEN,
 };
 
+use crate::managerdecision::{
+    self, ApprovalInputs, DecisionKind, FindingRef, KnownFinding, ManagerDecision,
+    ManagerReviewRow, Revalidation, RevalidationInputs, ThresholdPhase,
+};
 use crate::managerrun::{ManagerDispatchOutcome, ManagerRun};
 use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
@@ -59,7 +64,8 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         DivergenceKind::ChangesRequestedNoRun
         | DivergenceKind::ReviewRequestedNoRun
         | DivergenceKind::ReviewTokenCeilingStopped
-        | DivergenceKind::MergedTicketNotTerminal => None,
+        | DivergenceKind::MergedTicketNotTerminal
+        | DivergenceKind::ManagerDeferred => None,
     }
 }
 
@@ -78,6 +84,16 @@ pub enum EnqueueDecision {
     Stopped,
     /// `review_authority: off` — the manager does not act and the human feed keeps the signal.
     ModeOff,
+}
+
+/// What [`Orchestrator::route_stalls_to_manager`] did with this sweep's stall signals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ManagerRouting {
+    /// Pull-request keys the manager ADOPTED: the caller drops their signals from the human feed.
+    pub adopted: Vec<String>,
+    /// Pull-request keys the manager could NOT adopt this sweep, each with the §10.2 human-feed
+    /// sentence. Their signals stay on the feed, annotated with the manager's own wording.
+    pub surfaced: Vec<(String, String)>,
 }
 
 /// The pure routing rule (§7.2). Kept separate from the store writes so the deduplication across
@@ -320,6 +336,42 @@ fn parse_pr_key(key: &str) -> Option<PrCoord> {
     Some(PrCoord::new(owner, repo, number))
 }
 
+/// The lowercased pull-request key a manager run's issue id names (`pr:owner/repo#n@manager` →
+/// `owner/repo#n`), or `None` for any other key.
+fn manager_pr_key(issue_id: &str) -> Option<String> {
+    let rest = issue_id.strip_prefix(crate::review::REVIEW_KEY_PREFIX)?;
+    let rest = rest.strip_suffix(crate::managerrun::MANAGER_KEY_SUFFIX)?;
+    let coord = parse_pr_key(rest)?;
+    Some(format!("{}/{}#{}", coord.owner, coord.repo, coord.number).to_ascii_lowercase())
+}
+
+/// Whether a manager run still owns the intervention: `launching` or `running` (§7.2).
+fn is_in_flight(state: &str) -> bool {
+    state == MANAGER_INTERVENTION_LAUNCHING || state == MANAGER_INTERVENTION_RUNNING
+}
+
+/// The pull request's current patch-id as the eligibility predicates need it, from the live rows'
+/// recorded completions: the shared non-empty patch id when every completed row agrees, else empty.
+/// Empty never matches a stored completion (fail closed in `completion_approved_at_current_patch`),
+/// which is the cautious direction for a process with no `gh` read on this path.
+fn current_patch_id(rows: &[ManagerReviewRow]) -> String {
+    let mut seen: Option<String> = None;
+    for r in rows {
+        let Some(c) = r.completed.as_ref() else {
+            continue;
+        };
+        if c.patch_id.is_empty() {
+            continue;
+        }
+        match &seen {
+            None => seen = Some(c.patch_id.clone()),
+            Some(p) if p == &c.patch_id => {}
+            Some(_) => return String::new(), // rows disagree: not one current patch
+        }
+    }
+    seen.unwrap_or_default()
+}
+
 impl Orchestrator {
     /// Whether the manager acts (`act` or `advise`), i.e. the sweep routes stalls to it. `off`
     /// keeps today's byte-identical human feed.
@@ -352,15 +404,17 @@ impl Orchestrator {
     }
 
     /// Hands the sweep's stall signals to the manager (§5.1, D3), and returns the pull-request keys
-    /// it ADOPTED so the caller can drop those signals from the human feed.
+    /// it ADOPTED so the caller can drop those signals from the human feed — plus the ones it could
+    /// not adopt (a deferred launch, or an unavailable manager), which STAY on the feed with the
+    /// manager's own wording (§10.2).
     ///
     /// **The sweep still acts on nothing itself.** This only enqueues or merges an intervention; a
     /// launch happens on the control tick ([`Orchestrator::pump_manager_interventions`]). A signal
     /// for a PR whose generation is stopped is deliberately NOT adopted — the stop is a visible
     /// human-feed fact, not something to swallow.
-    pub(crate) fn route_stalls_to_manager(&self, found: &[Divergence]) -> Vec<String> {
+    pub(crate) fn route_stalls_to_manager(&self, found: &[Divergence]) -> ManagerRouting {
         if !self.manager_routing_enabled() {
-            return Vec::new();
+            return ManagerRouting::default();
         }
         let now = (self.now)().to_rfc3339_opts(SecondsFormat::Secs, true);
         let mode = self.manager_mode_token();
@@ -383,7 +437,7 @@ impl Orchestrator {
             }
         }
 
-        let mut adopted = Vec::new();
+        let mut routing = ManagerRouting::default();
         for pr in order {
             let kinds = by_pr.remove(&pr).unwrap_or_default();
             let stopped = self
@@ -393,21 +447,40 @@ impl Orchestrator {
                 .flatten()
                 .is_some_and(|b| b.is_stopped());
             let active = self.store().active_manager_intervention(&pr).ok().flatten();
-            match plan_enqueue(active.as_ref(), stopped, &kinds) {
+            // A not-yet-launched intervention (queued/deferred) whose launch a §10.2 gate refuses
+            // stays on the human feed with the manager's wording; a launched one is the manager's.
+            let pre_launch = active.as_ref().is_none_or(|r| {
+                r.state == MANAGER_INTERVENTION_QUEUED || r.state == MANAGER_INTERVENTION_DEFERRED
+            });
+            let surface = if pre_launch {
+                self.manager_surface_reason(self.manager_gate_env(&pr))
+            } else {
+                None
+            };
+            let decision = plan_enqueue(active.as_ref(), stopped, &kinds);
+            match decision {
                 EnqueueDecision::Stopped => {
                     // The generation is stopped; the signal stays on the human feed.
                     tracing::warn!(pr = %pr, "manager: the generation is stopped; no intervention");
                 }
                 EnqueueDecision::ModeOff => {}
                 EnqueueDecision::Drop => {
-                    adopted.push(pr);
+                    if let Some(reason) = surface {
+                        routing.surfaced.push((pr, reason));
+                    } else {
+                        routing.adopted.push(pr);
+                    }
                 }
                 EnqueueDecision::Merge { id, add } => {
                     if let Err(e) = self.store().merge_manager_stall_kinds(&id, &add) {
                         tracing::warn!(pr = %pr, id = %id, err = %e,
                             "manager: merging stall kinds into the intervention failed");
                     }
-                    adopted.push(pr);
+                    if let Some(reason) = surface {
+                        routing.surfaced.push((pr, reason));
+                    } else {
+                        routing.adopted.push(pr);
+                    }
                 }
                 EnqueueDecision::Create { kinds } => {
                     // Establish the generation row first: the intervention's budgets live on it, and
@@ -435,7 +508,11 @@ impl Orchestrator {
                     match self.store().save_manager_intervention(row) {
                         Ok(()) => {
                             tracing::info!(pr = %pr, "manager: intervention enqueued");
-                            adopted.push(pr);
+                            if let Some(reason) = surface {
+                                routing.surfaced.push((pr, reason));
+                            } else {
+                                routing.adopted.push(pr);
+                            }
                         }
                         Err(e) => {
                             // A constraint failure means another writer created the active row
@@ -447,7 +524,18 @@ impl Orchestrator {
                 }
             }
         }
-        adopted
+        routing
+    }
+
+    /// The §10.2 human-feed sentence for a pull request whose manager launch is refused by a
+    /// deferral (drain/budget/credentials) or by the §4.7 CLI self-test, or `None` when the launch
+    /// is not refused by one of those gates.
+    fn manager_surface_reason(&self, env: LaunchGateEnv) -> Option<String> {
+        match evaluate_launch_gates(env) {
+            LaunchGate::Deferred(reason) => Some(reason.human().to_string()),
+            LaunchGate::Unavailable => Some("manager unavailable: CLI contract".to_string()),
+            _ => None,
+        }
     }
 
     /// The control tick's manager pass: recover dead leases, then try to launch every candidate
@@ -459,6 +547,12 @@ impl Orchestrator {
         }
         let now_dt = (self.now)();
         let now = now_dt.to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        // §7.5 recovery: a `decided`/`validated` row re-runs its validation WITHOUT the model, using
+        // M3. Run before the candidate load so a row that revalidates to `stale` is re-queued in the
+        // same tick, and before the lease sweep so the ordering matches the design (both are pure
+        // control-task work).
+        self.revalidate_saved_manager_decisions();
 
         // §7.5 recovery: any `launching`/`running` lease from another boot, or one that has
         // expired, becomes a `failed_attempt`. Fail CLOSED on a store read error — nothing is
@@ -531,30 +625,30 @@ impl Orchestrator {
                 LaunchGate::Proceed => {}
             }
 
-            let Some(mut run) = self.manager_run_for(&row.pr) else {
+            let Some(run) = self.manager_run_for(&row.pr) else {
                 tracing::warn!(pr = %row.pr,
                     "manager: no configured project owns the pull request's repo; not launched");
                 continue;
             };
-            run.case_packet = self.manager_case_packet(row).render();
+            let key = run.key();
 
             // The pre-launch classification with no model call (§7.2): an `approved_still_open`
             // stall is exactly "every live row is satisfied, and only a merge gate blocks", so no
             // manager decision can help.
             let approved_still_open = row.stall_kinds.iter().any(|k| k == "approved_still_open");
             if classifies_no_review_gap(approved_still_open, approved_still_open) {
-                if let Err(e) = self
-                    .store()
-                    .set_manager_intervention_state(&row.id, MANAGER_INTERVENTION_NO_REVIEW_GAP)
-                {
+                // ONE transaction: the intervention ends `no_review_gap` AND the generation is
+                // stopped, so a crash between the two writes can never leave a terminal row with a
+                // live generation for the next sweep to recreate (§7.2, §15.4).
+                if let Err(e) = self.store().stop_manager_intervention(
+                    &row.id,
+                    MANAGER_INTERVENTION_NO_REVIEW_GAP,
+                    "no review gap: every reviewer row is satisfied; a merge gate blocks",
+                ) {
                     tracing::warn!(pr = %row.pr, err = %e,
                         "manager: recording no_review_gap failed");
                     continue;
                 }
-                self.stop_manager_generation(
-                    &row.pr,
-                    "no review gap: every reviewer row is satisfied; a merge gate blocks",
-                );
                 tracing::warn!(pr = %row.pr,
                     "manager: no review gap; the stall goes to the human feed");
                 continue;
@@ -602,9 +696,31 @@ impl Orchestrator {
                 }
             }
 
+            // Render the packet from the row AS RESERVED: `final` is set by the reservation (§7.3),
+            // so rendering it from the pre-reservation snapshot would hand the run `final: false`
+            // on the generation's LAST allocation.
+            let mut run = run;
+            let updated = self
+                .store()
+                .manager_intervention(&row.id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| row.clone());
+            run.case_packet = self.manager_case_packet(&updated).render();
+
             match self.dispatch_manager(run) {
                 ManagerDispatchOutcome::Dispatched => {
                     slots = slots.saturating_sub(1);
+                    // §7.2: the run is live, so the intervention is `running` and still holds its
+                    // lease. `on_manager_exit` settles it from here.
+                    let run_id = self.running.get(&key).map(|re| re.run_id);
+                    if let Err(e) = self
+                        .store()
+                        .mark_manager_intervention_running(&row.id, run_id)
+                    {
+                        tracing::warn!(pr = %row.pr, err = %e,
+                            "manager: marking the intervention running failed");
+                    }
                 }
                 other => {
                     // The lease is written and charged already; a refused dispatch leaves the
@@ -750,15 +866,405 @@ impl Orchestrator {
         }
     }
 
-    /// Stops `pr`'s generation and logs the reason (§7.2). A no-op with an empty reason.
-    pub(crate) fn stop_manager_generation(&self, pr: &str, reason: &str) {
-        if reason.is_empty() {
+    // --- the run's exit: parse the decision, settle the state machine (§7.2, §8.2) --------------
+
+    /// The exit path of a manager run (§7.2, §7.5). A run that produced a valid
+    /// `rhapsody-manager-decision` block moves the intervention `decided` (storing the decision),
+    /// then revalidates it WITHOUT the model via M3 and advances to `validated`, `stale`,
+    /// `superseded` or `complete` (`proposed` in `advise`). Anything else — a failed run, no block,
+    /// an invalid block, a refused final decision — is a `failed_attempt`, which the pump re-queues
+    /// while the budgets allow. Called after [`Orchestrator::on_manager_exit`]'s run bookkeeping.
+    pub(crate) fn settle_manager_intervention(
+        &mut self,
+        issue_id: &str,
+        e: &crate::retry::EvWorkerExit,
+    ) {
+        if !self.manager_routing_enabled() {
             return;
         }
-        if let Err(e) = self.store().stop_manager_generation(pr, reason) {
-            tracing::warn!(pr = %pr, err = %e, "manager: stopping the generation failed");
+        let Some(pr) = manager_pr_key(issue_id) else {
+            return;
+        };
+        let Some(row) = self.store().active_manager_intervention(&pr).ok().flatten() else {
+            // A clear may have superseded it while the run was in flight; nothing to settle.
+            return;
+        };
+        if !is_in_flight(&row.state) {
+            return;
+        }
+        if e.failed {
+            self.record_manager_failed_attempt(&row, "manager run failed");
+            return;
+        }
+        // A `launching`/`running` row the exit names but that produced no text is a failed attempt,
+        // exactly as a lease expiry is.
+        let Some(text) = e.manager_text.as_deref() else {
+            self.record_manager_failed_attempt(&row, "manager run produced no result text");
+            return;
+        };
+        let known = self.manager_known_findings(&pr);
+        match managerdecision::parse_decision(text, &known) {
+            Ok(decision) => self.advance_manager_decision(&row, &decision, text),
+            Err(err) => {
+                self.record_manager_failed_attempt(
+                    &row,
+                    &format!("invalid manager decision: {err:?}"),
+                );
+            }
+        }
+    }
+
+    /// Advance a PARSED decision through the deterministic checks and the `decided` state (§7.2).
+    fn advance_manager_decision(
+        &mut self,
+        row: &ManagerInterventionRow,
+        decision: &ManagerDecision,
+        text: &str,
+    ) {
+        // §7.3: a final intervention may only APPROVE (with an optional dismiss) or ESCALATE. A
+        // refusal is a failed attempt, so the run is charged but nothing is applied.
+        if let Err(err) = managerdecision::validate_final(decision, row.is_final) {
+            self.record_manager_failed_attempt(row, &format!("refused: {err:?}"));
+            return;
+        }
+        // §6.2 deterministic preconditions (a `RERUN_REVIEW` needs at least one eligible row). No
+        // model call.
+        let rows = self.manager_review_rows(&row.pr);
+        let patch_id = current_patch_id(&rows);
+        let precondition = managerdecision::PreconditionInputs {
+            eligible_rows: managerdecision::eligible_rows(&rows, row.generation, &patch_id).len(),
+        };
+        if let Err(err) = managerdecision::preconditions(decision, &precondition) {
+            self.record_manager_failed_attempt(row, &format!("refused: {err:?}"));
+            return;
+        }
+        // Store the decision and move to `decided`, clearing the lease. The stored body is the
+        // fenced block itself, so M9's activation can re-parse it.
+        let body =
+            crate::reviewfindings::fenced_blocks(text, managerdecision::MANAGER_DECISION_TAG)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+        if let Err(e) = self.store().record_manager_decision(
+            &row.id,
+            &body,
+            &decision.head,
+            decision.evidence_rev,
+        ) {
+            tracing::warn!(pr = %row.pr, err = %e, "manager: recording the decision failed");
+            return;
+        }
+        // Re-read so the state writes below name the row as stored.
+        let Some(saved) = self.store().manager_intervention(&row.id).ok().flatten() else {
+            return;
+        };
+        if saved.mode == MANAGER_MODE_ADVISE {
+            // §9: `advise` records the decision and never applies it. Terminal.
+            self.set_manager_state(&saved, MANAGER_INTERVENTION_PROPOSED);
+            return;
+        }
+        match self.revalidate_manager_decision(&saved, decision) {
+            Revalidation::StillValid => {
+                self.set_manager_state(&saved, MANAGER_INTERVENTION_VALIDATED)
+            }
+            Revalidation::Complete => self.set_manager_state(&saved, MANAGER_INTERVENTION_COMPLETE),
+            Revalidation::Stale => {
+                // §7.2: revalidation needs a new run; the pump re-queues it while the budgets allow.
+                self.set_manager_state(&saved, MANAGER_INTERVENTION_STALE)
+            }
+            Revalidation::Superseded => {
+                self.set_manager_state(&saved, MANAGER_INTERVENTION_SUPERSEDED)
+            }
+        }
+    }
+
+    /// Re-runs §8.1–§8.2's deterministic checks against current loop-owned state, with NO model call
+    /// (§7.5, §8.2). This is the same M3 [`managerdecision::revalidate`] the activation transaction
+    /// (M9, §7.7) re-runs in full; M8 uses it to decide between `validated` and `stale`.
+    ///
+    /// Two APPROVE inputs — `review_completed_since` and `finding_set_unchanged` — are not
+    /// revision-scoped on any M8 record, so they are carried as the permissive default here; the
+    /// activation transaction re-evaluates them before anything takes effect, which is the boundary
+    /// the design makes authoritative (§7.7).
+    fn revalidate_manager_decision(
+        &self,
+        row: &ManagerInterventionRow,
+        decision: &ManagerDecision,
+    ) -> Revalidation {
+        let pr = &row.pr;
+        let bound = self.store().review_bound(pr).ok().flatten();
+        let after_generation = bound.as_ref().map_or(row.generation, |b| b.generation);
+        let after_evidence_rev = bound.as_ref().map_or(0, |b| b.evidence_rev);
+        let (labelled, hold_known) = self.human_holds.labelled_and_primed();
+        let hold_applied = self.manager_pr_held(pr, &labelled);
+        let manager_enabled = self.teams.as_ref().is_some_and(|t| t.enabled)
+            && self.manager_review_authority() != ReviewAuthority::Off;
+        let rows = self.manager_review_rows(pr);
+        let patch_id = current_patch_id(&rows);
+        let eligible = managerdecision::eligible_rows(&rows, after_generation, &patch_id).len();
+        let all_rows_approved = !rows.is_empty()
+            && managerdecision::live_reviewer_rows(&rows).iter().all(|r| {
+                crate::reviewevidence::completion_approved_at_current_patch(
+                    r.completed.as_ref(),
+                    after_generation,
+                    &patch_id,
+                )
+            });
+        let route_fix_still_open = self.manager_route_fix_still_open(pr, decision);
+        let approval_still_eligible =
+            self.manager_approval_still_eligible(row, decision, &rows, after_generation, &patch_id);
+        // §8.1: the decision is bound to (generation, evidence_rev, head). A moved head that is not
+        // the decision's is a moved patch until proven otherwise.
+        let patch_id_unchanged = self.manager_head_unchanged(pr, &decision.head);
+        let pr_open = self
+            .store()
+            .load_live_review_watch()
+            .map(|w| {
+                w.iter().any(|r| {
+                    r.open
+                        && format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number)
+                            .to_ascii_lowercase()
+                            == *pr
+                })
+            })
+            .unwrap_or(false);
+        let phase_at_launch = if row.phase_hint == MANAGER_PHASE_POST_THRESHOLD {
+            ThresholdPhase::PostThreshold
         } else {
-            tracing::warn!(pr = %pr, reason = reason, "manager: the generation is stopped");
+            ThresholdPhase::PreThreshold
+        };
+        let answered_exchanges = parse_pr_key(pr).map_or(0, |c| self.rounds_used(&c) as i64);
+        let adjudicate_after_rounds = self.adjudication_threshold().map_or(0, |t| t as i64);
+        let interventions_applied = self
+            .store()
+            .manager_budget(pr)
+            .ok()
+            .flatten()
+            .map_or(0, |b| b.interventions_applied);
+
+        managerdecision::revalidate(&RevalidationInputs {
+            decision,
+            before_generation: row.generation,
+            after_generation,
+            authority_act: self.manager_review_authority() == ReviewAuthority::Act,
+            pr_open,
+            hold_known,
+            hold_applied,
+            manager_enabled,
+            before_evidence_rev: row.decision_evidence_rev,
+            after_evidence_rev,
+            patch_id_unchanged,
+            eligible_rows: eligible,
+            all_rows_approved,
+            route_fix_still_open,
+            review_completed_since: false,
+            finding_set_unchanged: true,
+            approval_still_eligible,
+            phase_at_launch,
+            answered_exchanges,
+            adjudicate_after_rounds,
+            interventions_applied,
+            max_interventions: self.manager_max_interventions(),
+            final_intervention: row.is_final,
+        })
+    }
+
+    /// §7.5: every `decided`/`validated` intervention re-runs its saved decision's validation with
+    /// NO model call. A `decided` row that revalidates to `validated` advances; one that no longer
+    /// holds becomes `stale` (re-queued by the pump while the budgets allow) or `superseded`/`complete`.
+    /// `advise` decisions are recorded, never applied, and end `proposed`.
+    fn revalidate_saved_manager_decisions(&self) {
+        let Ok(rows) = self.store().load_manager_interventions() else {
+            return;
+        };
+        for row in rows {
+            if row.state != MANAGER_INTERVENTION_DECIDED
+                && row.state != MANAGER_INTERVENTION_VALIDATED
+            {
+                continue;
+            }
+            if row.decision_json.is_empty() {
+                continue;
+            }
+            if row.mode == MANAGER_MODE_ADVISE {
+                self.set_manager_state(&row, MANAGER_INTERVENTION_PROPOSED);
+                continue;
+            }
+            // Re-parse the stored block (a fenced body) so revalidation names the same decision.
+            let wrapped = format!(
+                "```{}\n{}\n```",
+                managerdecision::MANAGER_DECISION_TAG,
+                row.decision_json
+            );
+            let known = self.manager_known_findings(&row.pr);
+            let Ok(decision) = managerdecision::parse_decision(&wrapped, &known) else {
+                continue; // a stored decision that no longer parses is left where it is
+            };
+            match self.revalidate_manager_decision(&row, &decision) {
+                Revalidation::StillValid => {
+                    if row.state != MANAGER_INTERVENTION_VALIDATED {
+                        self.set_manager_state(&row, MANAGER_INTERVENTION_VALIDATED);
+                    }
+                }
+                Revalidation::Complete => {
+                    self.set_manager_state(&row, MANAGER_INTERVENTION_COMPLETE)
+                }
+                Revalidation::Stale => self.set_manager_state(&row, MANAGER_INTERVENTION_STALE),
+                Revalidation::Superseded => {
+                    self.set_manager_state(&row, MANAGER_INTERVENTION_SUPERSEDED)
+                }
+            }
+        }
+    }
+
+    /// §6.2/§8.2: every `route.fix` revision the decision names is still an open finding.
+    fn manager_route_fix_still_open(&self, pr: &str, decision: &ManagerDecision) -> bool {
+        let DecisionKind::RouteToAuthor { fix, .. } = &decision.kind else {
+            return true; // not a ROUTE_TO_AUTHOR decision; the input is unused for it
+        };
+        let Ok(findings) = self.store().load_review_findings(pr) else {
+            return false; // fail closed
+        };
+        fix.iter().all(|want| {
+            findings.iter().any(|f| {
+                f.finding_id == want.finding
+                    && f.revision == want.revision
+                    && f.status == REVIEW_FINDING_OPEN
+            })
+        })
+    }
+
+    /// §6.4 re-evaluated now for an APPROVE decision's `approval_still_eligible` input.
+    fn manager_approval_still_eligible(
+        &self,
+        _row: &ManagerInterventionRow,
+        decision: &ManagerDecision,
+        rows: &[ManagerReviewRow],
+        generation: i64,
+        patch_id: &str,
+    ) -> bool {
+        if !matches!(decision.kind, DecisionKind::Approve) {
+            return true; // unused for a non-APPROVE decision
+        }
+        let open_blocking = self
+            .store()
+            .open_blocking_findings(&_row.pr)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| FindingRef {
+                finding: f.finding_id,
+                revision: f.revision,
+            })
+            .collect::<Vec<_>>();
+        let dismissed = decision
+            .dismiss
+            .iter()
+            .map(|d| d.finding.clone())
+            .collect::<Vec<_>>();
+        let required = self
+            .teams
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.review.required.clone());
+        let effective_reviewers = self
+            .teams
+            .as_ref()
+            .map_or(0, |t| t.review.effective_reviewers());
+        let (limit, answered) = {
+            let limit = self.adjudication_threshold().map_or(0, |t| t as i64);
+            let answered = parse_pr_key(&_row.pr).map_or(0, |c| self.rounds_used(&c) as i64);
+            (limit, answered)
+        };
+        managerdecision::approval_eligibility(&ApprovalInputs {
+            rows,
+            required: &required,
+            effective_reviewers,
+            generation,
+            current_patch_id: patch_id,
+            threshold_reached: answered >= limit,
+            final_intervention: _row.is_final,
+            open_blocking: &open_blocking,
+            dismissed: &dismissed,
+        })
+        .is_ok()
+    }
+
+    /// §8.2: whether the decision's head is still one of the pull request's observed heads. With no
+    /// observed head the answer is `true` — a head this process cannot read is not evidence it moved.
+    fn manager_head_unchanged(&self, pr: &str, head: &str) -> bool {
+        if head.is_empty() {
+            return true;
+        }
+        let Ok(rows) = self.store().load_live_review_watch() else {
+            return false; // fail closed on an unreadable watch set
+        };
+        let mut observed = Vec::new();
+        for r in rows {
+            if format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).to_ascii_lowercase() != pr
+            {
+                continue;
+            }
+            if !r.requested_sha.is_empty() {
+                observed.push(r.requested_sha.clone());
+            }
+            if !r.last_reviewed_sha.is_empty() {
+                observed.push(r.last_reviewed_sha.clone());
+            }
+        }
+        observed.is_empty() || observed.iter().any(|h| h == head)
+    }
+
+    /// The daemon's finding ledger for `pr`, as M3's parser needs it (§6.1).
+    fn manager_known_findings(&self, pr: &str) -> Vec<KnownFinding> {
+        self.store()
+            .load_review_findings(pr)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| KnownFinding {
+                finding_id: f.finding_id,
+                revision: f.revision,
+                status: f.status,
+                blocking: f.blocking,
+            })
+            .collect()
+    }
+
+    /// The pull request's live watch rows as approval/precondition eligibility sees them (§6.2,
+    /// §6.4). `diff_covered` is carried `true`: M8 has no evidence-access reader, and the activation
+    /// transaction re-evaluates §6.4 condition 3 against the real ledger before anything applies.
+    fn manager_review_rows(&self, pr: &str) -> Vec<ManagerReviewRow> {
+        let mut out = Vec::new();
+        let Ok(watch) = self.store().load_live_review_watch() else {
+            return out;
+        };
+        for r in watch {
+            if format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).to_ascii_lowercase() != pr
+            {
+                continue;
+            }
+            let completed = self.store().review_completed(&r.key).ok().flatten();
+            out.push(ManagerReviewRow {
+                reviewer: r.key.reviewer.clone(),
+                is_manager: r.key.reviewer == "manager",
+                status: r.status.clone(),
+                completed,
+                diff_covered: true,
+            });
+        }
+        out
+    }
+
+    /// Record a `failed_attempt` (with its reason logged) so the pump may re-queue it (§7.2).
+    fn record_manager_failed_attempt(&self, row: &ManagerInterventionRow, reason: &str) {
+        tracing::warn!(pr = %row.pr, id = %row.id, reason = reason,
+            "manager: recording a failed attempt");
+        self.set_manager_state(row, MANAGER_INTERVENTION_FAILED_ATTEMPT);
+    }
+
+    /// Idempotent state write with a warn on failure.
+    fn set_manager_state(&self, row: &ManagerInterventionRow, state: &str) {
+        if let Err(e) = self.store().set_manager_intervention_state(&row.id, state) {
+            tracing::warn!(pr = %row.pr, id = %row.id, err = %e,
+                "manager: writing the intervention state failed");
         }
     }
 }
@@ -1089,7 +1595,7 @@ mod tests {
             divergence(DivergenceKind::RoundBudgetExhausted, PR_DISPLAY),
         ];
         let adopted = o.route_stalls_to_manager(&found);
-        assert_eq!(adopted, vec![PR_KEY.to_string()]);
+        assert_eq!(adopted.adopted, vec![PR_KEY.to_string()]);
         let row = active(&o).expect("one active intervention");
         assert_eq!(
             row.stall_kinds,
@@ -1116,7 +1622,10 @@ mod tests {
             .stop_manager_generation(PR_KEY, "manager generation run budget exhausted")
             .expect("stop");
         let adopted = o.route_stalls_to_manager(&found);
-        assert!(adopted.is_empty(), "a stopped generation adopts nothing");
+        assert!(
+            adopted.adopted.is_empty(),
+            "a stopped generation adopts nothing"
+        );
         assert!(active(&o).is_none(), "no new intervention is created");
     }
 
@@ -1125,7 +1634,7 @@ mod tests {
     fn off_routes_nothing() {
         let (o, _) = orch(ReviewAuthority::Off);
         let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
-        assert!(o.route_stalls_to_manager(&found).is_empty());
+        assert!(o.route_stalls_to_manager(&found).adopted.is_empty());
         assert!(active(&o).is_none());
     }
 
@@ -1228,7 +1737,7 @@ mod tests {
             assert_eq!(d[0].issue.identifier, "pr:makewhatis/rhapsody#12@manager");
         }
         let id = active(&o).expect("row").id;
-        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_LAUNCHING);
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
         assert_eq!(
             o.store()
                 .manager_budget(PR_KEY)
@@ -1287,6 +1796,438 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("ticket: STUDIO-1"), "{rendered}");
+    }
+
+    // --- the run's exit: parse + revalidate (B1) ----------------------------------------------
+
+    fn seed_watch(o: &Orchestrator, introduced_by: &str) {
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".to_string(),
+                    repo: "rhapsody".to_string(),
+                    number: 12,
+                    reviewer: "alice".to_string(),
+                },
+                author: "bob".to_string(),
+                introduced_by: introduced_by.to_string(),
+                requested_sha: "deadbeef".to_string(),
+                last_reviewed_sha: String::new(),
+                status: "reviewed".to_string(),
+                open: true,
+            })
+            .expect("save watch");
+    }
+
+    fn decision_text(json: &str) -> String {
+        format!(
+            "prose\n\n```{}\n{json}\n```\n\nHANDOFF: done\n",
+            managerdecision::MANAGER_DECISION_TAG
+        )
+    }
+
+    fn exit_with(text: Option<&str>) -> crate::retry::EvWorkerExit {
+        crate::retry::EvWorkerExit {
+            issue_id: "pr:makewhatis/rhapsody#12@manager".to_string(),
+            failed: false,
+            started_at: Utc::now(),
+            err_msg: String::new(),
+            last_state: String::new(),
+            declared_handoff: true,
+            review_verdict: None,
+            manager_text: text.map(str::to_string),
+            refused: false,
+        }
+    }
+
+    fn launch_running(o: &mut Orchestrator) -> String {
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        o.route_stalls_to_manager(&found);
+        o.pump_manager_interventions();
+        let id = active(o).expect("row").id;
+        // The recording spawn seam leaves the run in `running`/`claimed`; drop it so a later pump can
+        // dispatch a relaunch, exactly as a real run's exit does.
+        o.running.remove("pr:makewhatis/rhapsody#12@manager");
+        o.claimed.remove("pr:makewhatis/rhapsody#12@manager");
+        id
+    }
+
+    // A clean exit with a VALID decision moves the intervention to `decided` → `validated` via M3,
+    // with no re-launch (B1). MUTATION: leave `on_manager_exit` untouched and the row stays
+    // `running`, so the pump recovers it as a failed attempt and re-runs the model.
+    #[test]
+    fn a_valid_decision_moves_to_validated() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let id = launch_running(&mut o);
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
+
+        let text = decision_text(
+            r#"{"decision":"ESCALATE","head":"deadbeef","evidence_rev":0,
+                "escalate":{"question":"which base?","checked":"compared both diffs"},
+                "rationale":"needs a human"}"#,
+        );
+        o.settle_manager_intervention("pr:makewhatis/rhapsody#12@manager", &exit_with(Some(&text)));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_VALIDATED);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            1,
+            "a settled exit charges no second run"
+        );
+    }
+
+    // A clean exit with NO decision block is a `failed_attempt`, which re-queues (B1).
+    #[test]
+    fn a_clean_exit_without_a_decision_is_a_failed_attempt() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        let id = launch_running(&mut o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some("no block here")),
+        );
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_FAILED_ATTEMPT);
+    }
+
+    // A failed run is a `failed_attempt`, not a stuck `running` row.
+    #[test]
+    fn a_failed_manager_run_is_a_failed_attempt() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        let id = launch_running(&mut o);
+        let mut e = exit_with(None);
+        e.failed = true;
+        o.settle_manager_intervention("pr:makewhatis/rhapsody#12@manager", &e);
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_FAILED_ATTEMPT);
+    }
+
+    // `advise` records the decision and never applies it: terminal `proposed` (§9).
+    #[test]
+    fn an_advise_decision_is_proposed_and_never_applied() {
+        let (mut o, _) = orch(ReviewAuthority::Advise);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let id = launch_running(&mut o);
+        let text = decision_text(
+            r#"{"decision":"ESCALATE","head":"deadbeef","evidence_rev":0,
+                "escalate":{"question":"which base?","checked":"compared both diffs"},
+                "rationale":"needs a human"}"#,
+        );
+        o.settle_manager_intervention("pr:makewhatis/rhapsody#12@manager", &exit_with(Some(&text)));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_PROPOSED);
+    }
+
+    // A decision that no longer holds (a moved generation) revalidates `superseded`.
+    #[test]
+    fn a_decision_on_a_moved_generation_is_superseded() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let id = launch_running(&mut o);
+        // Bump the generation while the run was in flight.
+        o.store()
+            .increment_review_generation(PR_KEY)
+            .expect("clear");
+        let text = decision_text(
+            r#"{"decision":"ESCALATE","head":"deadbeef","evidence_rev":0,
+                "escalate":{"question":"which base?","checked":"compared both diffs"},
+                "rationale":"needs a human"}"#,
+        );
+        o.settle_manager_intervention("pr:makewhatis/rhapsody#12@manager", &exit_with(Some(&text)));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_SUPERSEDED);
+    }
+
+    // --- deferral visibility (B2) --------------------------------------------------------------
+
+    // A drain defers the launch, and the stall STAYS on the human feed with the manager's wording
+    // (§10.2). MUTATION: adopt (drop) the signal while deferred and the surface assert reds.
+    #[test]
+    fn a_deferred_launch_stays_on_the_human_feed() {
+        let (o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        o.drain.arm(Utc::now(), crate::drain::DrainReason::Operator);
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(
+            routing.adopted.is_empty(),
+            "nothing is adopted while deferred"
+        );
+        assert_eq!(
+            routing.surfaced,
+            vec![(PR_KEY.to_string(), "manager deferred: drain".to_string())]
+        );
+    }
+
+    // An unavailable manager (the §4.7 self-test has not passed) surfaces its own wording.
+    #[test]
+    fn an_unavailable_manager_stays_on_the_human_feed() {
+        let (o, _) = orch(ReviewAuthority::Act);
+        prime_holds(&o); // holds read; the self-test is deliberately NOT passed
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(routing.adopted.is_empty());
+        assert_eq!(
+            routing.surfaced,
+            vec![(
+                PR_KEY.to_string(),
+                "manager unavailable: CLI contract".to_string()
+            )]
+        );
+    }
+
+    // A budget-exhausted manager surfaces the budget wording.
+    #[test]
+    fn a_budget_refusal_surfaces_the_budget_wording() {
+        let (o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        o.note_budget_hold("STUDIO-1", "t", "rhapsody", "claude", 100, 100);
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(routing.adopted.is_empty());
+        assert_eq!(
+            routing.surfaced,
+            vec![(PR_KEY.to_string(), "manager deferred: budget".to_string())]
+        );
+    }
+
+    // A dead credential surfaces the credentials wording.
+    #[test]
+    fn a_dead_credential_surfaces_the_credentials_wording() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        o.probe_cache = Some(crate::preflight::ProbeCache {
+            checked_at: Utc::now(),
+            healthy: false,
+            last_logged_dead_at: None,
+        });
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(routing.adopted.is_empty());
+        assert_eq!(
+            routing.surfaced,
+            vec![(
+                PR_KEY.to_string(),
+                "manager deferred: credentials".to_string()
+            )]
+        );
+    }
+
+    // --- every gate at every relaunch (B4) -----------------------------------------------------
+
+    // Every §10.2 gate is honoured when RELAUNCHING a `failed_attempt` — not just on the first
+    // launch. MUTATION: return `Proceed` for `failed_attempt` (gate only the pre-launch states) and
+    // every assert in the gate loop below reds on the run count.
+    #[test]
+    fn gates_are_honoured_when_relaunching_a_failed_attempt() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        let id = launch_running(&mut o);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            1
+        );
+        // The run ended with an invalid block: a failed attempt, which is a launch candidate.
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_FAILED_ATTEMPT)
+            .expect("failed attempt");
+
+        // (a) drain
+        o.drain.arm(Utc::now(), crate::drain::DrainReason::Operator);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_DEFERRED);
+        o.drain.disarm();
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            1
+        );
+        // (b) self-test (a fresh failed attempt, so the refusal leaves it where it was)
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_FAILED_ATTEMPT)
+            .expect("failed attempt");
+        o.manager_selftest.record(SelfTestRecord {
+            cli_version: test_cli_version(),
+            verdict: SelfTestVerdict::Failed(crate::managerselftest::ManagerUnavailable {
+                cli_version: test_cli_version(),
+                detail: "Bash succeeded".to_string(),
+            }),
+        });
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_FAILED_ATTEMPT);
+        pass_self_test(&o);
+        // (c) provider budget
+        seed_watch(&o, "adopt:STUDIO-1");
+        o.note_budget_hold("STUDIO-1", "t", "rhapsody", "claude", 100, 100);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_DEFERRED);
+        o.release_budget_hold("STUDIO-1");
+        // (d) credentials
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_FAILED_ATTEMPT)
+            .expect("failed attempt");
+        o.probe_cache = Some(crate::preflight::ProbeCache {
+            checked_at: Utc::now(),
+            healthy: false,
+            last_logged_dead_at: None,
+        });
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_DEFERRED);
+        o.probe_cache = None;
+
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            1,
+            "no refused relaunch charges a run"
+        );
+
+        // Every gate clear: the relaunch proceeds and charges exactly one more run.
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            2
+        );
+    }
+
+    // The same for a `stale` row (§7.2): a stalled re-run is gated at every gate.
+    #[test]
+    fn gates_are_honoured_when_relaunching_a_stale_row() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        let id = launch_running(&mut o);
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_STALE)
+            .expect("stale");
+
+        o.drain.arm(Utc::now(), crate::drain::DrainReason::Operator);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_DEFERRED);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            1
+        );
+
+        o.drain.disarm();
+        // A closed self-test gate leaves the stale row where it was too.
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_STALE)
+            .expect("stale");
+        o.manager_selftest.record(SelfTestRecord {
+            cli_version: test_cli_version(),
+            verdict: SelfTestVerdict::Failed(crate::managerselftest::ManagerUnavailable {
+                cli_version: test_cli_version(),
+                detail: "Bash succeeded".to_string(),
+            }),
+        });
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_STALE);
+        pass_self_test(&o);
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
+        assert_eq!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            2
+        );
+    }
+
+    // --- the case packet carries the RESERVED row (B3) -----------------------------------------
+
+    // The generation's LAST allocation is launched `final: true`, and the packet rendered for it
+    // says so. With `max_interventions = 1` the first reservation is already the final one, so the
+    // packet must come from the row AS RESERVED, not the pre-reservation snapshot (which has
+    // `final: false`). MUTATION: render the packet before the reservation and the stored row is
+    // still final but the packet handed to the run would say `final: false`.
+    #[test]
+    fn the_final_launch_packet_says_final_true() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        o.teams.as_mut().expect("teams").manager.max_interventions = 1;
+
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        o.route_stalls_to_manager(&found);
+        o.pump_manager_interventions();
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+
+        let row = active(&o).expect("row");
+        assert!(
+            row.is_final,
+            "the reservation sets `final` on the generation's last allocation"
+        );
+        let rendered = o.manager_case_packet(&row).render();
+        assert!(
+            rendered.contains("final: true"),
+            "the packet handed to the run must carry the reserved final flag: {rendered}"
+        );
+    }
+
+    // --- terminal stops (B5) -------------------------------------------------------------------
+    // A repeated `apply_failed` stops the generation: the first one already did, and the stall
+    // creates nothing new (§15.4). MUTATION: release the generation on a terminal failure and a new
+    // intervention appears.
+    #[test]
+    fn a_repeated_apply_failed_creates_nothing_new() {
+        let (o, _) = orch(ReviewAuthority::Act);
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        o.route_stalls_to_manager(&found);
+        let id = active(&o).expect("row").id;
+        o.store()
+            .stop_manager_intervention(
+                &id,
+                rhapsody_store::MANAGER_INTERVENTION_APPLY_FAILED,
+                "an effect failed",
+            )
+            .expect("apply_failed stops the generation");
+        assert!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
+        );
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(routing.adopted.is_empty() && routing.surfaced.is_empty());
+        assert!(active(&o).is_none(), "no new intervention is created");
     }
 
     // A second pump while the first run holds the single slot launches nothing more.

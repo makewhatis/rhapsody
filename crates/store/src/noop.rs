@@ -269,6 +269,30 @@ impl Store for Noop {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+    fn mark_manager_intervention_running(
+        &self,
+        _id: &str,
+        _run_id: Option<i64>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn record_manager_decision(
+        &self,
+        _id: &str,
+        _decision_json: &str,
+        _decision_head: &str,
+        _decision_evidence_rev: i64,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn stop_manager_intervention(
+        &self,
+        _id: &str,
+        _terminal_state: &str,
+        _reason: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn reserve_manager_run(
         &self,
         _id: &str,

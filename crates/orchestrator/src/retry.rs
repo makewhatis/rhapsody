@@ -73,6 +73,11 @@ pub struct EvWorkerExit {
     /// worker, where the agent's final text is still in hand; the exit path never re-reads a
     /// transcript.
     pub review_verdict: Option<ReviewVerdictBlock>,
+    /// A MANAGER run's final result text, carried verbatim so `on_manager_exit` can parse the
+    /// `rhapsody-manager-decision` block against the daemon's finding ledger (STUDIO-1015, §6.1).
+    /// `None` on every non-manager run. Carried from the worker, where the final text is still in
+    /// hand, exactly as `review_verdict` is.
+    pub manager_text: Option<String>,
     /// True when the exit is a TYPED CAPABILITY REFUSAL decided before any session was spawned
     /// (STUDIO-978): the resolved harness cannot honor a correctness requirement, or it is not
     /// implemented by this build. A refusal is terminal — the profile's harness name and the
@@ -1695,6 +1700,7 @@ mod tests {
             last_state: "In Review".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -1737,6 +1743,7 @@ mod tests {
             last_state: "Done".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -1977,6 +1984,7 @@ mod tests {
                 last_state: state.into(),
                 declared_handoff: false,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             });
             let runs = store_handle
@@ -2139,6 +2147,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert!(
@@ -2174,6 +2183,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert_eq!(
@@ -2197,6 +2207,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert_eq!(
@@ -2219,6 +2230,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
@@ -2255,6 +2267,7 @@ mod tests {
             last_state: "Todo".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: true,
         });
 
@@ -2293,6 +2306,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
         assert!(
@@ -2351,6 +2365,7 @@ mod tests {
             last_state: "Done".into(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -2382,6 +2397,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -2410,6 +2426,7 @@ mod tests {
             last_state: "Done".into(),
             declared_handoff: true,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -2443,6 +2460,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 
@@ -2474,6 +2492,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
+            manager_text: None,
             refused: false,
         });
 

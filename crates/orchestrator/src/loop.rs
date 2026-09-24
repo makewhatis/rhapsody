@@ -1916,6 +1916,7 @@ impl Orchestrator {
                 last_state: final_state,
                 declared_handoff: declared.declared_handoff,
                 review_verdict: declared.review_verdict,
+                manager_text: declared.manager_text,
                 refused,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
@@ -2319,6 +2320,7 @@ mod tests {
                 last_state: String::new(),
                 declared_handoff: false,
                 review_verdict: None,
+                manager_text: None,
                 refused: false,
             }));
         }));

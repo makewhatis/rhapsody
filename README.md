@@ -1367,6 +1367,21 @@ shown on the human feed, and the sweep never creates another intervention for it
 the sweep's human feed is byte-identical. `divergent_objects_are_gated_by_name_only` pins the
 fourteenth and fifteenth names (the table and its partial index).
 
+A manager run's EXIT settles its intervention (§7.2, §7.5): the run's final message is parsed for
+its `rhapsody-manager-decision` block, a valid one is stored and the row moves `decided`, then
+revalidated **without a model call** (M3's deterministic checks) to `validated`, `stale`,
+`superseded` or `complete` — `proposed` in `advise` mode. Anything else (a failed run, no block, an
+invalid block, a refused final decision) is a `failed_attempt`, which the pump re-queues while the
+budgets allow. `decided`/`validated` rows re-run the same validation each tick, so a crash recovers
+without spending a run. The `applying` internals and the activation transaction remain a later
+ticket's (§7.7).
+
+When the manager OWNS a stall but a §10.2 gate defers its launch — a drain, the provider budget,
+the credential preflight — or the §4.7 self-test has not passed, the stall is **not swallowed**:
+it stays on the human feed as a `manager_deferred` divergence whose `reason` carries the manager's
+own sentence (`manager deferred: drain` / `: budget` / `: credentials`, `manager unavailable: CLI
+contract`), rendered onto `/api/v1/state` beside the row.
+
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
