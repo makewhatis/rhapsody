@@ -283,17 +283,30 @@ impl Orchestrator {
             .provider_reported_tokens
             .unwrap_or(usage.reserved_tokens);
         if let Some(re) = self.running.get_mut(issue_id) {
-            re.input_tokens = 0;
-            re.output_tokens = 0;
-            re.total_tokens = broker_total;
-            re.cur_input_tokens = 0;
-            re.cur_output_tokens = 0;
-            re.cur_total_tokens = 0;
-            self.settle_broker_total_in_totals(broker_total);
-            return;
+            // The live entry must be THIS run's (STUDIO-1047, alice F2). A ticket can be
+            // re-dispatched while a terminated run's receipt is still in flight; matching on
+            // `issue_id` alone would let that stale receipt rewrite the NEW entry while the old run's
+            // row keeps its child figure. `on_worker_exit` guards the same race with `started_at`;
+            // the run id is the guard here. With the store off (`run_id == 0`) there is no id to
+            // compare and the entry is the only run this ticket has, so the live path stands.
+            if run_id == 0 || re.run_id == run_id {
+                re.input_tokens = 0;
+                re.output_tokens = 0;
+                re.total_tokens = broker_total;
+                re.cur_input_tokens = 0;
+                re.cur_output_tokens = 0;
+                re.cur_total_tokens = 0;
+                self.settle_broker_total_in_totals(broker_total);
+                return;
+            }
         }
-        // No live entry: a cancellation already closed the row. A zero run id (store disabled) has
-        // no row to correct; the rewrite is best-effort like every other persist call.
+        // No live entry — or one that belongs to a LATER run of the same ticket, whose receipt this
+        // is not: a cancellation already closed THIS run's row, so its tallies are rewritten from the
+        // receipt. Settle the in-memory aggregate FIRST, because it applies whether or not a row
+        // exists: a brokered run's child figure was never folded in, so with the store off
+        // (`run_id == 0`) there is no row to correct but the aggregate still needs the receipt
+        // (STUDIO-1047, alice F1). The rewrite is best-effort like every other persist call.
+        self.settle_broker_total_in_totals(broker_total);
         if run_id == 0 {
             return;
         }
@@ -313,7 +326,6 @@ impl Orchestrator {
                 "broker usage run-row rewrite failed; the run's own history is unaffected"
             );
         }
-        self.settle_broker_total_in_totals(broker_total);
     }
 
     /// Adds a brokered run's finalized figure to the cumulative aggregate. Shared by the live and
@@ -1319,6 +1331,80 @@ mod tests {
         assert_eq!(
             runs[0].total_tokens, 900,
             "an unreported receipt charges the reservation, not the child figure or zero"
+        );
+    }
+
+    // STUDIO-1047 (alice's review F1): with the store OFF (`run_id == 0`) a cancelled brokered run
+    // has no row to rewrite, but its receipt must still reach the in-memory aggregate — its child
+    // figure was never folded in, so without the settlement the run counts as zero. MUTATION GUARD:
+    // restoring the `run_id == 0` early return above the settlement reds this.
+    #[test]
+    fn a_cancelled_brokered_receipt_reaches_the_aggregate_with_the_store_off() {
+        let mut o = Orchestrator::new("WORKFLOW.md"); // no store injected => Noop
+        o.on_broker_usage(
+            "ghost",
+            0,
+            &store::RunUsage {
+                provider_reported_tokens: Some(42),
+                reserved_tokens: 900,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            o.totals.total_tokens, 42,
+            "a store-off cancelled run's receipt still settles the aggregate"
+        );
+    }
+
+    // STUDIO-1047 (alice's review F2): a terminated run's receipt can arrive after the ticket was
+    // re-dispatched, so the live entry under that issue id belongs to a DIFFERENT run. Matching on
+    // `issue_id` alone would let the stale receipt rewrite the new entry while the old run's row kept
+    // its child figure. MUTATION GUARD: dropping the `re.run_id == run_id` check reds this.
+    #[test]
+    fn a_late_receipt_for_an_earlier_run_does_not_land_on_a_redispatched_entry() {
+        let (mut o, st) = orch_with_store();
+        // Run A: terminated and closed with its child figure.
+        let mut a = re_for("ID-1", "MT-1", "In Progress");
+        a.brokered = true;
+        o.persist_start_run(&mut a, 0);
+        let run_a = a.run_id;
+        let issue_id = a.issue.id.clone();
+        o.running.insert(issue_id.clone(), a);
+        let a = o.terminate(&issue_id).expect("running");
+        o.persist_end_run(&a, OUTCOME_STOPPED, "stopped by user");
+
+        // The ticket is re-dispatched: run B is live under the SAME issue id.
+        let mut b = re_for("ID-1", "MT-1", "In Progress");
+        b.brokered = true;
+        o.persist_start_run(&mut b, 0);
+        let run_b = b.run_id;
+        assert_ne!(run_a, run_b, "the two runs have distinct row ids");
+        o.running.insert(issue_id.clone(), b);
+
+        // A's receipt arrives late, carrying A's run id.
+        o.on_broker_usage(
+            &issue_id,
+            run_a,
+            &store::RunUsage {
+                provider_reported_tokens: Some(42),
+                reserved_tokens: 900,
+                ..Default::default()
+            },
+        );
+
+        let runs = st.list_runs(RunFilter::default()).expect("list runs");
+        let row_a = runs.iter().find(|r| r.id == run_a).expect("run A row");
+        assert_eq!(
+            row_a.total_tokens, 42,
+            "the stale receipt still corrects ITS OWN run's row"
+        );
+        assert_eq!(
+            o.running[&issue_id].total_tokens, 0,
+            "the receipt must not land on the re-dispatched entry"
+        );
+        assert_eq!(
+            o.totals.total_tokens, 42,
+            "the aggregate takes A's receipt exactly once"
         );
     }
 }

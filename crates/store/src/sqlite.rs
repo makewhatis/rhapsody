@@ -5752,6 +5752,58 @@ mod tests {
         assert_eq!(store.run_provenance(with).expect("get"), Some(prov));
     }
 
+    // STUDIO-1047 (alice's review F3): `set_run_tokens` rewrites ONLY the tally columns of an
+    // already-CLOSED run — a broker receipt that lands after `end_run` corrects the totals without
+    // re-ending the run or disturbing its outcome/error/turns/transcript. MUTATION GUARD: widening
+    // the UPDATE to any end-run column reds the corresponding assertion below.
+    #[test]
+    fn set_run_tokens_rewrites_only_a_closed_runs_tallies() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let id = start_provenance_run(&store, "rewrite");
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_STOPPED.into(),
+                    error: "stopped by user".into(),
+                    turns: 3,
+                    input_tokens: 700,
+                    output_tokens: 300,
+                    total_tokens: 1000,
+                    usage_estimated: true,
+                    transcript_path: "t.jsonl".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+
+        store
+            .set_run_tokens(
+                id,
+                &RunTokens {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 42,
+                    usage_estimated: false,
+                },
+            )
+            .expect("rewrite");
+
+        let runs = store.list_runs(RunFilter::default()).expect("list runs");
+        let r = runs.iter().find(|r| r.id == id).expect("row");
+        assert_eq!(
+            r.total_tokens, 42,
+            "the receipt's total replaces the child's"
+        );
+        assert_eq!(r.input_tokens, 0);
+        assert_eq!(r.output_tokens, 0);
+        assert!(!r.usage_estimated, "a broker receipt is authoritative");
+        assert_eq!(r.outcome, OUTCOME_STOPPED, "the outcome is untouched");
+        assert_eq!(r.error, "stopped by user", "the error is untouched");
+        assert_eq!(r.turns, 3, "the turn count is untouched");
+        assert_eq!(r.transcript_path, "t.jsonl", "the transcript is untouched");
+    }
+
     // The stored provenance/usage columns are pinned to exactly the documented, non-secret set
     // (STUDIO-987). The mutation this guards: adding a column that could carry a credential, an
     // ephemeral OpenCode provider id, or a broker capability — none of which may ever be persisted.
