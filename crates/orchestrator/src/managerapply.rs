@@ -333,6 +333,22 @@ impl Orchestrator {
             .unwrap_or(true)
     }
 
+    /// Whether `pr` still has a live, OPEN review-watch row. The watcher retires every row for a
+    /// pull request that has left the open state (merged, closed or gone — `retire_review_pr`), so
+    /// the absence of an open row is the control task's observable signal that the PR is no longer
+    /// open. `None` when the store cannot be read: the caller must fail closed and must NOT treat an
+    /// unreadable store as "closed".
+    fn manager_pr_open(&self, pr: &str) -> Option<bool> {
+        self.store().load_live_review_watch().ok().map(|rows| {
+            rows.iter().any(|r| {
+                r.open
+                    && format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number)
+                        .to_ascii_lowercase()
+                        == pr
+            })
+        })
+    }
+
     /// §8.3: answer the applier's cheap check before an external effect. The decisive check is the
     /// activation transaction (§7.7); this only stops early to save work.
     pub(crate) fn manager_pre_effect_check(&self, intervention_id: &str) -> PreEffectCheck {
@@ -354,18 +370,7 @@ impl Orchestrator {
         let (labelled, hold_known) = self.human_holds.labelled_and_primed();
         let hold_applied = self.manager_pr_held(&row.pr, &labelled);
         let authority_act = self.manager_review_authority() == ReviewAuthority::Act;
-        let pr_open = self
-            .store()
-            .load_live_review_watch()
-            .map(|rows| {
-                rows.iter().any(|r| {
-                    r.open
-                        && format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number)
-                            .to_ascii_lowercase()
-                            == row.pr
-                })
-            })
-            .unwrap_or(false);
+        let pr_open = self.manager_pr_open(&row.pr).unwrap_or(false);
         let manager_enabled = self.teams.as_ref().is_some_and(|t| t.enabled);
         // §8.3 limits the evidence-staleness arm to APPROVE and ROUTE_TO_AUTHOR: a `RERUN_REVIEW`
         // whose evidence moved (for example a finding resolved) is not stopped by this cheap check,
@@ -680,6 +685,16 @@ impl Orchestrator {
                     return;
                 }
                 Err(_) => return, // fail closed: do not complete on an unreadable store
+            }
+            // §6.6: an APPROVE is complete when the PR MERGES. The watcher retires every live row
+            // for a pull request that has left the open state, so the absence of an open watch row
+            // is the control task's observable signal that it merged (or was closed). Checked
+            // BEFORE the timeout so a merged APPROVE completes rather than escalates as a D7-blocked
+            // stall. An outcome is left unset for the PR-state watcher to record `merged`/
+            // `closed_unmerged` (§11). `Some(false)` only: an unreadable store must not complete.
+            if self.manager_pr_open(&row.pr) == Some(false) {
+                self.set_manager_state(row, MANAGER_INTERVENTION_COMPLETE);
+                return;
             }
         }
         // §6.6: a `RERUN_REVIEW`/`ROUTE_TO_AUTHOR` completes when its effect condition is met. An

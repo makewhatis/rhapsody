@@ -2631,6 +2631,51 @@ mod tests {
         );
     }
 
+    // §6.6 (B5): an APPROVE whose pull request MERGES completes, rather than escalating at its 2 h
+    // timeout with a false "did not merge" reason. The watcher retires every live watch row for a
+    // merged pull request, which is the control task's observable signal that the PR left the open
+    // state. MUTATION: ignore the PR state and the row escalates instead of completing.
+    #[test]
+    fn an_approve_completes_when_the_pull_request_merges() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_approved_review(&o, "approve");
+        seed_open_finding(&o, "alice:F1");
+        install_applier(&mut o);
+        let id = launch_running(&mut o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        o.pump_manager_interventions();
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+
+        // The pull request merges: the watcher retires its live watch rows.
+        o.store()
+            .drop_review_watch(&alice_key())
+            .expect("retire the watch row");
+        o.pump_manager_interventions();
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_INTERVENTION_COMPLETE,
+            "a merged APPROVE completes rather than escalating at the timeout"
+        );
+        assert!(
+            !o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped(),
+            "a merge must not stop the generation"
+        );
+    }
+
     // §7.9: a `ROUTE_TO_AUTHOR` activation writes a wake obligation for the ticket, and ordinary
     // selection skips it until the obligation is spent.
     #[test]
