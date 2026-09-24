@@ -21,6 +21,9 @@ impl Store for Noop {
     fn update_run_progress(&self, _run_id: i64, _p: RunProgress) -> Result<(), StoreError> {
         Ok(())
     }
+    fn set_run_tokens(&self, _run_id: i64, _t: &RunTokens) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn append_events(&self, _run_id: i64, _ev: &[EventRow]) -> Result<(), StoreError> {
         Ok(())
     }

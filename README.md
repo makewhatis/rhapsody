@@ -299,7 +299,13 @@ and a refusal gate (`credential_absent`, `credential_denied_or_locked`, `credent
 `binding_mismatch`, `owner_unavailable`, `owner_unauthorized`, `provider_broker_unavailable`,
 `selection_refused`) and creates no workspace, claim, running entry, mailbox, or review-watch row.
 Each turn's usage is replaced from the broker's finalized receipt and persisted as a separate
-`rhapsody_run_usage` row (including a zero-usage cancellation receipt). The frozen reference has no
+`rhapsody_run_usage` row (including a zero-usage cancellation receipt). That replacement covers the
+run's committed token tallies on the `runs` row and the cumulative aggregate on EVERY teardown path,
+including a cancellation (operator Stop, stall kill, terminal reconcile, per-run token ceiling):
+those paths close the run row synchronously with the child's own figure before the receipt arrives,
+so the receipt corrects the already-closed row (and the aggregate) afterwards. A brokered run's child
+figures stay on the running entry for the ceiling/floor but are never folded into the aggregate, so
+the receipt is its single source of truth. The frozen reference has no
 provider broker, so none of this exists in Go; with no `providers:` block the resolver is inert and
 legacy Claude and native-login OpenCode behavior is byte-identical.
 

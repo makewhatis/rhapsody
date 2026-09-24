@@ -111,6 +111,25 @@ pub struct RunProgress {
     pub transcript_path: String,
 }
 
+/// RunTokens rewrites ONLY a run row's token tally columns (plus the estimated flag), leaving its
+/// outcome, timing, transcript and error untouched.
+///
+/// It exists for one Rhapsody-only correction (STUDIO-1047): a brokered run's finalized receipt
+/// arrives AFTER the run row has already been closed with the child's own tallies — every
+/// production cancellation (`terminate` + `persist_end_run`) writes the row synchronously while the
+/// worker's `Event::BrokerUsage` is still in flight. The receipt must be able to replace those
+/// tallies without re-writing (or racing) the run's terminal fields, so this is deliberately a
+/// narrower operation than [`RunEnd`]/[`RunProgress`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunTokens {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    /// Marks the tallies as a floored estimate (see [`RunEnd::usage_estimated`]). A broker receipt
+    /// is always authoritative, so the correction writes `false`.
+    pub usage_estimated: bool,
+}
+
 /// EventRow is a single captured session event. The field names match the history API's wire
 /// shape (Phase 5 /runs/<id>/events => {seq,at,kind,tool,text}).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

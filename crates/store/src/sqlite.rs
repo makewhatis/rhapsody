@@ -980,6 +980,26 @@ impl Store for Sqlite {
         Ok(())
     }
 
+    fn set_run_tokens(&self, run_id: i64, t: &RunTokens) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Only the tally columns: the run's outcome/ended_at/error/transcript are untouched, so a
+        // receipt that arrives after `end_run` closed the row corrects the tokens without re-ending
+        // it (STUDIO-1047).
+        conn.execute(
+            "UPDATE runs
+                SET input_tokens = ?1, output_tokens = ?2, total_tokens = ?3, usage_estimated = ?4
+              WHERE id = ?5",
+            params![
+                t.input_tokens,
+                t.output_tokens,
+                t.total_tokens,
+                t.usage_estimated,
+                run_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError> {
         if ev.is_empty() {
             return Ok(());
@@ -5794,6 +5814,58 @@ mod tests {
             )
             .expect("set usage again");
         assert_eq!(store.run_provenance(with).expect("get"), Some(prov));
+    }
+
+    // STUDIO-1047 (alice's review F3): `set_run_tokens` rewrites ONLY the tally columns of an
+    // already-CLOSED run — a broker receipt that lands after `end_run` corrects the totals without
+    // re-ending the run or disturbing its outcome/error/turns/transcript. MUTATION GUARD: widening
+    // the UPDATE to any end-run column reds the corresponding assertion below.
+    #[test]
+    fn set_run_tokens_rewrites_only_a_closed_runs_tallies() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let id = start_provenance_run(&store, "rewrite");
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_STOPPED.into(),
+                    error: "stopped by user".into(),
+                    turns: 3,
+                    input_tokens: 700,
+                    output_tokens: 300,
+                    total_tokens: 1000,
+                    usage_estimated: true,
+                    transcript_path: "t.jsonl".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+
+        store
+            .set_run_tokens(
+                id,
+                &RunTokens {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 42,
+                    usage_estimated: false,
+                },
+            )
+            .expect("rewrite");
+
+        let runs = store.list_runs(RunFilter::default()).expect("list runs");
+        let r = runs.iter().find(|r| r.id == id).expect("row");
+        assert_eq!(
+            r.total_tokens, 42,
+            "the receipt's total replaces the child's"
+        );
+        assert_eq!(r.input_tokens, 0);
+        assert_eq!(r.output_tokens, 0);
+        assert!(!r.usage_estimated, "a broker receipt is authoritative");
+        assert_eq!(r.outcome, OUTCOME_STOPPED, "the outcome is untouched");
+        assert_eq!(r.error, "stopped by user", "the error is untouched");
+        assert_eq!(r.turns, 3, "the turn count is untouched");
+        assert_eq!(r.transcript_path, "t.jsonl", "the transcript is untouched");
     }
 
     // The stored provenance/usage columns are pinned to exactly the documented, non-secret set
