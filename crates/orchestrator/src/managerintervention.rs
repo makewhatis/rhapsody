@@ -440,19 +440,19 @@ impl Orchestrator {
         let mut routing = ManagerRouting::default();
         for pr in order {
             let kinds = by_pr.remove(&pr).unwrap_or_default();
-            let stopped = self
-                .store()
-                .manager_budget(&pr)
-                .ok()
-                .flatten()
-                .is_some_and(|b| b.is_stopped());
+            let budget = self.store().manager_budget(&pr).ok().flatten();
+            let stopped = budget.as_ref().is_some_and(|b| b.is_stopped());
+            let stop_reason = budget.filter(|b| b.is_stopped()).map(|b| b.stopped);
             let active = self.store().active_manager_intervention(&pr).ok().flatten();
-            // A not-yet-launched intervention (queued/deferred) whose launch a §10.2 gate refuses
-            // stays on the human feed with the manager's wording; a launched one is the manager's.
-            let pre_launch = active.as_ref().is_none_or(|r| {
-                r.state == MANAGER_INTERVENTION_QUEUED || r.state == MANAGER_INTERVENTION_DEFERRED
-            });
-            let surface = if pre_launch {
+            // Every state the pump would still try to launch — `queued`, `deferred`, a
+            // `failed_attempt` or a `stale` row — is one a §10.2 gate can refuse, so the stall stays
+            // on the human feed with the manager's wording. Only an intervention that has actually
+            // LAUNCHED is the manager's to swallow, and its signal is re-detected once it is
+            // terminal.
+            let surfaceable = active
+                .as_ref()
+                .is_none_or(|r| is_launch_candidate(&r.state));
+            let surface = if surfaceable {
                 self.manager_surface_reason(self.manager_gate_env(&pr))
             } else {
                 None
@@ -460,8 +460,13 @@ impl Orchestrator {
             let decision = plan_enqueue(active.as_ref(), stopped, &kinds);
             match decision {
                 EnqueueDecision::Stopped => {
-                    // The generation is stopped; the signal stays on the human feed.
-                    tracing::warn!(pr = %pr, "manager: the generation is stopped; no intervention");
+                    // The generation is stopped: the stall stays on the human feed carrying the stop
+                    // reason (§7.2), so an operator can tell "the manager gave up" from "the manager
+                    // never looked". No log: this branch runs on every sweep while the generation is
+                    // stopped, and the feed row IS the report.
+                    if let Some(reason) = stop_reason {
+                        routing.surfaced.push((pr, reason));
+                    }
                 }
                 EnqueueDecision::ModeOff => {}
                 EnqueueDecision::Drop => {
@@ -1096,13 +1101,16 @@ impl Orchestrator {
                 continue;
             }
             // Re-parse the stored block (a fenced body) so revalidation names the same decision.
+            // `parse_stored_decision` skips the §6.1 open-status rule the block already satisfied
+            // when it was stored, so a `route.fix` revision the author has since resolved revalidates
+            // `stale` (§8.2) instead of failing to parse and pinning the row `validated` forever.
             let wrapped = format!(
                 "```{}\n{}\n```",
                 managerdecision::MANAGER_DECISION_TAG,
                 row.decision_json
             );
             let known = self.manager_known_findings(&row.pr);
-            let Ok(decision) = managerdecision::parse_decision(&wrapped, &known) else {
+            let Ok(decision) = managerdecision::parse_stored_decision(&wrapped, &known) else {
                 continue; // a stored decision that no longer parses is left where it is
             };
             match self.revalidate_manager_decision(&row, &decision) {
@@ -1977,6 +1985,67 @@ mod tests {
         assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_SUPERSEDED);
     }
 
+    // A stored decision that names a finding which is then RESOLVED revalidates `stale` rather than
+    // pinning the row `validated` forever (B6, §7.5/§8.2). Re-parsing the stored block with the
+    // live §6.1 open-status rule fails (`WrongStatusFinding`), the sweep `continue`s, and the active
+    // index is held until an operator `/clear`. MUTATION: parse with `parse_decision` (requiring
+    // open) and this reds — the row stays `validated`.
+    #[test]
+    fn a_resolved_named_finding_makes_a_stored_decision_stale() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let id = launch_running(&mut o);
+        let generation = o
+            .store()
+            .review_bound(PR_KEY)
+            .expect("bound")
+            .expect("row")
+            .generation;
+        o.store()
+            .save_review_finding(rhapsody_store::ReviewFindingRow {
+                pr: PR_KEY.to_string(),
+                generation,
+                reviewer: "alice".to_string(),
+                finding_id: "alice:F1".to_string(),
+                revision: 1,
+                review_run_id: 7,
+                raised_at_sha: "deadbeef".to_string(),
+                blocking: true,
+                status: rhapsody_store::REVIEW_FINDING_OPEN.to_string(),
+                ..rhapsody_store::ReviewFindingRow::default()
+            })
+            .expect("finding");
+        o.store()
+            .set_review_evidence_rev(PR_KEY, 1)
+            .expect("evidence rev");
+        let text = decision_text(
+            r#"{"decision":"ROUTE_TO_AUTHOR","head":"deadbeef","evidence_rev":1,
+                "route":{"fix":[{"finding":"alice:F1","revision":1}],"instructions":"fix it"},
+                "rationale":"the finding needs code"}"#,
+        );
+        o.settle_manager_intervention("pr:makewhatis/rhapsody#12@manager", &exit_with(Some(&text)));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_VALIDATED);
+
+        // The author fixes the finding: it resolves and the finding-set change moves evidence_rev.
+        o.store()
+            .resolve_review_findings(PR_KEY, generation, "alice", "run-9")
+            .expect("resolve");
+        o.store()
+            .set_review_evidence_rev(PR_KEY, 2)
+            .expect("evidence rev moved");
+
+        // Isolate the revalidation from the relaunch: no concurrent slot, so a `stale` row stays put.
+        o.teams.as_mut().expect("teams").manager.max_concurrent = 0;
+        o.pump_manager_interventions();
+        assert_eq!(
+            state_of(&o, &id),
+            MANAGER_INTERVENTION_STALE,
+            "a resolved named finding makes the stored decision stale"
+        );
+    }
+
     // --- deferral visibility (B2) --------------------------------------------------------------
 
     // A drain defers the launch, and the stall STAYS on the human feed with the manager's wording
@@ -2014,6 +2083,74 @@ mod tests {
                 "manager unavailable: CLI contract".to_string()
             )]
         );
+    }
+
+    // A retry the self-test gate refuses is surfaced on the human feed, not silently adopted
+    // (B2a): a `failed_attempt` is a launch candidate, so a refused relaunch is the manager's
+    // deferral to show, exactly as a never-launched row's is. MUTATION: treat only queued/deferred
+    // as pre-launch for surfacing and this reds (the relaunch is adopted and the stall disappears).
+    #[test]
+    fn a_refused_relaunch_stays_on_the_human_feed() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        let id = launch_running(&mut o);
+        // The run ended with an invalid block: a `failed_attempt`, which the pump would relaunch.
+        o.store()
+            .set_manager_intervention_state(&id, MANAGER_INTERVENTION_FAILED_ATTEMPT)
+            .expect("failed attempt");
+        // The §4.7 self-test now refuses the CLI contract, so the relaunch cannot proceed.
+        o.manager_selftest.record(SelfTestRecord {
+            cli_version: test_cli_version(),
+            verdict: SelfTestVerdict::Failed(crate::managerselftest::ManagerUnavailable {
+                cli_version: test_cli_version(),
+                detail: "Bash succeeded".to_string(),
+            }),
+        });
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(
+            routing.adopted.is_empty(),
+            "a refused relaunch is never silently adopted"
+        );
+        assert_eq!(
+            routing.surfaced,
+            vec![(
+                PR_KEY.to_string(),
+                "manager unavailable: CLI contract".to_string()
+            )]
+        );
+    }
+
+    // A stopped generation is on the human feed WITH its reason (§7.2): the operator can tell "the
+    // manager gave up" from "the manager never looked". MUTATION: push neither adopted nor surfaced
+    // on a stop and the row keeps its generic detail with no reason.
+    #[test]
+    fn a_stopped_generation_stays_on_the_human_feed_with_its_reason() {
+        let (o, _) = orch(ReviewAuthority::Act);
+        let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
+        o.route_stalls_to_manager(&found);
+        let id = active(&o).expect("row").id;
+        o.store()
+            .stop_manager_intervention(
+                &id,
+                rhapsody_store::MANAGER_INTERVENTION_EXHAUSTED,
+                "manager generation run budget exhausted",
+            )
+            .expect("stop");
+        let routing = o.route_stalls_to_manager(&found);
+        assert!(
+            routing.adopted.is_empty(),
+            "a stopped generation adopts nothing"
+        );
+        assert_eq!(
+            routing.surfaced,
+            vec![(
+                PR_KEY.to_string(),
+                "manager generation run budget exhausted".to_string()
+            )]
+        );
+        assert!(active(&o).is_none(), "no new intervention is created");
     }
 
     // A budget-exhausted manager surfaces the budget wording.
@@ -2256,7 +2393,15 @@ mod tests {
                 .is_stopped()
         );
         let routing = o.route_stalls_to_manager(&found);
-        assert!(routing.adopted.is_empty() && routing.surfaced.is_empty());
+        assert!(
+            routing.adopted.is_empty(),
+            "a stopped generation adopts nothing"
+        );
+        assert_eq!(
+            routing.surfaced,
+            vec![(PR_KEY.to_string(), "an effect failed".to_string())],
+            "the stall stays on the feed carrying the stop reason (§7.2)"
+        );
         assert!(active(&o).is_none(), "no new intervention is created");
     }
 
