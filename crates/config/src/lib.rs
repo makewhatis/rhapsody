@@ -28,6 +28,7 @@ pub mod room;
 pub mod routing;
 pub mod teams;
 pub mod validate;
+pub mod warnings;
 pub mod workflow;
 
 pub use decode::{ConfigError, decode};
@@ -53,3 +54,4 @@ pub use providers::{
 };
 pub use resolve::{Resolved, resolve};
 pub use validate::{ValidationError, validate, validate_providers_only};
+pub use warnings::{LegacyWarning, legacy_warnings};

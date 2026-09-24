@@ -350,7 +350,52 @@ authoritative design is `~/.rhapsody/docs/provider-broker-design.md` §1.2/§9.4
   response. Generic provider usage is labelled `provider_reported_unverified` and is never presented
   as exact measured usage.
 
-### Honest history paging + store-computed dashboard aggregates (TRA-320)
+### Migration diagnostics — `rhapsodyd doctor` and legacy config warnings (STUDIO-994)
+
+The provider feature is a migration, not a flag day: `provider-auth-design.md` §7 requires existing
+installs to keep working with no `providers:` block and requires that config warnings "identify
+legacy fields and suggest the new form **without rewriting the operator's workflow automatically**".
+Two additive, Rhapsody-only surfaces implement that (no Go counterpart — the frozen reference has no
+provider registry to migrate to):
+
+```text
+rhapsodyd doctor [WORKFLOW.md]        diagnose the resolved workflow (never rewrites it)
+```
+
+The doctor runs the SAME `load → decode → resolve → validate` pipeline the daemon runs at boot and
+prints: whether the workflow loaded (or defaults were used) and whether it validates; the resolved
+`agent.backend` and `agent.provider`/`agent.model`; every configured provider with its `protocol`,
+credential storage **kind** (never a value), `insecure_http` policy, and canonical non-secret
+credential binding; the compiled-in managed-OpenCode compatibility versions; and the migration
+warnings. It is READ-ONLY — it never writes the workflow, a sidecar, or a credential — and it never
+reads a credential: live per-provider credential **status** is the running daemon's
+`GET /api/v1/providers` surface (desktop-owner mediated), and the doctor says so. Exit code is 0 for a
+valid config and 1 for one the daemon's preflight would refuse; the refusal reason is printed in the
+report, so a broken config is diagnosed rather than hidden.
+
+`rhapsody_config::legacy_warnings` is the same scan as a library function. It is a pure, read-only
+borrow of the resolved config (it never mutates or persists) and emits nothing for a default config,
+so an install that never wrote the new keys is byte-identical to one built before this existed. The
+warnings are:
+
+- `legacy_opencode_auth_source` — `opencode.auth_source` is the legacy native-login path (unchanged;
+  see the design's §4.3); suggests a `providers:` entry plus `agent.provider`/`agent.model`.
+- `legacy_opencode_backend` — `agent.backend: opencode` with no `agent.provider` stays on that path.
+- `legacy_model_provider_prefix` — an `opencode.model` `provider/model` prefix that exactly matches a
+  configured provider may seed `agent.provider`; an unmatched prefix is left to dispatch's typed
+  refusal, never guessed at here.
+- `providers_ignored_for_non_opencode_backend` — explicit providers are OpenCode-only in v1, so a
+  non-OpenCode backend that defines them is told they are inert.
+- `deprecated_handoff_drain_grace_ms` — a non-default `agent.handoff_drain_grace_ms` is the INF-266
+  no-op it has been since that change.
+
+With no `providers:` block, no `agent.provider`, and no legacy auth spelling, the migration lane is
+exactly the legacy no-provider parity path: the existing config goldens, the no-provider daemon boot,
+and native-login OpenCode behavior are unchanged. The security guarantee and its residual risk are
+the section above; the doctor reports the *configuration* that guarantee is built from and makes no
+new claim about it.
+
+
 
 Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies
 `defaultRunLimit = 50` whenever the caller sends none. A request with no `limit` therefore returns a
