@@ -252,6 +252,31 @@ impl Manager {
         Ok(GrepRead { text, truncated })
     }
 
+    /// The commit sha the bare mirror's default remote branch points at — the pull request's usual
+    /// base. `origin/HEAD` when the mirror records it, else `origin/main`, else `origin/master`. The
+    /// revs are daemon-chosen constants (never caller input), so none can name a revision
+    /// expression.
+    pub async fn default_base_sha(&self, repo_url: &str) -> Result<String, ReadError> {
+        let mirror = self.mirror_dir(repo_url);
+        for rev in [
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/master",
+        ] {
+            let expr = format!("{rev}^{{commit}}");
+            let (out, err) = self.git(&mirror, &["rev-parse", "--verify", &expr]).await;
+            if err.is_none() {
+                let s = out.trim();
+                if is_commit_sha(s) {
+                    return Ok(s.to_string());
+                }
+            }
+        }
+        Err(ReadError::Git(
+            "the mirror has no default branch to use as a base".to_string(),
+        ))
+    }
+
     /// The merge base of two commits, from the bare mirror.
     pub async fn merge_base(&self, repo_url: &str, a: &str, b: &str) -> Result<String, ReadError> {
         if !is_commit_sha(a) || !is_commit_sha(b) {
