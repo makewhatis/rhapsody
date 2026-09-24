@@ -434,7 +434,10 @@ async fn the_brokered_daemon_chain_is_canary_clean_at_every_boundary() {
         model: MODEL.to_string(),
         origins: rhapsody_agent::ProviderOrigins::default(),
     };
-    let source = DaemonProviderSource::new(resolver, runtime.registrar());
+    let day_authority: Arc<dyn rhapsody_provider_broker::CumulativeBudgetAuthority> = Arc::new(
+        rhapsodyd::providerbudget::StoreDayAuthority::new(Arc::new(rhapsody_store::Noop), false),
+    );
+    let source = DaemonProviderSource::new(resolver, runtime.registrar(), day_authority);
     let opened = source
         .open_provider(&plan)
         .await

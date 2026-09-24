@@ -48,7 +48,12 @@ async fn a_no_owner_launch_refuses_and_mints_no_broker_session() {
         "a fresh broker holds no session"
     );
 
-    let source = DaemonProviderSource::new(unavailable_owner(), runtime.registrar());
+    let day_authority: std::sync::Arc<dyn rhapsody_provider_broker::CumulativeBudgetAuthority> =
+        std::sync::Arc::new(rhapsodyd::providerbudget::StoreDayAuthority::new(
+            std::sync::Arc::new(rhapsody_store::Noop),
+            false,
+        ));
+    let source = DaemonProviderSource::new(unavailable_owner(), runtime.registrar(), day_authority);
     let err = source
         .open_provider(&plan())
         .await
