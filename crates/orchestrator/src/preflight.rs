@@ -124,22 +124,35 @@ pub(crate) fn backend_has_probe(backend: &str) -> bool {
     backend == "claude"
 }
 
+/// The gh credentials a MANAGER child must never see (STUDIO-1014, design §4.5). The host serves
+/// every `gh` read for the manager, so the run has no business holding a GitHub token: dropping
+/// them here is the "cannot use it to act" half of the boundary.
+pub(crate) const MANAGER_GH_ENV_VARS: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+
 /// The scrubbed environment the credential probe runs with: identical to the per-turn scrub the claude
 /// runner applies to its children (`runner.rs`) — the tracker vars are ALWAYS dropped (by name and by
 /// value) and the billing/routing vars are dropped when the guard is on — MINUS the per-issue "me"
 /// identity, which a credential probe has no issue for. Reusing the runner's exact `scrub_env` +
 /// `scrubbed_env_vars` + `TRACKER_ENV_VARS` primitives guarantees the probe authenticates via the SAME
 /// credential path the dispatched children do.
+///
+/// `manager_role` additionally drops [`MANAGER_GH_ENV_VARS`] (STUDIO-1014, §4.5): the manager has no
+/// `gh`, so no GitHub token may reach its environment. `false` for every non-manager caller keeps
+/// the existing env byte-identical.
 pub(crate) fn scrub_child_env(
     base_env: &[String],
     billing_guard: bool,
     tracker_api_key: &str,
+    manager_role: bool,
 ) -> Vec<String> {
-    let drop_names: Vec<&str> = if billing_guard {
+    let mut drop_names: Vec<&str> = if billing_guard {
         scrubbed_env_vars()
     } else {
         TRACKER_ENV_VARS.to_vec()
     };
+    if manager_role {
+        drop_names.extend(MANAGER_GH_ENV_VARS);
+    }
     scrub_env(base_env, &drop_names, &[tracker_api_key])
 }
 
@@ -174,7 +187,7 @@ impl CredentialProbe for ClaudeCredentialProbe {
                 ));
             }
         };
-        let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key);
+        let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key, false);
 
         let mut cmd = tokio::process::Command::new(&name);
         cmd.args(&base_args);
@@ -429,7 +442,7 @@ mod tests {
             "ANTHROPIC_AUTH_TOKEN=tok".to_string(),
             "LINEAR_API_KEY=lin".to_string(),
         ];
-        let scrubbed = scrub_child_env(&base, true, "");
+        let scrubbed = scrub_child_env(&base, true, "", false);
         let names = names_of(&scrubbed);
         assert!(
             !names.contains(&"CLAUDE_CODE_OAUTH_TOKEN"),
@@ -452,7 +465,7 @@ mod tests {
             "MY_CUSTOM_TOKEN=lin".to_string(), // same value as the tracker key → dropped by value
             "KEEP=ok".to_string(),
         ];
-        let scrubbed = scrub_child_env(&base, false, "lin");
+        let scrubbed = scrub_child_env(&base, false, "lin", false);
         let names = names_of(&scrubbed);
         assert!(
             names.contains(&"CLAUDE_CODE_OAUTH_TOKEN"),
@@ -467,6 +480,35 @@ mod tests {
             "the tracker key is withheld by value even under a custom var name"
         );
         assert!(names.contains(&"KEEP"));
+    }
+
+    // STUDIO-1014 §4.5: a manager child additionally loses its GitHub tokens (the host serves gh).
+    #[test]
+    fn scrub_child_env_manager_drops_gh_tokens() {
+        let base = vec![
+            "PATH=/usr/bin".to_string(),
+            "GH_TOKEN=ghs_x".to_string(),
+            "GITHUB_TOKEN=ghp_y".to_string(),
+            "CLAUDE_CODE_OAUTH_TOKEN=secret".to_string(),
+            "KEEP=ok".to_string(),
+        ];
+        let scrubbed = scrub_child_env(&base, true, "", true);
+        let names = names_of(&scrubbed);
+        assert!(
+            !names.contains(&"GH_TOKEN"),
+            "manager run must not hold GH_TOKEN"
+        );
+        assert!(
+            !names.contains(&"GITHUB_TOKEN"),
+            "manager run must not hold GITHUB_TOKEN"
+        );
+        assert!(
+            names.contains(&"KEEP"),
+            "unrelated vars still survive the manager scrub"
+        );
+        // A non-manager caller keeps them (byte-identical to before this ticket).
+        let ordinary = scrub_child_env(&base, true, "", false);
+        assert!(names_of(&ordinary).contains(&"GH_TOKEN"));
     }
 
     // --- production verdict derivation: exit code + stdout → verdict (requirement 1's real path) ----
