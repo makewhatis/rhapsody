@@ -313,6 +313,11 @@ where
         prep_owner,
         broker_runtime.registrar(),
     ));
+    // The SAME off-loop credential/broker source serves the Teams manager's model turn (STUDIO-989,
+    // P8): a manager with an explicit provider opens its OWN custody through this source, exactly as
+    // a ticket dispatch does. Cloned before `prep_source` moves into the dispatch resolver below.
+    let manager_source: Arc<dyn rhapsody_orchestrator::PreparedProviderSource> =
+        Arc::clone(&prep_source) as _;
     o.set_preparation_resolver(Arc::new(
         rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
     ));
@@ -808,6 +813,41 @@ where
         let ears_handle = handle.clone();
         let knowledge_handle = handle.clone();
         let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
+        // --- the manager's OWN resolved tuple (STUDIO-989, P8) ---
+        //
+        // Per parent decision D6 the manager's harness/provider/model are its own: an absent
+        // `manager.harness` means `claude` and an absent `manager.model` preserves the CLI default —
+        // never a teammate's tuple, never `claude.model`, never `agent.backend`. An explicit
+        // non-Claude harness must name provider and model, or the resolution refuses; every manager
+        // turn then fails and the ticket is assigned deterministically rather than falling back to
+        // another harness/provider/auth source. An explicit provider opens its OWN broker session
+        // through the SAME off-loop PB7 source ticket dispatch uses — never a teammate's grant.
+        let manager_arbiter: Arc<rhapsody_orchestrator::ManagerArbiter> = match resolved.as_ref() {
+            Some(cfg) => {
+                let manager = rhapsody_orchestrator::selection::FieldSelection {
+                    harness: teams_cfg.manager.harness.clone(),
+                    provider: teams_cfg.manager.provider.clone(),
+                    model: teams_cfg.manager.model.clone(),
+                };
+                Arc::new(rhapsody_orchestrator::ManagerArbiter::from_config(
+                    &manager,
+                    &cfg.providers,
+                    rhapsody_config::providers::provider_turn_deadline_ms(
+                        cfg.opencode.turn_timeout_ms,
+                    ),
+                    Some(Arc::clone(&manager_source)),
+                    cfg,
+                ))
+            }
+            // Teams cannot be on without a readable workflow, so this arm is unreachable in
+            // production; it exists so the type is never built from an assumed config.
+            None => Arc::new(rhapsody_orchestrator::ManagerArbiter::new(
+                Err(rhapsody_orchestrator::selection::SelectionRefusal::MissingHarness),
+                Some(Arc::clone(&manager_source)),
+                None,
+                String::new(),
+            )),
+        };
         // ONE `gh` for both of the task's GitHub directions, built here rather than inside the
         // `ears` closure so the manager's answer path can share it: it holds a summon token and
         // nothing else, and a second handle would be a second place for that token to be read.
@@ -848,7 +888,9 @@ where
                     snap, slugs,
                 ))
             },
-            arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+            // The manager's model turn now runs through its OWN resolved tuple and the shared
+            // provider-preparation path (STUDIO-989, P8) instead of the hardcoded Claude subprocess.
+            arbiter: Arc::clone(&manager_arbiter) as Arc<dyn rhapsody_orchestrator::TriageArbiter>,
             agent_command: command,
             billing_guard,
             tracker_api_key,
@@ -937,7 +979,8 @@ where
                     Arc::new(
                         rhapsody_orchestrator::teamsears::Ears::new(
                             cursor,
-                            Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+                            Arc::clone(&manager_arbiter)
+                                as Arc<dyn rhapsody_orchestrator::teamsears::RoomArbiter>,
                         )
                         .with_github(Arc::clone(&gh) as _, gh as _)
                         // The live-run mailbox (§6.2). Through the `ControlHandle` seam, so the
