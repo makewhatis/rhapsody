@@ -2692,7 +2692,12 @@ impl Orchestrator {
                 // sweep. Only a row the pull request has ROOM for but no substitute can serve is
                 // retired here, which is what keeps a lowered `review.reviewers` from
                 // re-inflating and an off-roster row from pinning a review forever.
-                if working.len() > effective {
+                //
+                // A `review.required` pin is NOT deferred: rule 2 ranks it above everything but a
+                // running row, so leaving it here would keep an off-roster pin live and block the
+                // pull request rather than trimming it. Required semantics are STUDIO-1022's and
+                // are left exactly as they were.
+                if working.len() > effective && !required.contains(name) {
                     continue;
                 }
                 retires.push(ReconcileRetire {
