@@ -33,7 +33,9 @@ use rhapsody_orchestrator::selection::{
     resolve_selection,
 };
 
-use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
+use crate::bootcfg::{
+    resolve_manager_rules_path, resolve_profiles_dir, resolve_room_dir, resolve_teams_path,
+};
 
 /// How many room messages `teams show` prints when `--room` is not given
 /// (STUDIO-670). A glance, not a catch-up: the dashboard (STUDIO-652) is where
@@ -101,11 +103,18 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
     // which is also the only case where the backend is unavailable — so a successful resolve
     // always carries one.
     let cfg = load_config(getenv);
-    let (teams_path, profiles_dir, room_dir) = resolve_paths(cfg.as_ref())?;
+    let (teams_path, profiles_dir, room_dir, rules_path) = resolve_paths(cfg.as_ref())?;
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
-        "show" => show(rest, &teams_path, &profiles_dir, &room_dir, cfg.as_ref()),
+        "show" => show(
+            rest,
+            &teams_path,
+            &profiles_dir,
+            &room_dir,
+            &rules_path,
+            cfg.as_ref(),
+        ),
         "fork" => fork(rest, &profiles_dir),
         "" => Err("usage: rhapsodyd teams <show|fork> <name>".to_string()),
         other => Err(format!(
@@ -124,14 +133,17 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
 /// `teams fork` quietly creating directories in whatever directory the operator
 /// happened to be standing in, which is exactly the kind of surprise write §4's
 /// read-only posture exists to avoid.
-fn resolve_paths(cfg: Option<&Config>) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    // All three anchor to the same runtime home, so they resolve or fail together.
+fn resolve_paths(cfg: Option<&Config>) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
+    // All four anchor to the same runtime home, so they resolve or fail together.
     match (
         resolve_teams_path(cfg, "", false),
         resolve_profiles_dir(cfg, "", false),
         resolve_room_dir(cfg, "", false),
+        resolve_manager_rules_path(cfg, "", false),
     ) {
-        (Some(teams), Some(profiles), Some(room)) => Ok((teams, profiles, room)),
+        (Some(teams), Some(profiles), Some(room), Some(rules)) => {
+            Ok((teams, profiles, room, rules))
+        }
         _ => Err(
             "no Rhapsody runtime home to read profiles from: the workflow does not decode, or \
              storage.path is `off`/`:memory:`. Point SYMPHONY_WORKFLOW at a workflow with an \
@@ -167,6 +179,7 @@ fn show(
     teams_path: &Path,
     profiles_dir: &Path,
     room_dir: &Path,
+    rules_path: &Path,
     cfg: Option<&Config>,
 ) -> Result<String, String> {
     let (name, room_tail) = parse_show_args(args)?;
@@ -192,8 +205,16 @@ fn show(
         Some(i) => i.profile.clone(),
         None => name.clone(),
     };
-    let resolved =
-        profiles::resolve(profiles_dir, &profile_name).map_err(|e| format!("{name}: {e}"))?;
+    // The manager is the daemon's own built-in identity (STUDIO-1013): its prompt is the built-in
+    // `manager` profile with the maintainer's standing rules rendered into it as policy, and
+    // `show` is the one command that answers "what prompt does it actually get". Every other
+    // profile resolves unchanged.
+    let resolved = if profile_name == rhapsody_config::manager::MANAGER_PROFILE {
+        rhapsody_config::manager::resolve_prompt(profiles_dir, rules_path)
+    } else {
+        profiles::resolve(profiles_dir, &profile_name)
+    }
+    .map_err(|e| format!("{name}: {e}"))?;
     // Teams off has no room to speak of, so its report is byte-identical to the
     // one this command printed before the section existed (STUDIO-670).
     //
@@ -986,6 +1007,36 @@ mod tests {
             "out = {out}"
         );
         assert!(!profiles_dir.exists(), "show must not create the dir");
+    }
+
+    /// STUDIO-1013: `teams show manager` resolves the built-in manager identity and renders the
+    /// maintainer's `manager-rules.md` into its prompt as policy. No rules file means the built-in
+    /// profile alone — the optional feature's off state.
+    #[test]
+    fn show_manager_renders_the_maintainer_rules_as_policy() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        let teams_dir = dir.child("teams");
+        std::fs::create_dir_all(&teams_dir).expect("teams dir");
+        std::fs::write(
+            teams_dir.join("manager-rules.md"),
+            "Escalate to the maintainer after three rounds.\n",
+        )
+        .expect("write rules");
+
+        let out = run(&["show", "manager"], &env[0]).expect("show manager");
+        assert!(
+            out.contains(rhapsody_config::manager::POLICY_HEADING),
+            "the policy heading must be rendered: {out}"
+        );
+        assert!(
+            out.contains("Escalate to the maintainer after three rounds."),
+            "the rule text must reach the resolved prompt: {out}"
+        );
+        assert!(
+            out.contains("You are the manager."),
+            "the built-in manager profile must be the base: {out}"
+        );
     }
 
     // ── review model/effort visibility (STUDIO-901, ticket §4) ──────────────

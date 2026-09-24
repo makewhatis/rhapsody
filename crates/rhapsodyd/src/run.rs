@@ -402,6 +402,10 @@ where
                 rhapsody_config::teams::Teams::disabled()
             }
         };
+        // STUDIO-1013: `manager.review_authority` other than `off` requires durable storage. Applied
+        // BEFORE the config is injected/cloned anywhere, so every consumer sees the effective
+        // authority and the Noop store can never accept `act`.
+        enforce_manager_storage_requirement(&mut teams_cfg, durable_store);
         o.teams = Some(teams_cfg.clone());
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
@@ -2059,6 +2063,31 @@ fn install_teams_memory(
     wiring
 }
 
+/// Applies the §12 durable-storage requirement for `manager.review_authority` (STUDIO-1013).
+///
+/// Anything but `off` needs durable storage; with the Noop store the key is refused and forced
+/// back to `off`, with ONE loud line saying why. The write-back is deliberate rather than a
+/// caller-side check: every consumer of the authority (`manager_review_authority`) reads the
+/// field, so forcing it here is what makes "the Noop store cannot accept `act`" true for all of
+/// them at once. `off` needs nothing and warns nothing (the byte-identical default).
+fn enforce_manager_storage_requirement(
+    teams: &mut rhapsody_config::teams::Teams,
+    durable_store: bool,
+) {
+    use rhapsody_config::teams::ReviewAuthority;
+    if durable_store || teams.manager.review_authority == ReviewAuthority::Off {
+        return;
+    }
+    tracing::warn!(
+        review_authority = ?teams.manager.review_authority,
+        "manager.review_authority is set but this daemon has no durable store (--no-store, \
+         storage.path off/:memory:, or a failed open): the manager's exchange authorizations are \
+         persisted, so the authority is refused and falls back to `off`. Point storage.path at an \
+         on-disk database to use it."
+    );
+    teams.manager.review_authority = ReviewAuthority::Off;
+}
+
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
     let Some(teams) = teams else { return };
     if teams.enabled
@@ -2295,6 +2324,48 @@ mod tests {
     }
 
     const OFF_STORAGE: &str = "storage:\n  path: \"off\"\n";
+
+    /// STUDIO-1013 (§12): `manager.review_authority` is refused and forced back to `off` when the
+    /// daemon has no durable store. The mutation this pins — accepting `act` with the Noop store —
+    /// turns the first assertion red.
+    #[test]
+    fn manager_review_authority_is_refused_without_a_durable_store() {
+        use rhapsody_config::teams::{Manager, Review, ReviewAuthority, ReviewMode, Teams};
+        let mut t = Teams {
+            enabled: true,
+            manager: Manager {
+                review_authority: ReviewAuthority::Act,
+                ..Manager::default()
+            },
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            ..Teams::default()
+        };
+        enforce_manager_storage_requirement(&mut t, false);
+        assert_eq!(
+            t.manager.review_authority,
+            ReviewAuthority::Off,
+            "act must be refused without durable storage"
+        );
+
+        // With a durable store the key is left exactly as written.
+        let mut t = Teams {
+            enabled: true,
+            manager: Manager {
+                review_authority: ReviewAuthority::Act,
+                ..Manager::default()
+            },
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            ..Teams::default()
+        };
+        enforce_manager_storage_requirement(&mut t, true);
+        assert_eq!(t.manager.review_authority, ReviewAuthority::Act);
+    }
 
     // TRA-267: `resolve_boot_logdir` returns the configured `logging.dir` when the workflow resolves,
     // and falls back to the resolved `~/.rhapsody/logs` default when the config path is bad/missing.
