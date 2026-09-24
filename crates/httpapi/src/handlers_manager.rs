@@ -79,6 +79,11 @@ fn render(outcome: Result<serde_json::Value, ManagerReadError>) -> Response {
         Err(ManagerReadError::Unavailable(why)) => {
             write_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable", why, None)
         }
+        // The host's own `gh` could not answer: a gateway failure, not a not-found. A refusal to
+        // answer must never read as "the read found nothing".
+        Err(e @ ManagerReadError::Gh(_)) => {
+            write_error(StatusCode::BAD_GATEWAY, e.code(), e.message(), None)
+        }
         // A host git read (or a store read): its own code carries the meaning, so the status is
         // derived from the SAME code the tool sees rather than from a second mapping that can drift.
         Err(e @ ManagerReadError::Read(_)) | Err(e @ ManagerReadError::Store(_)) => {
@@ -399,6 +404,22 @@ mod tests {
         assert_eq!(resp.status(), 503);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], "unavailable");
+    }
+
+    // The host's own `gh` could not answer: a 502 gateway failure with its own code, never a 200
+    // that reads as "the read found nothing".
+    #[tokio::test]
+    async fn a_gh_failure_is_a_502_with_its_own_code() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_manager_outcome(Err(
+            ManagerReadError::Gh("gh pr view 7 --repo o/r: HTTP 502".to_string()),
+        )));
+        let url = spawn(provider).await;
+        let resp = reqwest::get(format!("{url}/api/v1/manager/pr?run_id=7"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 502);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "gh_failed");
     }
 
     // The routes are GET-only: a POST is a 405, not the SPA fallback.

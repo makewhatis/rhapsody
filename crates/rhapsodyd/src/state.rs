@@ -492,6 +492,20 @@ impl StateProvider for DaemonState {
         self.handle.manager_findings(run_id).await
     }
 
+    // The manager's pull-request reads run on the host's own off-loop `gh` (§4.4); the coordinate
+    // is the run's own, resolved on the handle exactly as the git reads' is.
+    async fn manager_pr(&self, run_id: i64) -> ManagerReadOutcome {
+        self.handle.manager_pr(run_id).await
+    }
+
+    async fn manager_pr_activity(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.handle.manager_pr_activity(run_id, &since).await
+    }
+
+    async fn manager_pr_commits(&self, run_id: i64, since: String) -> ManagerReadOutcome {
+        self.handle.manager_pr_commits(run_id, &since).await
+    }
+
     fn teams_config_path(&self) -> &str {
         &self.teams_config_path
     }

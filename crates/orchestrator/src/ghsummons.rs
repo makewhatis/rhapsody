@@ -1377,34 +1377,7 @@ impl PrChecksSource for GH {
                 format!("decode gh pr view {num} --repo {slug}: {e}").into()
             },
         )?;
-        let Some(rollup) = pr
-            .get("statusCheckRollup")
-            .and_then(serde_json::Value::as_array)
-        else {
-            return Ok(Vec::new());
-        };
-        Ok(rollup
-            .iter()
-            .filter_map(|c| {
-                let name = str_field(c, "name")
-                    .or_else(|| str_field(c, "context"))
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    return None;
-                }
-                // `conclusion` first: a completed check run carries BOTH, and `status` would say
-                // `COMPLETED` for a failure. `state` is the status-context spelling of the same
-                // thing.
-                let state = str_field(c, "conclusion")
-                    .or_else(|| str_field(c, "status"))
-                    .or_else(|| str_field(c, "state"))
-                    .unwrap_or_default();
-                Some(CheckRun {
-                    name,
-                    state: state.to_ascii_uppercase(),
-                })
-            })
-            .collect())
+        Ok(parse_check_rollup(&pr))
     }
 }
 
@@ -1414,6 +1387,269 @@ impl PrChecksSource for GH {
 fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
     let s = v.get(key).and_then(serde_json::Value::as_str)?.trim();
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The status-check rollup of a `gh pr view --json statusCheckRollup` body, normalized to
+/// [`CheckRun`]s. Shared by [`PrChecksSource::pr_checks`] and [`ManagerGhSource::manager_pr`] so
+/// the two readings of the same GitHub field cannot drift.
+fn parse_check_rollup(pr: &serde_json::Value) -> Vec<CheckRun> {
+    let Some(rollup) = pr
+        .get("statusCheckRollup")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    rollup
+        .iter()
+        .filter_map(|c| {
+            let name = str_field(c, "name")
+                .or_else(|| str_field(c, "context"))
+                .unwrap_or_default();
+            if name.is_empty() {
+                return None;
+            }
+            // `conclusion` first: a completed check run carries BOTH, and `status` would say
+            // `COMPLETED` for a failure. `state` is the status-context spelling of the same thing.
+            let state = str_field(c, "conclusion")
+                .or_else(|| str_field(c, "status"))
+                .or_else(|| str_field(c, "state"))
+                .unwrap_or_default();
+            Some(CheckRun {
+                name,
+                state: state.to_ascii_uppercase(),
+            })
+        })
+        .collect()
+}
+
+/// The fallible result of a [`ManagerGhSource`] read.
+pub type ManagerGhResult = Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The host's own off-loop `gh` reads for a manager run (STUDIO-1014; design record
+/// `manager-agent-design.md` §4.4). **No Go counterpart.**
+///
+/// This is the ONE place the manager's pull-request reads reach GitHub: a manager run has no `gh`
+/// and no network, so the daemon answers instead (§4.2, §4.3). Every call goes through
+/// [`GH::run_off_task`], so it is bounded by [`GH_EXEC_TIMEOUT`] and runs on the blocking pool, and
+/// every returned list is additionally bounded in COUNT by [`MAX_MANAGER_PR_ITEMS`] and says so
+/// when it cuts.
+///
+/// Object-safe, so it is declared via `async_trait`.
+#[async_trait]
+pub trait ManagerGhSource: Send + Sync {
+    /// The pull request's head, base, state, draft, mergeable and the checks at head.
+    async fn manager_pr(&self, owner: &str, repo: &str, number: i64) -> ManagerGhResult;
+    /// Comments and reviews created after `since` (an RFC3339 timestamp; empty ⇒ all).
+    async fn manager_pr_activity(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        since: &str,
+    ) -> ManagerGhResult;
+    /// Commits after `since` (a sha; empty ⇒ all), oldest first.
+    async fn manager_pr_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        since: &str,
+    ) -> ManagerGhResult;
+}
+
+/// The most items any one manager pull-request read returns. Beyond it the read is cut and the body
+/// carries `"truncated": true`, so the model can tell a short answer from a cut one.
+pub const MAX_MANAGER_PR_ITEMS: usize = 200;
+
+/// Rejects an incomplete coordinate the way the module's other reads do — a nameless pull request
+/// cannot be looked up.
+fn manager_gh_coordinate(
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if owner.is_empty() || repo.is_empty() || number <= 0 {
+        return Err(
+            format!("gh manager read: incomplete coordinate {owner}/{repo}#{number}").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Keeps only the entries of `items` whose `createdAt` is strictly after `since` (all when `since`
+/// is empty), capped at [`MAX_MANAGER_PR_ITEMS`]. Returns the kept slice and whether it was cut.
+fn newer_than(items: Option<&serde_json::Value>, since: &str) -> (Vec<serde_json::Value>, bool) {
+    let empty = Vec::new();
+    let all = items
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let mut kept: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|it| {
+            since.is_empty()
+                || str_field(it, "createdAt").is_none_or(|created| created.as_str() > since)
+        })
+        .cloned()
+        .collect();
+    let truncated = kept.len() > MAX_MANAGER_PR_ITEMS;
+    kept.truncate(MAX_MANAGER_PR_ITEMS);
+    (kept, truncated)
+}
+
+#[async_trait]
+impl ManagerGhSource for GH {
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json
+    /// headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup`.
+    async fn manager_pr(&self, owner: &str, repo: &str, number: i64) -> ManagerGhResult {
+        manager_gh_coordinate(owner, repo, number)?;
+        let num = number.to_string();
+        let slug = format!("{owner}/{repo}");
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup",
+        ];
+        let body = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug}: {e}").into()
+            })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        let checks: Vec<serde_json::Value> = parse_check_rollup(&pr)
+            .into_iter()
+            .map(|c| serde_json::json!({ "name": c.name, "state": c.state }))
+            .collect();
+        Ok(serde_json::json!({
+            "head": str_field(&pr, "headRefOid").unwrap_or_default(),
+            "base": str_field(&pr, "baseRefName").unwrap_or_default(),
+            "state": str_field(&pr, "state").unwrap_or_default(),
+            "draft": pr.get("isDraft").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            "mergeable": str_field(&pr, "mergeable").unwrap_or_default(),
+            "merge_state": str_field(&pr, "mergeStateStatus").unwrap_or_default(),
+            "checks": checks,
+        }))
+    }
+
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json comments,reviews`, filtered to
+    /// entries created after `since`.
+    async fn manager_pr_activity(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        since: &str,
+    ) -> ManagerGhResult {
+        manager_gh_coordinate(owner, repo, number)?;
+        let num = number.to_string();
+        let slug = format!("{owner}/{repo}");
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "comments,reviews",
+        ];
+        let body = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug} --json comments,reviews: {e}").into()
+            })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        let (comments, cut_comments) = newer_than(pr.get("comments"), since);
+        let (reviews, cut_reviews) = newer_than(pr.get("reviews"), since);
+        Ok(serde_json::json!({
+            "comments": comments,
+            "reviews": reviews,
+            "since": since,
+            "truncated": cut_comments || cut_reviews,
+        }))
+    }
+
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json commits`, taking the commits
+    /// after `since` (when `since` names one of them; otherwise all).
+    async fn manager_pr_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        since: &str,
+    ) -> ManagerGhResult {
+        manager_gh_coordinate(owner, repo, number)?;
+        let num = number.to_string();
+        let slug = format!("{owner}/{repo}");
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "commits",
+        ];
+        let body = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug} --json commits: {e}").into()
+            })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        let empty = Vec::new();
+        let all = pr
+            .get("commits")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty);
+        // `since` is a sha: everything AFTER it in GitHub's oldest-first list. A sha the list does
+        // not name (a force-push head, a fork sha) yields ALL commits rather than a false "none".
+        let start = if since.is_empty() {
+            0
+        } else {
+            all.iter()
+                .position(|c| {
+                    str_field(c, "oid").is_some_and(|oid| oid == since || oid.starts_with(since))
+                })
+                .map_or(0, |i| i + 1)
+        };
+        let mut kept: Vec<serde_json::Value> = all[start..].to_vec();
+        let truncated = kept.len() > MAX_MANAGER_PR_ITEMS;
+        kept.truncate(MAX_MANAGER_PR_ITEMS);
+        let commits: Vec<serde_json::Value> = kept
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "oid": str_field(c, "oid").unwrap_or_default(),
+                    "message_headline": str_field(c, "messageHeadline").unwrap_or_default(),
+                    "message_body": str_field(c, "messageBody").unwrap_or_default(),
+                    "committed_date": str_field(c, "committedDate").unwrap_or_default(),
+                    "authors": c.get("authors").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "commits": commits,
+            "since": since,
+            "truncated": truncated,
+        }))
+    }
 }
 
 /// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
@@ -3764,6 +4000,118 @@ mod tests {
             assert!(src.pr_checks(owner, repo, n).await.is_err());
         }
         assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    // --- the manager run's pull-request reads (STUDIO-1014 §4.4) --------------------------------
+
+    #[tokio::test]
+    async fn manager_pr_reads_head_base_state_and_checks() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefOid":"abc123","baseRefName":"main","state":"OPEN","isDraft":false,
+                    "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+                    "statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}]}"#,
+                Arc::clone(&seen),
+            )),
+        );
+        let got = src.manager_pr("o", "r", 64).await.expect("pr");
+        assert_eq!(got["head"], "abc123");
+        assert_eq!(got["base"], "main");
+        assert_eq!(got["state"], "OPEN");
+        assert_eq!(got["draft"], false);
+        assert_eq!(got["mergeable"], "MERGEABLE");
+        assert_eq!(got["merge_state"], "CLEAN");
+        assert_eq!(got["checks"][0]["name"], "ci");
+        assert_eq!(got["checks"][0]["state"], "SUCCESS");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec![
+                "pr view 64 --repo o/r --json \
+                 headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A manager read spawns nothing at an impossible coordinate, and a failed `gh` is an error
+    /// rather than a false "nothing there".
+    #[tokio::test]
+    async fn manager_pr_refuses_a_bad_coordinate_and_reports_a_failed_lookup() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("{}", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0)] {
+            assert!(src.manager_pr(owner, repo, n).await.is_err());
+        }
+        assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+        let failing = GH::new(
+            "@symphony",
+            Some(Box::new(|_: &[&str]| Err("HTTP 502".into()))),
+        );
+        let err = failing.manager_pr("o", "r", 1).await.expect_err("an error");
+        assert!(err.to_string().contains("HTTP 502"), "{err}");
+    }
+
+    /// `manager_pr_activity` keeps only entries created after `since`; an empty `since` keeps all.
+    #[tokio::test]
+    async fn manager_pr_activity_filters_by_timestamp() {
+        let body = r#"{
+            "comments":[
+                {"createdAt":"2026-06-25T16:00:00Z","body":"old"},
+                {"createdAt":"2026-06-25T17:30:00Z","body":"new"}
+            ],
+            "reviews":[{"createdAt":"2026-06-25T17:45:00Z","state":"APPROVED"}]
+        }"#;
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+        );
+        let got = src
+            .manager_pr_activity("o", "r", 7, "2026-06-25T17:00:00Z")
+            .await
+            .expect("activity");
+        assert_eq!(got["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(got["comments"][0]["body"], "new");
+        assert_eq!(got["reviews"].as_array().unwrap().len(), 1);
+        assert_eq!(got["truncated"], false);
+
+        let all = src.manager_pr_activity("o", "r", 7, "").await.expect("all");
+        assert_eq!(all["comments"].as_array().unwrap().len(), 2);
+    }
+
+    /// `manager_pr_commits` returns the commits AFTER the named sha (oldest first); an unknown sha
+    /// yields all rather than a false "none".
+    #[tokio::test]
+    async fn manager_pr_commits_slices_after_the_given_sha() {
+        let body = r#"{"commits":[
+            {"oid":"1111","messageHeadline":"first","messageBody":"","committedDate":"d1"},
+            {"oid":"2222","messageHeadline":"second","messageBody":"","committedDate":"d2"},
+            {"oid":"3333","messageHeadline":"third","messageBody":"","committedDate":"d3"}
+        ]}"#;
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+        );
+        let after = src
+            .manager_pr_commits("o", "r", 7, "1111")
+            .await
+            .expect("after");
+        let oids: Vec<&str> = after["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["oid"].as_str().unwrap())
+            .collect();
+        assert_eq!(oids, vec!["2222", "3333"]);
+
+        // A sha the list does not name yields ALL commits, never an empty page.
+        let unknown = src
+            .manager_pr_commits("o", "r", 7, "deadbeef")
+            .await
+            .expect("unknown");
+        assert_eq!(unknown["commits"].as_array().unwrap().len(), 3);
     }
 
     /// STUDIO-829: every `gh` exec in this module reaches the subprocess through

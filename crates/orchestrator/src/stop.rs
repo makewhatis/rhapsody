@@ -182,6 +182,12 @@ pub struct ControlHandle {
     /// takes no claim and records nothing ([`crate::rundiff`]'s module doc). `None` ⇒ the daemon
     /// was built with no GitHub access and the Diff tab has no answer to give.
     pub(crate) diff: Option<std::sync::Arc<crate::rundiff::DiffDeps>>,
+    /// The host's own off-loop `gh` reads the manager run's `manager_pr*` tools proxy (STUDIO-1014;
+    /// design record `manager-agent-design.md` §4.4). It lives on the handle for [`Self::diff`]'s
+    /// reason — every call BLOCKS on `gh`, so it runs on the request's own task — and like `diff` it
+    /// takes no claim and needs no control round-trip. `None` ⇒ the daemon was built with no GitHub
+    /// access and the manager's pull-request reads have no answer to give.
+    pub(crate) manager_gh: Option<std::sync::Arc<dyn crate::ghsummons::ManagerGhSource>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -212,6 +218,7 @@ impl crate::orchestrator::Orchestrator {
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
+            manager_gh: self.manager_gh_deps.as_ref().map(std::sync::Arc::clone),
         }
     }
 }

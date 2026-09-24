@@ -60,6 +60,9 @@ pub enum ManagerReadError {
     Unavailable(&'static str),
     /// The host's git read failed (`not_found`, `too_large`, `invalid_revision`, `git_failed`).
     Read(ReadError),
+    /// The host's off-loop `gh` read failed (`gh_failed`) — a network/CLI failure, never a claim
+    /// that the read found nothing.
+    Gh(String),
     /// A store read failed.
     Store(String),
 }
@@ -72,6 +75,7 @@ impl ManagerReadError {
             ManagerReadError::NotAManagerRun => "not_a_manager_run",
             ManagerReadError::Unavailable(_) => "unavailable",
             ManagerReadError::Read(e) => read_error_code(e),
+            ManagerReadError::Gh(_) => "gh_failed",
             ManagerReadError::Store(_) => "store_error",
         }
     }
@@ -83,6 +87,7 @@ impl ManagerReadError {
             ManagerReadError::NotAManagerRun => "this run is not a manager run".to_string(),
             ManagerReadError::Unavailable(why) => (*why).to_string(),
             ManagerReadError::Read(e) => e.to_string(),
+            ManagerReadError::Gh(e) => e.clone(),
             ManagerReadError::Store(e) => e.clone(),
         }
     }
@@ -303,6 +308,51 @@ impl crate::ControlHandle {
         Ok(serde_json::json!({ "sha": sha, "base": base, "patch_id": id }))
     }
 
+    /// The host's own off-loop `gh` seam, or a typed refusal when the daemon was built without one.
+    fn manager_gh(&self) -> Result<&Arc<dyn crate::ghsummons::ManagerGhSource>, ManagerReadError> {
+        self.manager_gh
+            .as_ref()
+            .ok_or(ManagerReadError::Unavailable(
+                "this daemon cannot serve manager pull-request reads",
+            ))
+    }
+
+    /// `manager_pr`: the pull request's head, base, state, draft, mergeable and the checks at head,
+    /// served by the host's own off-loop `gh` (§4.4).
+    pub async fn manager_pr(&self, run_id: i64) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr(&coord.owner, &coord.repo, coord.number)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
+    /// `manager_pr_activity`: comments and reviews since a timestamp, served by the host's `gh`.
+    pub async fn manager_pr_activity(
+        &self,
+        run_id: i64,
+        since: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr_activity(&coord.owner, &coord.repo, coord.number, since)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
+    /// `manager_pr_commits`: commits and their messages since a sha, served by the host's `gh`.
+    pub async fn manager_pr_commits(
+        &self,
+        run_id: i64,
+        since: &str,
+    ) -> Result<serde_json::Value, ManagerReadError> {
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let src = self.manager_gh()?;
+        src.manager_pr_commits(&coord.owner, &coord.repo, coord.number, since)
+            .await
+            .map_err(|e| ManagerReadError::Gh(e.to_string()))
+    }
+
     /// `manager_findings`: the structured findings recorded for the run's pull request (§5.3). A
     /// pure store read — it needs the coordinate, not the workspace.
     pub async fn manager_findings(
@@ -361,6 +411,14 @@ impl crate::ControlHandle {
 mod tests {
     use super::*;
 
+    use rhapsody_store::{EVIDENCE_ACCESS_DIFF, RunStart, Sqlite, Store, StorePath};
+    use rhapsody_workspace::{Config as WsConfig, HookScripts, Manager};
+
+    use crate::control_loop::Event;
+    use crate::orchestrator::Orchestrator;
+    use crate::testsupport::TempDir;
+    use crate::workspace_gc::WorkspaceGcPlan;
+
     fn run_row(key: &str, repo: &str) -> RunSummary {
         RunSummary {
             id: 7,
@@ -417,5 +475,286 @@ mod tests {
         assert_eq!(read_error_code(&ReadError::NotFound), "not_found");
         assert_eq!(read_error_code(&ReadError::TooLarge), "too_large");
         assert_eq!(read_error_code(&ReadError::Git("x".into())), "git_failed");
+    }
+
+    // --- §5.5 evidence-access log: the host RECORDS every diff/interdiff it serves -------------
+
+    fn git_run(dir: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn rev_parse(dir: &str, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", rev])
+            .output()
+            .expect("rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Builds a control handle whose `Event::WorkspaceGc` round-trip answers with `mgr`, plus the
+    /// shared store. The handle is driven directly (no control loop), exactly as the HTTP task does.
+    fn handle_with_workspace(
+        mgr: Arc<Manager>,
+        store: Arc<dyn Store + Send + Sync>,
+    ) -> crate::stop::ControlHandle {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let mut handle = o.control();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        handle.events = tx;
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if let Event::WorkspaceGc { reply } = ev {
+                    let _ = reply.send(WorkspaceGcPlan {
+                        mgr: Some(Arc::clone(&mgr)),
+                        keep: Default::default(),
+                    });
+                }
+            }
+        });
+        handle
+    }
+
+    /// A bare mirror of a fresh origin that carries two divergent one-commit branches (`old`/`new`)
+    /// off a common base plus a two-commit `main`, and the shas the evidence tests compare. The
+    /// caller keeps the returned dirs alive.
+    async fn mirror_with_two_commits() -> (
+        Arc<Manager>,
+        TempDir,
+        TempDir,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let root = TempDir::new();
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").unwrap();
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        let base = rev_parse(&origin.path, "HEAD");
+        // Two divergent one-commit branches off the base — a rebase-like pair for the interdiff.
+        for (branch, body) in [("old", "old body\n"), ("new", "new body\n")] {
+            git_run(&origin.path, &["checkout", "-b", branch, &base]);
+            std::fs::write(origin.child("feature.txt"), body).unwrap();
+            git_run(&origin.path, &["add", "feature.txt"]);
+            git_run(&origin.path, &["commit", "-m", "feature"]);
+        }
+        git_run(&origin.path, &["checkout", "main"]);
+        std::fs::write(origin.child("second.txt"), "second\n").unwrap();
+        git_run(&origin.path, &["add", "second.txt"]);
+        git_run(&origin.path, &["commit", "-m", "second"]);
+
+        let mgr = Arc::new(
+            Manager::new(WsConfig {
+                root: root.path.clone(),
+                hooks: HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("manager"),
+        );
+        mgr.ensure_from_repo(&origin.path, "", "AIE-1")
+            .await
+            .expect("provision mirror");
+        let head = rev_parse(&origin.path, "HEAD");
+        let old = rev_parse(&origin.path, "old");
+        let new = rev_parse(&origin.path, "new");
+        (mgr, root, origin, base, head, old, new)
+    }
+
+    fn manager_run_id(store: &dyn Store, repo: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_id: "pr:o/r#1@manager".to_string(),
+                issue_identifier: "pr:o/r#1@manager".to_string(),
+                title: "manager".to_string(),
+                repo: repo.to_string(),
+                ..RunStart::default()
+            })
+            .expect("start_run")
+    }
+
+    // Mutation discipline (§15.4 / review): deleting the `record_evidence` call from `manager_diff`
+    // must turn this red. It drives the real ControlHandle surface against a real store and mirror,
+    // so it cannot pass by testing `record_evidence` in isolation.
+    #[tokio::test]
+    async fn manager_diff_records_evidence_access() {
+        let (mgr, _root, origin, base, head, _old, _new) = mirror_with_two_commits().await;
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let handle = handle_with_workspace(mgr, Arc::clone(&store));
+        let run_id = manager_run_id(store.as_ref(), &origin.path);
+
+        handle
+            .manager_diff(run_id, &base, &head)
+            .await
+            .expect("diff served");
+
+        let rows = store.evidence_accesses(run_id).expect("evidence_accesses");
+        assert_eq!(rows.len(), 1, "the served diff must be recorded: {rows:?}");
+        assert_eq!(rows[0].kind, EVIDENCE_ACCESS_DIFF);
+        assert_eq!(rows[0].from_sha, base);
+        assert_eq!(rows[0].to_sha, head);
+        assert_eq!(rows[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn manager_interdiff_records_evidence_access() {
+        let (mgr, _root, origin, _base, _head, old, new) = mirror_with_two_commits().await;
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let handle = handle_with_workspace(mgr, Arc::clone(&store));
+        let run_id = manager_run_id(store.as_ref(), &origin.path);
+
+        // `old` and `new` are divergent one-commit branches off the same base — the rebase pair the
+        // interdiff exists to compare.
+        handle
+            .manager_interdiff(run_id, &old, &new)
+            .await
+            .expect("interdiff served");
+
+        let rows = store.evidence_accesses(run_id).expect("evidence_accesses");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the served interdiff must be recorded: {rows:?}"
+        );
+        assert_eq!(rows[0].kind, rhapsody_store::EVIDENCE_ACCESS_INTERDIFF);
+        assert_eq!(rows[0].from_sha, old);
+        assert_eq!(rows[0].to_sha, new);
+        assert_eq!(rows[0].run_id, run_id);
+    }
+
+    // --- the manager's pull-request reads (§4.4): the run's coordinate, never the caller's -------
+
+    #[derive(Default)]
+    struct FakeManagerGh {
+        seen: std::sync::Mutex<Vec<(String, String, i64, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::ManagerGhSource for FakeManagerGh {
+        async fn manager_pr(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                "pr".to_string(),
+            ));
+            Ok(serde_json::json!({ "head": "abc" }))
+        }
+        async fn manager_pr_activity(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            since: &str,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                since.to_string(),
+            ));
+            Ok(serde_json::json!({ "comments": [] }))
+        }
+        async fn manager_pr_commits(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            since: &str,
+        ) -> crate::ghsummons::ManagerGhResult {
+            self.seen.lock().expect("lock").push((
+                owner.to_string(),
+                repo.to_string(),
+                number,
+                since.to_string(),
+            ));
+            Ok(serde_json::json!({ "commits": [] }))
+        }
+    }
+
+    fn handle_with_gh(
+        source: Arc<dyn crate::ghsummons::ManagerGhSource>,
+        store: Arc<dyn Store + Send + Sync>,
+    ) -> crate::stop::ControlHandle {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let mut handle = o.control();
+        handle.manager_gh = Some(source);
+        handle
+    }
+
+    #[tokio::test]
+    async fn manager_pr_is_unavailable_without_a_gh_seam() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::clone(&store));
+        let handle = o.control();
+        let run_id = manager_run_id(store.as_ref(), "git@github.com:o/r.git");
+        assert!(matches!(
+            handle.manager_pr(run_id).await,
+            Err(ManagerReadError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_pr_reads_the_runs_own_coordinate() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let src = Arc::new(FakeManagerGh::default());
+        let handle = handle_with_gh(
+            Arc::clone(&src) as Arc<dyn crate::ghsummons::ManagerGhSource>,
+            Arc::clone(&store),
+        );
+        let run_id = manager_run_id(store.as_ref(), "git@github.com:o/r.git");
+
+        let pr = handle.manager_pr(run_id).await.expect("pr");
+        assert_eq!(pr["head"], "abc");
+        handle
+            .manager_pr_activity(run_id, "2026-06-25T00:00:00Z")
+            .await
+            .expect("activity");
+        handle
+            .manager_pr_commits(run_id, "1111")
+            .await
+            .expect("commits");
+
+        let seen = src.seen.lock().expect("lock").clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("o".to_string(), "r".to_string(), 1, "pr".to_string()),
+                (
+                    "o".to_string(),
+                    "r".to_string(),
+                    1,
+                    "2026-06-25T00:00:00Z".to_string()
+                ),
+                ("o".to_string(), "r".to_string(), 1, "1111".to_string()),
+            ],
+            "every read must resolve the coordinate from the RUN, never a caller value"
+        );
     }
 }

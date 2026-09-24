@@ -597,6 +597,18 @@ where
         })
     });
 
+    // The manager run's pull-request reads (STUDIO-1014 §4.4): the same off-loop `gh`, one seam,
+    // bounded by `GH_EXEC_TIMEOUT`. Built unconditionally for `diff_deps`' reason — a read writes
+    // nothing and decides nothing, so there is no reason to make it dependency-named on Teams.
+    o.manager_gh_deps = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        &resolved
+            .as_ref()
+            .map(|c| c.tracker.summon_token.clone())
+            .unwrap_or_default(),
+        None,
+    ))
+        as Arc<dyn rhapsody_orchestrator::ghsummons::ManagerGhSource>);
+
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
 

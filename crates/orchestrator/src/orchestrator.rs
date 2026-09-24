@@ -449,6 +449,13 @@ pub struct Orchestrator {
     /// coordinate it derived itself. Gating it would make the console's Diff tab dependency-named
     /// on a daemon that can perfectly well answer it.
     pub diff_deps: Option<std::sync::Arc<crate::rundiff::DiffDeps>>,
+    /// The host's own off-loop `gh` reads behind the manager run's `manager_pr`,
+    /// `manager_pr_activity` and `manager_pr_commits` (STUDIO-1014; design record
+    /// `manager-agent-design.md` §4.4). Snapshotted onto the [`ControlHandle`] exactly as
+    /// [`Self::diff_deps`] is, and for the same reason: every call BLOCKS on `gh`, so it runs on
+    /// the HTTP request's own task, takes no claim and needs no control round-trip. Not gated on
+    /// Teams — a read writes nothing and decides nothing.
+    pub manager_gh_deps: Option<std::sync::Arc<dyn crate::ghsummons::ManagerGhSource>>,
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -1105,6 +1112,7 @@ impl Orchestrator {
             teams_triage: None,
             merge_deps: None,
             diff_deps: None,
+            manager_gh_deps: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
