@@ -273,6 +273,14 @@ pub struct WorkerDeps {
     /// `None` for every ticket dispatch — and, in this slice, for every dispatch, since nothing
     /// triggers a review yet.
     pub review: Option<crate::review::ReviewCheckout>,
+    /// Manager-run provisioning (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3). `Some`
+    /// makes this attempt a MANAGER run: no repository checkout at all — an empty, daemon-owned,
+    /// per-run cwd, a dedicated config directory, and the manager session posture. `None` for every
+    /// other run, which leaves every existing provisioning path byte-identical.
+    pub manager: Option<crate::managerrun::ManagerCheckout>,
+    /// The resolved workspace root, under which a manager run's per-run cwd is created (only read
+    /// when [`Self::manager`] is `Some`). Empty on every construction that skips the stamp.
+    pub manager_root: String,
     /// The `gh` reads a DELTA review round needs (STUDIO-959): whether the commit the reviewer last
     /// read is an ancestor of the head, and the findings already on the pull request. `None` on
     /// every non-review run, and on a review daemon that could not build the seam — in which case
@@ -459,6 +467,196 @@ pub(crate) fn has_handoff_marker(result_text: &str) -> bool {
         .any(|ln| ln.trim().starts_with("HANDOFF:"))
 }
 
+/// Performs one MANAGER attempt (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3). Split out
+/// of [`run_agent_attempt`] because it shares none of its provisioning: there is no repository, no
+/// worktree, no `before_run`/`after_run` hook and no prompt file — only an empty daemon-owned
+/// per-run cwd, a dedicated configuration directory, and the manager session posture. The turn loop
+/// is the ordinary one ([`WorkerDeps::run_turns`]), whose manager wind-down branch ends on the
+/// budget or the agent's own declaration without a tracker read.
+///
+/// The per-run directory is removed on every exit path by a drop guard, so neither the cwd nor the
+/// config directory outlives the run.
+async fn run_manager_attempt(
+    deps: &mut WorkerDeps,
+    issue: Issue,
+    mgr: crate::managerrun::ManagerCheckout,
+    messages: Option<&mut mpsc::Receiver<String>>,
+    on_event: &(dyn Fn(Event) + Send + Sync),
+    on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> (String, WorkerDeclaration, Option<WorkerError>) {
+    // The empty, daemon-owned, per-run cwd (§4.2), under the workspace root so the launch
+    // containment invariant holds. There is deliberately NO checkout: the host serves every read.
+    // The config directory is a SIBLING of the cwd, not a child of it, so the run's working
+    // directory stays empty and the model credential is never inside it.
+    let run_dir = std::path::Path::new(&deps.manager_root)
+        .join("manager")
+        .join(workspace::sanitize_key(&mgr.key));
+    let cwd = run_dir.join("cwd");
+    let config_dir = run_dir.join("config");
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        return (
+            issue.state.clone(),
+            WorkerDeclaration::default(),
+            Some(WorkerError::Agent(agent::AgentError::Other(format!(
+                "manager_cwd_failed: {e}"
+            )))),
+        );
+    }
+    // Removed on every exit path below (including an early return / a dropped run future).
+    let _cleanup = ManagerDirGuard(run_dir.clone());
+    // The dedicated manager configuration directory carries ONLY the model credential (§4.2), and
+    // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
+    // authenticate from the file on macOS (§4.5).
+    let model_credential = provision_manager_config_dir(&config_dir);
+
+    // Optional transcript, best-effort exactly as the ordinary path.
+    let mut transcript: Option<Transcript> = None;
+    let mut _run_guard: Option<obslog::Run> = None;
+    if let Some(store) = &deps.transcripts
+        && let Ok(run) = store.open(&issue.identifier)
+        && let (Ok(so), Ok(se)) = (run.stdout(), run.stderr())
+    {
+        transcript = Some(Transcript {
+            stdout: Some(Box::new(so)),
+            stderr: Some(Box::new(se)),
+        });
+        if let Some(cb) = on_transcript {
+            cb(run.path());
+        }
+        _run_guard = Some(run);
+    }
+
+    let req = rhapsody_agent::manager::ManagerSessionStart {
+        cwd: cwd.to_string_lossy().into_owned(),
+        config_dir: config_dir.to_string_lossy().into_owned(),
+        run_timeout_ms: mgr.run_timeout_ms.max(0) as u64,
+        model_credential,
+    };
+    let session = match deps
+        .agent
+        .start_manager_session(req, issue.clone(), transcript)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(WorkerError::Agent(e)),
+            );
+        }
+    };
+    session.set_run_id(deps.run_id);
+    session.set_model_override(deps.model_override.clone());
+
+    let (final_state, result_text, loop_err) = deps
+        .run_turns(
+            session.as_ref(),
+            crate::managerrun::MANAGER_BASE_PROMPT,
+            issue.clone(),
+            None,
+            messages,
+            on_event,
+        )
+        .await;
+    let _ = session.stop().await; // best-effort
+    (
+        final_state,
+        WorkerDeclaration {
+            declared_handoff: has_handoff_marker(&result_text),
+            review_verdict: None,
+        },
+        loop_err,
+    )
+}
+
+/// Removes a manager run's per-run directory on every drop path. The directory is daemon-owned and
+/// contains only the empty cwd plus the manager config dir, so a failed removal is logged, never
+/// fatal.
+struct ManagerDirGuard(std::path::PathBuf);
+impl Drop for ManagerDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!(dir = %self.0.display(), err = %e, "manager: could not remove the per-run directory");
+        }
+    }
+}
+
+/// Copies ONLY the model credential into a dedicated manager configuration directory (§4.2) and
+/// returns the OAuth access token to inject as `CLAUDE_CODE_OAUTH_TOKEN` (§4.5).
+///
+/// The source is the operator's own Claude config root (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`).
+/// The document it reads is `.credentials.json`; what is WRITTEN into `config_dir` is a FILTERED
+/// document carrying only `claudeAiOauth` — the operator file's unrelated `mcpOAuth` tokens (Linear,
+/// Cloudflare, …) are never copied.
+///
+/// The token is returned because a relocated config root cannot authenticate from the file alone on
+/// macOS, where the CLI reads its OAuth credential from the login Keychain keyed by the config root
+/// (measured on `claude` 2.1.281: `loggedIn: false` with the file present). The adapter therefore
+/// injects the same token as `CLAUDE_CODE_OAUTH_TOKEN`, which the relocated CLI DOES honour.
+///
+/// Best-effort: an absent or credential-free source is logged and the run proceeds — the child then
+/// fails to authenticate, which is a runtime failure rather than a boundary hole (no operator hook,
+/// plugin, MCP server or permission rule is ever copied).
+pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) -> Option<String> {
+    if let Err(e) = std::fs::create_dir_all(config_dir) {
+        tracing::warn!(dir = %config_dir.display(), err = %e, "manager: could not create the config dir");
+        return None;
+    }
+    let source = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
+    let source = source?;
+    let cred = source.join(".credentials.json");
+    let raw = match std::fs::read_to_string(&cred) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(
+                source = %cred.display(),
+                err = %e,
+                "manager: no model credential found to provision; the manager run will fail to \
+                 authenticate"
+            );
+            return None;
+        }
+    };
+    // Write the filtered document (only `claudeAiOauth`) when the source has a usable OAuth token.
+    // Written 0600: it is a live OAuth access token, and the operator's own copy is mode 0600.
+    match rhapsody_agent::manager::manager_credential_document(&raw) {
+        Some(doc) => {
+            if let Err(e) = write_secret_file(&config_dir.join(".credentials.json"), &doc) {
+                tracing::warn!(err = %e, "manager: could not write the filtered model credential");
+            }
+        }
+        None => tracing::warn!(
+            source = %cred.display(),
+            "manager: the operator credential holds no OAuth access token; the manager run will \
+             fail to authenticate"
+        ),
+    }
+    rhapsody_agent::manager::model_credential_from_config_json(&raw)
+}
+
+/// Writes a secret-bearing file with owner-only permissions (0600), so a copied credential never
+/// lands world-readable under the workspace root. `std::fs::write` would honour only the umask.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 /// Performs one worker attempt (upstream §16.5). Returns the worker's last-known issue state — the
 /// per-turn refresh from [`WorkerDeps::run_turns`], or the dispatch-time snapshot when the run fails
 /// before any turn completes — alongside the hand-off declaration and the abnormal-exit error (`None`
@@ -536,6 +734,14 @@ pub async fn run_agent_attempt(
                 );
             }
         }
+    }
+    // Manager mode (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3): a manager run has NO
+    // repository, so it takes an entirely separate provisioning path — an empty daemon-owned cwd and
+    // the isolated session posture — and creates no worktree, runs no before_run/after_run hooks and
+    // reads no prompt file. Handled BEFORE the workspace block so no checkout can ever be created for
+    // one. `None` for every other run, leaving this function byte-identical.
+    if let Some(mgr) = deps.manager.clone() {
+        return run_manager_attempt(deps, issue, mgr, messages, on_event, on_transcript).await;
     }
     // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
     // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
@@ -1037,6 +1243,21 @@ impl WorkerDeps {
                 turn += 1;
                 continue;
             }
+            // Manager-mode wind-down (STUDIO-1049): a manager run's `pr:` key resolves to no tracker
+            // issue, so the ticket path below (per-turn refresh + handoff auto-park) is wrong for it
+            // exactly as it is for a review. The run ends on its budget or the agent's own hand-off
+            // declaration, and returns the synthetic state unchanged. `max_turns` is
+            // `manager.max_turns` (default 1), so this normally ends after the first turn.
+            if self.manager.is_some() {
+                if has_handoff_marker(&last_result)
+                    || turn >= self.max_turns
+                    || self.drained_at_boundary(&issue.identifier, turn)
+                {
+                    return (issue.state.clone(), last_result, None);
+                }
+                turn += 1;
+                continue;
+            }
             // Handoff auto-park (TRA-240 loop fix): when the agent declares a HANDOFF but the ticket
             // is still active, the daemon moves it to the configured review state on the agent's
             // behalf (dispatched agents have no Linear-write MCP) and ENDS the loop here — otherwise
@@ -1187,6 +1408,8 @@ mod tests {
             review_done_state: None,
             review: None,
             review_delta: None,
+            manager: None,
+            manager_root: String::new(),
             run_id: 0,
             drain: crate::drain::DrainSignal::new(),
             // STUDIO-978: a fully-capable fake, MCP injection on, no pre-decided refusal — the
@@ -3607,6 +3830,98 @@ mod tests {
         assert_eq!(usage.reserved_tokens, 0);
         assert_eq!(usage.provider_reported_tokens, None);
         assert!(usage.usage_authority.is_empty());
+    }
+
+    // §4.5: the filtered credential document is written owner-only (0600). `std::fs::write` would
+    // leave it umask-readable, and this file holds a live OAuth access token under the workspace root.
+    #[cfg(unix)]
+    #[test]
+    fn the_manager_credential_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("config")).join(".credentials.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        write_secret_file(&path, "{\"claudeAiOauth\":{}}").expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a copied credential must not be world-readable"
+        );
+    }
+
+    // STUDIO-1049 (§4.2): a manager attempt takes the manager provisioning path — an empty
+    // daemon-owned per-run cwd (no checkout), a dedicated config dir, the checkout's run timeout,
+    // and the cwd removed afterwards. The ordinary session start is never used, and no tracker read
+    // is made.
+    //
+    // Mutation: return to the ordinary provisioning path for a manager run and the manager session
+    // is never started (`last_manager_start` is `None`), or the cwd survives.
+    #[tokio::test]
+    async fn a_manager_attempt_provisions_an_empty_cwd_and_removes_it() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "ignored",
+            1,
+        );
+        d.manager_root = root.path.clone();
+        d.manager = Some(crate::managerrun::ManagerCheckout {
+            key: "pr:o/r#1@manager".to_string(),
+            run_timeout_ms: 1234,
+        });
+        let key = "pr:o/r#1@manager";
+        let iss = Issue {
+            id: key.to_string(),
+            identifier: key.to_string(),
+            ..Default::default()
+        };
+        let (_last, decl, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "manager attempt clean: {err:?}");
+        assert!(!decl.declared_handoff);
+
+        let started = ag
+            .last_manager_start()
+            .expect("a manager session must be started");
+        let cwd = std::path::PathBuf::from(&started.cwd);
+        assert!(
+            cwd.starts_with(&root.path),
+            "the manager cwd must be under the workspace root: {cwd:?}"
+        );
+        // The config dir is a SIBLING of the cwd, so the run's working directory stays empty and the
+        // model credential is never inside it.
+        assert_eq!(
+            std::path::PathBuf::from(&started.config_dir),
+            cwd.parent().expect("the cwd has a parent").join("config"),
+            "the dedicated config dir is a sibling of the per-run cwd"
+        );
+        assert_eq!(
+            started.run_timeout_ms, 1234,
+            "manager.run_timeout_ms carried"
+        );
+        assert!(
+            !cwd.exists(),
+            "the daemon-owned per-run cwd must be removed afterwards"
+        );
+        assert!(
+            !std::path::Path::new(&started.config_dir).exists(),
+            "the dedicated config dir must be removed with the run directory"
+        );
+        assert_eq!(
+            tr.move_calls().len(),
+            0,
+            "a manager run makes no tracker state move"
+        );
     }
 }
 

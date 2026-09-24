@@ -56,6 +56,7 @@ pub mod managerdecision;
 pub mod managerexchange;
 pub mod managerprep;
 pub mod managerread;
+pub mod managerrun;
 pub mod managerselftest;
 pub mod mergeconsole;
 pub mod message;

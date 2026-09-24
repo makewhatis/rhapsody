@@ -399,6 +399,17 @@ where
     // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
     // manager's replies. See the sharing note where the off-loop tasks take their clones.
     let mut teams_room: Option<Arc<rhapsody_config::room::LocalRoom>> = None;
+    // The off-loop self-test watcher wiring (STUDIO-1049, §4.7): `Some` only when
+    // `manager.review_authority` is not `off` after the boot self-test, so a default install spawns
+    // no task and has no delta. Carried out of the Teams block for `teams_prefetch`'s reason — the
+    // watcher is spawned beside the prune scheduler, by which point `o` has moved into the control
+    // task.
+    let mut manager_selftest_watch: Option<(
+        Arc<rhapsody_orchestrator::managerselftest::ManagerSelfTestState>,
+        String,
+        String,
+        String,
+    )> = None;
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
@@ -415,6 +426,33 @@ where
         // BEFORE the config is injected/cloned anywhere, so every consumer sees the effective
         // authority and the Noop store can never accept `act`.
         enforce_manager_storage_requirement(&mut teams_cfg, durable_store);
+        // STUDIO-1049 (§4.7/§10.2): before any authority other than `off` takes effect, verify the
+        // installed `claude` CLI honours the manager tool contract with a canary launch. Fail closed:
+        // any successful attempt, an unexercised attempt, or a canary that cannot run forces the
+        // authority back to `off` and records the typed reason. The recorded verdict is what
+        // `manager_launch_permitted()` (and M8's launch gate) reads.
+        apply_manager_self_test(
+            &mut teams_cfg,
+            o.manager_selftest_state(),
+            resolved.as_ref(),
+            &flags.path.to_string_lossy(),
+        )
+        .await;
+        // When the manager may act, keep the §4.7 verdict fresh across a CLI version change: the
+        // watcher re-probes the installed version and re-runs the canary whenever it changed. The
+        // launch gate re-probes too, so nothing acts on a stale verdict in the meantime.
+        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+            manager_selftest_watch = Some((
+                o.manager_selftest_handle(),
+                resolved
+                    .as_ref()
+                    .map_or_else(|| "claude".to_string(), |c| c.claude.command.clone()),
+                resolved
+                    .as_ref()
+                    .map_or_else(String::new, |c| c.workspace.root.clone()),
+                flags.path.to_string_lossy().into_owned(),
+            ));
+        }
         o.teams = Some(teams_cfg.clone());
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
@@ -821,6 +859,30 @@ where
         };
         crate::prune::run_prune_schedule(prune_ctx, sf, rf, pw, rl).await;
     });
+
+    // --- manager self-test watcher (STUDIO-1049, §4.7) ---
+    //
+    // Spawned only when the manager may act. It re-probes the installed `claude` version on a fixed
+    // cadence and re-runs the canary whenever it changed, so a CLI that auto-updates in place is
+    // re-verified without a daemon restart. It holds no `Orchestrator`: its whole contact is the
+    // shared `ManagerSelfTestState` handle and the resolved command/paths.
+    let manager_watch_task =
+        manager_selftest_watch.map(|(state, command, workspace_root, workflow_path)| {
+            let ctx = shutdown.wait();
+            let daemon_bin = std::env::current_exe()
+                .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
+            tokio::spawn(async move {
+                rhapsody_orchestrator::managerselftest::run_selftest_watch_task(
+                    ctx,
+                    command,
+                    workspace_root,
+                    daemon_bin,
+                    workflow_path,
+                    state,
+                )
+                .await;
+            })
+        });
 
     // --- Rhapsody Teams triage (STUDIO-644, slice T3b; design record
     // ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md, §0.11.2) ---
@@ -1456,6 +1518,12 @@ where
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
+    // The manager self-test watcher is cancelled by the same signal and checks it around its sleep,
+    // so its wait is bounded by one probe (and, at most, one canary turn, itself capped by the turn
+    // timeout).
+    if let Some(t) = manager_watch_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
     // The triage task is cancelled by the same signal, and checks it between model turns as well as
     // between cycles. The wait is still BOUNDED: a turn already in flight can take up to
     // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the
@@ -2109,6 +2177,65 @@ fn enforce_manager_storage_requirement(
          on-disk database to use it."
     );
     teams.manager.review_authority = effective;
+}
+
+/// STUDIO-1049 (§4.7/§10.2): before `manager.review_authority` other than `off` takes effect, run the
+/// startup self-test against the installed `claude` CLI. Fail closed — any successful attempt, an
+/// attempt not exercised, or a canary that cannot run (including an unprobeable CLI version) forces
+/// the authority back to `off` and records the typed reason, which items go to the human feed with.
+///
+/// `off` is skipped entirely, so a default installation boots without a model launch and is
+/// byte-identical.
+async fn apply_manager_self_test(
+    teams: &mut rhapsody_config::teams::Teams,
+    selftest: &rhapsody_orchestrator::managerselftest::ManagerSelfTestState,
+    resolved: Option<&rhapsody_config::Config>,
+    workflow_path: &str,
+) {
+    use rhapsody_config::teams::ReviewAuthority;
+    if teams.manager.review_authority == ReviewAuthority::Off {
+        return;
+    }
+    let command = resolved.map_or_else(|| "claude".to_string(), |c| c.claude.command.clone());
+    let workspace_root = resolved.map_or_else(String::new, |c| c.workspace.root.clone());
+    let cli_version = match rhapsody_orchestrator::managerselftest::probe_cli_version(&command) {
+        Ok(v) => v,
+        Err(e) => {
+            // No version ⇒ no passing record ⇒ the gate refuses. Typed reason to the human feed.
+            selftest.set_installed_version(None);
+            teams.manager.review_authority = ReviewAuthority::Off;
+            tracing::warn!(
+                reason = %format!("manager unavailable: cannot determine the claude CLI version: {e}"),
+                "manager self-test could not run; manager disabled"
+            );
+            return;
+        }
+    };
+    let daemon_bin = std::env::current_exe()
+        .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
+    let runner = rhapsody_orchestrator::managerselftest::CliCanaryRunner {
+        command,
+        workspace_root,
+        daemon_bin,
+        workflow_path: workflow_path.to_string(),
+    };
+    let mut authority = teams.manager.review_authority;
+    let reason = rhapsody_orchestrator::managerselftest::run_boot_self_test(
+        &runner,
+        selftest,
+        &mut authority,
+        &cli_version,
+    )
+    .await;
+    teams.manager.review_authority = authority;
+    if let Some(reason) = reason {
+        tracing::warn!(
+            reason = %reason.message(),
+            "manager self-test failed; manager disabled and its items go to the human feed"
+        );
+    } else {
+        tracing::info!(cli_version = %cli_version, "manager self-test passed");
+    }
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {

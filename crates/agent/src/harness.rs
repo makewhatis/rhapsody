@@ -451,6 +451,28 @@ pub trait Harness: Runner {
             self.id()
         )))
     }
+
+    /// Start a MANAGER session (STUDIO-1049; design record `~/.rhapsody/docs/manager-agent-design.md`
+    /// §4.2–§4.3, §10.1): the isolated posture — an empty daemon-owned cwd, a dedicated manager
+    /// configuration directory, the manager-only MCP config, no built-in tools, and
+    /// `--permission-mode default`. Unlike [`Self::start_brokered_session`] this is not a provider
+    /// path: it is the manager's own launch (§4.1), reachable only from a manager run.
+    ///
+    /// The default REFUSES with a typed, non-secret reason. v1 manager runs are `claude`-only
+    /// (§4.1), and a harness that is not the pinned Claude CLI must never silently run one — that
+    /// would bypass the §4.7 self-test, whose whole subject is what the installed CLI honours.
+    fn start_manager_session(
+        &self,
+        _req: crate::manager::ManagerSessionStart,
+        _issue: rhapsody_core::Issue,
+        _transcript: Option<crate::Transcript>,
+    ) -> Result<Box<dyn crate::Session>, crate::AgentError> {
+        Err(crate::AgentError::Other(format!(
+            "manager_harness_unsupported: harness {:?} cannot run a manager session; v1 manager runs \
+             require the claude harness",
+            self.id()
+        )))
+    }
 }
 
 /// What one dispatch NEEDS from its resolved harness (design §5's table). This is the PURE input to

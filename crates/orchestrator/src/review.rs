@@ -460,6 +460,19 @@ impl Orchestrator {
         if run.reviewer.is_empty() {
             return ReviewDispatchOutcome::Refused("no reviewer".to_string());
         }
+        // `manager` is a RESERVED roster name (STUDIO-1049; `rhapsody_config::room`): a review key
+        // ending `@manager` would collide with a MANAGER run's key (`pr:owner/repo#n@manager`), which
+        // only `dispatch_manager` may create. Roster validation already refuses a teammate named
+        // `manager`, so this is the belt-and-braces refusal at the dispatch itself — a direct caller
+        // can never mint a manager key through the review path.
+        if run.reviewer.trim_start_matches('@')
+            == crate::reviewadjudicate::MANAGER_IDENTITY.trim_start_matches('@')
+        {
+            return ReviewDispatchOutcome::Refused(
+                "`manager` is a reserved identity; only the manager's own launch dispatches it"
+                    .to_string(),
+            );
+        }
         if run.head_sha.is_empty() {
             return ReviewDispatchOutcome::Refused("no pinned head SHA".to_string());
         }
@@ -643,7 +656,7 @@ impl Orchestrator {
     /// Resolves the dispatch routing for a pull request's repository: the enabled project whose
     /// `repo` IS that URL. `None` when no project owns it — which refuses the review rather than
     /// falling back to the top-level binding, whose repo would be some OTHER repository's.
-    fn review_route(&self, repo_url: &str) -> Option<DispatchRoute> {
+    pub(crate) fn review_route(&self, repo_url: &str) -> Option<DispatchRoute> {
         if repo_url.is_empty() {
             return None;
         }
