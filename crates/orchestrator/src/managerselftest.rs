@@ -638,10 +638,12 @@ pub fn probe_cli_version(command: &str) -> Result<String, String> {
 /// path, in a daemon-owned empty cwd holding the trap settings file, and reads the observed side
 /// effects plus the report line.
 ///
-/// The two attempts with a real host-observable side effect are verified by the HOST: the project
-/// settings hook (its trap file must not exist) and `Bash` (its marker must not exist). The other
-/// three are read from the CLI's own refusal output. A run that cannot start, or that emits no
-/// report, is reported as NOT refused for every attempt — the fail-closed direction.
+/// The attempts with a real host-observable side effect are verified by the HOST: the project
+/// settings hook (its trap file must not exist) and `Bash` (its marker must not exist). Each tool
+/// attempt is refused when the CLI's own init `tools` array does not expose it — the CLI's report,
+/// not the model's prose — and falls back to the model's report line only when no init line was
+/// captured. A run that cannot start, or that emits neither an init line nor a report, is reported
+/// as NOT refused for every attempt — the fail-closed direction.
 pub struct CliCanaryRunner {
     /// The `claude` command (may include args), from the resolved config.
     pub command: String,

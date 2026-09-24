@@ -620,9 +620,10 @@ pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) -> Opti
         }
     };
     // Write the filtered document (only `claudeAiOauth`) when the source has a usable OAuth token.
+    // Written 0600: it is a live OAuth access token, and the operator's own copy is mode 0600.
     match rhapsody_agent::manager::manager_credential_document(&raw) {
         Some(doc) => {
-            if let Err(e) = std::fs::write(config_dir.join(".credentials.json"), doc) {
+            if let Err(e) = write_secret_file(&config_dir.join(".credentials.json"), &doc) {
                 tracing::warn!(err = %e, "manager: could not write the filtered model credential");
             }
         }
@@ -633,6 +634,27 @@ pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) -> Opti
         ),
     }
     rhapsody_agent::manager::model_credential_from_config_json(&raw)
+}
+
+/// Writes a secret-bearing file with owner-only permissions (0600), so a copied credential never
+/// lands world-readable under the workspace root. `std::fs::write` would honour only the umask.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 /// Performs one worker attempt (upstream §16.5). Returns the worker's last-known issue state — the
@@ -3808,6 +3830,23 @@ mod tests {
         assert_eq!(usage.reserved_tokens, 0);
         assert_eq!(usage.provider_reported_tokens, None);
         assert!(usage.usage_authority.is_empty());
+    }
+
+    // §4.5: the filtered credential document is written owner-only (0600). `std::fs::write` would
+    // leave it umask-readable, and this file holds a live OAuth access token under the workspace root.
+    #[cfg(unix)]
+    #[test]
+    fn the_manager_credential_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("config")).join(".credentials.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        write_secret_file(&path, "{\"claudeAiOauth\":{}}").expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a copied credential must not be world-readable"
+        );
     }
 
     // STUDIO-1049 (§4.2): a manager attempt takes the manager provisioning path — an empty
