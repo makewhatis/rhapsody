@@ -674,19 +674,16 @@ mod tests {
     fn warm_exec(script: &str) {
         for _ in 0..50 {
             match std::process::Command::new(script).arg("--version").output() {
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    if !stderr.contains("Text file busy") {
-                        return;
-                    }
+                // A successful spawn (whatever its exit code) means no sibling still holds the
+                // inode open for writing, so the turn's own probe/spawn can no longer hit ETXTBSY.
+                Ok(_) => return,
+                Err(e) if e.to_string().contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => {
-                    if !e.to_string().contains("Text file busy") {
-                        return;
-                    }
-                }
+                // Any other spawn failure is a real fixture problem, not the race: let the turn
+                // surface it rather than spinning here.
+                Err(_) => return,
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
