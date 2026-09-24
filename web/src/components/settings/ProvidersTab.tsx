@@ -16,15 +16,22 @@
 
 import * as React from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button, Cpu, Field, Key, SectionCard, Select, TextInput } from "@/components/ui";
+import { Button, Cpu, Field, Key, Plus, SectionCard, Select, TextInput } from "@/components/ui";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
+  ProviderConfigError,
   fetchProviderCatalog,
   fetchProviderStatuses,
   refreshProviderCatalog,
+  saveProviderConfig,
   type ProviderCatalogDTO,
+  type ProviderConfigDTO,
+  type ProviderReferenceDTO,
 } from "@/lib/api";
 import {
   hasProviderBridge,
+  providerPrepare,
+  providerRemove,
   providerStatuses as desktopProviderStatuses,
   type ProviderStatus,
 } from "@/lib/provider-credentials";
@@ -36,6 +43,7 @@ import {
   catalogOptions,
   credentialStatusLabel,
   credentialTone,
+  hasStoredKey,
   isCredentialBlocked,
   manualEntryAllowed,
   providerViews,
@@ -46,11 +54,14 @@ import {
 } from "@/lib/providers-model";
 import type { UiGlobal } from "@/lib/settings-model";
 import { ProviderCredentialForm } from "./ProviderCredentialForm";
+import { ProviderEditor } from "./ProviderEditor";
 
 export interface ProvidersTabProps {
   value: UiGlobal;
   /** Apply a global-defaults edit (the parent marks the form dirty + autosaves). */
   onChange: (next: UiGlobal) => void;
+  /** The parent reloads the typed config after a definition write (STUDIO-1048). */
+  onDefinitionsChanged?: () => void;
 }
 
 const STATUS_QUERY_KEY = "provider-statuses";
@@ -62,9 +73,20 @@ function statusQueryFn(bridged: boolean): () => Promise<ProviderStatusInput[]> {
   return bridged ? () => desktopProviderStatuses() : () => fetchProviderStatuses();
 }
 
-export function ProvidersTab({ value, onChange }: ProvidersTabProps) {
+export function ProvidersTab({ value, onChange, onDefinitionsChanged }: ProvidersTabProps) {
   const bridged = hasProviderBridge();
   const qc = useQueryClient();
+
+  const [editorOpen, setEditorOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<ProviderConfigDTO | null>(null);
+  const [removeTarget, setRemoveTarget] = React.useState<ProviderView | null>(null);
+  const [removeError, setRemoveError] = React.useState<{
+    message: string;
+    references: ProviderReferenceDTO[];
+  } | null>(null);
+  const [removing, setRemoving] = React.useState(false);
+  // On desktop, the removal dialog offers to also delete the stored Keychain item (REVIEW B3).
+  const [removeKey, setRemoveKey] = React.useState(false);
 
   const statuses = useQuery({
     queryKey: [STATUS_QUERY_KEY, bridged],
@@ -122,6 +144,14 @@ export function ProvidersTab({ value, onChange }: ProvidersTabProps) {
     provider: value.provider,
     model: value.agentModel,
   });
+
+  // Whether the removal dialog should offer the desktop credential deletion: only when a key is
+  // actually stored and the desktop owner says it can remove it.
+  const removeStatus =
+    removeTarget == null
+      ? ""
+      : (statuses.data?.find((s) => s.provider_id === removeTarget.provider_id)?.status ?? "");
+  const removeHasStoredKey = bridged && removeTarget?.can_remove === true && hasStoredKey(removeStatus);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -209,12 +239,24 @@ export function ProvidersTab({ value, onChange }: ProvidersTabProps) {
       <SectionCard
         title="Providers"
         icon={Key}
-        desc="Credential status is read from the daemon's non-secret cache. No key, stored binding, or credential revision is ever shown."
+        desc="Credential status is read from the daemon's non-secret cache. No key, stored binding, or credential revision is ever shown. Definitions are non-secret configuration and are edited here without hand-editing WORKFLOW.md."
+        action={
+          <Button
+            variant="subtle"
+            size="sm"
+            onClick={() => {
+              setEditing(null);
+              setEditorOpen(true);
+            }}
+          >
+            <Plus size={14} /> Add provider
+          </Button>
+        }
       >
         {views.length === 0 ? (
           <p style={{ fontSize: 13, color: "var(--tx-3)" }}>
-            No providers are configured. Add a <code className="mono">providers:</code> block to
-            WORKFLOW.md to register one.
+            No providers are configured. Use <strong>Add provider</strong> above — no WORKFLOW.md
+            hand-editing is needed.
           </p>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -225,6 +267,15 @@ export function ProvidersTab({ value, onChange }: ProvidersTabProps) {
                 bridged={bridged}
                 status={statuses.data?.find((s) => s.provider_id === view.provider_id)}
                 onChanged={() => void statuses.refetch()}
+                onEdit={() => {
+                  setEditing(value.providers.find((p) => p.id === view.provider_id) ?? null);
+                  setEditorOpen(true);
+                }}
+                onRemove={() => {
+                  setRemoveError(null);
+                  setRemoveKey(false);
+                  setRemoveTarget(view);
+                }}
               />
             ))}
           </div>
@@ -232,8 +283,106 @@ export function ProvidersTab({ value, onChange }: ProvidersTabProps) {
         {!bridged && <p style={{ fontSize: 12, color: "var(--tx-3)" }}>{DESKTOP_ONLY_MESSAGE}</p>}
         {bridged && <p style={{ fontSize: 12, color: "var(--tx-3)" }}>{ACTIVE_SESSION_NOTICE}</p>}
       </SectionCard>
+
+      <ProviderEditor
+        open={editorOpen}
+        editing={editing}
+        usedIds={value.providers.map((p) => p.id)}
+        hasStoredKey={
+          editing != null &&
+          hasStoredKey(
+            statuses.data?.find((s) => s.provider_id === editing.id)?.status ?? "",
+          )
+        }
+        onClose={() => setEditorOpen(false)}
+        onSaved={() => {
+          void statuses.refetch();
+          onDefinitionsChanged?.();
+        }}
+      />
+
+      <ConfirmDialog
+        open={removeTarget != null}
+        title="Remove provider definition?"
+        body={
+          removeError
+            ? `${removeError.message}\n\nStill selected by:\n${removeError.references
+                .map((r) => `• ${r.label}`)
+                .join("\n")}`
+            : bridged
+              ? "This removes the providers: definition from WORKFLOW.md. The credential lives in the Keychain; remove it too if you no longer need it."
+              : "This removes the providers: definition from WORKFLOW.md. A stored key, if any, is not removed — use the desktop app's Remove on the card."
+        }
+        confirmLabel="Remove provider"
+        danger
+        busy={removing}
+        onConfirm={() => void removeProvider()}
+        onClose={() => {
+          setRemoveTarget(null);
+          setRemoveError(null);
+          setRemoveKey(false);
+        }}
+      >
+        {removeTarget != null && removeHasStoredKey && !removeError ? (
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+            <input
+              type="checkbox"
+              aria-label="Also remove the stored key"
+              checked={removeKey}
+              onChange={(e) => setRemoveKey(e.target.checked)}
+            />
+            Also remove the stored key from this device
+          </label>
+        ) : null}
+      </ConfirmDialog>
     </div>
   );
+
+  async function removeProvider() {
+    if (removeTarget == null) return;
+    setRemoving(true);
+    setRemoveError(null);
+    // The stored key must be removed WHILE the definition still exists (the desktop command derives
+    // the binding from it), so the credential goes first. But the definition removal can still be
+    // REFUSED (a provider something else selects), and that refusal must happen before the Keychain
+    // item is destroyed — otherwise a refused removal silently orphans every run's credential
+    // (REVIEW A1). So pre-flight the removal with the daemon's own reference check first.
+    const alsoRemoveKey = removeHasStoredKey && removeKey;
+    let keyRemoved = false;
+    try {
+      if (alsoRemoveKey) {
+        await saveProviderConfig({
+          op: "remove",
+          provider_id: removeTarget.provider_id,
+          dry_run: true,
+        });
+        const prepared = await providerPrepare(removeTarget.provider_id, "remove");
+        const result = await providerRemove(removeTarget.provider_id, prepared.nonce);
+        keyRemoved = result.mutated;
+      }
+      await saveProviderConfig({ op: "remove", provider_id: removeTarget.provider_id });
+      setRemoveTarget(null);
+      setRemoveKey(false);
+      void statuses.refetch();
+      onDefinitionsChanged?.();
+    } catch (e) {
+      if (e instanceof ProviderConfigError && e.references.length > 0) {
+        setRemoveError({
+          message: keyRemoved
+            ? `${e.message} — the stored key was already removed`
+            : e.message,
+          references: e.references,
+        });
+      } else {
+        setRemoveError({
+          message: e instanceof Error ? e.message : "the provider could not be removed",
+          references: [],
+        });
+      }
+    } finally {
+      setRemoving(false);
+    }
+  }
 }
 
 const TONE_COLOR: Record<ReturnType<typeof credentialTone>, string> = {
@@ -248,11 +397,15 @@ function ProviderCard({
   bridged,
   status,
   onChanged,
+  onEdit,
+  onRemove,
 }: {
   view: ProviderView;
   bridged: boolean;
   status?: ProviderStatusInput;
   onChanged: () => void;
+  onEdit: () => void;
+  onRemove: () => void;
 }) {
   const hint = recoveryHint(view.recovery);
   // Reconstruct the desktop DTO shape the credential form consumes. The form only reads the fields
@@ -300,6 +453,16 @@ function ProviderCard({
         {!view.broker_available
           ? ` · broker unavailable${view.broker_reason ? ` (${view.broker_reason})` : ""} — credentialed dispatch is refused`
           : ""}
+      </div>
+
+      {/* Definition actions: NON-secret configuration, so they are available in the browser too. */}
+      <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        <Button variant="ghost" size="sm" aria-label={`Edit ${view.provider_id}`} onClick={onEdit}>
+          Edit provider
+        </Button>
+        <Button variant="ghost" size="sm" aria-label={`Remove ${view.provider_id}`} onClick={onRemove}>
+          Remove provider
+        </Button>
       </div>
 
       {view.insecure_http && (

@@ -41,6 +41,7 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
+use crate::handlers_provider_config::handle_provider_config;
 use crate::handlers_providers::{
     handle_provider_models, handle_provider_models_refresh, handle_providers,
 };
@@ -448,6 +449,14 @@ pub trait StateProvider: Send + Sync {
         Err(CatalogError::Unsupported)
     }
 
+    /// Every place `provider_id` is still SELECTED (STUDIO-1048): the global default, a profile, a
+    /// roster entry, the review override or the manager. The provider-definition editor refuses a
+    /// removal when this is non-empty and lists every entry. Rhapsody-only; the default answers
+    /// empty, which is the truth for a provider with no selection surfaces.
+    fn provider_references(&self, _provider_id: &str) -> Vec<rhapsody_config::ProviderReference> {
+        Vec::new()
+    }
+
     // --- the ticketless review console (STUDIO-722, slice 8; design §7, §15-e, §16) ---
     //
     // The three default to a DORMANT subsystem rather than to an error, unlike the `teams_*`
@@ -658,6 +667,14 @@ where
         .route(
             "/api/v1/providers/{id}/models/refresh",
             operator_write(handle_provider_models_refresh),
+        )
+        // Authoring provider DEFINITIONS (STUDIO-1048; Rhapsody-only). Non-secret configuration, so
+        // like /api/v1/config it is behind the operator-write guard but available to the browser
+        // dashboard too; the splice is byte-preserving and the candidate is validated by the
+        // daemon's own load pipeline.
+        .route(
+            "/api/v1/providers/config",
+            operator_write(handle_provider_config),
         )
         // Rhapsody Teams memory (STUDIO-645, Rhapsody-only — no Go v0.4.0 counterpart): the roster
         // with derived status, an identity's recalled memory, and the per-record invalidate that

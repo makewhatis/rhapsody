@@ -448,6 +448,19 @@ fn raw_project_from_project(
     rp
 }
 
+/// Serializes ONE provider definition to its pruned YAML value (STUDIO-1048), reusing exactly the
+/// same emit-only-when-non-default rules [`raw_provider_from_definition`] and [`prune_empty`] apply
+/// during a full `encode`. This lets the Settings provider editor write a canonical `providers.<id>`
+/// block without re-serializing (and thus destroying comments in) the rest of WORKFLOW.md.
+pub(crate) fn provider_definition_value(
+    def: &crate::providers::ProviderDefinition,
+) -> Result<Value, String> {
+    let default_limits = crate::providers::BrokerLimits::default();
+    let raw = raw_provider_from_definition(def, &default_limits);
+    let value = serde_yaml_ng::to_value(raw).map_err(|e| e.to_string())?;
+    Ok(prune_empty(value).unwrap_or(Value::Null))
+}
+
 /// Recursively drops `null`, empty-string, empty-sequence and empty-map values from a decoded YAML
 /// value, returning `Some(pruned)` or `None` when the whole value is empty (Go `pruneEmpty`).
 /// Numbers (including `0`) and booleans (including `false`) are ALWAYS kept, so an explicit zero/

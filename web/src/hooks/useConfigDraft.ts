@@ -75,6 +75,8 @@ export interface ConfigDraftModel {
   onRemoveAgent: (index: number) => void;
   onCreateAgent: (project: LinearProject, repo: string) => void;
   onDisconnect: () => void;
+  /** Re-read the typed config from disk (after a non-typed write, e.g. a provider definition). */
+  reload: () => void;
 }
 
 export function useConfigDraft(): ConfigDraftModel {
@@ -280,5 +282,6 @@ export function useConfigDraft(): ConfigDraftModel {
     onRemoveAgent,
     onCreateAgent,
     onDisconnect,
+    reload: () => void cfg.refetch(),
   };
 }

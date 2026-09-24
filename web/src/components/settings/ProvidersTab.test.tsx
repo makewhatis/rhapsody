@@ -3,14 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { GlobalConfigDTO, ProviderCatalogDTO, ProviderConfigDTO } from "@/lib/api";
+import { ProviderConfigError } from "@/lib/api";
 import { toUiGlobal } from "@/lib/settings-model";
 
 const h = vi.hoisted(() => ({
   hasProviderBridge: vi.fn(() => false),
   providerStatuses: vi.fn(),
+  providerPrepare: vi.fn(),
+  providerRemove: vi.fn(),
   fetchProviderStatuses: vi.fn(),
   fetchProviderCatalog: vi.fn(),
   refreshProviderCatalog: vi.fn(),
+  saveProviderConfig: vi.fn(),
 }));
 
 vi.mock("@/lib/provider-credentials", async (orig) => {
@@ -19,6 +23,8 @@ vi.mock("@/lib/provider-credentials", async (orig) => {
     ...actual,
     hasProviderBridge: h.hasProviderBridge,
     providerStatuses: h.providerStatuses,
+    providerPrepare: h.providerPrepare,
+    providerRemove: h.providerRemove,
   };
 });
 
@@ -29,6 +35,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchProviderStatuses: h.fetchProviderStatuses,
     fetchProviderCatalog: h.fetchProviderCatalog,
     refreshProviderCatalog: h.refreshProviderCatalog,
+    saveProviderConfig: h.saveProviderConfig,
   };
 });
 
@@ -234,6 +241,63 @@ describe("ProvidersTab", () => {
     expect(text).not.toContain("rev-1234");
   });
 
+  // ACCEPTANCE: definitions are non-secret configuration, so the browser dashboard can add/edit/remove
+  // them (only the KEY actions are desktop-only).
+  it("offers definition actions in browser-only mode", async () => {
+    h.hasProviderBridge.mockReturnValue(false);
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Add provider" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit fireworks" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove fireworks" })).toBeTruthy();
+  });
+
+  // ACCEPTANCE: a refused removal lists EVERY reference the daemon reported.
+  it("refuses to remove a referenced provider and lists every reference", async () => {
+    h.saveProviderConfig.mockRejectedValue(
+      new ProviderConfigError("provider \"fireworks\" is still selected", "provider_in_use", [
+        { kind: "global", label: "the global default (agent.provider)" },
+        { kind: "manager", label: "the manager (manager.provider)" },
+        { kind: "roster", label: "roster entry \"jerry\"" },
+      ]),
+    );
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    const confirm = await screen.findByRole("button", { name: "Remove provider" });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(screen.getByText(/the global default/)).toBeTruthy());
+    const body = screen.getByRole("dialog").textContent ?? "";
+    expect(body).toContain("the manager (manager.provider)");
+    expect(body).toContain('roster entry "jerry"');
+  });
+
+  // ACCEPTANCE: an unreferenced removal goes straight to the daemon and succeeds.
+  it("removes an unreferenced provider", async () => {
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+    const onDefinitionsChanged = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <ProvidersTab
+          value={toUiGlobal(makeGlobal())}
+          onChange={vi.fn()}
+          onDefinitionsChanged={onDefinitionsChanged}
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove provider" }));
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith({
+        op: "remove",
+        provider_id: "fireworks",
+      }),
+    );
+    await waitFor(() => expect(onDefinitionsChanged).toHaveBeenCalled());
+  });
+
   // MUTATION GUARD: an unavailable broker renders the CLOSED reason code and nothing about the
   // broker's internals (a listener address, capability, or credential). A view that rendered a
   // raw address/capability here reds; one that hid the reason entirely reds the positive assert.
@@ -258,5 +322,136 @@ describe("ProvidersTab", () => {
     expect(text).toContain("provider_broker_unavailable");
     expect(text).not.toContain("127.0.0.1:54321");
     expect(text).not.toContain("cap-CANARY");
+  });
+
+  // ACCEPTANCE (REVIEW B3): on desktop the removal dialog offers to delete the stored key, and the
+  // key is removed BEFORE the definition (the desktop command derives the binding from the
+  // definition, which must still exist).
+  it("offers to remove the stored key on desktop and does so before the definition", async () => {
+    h.hasProviderBridge.mockReturnValue(true);
+    h.providerStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        display_name: "Fireworks",
+        endpoint: "https://api.fireworks.ai/inference/v1",
+        adapter: "openai-chat-completions-bearer-v1",
+        insecure_http: false,
+        status: "configured",
+        recovery: null,
+        can_connect: false,
+        can_replace: true,
+        can_rebind: false,
+        can_remove: true,
+      },
+    ]);
+    h.providerPrepare.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      endpoint: "https://api.fireworks.ai/inference/v1",
+      insecure_http: false,
+      nonce: "nonce-1",
+      expires_in_ms: 1000,
+    });
+    h.providerRemove.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      mutated: true,
+      status: "absent",
+      sync: "synchronized",
+    });
+    h.saveProviderConfig.mockResolvedValue({ config: {}, prompt_body: "" });
+
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    // Wait for the desktop status feed so the card's can_remove is known before opening the dialog.
+    await waitFor(() => expect(screen.getAllByText("Connected").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    fireEvent.click(await screen.findByLabelText("Also remove the stored key"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove provider" }));
+    // The daemon's reference check runs FIRST as a `dry_run`; only then is the key removed, and only
+    // then is the real definition removal posted.
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith({
+        op: "remove",
+        provider_id: "fireworks",
+        dry_run: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(h.saveProviderConfig).toHaveBeenCalledWith({
+        op: "remove",
+        provider_id: "fireworks",
+      }),
+    );
+    expect(h.providerPrepare).toHaveBeenCalledWith("fireworks", "remove");
+    expect(h.providerRemove).toHaveBeenCalledWith("fireworks", "nonce-1");
+    const dryRun = h.saveProviderConfig.mock.invocationCallOrder[0];
+    const keyRemoval = h.providerRemove.mock.invocationCallOrder[0];
+    const realRemove = h.saveProviderConfig.mock.invocationCallOrder[1];
+    expect(dryRun).toBeLessThan(keyRemoval);
+    expect(keyRemoval).toBeLessThan(realRemove);
+  });
+
+  // REVIEW A1 (MUTATION GUARD): when the daemon REFUSES the definition removal, the stored key must
+  // never be destroyed. Removing the credential before the `dry_run` pre-flight reds this — the
+  // operator would orphan every run on a provider that is still selected.
+  it("never removes the stored key when the daemon refuses the removal", async () => {
+    h.hasProviderBridge.mockReturnValue(true);
+    h.providerStatuses.mockResolvedValue([
+      {
+        provider_id: "fireworks",
+        display_name: "Fireworks",
+        endpoint: "https://api.fireworks.ai/inference/v1",
+        adapter: "openai-chat-completions-bearer-v1",
+        insecure_http: false,
+        status: "configured",
+        recovery: null,
+        can_connect: false,
+        can_replace: true,
+        can_rebind: false,
+        can_remove: true,
+      },
+    ]);
+    h.providerPrepare.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      endpoint: "https://api.fireworks.ai/inference/v1",
+      insecure_http: false,
+      nonce: "nonce-1",
+      expires_in_ms: 1000,
+    });
+    h.providerRemove.mockResolvedValue({
+      provider_id: "fireworks",
+      operation: "remove",
+      mutated: true,
+      status: "absent",
+      sync: "synchronized",
+    });
+    h.saveProviderConfig.mockRejectedValue(
+      new ProviderConfigError("provider \"fireworks\" is still selected", "provider_in_use", [
+        { kind: "global", label: "the global default (agent.provider)" },
+      ]),
+    );
+
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText("Connected").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    fireEvent.click(await screen.findByLabelText("Also remove the stored key"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove provider" }));
+    // The refusal is surfaced, and neither the prepare nor the removal of the key ever ran.
+    await waitFor(() => expect(screen.getByText(/the global default/)).toBeTruthy());
+    expect(h.providerPrepare).not.toHaveBeenCalled();
+    expect(h.providerRemove).not.toHaveBeenCalled();
+  });
+
+  // MUTATION GUARD: a browser has no Keychain, so the dialog must NOT offer to remove a stored key.
+  it("never offers to remove a stored key in browser-only mode", async () => {
+    h.hasProviderBridge.mockReturnValue(false);
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("provider-card-fireworks")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove fireworks" }));
+    await screen.findByRole("button", { name: "Remove provider" });
+    expect(screen.queryByLabelText("Also remove the stored key")).toBeNull();
   });
 });

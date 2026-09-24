@@ -22,6 +22,7 @@ pub mod model;
 pub mod profiles;
 pub mod projects;
 pub mod prompt;
+pub mod provider_edit;
 pub mod providers;
 pub mod resolve;
 pub mod room;
@@ -41,6 +42,10 @@ pub use model::{
     WORKSPACE_MODE_WORKTREE, Workspace,
 };
 pub use projects::{EffectiveConfig, ResolvedProject, effective_for, resolve_projects};
+pub use provider_edit::{
+    EditError, ProviderOp, ProviderReference, apply_provider_edit, profile_providers,
+    provider_references,
+};
 pub use providers::{
     ADAPTER_OPENAI_CHAT_COMPLETIONS_BEARER_V1, BrokerLimits, CredentialBinding, CredentialSource,
     DEFAULT_CAPABILITY_LIFETIME_MS, MAX_PROVIDERS, MODEL_ID_MAX_BYTES, PROTOCOL_OPENAI_COMPATIBLE,
