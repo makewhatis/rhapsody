@@ -642,8 +642,9 @@ pub fn probe_cli_version(command: &str) -> Result<String, String> {
 /// settings hook (its trap file must not exist) and `Bash` (its marker must not exist). Each tool
 /// attempt is refused when the CLI's own init `tools` array does not expose it — the CLI's report,
 /// not the model's prose — and falls back to the model's report line only when no init line was
-/// captured. A run that cannot start, or that emits neither an init line nor a report, is reported
-/// as NOT refused for every attempt — the fail-closed direction.
+/// captured. A run that cannot start, or whose turn ERRORS after emitting its init line (auth,
+/// quota, crash, timeout), is reported as NOT refused for every attempt — the fail-closed direction
+/// (alice's review B5: the init posture alone must never carry a dead canary to a pass).
 pub struct CliCanaryRunner {
     /// The `claude` command (may include args), from the resolved config.
     pub command: String,
@@ -733,12 +734,21 @@ impl CanaryRunner for CliCanaryRunner {
         };
         let noop = |_e: rhapsody_agent::Event| {};
         let (result, err) = session.run_turn(&canary_prompt(), None, None, &noop).await;
+        // The canary must actually RUN to prove anything. A CLI (or a config root) that emits a
+        // clean init line and then dies — an auth failure, a quota, a crash, the turn timeout —
+        // has proven nothing: its posture might be clean only because the session never got as far
+        // as trying the boundaries. So a turn error reads as NOT refused for EVERY attempt, which
+        // `evaluate` turns into a disable (alice's review B5: reading the verdict from the init
+        // posture alone let a dead canary pass, the exact B1 failure mode treated as a pass).
+        if let Some(e) = err {
+            return self.failed(format!("the canary turn did not complete: {e}"));
+        }
         let report = parse_canary_report(&result.result_text);
         let trap_fired = dir.join(CANARY_TRAP_FILE).exists();
         let bash_ran = dir.join("canary-bash-ran").exists();
-        let run_detail = err
-            .map(|e| format!("canary turn errored: {e}"))
-            .unwrap_or_else(|| "canary turn completed".to_string());
+        // Past the guard above the turn completed cleanly; a missing refusal is then attributable to
+        // the CLI's posture rather than to the turn dying.
+        let run_detail = "the canary turn completed without refusing it".to_string();
         // §4.3/§15.4: the CLI's OWN init posture — no built-in tool, no inherited MCP server,
         // `default` mode. This is what catches a CLI that adds a built-in the deny list doesn't name
         // (alice's review B2) and a dropped `--strict-mcp-config` (the mutation discipline's
@@ -1094,6 +1104,43 @@ mod tests {
             evaluate("0.0.0", &observations),
             SelfTestVerdict::Failed(_)
         ));
+    }
+
+    // The production runner's SECOND fail-closed path (alice's review B5): a canary that emits a
+    // clean init posture and then ERRORs — auth failure, quota, a crash, the turn timeout — must not
+    // be read as enforcement. The init posture is necessary but not sufficient: the turn must
+    // complete. The mutation "treat a crashed canary as passed" (dropping the turn-error guard) reds
+    // this, which is why the fake CLI prints a CLEAN init line before its error result.
+    #[tokio::test]
+    async fn a_canary_whose_turn_errors_after_init_fails_closed() {
+        let script_dir = crate::testsupport::TempDir::new();
+        let script = script_dir.child("fake-claude.sh");
+        let body = concat!(
+            "#!/usr/bin/env bash\n",
+            // Drain the runner's held-open stdin so the writer goroutine never blocks (INF-250).
+            "cat >/dev/null 2>&1 &\n",
+            // A CLEAN init posture: only manager MCP tools, only the daemon's server, default mode.
+            "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\",\"tools\":[\"mcp__symphony__manager_pr\"],\"mcp_servers\":[{\"name\":\"symphony\"}],\"permissionMode\":\"default\"}'\n",
+            // …then die, as an auth/quota/crash/timeout would: a terminal ERROR result.
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"s\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+        );
+        std::fs::write(&script, body).expect("write fake claude");
+        let root = crate::testsupport::TempDir::new();
+        let runner = CliCanaryRunner {
+            command: format!("bash {script}"),
+            workspace_root: root.path.clone(),
+            daemon_bin: String::new(),
+            workflow_path: String::new(),
+        };
+        let observations = runner.run_canary("0.0.0").await;
+        assert!(
+            observations.iter().all(|o| !o.refused),
+            "a canary whose turn errored must observe NO refusal: {observations:?}"
+        );
+        assert!(
+            matches!(evaluate("0.0.0", &observations), SelfTestVerdict::Failed(_)),
+            "a canary whose turn errored must disable the manager"
+        );
     }
 
     // §4.7 / the ticket's mutation "skip the version-change re-run: its test must fail". A verdict
