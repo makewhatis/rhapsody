@@ -1016,7 +1016,10 @@ mod tests {
             o.terminate(&issue_id).is_some(),
             "the fixture run must be running to cancel"
         );
-        assert!(o.running.get(&issue_id).is_none(), "terminate removed the entry");
+        assert!(
+            !o.running.contains_key(&issue_id),
+            "terminate removed the entry"
+        );
 
         let usage = store::RunUsage {
             reserved_tokens: 0,

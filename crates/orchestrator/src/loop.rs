@@ -3382,7 +3382,10 @@ mod tests {
                 usage,
             } => {
                 assert_eq!(issue_id, "1");
-                assert_eq!(run_id, 42, "the run id rides on the event, not a live lookup");
+                assert_eq!(
+                    run_id, 42,
+                    "the run id rides on the event, not a live lookup"
+                );
                 assert_eq!(usage.reserved_tokens, 0);
                 assert_eq!(usage.provider_reported_tokens, None);
                 assert!(usage.usage_authority.is_empty());
