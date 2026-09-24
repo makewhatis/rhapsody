@@ -1132,6 +1132,18 @@ mod tests {
         fn invalidate_manager_exchanges(&self, pr: &str) -> Result<(), StoreError> {
             self.0.invalidate_manager_exchanges(pr)
         }
+        fn record_evidence_access(
+            &self,
+            access: rhapsody_store::EvidenceAccess,
+        ) -> Result<(), StoreError> {
+            self.0.record_evidence_access(access)
+        }
+        fn evidence_accesses(
+            &self,
+            run_id: i64,
+        ) -> Result<Vec<rhapsody_store::EvidenceAccess>, StoreError> {
+            self.0.evidence_accesses(run_id)
+        }
         fn record_review_completion(
             &self,
             key: &rhapsody_store::ReviewWatchKey,

@@ -2940,6 +2940,18 @@ mod tests {
         fn invalidate_manager_exchanges(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
             self.0.invalidate_manager_exchanges(a0)
         }
+        fn record_evidence_access(
+            &self,
+            a0: rhapsody_store::EvidenceAccess,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.record_evidence_access(a0)
+        }
+        fn evidence_accesses(
+            &self,
+            a0: i64,
+        ) -> Result<Vec<rhapsody_store::EvidenceAccess>, rhapsody_store::StoreError> {
+            self.0.evidence_accesses(a0)
+        }
         fn record_review_completion(
             &self,
             a0: &rhapsody_store::ReviewWatchKey,
