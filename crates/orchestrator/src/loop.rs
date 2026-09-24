@@ -1822,8 +1822,10 @@ impl Orchestrator {
                 _ = cancel.cancelled() => (iss.state.clone(), crate::worker::WorkerDeclaration::default(), None),
             };
             // Drain the broker supervisor after the run future is fully dropped and report the usage
-            // (PB7, STUDIO-1002; design §10.3). BEFORE the exit event, so the control task still has
-            // the running entry to resolve the store run id from.
+            // (PB7, STUDIO-1002; design §10.3). BEFORE the exit event, so the control task's running
+            // entry is still live to have its child tallies replaced by the finalized receipt; the
+            // run id rides on the event so persistence does not depend on the entry surviving a
+            // cancellation (review A2).
             finalize_broker_usage(broker_slots.as_ref(), &events_exit, &issue_id, run_id);
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
