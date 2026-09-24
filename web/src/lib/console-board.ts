@@ -364,12 +364,18 @@ const TERMINAL_STATES: readonly string[] = ["done", "canceled", "cancelled"];
  * was guessing a TICKET state from an unresolved one, now returns no lane so the card is held out
  * until tracker states arrive.
  *
- * THE DELIBERATE HOLDS ARE NOT GUESSES. A `heldForHuman` or `budgetHeld` card's lane comes from the
- * live snapshot (STUDIO-949/970), not the tracker, so it keeps Queued even with a blank state —
- * and it must, or the very restart window this fires in would erase every hold from the board.
+ * THE LIVE-SNAPSHOT HOLDS ARE NOT GUESSES. A `heldForHuman`, `budgetHeld` or held-dependent card's
+ * lane comes from the live snapshot (STUDIO-949/970, INF-318/320), not the tracker, so it keeps
+ * Queued even with a blank state — and it must, or the very restart window this fires in would erase
+ * the hold from the board. A held dependent is the third such kind: the daemon synthesizes a
+ * `state.blocked` row for a ticket it is holding on an uncleared predecessor, and that ticket has
+ * usually NEVER RUN, so the tracker is never asked about it and its `trackerState` is blank for good,
+ * not just until states arrive. `dependencies` is that live-snapshot fact on the card (filled before
+ * the lane loop in [`buildConsoleBoard`]), and it is what tells the two blanks apart.
  */
 export function boardLaneOf(
   card: Pick<BoardCard, "status" | "live" | "trackerState"> & {
+    dependencies?: readonly string[];
     heldForHuman?: boolean;
     budgetHeld?: string;
   },
@@ -386,9 +392,12 @@ export function boardLaneOf(
     default:
       // A live run outranks a stale status word: an agent on the ticket IS running.
       if (card.live) return "running";
-      // A hold is a live-snapshot fact, not a tracker answer, so it speaks for the lane regardless.
-      if (card.heldForHuman || card.budgetHeld !== undefined) return "queued";
-      // No tracker answer and no live run: the lane would be a guess. Hold the card out.
+      // Every live-snapshot hold speaks for the lane regardless of the tracker: the human hold, the
+      // budget hold, and a held dependent (which carries its blocker chip in `dependencies`).
+      if (card.heldForHuman || card.budgetHeld !== undefined || (card.dependencies?.length ?? 0) > 0) {
+        return "queued";
+      }
+      // No tracker answer and no live-snapshot fact: the lane would be a guess. Hold the card out.
       return card.trackerState.trim() === "" ? undefined : "queued";
   }
 }
@@ -557,9 +566,9 @@ export function buildConsoleBoard(
   const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));
   for (const card of cards) {
     const id = boardLaneOf(card);
-    // `undefined` is "no lane is known" (STUDIO-1039): the card is held out of the board until the
-    // tracker answers, rather than guessed into Queued. It is not silently rendered nowhere else —
-    // the caller gets exactly the four fixed lanes it always did.
+    // `undefined` is "no lane is known" (STUDIO-1039): the card is deliberately held out of every
+    // lane until the tracker answers, rather than guessed into Queued — the caller still gets
+    // exactly the four fixed lanes it always did, just without this one card in them.
     if (id === undefined) continue;
     lanes.find((lane) => lane.id === id)?.cards.push(card);
   }

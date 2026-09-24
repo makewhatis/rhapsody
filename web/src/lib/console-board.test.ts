@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { BlockedEntry } from "@/lib/api";
-import type { ConsoleJobRow } from "@/lib/console-jobs";
+import type { BlockedEntry, StateResponse } from "@/lib/api";
+import { buildConsoleJobs, type ConsoleJobRow } from "@/lib/console-jobs";
+import { mergeJobs } from "@/lib/runs-model";
 import {
   type BoardLane,
   BOARD_ACTIVE_OUTCOMES,
@@ -224,6 +225,40 @@ describe("the board regroup (STUDIO-925)", () => {
     ]);
     expect(cards(board)).toEqual([]);
     expect(laneIssues(board, "queued")).toEqual([]);
+  });
+
+  // The blocking case the direct row test above cannot see (review of PR #266). A held dependent
+  // (`state.blocked`, graphite/dag) has usually NEVER run, so `mergeJobs` synthesizes its row and the
+  // daemon never asks the tracker about it — its `trackerState` is blank for GOOD, not just during
+  // the restart window. Keying the guard off the blank state alone therefore drops the card and its
+  // blocker chip off the board permanently. This drives the real chain
+  // `mergeJobs → buildConsoleJobs → buildConsoleBoard`, where the card's live-snapshot fact is the
+  // `dependencies` it already carries.
+  it("keeps a never-ran held dependent in Queued through the full chain", () => {
+    const blocked: BlockedEntry[] = [
+      {
+        issue_identifier: "STUDIO-2",
+        title: "dependent",
+        project: "rhapsody",
+        blocker_identifier: "STUDIO-1",
+        blocker_state: "In Progress",
+        mode: "dag",
+      },
+    ];
+    const state: StateResponse = {
+      status: "ok",
+      poll_interval_ms: 2000,
+      running: [],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: [],
+      blocked,
+    };
+    const jobs = buildConsoleJobs(mergeJobs(state, [], [], 0), [], undefined, 0, []);
+    const board = buildConsoleBoard(jobs, blocked);
+
+    expect(laneIssues(board, "queued")).toEqual(["STUDIO-2"]);
+    expect(cards(board)[0].dependencies).toEqual(["STUDIO-1 · In Progress"]);
   });
 
   // STUDIO-966 — a parked ticket keeps its own pill but rides in the Queued lane (it is not
