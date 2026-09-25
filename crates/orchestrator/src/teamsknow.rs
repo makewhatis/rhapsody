@@ -744,6 +744,25 @@ impl<'a> Knowledge<'a> {
         self.runs_of(&self.key(identifier), limit)
     }
 
+    /// The ticket a run reference (`run 2625`) names, or `None`.
+    ///
+    /// Team-scoped for [`Knowledge::issue_runs`]'s reason: a `run N` in an operator post is
+    /// untrusted data, so a run numbered off another team's project must resolve to nothing rather
+    /// than to a key the reply would then echo. `issue_identifier` is returned verbatim — the
+    /// caller validates it against the cycle's own candidate set exactly as it does every other
+    /// extracted key, so a review run (`pr:owner/repo#n@reviewer`) simply fails that gate rather
+    /// than being special-cased here.
+    pub fn ticket_for_run(&self, run_id: i64) -> Result<Option<String>, KnowledgeError> {
+        match self.store.get_run(run_id)? {
+            // An unattributed run (`issue_identifier` empty) names no ticket, so it resolves to
+            // nothing rather than to an empty key the reply would then echo.
+            Some(run) if self.scope.admits_run(&run) && !run.issue_identifier.is_empty() => {
+                Ok(Some(run.issue_identifier))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// This team's most recent runs, newest first, projected.
     pub fn recent_runs(&self, limit: i64) -> Result<Runs, KnowledgeError> {
         let limit = clamp_rows(limit);

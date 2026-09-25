@@ -145,9 +145,10 @@ const MAX_TARGETS_PER_POST: usize = 5;
 /// idempotent per ticket.
 const MAX_ACTED_POSTS_PER_INTERVAL: usize = 5;
 
-/// How many raw ticket-key matches one post body is scanned for before the scan gives up. A bound on
-/// the SCAN, not on the answer ([`MAX_TARGETS_PER_POST`] is that): a pasted changelog should cost a
-/// bounded walk, not a vector the length of the paste.
+/// How many raw ticket-key matches — and how many refs — one post is scanned for before the scan
+/// gives up. A bound on the SCAN, not on the answer ([`MAX_TARGETS_PER_POST`] is that): a pasted
+/// changelog, or a post carrying a wall of refs, should cost a bounded walk, not a vector the
+/// length of the paste.
 const MAX_KEYS_SCANNED: usize = 32;
 
 /// How much of a post body is rendered into the manager's turn, in characters. The cap that keeps a
@@ -608,7 +609,7 @@ async fn act_on_post(
     post: &Message,
     report: &mut EarsReport,
 ) {
-    let (keys, truncated) = resolve_keys(ears, cycle, &post.body).await;
+    let (keys, truncated) = resolve_keys(ears, cycle, post).await;
     // Gathered ONCE, and only when a model turn will actually be spent. Once because the turn's
     // prompt and the reply's own fallback have to be bounded by the SAME records — a second gather
     // could answer differently and the reply would then vouch for facts the turn never saw. Only
@@ -832,16 +833,17 @@ async fn gather_facts(
     if !cycle.model || teams.manager.mode != ManagerMode::LabelsModel || keys.is_empty() {
         return Facts::default();
     }
-    // The pull requests the post PASTED, re-read from the same body `resolve_keys` read and bounded
-    // the same way. `resolve_keys` resolves each URL to the TICKET it belongs to and then drops the
-    // coordinate — which is right for a target, because a ticket is what an action acts on, and
-    // wrong for a fact, because slice 2's review verdicts are keyed by the coordinate and are
-    // reachable no other way.
+    // The pull requests the post PASTED or REFED, re-read from the same two sources `resolve_keys`
+    // read and bounded the same way. `resolve_keys` resolves each coordinate to the TICKET it
+    // belongs to and then drops the coordinate — which is right for a target, because a ticket is
+    // what an action acts on, and wrong for a fact, because slice 2's review verdicts are keyed by
+    // the coordinate and are reachable no other way.
     //
     // Rendered in the accessor's own review-key spelling so the gather takes the review path rather
     // than the ticket one. Costs no extra GitHub call by itself: the accessor's `gh` leg is gated
     // on this team's watch set already holding a row for the pull request.
-    let prs: Vec<String> = extract_pr_urls(&post.body)
+    let prs: Vec<String> = scan_mentions(&post.body, &post.refs)
+        .prs
         .iter()
         .take(MAX_TARGETS_PER_POST)
         .map(|p| format!("pr:{}/{}#{}", p.owner, p.repo, p.number))
@@ -882,18 +884,135 @@ fn no_target_reply(keys: &[String]) -> String {
     }
 }
 
-/// Extracts the tickets one post names — keys verbatim, plus any resolved from pasted PR URLs —
-/// bounded to [`MAX_TARGETS_PER_POST`]. Returns `(keys, whether more were named)`.
-async fn resolve_keys(ears: &Ears, cycle: &EarsCycle<'_>, body: &str) -> (Vec<String>, bool) {
+/// The reply a HELD ticket earns (STUDIO-1052 requirement 2): name the hold and how to release it.
+///
+/// `rhapsody:human` is the one hold, whether an operator applied it by hand or the runaway-loop
+/// breaker applied it on a limit crossing ([`crate::breaker`]). The operator's lever is the same
+/// either way — remove the label — so the reply says so rather than answering as if the ticket were
+/// idle or missing.
+fn human_hold_reply(iss: &Issue) -> String {
+    format!(
+        "{} is held for a human (`rhapsody:human`), so I did nothing with it. Remove the \
+         `rhapsody:human` label to release it.",
+        iss.identifier
+    )
+}
+
+/// Every ticket key, pull request and run reference a post names, from its BODY and its REFS.
+///
+/// The two sources are scanned by one function so a ref is resolved EXACTLY the way a body mention
+/// is (STUDIO-1052): a key is a key (and is then validated against the cycle's own set by
+/// `find_issue`), a pull request is a coordinate (and is then resolved to a ticket), and a `run N`
+/// is a run reference resolved through the team-scoped store. **The trust posture is unchanged:**
+/// refs are untrusted data exactly like the body, they pick targets for the bounded actions that
+/// already exist, and they grant nothing new.
+struct Mentions {
+    keys: Vec<String>,
+    prs: Vec<PrRef>,
+    runs: Vec<i64>,
+}
+
+/// Scans a post's body AND its refs. The refs walk is bounded at [`MAX_KEYS_SCANNED`], mirroring
+/// the body scan's own bound, so a post carrying thousands of refs costs a bounded walk rather than
+/// a vector the length of the ref list.
+fn scan_mentions(body: &str, refs: &[String]) -> Mentions {
     let mut keys = extract_keys(body);
+    let mut prs = extract_pr_urls(body);
+    let mut runs: Vec<i64> = Vec::new();
+    for r in refs.iter().take(MAX_KEYS_SCANNED) {
+        for k in extract_keys(r) {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        for pr in ref_prs(r) {
+            if !prs.contains(&pr) {
+                prs.push(pr);
+            }
+        }
+        if let Some(run) = parse_run_ref(r)
+            && !runs.contains(&run)
+        {
+            runs.push(run);
+        }
+    }
+    Mentions { keys, prs, runs }
+}
+
+/// A run reference's numeric id (`run 2625`), or `None`.
+///
+/// The console's "ask about this run" dock attaches exactly this spelling (`askRefs`), and
+/// [`resolve_keys`] resolves it to the run's ticket through the team-scoped store. The prefix is
+/// matched case-insensitively and the remainder must be all digits, so `runner 5` and `run away`
+/// name no run.
+fn parse_run_ref(s: &str) -> Option<i64> {
+    let digits = s.trim().to_ascii_lowercase();
+    let digits = digits.strip_prefix("run")?.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+/// The pull requests ONE ref or body names: [`extract_pr_urls`]'s host-checked URL form plus the
+/// bare `owner/repo#n` shorthand the console's ref field carries.
+///
+/// The shorthand is admitted only for a string with no URL scheme, so a look-alike host stays
+/// subject to `extract_pr_urls`'s `github.com` check rather than being parsed as a coordinate by
+/// [`parse_pr_ref`](crate::teamsknow::parse_pr_ref)'s host-agnostic `/pull/` split.
+fn ref_prs(s: &str) -> Vec<PrRef> {
+    let mut out = extract_pr_urls(s);
+    if !s.contains("://")
+        && let Some(pr) = crate::teamsknow::parse_pr_ref(s)
+    {
+        let pr = PrRef {
+            owner: pr.owner,
+            repo: pr.repo,
+            number: pr.number,
+        };
+        if !out.contains(&pr) {
+            out.push(pr);
+        }
+    }
+    out
+}
+
+/// The ticket a `run N` ref names, through the cycle's team-scoped knowledge accessor.
+///
+/// `None` — not an error — when this daemon has no accessor (no durable store) or when the run is
+/// not this team's; a store failure is logged and treated the same way, because a room post must
+/// never fail a cycle.
+fn ticket_for_run(cycle: &EarsCycle<'_>, run_id: i64) -> Option<String> {
+    let knowledge = cycle.knowledge?;
+    match knowledge.ticket_for_run(run_id) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(
+                run_id,
+                err = %e,
+                "teams manager could not resolve a `run` ref to its ticket"
+            );
+            None
+        }
+    }
+}
+
+/// Extracts the tickets one post names — keys verbatim from the body AND the refs, plus any
+/// resolved from pasted PR URLs or `run N` refs — bounded to [`MAX_TARGETS_PER_POST`]. Returns
+/// `(keys, whether more were named)`.
+async fn resolve_keys(ears: &Ears, cycle: &EarsCycle<'_>, post: &Message) -> (Vec<String>, bool) {
+    let Mentions {
+        mut keys,
+        prs,
+        runs,
+    } = scan_mentions(&post.body, &post.refs);
     // The candidate URLs are cut to the answer's cap BEFORE the network loop, not after it. Each
     // one costs a `gh pr view --repo <owner>/<repo>` with the owner and repo taken VERBATIM from a
     // post whose `from: operator` is forgeable, and resolving up to `MAX_KEYS_SCANNED` of them to
     // then throw all but five away would let one post aim that many outbound calls at repositories
     // it chose. Read-only and fork-checked either way, so this is a cost bound rather than a
     // posture fix — but an unnecessary bound is still worth having.
-    let prs = extract_pr_urls(body);
-    let mut truncated = prs.len() > MAX_TARGETS_PER_POST;
+    let mut truncated = prs.len() > MAX_TARGETS_PER_POST || runs.len() > MAX_TARGETS_PER_POST;
     for pr in prs.iter().take(MAX_TARGETS_PER_POST) {
         if keys.len() >= MAX_TARGETS_PER_POST {
             // The answer is already full, so every remaining URL is a call whose result could not
@@ -902,6 +1021,20 @@ async fn resolve_keys(ears: &Ears, cycle: &EarsCycle<'_>, body: &str) -> (Vec<St
             break;
         }
         if let Some(key) = ticket_for_pr(ears, cycle, pr).await
+            && !keys.iter().any(|k| k == &key)
+        {
+            keys.push(key);
+        }
+    }
+    // `run N` → that run's ticket, through the team-scoped store. No accessor (no durable store)
+    // means a run ref resolves to nothing rather than erroring, exactly as an unwired GitHub seam
+    // does.
+    for run_id in runs.iter().take(MAX_TARGETS_PER_POST) {
+        if keys.len() >= MAX_TARGETS_PER_POST {
+            truncated = true;
+            break;
+        }
+        if let Some(key) = ticket_for_run(cycle, *run_id)
             && !keys.iter().any(|k| k == &key)
         {
             keys.push(key);
@@ -1215,13 +1348,25 @@ async fn execute(
     answerable: &Answerable<'_>,
     report: &mut EarsReport,
 ) -> Done {
+    // The hold is answered HERE, ahead of EVERY intent and whatever the post asked for — a
+    // `relay`, the floor's `ask`, and an `Answer` alike (STUDIO-1052 requirement 2: a held ticket's
+    // reply must name the hold, not read as idle or missing). It cannot sit behind the `find_issue`
+    // gate below, because `Answer` returns before that gate — see the next comment for why — so the
+    // lookup is its own, and a missing ticket simply falls through to that intent's own branch.
+    if let Some(iss) = find_issue(cycle.issues, &target.key)
+        && crate::teams::is_human(iss)
+    {
+        return Done::say(human_hold_reply(iss));
+    }
     // **Before the `find_issue` gate, and that placement is the whole feature.** Every action
     // intent must pass that gate, because the cycle's issue set is what team-scopes a WRITE. An
     // answer is a read, and the gate is exactly why the question that motivated this design got
     // "not found": STUDIO-725 had reached a terminal state and fallen out of `cycle.issues`, so the
     // one ticket the operator asked about was the one shape the gate could not see. `Answer`'s
     // scope guard is not this gate but `TeamScope`, applied inside the accessor to every row the
-    // gather returned — see `teamsknow`'s module doc.
+    // gather returned — see `teamsknow`'s module doc. The hold above still reads this cycle's
+    // label snapshot when it CAN see the ticket, which is the held ticket an operator has not let
+    // go terminal and the one requirement 2 speaks to.
     if target.intent == Intent::Answer {
         return Done::grounded(answer_for(target, answerable));
     }
@@ -1303,17 +1448,9 @@ async fn file_review(
             iss.identifier
         ));
     }
-    // The absolute human hold (STUDIO-949 round 7). `file_review` is a DISPATCH path — it mints a
-    // review ticket and wakes a reviewer — and its sibling `confirm_assignment` refuses a held
-    // ticket thirty lines below, so the room's explicit "review this" must answer the same way as
-    // its "assign this" rather than the opposite. `iss` here is this cycle's tracker fetch, so its
-    // labels are CURRENT, unlike `plan_quorum`'s dispatch-time snapshot.
-    if crate::teams::is_human(iss) {
-        return Done::say(format!(
-            "{} is held for a human, so I do not ask for a review of it.",
-            iss.identifier
-        ));
-    }
+    // The absolute human hold (STUDIO-949 round 7) is refused in `execute`, ahead of every intent,
+    // so this DISPATCH path is never reached for a held ticket. `iss` here is this cycle's tracker
+    // fetch, so its labels are CURRENT, unlike `plan_quorum`'s dispatch-time snapshot.
     if !cycle.states.is_in_review(iss) {
         return Done::say(format!(
             "{} is in `{}`, not a review state — nothing has been handed off yet, so there is no \
@@ -1552,17 +1689,11 @@ async fn confirm_assignment(
             iss.identifier
         ));
     }
-    // The room is the OTHER writer of `rhapsody:@<name>` — §0.13's "labelling now IS the
-    // assignment" — so the absolute human hold has to sit beside `is_solo` here too. Without it a
-    // `rhapsody:human` ticket gets a tracker write it can never earn and the room is told a
-    // teammate took work no agent will ever run; the label is durable and occupied labels are
-    // never edited (§0.11.1), so a person would have to remove it by hand.
-    if crate::teams::is_human(iss) {
-        return Done::say(format!(
-            "{} is held for a human, so the team does not route it.",
-            iss.identifier
-        ));
-    }
+    // The absolute human hold is refused in `execute` ahead of every intent, so the room — the
+    // OTHER writer of `rhapsody:@<name>` (§0.13's "labelling now IS the assignment") — never gets
+    // here for a held ticket. Without that guard a `rhapsody:human` ticket would earn a tracker
+    // write it can never justify; the label is durable and an occupied one is never edited
+    // (§0.11.1), so a person would have to remove it by hand.
     let Some((tracker, _)) = client_for(cycle, iss) else {
         return Done::say(format!(
             "{}: I lost track of which project it came from, so I wrote nothing.",
@@ -2478,6 +2609,17 @@ mod tests {
                 .expect("append")
         }
 
+        /// Appends an operator post carrying structured REFS (the job-page composer's shape) and
+        /// returns its `file:seq` id.
+        fn operator_says_with_refs(&self, body: &str, refs: &[&str]) -> String {
+            self.room
+                .append(
+                    &Message::room(OPERATOR_IDENTITY, Utc::now(), body)
+                        .with_refs(refs.iter().copied()),
+                )
+                .expect("append")
+        }
+
         /// Every manager reply in the room, oldest first.
         fn replies(&self) -> Vec<Message> {
             self.room
@@ -2695,6 +2837,59 @@ mod tests {
                 }],
                 "body = {body}"
             );
+        }
+    }
+
+    /// A ref is scanned for the same three things a body is, plus the console's bare
+    /// `owner/repo#n` shorthand and its `run N` spawn.
+    #[test]
+    fn refs_are_scanned_for_keys_pull_requests_and_runs() {
+        let refs = vec![
+            "STUDIO-1050".to_string(),
+            "run 2625".to_string(),
+            "acme/rhapsody#12".to_string(),
+            "https://github.com/o/r/pull/230".to_string(),
+        ];
+        let m = scan_mentions("no key in this prose", &refs);
+        assert_eq!(m.keys, vec!["STUDIO-1050".to_string()]);
+        assert_eq!(m.runs, vec![2625]);
+        assert_eq!(
+            m.prs,
+            vec![
+                PrRef {
+                    owner: "acme".into(),
+                    repo: "rhapsody".into(),
+                    number: 12
+                },
+                PrRef {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 230
+                },
+            ]
+        );
+
+        // A key and a PR URL named in BOTH the body and a ref are not double-counted.
+        let m = scan_mentions("STUDIO-1050 https://github.com/o/r/pull/230", &refs);
+        assert_eq!(m.keys, vec!["STUDIO-1050".to_string()]);
+        assert_eq!(m.prs.len(), 2, "{:?}", m.prs);
+    }
+
+    /// `run N` is the only run spelling; anything else is not a run reference.
+    #[test]
+    fn only_the_run_spelling_is_a_run_ref() {
+        assert_eq!(parse_run_ref("run 2625"), Some(2625));
+        assert_eq!(parse_run_ref("  Run  7 "), Some(7));
+        assert_eq!(parse_run_ref("run2625"), Some(2625));
+        for not in [
+            "runner 5",
+            "run away",
+            "run",
+            "run 0",
+            "run -3",
+            "STUDIO-1050",
+        ] {
+            assert_eq!(parse_run_ref(not), None, "{not:?} must name no run");
         }
     }
 
@@ -4010,6 +4205,321 @@ mod tests {
         }
     }
 
+    // ── refs are targets too (STUDIO-1052) ──────────────────────────────────────────────────────
+
+    /// **The incident.** An operator posted from the job page; the composer attached the ticket
+    /// and the run as STRUCTURED REFS and left the body as prose. The reader consulted the body
+    /// only and answered "I could not find a ticket or a pull request in that" about a post whose
+    /// refs named the ticket. Refs are untrusted exactly like the body — they pick targets for the
+    /// bounded actions that already exist — so a ref names a target the same way a body mention
+    /// does.
+    #[tokio::test]
+    async fn a_post_whose_refs_name_the_ticket_resolves_it_and_never_says_not_found() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let run = Know::new(&["alice", "jimmy"], Box::new(NoneBackend));
+        let run_id = run.seed_run("STUDIO-1050", "completed");
+        let post = fx.operator_says_with_refs(
+            "I have added the secrets and pushed the encrypted sops blobs to the repo",
+            &["STUDIO-1050", &format!("run {run_id}")],
+        );
+        let t = teams(&["alice", "jimmy"], ManagerMode::Labels);
+        let issues = vec![in_review("STUDIO-1050")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let k = run.knowledge(&issues, fx.room.as_ref());
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+            }))),
+        );
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, false), &k),
+        )
+        .await;
+
+        assert_eq!(report.filed, 1, "{:?}", fx.reply_bodies());
+        let replies = fx.reply_bodies();
+        assert_eq!(replies.len(), 1, "one reply: {replies:?}");
+        assert!(
+            !replies[0].contains("could not find a ticket"),
+            "the refs named the ticket: {replies:?}"
+        );
+        assert!(
+            replies[0].contains("STUDIO-1050"),
+            "the reply names the ref's ticket: {replies:?}"
+        );
+        assert_eq!(
+            fx.replies()[0].refs[0],
+            post,
+            "the reply still carries the post's id — that IS the restart dedupe"
+        );
+    }
+
+    /// A `run N` ref resolves to THAT RUN's ticket through the team-scoped store — the other half
+    /// of the job-page composer's `askRefs`.
+    #[tokio::test]
+    async fn a_run_ref_resolves_to_its_run_s_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let know = Know::new(&["alice", "jimmy"], Box::new(NoneBackend));
+        let run_id = know.seed_run("STUDIO-1050", "completed");
+        fx.operator_says_with_refs("carry on with this", &[&format!("run {run_id}")]);
+        let t = teams(&["alice", "jimmy"], ManagerMode::Labels);
+        let issues = vec![in_review("STUDIO-1050")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
+            }))),
+        );
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, false), &k),
+        )
+        .await;
+
+        assert_eq!(report.filed, 1, "{:?}", fx.reply_bodies());
+        assert!(
+            fx.reply_bodies()[0].contains("STUDIO-1050"),
+            "{:?}",
+            fx.reply_bodies()
+        );
+    }
+
+    /// **The scope guard holds for a `run N` ref.** A run numbered on another team's project is
+    /// untrusted data that must resolve to NOTHING — a distinguishable "exists but not yours" is
+    /// itself the leak, so the reply falls back to the one keyless wording rather than echoing a
+    /// foreign ticket.
+    #[tokio::test]
+    async fn a_run_ref_on_another_team_s_project_resolves_to_nothing() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        let foreign = know
+            .store
+            .start_run(RunStart {
+                issue_id: "id-OTHER-42".to_string(),
+                issue_identifier: "OTHER-42".to_string(),
+                started_at: "2026-09-01T10:00:00Z".to_string(),
+                project_slug: "someone-elses-project".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        fx.operator_says_with_refs("carry on", &[&format!("run {foreign}")]);
+        let t = teams(&["alice"], ManagerMode::Labels);
+        let (issues, trackers): (Vec<Issue>, Vec<Arc<dyn Tracker>>) = (Vec::new(), Vec::new());
+        let owner = HashMap::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let k = know.knowledge(&issues, fx.room.as_ref());
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &fx.ears(FakeArbiter::never()),
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, false), &k),
+        )
+        .await;
+
+        assert!(
+            fx.reply_bodies()[0].contains("could not find a ticket"),
+            "a foreign run must name no ticket: {:?}",
+            fx.reply_bodies()
+        );
+    }
+
+    /// **§0.12's bound survives refs.** Every pasted/refed URL costs a `gh pr view`, so a post
+    /// carrying twenty PR-url REFS must make the same bounded number of calls a body with twenty
+    /// URLs does — refs do not widen the target bound.
+    #[tokio::test]
+    async fn many_pull_request_refs_make_a_bounded_number_of_github_calls() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let refs: Vec<String> = (1..=20)
+            .map(|n| format!("https://github.com/o/r{n}/pull/{n}"))
+            .collect();
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        fx.operator_says_with_refs("review these", &refs);
+        let t = teams(&["alice"], ManagerMode::Labels);
+        let (issues, trackers): (Vec<Issue>, Vec<Arc<dyn Tracker>>) = (Vec::new(), Vec::new());
+        let owner = HashMap::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            }))),
+            Arc::new(FakeOpenPr(Box::new(|| Ok(None)))),
+        );
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) <= MAX_TARGETS_PER_POST,
+            "20 refed URLs cost at most {MAX_TARGETS_PER_POST} lookups: {}",
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// **Refs do not widen the target bound.** A post whose REFS name ten tickets is answered for
+    /// [`MAX_TARGETS_PER_POST`] of them and says the rest were not looked at — the same cap the
+    /// body's keys have.
+    #[tokio::test]
+    async fn refs_do_not_increase_the_target_bound() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let refs: Vec<String> = (1..=10).map(|n| format!("MT-{n}")).collect();
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        fx.operator_says_with_refs("all of these need owners", &refs);
+        let t = teams(&["alice"], ManagerMode::Labels);
+        // Distinct ids, or `PassWrites` reads the ten tickets as one and only the first is written.
+        let issues: Vec<Issue> = (1..=10)
+            .map(|n| Issue {
+                team_id: "team-1".to_string(),
+                ..issue(&format!("iss-{n}"), &format!("MT-{n}"), "Todo")
+            })
+            .collect();
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &fx.ears(FakeArbiter::never()),
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert_eq!(
+            report.assigned,
+            MAX_TARGETS_PER_POST,
+            "ten refed keys are answered for five: {:?}",
+            fx.reply_bodies()
+        );
+        assert!(
+            fx.reply_bodies()[0].contains("named more than"),
+            "and the reply says the rest were not looked at: {:?}",
+            fx.reply_bodies()
+        );
+    }
+
+    /// **A held ticket is named as held, and the operator is told how to release it.** The reply
+    /// must not read as if the ticket were idle or missing, and `rhapsody:human` is the one hold —
+    /// whether an operator applied it or the runaway-loop breaker did.
+    #[tokio::test]
+    async fn a_held_ticket_s_reply_names_the_hold_and_how_to_release() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("review STUDIO-654 please");
+        let t = teams(&["alice", "jimmy"], ManagerMode::Labels);
+        let mut iss = in_review("STUDIO-654");
+        iss.labels = Some(vec![crate::teams::HUMAN_LABEL.to_string()]);
+        let issues = vec![iss];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // Asked ⇒ the test fails: a held ticket must spend no `gh` round-trip.
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| {
+                panic!("a held ticket must not cost a lookup")
+            }))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                panic!("a held ticket must not cost a lookup")
+            }))),
+        );
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        let replies = fx.reply_bodies();
+        assert_eq!(replies.len(), 1, "one reply: {replies:?}");
+        assert!(
+            replies[0].contains("held for a human") && replies[0].contains("rhapsody:human"),
+            "the reply must name the hold: {replies:?}"
+        );
+        assert!(
+            replies[0].contains("Remove the `rhapsody:human` label"),
+            "and tell the operator how to release it: {replies:?}"
+        );
+        assert!(
+            fx.tracker.create_issue_calls().is_empty() && fx.tracker.add_label_calls().is_empty(),
+            "and write nothing: {:?}",
+            fx.tracker.create_issue_calls()
+        );
+    }
+
+    /// **A QUESTION about a held ticket must name the hold too.** `labels+model` is the default mode
+    /// and a question is exactly what it routes to `answer`, so a hold gate that sat behind the
+    /// `Answer` early return left the operator with an idle-looking record and no hold. This is the
+    /// floor test above, one mode over.
+    #[tokio::test]
+    async fn a_question_about_a_held_ticket_answers_with_the_hold() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What is the state of STUDIO-1050?");
+        let t = teams(&["alice", "jimmy"], ManagerMode::LabelsModel);
+        let mut iss = in_review("STUDIO-1050");
+        iss.labels = Some(vec![crate::teams::HUMAN_LABEL.to_string()]);
+        let issues = vec![iss];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // The model would answer from the ticket's records, none of which carries the hold. The
+        // hold must win, so this idle-sounding prose must NOT reach the reply.
+        let ears = fx.ears(answering_with(
+            "STUDIO-1050",
+            "STUDIO-1050's last run completed.",
+        ));
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, true),
+        )
+        .await;
+
+        let replies = fx.reply_bodies();
+        assert_eq!(replies.len(), 1, "one reply: {replies:?}");
+        assert!(
+            replies[0].contains("held for a human") && replies[0].contains("rhapsody:human"),
+            "a held question must name the hold, not read as idle: {replies:?}"
+        );
+        assert!(
+            replies[0].contains("Remove the `rhapsody:human` label"),
+            "and tell the operator how to release it: {replies:?}"
+        );
+        assert!(
+            !replies[0].contains("last run completed"),
+            "the model's idle-sounding prose must not answer a held ticket: {replies:?}"
+        );
+        assert!(
+            fx.tracker.create_issue_calls().is_empty() && fx.tracker.add_label_calls().is_empty(),
+            "and write nothing: {:?}",
+            fx.tracker.create_issue_calls()
+        );
+    }
+
     // ── ticketless review (STUDIO-720, slice 6) ─────────────────────────────────────────────────
 
     /// A ticketless `teams()`: the same roster and mode, with `review.mode: ticketless`.
@@ -4346,8 +4856,9 @@ mod tests {
             }
         }
 
-        /// One ENDED run of `key` on the team's own project.
-        fn seed_run(&self, key: &str, outcome: &str) {
+        /// One ENDED run of `key` on the team's own project. Returns the run id, so a test can name
+        /// it in a `run N` ref.
+        fn seed_run(&self, key: &str, outcome: &str) -> i64 {
             let id = self
                 .store
                 .start_run(RunStart {
@@ -4369,6 +4880,7 @@ mod tests {
                     },
                 )
                 .expect("end run");
+            id
         }
 
         fn knowledge<'a>(&'a self, issues: &'a [Issue], room: &'a dyn RoomLog) -> Knowledge<'a> {
