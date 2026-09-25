@@ -3056,14 +3056,11 @@ impl Orchestrator {
         // at a patch-id-proven head), and only after that round returns.
         // STUDIO-1018 (§9): in `act` mode the manager's intervention lifecycle is authoritative and
         // the legacy STUDIO-956 SHIP|ESCALATE turn is NOT invoked. The stall is handled by the
-        // manager's own run (routed from `reviewreconcile`), so this branch is skipped entirely and
-        // the dispatch loop below — already gated by the manager exchange authorization past the
-        // threshold — decides. In `off` and `advise` today's turn is still authoritative, so the
-        // branch behaves exactly as before.
-        let manager_is_authoritative =
-            self.manager_review_authority() == rhapsody_config::teams::ReviewAuthority::Act;
-        if !manager_is_authoritative
-            && !mine.is_empty()
+        // manager's own run (routed from `reviewreconcile`), so the plan branch below defers instead
+        // of building one. The convergence and in-flight early returns above still run, so a pull
+        // request every reviewer approved still auto-merges. In `off` and `advise` today's turn is
+        // still authoritative, so the branch behaves exactly as before.
+        if !mine.is_empty()
             && let Some(threshold) = self.adjudication_threshold()
         {
             if let Some(decision) = self.adjudication(pr) {
@@ -3168,6 +3165,14 @@ impl Orchestrator {
                 // lands there is what this branch reads back on the next sweep (the
                 // `self.adjudication(pr)` check above) to stop handing out plans, so the bound is
                 // enforced without a second, comment-less escalation path here.
+                if self.manager_review_authority() == rhapsody_config::teams::ReviewAuthority::Act {
+                    // STUDIO-1018 (§9): the manager is authoritative, so the legacy turn is not
+                    // invoked. The reconciliation sweep already routed this stall to the manager's
+                    // intervention; defer here exactly as a plan would, and let the manager decide.
+                    report.deferred += 1;
+                    self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
+                    return;
+                }
                 let plan = crate::reviewadjudicate::ReviewAdjudicationPlan {
                     pr: pr.clone(),
                     head: head.to_string(),
