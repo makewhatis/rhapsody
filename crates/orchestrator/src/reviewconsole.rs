@@ -297,11 +297,17 @@ impl Orchestrator {
     }
 
     /// Project one intervention row into the console view. The deferral reason comes from the same
-    /// §10.2 gate evaluation the human-feed sentence uses, so the console and the feed agree.
+    /// §10.2 gate evaluation the human-feed sentence uses, so the console and the feed agree; an
+    /// `exhausted` row carries the last failed attempt's reason and count (STUDIO-1054), so an
+    /// invalid-output exhaustion is visible here rather than only in a WARN log.
     fn manager_state_row(&self, row: &rhapsody_store::ManagerInterventionRow) -> ManagerStateRow {
         let reason = if row.state == rhapsody_store::MANAGER_INTERVENTION_DEFERRED {
             self.manager_surface_reason(self.manager_gate_env(&row.pr))
                 .unwrap_or_default()
+        } else if row.state == rhapsody_store::MANAGER_INTERVENTION_EXHAUSTED
+            && !row.failure_reason.is_empty()
+        {
+            format!("{}, {} attempts", row.failure_reason, row.attempts.max(0))
         } else {
             String::new()
         };

@@ -240,6 +240,34 @@ impl std::fmt::Display for DecisionError {
     }
 }
 
+impl DecisionError {
+    /// The stable short token for this refusal (STUDIO-1054), for logs, the console and the room.
+    /// Unlike [`Display`], it is a bare variant name with no prose — the form the incident report
+    /// uses ("ZeroOrManyBlocks") and safe to persist.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DecisionError::ZeroOrManyBlocks => "ZeroOrManyBlocks",
+            DecisionError::NotJson => "NotJson",
+            DecisionError::NotAnObject => "NotAnObject",
+            DecisionError::DuplicateKey(_) => "DuplicateKey",
+            DecisionError::UnknownField(_) => "UnknownField",
+            DecisionError::UnknownDecision => "UnknownDecision",
+            DecisionError::NullField(_) => "NullField",
+            DecisionError::MissingField(_) => "MissingField",
+            DecisionError::EmptyField(_) => "EmptyField",
+            DecisionError::StringTooLong { .. } => "StringTooLong",
+            DecisionError::EmptyList(_) => "EmptyList",
+            DecisionError::FieldNotAllowed { .. } => "FieldNotAllowed",
+            DecisionError::UnknownFinding(_) => "UnknownFinding",
+            DecisionError::WrongStatusFinding(_) => "WrongStatusFinding",
+            DecisionError::SecretShape(_) => "SecretShape",
+            DecisionError::NoEligibleRows => "NoEligibleRows",
+            DecisionError::HeadNotCurrent => "HeadNotCurrent",
+            DecisionError::FinalRestriction => "FinalRestriction",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The strict JSON reader
 // ---------------------------------------------------------------------------------------------
