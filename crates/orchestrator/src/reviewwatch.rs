@@ -1387,6 +1387,16 @@ impl Orchestrator {
                     } else {
                         "closed"
                     };
+                    // STUDIO-1018 (§9/§11.1): a proposal's PR leaving the watch set is the
+                    // maintainer's actual action on it, recorded once as the proposal's outcome —
+                    // the calibration evidence for switching `advise` to `act`. The outcome taxonomy
+                    // names a closed-unmerged PR `closed_unmerged`.
+                    let outcome = if snap.status == PrStatus::Merged {
+                        "merged"
+                    } else {
+                        "closed_unmerged"
+                    };
+                    self.record_manager_proposal_outcomes(&churn_key(&obs.pr), outcome);
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
@@ -3044,7 +3054,16 @@ impl Orchestrator {
         // every push paged a human; it is head-scoped now, exactly like a `ship`. The manager is
         // asked only when every live reviewer has COMPLETED a review of the change at this head (or
         // at a patch-id-proven head), and only after that round returns.
-        if !mine.is_empty()
+        // STUDIO-1018 (§9): in `act` mode the manager's intervention lifecycle is authoritative and
+        // the legacy STUDIO-956 SHIP|ESCALATE turn is NOT invoked. The stall is handled by the
+        // manager's own run (routed from `reviewreconcile`), so this branch is skipped entirely and
+        // the dispatch loop below — already gated by the manager exchange authorization past the
+        // threshold — decides. In `off` and `advise` today's turn is still authoritative, so the
+        // branch behaves exactly as before.
+        let manager_is_authoritative =
+            self.manager_review_authority() == rhapsody_config::teams::ReviewAuthority::Act;
+        if !manager_is_authoritative
+            && !mine.is_empty()
             && let Some(threshold) = self.adjudication_threshold()
         {
             if let Some(decision) = self.adjudication(pr) {
@@ -10314,6 +10333,45 @@ mod tests {
         // The author half is stopped too, on the same threshold.
         let iss = author_issue("STUDIO-12", 12);
         assert!(o.author_round_budget_spent(&iss));
+    }
+
+    /// **Acceptance (STUDIO-1018, §9).** In `act` mode the manager's intervention lifecycle is
+    /// authoritative, so the legacy STUDIO-956 SHIP|ESCALATE turn is NOT invoked: the threshold no
+    /// longer produces an adjudication plan. MUTATION: drop the `manager_is_authoritative` guard and
+    /// this reds (`report.adjudicate.len() == 1`).
+    #[test]
+    fn act_mode_suppresses_the_legacy_adjudication() {
+        for authority in [
+            rhapsody_config::teams::ReviewAuthority::Act,
+            rhapsody_config::teams::ReviewAuthority::Advise,
+        ] {
+            let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+            o.teams.as_mut().expect("teams").manager.review_authority = authority;
+            let _l = ledger(&mut o);
+            introduce(&o, reviewed_row(12, "bob", HEAD_A));
+            o.review_rounds
+                .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+            let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+            if authority == rhapsody_config::teams::ReviewAuthority::Act {
+                assert_eq!(
+                    report.adjudicate.len(),
+                    0,
+                    "act mode must not build a legacy adjudication plan"
+                );
+            } else {
+                assert_eq!(
+                    report.adjudicate.len(),
+                    1,
+                    "advise keeps today's turn authoritative"
+                );
+            }
+            assert!(
+                dispatched.lock().expect("lock").is_empty(),
+                "nothing reached a worker either way"
+            );
+        }
     }
 
     /// **The threshold is not a failure when the loop CONVERGED.** A pull request whose last allowed

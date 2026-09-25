@@ -1,5 +1,5 @@
 import type { NoteVariant, PillVariant } from "@/components/console";
-import type { ReviewActionResponse, ReviewJob } from "@/lib/api";
+import type { ManagerState, ReviewActionResponse, ReviewJob } from "@/lib/api";
 
 // reviews-model — the pure logic behind the console's Reviews surface (STUDIO-722, slice 8 of the
 // design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §7, §15-e).
@@ -241,3 +241,101 @@ export function clearNotice(res: ReviewActionResponse): ReviewNotice {
     text: `The review↔author round budget for ${res.pr} is cleared — its next round may dispatch.`,
   };
 }
+
+// --- the manager's state (STUDIO-1018, design §9/§10.2) ---------------------------------------
+
+/** The manager state, ready to render: a pill plus the reason and decision behind it. */
+export interface ManagerView {
+  variant: PillVariant;
+  label: string;
+  /** The §10.2 deferral, unavailable or stop reason; "" when the state carries none. */
+  reason: string;
+  /** True for an `advise` proposal — recorded, never applied. Rendered DISTINCTLY from a decision. */
+  proposal: boolean;
+  /** The validated decision behind the state, when one was recorded. */
+  decision: {
+    kind: string;
+    rationale: string;
+    /** `alice:F1 @ r1` lines, one per dismissed revision. */
+    dismissals: string[];
+    /** The specific question an escalation asks, when the decision is one. */
+    question: string;
+    unapplied: boolean;
+  } | null;
+}
+
+/**
+ * How a manager state reads to an operator, or `null` when there is nothing to render. The state
+ * labels are the ticket's list (§10.2 plus §7.2's lifecycle). An `advise` proposal takes the accent
+ * `review` variant so it can never be mistaken for an applied decision, which is the ticket's
+ * explicit "don't make proposals look like applied decisions".
+ */
+export function managerView(m: ManagerState | undefined): ManagerView | null {
+  if (!m || m.state === "") return null;
+  const decision = m.decision
+    ? {
+        kind: m.decision.kind,
+        rationale: m.decision.rationale,
+        dismissals: m.decision.dismissals.map((d) => `${d.finding} @ r${d.revision}`),
+        question: m.decision.question ?? "",
+        unapplied: m.decision.unapplied,
+      }
+    : null;
+  const base = (variant: PillVariant, label: string, reason = ""): ManagerView => ({
+    variant,
+    label,
+    reason,
+    proposal: m.proposal,
+    decision,
+  });
+  switch (m.state) {
+    case "queued":
+      return base("queued", "Manager queued");
+    case "deferred":
+      return base("blocked", "Manager deferred", m.reason);
+    case "stale":
+      return base("queued", "Manager re-queued");
+    case "launching":
+    case "running":
+      return base("run", "Manager working");
+    case "decided":
+    case "validated":
+    case "applying":
+      return base("run", "Manager applying");
+    case "awaiting_effect":
+      return base("run", "Manager awaiting effect");
+    case "complete":
+      return base("done", "Manager complete");
+    case "proposed":
+      // An advise proposal: recorded, never applied. Its own accent so it is unmistakably not a
+      // decision the daemon acted on.
+      return base("review", "Manager proposal");
+    case "escalated":
+      return base("blocked", "Manager escalated", m.reason);
+    case "exhausted":
+      return base("blocked", "Manager exhausted");
+    case "no_review_gap":
+      return base("parked", "Manager: no review gap");
+    case "superseded":
+      return base("parked", "Manager superseded");
+    case "failed_attempt":
+      return base("blocked", "Manager retrying");
+    case "effect_timeout":
+    case "apply_failed":
+    case "apply_uncertain":
+      return base("blocked", `Manager ${m.state.replace(/_/g, " ")}`);
+    case "stopped":
+      return base("blocked", "Manager stopped", m.reason);
+    case "unavailable":
+      return base("blocked", "Manager unavailable", m.reason);
+    default:
+      // A state this build has never heard of: show it verbatim rather than guessing or hiding it.
+      return base("queued", `Manager ${m.state}`);
+  }
+}
+
+/** The manager state of the first row that carries one — the state is per PR, so all rows agree. */
+export function managerFor(jobs: readonly ReviewJob[]): ManagerState | undefined {
+  return jobs.find((j) => j.manager !== undefined)?.manager;
+}
+

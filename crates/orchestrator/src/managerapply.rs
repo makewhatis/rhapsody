@@ -84,7 +84,10 @@ pub fn manager_explanation_marker(intervention_id: &str, effect: &str) -> String
 /// Strip every summon token from a manager comment body. **No manager comment carries a summon
 /// token** (§7.9): a manager comment can wake nobody and carry no manager authority, so any token
 /// the model's own rationale happened to contain is removed before the body is ever posted.
-fn strip_summon_tokens(body: &str) -> String {
+///
+/// `pub(crate)` because the `advise` proposal path (`managerintervention.rs`, §9) posts shadow
+/// output to the room under the same rule: a proposal can wake nobody either.
+pub(crate) fn strip_summon_tokens(body: &str) -> String {
     let mut out = body.to_string();
     for token in [
         rhapsody_core::SUMMON_TOKEN_SYMPHONY,

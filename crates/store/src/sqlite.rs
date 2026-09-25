@@ -3263,20 +3263,64 @@ impl Store for Sqlite {
         let tx = conn.transaction()?;
         // Read the intervention inside the transaction so a concurrent terminal write cannot race
         // the charge. A missing row means the reservation loses and charges nothing.
-        let existing: Option<(String, i64, i64, String)> = tx
+        let existing: Option<(String, i64, i64, String, String)> = tx
             .query_row(
-                "SELECT pr, generation, attempts, state FROM rhapsody_manager_intervention \
+                "SELECT pr, generation, attempts, state, mode FROM rhapsody_manager_intervention \
                  WHERE id = ?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((pr, generation, attempts, state)) = existing else {
+        let Some((pr, generation, attempts, state, mode)) = existing else {
             return Ok(ManagerReservation::Absent);
         };
         if manager_intervention_is_terminal(&state) {
             // A terminal intervention is never resurrected; nothing was charged.
             return Ok(ManagerReservation::Absent);
+        }
+        // §9: an `advise` run is SHADOW. It is charged to a separate shadow budget and must never
+        // touch the live counters (`manager_runs_used`, `manager_interventions_applied`) nor stop
+        // the generation (`manager_stopped`). The shadow bound is the sum of every advise
+        // intervention's attempts for this generation, so a PR cannot spend unbounded model runs on
+        // proposals; exhausting it ends THIS intervention without ever stopping the live generation.
+        if mode == MANAGER_MODE_ADVISE {
+            let shadow_used: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(attempts), 0) FROM rhapsody_manager_intervention \
+                 WHERE pr = ?1 AND generation = ?2 AND mode = ?3",
+                params![pr, generation, MANAGER_MODE_ADVISE],
+                |row| row.get(0),
+            )?;
+            if shadow_used >= max_runs || attempts >= max_attempts {
+                tx.execute(
+                    "UPDATE rhapsody_manager_intervention \
+                     SET state = ?2, lease_boot_id = '', lease_expires_at = '' WHERE id = ?1",
+                    params![id, MANAGER_INTERVENTION_EXHAUSTED],
+                )?;
+                tx.commit()?;
+                return Ok(ManagerReservation::Exhausted);
+            }
+            tx.execute(
+                "UPDATE rhapsody_manager_intervention \
+                 SET state = ?2, attempts = attempts + 1, \
+                     lease_boot_id = ?3, lease_expires_at = ?4 \
+                 WHERE id = ?1",
+                params![
+                    id,
+                    MANAGER_INTERVENTION_LAUNCHING,
+                    boot_id,
+                    lease_expires_at,
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(ManagerReservation::Reserved);
         }
         // The bound row is the budget authority. Created at the intervention's generation when
         // absent, so a reservation can always charge somewhere.
@@ -9031,6 +9075,124 @@ mod tests {
         let row = st.manager_intervention("iv-1").expect("read").expect("row");
         assert_eq!(row.state, MANAGER_INTERVENTION_FAILED_ATTEMPT);
         assert!(row.lease_boot_id.is_empty() && row.lease_expires_at.is_empty());
+    }
+
+    // §9: an `advise` run is charged to the SHADOW budget only — never to `manager_runs_used`,
+    // `manager_interventions_applied` or `manager_stopped`. MUTATION: charge the live budget for an
+    // advise row (drop the shadow branch) and this reds on `runs_used`.
+    #[test]
+    fn an_advise_run_is_charged_to_the_shadow_budget_only() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            id: "iv-1".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            stall_kinds: vec!["review_escalated".to_string()],
+            mode: MANAGER_MODE_ADVISE.to_string(),
+            state: MANAGER_INTERVENTION_QUEUED.to_string(),
+            ..ManagerInterventionRow::default()
+        })
+        .expect("save");
+        assert_eq!(
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                .expect("reserve"),
+            ManagerReservation::Reserved
+        );
+        let row = st.manager_intervention("iv-1").expect("read").expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_LAUNCHING);
+        assert_eq!(
+            row.attempts, 1,
+            "the proposal's own attempt count is charged"
+        );
+        assert!(!row.is_final, "a proposal is never final");
+        assert!(
+            st.manager_budget(PR).expect("budget").is_none(),
+            "a shadow run creates no live budget row at all"
+        );
+    }
+
+    // §9: exhausting the shadow budget ends the proposal `exhausted` WITHOUT stopping the live
+    // generation. MUTATION: call `stop_manager_intervention` (or set `manager_stopped`) on shadow
+    // exhaustion and this reds on `is_stopped`.
+    #[test]
+    fn an_exhausted_shadow_budget_does_not_stop_the_generation() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            id: "iv-1".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            stall_kinds: vec!["review_escalated".to_string()],
+            mode: MANAGER_MODE_ADVISE.to_string(),
+            state: MANAGER_INTERVENTION_QUEUED.to_string(),
+            ..ManagerInterventionRow::default()
+        })
+        .expect("save");
+        for _ in 0..3 {
+            assert_eq!(
+                st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                    .expect("reserve"),
+                ManagerReservation::Reserved
+            );
+        }
+        assert_eq!(
+            st.reserve_manager_run("iv-1", "boot-a", "2099-01-01T00:00:00Z", 100, 3, 3)
+                .expect("reserve"),
+            ManagerReservation::Exhausted
+        );
+        assert_eq!(
+            st.manager_intervention("iv-1")
+                .expect("read")
+                .expect("row")
+                .state,
+            MANAGER_INTERVENTION_EXHAUSTED
+        );
+        let budget = st.manager_budget(PR).expect("budget");
+        assert!(
+            budget.as_ref().is_none_or(|b| !b.is_stopped()),
+            "shadow exhaustion must not stop the generation"
+        );
+        assert!(budget.is_none_or(|b| b.runs_used == 0));
+    }
+
+    // §9: a shadow run does not consume the generation's live run budget, so a later `act`
+    // intervention can still spend all 12 live runs.
+    #[test]
+    fn shadow_runs_do_not_consume_the_live_run_budget() {
+        let st = open_mem();
+        st.save_manager_intervention(ManagerInterventionRow {
+            id: "iv-adv".to_string(),
+            pr: PR.to_string(),
+            generation: 1,
+            stall_kinds: vec!["review_escalated".to_string()],
+            mode: MANAGER_MODE_ADVISE.to_string(),
+            state: MANAGER_INTERVENTION_QUEUED.to_string(),
+            ..ManagerInterventionRow::default()
+        })
+        .expect("save");
+        for _ in 0..12 {
+            assert_eq!(
+                st.reserve_manager_run("iv-adv", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                    .expect("reserve"),
+                ManagerReservation::Reserved
+            );
+        }
+        // Exhaust the shadow budget so the proposal ends terminal, releasing the one-active index.
+        assert_eq!(
+            st.reserve_manager_run("iv-adv", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                .expect("reserve"),
+            ManagerReservation::Exhausted
+        );
+        save_queued(&st, "iv-act", "review_escalated");
+        for _ in 0..12 {
+            assert_eq!(
+                st.reserve_manager_run("iv-act", "boot-a", "2099-01-01T00:00:00Z", 12, 100, 3)
+                    .expect("reserve"),
+                ManagerReservation::Reserved,
+                "the live budget is untouched by shadow runs"
+            );
+        }
+        let budget = st.manager_budget(PR).expect("budget").expect("row");
+        assert_eq!(budget.runs_used, 12);
     }
 
     // An expired lease on the CURRENT boot is recovered the same way.

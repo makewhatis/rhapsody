@@ -1969,6 +1969,46 @@ export interface ReviewJob {
   status: string;
   /** Whether the PR is still open. `false` is merged, closed, gone or dismissed. */
   open: boolean;
+  /**
+   * The manager's state for this pull request (STUDIO-1018, design §9/§10.2). Absent when
+   * `manager.review_authority` is `off`, or when the manager has never touched the PR. The same
+   * object is repeated on every reviewer row of one PR — the state is per-PR, not per-reviewer.
+   */
+  manager?: ManagerState;
+}
+
+/** One finding revision a manager decision dismissed. */
+export interface ManagerDismissal {
+  finding: string;
+  revision: number;
+}
+
+/** The validated decision behind a manager state. */
+export interface ManagerDecision {
+  /** `RERUN_REVIEW` | `ROUTE_TO_AUTHOR` | `APPROVE` | `ESCALATE`. */
+  kind: string;
+  rationale: string;
+  dismissals: ManagerDismissal[];
+  /** The specific question an `ESCALATE` asks the human, when this is one. */
+  question?: string;
+  /** True when the explanation was posted but activation refused it: shown as NOT applied. */
+  unapplied: boolean;
+}
+
+/**
+ * The manager's state for one PR. `proposal` is the load-bearing distinction: an `advise` proposal
+ * is recorded and never applied, so the console MUST render it differently from an applied decision.
+ */
+export interface ManagerState {
+  /** Lifecycle state, or the derived `stopped` / `unavailable`. */
+  state: string;
+  /** `act` or `advise`. */
+  mode: string;
+  /** True for an `advise` proposal (recorded, never applied). */
+  proposal: boolean;
+  /** The §10.2 deferral text, the unavailable reason, or the generation-stop reason. */
+  reason: string;
+  decision?: ManagerDecision;
 }
 
 // ReviewsResponse is GET /api/v1/reviews. `enabled: false` means Teams is off or the review mode

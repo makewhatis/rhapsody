@@ -860,13 +860,20 @@ pub trait Store {
 
     /// ATOMICALLY reserves one manager run (§7.3) — the one place model spend is charged.
     ///
-    /// In ONE SQLite transaction it: refuses when `id` names no row ([`ManagerReservation::Absent`]);
-    /// refuses when the generation is already stopped, when `manager_runs_used >= max_runs`, or when
-    /// the intervention's `attempts >= max_attempts` — marking the intervention `exhausted` AND the
-    /// generation stopped in the same transaction ([`ManagerReservation::Exhausted`]); otherwise
-    /// increments both the intervention's `attempts` and the generation's `manager_runs_used`, sets
-    /// `final` when `manager_interventions_applied >= max_interventions - 1`, writes the lease and
-    /// moves the state to `launching` ([`ManagerReservation::Reserved`]).
+    /// For an `act` intervention, in ONE SQLite transaction it: refuses when `id` names no row
+    /// ([`ManagerReservation::Absent`]); refuses when the generation is already stopped, when
+    /// `manager_runs_used >= max_runs`, or when the intervention's `attempts >= max_attempts` —
+    /// marking the intervention `exhausted` AND the generation stopped in the same transaction
+    /// ([`ManagerReservation::Exhausted`]); otherwise increments both the intervention's `attempts`
+    /// and the generation's `manager_runs_used`, sets `final` when `manager_interventions_applied >=
+    /// max_interventions - 1`, writes the lease and moves the state to `launching`
+    /// ([`ManagerReservation::Reserved`]).
+    ///
+    /// For an `advise` intervention (§9) it charges only the intervention's own `attempts` against a
+    /// SHADOW budget (the sum of `attempts` over every `advise` intervention for the same
+    /// `(pr, generation)`); it NEVER touches `manager_runs_used`, `manager_interventions_applied` or
+    /// `manager_stopped`. Exhausting the shadow budget ends the intervention `exhausted` without
+    /// stopping the generation, so a shadow run can never fail a live one.
     ///
     /// **Nothing is refunded:** a run charged here is spent even if it crashes, which is what makes
     /// the 12-run bound true by construction.
