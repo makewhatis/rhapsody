@@ -145,9 +145,10 @@ const MAX_TARGETS_PER_POST: usize = 5;
 /// idempotent per ticket.
 const MAX_ACTED_POSTS_PER_INTERVAL: usize = 5;
 
-/// How many raw ticket-key matches one post body is scanned for before the scan gives up. A bound on
-/// the SCAN, not on the answer ([`MAX_TARGETS_PER_POST`] is that): a pasted changelog should cost a
-/// bounded walk, not a vector the length of the paste.
+/// How many raw ticket-key matches — and how many refs — one post is scanned for before the scan
+/// gives up. A bound on the SCAN, not on the answer ([`MAX_TARGETS_PER_POST`] is that): a pasted
+/// changelog, or a post carrying a wall of refs, should cost a bounded walk, not a vector the
+/// length of the paste.
 const MAX_KEYS_SCANNED: usize = 32;
 
 /// How much of a post body is rendered into the manager's turn, in characters. The cap that keeps a
