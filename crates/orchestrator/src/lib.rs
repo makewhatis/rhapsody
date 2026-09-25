@@ -80,6 +80,7 @@ pub mod reconcile;
 pub mod reconcile_run;
 pub mod recovery;
 pub mod reload;
+pub mod resumehold;
 pub mod retry;
 pub mod review;
 pub mod reviewadjudicate;
@@ -160,6 +161,7 @@ pub use quorum::{
 pub use reads::{Identity, ProjectTracker, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use reload::ReloadError;
+pub use resumehold::{BreakerHold, ResumeHoldError, ResumeHoldResult, RunHoldView};
 pub use retry::{EvRetry, EvWorkerExit};
 pub use snapshot::{
     ProjectStatus, RateLimit, RefreshResult, RetryRow, RunningRow, Snapshot, TokenCounts,
