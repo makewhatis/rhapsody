@@ -56,6 +56,11 @@
 //! an empty manager tuple stays on the legacy `claude -p` lane with `manager.model` /
 //! `manager.timeout_ms`. A `labels`-mode install that sets the key gets adjudication; one that does
 //! not gets today's behaviour byte-for-byte.
+//!
+//! **STUDIO-1018 adds one more gate.** When `manager.review_authority: act` the manager's own
+//! intervention lifecycle is authoritative, so the review watcher does not build a legacy
+//! SHIP|ESCALATE plan at all (`reviewwatch::service_review_pr`). In `off` and `advise` this turn is
+//! still authoritative and this module behaves exactly as before.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -17,6 +17,7 @@ import { errText } from "@/lib/teams-model";
 import {
   clearNotice,
   dismissNotice,
+  managerView,
   rerunNotice,
   retiredCount,
   reviewRows,
@@ -25,7 +26,7 @@ import {
   type ReviewNotice,
   type ReviewRow,
 } from "@/lib/reviews-model";
-import type { ReviewJob } from "@/lib/api";
+import type { ManagerState, ReviewJob } from "@/lib/api";
 import "@/theme/console-reviews.css";
 
 // Reviews — the ticketless review console (STUDIO-722, slice 8 of the design record
@@ -214,6 +215,7 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
               <th>Reviewer</th>
               <th>Status</th>
               <th>Reviewed at</th>
+              <th>Manager</th>
               <th>
                 <span className="sr">Controls</span>
               </th>
@@ -298,6 +300,9 @@ function ReviewsRow({
       {/* The SHA the last completed round actually READ — pinned at checkout, never re-queried at
           completion, so it is the commit that was reviewed rather than whatever the head is now. */}
       <td>{row.reviewedShort === "" ? "—" : <Mono>{row.reviewedShort}</Mono>}</td>
+      <td>
+        <ManagerCell manager={row.job.manager} />
+      </td>
       <td className="rctl">
         {row.live ? (
           confirming ? (
@@ -405,6 +410,32 @@ function ReviewsRow({
         )}
       </td>
     </tr>
+  );
+}
+
+/**
+ * The manager's state for a pull request (STUDIO-1018, §9/§10.2), or nothing when it never touched
+ * it. An `advise` proposal renders on its own accent pill (never `done`/`run`), so it can never read
+ * as an applied decision; an unapplied decision says so explicitly.
+ */
+function ManagerCell({ manager }: { manager?: ManagerState }) {
+  const view = managerView(manager);
+  if (!view) return <>—</>;
+  return (
+    <div className="rmgr">
+      <Pill variant={view.variant}>{view.label}</Pill>
+      {view.reason ? <div className="pj">{view.reason}</div> : null}
+      {view.decision ? (
+        <div className="pj">
+          {view.decision.kind}: {view.decision.rationale}
+          {view.decision.unapplied ? " · NOT applied" : ""}
+          {view.decision.dismissals.length > 0
+            ? ` · dismissed ${view.decision.dismissals.join(", ")}`
+            : ""}
+          {view.decision.question ? ` · asks: ${view.decision.question}` : ""}
+        </div>
+      ) : null}
+    </div>
   );
 }
 

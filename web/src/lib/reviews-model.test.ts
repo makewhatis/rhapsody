@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { ReviewJob } from "@/lib/api";
+import type { ManagerState, ReviewJob } from "@/lib/api";
 import {
   REVIEW_STATUSES,
   clearNotice,
   dismissNotice,
   isLive,
+  managerFor,
+  managerView,
   prLabel,
   rerunNotice,
   retiredCount,
@@ -264,3 +266,111 @@ describe("clearNotice", () => {
     expect(cleared.text).toMatch(/cleared/i);
   });
 });
+
+// --- the manager's state (STUDIO-1018, §9/§10.2) ------------------------------------------------
+
+function managed(over: Partial<ManagerState> = {}): ManagerState {
+  return { state: "queued", mode: "act", proposal: false, reason: "", ...over };
+}
+
+describe("managerView", () => {
+  it("returns null when the manager has never touched the pull request", () => {
+    expect(managerView(undefined)).toBeNull();
+    expect(managerView(managed({ state: "" }))).toBeNull();
+  });
+
+  it("shows a deferral with the manager's own reason", () => {
+    const view = managerView(managed({ state: "deferred", reason: "manager deferred: drain" }));
+    expect(view?.label).toBe("Manager deferred");
+    expect(view?.reason).toBe("manager deferred: drain");
+    expect(view?.proposal).toBe(false);
+  });
+
+  it("shows unavailable and stopped with their reasons", () => {
+    expect(managerView(managed({ state: "unavailable", reason: "manager unavailable: CLI contract" }))?.reason).toBe(
+      "manager unavailable: CLI contract",
+    );
+    const stopped = managerView(managed({ state: "stopped", reason: "manager run budget exhausted" }));
+    expect(stopped?.label).toBe("Manager stopped");
+    expect(stopped?.reason).toBe("manager run budget exhausted");
+  });
+
+  // §9: an `advise` run is advisory — today's review call remains authoritative — so the console
+  // needs the mode to avoid claiming authority the manager does not have.
+  it("carries the mode so an advisory run is not read as authoritative", () => {
+    expect(managerView(managed({ state: "running", mode: "advise" }))?.mode).toBe("advise");
+    expect(managerView(managed({ state: "running", mode: "act" }))?.mode).toBe("act");
+  });
+
+  // The ticket's load-bearing distinction: a proposal must NOT look like an applied decision. The
+  // proposal carries its own label and accent variant, and the decision pills never use it.
+  it("renders a proposal distinctly from an applied decision", () => {
+    const proposal = managerView(managed({ state: "proposed", mode: "advise", proposal: true }));
+    expect(proposal?.proposal).toBe(true);
+    expect(proposal?.label).toBe("Manager proposal");
+    expect(proposal?.variant).toBe("review");
+
+    for (const applied of ["complete", "awaiting_effect", "running"]) {
+      const view = managerView(managed({ state: applied }));
+      expect(view?.proposal).toBe(false);
+      expect(view?.variant).not.toBe("review");
+    }
+  });
+
+  it("carries the decision's rationale, dismissals and unapplied flag", () => {
+    const view = managerView(
+      managed({
+        state: "complete",
+        decision: {
+          kind: "RERUN_REVIEW",
+          rationale: "reviewers must re-read the head",
+          dismissals: [{ finding: "alice:F1", revision: 2 }],
+          unapplied: true,
+        },
+      }),
+    );
+    expect(view?.decision?.kind).toBe("RERUN_REVIEW");
+    expect(view?.decision?.dismissals).toEqual(["alice:F1 @ r2"]);
+    expect(view?.decision?.unapplied).toBe(true);
+  });
+
+  it("names every lifecycle state it is given", () => {
+    const states = [
+      "queued",
+      "deferred",
+      "launching",
+      "running",
+      "validated",
+      "applying",
+      "awaiting_effect",
+      "complete",
+      "escalated",
+      "exhausted",
+      "stale",
+      "no_review_gap",
+      "superseded",
+      "failed_attempt",
+      "effect_timeout",
+      "apply_failed",
+      "apply_uncertain",
+      "stopped",
+      "unavailable",
+      "proposed",
+    ];
+    for (const state of states) {
+      const view = managerView(managed({ state }));
+      expect(view, state).not.toBeNull();
+      expect(view?.label.length, state).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("managerFor", () => {
+  it("reads the one per-PR state, whichever reviewer row carries it", () => {
+    const m = managed({ state: "proposed", mode: "advise", proposal: true });
+    const jobs = [job(), job({ reviewer: "carol", manager: m })];
+    expect(managerFor(jobs)?.state).toBe("proposed");
+    expect(managerFor([job()])).toBeUndefined();
+  });
+});
+

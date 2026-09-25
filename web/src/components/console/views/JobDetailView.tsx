@@ -101,7 +101,7 @@ import {
   roomPostsFor,
   type WatchTabId,
 } from "@/lib/console-watch";
-import { reviewRow } from "@/lib/reviews-model";
+import { managerFor, managerView, reviewRow } from "@/lib/reviews-model";
 import { runIdentities } from "@/lib/run-identity";
 import {
   baseToolName,
@@ -2144,6 +2144,10 @@ function ReviewPanel({
   const reviews = useReviews(teamsEnabled);
   const jobs = reviews.data?.reviews ?? [];
   const rows = useMemo(() => reviewsForRun(jobs, run).map(reviewRow), [jobs, run]);
+  // The manager's state for this run's pull request (STUDIO-1018, §9/§10.2). Per PR, so it is read
+  // once rather than per reviewer row.
+  const mgr = useMemo(() => managerFor(reviewsForRun(jobs, run)), [jobs, run]);
+  const mgrView = managerView(mgr);
 
   if (!teamsEnabled) {
     return <div className="trdep">Teams is off on this daemon, so no reviewer is assigned.</div>;
@@ -2187,6 +2191,35 @@ function ReviewPanel({
           </div>
         ))}
       </div>
+      {/* The manager's state for this pull request (STUDIO-1018, §9/§10.2). An `advise` proposal is
+          rendered on its own accent pill and marked as not applied, so it can never read as a
+          decision the daemon acted on. */}
+      {mgrView ? (
+        <div
+          className="trdep"
+          data-manager-state={mgr?.state}
+          data-manager-proposal={mgrView.proposal ? "true" : "false"}
+        >
+          <Pill variant={mgrView.variant}>{mgrView.label}</Pill>
+          <b> The manager:</b> {mgrView.reason ? `${mgrView.reason}. ` : ""}
+          {mgrView.proposal
+            ? "proposed this in advise mode — recorded, never applied."
+            : mgrView.mode === "act"
+              ? "the manager is authoritative for this pull request."
+              : "the manager is advising; today's review call remains authoritative."}
+          {mgrView.decision ? (
+            <>
+              {" "}
+              <Mono>{mgrView.decision.kind}</Mono>: {mgrView.decision.rationale}
+              {mgrView.decision.unapplied ? " (NOT applied)" : ""}
+              {mgrView.decision.dismissals.length > 0
+                ? ` — dismissed ${mgrView.decision.dismissals.join(", ")}`
+                : ""}
+              {mgrView.decision.question ? ` — asks: ${mgrView.decision.question}` : ""}
+            </>
+          ) : null}
+        </div>
+      ) : null}
       {/* The one part of a review nothing serves back. Said once, under the rows, rather than
           dressed up as a verdict the console does not have. */}
       <div className="trdep">

@@ -377,4 +377,67 @@ describe("the Reviews surface", () => {
     await screen.findByRole("status");
     expect(screen.queryByRole("alert")).toBeNull();
   });
+
+  // STUDIO-1018 (§9/§10.2, acceptance "the console distinguishes proposed from applied"): an advise
+  // proposal is shown on its own accent pill and named "Manager proposal", with the decision's
+  // rationale and dismissals; an applied decision never borrows that label.
+  it("shows the manager state and renders a proposal distinctly from an applied decision", async () => {
+    mount({
+      enabled: true,
+      reviews: [
+        job({
+          manager: {
+            state: "proposed",
+            mode: "advise",
+            proposal: true,
+            reason: "",
+            decision: {
+              kind: "RERUN_REVIEW",
+              rationale: "both reviewers must re-read the head",
+              dismissals: [{ finding: "alice:F1", revision: 2 }],
+              unapplied: false,
+            },
+          },
+        }),
+      ],
+    });
+
+    const proposal = await screen.findByText("Manager proposal");
+    // Its own pill sitting beside the row — and not the "done"/"run" an applied decision uses.
+    expect(proposal.className).toContain("review");
+    expect(proposal.className).not.toContain("done");
+    expect(screen.getByText(/RERUN_REVIEW/)).toBeTruthy();
+    expect(screen.getByText(/alice:F1 @ r2/)).toBeTruthy();
+  });
+
+  it("shows a deferral with the manager's own reason, and an applied decision as not-a-proposal", async () => {
+    mount({
+      enabled: true,
+      reviews: [
+        job({
+          reviewer: "bob",
+          manager: {
+            state: "deferred",
+            mode: "act",
+            proposal: false,
+            reason: "manager deferred: drain",
+          },
+        }),
+        job({
+          reviewer: "carol",
+          manager: { state: "complete", mode: "act", proposal: false, reason: "" },
+        }),
+      ],
+    });
+
+    const reasonCell = await screen.findByText("manager deferred: drain");
+    const row = reasonCell.closest("tr");
+    if (row === null) throw new Error("no row holds the deferral reason");
+    expect(within(row).getByText("Manager deferred")).toBeTruthy();
+    const carolCell = await screen.findByText("carol");
+    const carolRow = carolCell.closest("tr");
+    if (carolRow === null) throw new Error("no row for carol");
+    expect(within(carolRow).getByText("Manager complete")).toBeTruthy();
+    expect(screen.queryByText("Manager proposal")).toBeNull();
+  });
 });

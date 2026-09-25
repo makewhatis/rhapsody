@@ -37,7 +37,8 @@ use rhapsody_store::{
     MANAGER_INTERVENTION_APPLY_FAILED, MANAGER_INTERVENTION_APPLY_UNCERTAIN,
     MANAGER_INTERVENTION_APPLYING, MANAGER_INTERVENTION_AWAITING_EFFECT,
     MANAGER_INTERVENTION_COMPLETE, MANAGER_INTERVENTION_EFFECT_TIMEOUT,
-    MANAGER_INTERVENTION_ESCALATED, MANAGER_WAKE_PENDING, ManagerActivation,
+    MANAGER_INTERVENTION_ESCALATED, MANAGER_INTERVENTION_SUPERSEDED,
+    MANAGER_INTERVENTION_VALIDATED, MANAGER_MODE_ACT, MANAGER_WAKE_PENDING, ManagerActivation,
     ManagerActivationOutcome, ManagerActivationVerdict, ManagerApprovalRow, ManagerExchange,
     ManagerInterventionRow, ManagerWakeRow, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED,
 };
@@ -84,7 +85,10 @@ pub fn manager_explanation_marker(intervention_id: &str, effect: &str) -> String
 /// Strip every summon token from a manager comment body. **No manager comment carries a summon
 /// token** (§7.9): a manager comment can wake nobody and carry no manager authority, so any token
 /// the model's own rationale happened to contain is removed before the body is ever posted.
-fn strip_summon_tokens(body: &str) -> String {
+///
+/// `pub(crate)` because the `advise` proposal path (`managerintervention.rs`, §9) posts shadow
+/// output to the room under the same rule: a proposal can wake nobody either.
+pub(crate) fn strip_summon_tokens(body: &str) -> String {
     let mut out = body.to_string();
     for token in [
         rhapsody_core::SUMMON_TOKEN_SYMPHONY,
@@ -294,6 +298,13 @@ impl Orchestrator {
     /// [`Orchestrator::pump_manager_interventions`] right after the saved-decision revalidation.
     pub(crate) fn pump_manager_applying(&mut self) {
         if self.manager_review_authority() != ReviewAuthority::Act {
+            // §9 "when the mode changes mid-flight": an `act` intervention stops before its next
+            // effect and ends `superseded`. A `validated` row has had no effect yet, so it is
+            // superseded here; otherwise it would hold the one-active slot forever — blocking any
+            // proposal for that pull request — and, on a flip back to `act`, apply a decision taken
+            // under an authority that is gone. (This pass is unreachable in `off`: the caller returns
+            // first when routing is disabled, which is what keeps `off` byte-identical.)
+            self.supersede_validated_act_interventions();
             return;
         }
         let Ok(rows) = self.store().load_manager_interventions() else {
@@ -315,6 +326,23 @@ impl Orchestrator {
                 MANAGER_INTERVENTION_APPLYING => self.recover_manager_apply(&row),
                 _ => {}
             }
+        }
+    }
+
+    /// §9: supersede every `act` intervention that has reached `validated` but not begun applying,
+    /// because the authority is no longer `act`. The decision was taken under an authority that is
+    /// gone, so nothing may be applied; a `validated` row has run NO effect yet, so the report of
+    /// "effects that already ran" is empty and a plain supersede is the whole record.
+    fn supersede_validated_act_interventions(&mut self) {
+        let Ok(rows) = self.store().load_manager_interventions() else {
+            return;
+        };
+        for row in rows {
+            if row.state != MANAGER_INTERVENTION_VALIDATED || row.mode != MANAGER_MODE_ACT {
+                continue;
+            }
+            self.set_manager_state(&row, MANAGER_INTERVENTION_SUPERSEDED);
+            self.record_manager_outcome_if_absent(&row, "superseded");
         }
     }
 

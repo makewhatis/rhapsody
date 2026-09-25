@@ -294,6 +294,7 @@ mod tests {
             last_reviewed_sha: reviewed.to_string(),
             status: status.to_string(),
             open,
+            manager: None,
         }
     }
 

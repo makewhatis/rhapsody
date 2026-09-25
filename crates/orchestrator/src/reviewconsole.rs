@@ -75,6 +75,56 @@ pub struct ReviewJobRow {
     pub status: String,
     /// Whether the pull request is still open. `false` is a merged, closed, gone or dismissed row.
     pub open: bool,
+    /// The manager's state for this pull request (STUDIO-1018, design §9/§10.2). Absent when the
+    /// manager is `off`, and when it has never touched this pull request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager: Option<ManagerStateRow>,
+}
+
+/// One finding revision a decision dismissed, as the console renders it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagerDismissalRow {
+    /// The reviewer-scoped finding id (`alice:F1`).
+    pub finding: String,
+    /// The revision.
+    pub revision: i64,
+}
+
+/// The validated decision behind a manager state, as the console renders it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagerDecisionRow {
+    /// `RERUN_REVIEW`, `ROUTE_TO_AUTHOR`, `APPROVE` or `ESCALATE`.
+    pub kind: String,
+    /// The manager's rationale.
+    pub rationale: String,
+    /// Every finding revision it dismissed.
+    pub dismissals: Vec<ManagerDismissalRow>,
+    /// The specific question an `ESCALATE` asks the human, when this is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// True when the explanation was posted but activation refused it — shown as NOT applied.
+    pub unapplied: bool,
+}
+
+/// The manager's state for one pull request (STUDIO-1018, design §9/§10.2). Distinguishes an
+/// `advise` proposal from an applied decision so the console can never render one as the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagerStateRow {
+    /// The lifecycle state: `queued`, `deferred`, `launching`, `running`, `awaiting_effect`,
+    /// `escalated`, `exhausted`, `proposed`, `superseded`, `complete`, …; or the derived `stopped`
+    /// (the generation is stopped) and `unavailable` (the §4.7 CLI self-test has not passed).
+    pub state: String,
+    /// `act` or `advise` — fixed at the intervention's creation.
+    pub mode: String,
+    /// True for an `advise` proposal: recorded, never applied. The console MUST render it distinctly
+    /// from an applied decision.
+    pub proposal: bool,
+    /// Why the manager is in this state, when the state carries a reason: the §10.2 deferral text,
+    /// `manager unavailable: CLI contract`, or the generation-stop reason.
+    pub reason: String,
+    /// The validated decision, when one was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ManagerDecisionRow>,
 }
 
 impl From<ReviewWatchRow> for ReviewJobRow {
@@ -90,6 +140,7 @@ impl From<ReviewWatchRow> for ReviewJobRow {
             last_reviewed_sha: row.last_reviewed_sha,
             status: row.status,
             open: row.open,
+            manager: None,
         }
     }
 }
@@ -163,10 +214,137 @@ impl Orchestrator {
             return Ok(ReviewsView::default()); // §16
         }
         let rows = self.store().load_review_watch()?;
+        // The manager state is per PR, and one PR has one row per reviewer: compute it once per
+        // coordinate rather than per row (each computation reads the intervention table).
+        let mut states: std::collections::HashMap<String, Option<ManagerStateRow>> =
+            std::collections::HashMap::new();
+        let reviews = rows
+            .into_iter()
+            .map(|row| {
+                let mut job = ReviewJobRow::from(row);
+                let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();
+                job.manager = states
+                    .entry(key.clone())
+                    .or_insert_with(|| self.manager_console_state(&key))
+                    .clone();
+                job
+            })
+            .collect();
         Ok(ReviewsView {
             enabled: true,
-            reviews: rows.into_iter().map(ReviewJobRow::from).collect(),
+            reviews,
         })
+    }
+
+    /// The manager's current state for `pr` as the console renders it (STUDIO-1018, §9/§10.2), or
+    /// `None` when the manager is `off` or has never touched the pull request. The state list is
+    /// exactly the ticket's: `queued`, `deferred` (with the reason), `running`, `awaiting_effect`,
+    /// `escalated`, `exhausted`, `unavailable` (with the reason), `stopped` for the generation (with
+    /// the reason) — plus the terminal states, and `proposed` for an advise proposal.
+    fn manager_console_state(&self, pr: &str) -> Option<ManagerStateRow> {
+        if !self.manager_routing_enabled() {
+            return None; // `off`: today's surface, byte-identical
+        }
+        // A stopped generation is a manager state of its own, and its reason is the fact an operator
+        // needs. It is checked FIRST because it outlives every intervention row.
+        if let Some(reason) = self
+            .store()
+            .manager_budget(pr)
+            .ok()
+            .flatten()
+            .filter(|b| b.is_stopped())
+            .map(|b| b.stopped)
+        {
+            // The stop is GENERATION-scoped, but the MODE the console reports must be the one this
+            // pull request's interventions were created under: the current config token can have
+            // moved on since a mid-flight flip. Fall back to the current token when there is no row
+            // to read it from.
+            let mode = self
+                .store()
+                .load_manager_interventions()
+                .ok()
+                .and_then(|rows| {
+                    rows.iter()
+                        .rev()
+                        .find(|r| r.pr.eq_ignore_ascii_case(pr))
+                        .map(|r| r.mode.clone())
+                })
+                .unwrap_or_else(|| self.manager_mode_token().to_string());
+            return Some(ManagerStateRow {
+                state: "stopped".to_string(),
+                mode,
+                reason,
+                ..ManagerStateRow::default()
+            });
+        }
+        // The intervention row, when there is one, is the state the operator most needs — including a
+        // proposal recorded before the self-test last failed. The launch-imperilling states
+        // (`unavailable`) are only shown when there is no row to report.
+        let rows = self.store().load_manager_interventions().ok()?;
+        if let Some(row) = rows.iter().rev().find(|r| r.pr.eq_ignore_ascii_case(pr)) {
+            return Some(self.manager_state_row(row));
+        }
+        // The §4.7 self-test has not passed on the current CLI, so no manager run can launch.
+        if self.manager_launch_permitted().is_err() {
+            return Some(ManagerStateRow {
+                state: "unavailable".to_string(),
+                mode: self.manager_mode_token().to_string(),
+                reason: "manager unavailable: CLI contract".to_string(),
+                ..ManagerStateRow::default()
+            });
+        }
+        None
+    }
+
+    /// Project one intervention row into the console view. The deferral reason comes from the same
+    /// §10.2 gate evaluation the human-feed sentence uses, so the console and the feed agree.
+    fn manager_state_row(&self, row: &rhapsody_store::ManagerInterventionRow) -> ManagerStateRow {
+        let reason = if row.state == rhapsody_store::MANAGER_INTERVENTION_DEFERRED {
+            self.manager_surface_reason(self.manager_gate_env(&row.pr))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let decision = if row.decision_json.is_empty() {
+            None
+        } else {
+            let wrapped = format!(
+                "```{}\n{}\n```",
+                crate::managerdecision::MANAGER_DECISION_TAG,
+                row.decision_json
+            );
+            crate::managerdecision::parse_stored_decision(&wrapped, &[])
+                .ok()
+                .map(|d| ManagerDecisionRow {
+                    kind: d.variant().to_string(),
+                    rationale: d.rationale,
+                    dismissals: d
+                        .dismiss
+                        .iter()
+                        .map(|x| ManagerDismissalRow {
+                            finding: x.finding.finding.clone(),
+                            revision: x.finding.revision,
+                        })
+                        .collect(),
+                    // §10.2: an escalation shows the manager's SPECIFIC question, not a generic
+                    // "escalated".
+                    question: match &d.kind {
+                        crate::managerdecision::DecisionKind::Escalate { question, .. } => {
+                            Some(question.clone())
+                        }
+                        _ => None,
+                    },
+                    unapplied: row.unapplied_explanation,
+                })
+        };
+        ManagerStateRow {
+            state: row.state.clone(),
+            mode: row.mode.clone(),
+            proposal: row.mode == rhapsody_store::MANAGER_MODE_ADVISE
+                && row.state == rhapsody_store::MANAGER_INTERVENTION_PROPOSED,
+            reason,
+            decision,
+        }
     }
 
     /// **Re-run** (`Event::ReviewRerun`) — the operator asking for one more review round of a
@@ -1689,5 +1867,93 @@ mod tests {
                 .is_empty(),
             "a dismissed review must not come back live"
         );
+    }
+
+    // STUDIO-1018 (§9/§10.2, acceptance "the console distinguishes proposed from applied"): the
+    // reviews payload carries the manager's state, and an `advise` proposal is flagged so the
+    // console can render it distinctly. MUTATION: drop the `manager` attachment (or the proposal
+    // flag) and this reds.
+    #[test]
+    fn the_reviews_payload_carries_the_manager_state_and_flags_a_proposal() {
+        let mut o = ticketless();
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Advise;
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                id: "iv-1".to_string(),
+                pr: "makewhatis/rhapsody#12".to_string(),
+                generation: 1,
+                stall_kinds: vec!["review_escalated".to_string()],
+                mode: rhapsody_store::MANAGER_MODE_ADVISE.to_string(),
+                state: rhapsody_store::MANAGER_INTERVENTION_PROPOSED.to_string(),
+                decision_json: format!(
+                    r#"{{"decision":"ESCALATE","head":"{HEAD_A}","evidence_rev":0,
+                        "escalate":{{"question":"which gate?","checked":"ci and approvals"}},
+                        "rationale":"the loop cannot converge"}}"#
+                ),
+                ..rhapsody_store::ManagerInterventionRow::default()
+            })
+            .expect("save intervention");
+
+        let view = o.review_console_list().expect("list");
+        let manager = view.reviews[0].manager.as_ref().expect("manager state");
+        assert_eq!(manager.state, "proposed");
+        assert_eq!(manager.mode, "advise");
+        assert!(manager.proposal, "an advise proposal is flagged");
+        let decision = manager.decision.as_ref().expect("decision");
+        assert_eq!(decision.kind, "ESCALATE");
+        assert_eq!(decision.rationale, "the loop cannot converge");
+        assert_eq!(
+            decision.question.as_deref(),
+            Some("which gate?"),
+            "an escalation shows the manager's specific question"
+        );
+    }
+
+    // `manager.review_authority: off` stays byte-identical: no manager state is attached at all.
+    #[test]
+    fn off_attaches_no_manager_state() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let view = o.review_console_list().expect("list");
+        assert!(view.reviews[0].manager.is_none(), "off adds nothing");
+    }
+
+    // STUDIO-1018 (§9): the derived `stopped` state reports the MODE the pull request's
+    // interventions ran under, not the current config token — a mid-flight `act`→`advise` flip must
+    // not relabel a stopped `act` generation as `advise`. MUTATION: report
+    // `self.manager_mode_token()` and this reds.
+    #[test]
+    fn a_stopped_generation_reports_the_rows_mode_not_the_current_token() {
+        let mut o = ticketless();
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Advise;
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let pr = "makewhatis/rhapsody#12";
+        o.store().ensure_review_generation(pr).expect("generation");
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                id: "iv-1".to_string(),
+                pr: pr.to_string(),
+                generation: 1,
+                stall_kinds: vec!["review_escalated".to_string()],
+                mode: rhapsody_store::MANAGER_MODE_ACT.to_string(),
+                state: rhapsody_store::MANAGER_INTERVENTION_ESCALATED.to_string(),
+                ..rhapsody_store::ManagerInterventionRow::default()
+            })
+            .expect("save intervention");
+        o.store()
+            .stop_manager_generation(pr, "the run budget is spent")
+            .expect("stop");
+
+        let view = o.review_console_list().expect("list");
+        let manager = view.reviews[0].manager.as_ref().expect("manager state");
+        assert_eq!(manager.state, "stopped");
+        assert_eq!(
+            manager.mode, "act",
+            "the row's mode, not the current `advise` token"
+        );
+        assert_eq!(manager.reason, "the run budget is spent");
     }
 }
