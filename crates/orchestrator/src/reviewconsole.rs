@@ -214,12 +214,19 @@ impl Orchestrator {
             return Ok(ReviewsView::default()); // §16
         }
         let rows = self.store().load_review_watch()?;
+        // The manager state is per PR, and one PR has one row per reviewer: compute it once per
+        // coordinate rather than per row (each computation reads the intervention table).
+        let mut states: std::collections::HashMap<String, Option<ManagerStateRow>> =
+            std::collections::HashMap::new();
         let reviews = rows
             .into_iter()
             .map(|row| {
                 let mut job = ReviewJobRow::from(row);
                 let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();
-                job.manager = self.manager_console_state(&key);
+                job.manager = states
+                    .entry(key.clone())
+                    .or_insert_with(|| self.manager_console_state(&key))
+                    .clone();
                 job
             })
             .collect();
