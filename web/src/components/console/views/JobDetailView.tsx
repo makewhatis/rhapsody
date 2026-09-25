@@ -16,6 +16,7 @@ import {
   Mono,
   Pill,
   Seg,
+  Select,
   TeammateAvatar,
   TicketChip,
   Timestamp,
@@ -31,7 +32,7 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
-import { useLiveHistoryCosts } from "@/hooks/useHistory";
+import { useIssueRuns, useLiveHistoryCosts } from "@/hooks/useHistory";
 import {
   useMergeRun,
   useResumeRun,
@@ -68,17 +69,22 @@ import {
   relayBatons,
   resultBanner,
   resultEyebrow,
-  reviewOptions,
+  reviewRounds,
+  reviewPr,
+  reviewPrUrl,
   runBranch,
   runTeammate,
   runVitals,
   ticketCostView,
   ticketUrl,
+  BRANCH_DISPLAY_MAX,
+  middleEllipsis,
   type AttemptOption,
   type Baton,
   harnessFidelity,
   type FailingStep,
   type RelayBatons,
+  type ReviewRound,
   type RunVitals,
   type TraceFilter,
 } from "@/lib/console-trace-view";
@@ -342,14 +348,31 @@ function RunTrace({
     () => attemptOptions(runs, identities, assignee),
     [runs, identities, assignee],
   );
-  // The review strip (STUDIO-976): the ticket's review runs, labelled by reviewer through the SAME
-  // resolution the attempts, the batons and the header's assignee use. Deliberately NOT folded into
-  // `attempts`: an attempt's ordinal is its position in the TICKET's run list, and inserting
-  // reviews there would renumber every attempt label quoted in tickets, PR comments and the room.
-  const reviewStrip = useMemo(
-    () => reviewOptions(reviews, identities, assignee),
+  // The review strip (STUDIO-976), grouped into ROUNDS (STUDIO-1023): one chip per reviewer per
+  // pull request, the newest round expanded and older rounds collapsed. Labelled by reviewer
+  // through the SAME resolution the attempts, the batons and the header's assignee use.
+  // Deliberately NOT folded into `attempts`: an attempt's ordinal is its position in the TICKET's
+  // run list, and inserting reviews there would renumber every attempt label quoted in tickets,
+  // PR comments and the room.
+  const rounds = useMemo(
+    () => reviewRounds(reviews, identities, assignee),
     [reviews, identities, assignee],
   );
+  // Whether the RUN being read is a ticketless review run (`pr:…@reviewer`), and — when the route
+  // is the review's own key rather than the origin ticket's — the TICKET it reviews (STUDIO-1023).
+  //
+  // A review run selected from a ticket's own strip is read while `issue` IS the origin ticket, so
+  // the answer is already in hand and no fetch fires. A review run opened DIRECTLY (`#job/pr:…`)
+  // has no ticket on the route, and its key carries none, so the origin is resolved through the
+  // daemon's own origin-ticket join — the SAME `review_of` field the issue listing already
+  // serves, read here for the one key. It is asked only on a review route, so an ordinary ticket's
+  // detail page keeps the reads it always had.
+  const reviewRoute = reviewPr(issue) !== undefined;
+  const originRuns = useIssueRuns({ issue }, { enabled: reviewRoute });
+  const originTicket = reviewRoute ? (originRuns.data?.issues[0]?.review_of ?? "") : issue;
+  // Whether the origin-ticket read may still answer. Only a review ROUTE asks, so this is false
+  // for every ordinary ticket and the header never claims to be resolving one it never asked for.
+  const originPending = reviewRoute && originRuns.isPending;
   // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
   // "what <who> did" can never disagree about whose run this is — they did while only the header
   // knew about a review key.
@@ -401,7 +424,10 @@ function RunTrace({
         ref={headerRef}
         run={live}
         issue={issue}
+        originTicket={originTicket}
+        originPending={originPending}
         attempts={attempts}
+        rounds={rounds}
         who={who}
         resolvingWho={identityRead.isPending}
         roster={roster}
@@ -423,44 +449,6 @@ function RunTrace({
         }}
       />
 
-      {/* The review strip (STUDIO-976). Its own row beneath the attempt selector, not folded into
-          it: the selector's single-row width budget is measured per ATTEMPT count (`attemptBucket`,
-          console-trace.css), and a one-attempt ticket with reviews would have them hidden by the
-          `[data-attempts="1"]` rule — while a heavily reviewed ticket's strip is long enough that
-          no threshold fits it either way. A review is a real run with its own trace, so each entry
-          opens it exactly as an attempt does; a review is never numbered, and it is styled as its
-          own kind of row rather than a fourth attempt. */}
-      {reviewStrip.length === 0 ? null : (
-        <div className="trreviews" role="group" aria-label="Reviews">
-          {reviewStrip.map((r) => {
-            // The verdict phrase the tooltip adds (STUDIO-1020), or "" for a round with no verdict.
-            const verdict = REVIEW_STATE_LABELS[r.state];
-            const id = `run ${r.id}`;
-            // A NAMED entry's label already carries "review · <who>", so the run id follows it; the
-            // unnamed fallback's label IS the run id, so the tooltip must not repeat it.
-            const head = r.named ? [r.label, verdict] : [verdict];
-            return (
-              <button
-                key={r.id}
-                type="button"
-                className={r.id === run.id ? "trrev on" : "trrev"}
-                // The state the chip paints its colour and its leading glyph from (STUDIO-1020). A
-                // data attribute rather than a class because the View must not decide the form the
-                // stylesheet draws — the model names the state, the stylesheet encodes it.
-                data-verdict={r.state}
-                aria-pressed={r.id === run.id}
-                title={[...head, id, `started ${formatDateTime(r.startedAt)}`]
-                  .filter((part) => part !== "")
-                  .join(" · ")}
-                onClick={() => selectRun(r.id)}
-              >
-                {r.label}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
       <div className="trmode">
         <div className="rt">
           <Seg
@@ -481,7 +469,7 @@ function RunTrace({
         <>
           <ResultCardZone
             run={live}
-            ticket={issue}
+            ticket={originTicket === "" ? issue : originTicket}
             result={result}
             vitals={vitals}
             pending={transcript.isPending}
@@ -579,7 +567,10 @@ function TraceHeader({
   ref,
   run,
   issue,
+  originTicket,
+  originPending,
   attempts,
+  rounds,
   who,
   resolvingWho,
   roster,
@@ -597,8 +588,15 @@ function TraceHeader({
   /** The route-level ticket being viewed — what "Open ticket" links to. A selected review run's
    * own `issue_identifier` is a synthetic `pr:` key, never a Linear ticket. */
   issue: string;
+  /** The TICKET a review run reviews (STUDIO-1023), resolved through the daemon's origin-ticket
+   * join; "" when the daemon credited none. "Open origin ticket" and the ticket total read it. */
+  originTicket: string;
+  /** Whether that origin-ticket read may still answer — see "Open origin ticket" below. */
+  originPending: boolean;
   /** Every attempt the ticket has, newest first, already labelled — see `attemptOptions`. */
   attempts: readonly AttemptOption[];
+  /** The ticket's reviews grouped into rounds (STUDIO-1023) — see `reviewRounds`. */
+  rounds: readonly ReviewRound[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
   /** Whether the durable routing search may still name one — see the assignee slot below. */
@@ -617,25 +615,79 @@ function TraceHeader({
   onCompose: () => void;
 }) {
   const workspaceURLKey = useLinearIdentity().data?.workspace_url_key ?? "";
+  // A ticketless review run's own key, or undefined for an ordinary attempt. The actions below are
+  // KIND-SPECIFIC: a review run judges a pull request rather than owning a ticket, so it gets
+  // "Open origin ticket" and the PR its key names, and it is never offered Merge.
+  const reviewRun = reviewPr(run.issue_identifier) !== undefined;
+  const origin = originTicket === "" ? issue : originTicket;
   return (
-    // `data-attempts` is for the stylesheet, not for anyone reading the DOM: the width one header
-    // row costs grows with the attempt selector, so `console-trace.css` sets the single-row
-    // breakpoint per bucket rather than once for every ticket. See `attemptBucket`.
+    // `data-attempts` is kept for the stylesheet and the tests that pin the attempt count; the
+    // three rows below no longer reshape per count, because the selector collapses to a dropdown
+    // past three attempts instead of buying a row with its labels. See `attemptBucket`.
     <div className="trhd" data-attempts={attemptBucket(attempts.length)} ref={ref}>
-      <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
-        ‹
-      </button>
-      <div className="idw">
-        <div className="k">{run.issue_identifier}</div>
-        <h1>{run.title === "" ? run.issue_identifier : run.title}</h1>
-        {/* What this run actually ran on (STUDIO-909). Each value carries the config key it came
-            from, because the failure that motivated the field was an override (`review.model.opencode`)
-            that no other surface named. A run that recorded nothing renders `unknown` for all three
-            rather than a value inferred from whatever config is live now — the config hot-reloads,
-            the run is history.
+      {/* --- Row 1: identity. Back · key · full title · assignee · outcome --- */}
+      <div className="trhd-id">
+        <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
+          ‹
+        </button>
+        <div className="idw">
+          <div className="k">{run.issue_identifier}</div>
+          <h1>{run.title === "" ? run.issue_identifier : run.title}</h1>
+        </div>
+        {/* The persistent assignee (§3A). A run nothing can name keeps the slot and reads "—":
+            the header's job is to say who ran this, and an omitted element says nothing at all —
+            which is indistinguishable from a layout that forgot to render it.
+
+            While the durable search is still in flight the slot is kept but says NOTHING, for the
+            same reason the Result card's headline waits: "—" is an assertion that this run had
+            nobody, and it would be a wrong one for every routed run. Only a search that has
+            answered gets to fill the slot. A ticketless review run is named by its own key and
+            never reaches this. */}
+        {who !== "" ? (
+          <span className="who2">
+            {/* The prototype's `.who` — a 20px avatar carrying the initial, then the name (§3A). */}
+            <TeammateAvatar color={teammateColor(roster, who)} size={20} name={who} />
+            {who}
+          </span>
+        ) : resolvingWho ? (
+          <span className="whoskel" role="status">
+            <span className="vh">Resolving who ran this…</span>
+          </span>
+        ) : (
+          <span className="who2 none">—</span>
+        )}
+        {/* The outcome pill, in the prototype's own vocabulary rather than the daemon's column
+            value — "done", not "completed" (§3A). `runOutcomeLabel` translates only the three
+            states the prototype names and passes anything else through.
+
+            It also carries the run's id and start time, which are the two facts NOTHING else on
+            this page renders: the route is `#job/<TICKET-KEY>`, the receipt carries neither, and
+            the id is the daemon's own handle — what `/api/v1/runs/{id}`, `symphony_run_status` and
+            the logs are keyed by. It belongs on the one header member that describes this RUN and
+            not the ticket, so "which run, and when did it start" is the same question its state
+            answers. */}
+        <Pill
+          variant={runOutcomePill(run.outcome)}
+          title={`run ${run.id} · started ${formatDateTime(run.started_at)}`}
+        >
+          {runOutcomeLabel(run.outcome)}
+        </Pill>
+        {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
+            in words — a screen reader that announced a second "live" would only repeat it. */}
+        {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
+      </div>
+
+      {/* --- Row 2: provenance. Three inline chips on one line, never wrapping inside a value;
+              the config key rides in each chip's tooltip, and inline only when it names an
+              override (STUDIO-1023). The row scrolls sideways in its own box when it is too wide,
+              so the page body never does (§3C). --- */}
+      <div className="trprovrow">
+        {/* What this run actually ran on (STUDIO-909). A run that recorded nothing renders
+            `unknown` for all three rather than a value inferred from whatever config is live now —
+            the config hot-reloads, the run is history.
 
             While the fetch is still in flight the header says NOTHING, exactly like the assignee
-            slot below: `provenanceFields(undefined)` cannot tell loading from "recorded nothing", and
+            slot: `provenanceFields(undefined)` cannot tell loading from "recorded nothing", and
             rendering three `unknown`s for the first frame would assert a fact the run may not have
             (STUDIO-909 round 1). */}
         {resolvingProvenance ? (
@@ -647,136 +699,233 @@ function TraceHeader({
         ) : (
           <div className="prov">
             {provenanceFields(provenance).map((f) => (
-              <span className="pf" key={f.label}>
+              <span
+                className="pf"
+                key={f.label}
+                data-override={f.override ? "true" : undefined}
+                title={f.origin === "" ? undefined : `${f.label} · from ${f.origin}`}
+              >
                 <span className="pl">{f.label}</span>
                 <span className="pv">{f.value}</span>
-                {f.origin === "" ? null : <span className="po">[{f.origin}]</span>}
+                {/* The origin inline ONLY when it is an override: the ordinary tier is the same
+                    for every run and belongs in the tooltip; an override is the thing the operator
+                    has to notice (STUDIO-1023). */}
+                {f.override ? <span className="po">[{f.origin}]</span> : null}
               </span>
             ))}
           </div>
         )}
       </div>
-      {/* The persistent assignee (§3A). A run nothing can name keeps the slot and reads "—":
-          the header's job is to say who ran this, and an omitted element says nothing at all —
-          which is indistinguishable from a layout that forgot to render it.
 
-          While the durable search is still in flight the slot is kept but says NOTHING, for the
-          same reason the Result card's headline waits: "—" is an assertion that this run had
-          nobody, and it would be a wrong one for every routed run. Only a search that has
-          answered gets to fill the slot. A ticketless review run is named by its own key and
-          never reaches this. */}
-      {who !== "" ? (
-        <span className="who2">
-          {/* The prototype's `.who` — a 20px avatar carrying the initial, then the name (§3A). */}
-          <TeammateAvatar color={teammateColor(roster, who)} size={20} name={who} />
-          {who}
-        </span>
-      ) : resolvingWho ? (
-        <span className="whoskel" role="status">
-          <span className="vh">Resolving who ran this…</span>
-        </span>
-      ) : (
-        <span className="who2 none">—</span>
-      )}
-      {/* The outcome pill, in the prototype's own vocabulary rather than the daemon's column
-          value — "done", not "completed" (§3A). `runOutcomeLabel` translates only the three
-          states the prototype names and passes anything else through.
+      {/* --- Row 3: controls. Attempts · reviews · branch · actions, actions right-aligned. --- */}
+      <div className="trctl">
+        {/* The attempt selector — the implement→revise relay. Switching swaps the Result card, the
+            spine and the header's assignee to that run, and the spine draws the handoff baton
+            either side of it (`relayBatons`), naming each attempt's own teammate.
 
-          It also carries the run's id and start time, which are the two facts NOTHING else on this
-          page renders: the route is `#job/<TICKET-KEY>`, the receipt carries neither, and the id
-          is the daemon's own handle — what `/api/v1/runs/{id}`, `symphony_run_status` and the logs
-          are keyed by. They used to live only in the attempt selector's tooltip, and the
-          single-row header sheds that selector on a one-attempt ticket at the desktop default
-          width (see `console-trace.css`), which would have taken both with it.
-
-          The pill is where they belong rather than merely where they fit: it is the one header
-          member that describes this RUN and not the ticket, so "which run, and when did it start"
-          is the same question its state answers. It is never shed and `flex: none` in the single
-          row, so the hover target exists at every width. Unconditional, too — the width the
-          selector goes at lives in the stylesheet, and a copy of that breakpoint in TSX would be a
-          second source of truth for it, silently stale the next time the row is re-measured. */}
-      <Pill
-        variant={runOutcomePill(run.outcome)}
-        title={`run ${run.id} · started ${formatDateTime(run.started_at)}`}
-      >
-        {runOutcomeLabel(run.outcome)}
-      </Pill>
-      {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
-          in words — a screen reader that announced a second "live" would only repeat it. */}
-      {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
-      {/* The attempt selector — the implement→revise relay. Switching swaps the Result card, the
-          spine and the header's assignee to that run, and the spine draws the handoff baton
-          either side of it (`relayBatons`), naming each attempt's own teammate.
-
-          Labelled "attempt N · <teammate>", as the prototype's `.hd` labels it (STUDIO-763), from
-          the durable per-run identity STUDIO-746 wired. `attemptOptions` owns both halves — see it
-          for why the ordinal is the ticket's own run order rather than `runs.attempt`, and for the
-          two degradations when nothing can name an attempt. The run id is the daemon's own handle
-          and the ordinal is not, so it rides along in the tooltip with the start time. */}
-      <Seg
-        className="trattempts"
-        aria-label="Attempt"
-        options={attempts.map((a) => ({
-          value: String(a.id),
-          label: (
-            // The label itself rides in the tooltip too: on a narrow wide-view window a long
-            // attempt list is clipped, and the teammate is exactly what must stay reachable. A
-            // fallback label already IS the run id, so the tooltip does not repeat it.
-            <span
-              title={
-                a.named
-                  ? `${a.label} · run ${a.id} · started ${formatDateTime(a.startedAt)}`
-                  : `run ${a.id} · started ${formatDateTime(a.startedAt)}`
-              }
-            >
-              {a.label}
+            Past three attempts the segments collapse to a compact dropdown (STUDIO-1023): eleven
+            full-width segments left no room for a teammate's name, and the ticket's own fix is the
+            one control ("attempt 5 of 5 · jimmy") rather than eleven truncated buttons. Three or
+            fewer stay as segments, which is where the relay reads best. `attemptOptions` owns both
+            labels — see it for why the ordinal is the ticket's own run order rather than
+            `runs.attempt`, and for the two degradations when nothing can name an attempt. */}
+        {attempts.length > 3 ? (
+          <Select
+            wrapperClassName="tradropwrap"
+            className="trattempts"
+            aria-label="Attempt"
+            // A selected REVIEW run is not one of this ticket's attempts, so a bare `value` would
+            // resolve to the first option and the control would NAME AN ATTEMPT the operator did
+            // not select — the same lie the Seg form avoids by pressing nothing. So the dropdown
+            // carries a blank leading option when the selection is not an attempt.
+            options={
+              attempts.some((a) => a.id === run.id)
+                ? attempts.map((a) => ({ value: String(a.id), label: a.dropdownLabel }))
+                : [
+                    { value: "", label: "—" },
+                    ...attempts.map((a) => ({ value: String(a.id), label: a.dropdownLabel })),
+                  ]
+            }
+            value={attempts.some((a) => a.id === run.id) ? String(run.id) : ""}
+            title={attempts.find((a) => a.id === run.id)?.label}
+            onChange={(e) => {
+              if (e.target.value !== "") onSelectRun(Number(e.target.value));
+            }}
+          />
+        ) : (
+          <Seg
+            className="trattempts"
+            aria-label="Attempt"
+            options={attempts.map((a) => ({
+              value: String(a.id),
+              label: (
+                // The label itself rides in the tooltip too: on a narrow wide-view window a long
+                // attempt list is clipped, and the teammate is exactly what must stay reachable. A
+                // fallback label already IS the run id, so the tooltip does not repeat it.
+                <span
+                  title={
+                    a.named
+                      ? `${a.label} · run ${a.id} · started ${formatDateTime(a.startedAt)}`
+                      : `run ${a.id} · started ${formatDateTime(a.startedAt)}`
+                  }
+                >
+                  {a.label}
+                </span>
+              ),
+            }))}
+            value={String(run.id)}
+            onChange={(v) => onSelectRun(Number(v))}
+          />
+        )}
+        <ReviewStrip rounds={rounds} selectedId={run.id} onSelect={onSelectRun} />
+        <div className="trvitals">
+          {/* Duration, turns and tokens, grouped so a narrow row can shed them together: all three
+              are repeated verbatim in the Result card's receipt below (§3B). */}
+          <span className="trdup">
+            <span>
+              <b>{vitals.duration}</b>
             </span>
-          ),
-        }))}
-        value={String(run.id)}
-        onChange={(v) => onSelectRun(Number(v))}
-      />
-      <div className="trvitals">
-        {/* Duration, turns and tokens, grouped because they leave together: all three are repeated
-            verbatim in the Result card's receipt ~8px below (§3B), so the single-row header sheds
-            them rather than squeezing the branch, which the receipt does NOT carry. The wrapper is
-            `display: contents` until it is shed, so grouping them costs the row no layout. */}
-        <span className="trdup">
-          <span>
-            <b>{vitals.duration}</b>
+            <span>
+              <b>{vitals.turns}</b>
+            </span>
+            <span>
+              <b>{vitals.tokens}</b> tokens
+            </span>
           </span>
-          <span>
-            <b>{vitals.turns}</b>
+          {/* The one vital the Result card's receipt does NOT repeat. A long branch is shortened in
+              the MIDDLE (STUDIO-1023), so its meaningful tail survives, and the whole value rides
+              in the tooltip and on the copy button. */}
+          <span className="trbranch">
+            <Mono title={vitals.branch}>{middleEllipsis(vitals.branch, BRANCH_DISPLAY_MAX)}</Mono>
+            {vitals.branch === "—" || vitals.branch === "" ? null : (
+              <BranchCopy value={vitals.branch} />
+            )}
           </span>
-          <span>
-            <b>{vitals.tokens}</b> tokens
-          </span>
-        </span>
-        {/* The one vital the Result card's receipt does NOT repeat, so it is the member the row
-            keeps and floors — and it carries itself in a tooltip for a branch long enough to
-            ellipsize anyway. */}
-        <Mono title={vitals.branch}>{vitals.branch}</Mono>
+        </div>
+        <HeaderActions
+          run={run}
+          ticketHref={ticketUrl(workspaceURLKey, origin)}
+          reviewRun={reviewRun}
+          originPending={originPending}
+          inFlight={inFlight}
+          composerId={composerId}
+          onCompose={onCompose}
+        />
       </div>
-      <HeaderActions
-        run={run}
-        ticketHref={ticketUrl(workspaceURLKey, issue)}
-        inFlight={inFlight}
-        composerId={composerId}
-        onCompose={onCompose}
-      />
     </div>
+  );
+}
+
+/**
+ * The review strip (STUDIO-976), grouped into rounds (STUDIO-1023): the newest round's chips are
+ * always shown, and the older rounds collapse behind one "+N earlier rounds" toggle so a
+ * twenty-five-review ticket reads as a handful of rounds rather than two screens of identical
+ * chips. A review is a real run with its own trace, so each chip opens it exactly as an attempt
+ * does; a review is never numbered.
+ */
+function ReviewStrip({
+  rounds,
+  selectedId,
+  onSelect,
+}: {
+  rounds: readonly ReviewRound[];
+  selectedId: number;
+  onSelect: (id: number) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (rounds.length === 0) return null;
+  const older = rounds.slice(1);
+  const shown = expanded ? rounds : rounds.slice(0, 1);
+  return (
+    <div className="trreviews" role="group" aria-label="Reviews">
+      {shown.map((round) =>
+        round.chips.map((r) => {
+          // The verdict phrase the tooltip adds (STUDIO-1020), or "" for a round with no verdict.
+          const verdict = REVIEW_STATE_LABELS[r.state];
+          const id = `run ${r.id}`;
+          // A NAMED entry's label already carries "review · <who>", so the run id follows it; the
+          // unnamed fallback's label IS the run id, so the tooltip must not repeat it.
+          const head = r.named ? [r.label, verdict] : [verdict];
+          return (
+            <button
+              key={r.id}
+              type="button"
+              className={r.id === selectedId ? "trrev on" : "trrev"}
+              // The state the chip paints its colour and its leading glyph from (STUDIO-1020). A
+              // data attribute rather than a class because the View must not decide the form the
+              // stylesheet draws — the model names the state, the stylesheet encodes it.
+              data-verdict={r.state}
+              aria-pressed={r.id === selectedId}
+              title={[...head, id, `started ${formatDateTime(r.startedAt)}`]
+                .filter((part) => part !== "")
+                .join(" · ")}
+              onClick={() => onSelect(r.id)}
+            >
+              {r.label}
+            </button>
+          );
+        }),
+      )}
+      {older.length === 0 ? null : (
+        <button
+          type="button"
+          className="trrevmore"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "hide earlier rounds" : `+${older.length} earlier round${older.length === 1 ? "" : "s"}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A copy button for the run's branch (STUDIO-1023). The header shortens a long branch in the
+ * middle, so this is how the operator gets the whole thing; the clipboard API is absent in jsdom
+ * and in some webviews, where the click is a no-op rather than a thrown error.
+ */
+function BranchCopy({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="trcopy"
+      aria-label="Copy branch"
+      title={`Copy branch — ${value}`}
+      onClick={() => {
+        const clip = navigator.clipboard;
+        if (clip === undefined) return;
+        void clip.writeText(value).then(
+          () => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1500);
+          },
+          () => {},
+        );
+      }}
+    >
+      {copied ? "copied" : "copy"}
+    </button>
   );
 }
 
 function HeaderActions({
   run,
   ticketHref,
+  reviewRun,
+  originPending,
   inFlight,
   composerId,
   onCompose,
 }: {
   run: RunSummary;
   ticketHref: string;
+  /** STUDIO-1023: this run's key is a ticketless `pr:…@reviewer`, so its actions are the review's
+   *  own — "Open origin ticket" and the PR the key names — and it is never offered Merge. */
+  reviewRun: boolean;
+  /** Whether the origin-ticket read may still answer — "Open origin ticket"'s own load state. */
+  originPending: boolean;
   inFlight: boolean;
   composerId: string | undefined;
   onCompose: () => void;
@@ -787,8 +936,13 @@ function HeaderActions({
   const teamsEnabled = useTeamsEnabled();
   // What the daemon would say if Merge were clicked right now (STUDIO-790). Asked only where a
   // merge path exists at all, because with Teams off the daemon serves `teams_disabled` and the
-  // control below is dependency-named without a round trip.
-  const verdict = useRunMergeability(run.id, teamsEnabled);
+  // control below is dependency-named without a round trip — and, since STUDIO-1023, not asked at
+  // all on a review run, which has no Merge to arm.
+  const verdict = useRunMergeability(run.id, teamsEnabled && !reviewRun);
+  // The PR a REVIEW run names outright, or "" for an ordinary run, whose "View PR" is a head-branch
+  // search instead (STUDIO-1023). A review run's branch is a detached review worktree, so the
+  // search finds nothing and the key's own number is the only exact answer.
+  const reviewHref = reviewRun ? reviewPrUrl(run) : "";
   const prHref = prSearchUrl(run);
   // The receipt the daemon is asking the operator to confirm (STUDIO-767). Held here rather than
   // read off `merge.data`, because confirming re-runs the mutation and the modal must keep showing
@@ -863,34 +1017,59 @@ function HeaderActions({
         </DepButton>
       )}
       {ticketHref === "" ? (
-        <DepButton title="No Linear workspace is connected, so the ticket has no deep link.">
-          Open ticket
+        <DepButton
+          title={
+            reviewRun
+              ? originPending
+                ? "Resolving this review run's origin ticket…"
+                : "The daemon credits no origin ticket to this review run, so there is nothing to open."
+              : "No Linear workspace is connected, so the ticket has no deep link."
+          }
+        >
+          {reviewRun ? "Open origin ticket" : "Open ticket"}
         </DepButton>
       ) : (
         <ExternalLink className="btn sec" href={ticketHref}>
-          Open ticket
+          {/* A review run's `issue_identifier` is a synthetic `pr:` key, never a Linear ticket.
+              What an operator wants from it is the TICKET the review is about, which the route (or
+              the daemon's origin-ticket join) resolves — so the action says so (STUDIO-1023). */}
+          {reviewRun ? "Open origin ticket" : "Open ticket"}
         </ExternalLink>
       )}
-      {/* No endpoint serves a PR number (design record §5), so this is a head-branch search on
-          the run's own remote — it finds the branch's PR without the console asserting one. The
-          branch it searches for comes from `runBranch`, since the daemon writes none. */}
-      {prHref === "" ? (
-        <DepButton title="No daemon pull-request endpoint, and this run's remote is not on github.com, so there is nothing to search.">
+      {/* No endpoint serves a PR number for an ORDINARY run (design record §5), so "View PR" there
+          is a head-branch search on the run's own remote — it finds the branch's PR without the
+          console asserting one. A REVIEW run is different: its key names the pull request outright
+          and its branch is a detached review worktree, so the search would find nothing and the
+          link is built from the number (STUDIO-1023). */}
+      {(reviewRun ? reviewHref : prHref) === "" ? (
+        <DepButton
+          title={
+            reviewRun
+              ? "This review run's key names no pull-request coordinate, so there is nothing to link to."
+              : "No daemon pull-request endpoint, and this run's remote is not on github.com, so there is nothing to search."
+          }
+        >
           View PR
         </DepButton>
       ) : (
-        <ExternalLink className="btn sec" href={prHref}>
+        <ExternalLink className="btn sec" href={reviewRun ? reviewHref : prHref}>
           View PR
         </ExternalLink>
       )}
-      {/* The real green primary (design §5), rendered from the daemon's own verdict rather than
+      {/* Merge is offered ONLY on the origin ticket's own run (STUDIO-1023). A review run judges a
+          pull request rather than owning it, and its branch is a detached review worktree, so a
+          Merge there is a correctness bug — the verdict would be asked about the wrong run. The
+          control is simply absent on a `pr:` run, rather than disabled: there is no merge path on
+          that run for anyone to enable.
+
+          The real green primary (design §5), rendered from the daemon's own verdict rather than
           from its own in-flight state (STUDIO-790). Every refusal — no open pull request on the
           branch, a live Rhapsody review round, one that asked for changes, an already-merged or
           closed pull request, a branch behind its base, a ticket routed back out of review — is
           still the DAEMON's to make; the console now READS it before the click instead of learning
           it afterwards, and shows it the way every other unavailable action on this header does.
           The console derives none of them: `reason` is the daemon's sentence, verbatim. */}
-      {!teamsEnabled ? (
+      {reviewRun ? null : !teamsEnabled ? (
         <DepButton title="Rhapsody Teams is not enabled on this daemon, so it has no merge path.">
           Merge
         </DepButton>
@@ -904,18 +1083,23 @@ function HeaderActions({
         <DepButton title={`Rhapsody will not merge this run's pull request: ${verdict.data.reason}.`}>
           Merge
         </DepButton>
+      ) : verdict.isError ? (
+        // A verdict that could not be READ — a `gh` that would not answer — is DISABLED, with the
+        // reason in the tooltip (STUDIO-1023). Nobody could ask is not the daemon saying no, but a
+        // live primary whose verdict is unknown is exactly the "most prominent control on the page
+        // might be wrong" failure this ticket exists to end; the operator can retry by reloading,
+        // and `merge` still refuses server-side when the answer is no.
+        <Button
+          variant="pri"
+          disabled
+          title={`Merge is disabled: the daemon could not be asked whether this can be merged (${verdict.error?.message ?? "no answer"}).`}
+        >
+          Merge
+        </Button>
       ) : (
         <Button
           variant="pri"
-          // Two states share this arm, and the title separates them. A resolved verdict names the
-          // pull request the click would act on. A verdict that could not be READ — a `gh` that
-          // would not answer — leaves the control live on purpose: nobody could ask is not the
-          // daemon saying no, and the click still refuses server-side if the answer is no.
-          title={
-            resolved
-              ? `Merge ${resolved.pr} — ${resolved.method}, with GitHub's own auto-merge.`
-              : `The daemon could not be asked whether this can be merged (${verdict.error?.message ?? "no answer"}). Clicking asks again and merges nothing before you confirm.`
-          }
+          title={`Merge ${resolved?.pr ?? "this run's pull request"} — ${resolved?.method ?? "the daemon's method"}, with GitHub's own auto-merge.`}
           onClick={() => askMerge("")}
           disabled={merge.isPending}
         >
@@ -1621,7 +1805,10 @@ function Inspector({
   const name = who === "" ? "the agent" : who;
   return (
     <>
-      <h4>
+      {/* The inspector's heading names the step and its actor, and it is a LABEL — not prose, not
+          output. It takes the muted label treatment (`console-trace.css` `.trinsp .insphead`) so
+          the cards below it read as the content and this as the heading over them (STUDIO-1023). */}
+      <h4 className="insphead">
         {phase.title} — what {name} did
       </h4>
       {phase.did.map((card) => (
@@ -1781,8 +1968,9 @@ const WATCH_PANEL_ID = "trwatch-panel";
  * Diff, Review, Room and Memory are all scoped to the TICKET, built to the last one on
  * `run.issue_identifier`. What they do have in common is the negative — none of them follows the
  * spine, unlike the inspector above, which is scoped to the step the spine has selected. So the
- * eyebrow states that negation, "Not this step", rather than a positive scope that would be false
- * about part of the rail; the JSX comment on it carries the per-tab audit (STUDIO-766).
+ * eyebrow names the scope plainly — "Around this run" (STUDIO-1023) — rather than the old
+ * negation, which named nothing an operator could use; the JSX comment on it carries the per-tab
+ * audit (STUDIO-766).
  *
  * Only the SELECTED panel is mounted, which is what keeps the rail's cost honest — a run detail
  * that polled the room, the reviews and the message list all at once, for four surfaces nobody was
@@ -1803,15 +1991,13 @@ function WatchTabsRail({
     <div className="trwatch">
       {/* What the five tabs are scoped to, STATED rather than left to be inferred from position —
           the whole point of pulling this zone out from under the step-scoped inspector.
-          It is a negation because every positive label is a lie about part of the rail: only
-          Messages is scoped to the run (`runId={run.id}`). Diff, Review, Room and Memory are all
-          scoped to the TICKET — `runBranch`/`prSearchUrl`, `reviewsForRun`, `roomPostsFor` and
-          `useTicketFacts` are built on `run.issue_identifier` to the last one — so switching
-          attempt leaves those four byte-identical. "This whole run" would therefore promise a
-          scope change four of the five tabs never make, which is the same defect this ticket
-          exists to remove, moved one zone up. "Not this step" is true of all five, and it draws
-          the contrast with zone C that this label is here for. */}
-      <div className="eyebrow">Not this step</div>
+          The tabs do NOT share one scope: only Messages is scoped to the run (`runId={run.id}`),
+          while Diff, Review, Room and Memory are scoped to the TICKET — `runBranch`/`prSearchUrl`,
+          `reviewsForRun`, `roomPostsFor` and `useTicketFacts` are built on `run.issue_identifier`
+          to the last one. What they have in common is that none follows the spine, so the label
+          names that sit-around-the-run scope. The old wording was a negation — "Not this step" —
+          which said what the panel was NOT and nothing about what it was (STUDIO-1023). */}
+      <div className="eyebrow">Around this run</div>
       {/* The ARIA roles below are a promise about the keyboard as much as about the screen
           reader, and `shell/tabs` is the repo's own answer to it — the same wire-up the Settings
           rail uses, so the two tablists behave alike. */}

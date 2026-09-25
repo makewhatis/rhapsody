@@ -19,6 +19,7 @@ import { LIVE_POLL_MS } from "@/hooks/useStateQuery";
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
+  fetchIssueRuns: vi.fn(),
   fetchRunDetail: vi.fn(),
   fetchHistoryCosts: vi.fn(),
   fetchRunProvenance: vi.fn(),
@@ -47,6 +48,7 @@ vi.mock("@/lib/api", async (orig) => {
   return {
     ...actual,
     fetchIssueHistory: h.fetchIssueHistory,
+    fetchIssueRuns: h.fetchIssueRuns,
     fetchRunDetail: h.fetchRunDetail,
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchRunProvenance: h.fetchRunProvenance,
@@ -206,8 +208,18 @@ function teammate(name: string) {
 /** The client the last mount rendered under — how a test simulates a poll tick landing. */
 let client: QueryClient;
 
-function mountDetail(runs: RunSummary[], onNavigate = vi.fn(), reviews: RunSummary[] = []) {
-  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs, reviews });
+function mountDetail(
+  runs: RunSummary[],
+  onNavigate = vi.fn(),
+  reviews: RunSummary[] = [],
+  issue = "STUDIO-654",
+) {
+  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: issue, runs, reviews });
+  // STUDIO-1023: a review route resolves its origin ticket through `/history/issues`, so that read
+  // is defaulted here (empty, the honest "no origin credited" answer) and overridden per test.
+  if (h.fetchIssueRuns.getMockImplementation() === undefined) {
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+  }
   // The whole-ticket cost ledger (STUDIO-975). Empty by default, which is the "—" case; a test
   // about the total configures it BEFORE mounting.
   if (h.fetchHistoryCosts.getMockImplementation() === undefined) {
@@ -278,7 +290,7 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn(), reviews: RunSumma
   client = qc;
   render(
     <QueryClientProvider client={qc}>
-      <JobDetailView issue="STUDIO-654" onNavigate={onNavigate} />
+      <JobDetailView issue={issue} onNavigate={onNavigate} />
     </QueryClientProvider>,
   );
   return onNavigate;
@@ -360,7 +372,7 @@ const RUN_DIFF = {
 
 function action(name: string | RegExp): HTMLElement {
   return within(document.querySelector(".trhd .acts") as HTMLElement).getByRole(
-    /view pr|open ticket/i.test(String(name)) ? "link" : "button",
+    /view pr|open (origin )?ticket/i.test(String(name)) ? "link" : "button",
     { name },
   );
 }
@@ -390,6 +402,7 @@ afterEach(() => {
   h.fetchTeamsOverview.mockReset();
   h.fetchRunIdentityEvents.mockReset();
   h.fetchHistoryCosts.mockReset();
+  h.fetchIssueRuns.mockReset();
   // The scroll position is on the live document, which outlives a render. (The step list's own
   // geometry is reset by the `beforeEach` beside `sizeList`; the list itself is torn down with
   // the render, so there is nothing of it left here to clear.)
@@ -521,6 +534,67 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(document.querySelector(".trreviews")).toBeNull();
   });
 
+  // STUDIO-1023 — past three attempts the segments collapse to ONE compact dropdown, so eleven
+  // attempts read "attempt 11 of 11 · alice" instead of eleven truncated buttons. MUTATION GUARD:
+  // drop the dropdown and this test fails on the missing combobox (the eleven segments it would
+  // render instead overflow the controls row).
+  it("collapses more than three attempts into a compact dropdown", async () => {
+    const runs = Array.from({ length: 11 }, (_, i) =>
+      run({ id: i + 1, started_at: `2026-09-01T19:${String(i).padStart(2, "0")}:00Z` }),
+    );
+    mountDetail(runs);
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Attempt" })).toBeTruthy(),
+    );
+    const select = screen.getByRole("combobox", { name: "Attempt" }) as HTMLSelectElement;
+    expect(select.options).toHaveLength(11);
+    // The selected option names the attempt AND the total — the whole reason a collapsed control
+    // carries "of N": there are no sibling segments to count. The label waits on the durable
+    // routing search, exactly as the segments do.
+    await waitFor(() =>
+      expect(select.options[select.selectedIndex].textContent).toBe("attempt 11 of 11 · alice"),
+    );
+    // No segments: the dropdown REPLACES them, it does not sit beside them.
+    expect(document.querySelectorAll(".trattempts button")).toHaveLength(0);
+  });
+
+  // The STUDIO-988 shape the ticket measured: 11 attempts AND 25 reviews. Both strips must stay
+  // bounded — the attempts collapse to a dropdown and the reviews to one round of chips plus a
+  // "+N earlier rounds" toggle, rather than 11 segments and two full rows of 25 chips.
+  it("bounds the 11-attempt / 25-review shape the ticket measured", async () => {
+    const runs = Array.from({ length: 11 }, (_, i) =>
+      run({ id: i + 1, started_at: `2026-09-01T19:${String(i).padStart(2, "0")}:00Z` }),
+    );
+    const reviewers = ["alice", "sol", "jimmy", "bob", "carol"];
+    const reviews = Array.from({ length: 25 }, (_, i) => {
+      const round = Math.floor(i / 5) + 1; // 5 pull requests × 5 reviewers
+      const who = reviewers[i % 5];
+      const day = String(round).padStart(2, "0");
+      return run({
+        id: 900 + i,
+        issue_identifier: `pr:acme/app#${20 + round}@${who}`,
+        started_at: `2026-09-01T${day}:00:00Z`,
+      });
+    });
+    mountDetail(runs, vi.fn(), reviews);
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Attempt" })).toBeTruthy());
+    // One round of five reviewer chips, not 25 chips — the five are the NEWEST round.
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(5));
+    expect(document.querySelector(".trrevmore")?.textContent).toBe("+4 earlier rounds");
+  });
+
+  // The provenance lives in its OWN row (STUDIO-1023), not under the title inside `.idw`. MUTATION
+  // GUARD: move it back into `.idw` and this test — and the overlap it stands in for at 1440px —
+  // fails.
+  it("puts the provenance in its own row, not squeezed under the title", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(document.querySelector(".trhd .trprovrow .pf")).toBeTruthy());
+    expect(document.querySelector(".trhd .idw .prov")).toBeNull();
+    expect(document.querySelector(".trhd .trprovrow .prov")).toBeTruthy();
+  });
+
   // STUDIO-976 — the ticket's review runs, credited to it by the daemon's own origin-ticket join,
   // shown beside the attempts. They live in their OWN strip, never in the attempt selector: an
   // attempt's ordinal is its position in the ticket's run list, so folding reviews into
@@ -572,13 +646,13 @@ describe("zone A — the sticky header (§3A)", () => {
     });
     const changes = run({
       id: 802,
-      issue_identifier: "pr:makewhatis/rhapsody#223@sol",
+      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
       started_at: "2026-09-01T17:30:00Z",
       verdict: "changes_requested",
     });
     const approved = run({
       id: 801,
-      issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+      issue_identifier: "pr:makewhatis/rhapsody#223@jimmy",
       started_at: "2026-09-01T17:00:00Z",
       verdict: "approved",
     });
@@ -590,14 +664,14 @@ describe("zone A — the sticky header (§3A)", () => {
     // The verdict is ADDED to what the tooltip already showed, not instead of it.
     const titles = [...document.querySelectorAll(".trrev")].map((b) => b.getAttribute("title"));
     expect(titles[0]).toMatch(/^review · sol · reviewing · run 803 · started /);
-    expect(titles[1]).toMatch(/^review · sol · changes requested · run 802 · started /);
-    expect(titles[2]).toMatch(/^review · alice · approved · run 801 · started /);
+    expect(titles[1]).toMatch(/^review · alice · changes requested · run 802 · started /);
+    expect(titles[2]).toMatch(/^review · jimmy · approved · run 801 · started /);
     // The button's text is unchanged: the state rides in the chip's form (a `::before` glyph) and
     // its colour, so a screen reader and the existing strip assertions both still read the label.
     expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
       "review · sol",
-      "review · sol",
       "review · alice",
+      "review · jimmy",
     ]);
   });
 
@@ -617,6 +691,35 @@ describe("zone A — the sticky header (§3A)", () => {
     const title = chip.getAttribute("title") ?? "";
     expect(title).toMatch(/^changes requested · run 804 · started /);
     expect(title).not.toMatch(/run 804.*run 804/);
+  });
+
+  // STUDIO-1023 — the strip groups by ROUND: the newest pull request's chips are shown, one per
+  // reviewer, and the older rounds collapse behind a "+N earlier rounds" toggle. Twenty-five flat
+  // chips told the operator nothing; this reads as a handful of rounds.
+  it("groups the review strip into rounds and collapses the older ones", async () => {
+    const newest = [
+      run({ id: 812, issue_identifier: "pr:acme/app#8@alice", started_at: "2026-09-01T18:00:00Z" }),
+      run({ id: 811, issue_identifier: "pr:acme/app#8@sol", started_at: "2026-09-01T17:50:00Z" }),
+    ];
+    const older = [
+      run({ id: 802, issue_identifier: "pr:acme/app#7@alice", started_at: "2026-09-01T15:00:00Z" }),
+      run({ id: 801, issue_identifier: "pr:acme/app#6@sol", started_at: "2026-09-01T13:00:00Z" }),
+    ];
+    mountDetail([run({ id: 522 })], vi.fn(), [...newest, ...older]);
+
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(2));
+    expect([...document.querySelectorAll(".trrev")].map((b) => b.textContent)).toEqual([
+      "review · alice",
+      "review · sol",
+    ]);
+    // The two older rounds (one PR each) are collapsed behind the toggle.
+    const more = document.querySelector(".trrevmore") as HTMLButtonElement;
+    expect(more.textContent).toBe("+2 earlier rounds");
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(more);
+    await waitFor(() => expect(document.querySelectorAll(".trrev")).toHaveLength(4));
+    expect(document.querySelector(".trrevmore")?.textContent).toBe("hide earlier rounds");
   });
 
   // The WIRING half of the round-6 fix: `historyPollInterval` is unit-tested, but the rule only
@@ -691,11 +794,11 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(document.querySelector('.trrev[aria-pressed="true"]')?.textContent).toBe("review · alice");
     // No ATTEMPT is selected — a review is not an attempt.
     expect(document.querySelector('.trattempts button[aria-pressed="true"]')).toBeNull();
-    // "Open ticket" still opens the TICKET being viewed, not the review's synthetic
-    // `pr:<owner>/<repo>#<n>@<reviewer>` issue key. A review run's `issue_identifier` is not a
-    // Linear ticket, so the action must resolve the route-level identifier.
+    // STUDIO-1023: on a review run the action is "Open origin ticket" — the review's synthetic
+    // `pr:<owner>/<repo>#<n>@<reviewer>` issue key is not a Linear ticket, so the label says which
+    // ticket it actually opens and resolves from the route-level identifier.
     await waitFor(() =>
-      expect(action(/open ticket/i).getAttribute("href")).toBe(
+      expect(action(/open origin ticket/i).getAttribute("href")).toBe(
         "https://linear.app/studio49/issue/STUDIO-654",
       ),
     );
@@ -791,12 +894,18 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => {
       const line = document.querySelector(".trhd .prov");
       expect(line?.textContent).toContain("opencode");
-      expect(line?.textContent).toContain("[profile]");
       expect(line?.textContent).toContain("deepseek-v4p1-flash");
-      // NOT [profile] — the override the operator could not see anywhere else.
-      expect(line?.textContent).toContain("[review.model.opencode]");
       expect(line?.textContent).toContain("fireworks-ai");
+      // The OVERRIDE shows inline — the half an operator has to notice (STUDIO-1023)...
+      expect(line?.textContent).toContain("[review.model.opencode]");
+      // ...while an ordinary tier key stays in the chip's tooltip, not in the row.
+      expect(line?.textContent).not.toContain("[profile]");
     });
+    // The ordinary origin is still NAMED — in the chip's own tooltip.
+    const harness = document.querySelector('.trhd .prov .pf[title*="harness"]');
+    expect(harness?.getAttribute("title")).toContain("profile");
+    const override = document.querySelector('.trhd .prov .pf[data-override="true"]');
+    expect(override?.getAttribute("title")).toContain("review.model.opencode");
   });
 
   it("shows unknown, with no origin, for a run that recorded no provenance", async () => {
@@ -906,7 +1015,7 @@ describe("zone A — the sticky header (§3A)", () => {
     it("keeps the selected chip's selection even when it carries a verdict", async () => {
       const changes = run({
         id: 802,
-        issue_identifier: "pr:makewhatis/rhapsody#223@alice",
+        issue_identifier: "pr:makewhatis/rhapsody#223@sol",
         started_at: "2026-09-01T17:30:00Z",
         verdict: "changes_requested",
       });
@@ -956,6 +1065,41 @@ describe("zone A — the header's actions are real or dependency-named, never fa
       "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
     );
     expect(href).not.toMatch(/\/pull\/\d/);
+  });
+
+  // STUDIO-1023 — a review run is a different KIND of run: it judges a pull request rather than
+  // owning a ticket. Its actions are therefore the ORIGIN TICKET (resolved through the daemon's own
+  // origin-ticket join, never parsed from the `pr:` key) and the PR its key names outright, and it
+  // is NEVER offered Merge. MUTATION GUARD: render Merge as a live primary on a `pr:` run and this
+  // test fails on the button being present at all.
+  it("gives a review run the origin ticket and the PR in its key, and never Merge", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#223@jimmy",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "",
+      outcome: "running",
+    });
+    // The daemon's origin-ticket join credits the pull request to STUDIO-988.
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [{ ...review, review_run: true, review_of: "STUDIO-988" }],
+      next_offset: null,
+    });
+    mountDetail([review], vi.fn(), [], "pr:makewhatis/rhapsody#223@jimmy");
+
+    await waitFor(() => expect(document.querySelector(".trhd .acts")).toBeTruthy());
+    const acts = document.querySelector(".trhd .acts") as HTMLElement;
+    // Not a disabled Merge — NO Merge. There is no merge path on a review run at all.
+    expect(within(acts).queryByRole("button", { name: /^merge$/i })).toBeNull();
+    await waitFor(() =>
+      expect(action(/open origin ticket/i).getAttribute("href")).toBe(
+        "https://linear.app/studio49/issue/STUDIO-988",
+      ),
+    );
+    // View PR is the number in the key, not a branch search that cannot find the review worktree.
+    expect(action(/view pr/i).getAttribute("href")).toBe(
+      "https://github.com/makewhatis/rhapsody/pull/223",
+    );
   });
 
   it("names its dependency, rather than linking, when the remote is not a GitHub one", async () => {
@@ -1294,22 +1438,25 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
   });
 
-  // A verdict that could not be READ is not a refusal, and must not be rendered as one: a `gh`
-  // that would not answer is not the daemon saying no, and taking the control away on it would
-  // strand the operator. The click still refuses server-side if the real answer is no.
-  it("keeps Merge live, and says why it is unsure, when the verdict cannot be read", async () => {
+  // A verdict that could not be READ is not a refusal, but it must not be a LIVE primary either
+  // (STUDIO-1023): Merge is the most prominent control on the page, and one whose verdict is
+  // unknown could be offered on the exact run the daemon would refuse. It renders disabled, with
+  // the daemon's own error in the tooltip, so a click cannot fire and the reason is still readable.
+  it("disables Merge, with the reason in the tooltip, when the verdict cannot be read", async () => {
     h.fetchRunMergeability.mockRejectedValue(new Error("gh pr list: HTTP 502"));
     h.mergeRun.mockResolvedValue({ status: "confirm", receipt: MERGE_RECEIPT });
     mountDetail([run({ id: 547 })]);
 
     await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
-    const merge = action(/^merge$/i);
+    const merge = action(/^merge$/i) as HTMLButtonElement;
     expect(merge.className).toMatch(/\bpri\b/);
+    expect(merge.disabled).toBe(true);
     expect(merge.getAttribute("title")).toMatch(/could not be asked/i);
     expect(merge.getAttribute("title")).toContain("gh pr list: HTTP 502");
 
     fireEvent.click(merge);
-    await waitFor(() => expect(h.mergeRun).toHaveBeenCalledWith(547, ""));
+    // A disabled button fires nothing — the mutation is never reached.
+    expect(h.mergeRun).not.toHaveBeenCalled();
   });
 
   // A live Merge now knows WHAT it would merge, so it says so.
@@ -2060,7 +2207,9 @@ describe("the watch-tabs rail (§3C)", () => {
     // Room and Memory are ticket-scoped (every one of them built on `run.issue_identifier`), so a
     // label naming EITHER of those two scopes would promise the other's tabs a change they never
     // make — the very defect, one zone up, that moving this rail was meant to remove.
-    expect(watch.querySelector(".eyebrow")?.textContent).toBe("Not this step");
+    // STUDIO-1023 renamed the label: the old "Not this step" was a negation that named what the
+    // rail was NOT and nothing about what it was. "Around this run" states its scope.
+    expect(watch.querySelector(".eyebrow")?.textContent).toBe("Around this run");
 
     // No tab carries a `dep` mark any more: Diff was the last one that did, and STUDIO-749 built
     // the endpoint it was waiting on. Leaving the mark would tell an operator a served surface is
@@ -3352,87 +3501,53 @@ describe("the watch-tabs zone is drawn as a zone of its own (STUDIO-766)", () =>
   });
 });
 
-// jsdom does no layout, so nothing in CI can see the single header row itself — the widths in
-// `console-trace.css`'s own comment are the only record of what it was measured to do. What CAN be
-// held is the handful of declarations the row is built out of, each of which was a real bug when
-// it was missing, and the class names, which is where the playhead's collision lived.
-describe("the single header row is built out of what it says it is (STUDIO-763)", () => {
+// jsdom does no layout, so nothing in CI can see the header itself. What CAN be held is the
+// handful of declarations the THREE-row header (STUDIO-1023) is built out of, each of which was a
+// real bug when it was missing, plus the class names, which is where the playhead's collision lived.
+describe("the three-row header is built out of what it says it is (STUDIO-763 → 1023)", () => {
   const traceCss = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
   const themeDir = path.resolve(__dirname, "../../../theme");
 
-  it("floors the vitals, so the branch and its tooltip cannot be squeezed to nothing", () => {
-    // `min-width: 0` here let the group reach 0px, which took the branch AND the `title` that was
-    // supposed to recover it — a 0px box has no hover target.
-    expect(traceCss).toMatch(/\.trhd \.trvitals \{[^}]*min-width: 19ch/);
+  // STUDIO-1023 replaced the single-row header with a three-row one. These assertions hold the
+  // shape that makes the three rows true; the mutation guards (dashboard overlap, the 11-attempt
+  // dropdown, the review-run Merge) live in the DOM tests beside them and in the model tests.
+  it("lays the header out as three rows, each with one job", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trhd \{[^}]*flex-direction:\s*column/);
+    // Row 1 identity, row 2 provenance, row 3 controls — the three direct children.
+    expect(traceCss).toMatch(/\.rh-console \.trhd-id \{/);
+    expect(traceCss).toMatch(/\.rh-console \.trhd \.trprovrow \{[^}]*overflow-x:\s*auto/);
+    expect(traceCss).toMatch(/\.rh-console \.trctl \{[^}]*flex-wrap:\s*wrap/);
+    // The actions are right-aligned in the controls row.
+    expect(traceCss).toMatch(/\.rh-console \.trhd \.acts \{[^}]*margin-left:\s*auto/);
   });
 
-  it("sheds the three receipt-duplicated vitals as a group rather than clipping them", () => {
-    // `contents` while it is kept, so grouping them costs the vitals row no layout of its own.
-    expect(traceCss).toMatch(/\.trvitals \.trdup \{[^}]*display: contents/);
-    expect(traceCss).toMatch(/\.trhd \.trdup \{[^}]*display: none/);
+  it("wraps the title to two balanced lines instead of ellipsizing it", () => {
+    const h1 = traceCss.slice(traceCss.indexOf(".rh-console .trhd h1 {"));
+    const block = h1.slice(0, h1.indexOf("}"));
+    expect(block).toMatch(/text-wrap:\s*balance/);
+    expect(block).toMatch(/-webkit-line-clamp:\s*2/);
+    // The old single-row rule's end-ellipsis must not come back.
+    expect(block).not.toMatch(/text-overflow:\s*ellipsis/);
+    expect(block).not.toMatch(/white-space:\s*nowrap/);
   });
 
-  it("ellipsizes a clipped attempt label, with a pixel of slack against sub-pixel rounding", () => {
-    const label = traceCss.slice(traceCss.indexOf(".rh-console .trhd .trattempts button > span {"));
-    const block = label.slice(0, label.indexOf("}"));
-    // Without the ellipsis a cut label is SILENT — "attempt 5 · a" reads as complete.
-    expect(block).toMatch(/text-overflow: ellipsis/);
-    // Without the slack it fires on a button that rounded a fraction of a pixel under its text.
-    expect(block).toMatch(/padding-right: 1px/);
+  it("never wraps inside a provenance value; the line scrolls in its own box", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trhd \.prov \{[^}]*flex-wrap:\s*nowrap/);
+    expect(traceCss).toMatch(/\.rh-console \.trhd \.prov \.pf \{[^}]*white-space:\s*nowrap/);
+    // The provenance must NOT be a child of `.idw`, which is what overlapped it in the report.
+    expect(traceCss).not.toMatch(/\.rh-console \.trhd \.idw \.prov/);
   });
 
-  it("draws the single-row breakpoint per attempt count, not once for every ticket", () => {
-    // The selector grows ~110px per attempt while every other member is fixed, so one threshold
-    // either denies the row to a ticket that had room or grants it to one that has to crush every
-    // label to a glyph. These four are the measured widths — see the block comment.
-    //
-    // The trailing brace is load-bearing, and 1100 is the number David's decision turns on: the
-    // shed rule below opens `@media (min-width: 1100px) and (max-width: 1199.98px)`, which CONTAINS
-    // the bare prefix — so without the brace this assertion passed with the single-row block back
-    // at 1160, guarding nothing. Only the block that opens on 1100 alone has the brace next to it.
-    expect(traceCss).toContain("@media (min-width: 1100px) {");
-    for (const [width, bucket] of [
-      ["1279.98", '.trhd:not([data-attempts="1"])'],
-      ["1399.98", '.trhd[data-attempts="3"]'],
-      ["1699.98", '.trhd[data-attempts="few"]'],
-    ] as const) {
-      expect(traceCss).toContain(`@media (max-width: ${width}px)`);
-      expect(traceCss).toContain(bucket);
-    }
-    // Six or more gets no threshold at all — no width fits it, so the rule carries no media query.
-    expect(traceCss).toMatch(
-      /\n\.rh-console \.trhd\[data-attempts="many"\] \{[^}]*flex-wrap: wrap/,
-    );
+  it("keeps the branch one line, with a copy control beside it", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trbranch \.mono \{[^}]*white-space:\s*nowrap/);
+    expect(traceCss).toMatch(/\.rh-console \.trcopy \{/);
   });
 
-  it("sheds the one-attempt selector where it would render as a stub, not a label", () => {
-    // Under 1200 the selector is the only member with anywhere left to give (the title is on its
-    // floor), so it absorbs the whole squeeze — measured 21px at 1100, a button with no glyph in
-    // it. A group of ONE selects nothing and its teammate is already the assignee slot beside it,
-    // so the single-attempt ticket drops it rather than showing a stub. It returns at 1200.
-    expect(traceCss).toContain("@media (min-width: 1100px) and (max-width: 1199.98px)");
-    expect(traceCss).toContain(
-      '.rh-console .trhd[data-attempts="1"]:not(:has(.acterr)) .trattempts { display: none; }',
-    );
-    // Only that bucket: every other count has wrapped again by 1280, and a wrapped row has the
-    // room to keep its selector — as does a header wrapped by an inline error, hence the `:not`.
-    expect(traceCss).not.toMatch(/\.trhd\[data-attempts="(2|3|few|many)"\][^{]*\.trattempts \{[^}]*display: none/);
-  });
-
-  it("gates the whole single-row block on the `:has()` it depends on", () => {
-    // The block's inline-error rule is what stops a header carrying a failed Stop from pushing the
-    // page sideways (§3C), and it has no `:has()`-free spelling. An engine that applied the nowrap
-    // row but skipped that one rule would scroll sideways, so such an engine gets none of the
-    // block and keeps today's wrapped header. Every engine this ships to has `:has()`.
-    const at = traceCss.indexOf("@supports selector(:has(*)) {");
-    expect(at, "the single-row block is not gated").toBeGreaterThan(-1);
-    // The gate is around the media query, not inside it — a gate the block's own rules sit beside
-    // would leave the nowrap row applying on an engine that dropped the error rule.
-    expect(traceCss.slice(at)).toMatch(/^@supports selector\(:has\(\*\)\) \{\n {2}@media \(min-width: 1100px\) \{/);
-    // …and the two braces that close it, which is the pair a hand-indented block loses first.
-    const block = traceCss.slice(at, traceCss.indexOf("\n}\n", at) + 3);
-    expect(block).toContain(".rh-console .trhd:has(.acterr) { flex-wrap: wrap;");
-    expect(block.trimEnd().endsWith("}\n}")).toBe(true);
+  it("gives the inspector heading the muted label treatment", () => {
+    const head = traceCss.slice(traceCss.indexOf(".rh-console .trinsp .insphead {"));
+    const block = head.slice(0, head.indexOf("}"));
+    expect(block).toMatch(/text-transform:\s*uppercase/);
+    expect(block).toMatch(/color:\s*var\(--ink-4\)/);
   });
 
   // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
@@ -3525,11 +3640,11 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
   });
 
-  // The header wraps: `flex-wrap: wrap` over an attempt selector, a vitals strip and six actions
-  // is taller than one row on a narrow window, and a spine pinned to a literal offset then slides
-  // underneath it. The offset is a custom property the view measures and publishes.
+  // The header is three rows (STUDIO-1023) whose height changes with the title's wrap and the
+  // controls' own wrap, so a spine pinned to a literal offset would slide underneath it. The offset
+  // is a custom property the view measures and publishes.
   it("sticks the spine below the header's MEASURED height, not a hardcoded one", () => {
-    expect(rule(".rh-console .trhd")).toMatch(/flex-wrap:\s*wrap/);
+    expect(rule(".rh-console .trhd")).toMatch(/flex-direction:\s*column/);
     expect(rule(".rh-console .trspine")).toMatch(/top:\s*var\(--trhd-h,\s*\d+px\)/);
   });
 
