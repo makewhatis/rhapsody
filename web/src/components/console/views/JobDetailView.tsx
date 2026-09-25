@@ -564,7 +564,11 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 
 // --- (A) the sticky header -----------------------------------------------------------------
 
-function TraceHeader({
+// Exported for the browser layout fixture (`web/src/layout-fixture/`) that the Playwright
+// `header-layout` spec drives at real viewport widths: jsdom does no layout, so the width
+// acceptance (STUDIO-1023) can only be proven in a real engine, and that fixture mounts this
+// component directly inside the console's own `.main`/`.trrun` ancestors.
+export function TraceHeader({
   ref,
   run,
   originTicket,
