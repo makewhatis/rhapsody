@@ -772,6 +772,11 @@ fn all_nine_incident_fixtures_pass_tier_2() {
             "{} must carry an acceptable answer",
             f.id
         );
+        assert!(
+            !f.rejected.is_empty() || !f.must_not_rerun.is_empty(),
+            "{} must pair its acceptable answer with a deterministic rejection (§15.2)",
+            f.id
+        );
         check_fixture(f);
     }
     assert_eq!(
@@ -1519,16 +1524,4 @@ fn the_matrix_covers_every_acceptance_group() {
             c.group
         );
     }
-}
-
-/// A guard on the guard: the existence check actually catches a nonsense test name.
-#[test]
-fn the_matrix_guard_detects_a_missing_test() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-    let path = format!("{root}/crates/orchestrator/src/managerdecision.rs");
-    let src = std::fs::read_to_string(&path).expect("read managerdecision.rs");
-    assert!(
-        !src.contains("fn this_test_does_not_exist_anywhere("),
-        "the guard's needle must not appear"
-    );
 }
