@@ -1712,6 +1712,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_A.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         assert!(
@@ -1813,6 +1814,7 @@ mod tests {
             ReviewHeadObservation {
                 open: true,
                 head: HEAD_B.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         let route = o.route_for(Some(0)).expect("a configured project route");

@@ -1279,6 +1279,10 @@ impl Orchestrator {
                         crate::prepare::ReviewHeadObservation {
                             open: snap.status == PrStatus::Open,
                             head: snap.head_sha.clone(),
+                            // STUDIO-972: the patch-id proof travels with the head it was computed
+                            // for, so the reconciliation sweep can ask `Adjudication::governs`
+                            // about the head the branch now carries without a `gh` call of its own.
+                            unchanged_from: obs.unchanged_from.clone(),
                         },
                     );
                 }
@@ -5685,6 +5689,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_A.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         o.handle_review_sweep(&[open_at(12, HEAD_B)]);
@@ -5703,6 +5708,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_B.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);

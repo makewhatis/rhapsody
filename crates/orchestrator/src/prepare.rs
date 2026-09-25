@@ -2145,6 +2145,16 @@ pub struct ReviewHeadObservation {
     /// `Found` naming no head, `Gone`, or `Untrusted`. A merged or closed pull request still carries
     /// its real head; `open` carries the open/closed bit beside it.
     pub head: String,
+    /// The heads this observation's diff was PROVEN patch-identical to (STUDIO-960/STUDIO-977): a
+    /// copy of the off-loop watcher's [`PrObservation::unchanged_from`](crate::prstate::PrObservation::unchanged_from).
+    ///
+    /// The reconciliation sweep needs it (STUDIO-972): it decides whether a settled adjudication
+    /// still governs the head the branch now carries, and a no-op rebase governs only because the
+    /// change against the base is unchanged. The control task cannot recompute the proof without the
+    /// `gh` call the sweep is forbidden (it is local-only), so the memo carries it beside the head
+    /// it was computed for. Empty is "no proof", exactly as on the observation — a failed comparison
+    /// degrades to today's behavior, never to a false claim.
+    pub unchanged_from: Vec<String>,
 }
 
 /// Whether a completion's target is still the one a fresh dispatch would choose, as of `now`.
@@ -4043,6 +4053,7 @@ mod tests {
             ReviewHeadObservation {
                 open: true,
                 head: "def".to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         let target = PreparedTarget::Review {
@@ -4097,6 +4108,7 @@ mod tests {
                 ReviewHeadObservation {
                     open: true,
                     head: "abc".to_string(),
+                    unchanged_from: Vec::new(),
                 },
             );
             let target = PreparedTarget::Review {
@@ -4115,6 +4127,7 @@ mod tests {
                 ReviewHeadObservation {
                     open,
                     head: head.to_string(),
+                    unchanged_from: Vec::new(),
                 },
             );
             let token = o
@@ -4574,6 +4587,7 @@ mod tests {
             ReviewHeadObservation {
                 open: true,
                 head: "abc".to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         let target = PreparedTarget::Review {
