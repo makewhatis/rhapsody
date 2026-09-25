@@ -277,22 +277,27 @@ pub enum Event {
         reply: oneshot::Sender<()>,
     },
     /// Record the operator's "Human step done" note for the next run and clear the in-memory
-    /// suppression (STUDIO-1053; NEW beyond Go v0.4.0). The off-loop action has already removed the
-    /// `rhapsody:human` label and read the ticket's state; only these two writes touch loop-owned
-    /// state (`claimed`, `pending_reopen_summons`), so only they round trip the control channel.
+    /// suppression (STUDIO-1053; NEW beyond Go v0.4.0). The off-loop action seeds this BEFORE it
+    /// removes the `rhapsody:human` label, so a tick racing the tracker round-trip already finds the
+    /// note; only the two writes that touch loop-owned state (`claimed`, `pending_reopen_summons`)
+    /// round trip the control channel. The reply carries any seed it REPLACED, so a later label
+    /// removal that is refused can restore it rather than lose a pending reopening summons.
     SeedResumeNote {
         issue_id: String,
         note: String,
         at: chrono::DateTime<chrono::Utc>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Option<(chrono::DateTime<chrono::Utc>, String)>>,
     },
     /// Undo [`Event::SeedResumeNote`] after a LATER step of the action failed (STUDIO-1053). The
     /// note is seeded BEFORE the label removal, so a dispatch racing the removal still reads it; if
     /// the removal is then refused, this restores the pre-action state so nothing is left committed.
-    /// `claimed` is deliberately NOT restored: the ticket still wears the label, so it cannot
-    /// dispatch, and re-claiming a ticket the operator later un-holds by hand would strand it.
+    /// `prior` is the seed [`Event::SeedResumeNote`] replaced — restored when it was `Some`, so a
+    /// pending reopening summons survives a refused resume. `claimed` is deliberately NOT restored:
+    /// the ticket still wears the label, so it cannot dispatch, and re-claiming a ticket the
+    /// operator later un-holds by hand would strand it.
     ClearResumeNote {
         issue_id: String,
+        prior: Option<(chrono::DateTime<chrono::Utc>, String)>,
         reply: oneshot::Sender<()>,
     },
     /// Admit an operator message for a live run ON the loop (Go `evRunMessage`, INF-250). O6 owns the
@@ -776,11 +781,15 @@ impl Orchestrator {
                 at,
                 reply,
             } => {
-                self.handle_seed_resume_note(&issue_id, &note, at);
-                let _ = reply.send(());
+                let prior = self.handle_seed_resume_note(&issue_id, &note, at);
+                let _ = reply.send(prior);
             }
-            Event::ClearResumeNote { issue_id, reply } => {
-                self.handle_clear_resume_note(&issue_id);
+            Event::ClearResumeNote {
+                issue_id,
+                prior,
+                reply,
+            } => {
+                self.handle_clear_resume_note(&issue_id, prior);
                 let _ = reply.send(());
             }
             Event::RunMessage {

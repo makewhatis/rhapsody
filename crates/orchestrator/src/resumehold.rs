@@ -12,12 +12,14 @@
 //! The job page is where the operator is when the human step finishes, so the job page gets the
 //! action. One confirmed click does three things, in this order:
 //!
-//! 1. **removes** `rhapsody:human` through the tracker (the wrinkle that actually unblocks
-//!    dispatch). Done FIRST so a tracker refusal leaves no side effect behind;
-//! 2. **records the note** where the next run is guaranteed to read it — the same reopen-seed
+//! 1. **records the note** where the next run is guaranteed to read it — the same reopen-seed
 //!    mechanism a reopening summons uses (`pending_reopen_summons` → [`crate::message::Orchestrator::seed_reopen_summons`],
 //!    which wraps it as an OPERATOR MESSAGE, not a teammate one). The room and comments are
-//!    deliberately NOT used: neither is guaranteed to reach the next prompt;
+//!    deliberately NOT used: neither is guaranteed to reach the next prompt. Done FIRST so a tick
+//!    racing the label removal already finds the note waiting;
+//! 2. **removes** `rhapsody:human` through the tracker (the wrinkle that actually unblocks
+//!    dispatch). If the tracker refuses, the seed is undone (restoring any seed it replaced) so a
+//!    refused action leaves no side effect behind;
 //! 3. **requeues** the ticket — clears the in-memory suppression so the next tick can dispatch it,
 //!    keeping its state when it is already active and otherwise moving it to Todo.
 //!
@@ -136,29 +138,47 @@ impl Orchestrator {
     /// becomes live — the same funnel every dispatch path shares — so the note reaches the fresh
     /// run's operator mailbox regardless of how the ticket was requeued (an active-state dispatch or
     /// a review reopen). An existing seed for the issue is REPLACED: the operator's newest statement
-    /// of what they did supersedes an older summons for a ticket they have just resumed.
+    /// of what they did supersedes an older summons for a ticket they have just resumed. The
+    /// replaced entry is RETURNED so a later refused label removal can restore it rather than
+    /// silently losing a pending reopening summons.
     pub(crate) fn handle_seed_resume_note(
         &mut self,
         issue_id: &str,
         note: &str,
         at: DateTime<Utc>,
-    ) {
+    ) -> Option<(DateTime<Utc>, String)> {
         self.claimed.remove(issue_id);
-        self.pending_reopen_summons
+        let prior = self
+            .pending_reopen_summons
             .insert(issue_id.to_string(), (at, note.to_string()));
         tracing::info!(
             issue_id,
             "human-step resume: the operator's note is seeded into the next run and the ticket is \
              requeued"
         );
+        prior
     }
 
     /// Runs ON the control task for `evClearResumeNote`: undoes [`handle_seed_resume_note`] after a
-    /// LATER step of the action failed (STUDIO-1053). `claimed` is deliberately left as the seed set
+    /// LATER step of the action failed (STUDIO-1053). `prior` is the seed the action replaced, or
+    /// `None` when the issue had none; the prior entry is restored when present, so a refused resume
+    /// does not destroy a pending reopening summons. `claimed` is deliberately left as the seed set
     /// it — the ticket still wears the label, so it cannot dispatch, and re-claiming a ticket the
-    /// operator later un-holds by hand would strand it.
-    pub(crate) fn handle_clear_resume_note(&mut self, issue_id: &str) {
-        self.pending_reopen_summons.remove(issue_id);
+    /// operator later un-hands by hand would strand it.
+    pub(crate) fn handle_clear_resume_note(
+        &mut self,
+        issue_id: &str,
+        prior: Option<(DateTime<Utc>, String)>,
+    ) {
+        match prior {
+            Some(entry) => {
+                self.pending_reopen_summons
+                    .insert(issue_id.to_string(), entry);
+            }
+            None => {
+                self.pending_reopen_summons.remove(issue_id);
+            }
+        }
     }
 }
 
@@ -253,16 +273,18 @@ impl ControlHandle {
         //    dispatch candidate, and a tick racing the label removal must find the note waiting for
         //    it. Seeding after the removal would let that run start without it.
         let at = Utc::now();
-        if !self.seed_resume_note(&run.issue_id, note, at).await {
-            return Err(ResumeHoldError::Canceled);
-        }
-        // 2. Remove the label. A refusal here undoes the seed, so nothing is left committed and the
-        //    response reports a failure rather than a partial success.
+        let prior = match self.seed_resume_note(&run.issue_id, note, at).await {
+            Some(prior) => prior,
+            None => return Err(ResumeHoldError::Canceled),
+        };
+        // 2. Remove the label. A refusal here undoes the seed (restoring any seed it replaced), so
+        //    nothing is left committed and the response reports a failure rather than a partial
+        //    success.
         if let Err(e) = tracker
             .remove_issue_label(&run.issue_id, &run.team_id, HUMAN_LABEL)
             .await
         {
-            let _ = self.clear_resume_note(&run.issue_id).await;
+            let _ = self.clear_resume_note(&run.issue_id, prior).await;
             tracing::error!(
                 issue_identifier = %run.issue_identifier,
                 err = %e,
@@ -349,9 +371,16 @@ impl ControlHandle {
             })
     }
 
-    /// Round-trips [`Event::SeedResumeNote`]. Returns false when the loop is gone or the lifetime
-    /// ctx ended before the reply — the caller then reports cancellation rather than a success.
-    async fn seed_resume_note(&self, issue_id: &str, note: &str, at: DateTime<Utc>) -> bool {
+    /// Round-trips [`Event::SeedResumeNote`]. Returns `None` when the loop is gone or the lifetime
+    /// ctx ended before the reply — the caller then reports cancellation rather than a success — and
+    /// otherwise the seed it REPLACED (`None` when the issue had none), which the failure path hands
+    /// back to [`clear_resume_note`](Self::clear_resume_note) so a refused action restores it.
+    async fn seed_resume_note(
+        &self,
+        issue_id: &str,
+        note: &str,
+        at: DateTime<Utc>,
+    ) -> Option<Option<(DateTime<Utc>, String)>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = Event::SeedResumeNote {
             issue_id: issue_id.to_string(),
@@ -360,22 +389,28 @@ impl ControlHandle {
             reply: tx,
         };
         if self.events.send(ev).is_err() {
-            return false;
+            return None;
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
-            r = rx => r.is_ok(),
-            _ = lifetime.cancelled() => false,
+            r = rx => r.ok(),
+            _ = lifetime.cancelled() => None,
         }
     }
 
     /// Round-trips [`Event::ClearResumeNote`], the failure path's undo of
-    /// [`seed_resume_note`](Self::seed_resume_note). Best-effort: a gone loop or an ended lifetime
-    /// leaves the seed in place, which is harmless (the ticket is still held by the label).
-    async fn clear_resume_note(&self, issue_id: &str) -> bool {
+    /// [`seed_resume_note`](Self::seed_resume_note), restoring `prior` when the seed had replaced an
+    /// earlier entry. Best-effort: a gone loop or an ended lifetime leaves the seed in place, which
+    /// is harmless (the ticket is still held by the label).
+    async fn clear_resume_note(
+        &self,
+        issue_id: &str,
+        prior: Option<(DateTime<Utc>, String)>,
+    ) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = Event::ClearResumeNote {
             issue_id: issue_id.to_string(),
+            prior,
             reply: tx,
         };
         if self.events.send(ev).is_err() {
@@ -691,6 +726,38 @@ mod tests {
             !o.pending_reopen_summons.contains_key("iss-1"),
             "a failed label removal must not leave the note recorded"
         );
+    }
+
+    // The failed-label-removal undo restores a seed it REPLACED, so a pending reopening summons is
+    // not silently destroyed by an action the tracker refused (STUDIO-1053 review follow-up).
+    #[test]
+    fn a_refused_resume_restores_a_pending_reopening_seed() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let t0 = Utc::now();
+        o.pending_reopen_summons
+            .insert("iss-1".into(), (t0, "prior summons".into()));
+        let prior = o.handle_seed_resume_note("iss-1", "operator note", Utc::now());
+        assert_eq!(
+            prior,
+            Some((t0, "prior summons".into())),
+            "the seed must hand back what it replaced"
+        );
+        o.handle_clear_resume_note("iss-1", prior);
+        assert_eq!(
+            o.pending_reopen_summons.get("iss-1"),
+            Some(&(t0, "prior summons".into())),
+            "the refused resume must restore the prior seed"
+        );
+    }
+
+    // With no prior seed the undo removes the note entirely — a refused action leaves nothing.
+    #[test]
+    fn the_undo_removes_the_note_when_there_was_no_prior() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let prior = o.handle_seed_resume_note("iss-1", "operator note", Utc::now());
+        assert!(prior.is_none());
+        o.handle_clear_resume_note("iss-1", prior);
+        assert!(!o.pending_reopen_summons.contains_key("iss-1"));
     }
 
     // The read behind the console's action: it reports the held ticket and the crossed limit.

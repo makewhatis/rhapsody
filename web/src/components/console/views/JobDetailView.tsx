@@ -125,6 +125,7 @@ import type {
   BreakerHold,
   LogEntry,
   MergeReceipt,
+  ResumeHoldResult,
   RunProvenance,
   RunSummary,
   TeamsFact,
@@ -948,6 +949,12 @@ function HeaderActions({
   // operator's way out of the hold, so the button only exists when the daemon says the ticket is
   // held. A review run's key is not a ticket, so it asks nothing.
   const hold = useRunHold(run.id, !reviewRun);
+  // The resume-hold mutation is owned HERE, not inside the action button (STUDIO-1053 review). Its
+  // settle invalidates ["run-hold"], and the label is gone by then, so the hold read flips to
+  // `held:false` and the button unmounts — a result owned by that button would vanish with it and
+  // report nothing, which is exactly the silent success the ticket forbids. The outcome therefore
+  // renders outside the held-only guard, from this mutation's data.
+  const holdResume = useResumeHold(run.id);
   const teamsEnabled = useTeamsEnabled();
   // What the daemon would say if Merge were clicked right now (STUDIO-790). Asked only where a
   // merge path exists at all, because with Teams off the daemon serves `teams_disabled` and the
@@ -1015,8 +1022,11 @@ function HeaderActions({
           its own (STUDIO-1053). A room post cannot unblock a `rhapsody:human` ticket, so this
           header carries the action that can. */}
       {hold.data?.held ? (
-        <HumanResumeAction runID={run.id} breaker={hold.data.breaker} />
+        <HumanResumeAction resume={holdResume} breaker={hold.data.breaker} />
       ) : null}
+      {/* The outcome of the last resume click, OUTSIDE the held-only guard above (STUDIO-1053
+          review): the click clears the hold, so this must outlive the button that started it. */}
+      {holdResume.data === undefined ? null : <ResumeHoldOutcome result={holdResume.data} />}
       {/* Real while the run is live — `POST /api/v1/runs/{id}/message` is an endpoint the daemon
           already serves. On a finished run it is dependency-named for a different reason than the
           rest of this cluster: there is no missing endpoint, there is no agent left to read it.
@@ -1283,14 +1293,19 @@ function MergeConfirm({
  * the operator's note for the next run, removes the hold, and requeues the ticket.
  *
  * The confirmation names the crossed limit when the breaker applied the hold, and the result line
- * reports exactly what happened — including the honest partial outcome where the note landed and the
- * hold came off but the ticket could not be moved back to Todo.
+ * (rendered by `ResumeHoldOutcome`, above the held-only button) reports exactly what happened —
+ * including the honest partial outcome where the note landed and the hold came off but the ticket
+ * could not be moved back to Todo.
  */
-function HumanResumeAction({ runID, breaker }: { runID: number; breaker?: BreakerHold }) {
-  const resume = useResumeHold(runID);
+function HumanResumeAction({
+  resume,
+  breaker,
+}: {
+  resume: HoldResume;
+  breaker?: BreakerHold;
+}) {
   const [open, setOpen] = useState(false);
   const [note, setNote] = useState("");
-  const result = resume.data;
   const confirm = () => {
     const body = note.trim();
     if (body === "" || resume.isPending) return;
@@ -1313,23 +1328,6 @@ function HumanResumeAction({ runID, breaker }: { runID: number; breaker?: Breake
       >
         Human step done → resume
       </Button>
-      {result === undefined ? null : result.queued ? (
-        <span className="actok" role="status">
-          Note recorded, hold removed
-          {result.moved_to === undefined || result.moved_to === ""
-            ? ""
-            : ` and moved to ${result.moved_to}`}{" "}
-          — the ticket is queued.
-        </span>
-      ) : (
-        <span className="acterr" role="status">
-          Note recorded and hold removed, but the ticket could not be requeued:{" "}
-          {result.move_error === undefined || result.move_error === ""
-            ? "the state move failed"
-            : result.move_error}
-          .
-        </span>
-      )}
       {open ? (
         <ResumeHoldConfirm
           breaker={breaker}
@@ -1342,6 +1340,36 @@ function HumanResumeAction({ runID, breaker }: { runID: number; breaker?: Breake
         />
       ) : null}
     </>
+  );
+}
+
+/** The mutation the "Human step done → resume" action drives, as `HeaderActions` owns it. */
+type HoldResume = ReturnType<typeof useResumeHold>;
+
+/**
+ * The outcome of a resume click, rendered in the header OUTSIDE the held-only action (STUDIO-1053
+ * review). The click clears the hold, so a result line owned by the button would unmount with the
+ * button the moment the hold read refetches `held:false` — leaving the operator with no report of
+ * what happened, in both the queued and the partial-failure case. This pins the outcome for as long
+ * as the mutation's data lives.
+ */
+function ResumeHoldOutcome({ result }: { result: ResumeHoldResult }) {
+  return result.queued ? (
+    <span className="actok" role="status">
+      Note recorded, hold removed
+      {result.moved_to === undefined || result.moved_to === ""
+        ? ""
+        : ` and moved to ${result.moved_to}`}{" "}
+      — the ticket is queued.
+    </span>
+  ) : (
+    <span className="acterr" role="status">
+      Note recorded and hold removed, but the ticket could not be requeued:{" "}
+      {result.move_error === undefined || result.move_error === ""
+        ? "the state move failed"
+        : result.move_error}
+      .
+    </span>
   );
 }
 

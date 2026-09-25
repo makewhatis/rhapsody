@@ -74,6 +74,8 @@ export function useResumeHold(runID: number) {
 }
 
 // useSendRunMessage queues an operator message for a live run's agent (INF-250), then invalidates
+// this run's message list (["run-messages", runId], matching useRunMessages) so the new row shows
+// immediately as "sent" without waiting for the next poll tick.
 export function useSendRunMessage(runID: number) {
   const qc = useQueryClient();
   return useMutation<{ id: number; identifier: string; status: string }, Error, string>({

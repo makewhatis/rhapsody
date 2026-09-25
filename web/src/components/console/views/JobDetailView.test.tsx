@@ -1746,6 +1746,71 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await settleTrace();
     expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull();
   });
+
+  // STUDIO-1053 review: the resume click removes the label, so the very next hold read answers
+  // `held:false` and unmounts the action button. The outcome must NOT unmount with it — that would
+  // be a silent success, the one thing the ticket forbids.
+  it("keeps the queued outcome after the hold read flips to not-held", async () => {
+    let resumed = false;
+    h.fetchRunHold.mockImplementation(async () => ({
+      identifier: "STUDIO-654",
+      held: !resumed,
+    }));
+    h.resumeHold.mockImplementation(async () => {
+      resumed = true;
+      return {
+        identifier: "STUDIO-654",
+        note_recorded: true,
+        label_removed: true,
+        queued: true,
+        moved_to: "Todo",
+      };
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "added the secrets" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull(),
+    );
+    expect(document.querySelector(".trhd .actok")?.textContent).toContain("the ticket is queued");
+  });
+
+  // The partial failure is the case the review called out: after the refetch clears the hold, the
+  // operator must still see that the ticket was NOT requeued.
+  it("keeps a partial-failure outcome after the hold read flips to not-held", async () => {
+    let resumed = false;
+    h.fetchRunHold.mockImplementation(async () => ({
+      identifier: "STUDIO-654",
+      held: !resumed,
+    }));
+    h.resumeHold.mockImplementation(async () => {
+      resumed = true;
+      return {
+        identifier: "STUDIO-654",
+        note_recorded: true,
+        label_removed: true,
+        queued: false,
+        move_error: "no unstarted state for team",
+      };
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "done" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull(),
+    );
+    const outcome = document.querySelector(".trhd .acterr")?.textContent ?? "";
+    expect(outcome).toContain("could not be requeued");
+    expect(outcome).toContain("no unstarted state for team");
+  });
 });
 
 describe("zone B — the Result card (§3B)", () => {
