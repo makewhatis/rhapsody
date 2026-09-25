@@ -108,9 +108,13 @@ Example:
 /// The manager's full instruction set — the base task prompt, the tool contract and the decision
 /// contract — built by the ONE builder the live launch and the M12 harness share (STUDIO-1054).
 ///
-/// The live run gets its profile prose through the ordinary Teams routing (the `rhapsody:@manager`
-/// label), so this is the host's own BASE instruction; the case packet is appended on top by
-/// [`manager_live_prompt`].
+/// This is the host's own BASE instruction and the output contract; the harness additionally
+/// prepends the shipped `manager` profile prose (`manager_profile_prompt`), and the case packet is
+/// appended on top by [`manager_live_prompt`]. NOTE: a live run is dispatched under the reserved
+/// `rhapsody:@manager` label, which the Teams router resolves to the configured
+/// `manager.default_identity` teammate rather than to the `manager` profile — so today the live run
+/// does NOT receive that profile prose, only this builder's contract. Closing that divergence is a
+/// separate follow-up; do not assume `manager.v1.md` reaches a live run.
 pub fn manager_instructions() -> String {
     format!("{MANAGER_BASE_PROMPT}\n\n{MANAGER_TOOL_CONTRACT}\n\n{MANAGER_DECISION_CONTRACT}")
 }
