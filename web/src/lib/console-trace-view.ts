@@ -907,7 +907,11 @@ export function reviewRounds(
       state: reviewState(run),
     });
   }
-  return rounds.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  // The `reviewers` set is scratch for building the rounds, never part of the model: drop it before
+  // the value leaves this function so a caller cannot start depending on it.
+  return rounds
+    .map(({ key, startedAt, chips }) => ({ key, startedAt, chips }))
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
 
 /**

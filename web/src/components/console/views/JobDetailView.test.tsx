@@ -1104,6 +1104,11 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await waitFor(() =>
       expect(within(acts).queryByRole("button", { name: /^merge$/i })).toBeNull(),
     );
+    // ...and not even a DISABLED, dependency-named Merge: on a `pr:` run there is no merge path at
+    // all, so the word never appears. MUTATION GUARD: the role query above cannot see a DepButton
+    // (its accessible name is "Merge dep"), so dropping only the `reviewRun ? null :` render guard
+    // left a permanent "Asking the daemon…" placeholder and every test green (STUDIO-1023 round 2).
+    expect(acts.textContent ?? "").not.toMatch(/merge/i);
     // View PR is the number in the key, not a branch search that cannot find the review worktree.
     expect(action(/view pr/i).getAttribute("href")).toBe(
       "https://github.com/makewhatis/rhapsody/pull/223",

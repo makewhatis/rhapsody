@@ -53,7 +53,11 @@
 .rh-console .trhd .back { color: var(--ink-3); background: none; border: 0; font: inherit; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; flex: none; }
 .rh-console .trhd .back:hover { color: var(--ink); }
 .rh-console .trhd .idw { min-width: 0; flex: 1 1 auto; }
-.rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+/* The run key (`STUDIO-988`, or a review run's `pr:owner/repo#N@reviewer`). A `pr:` key has no
+   whitespace, so at a narrow width it cannot wrap on its own and runs out of `.idw` — under the
+   assignee avatar (STUDIO-1023 round 2). `overflow-wrap: anywhere` gives it a break point, so the
+   key wraps inside its own column and never overlaps what is to its right. */
+.rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
 /* The full title, wrapped to at most TWO lines with balanced breaks and NEVER ellipsized at
    desktop width (STUDIO-1023). `-webkit-line-clamp` is the one cross-engine way to cap lines;
    engines without it simply wrap further, which is a height cost rather than a truncation. */
@@ -63,6 +67,11 @@
   font-size: 14px;
   line-height: 1.3;
   text-wrap: balance;
+  /* A title can carry an unbreakable token (`owner/repo#N`); `break-word` lets it break
+     only when the line cannot hold it, so it never overflows and gets end-ellipsized at a narrow
+     width (STUDIO-1023 round 2). `anywhere` would do the same but also shrink the column's
+     min-content, which is the flex item's shrink floor; `break-word` leaves that alone. */
+  overflow-wrap: break-word;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -128,9 +137,11 @@
 /* ---- the review strip (STUDIO-976, regrouped by round STUDIO-1023) ----
    The ticket's review runs, in the controls row beside the attempt selector. A review is a real run
    with its own trace, so an entry opens it exactly as an attempt does, but it is styled as its own
-   kind: dashed, mono, and never numbered. The strip shows ONE chip per reviewer per pull request,
-   the newest round expanded and older rounds behind a "+N earlier rounds" toggle (the view builds
-   the rounds; the stylesheet only draws them). */
+    kind: dashed, mono, and never numbered. The strip shows every review, grouped into ROUNDS — one
+   round is a pull request (or a repeated reviewer, which marks a new head); the newest round is
+   expanded and the older rounds collapse behind a "+N earlier rounds" toggle (the view builds the
+   rounds; the stylesheet only draws them). Nothing is dropped: a review left out of the newest
+   round is still reachable behind the toggle (STUDIO-1023). */
 .rh-console .trreviews { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 /* The toggle that reveals the collapsed older rounds. Plain text rather than a chip, so it reads as
    a control rather than another review. */

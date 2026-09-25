@@ -4,6 +4,11 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 // structure; this is the one place a real engine measures it. Three fixtures — a one-attempt
 // ticket, the 11-attempt/25-review STUDIO-988 shape, and a review run — at 400, 1440, 1728 and
 // 1920px. Run with `npm run test:layout` (needs `npx playwright install chromium`).
+//
+// Every "not cut" assertion here measures what is DRAWN, not `textContent`: a CSS
+// `text-overflow: ellipsis` never changes `textContent`, which is how `Review makew…` and
+// `attempt 5 · jim…` shipped green (STUDIO-1023 round 2). `hClipped` walks the element and its
+// descendants and reports any box whose painted content is wider than its own client box.
 
 const WIDTHS = [400, 1440, 1728, 1920];
 const FIXTURES = ["one", "many", "review"] as const;
@@ -36,6 +41,40 @@ async function requireBox(loc: Locator) {
   return box as NonNullable<typeof box>;
 }
 
+/**
+ * The rect the element's TEXT actually paints into. A `Range` over the contents reports the drawn
+ * extent, which is what must not reach under the assignee — an element BOX reports its own
+ * (clipped) bounds and hid the overlapping key.
+ */
+async function textRect(loc: Locator) {
+  return loc.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const r = range.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  });
+}
+
+/**
+ * Every element at or under `loc` whose painted content is wider than its client box — a CSS
+ * ellipsis, a `nowrap` overflow, the reported `clim…` cut. Returns a description per offender.
+ */
+async function hClipped(loc: Locator): Promise<string[]> {
+  return loc.evaluate((root) => {
+    const bad: string[] = [];
+    const walk = (el: HTMLElement) => {
+      if (el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1) {
+        bad.push(`${el.className || el.tagName} ${el.scrollWidth}>${el.clientWidth}`);
+      }
+      for (const child of Array.from(el.children)) {
+        if (child instanceof HTMLElement) walk(child);
+      }
+    };
+    walk(root as HTMLElement);
+    return bad;
+  });
+}
+
 for (const fixture of FIXTURES) {
   for (const width of WIDTHS) {
     test(`${fixture} header lays out cleanly at ${width}px`, async ({ page }) => {
@@ -61,20 +100,38 @@ for (const fixture of FIXTURES) {
       expect(overlaps(idw, pill), "outcome pill overlaps the title").toBe(false);
       expect(idw.x + idw.width).toBeLessThanOrEqual(who.x + 1);
 
-      // The title is shown in full, never end-ellipsized.
+      // The run key (`pr:owner/repo#N@reviewer` has no break point of its own) is drawn inside the
+      // identity column, never over the assignee — measured against the TEXT, not the box.
+      const keyEl = header.locator(".idw .k");
+      const keyText = await textRect(keyEl);
+      expect(overlaps(keyText, who), "run key drawn under the assignee").toBe(false);
+      expect(keyText.x + keyText.width, "run key overflows its column").toBeLessThanOrEqual(
+        idw.x + idw.width + 1,
+      );
+      expect(await hClipped(keyEl), "run key cut sideways").toEqual([]);
+
+      // The title is shown in full, never end-ellipsized, and never drawn under the assignee.
       const h1 = header.locator(".idw h1");
+      const titleText = await textRect(h1);
+      expect(overlaps(titleText, who), "title drawn under the assignee").toBe(false);
       const title = await h1.textContent();
       expect(title ?? "").not.toContain("…");
       expect(title?.trim().length ?? 0).toBeGreaterThan(0);
-      // At desktop width it fits within the two balanced lines.
+      // No horizontal cut at ANY width — a CSS ellipsis shows here as `scrollWidth > clientWidth`.
+      expect(await hClipped(h1), "title cut sideways").toEqual([]);
+      // At desktop width it fits within the two balanced lines (the line-clamp is vertical; at
+      // 400px a long title is allowed to clamp to two lines, which the ticket's "at most two lines"
+      // permits — the horizontal cut above is what is forbidden everywhere).
       if (width >= 1440) {
-        const { clientHeight, lineHeight } = await h1.evaluate((el) => ({
+        const { clientHeight, scrollHeight, lineHeight } = await h1.evaluate((el) => ({
           clientHeight: el.clientHeight,
+          scrollHeight: el.scrollHeight,
           lineHeight: parseFloat(getComputedStyle(el).lineHeight) || 18,
         }));
         expect(clientHeight, "title clipped at desktop width").toBeLessThanOrEqual(
           lineHeight * 2 + 2,
         );
+        expect(scrollHeight, "title clamped at desktop width").toBeLessThanOrEqual(clientHeight + 1);
       }
 
       // --- Row 2: provenance ---------------------------------------------------------------
@@ -106,9 +163,13 @@ for (const fixture of FIXTURES) {
       ).toBeLessThanOrEqual(await header.locator(".trctl").evaluate((el) => el.clientWidth) + 1);
 
       // Attempts: one full label, or a compact dropdown that still names the teammate in full —
-      // never a `jim…` fragment.
+      // never a `jim…` fragment. The segment labels are measured as DRAWN.
       const attemptLabels = await header.locator(".trattempts button, .trattempts option").allTextContents();
       for (const label of attemptLabels) expect(label).not.toContain("…");
+      const segments = header.locator(".trattempts button");
+      for (let i = 0; i < (await segments.count()); i += 1) {
+        expect(await hClipped(segments.nth(i)), `attempt label ${i} cut`).toEqual([]);
+      }
       if (fixture === "many") {
         const select = header.locator("select.trattempts");
         await expect(select).toHaveCount(1);
@@ -116,11 +177,13 @@ for (const fixture of FIXTURES) {
           (el: HTMLSelectElement) => el.options[el.selectedIndex]?.textContent ?? "",
         );
         expect(selected).toBe("attempt 11 of 11 · alice");
+        expect(await hClipped(select), "attempt dropdown cut").toEqual([]);
       } else {
         expect(await header.locator("select.trattempts").count()).toBe(0);
       }
 
-      // The branch is full or middle-ellipsized, and the FULL value is always in the tooltip.
+      // The branch is full or middle-ellipsized, and the FULL value is always in the tooltip. The
+      // drawn label must fit its own box — a CSS end-ellipsis would show as `scrollWidth` overrun.
       const mono = header.locator(".trbranch .mono");
       await expect(mono).toHaveAttribute("title", state.branch);
       const shown = (await mono.textContent()) ?? "";
@@ -134,6 +197,7 @@ for (const fixture of FIXTURES) {
       } else {
         expect(shown).toBe(state.branch);
       }
+      expect(await hClipped(mono), "branch cut sideways").toEqual([]);
 
       // Actions stay right-aligned within the controls row.
       const acts = await requireBox(header.locator(".acts"));
@@ -141,8 +205,11 @@ for (const fixture of FIXTURES) {
 
       // --- Review-run correctness, at every width -----------------------------------------
       if (fixture === "review") {
-        // No Merge at all on a `pr:` run — not disabled, absent.
-        await expect(header.locator(".acts").getByRole("button", { name: /^merge$/i })).toHaveCount(0);
+        // No Merge on a `pr:` run — not disabled, absent. `getByRole("button", { name: /^merge$/i })`
+        // misses a dependency-named Merge (whose name is "Merge dep"), so the WORD is asserted to be
+        // absent from the cluster: MUTATION GUARD, drop the render guard and a disabled "Asking the
+        // daemon…" Merge appears here.
+        expect(await header.locator(".acts").textContent()).not.toMatch(/merge/i);
         await expect(header.locator(".acts").getByRole("link", { name: /open origin ticket/i })).toHaveAttribute(
           "href",
           /\/issue\/STUDIO-988$/,

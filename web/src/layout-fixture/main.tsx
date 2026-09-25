@@ -134,6 +134,8 @@ function reviewRun(): Fixture {
   const review = run({
     id: 801,
     issue_identifier: "pr:makewhatis/rhapsody#223@jimmy",
+    // The report's real title, not the default — the long one that broke at 400px.
+    title: "Review makewhatis/rhapsody#223 — is the header legible?",
     branch: "symphony/pr_makewhatis_rhapsody_223_jimmy",
     started_at: "2026-09-01T18:00:00Z",
     ended_at: "",
