@@ -35,9 +35,100 @@ pub const MANAGER_KEY_SUFFIX: &str = "@manager";
 /// packet; M7b lands the launch, and this prompt is the host's own instruction to the manager
 /// identity (whose profile, policy and bank the dispatch other-wise attaches via the
 /// `rhapsody:@manager` label). It contains no `{{ … }}` so the prompt renderer cannot fail on it.
+///
+/// It no longer tells the manager to end with a `HANDOFF:` line (STUDIO-1054): that instruction is
+/// exactly what the three flux#87 shadow runs obeyed, producing prose and a `HANDOFF:` marker and
+/// no decision block. The block named by [`MANAGER_DECISION_CONTRACT`] is the answer, and
+/// [`manager_instructions`] is the ONE builder that states it.
 pub const MANAGER_BASE_PROMPT: &str = "You are the manager for this pull request's review loop. \
-Review the evidence the host serves you through your MCP tools, then end your final message with \
-a `HANDOFF:` line describing the decision you reached.";
+Review the evidence the host serves you through your MCP tools, then answer with the decision \
+block described below — the `rhapsody-manager-decision` block, not a `HANDOFF:` line, is your \
+answer.";
+
+/// The manager's TOOL contract, as the live run must be told it (STUDIO-1054; design record
+/// `manager-agent-design.md` §4.4, §4.8). The manager run's MCP role registers reads and exactly one
+/// write — `teams_retain`, its own bank, observations only. Everything else it might reach for
+/// (`teams_post`, `teams_invalidate`, `symphony_send_message`, `symphony_handoff`, …) is NOT
+/// registered, so a call is refused. Stating that here is what stops a run spending its turn trying
+/// to post a proposal the host never enabled.
+pub const MANAGER_TOOL_CONTRACT: &str = "## Your tools
+
+The host registers your reads and exactly ONE write: `teams_retain`, which records an observation \
+in your own bank. You have no `teams_post`, no `teams_invalidate`, no `symphony_send_message`, no \
+`symphony_handoff` and no other write tool — a call to one of those is refused, so do not try. \
+Your decision is the only thing you write that has an effect; the daemon performs every action. Do \
+not attempt to post a proposal, mark a finding, move a ticket or approve a pull request yourself.";
+
+/// The manager's OUTPUT CONTRACT: the exact fenced block the strict parser
+/// ([`crate::managerdecision`]) accepts, the one-JSON-object rule, the four decision verbs and
+/// their payloads, and the dismissal/finding-revision rule (STUDIO-1054; design record
+/// `manager-agent-design.md` §6.1, §6.3).
+///
+/// This is the production copy. It used to live only in the M12 replay harness
+/// (`managerfixtures.rs`), which is why the release gate passed on a prompt every live run was
+/// never sent. [`manager_instructions`] is now the single builder; the harness composes its prompt
+/// from it rather than carrying a private duplicate.
+pub const MANAGER_DECISION_CONTRACT: &str = r#"## The decision block (required output)
+
+End your final message with exactly one fenced block whose info string is
+`rhapsody-manager-decision`; its body is one JSON object. The block is how you answer — a prose
+`HANDOFF:` line is NOT a decision and the daemon reads nothing from it. The parser is STRICT: no
+unknown keys, no duplicate keys, and a field that does not apply to your variant must be ABSENT
+(JSON `null` counts as present and is invalid).
+
+Common fields, on every variant:
+- `decision`: one of `RERUN_REVIEW`, `ROUTE_TO_AUTHOR`, `APPROVE`, `ESCALATE`.
+- `head`: the current head, exactly as the data below gives it.
+- `evidence_rev`: the data below's `evidence_rev`.
+- `rationale`: required, at most 4000 characters.
+
+Variant payloads:
+- `RERUN_REVIEW`: `rerun` is optional: {"reviewers": ["..."], "note": "..."}. Invalid when there is
+  no eligible row (every live reviewer row already approved at the current patch).
+- `ROUTE_TO_AUTHOR`: `route` required: {"fix": [{"finding": "alice:F1", "revision": 1}],
+  "instructions": "..."}. Every `fix` entry must name an open, blocking finding revision listed
+  below.
+- `APPROVE`: no payload beyond an optional `dismiss`:
+  [{"finding": "alice:F1", "revision": 1, "rationale": "..."}]. Eligible only when the round
+  threshold is reached, the reviewer quorum is met, every live row read the current patch-id, diff
+  coverage holds, and every open blocking finding is resolved or dismissed in this same decision.
+- `ESCALATE`: `escalate` required: {"question": "...", "checked": "..."}.
+
+A `dismiss` is bound to the exact finding REVISION it names; a later revision of the same finding
+is re-evaluated and can reopen it. A field that does not apply to the variant must be absent, never
+`null`.
+
+Example:
+
+```json
+{"decision":"RERUN_REVIEW","head":"<head>","evidence_rev":<rev>,"rerun":{"note":"what changed"},"rationale":"the evidence"}
+```
+"#;
+
+/// The manager's full instruction set — the base task prompt, the tool contract and the decision
+/// contract — built by the ONE builder the live launch and the M12 harness share (STUDIO-1054).
+///
+/// The live run gets its profile prose through the ordinary Teams routing (the `rhapsody:@manager`
+/// label), so this is the host's own BASE instruction; the case packet is appended on top by
+/// [`manager_live_prompt`].
+pub fn manager_instructions() -> String {
+    format!("{MANAGER_BASE_PROMPT}\n\n{MANAGER_TOOL_CONTRACT}\n\n{MANAGER_DECISION_CONTRACT}")
+}
+
+/// The prompt a LIVE manager run sends: [`manager_instructions`] plus the case packet (§7.2, §8),
+/// which is the host's own record of the stall rendered as DATA. An empty packet (an older path)
+/// sends the instructions alone.
+///
+/// [`worker::run_manager_attempt`](crate::worker) is the production caller; the M12 harness
+/// (`crate::managerfixtures`) composes its replay prompt from [`manager_instructions`] too, so a
+/// live run and the release gate can never again be told different contracts.
+pub fn manager_live_prompt(case_packet: &str) -> String {
+    if case_packet.is_empty() {
+        manager_instructions()
+    } else {
+        format!("{}\n\n{case_packet}", manager_instructions())
+    }
+}
 
 /// Pending manager runs staged by [`Orchestrator::dispatch_manager`] and consumed by the dispatch
 /// funnel, keyed by the run's key.
@@ -53,7 +144,8 @@ pub struct ManagerCheckout {
     /// `manager.run_timeout_ms` (§10.1), the run's wall-clock ceiling.
     pub run_timeout_ms: i64,
     /// The case packet (§7.2, §8) the host assembles at launch and hands the run as DATA. Empty
-    /// means no packet (an older code path); the worker then sends only [`MANAGER_BASE_PROMPT`].
+    /// means no packet (an older code path); the worker then sends only the shared
+    /// [`manager_instructions`].
     pub case_packet: String,
 }
 
@@ -578,5 +670,55 @@ mod tests {
             "a manager run schedules no retry"
         );
         assert!(!o.claimed.contains(key), "the claim is released");
+    }
+
+    /// **STUDIO-1054 acceptance, item 2.** The PRODUCTION prompt — the one
+    /// [`crate::worker::run_manager_attempt`] sends — carries the exact decision contract. This is
+    /// the test the release gate lacked: it targets [`manager_live_prompt`], not the harness.
+    /// Removing the contract from the shared builder reds it, even though the harness composes from
+    /// the same builder (which is the point: they can no longer disagree).
+    #[test]
+    fn the_live_manager_prompt_carries_the_decision_contract() {
+        let prompt = manager_live_prompt("CASE PACKET DATA");
+        assert!(
+            prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG),
+            "the live prompt must name the block tag: {prompt}"
+        );
+        for verb in ["RERUN_REVIEW", "ROUTE_TO_AUTHOR", "APPROVE", "ESCALATE"] {
+            assert!(
+                prompt.contains(verb),
+                "the live prompt must name {verb}: {prompt}"
+            );
+        }
+        for field in ["evidence_rev", "rationale", "dismiss", "route", "escalate"] {
+            assert!(
+                prompt.contains(field),
+                "the live prompt must state the {field} field: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("teams_retain"),
+            "the live prompt must tell the run its only write is teams_retain: {prompt}"
+        );
+        assert!(
+            prompt.contains("no `teams_post`"),
+            "the live prompt must say teams_post is not registered: {prompt}"
+        );
+        assert!(
+            prompt.contains("CASE PACKET DATA"),
+            "the case packet must still accompany the contract: {prompt}"
+        );
+        // The empty-packet path is the instructions alone (the M7 shape).
+        assert_eq!(manager_live_prompt(""), manager_instructions());
+    }
+
+    /// The contract names the tag the strict parser actually looks for. Mutation: rename
+    /// `MANAGER_DECISION_TAG` and this reds, so the two can never drift.
+    #[test]
+    fn the_contract_names_the_parser_tag() {
+        assert!(
+            manager_instructions().contains(crate::managerdecision::MANAGER_DECISION_TAG),
+            "the shared builder must name the parser's tag"
+        );
     }
 }

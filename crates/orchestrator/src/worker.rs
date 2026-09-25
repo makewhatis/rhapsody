@@ -555,16 +555,10 @@ async fn run_manager_attempt(
 
     // §8: the case packet is the host's own record of the stall, rendered as DATA, and it
     // accompanies the base prompt rather than replacing it. An empty packet (an older path) sends
-    // the base prompt alone, byte-identical to M7.
-    let prompt = if mgr.case_packet.is_empty() {
-        crate::managerrun::MANAGER_BASE_PROMPT.to_string()
-    } else {
-        format!(
-            "{}\n\n{}",
-            crate::managerrun::MANAGER_BASE_PROMPT,
-            mgr.case_packet
-        )
-    };
+    // the base instructions alone. STUDIO-1054: the base prompt and the decision contract come from
+    // the ONE builder the M12 harness also uses, so the live run is told the block it must emit
+    // instead of a `HANDOFF:` line.
+    let prompt = crate::managerrun::manager_live_prompt(&mgr.case_packet);
     let (final_state, result_text, loop_err) = deps
         .run_turns(
             session.as_ref(),
