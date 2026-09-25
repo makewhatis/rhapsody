@@ -13,8 +13,10 @@ import {
   failingStep,
   filterPhases,
   githubRepo,
+  isOverrideOrigin,
   leadParagraph,
   liveRunRow,
+  middleEllipsis,
   playheadPhase,
   phaseGlyph,
   prSearchUrl,
@@ -24,6 +26,9 @@ import {
   resultBanner,
   resultEyebrow,
   reviewOptions,
+  reviewPr,
+  reviewPrUrl,
+  reviewRounds,
   reviewState,
   runBranch,
   runTeammate,
@@ -653,9 +658,9 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
   it("keeps the daemon's run id and start time on every option, whatever the label says", () => {
     const identities = new Map([[547, "alice"]]);
     expect(attemptOptions(newestFirst, identities, "")).toEqual([
-      { id: 547, ordinal: 3, label: "attempt 3 · alice", named: true, startedAt: "2026-09-03T10:00:00Z" },
-      { id: 545, ordinal: 2, label: "run 545", named: false, startedAt: "2026-09-03T09:00:00Z" },
-      { id: 522, ordinal: 1, label: "run 522", named: false, startedAt: "2026-09-03T08:00:00Z" },
+      { id: 547, ordinal: 3, label: "attempt 3 · alice", dropdownLabel: "attempt 3 of 3 · alice", named: true, startedAt: "2026-09-03T10:00:00Z" },
+      { id: 545, ordinal: 2, label: "run 545", dropdownLabel: "run 545", named: false, startedAt: "2026-09-03T09:00:00Z" },
+      { id: 522, ordinal: 1, label: "run 522", dropdownLabel: "run 522", named: false, startedAt: "2026-09-03T08:00:00Z" },
     ]);
   });
 
@@ -785,6 +790,105 @@ describe("reviewOptions — the run detail's review strip (STUDIO-976)", () => {
   });
 });
 
+// STUDIO-1023 — the review strip grouped into rounds, and the direct PR link a review key names.
+describe("reviewRounds / reviewPrUrl — the review strip grouped by round (STUDIO-1023)", () => {
+  const NONE = new Map<number, string>();
+
+  it("keeps consecutive reviews of one pull request together, one chip per reviewer", () => {
+    const rounds = reviewRounds(
+      [
+        run({ id: 803, issue_identifier: "pr:acme/app#7@sol", started_at: "2026-09-03T12:00:00Z" }),
+        run({ id: 801, issue_identifier: "pr:acme/app#7@alice", started_at: "2026-09-03T11:30:00Z" }),
+        run({ id: 802, issue_identifier: "pr:acme/app#7@sol", started_at: "2026-09-03T11:00:00Z" }),
+      ],
+      NONE,
+      "",
+    );
+    // sol's 11:00 re-review says the head that the 12:00 round judged had been superseded, so it
+    // opens its OWN round. Nothing is dropped: all three runs survive across the two rounds.
+    expect(rounds).toHaveLength(2);
+    expect(rounds[0].chips.map((c) => [c.label, c.id])).toEqual([
+      ["review · sol", 803],
+      ["review · alice", 801],
+    ]);
+    expect(rounds[1].chips.map((c) => [c.label, c.id])).toEqual([["review · sol", 802]]);
+  });
+
+  it("keeps every review of one pull request reachable, never collapsing same-reviewer rounds away", () => {
+    // The shape the ticket measured: one PR, several heads, sol and alice alternating.
+    const reviews = Array.from({ length: 10 }, (_, i) =>
+      run({
+        id: 900 - i,
+        issue_identifier: `pr:acme/app#223@${i % 2 === 0 ? "sol" : "alice"}`,
+        started_at: `2026-09-03T${String(12 - i).padStart(2, "0")}:00:00Z`,
+      }),
+    );
+    const rounds = reviewRounds(reviews, NONE, "");
+    // Five heads × two reviewers, newest-first. The oldest runs are rounds, not lost runs.
+    expect(rounds).toHaveLength(5);
+    expect(rounds.map((r) => r.chips.length)).toEqual([2, 2, 2, 2, 2]);
+    const seen = rounds.flatMap((r) => r.chips.map((c) => c.id)).sort((a, b) => a - b);
+    expect(seen).toEqual([891, 892, 893, 894, 895, 896, 897, 898, 899, 900]);
+  });
+
+  it("orders rounds newest-first and keeps older pr numbers as their own rounds", () => {
+    const rounds = reviewRounds(
+      [
+        run({ id: 701, issue_identifier: "pr:acme/app#6@alice", started_at: "2026-09-03T09:00:00Z" }),
+        run({ id: 801, issue_identifier: "pr:acme/app#7@alice", started_at: "2026-09-03T12:00:00Z" }),
+      ],
+      NONE,
+      "",
+    );
+    expect(rounds.map((r) => r.key)).toEqual(["pr:acme/app#7", "pr:acme/app#6"]);
+  });
+
+  it("never merges an unparseable key into a real round", () => {
+    const rounds = reviewRounds(
+      [
+        run({ id: 601, issue_identifier: "pr:acme/app" }),
+        run({ id: 602, issue_identifier: "pr:acme/app" }),
+      ],
+      NONE,
+      "",
+    );
+    expect(rounds.map((r) => r.key)).toEqual(["run:601", "run:602"]);
+  });
+
+  it("links View PR straight to the number in a review run's key", () => {
+    expect(reviewPr("pr:makewhatis/rhapsody#223@jimmy")).toEqual({
+      owner: "makewhatis",
+      repo: "rhapsody",
+      number: 223,
+      branch: "jimmy",
+    });
+    expect(
+      reviewPrUrl(run({ id: 1, issue_identifier: "pr:makewhatis/rhapsody#223@jimmy" })),
+    ).toBe("https://github.com/makewhatis/rhapsody/pull/223");
+    // An ordinary ticket key names no pull request, so the caller falls back to the branch search.
+    expect(reviewPrUrl(run({ id: 1, issue_identifier: "STUDIO-654" }))).toBe("");
+    expect(reviewPr("pr:acme/app")).toBeUndefined();
+  });
+});
+
+describe("middleEllipsis — the header's branch never loses its tail (STUDIO-1023)", () => {
+  it("keeps both ends, never cutting to the ticket-only head", () => {
+    const branch = "symphony/pr_makewhatis_rhapsody_223_jimmy";
+    const got = middleEllipsis(branch, 24);
+    expect(got).toContain("…");
+    expect(got.startsWith("symphony/")).toBe(true);
+    expect(got.endsWith("223_jimmy")).toBe(true);
+    // The end-ellipsis failure the ticket names — "symphony/pr_makewhatis_rhapsody_223_jim…".
+    expect(got).not.toMatch(/jim…$/);
+  });
+
+  it("returns a value that fits unchanged, and survives a tiny budget", () => {
+    expect(middleEllipsis("symphony/STUDIO-654", 34)).toBe("symphony/STUDIO-654");
+    expect(middleEllipsis("abcdef", 3)).toBe("a…f");
+    expect(middleEllipsis("abcdef", 2)).toBe("abcdef");
+  });
+});
+
 describe("attemptBucket — the single-row breakpoint the header publishes (STUDIO-763)", () => {
   // The stylesheet grants the one-row header per count because the width it costs is not a
   // constant: the selector grows ~110px per attempt while every other member is fixed. These are
@@ -888,10 +992,11 @@ describe("provenanceFields — the header's provenance line (STUDIO-909)", () =>
       provider: "fireworks-ai",
     };
     expect(provenanceFields(p)).toEqual([
-      { label: "harness", value: "opencode", origin: "profile" },
-      { label: "model", value: "deepseek-v4p1-flash", origin: "review.model.opencode" },
+      { label: "harness", value: "opencode", origin: "profile", override: false },
+      // `review.model.opencode` is a scoped OVERRIDE (STUDIO-1023), so this one shows inline.
+      { label: "model", value: "deepseek-v4p1-flash", origin: "review.model.opencode", override: true },
       // Derived from the harness + model at dispatch, so there is no config key to name.
-      { label: "provider", value: "fireworks-ai", origin: "" },
+      { label: "provider", value: "fireworks-ai", origin: "", override: false },
     ]);
   });
 
@@ -912,9 +1017,9 @@ describe("provenanceFields — the header's provenance line (STUDIO-909)", () =>
 
   it("says unknown for every value of a run that recorded none, and names no origin", () => {
     expect(provenanceFields(undefined)).toEqual([
-      { label: "harness", value: PROVENANCE_UNKNOWN, origin: "" },
-      { label: "model", value: PROVENANCE_UNKNOWN, origin: "" },
-      { label: "provider", value: PROVENANCE_UNKNOWN, origin: "" },
+      { label: "harness", value: PROVENANCE_UNKNOWN, origin: "", override: false },
+      { label: "model", value: PROVENANCE_UNKNOWN, origin: "", override: false },
+      { label: "provider", value: PROVENANCE_UNKNOWN, origin: "", override: false },
     ]);
   });
 
@@ -931,12 +1036,26 @@ describe("provenanceFields — the header's provenance line (STUDIO-909)", () =>
       label: "model",
       value: PROVENANCE_UNKNOWN,
       origin: "",
+      override: false,
     });
+    // `agent.backend` is an ordinary tier key, not an override — it belongs in the tooltip only.
     expect(fields.find((f) => f.label === "harness")).toEqual({
       label: "harness",
       value: "claude",
       origin: "agent.backend",
+      override: false,
     });
+  });
+
+  // STUDIO-1023: the origin shows inline only when it is an OVERRIDE. The rule is a prefix test on
+  // the two scoped families the daemon mints, so an ordinary dotted tier key is NOT one.
+  it("treats only review/manager scoped origins as overrides", () => {
+    for (const origin of ["review.model.opencode", "review.model", "review", "manager.model", "manager.harness"]) {
+      expect(isOverrideOrigin(origin), origin).toBe(true);
+    }
+    for (const origin of ["", "profile", "default", "agent.backend", "claude.model", "ticket", "global", "identity", "project"]) {
+      expect(isOverrideOrigin(origin), origin).toBe(false);
+    }
   });
 });
 

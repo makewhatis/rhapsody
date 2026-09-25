@@ -23,33 +23,74 @@
    or wraps INSIDE its own box, so the page body never scrolls sideways.
    ============================================================================ */
 
-/* ---- (A) the sticky header ---- */
+/* ---- (A) the sticky header — THREE ROWS (STUDIO-1023) -------------------------------
+   The single-row header (STUDIO-763) was measured before the provenance line and the review strip
+   existed, and both were then added to the same row budget: at a normal desktop width the title
+   ellipsized, every attempt label read "attempt 5 · jim…", the branch lost its tail, and the
+   provenance line was squeezed into ~150px and overlapped by the avatar. The fix is a three-row
+   header, each row with ONE job, rather than a fourth re-measurement of a row that was never sized
+   for what it now carries:
+
+     row 1  identity   back · key · full title · assignee · outcome
+     row 2  provenance harness · model · provider, inline chips, scrolls in its own box
+     row 3  controls   attempts · reviews · branch · actions (right-aligned)
+
+   Nothing here reshapes per attempt count any more: past three attempts the selector is a compact
+   dropdown (`attemptOptions`/`Select`), so the row cannot grow without limit. */
 .rh-console .trhd {
   position: sticky;
   top: 0;
   z-index: 5;
   display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 8px;
   padding: 11px 0;
   margin-bottom: 4px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
 }
-.rh-console .trhd .back { color: var(--ink-3); background: none; border: 0; font: inherit; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.rh-console .trhd-id { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.rh-console .trhd .back { color: var(--ink-3); background: none; border: 0; font: inherit; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; flex: none; }
 .rh-console .trhd .back:hover { color: var(--ink); }
-.rh-console .trhd .idw { min-width: 0; }
-.rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
-.rh-console .trhd h1 { margin: 0; font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
-/* What the run actually ran on (STUDIO-909): a compact mono line under the title, each value with
-   the config key it came from. It wraps rather than truncating, because the origin — the half that
-   says an override is in play — is the part that must stay readable. */
-.rh-console .trhd .prov { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 2px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
-.rh-console .trhd .prov .pf { display: inline-flex; gap: 4px; }
+.rh-console .trhd .idw { min-width: 0; flex: 1 1 auto; }
+/* The run key (`STUDIO-988`, or a review run's `pr:owner/repo#N@reviewer`). A `pr:` key has no
+   whitespace, so at a narrow width it cannot wrap on its own and runs out of `.idw` — under the
+   assignee avatar (STUDIO-1023 round 2). `overflow-wrap: anywhere` gives it a break point, so the
+   key wraps inside its own column and never overlaps what is to its right. */
+.rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
+/* The full title, wrapped to at most TWO lines with balanced breaks and NEVER ellipsized at
+   desktop width (STUDIO-1023). `-webkit-line-clamp` is the one cross-engine way to cap lines;
+   engines without it simply wrap further, which is a height cost rather than a truncation. */
+.rh-console .trhd h1 {
+  margin: 0;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.3;
+  text-wrap: balance;
+  /* A title can carry an unbreakable token (`owner/repo#N`); `break-word` lets it break
+     only when the line cannot hold it, so it never overflows and gets end-ellipsized at a narrow
+     width (STUDIO-1023 round 2). `anywhere` would do the same but also shrink the column's
+     min-content, which is the flex item's shrink floor; `break-word` leaves that alone. */
+  overflow-wrap: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rh-console .trhd .who2,
+.rh-console .trhd .trhd-id > .whoskel { margin-left: auto; flex: none; }
+.rh-console .trhd .trhd-id > .pill, .rh-console .trhd .trhd-id > .trpulse { flex: none; }
+
+/* Row 2 — provenance. Three inline chips on ONE line; the line scrolls sideways inside its own
+   container rather than wrapping a value or widening the page. Each chip carries the config key in
+   its tooltip, and shows it inline ONLY when it is an override (`data-override`). */
+.rh-console .trhd .trprovrow { min-width: 0; overflow-x: auto; overflow-y: hidden; }
+.rh-console .trhd .prov { display: flex; flex-wrap: nowrap; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.rh-console .trhd .prov .pf { display: inline-flex; align-items: baseline; gap: 5px; flex: none; white-space: nowrap; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; background: var(--panel); }
 .rh-console .trhd .prov .pl { color: var(--ink-4); }
 .rh-console .trhd .prov .pv { color: var(--ink-2); }
-.rh-console .trhd .prov .po { color: var(--ink-4); }
+.rh-console .trhd .prov .po { color: var(--warn); }
+.rh-console .trhd .prov .pf[data-override="true"] { border-color: var(--warn); }
 /* The prototype's `.av` (§3A): the header's assignee disc carries the teammate's INITIAL, where a
    table row's plain disc does not. Size and colour stay inline on the component — only the
    centring and the type live here. The text takes the page background rather than a fixed dark,
@@ -61,188 +102,51 @@
 .rh-console .trhd .whoskel { display: inline-block; font-size: 12.5px; width: 11ch; height: 20px; border-radius: 10px; background: var(--line); opacity: .55; }
 /* A live region announces its CONTENT, so the placeholder carries text an aria-label would not. */
 .rh-console .trhd .whoskel .vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
-.rh-console .trvitals { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-4); display: flex; gap: 14px; flex-wrap: wrap; }
+/* Row 3 — controls. Attempts · reviews · branch · vitals · actions, the actions right-aligned.
+   `flex-wrap: wrap` so a narrow window stacks the cluster rather than scrolling the page. */
+.rh-console .trctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.rh-console .trvitals { font-family: var(--mono); font-size: 11px; color: var(--ink-4); display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .rh-console .trvitals b { color: var(--ink-2); font-weight: 500; }
-.rh-console .trhd .acts { display: flex; gap: 7px; flex-wrap: wrap; }
-/* The prototype's `.btn.sm` and `.seg button`. The header carries five controls beside the title,
-   the assignee, the pill, the selector and the vitals, and at the shipped size that cluster could
-   not fit any window — it wrapped to a second row at every width (§3A says one row). */
+/* The three receipt-duplicated vitals, grouped so one selector can shed them together. `contents`
+   rather than a box: the wrapper costs the vitals row no layout of its own. */
+.rh-console .trvitals .trdup { display: contents; }
+/* The branch, shortened in the MIDDLE by the view, with a copy button beside it (STUDIO-1023). The
+   mono span keeps its own tooltip holding the full value, so a shortened branch is never lost. */
+.rh-console .trbranch { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.rh-console .trbranch .mono { white-space: nowrap; }
+.rh-console .trcopy { font: inherit; font-family: var(--mono); font-size: 10px; color: var(--ink-4); background: none; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; cursor: pointer; }
+.rh-console .trcopy:hover { color: var(--ink); border-color: var(--line-strong); }
+.rh-console .trhd .acts { display: flex; gap: 7px; flex-wrap: wrap; margin-left: auto; }
+/* The prototype's `.btn.sm` and `.seg button`. */
 .rh-console .trhd .btn { padding: 3px 8px; font-size: 11px; }
 .rh-console .trhd .trattempts button { padding: 5px 10px; font-size: 11px; }
+/* The compact attempt dropdown (STUDIO-1023): the same control as the segments for a ticket with
+   more than three attempts, where eleven segments leave no room for a teammate's name. */
+.rh-console .trhd .tradropwrap { flex: none; }
+.rh-console .trhd .trattempts { font-family: var(--mono); font-size: 11px; max-width: 40ch; }
 /* A dependency-named action stays hoverable — its `title` is what names the missing surface —
    but is inert: `aria-disabled` instead of the `disabled` attribute, which suppresses the
    mouse events the tooltip needs. */
 .rh-console .trhd .btn.dependency { cursor: not-allowed; opacity: .7; }
 .rh-console .trhd .btn.dependency:hover { background: var(--panel); color: var(--ink-2); border-color: var(--line); }
-.rh-console .trhd .btn:disabled { cursor: progress; opacity: .6; }
+.rh-console .trhd .btn:disabled { cursor: not-allowed; opacity: .6; }
 .rh-console .trhd .acterr { font-size: 11.5px; color: var(--bad); align-self: center; max-width: 40ch; }
 /* A dependency-named action: it links its own missing surface rather than pretending to act. */
 .rh-console .dep { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-4); border: 1px solid var(--line); border-radius: 4px; padding: 0 3px; margin-left: 5px; }
 
-/* The three receipt-duplicated vitals, grouped so they can leave together — see the single-row
-   rules below. `contents` rather than a box: until it is shed the wrapper must cost the vitals
-   row no layout at all, so the three spans stay direct flex children of `.trvitals`. */
-.rh-console .trvitals .trdup { display: contents; }
-
-/* ============================================================================================
-   ONE header row (§3A, STUDIO-763) — and the width it costs.
-
-   The window that matters is the DESKTOP DEFAULT: `desktop/src-tauri/tauri.conf.json` opens the
-   Tauri window at 1100x760 and `web/` is that window's content, so 1100 — not a large external
-   display — is where the shipped app renders this header. rc.13, the build this ticket was filed
-   against, IS the desktop app, so a breakpoint drawn at a laptop width would have left the
-   reported two-row header exactly where it was.
-
-   What pays for the row is SHEDDING rather than squeezing. Duration, turns and tokens are
-   repeated verbatim in the Result card's receipt about 8px below (§3B), so the row drops all
-   three (~174px) and loses no information at all; the branch — the one vital the receipt does NOT
-   carry — stays, and gets a floor so it can never be crushed to nothing. The header's own gap
-   tightens from the prototype's 14px to 10px, worth another 24px across six gaps.
-
-   Only the title then yields, ellipsizing down to a 110px floor, and only once it is there do the
-   attempt labels — which ellipsize rather than clipping silently, so a cut label always says so.
-
-   The breakpoint is per attempt count (`data-attempts`, see `attemptBucket`) because the width
-   the row costs is NOT a constant: every other member has a fixed natural width and the selector
-   grows ~110px per attempt. Measured in headless Chrome against these stylesheets, in the real
-   214px-rail shell, with the `.trhd` markup dumped from a mounted `JobDetailView` — the narrowest
-   viewport at which each count still fits one 62px row with the branch whole and no sideways page
-   scroll:
-
-     1 attempt   1100      4-5 attempts  1700
-     2 attempts  1280      6 or more     never — see the last rule in this section
-     3 attempts  1400
-
-   At the threshold ITSELF a long teammate name can still take the last few pixels out of a label:
-   measured, "attempt 2 · jimmy" ellipsizes by ~18px at exactly 1280 and is whole by 1320. That is
-   the accepted cost — the ellipsis says a name was cut and the button's `title` carries it in full
-   — and it is why these are the widths the ROW is whole at, not the widths nothing yields at.
-   1100 alone is chosen rather than measured: it is the desktop default, and the row is made to fit
-   it by the paragraph below.
-
-   So a one-attempt ticket — 432 of the 441 rows the store has ever written — is one row AT the
-   desktop default, which is the window this ticket was actually filed against, and up to five
-   attempts is one row on a 1728 display.
-
-   The one-attempt row is bought by shedding a SECOND duplicate, for the same reason as the first.
-   Measured, the selector is the only member with anywhere left to give below 1200 (the title is
-   already on its floor), so it absorbs the whole squeeze: 110px natural at 1200, 76 at 1160, and
-   21 at 1100 — a stub with no glyph in it, which is precisely the "names nobody" failure below.
-   But a one-attempt selector is a group of ONE: §3A defines it as the implement→review relay's
-   linked siblings, and with one sibling it can switch to nothing, while its visible content — the
-   teammate — is the assignee slot 10px to its left. Its TOOLTIP carried more than that: the run's
-   id and start time, which nothing else on the page renders. Those moved to the outcome pill,
-   which this block never sheds and never shrinks, so the shed now costs the header nothing at all.
-   With that done, under 1200 the single-attempt ticket drops the selector and keeps every member
-   that carries something, and the row at the desktop default is whole rather than squeezed. It
-   comes back at 1200, the width its label is intact at.
-
-   Below its own threshold a ticket wraps exactly as it did before, and takes its shed vitals back
-   with it. That is the honest answer rather than a fallback: granting the row anyway crushed five
-   labels to one glyph each, and an "attempt" button that names nobody is the failure
-   `attemptOptions` exists to end.
-
-   The whole block is gated on `:has()` because it DEPENDS on `:has()` to stay honest. The inline
-   error rule at the end of the block is what stops a header carrying a failed Stop from pushing
-   the page sideways, and it is the one rule here that has no `:has()`-free spelling — an engine
-   that skipped it alone would keep the nowrap row and scroll sideways, which §3C forbids. So an
-   engine without `:has()` gets no single-row block at all and keeps the wrapped header it has
-   today. Every engine this ships to has it (WKWebView on macOS 13+ is Safari 16), so the gate
-   costs the shipped app nothing; it is here so that lowering the threshold to the desktop default
-   cannot make any other engine worse than it was.
-   ============================================================================================ */
-@supports selector(:has(*)) {
-  @media (min-width: 1100px) {
-    .rh-console .trhd { flex-wrap: nowrap; gap: 10px; }
-    .rh-console .trhd > * { flex: none; }
-    /* Shed, not squeezed — the Result card's receipt carries all three in full. */
-    .rh-console .trhd .trdup { display: none; }
-    /* Yields FIRST, and takes ~99.99% of any squeeze: the title already ellipsizes at 42ch, and the
-       ticket key above it is what actually identifies the page. It stops at 110px — about 14
-       characters — so the row never trades the whole subject away for a vital. */
-    .rh-console .trhd .idw { flex: 0 20000 auto; min-width: 110px; }
-    /* Floored, not yielded. `runBranch` derives `symphony/<KEY>` for every row the daemon has ever
-       written (`runs.branch` is empty on all of them), which is the 19ch this reserves; a longer
-       branch ellipsizes into its own tooltip rather than pushing the row sideways. Without a floor
-       `min-width: 0` let this group reach 0px, and a 0px box has no hover target — which took the
-       branch AND the tooltip that was supposed to recover it. */
-    .rh-console .trhd .trvitals { flex: 0 1 auto; min-width: 19ch; flex-wrap: nowrap; overflow: hidden; }
-    .rh-console .trhd .trvitals .mono { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    /* Yields LAST — a truncated "attempt 3 · ali…" defeats the one thing this selector is for.
-       The lopsided shrink factors are what make the order SEQUENTIAL rather than merely weighted,
-       and they have to be that lopsided: flex shares a squeeze across every unfrozen member at
-       once, in proportion to factor x BASE WIDTH, and `text-overflow` fires on a single pixel of
-       overflow — with equal factors the selector gave up 3px of 327 and every label lost its
-       teammate while the title beside it still had 190px to give. Whole numbers, not fractions: a
-       flex line whose unfrozen shrink factors SUM to less than one absorbs only that fraction of
-       the overflow by spec, and a fractional factor left a five-attempt header spilling sideways
-       instead of ellipsizing. */
-    .rh-console .trhd .trattempts { flex: 0 1 auto; min-width: 0; }
-    .rh-console .trhd .trattempts button { min-width: 0; overflow: hidden; }
-    /* Ellipsized, with a pixel of slack. The ellipsis is what stops a clip being SILENT — without
-       it "attempt 5 · a" reads as a complete label — but a button laid out at its own natural width
-       can round to a fraction of a pixel narrower than its text, and `text-overflow` fires on that
-       fraction. The 1px of padding makes the span's content box wider than the text it holds, so
-       the rounding never reaches it while a real squeeze of more than a pixel still does. */
-    .rh-console .trhd .trattempts button > span { display: block; min-width: 0; padding-right: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    /* A failed Stop or Resume reports inline (the console has no toast surface), and its text is a
-       raw daemon message up to 40ch wide. It is not one of the members §3A puts in the row, and it
-       has no good way to be one: rigid it pushed the whole header off the side of the page, which
-       §3C's wide-content rule forbids, and shrinkable it collapsed to a 0px box with no hover
-       target — the same failure the branch's own floor exists to prevent. A header carrying one
-       wraps instead, exactly as it did before this ticket, and takes its shed vitals back with it:
-       the message keeps every word, and nothing else in the row pays for an exceptional state. */
-    .rh-console .trhd:has(.acterr) { flex-wrap: wrap; gap: 14px; }
-    .rh-console .trhd:has(.acterr) .trdup { display: contents; }
-  }
-  /* The second duplicate, shed for the same reason as the first — see the block comment. Scoped to
-     the one bucket that is in the single-row regime this low: every other count has wrapped again
-     by 1280, and a wrapped row has the room to keep its selector. A header carrying an inline
-     error has wrapped too, and gets its selector back with the rest of what wrapping affords. */
-  @media (min-width: 1100px) and (max-width: 1199.98px) {
-    .rh-console .trhd[data-attempts="1"]:not(:has(.acterr)) .trattempts { display: none; }
-  }
-}
-
-/* Below the width its OWN selector needs, a ticket goes back to the wrapped header it had before
-   this ticket, and takes its shed vitals back with it — a wrapped row has the room for them. Only
-   the three declarations that decide the row's shape are undone: the shrink factors and floors
-   above are inert once the line wraps, because a wrapping flex line collects items at their
-   hypothetical size and only shrinks what does not fit on a line of its own.
-
-   The `.98` is what keeps each of these off the width its own `min-width` query claims. They
-   carry no lower bound on purpose: under 1100 the single-row block never applied, so restoring
-   the wrapped defaults there restores what was already true. */
-@media (max-width: 1279.98px) {
-  .rh-console .trhd:not([data-attempts="1"]) { flex-wrap: wrap; gap: 14px; }
-  .rh-console .trhd:not([data-attempts="1"]) .trdup { display: contents; }
-}
-@media (max-width: 1399.98px) {
-  .rh-console .trhd[data-attempts="3"],
-  .rh-console .trhd[data-attempts="few"] { flex-wrap: wrap; gap: 14px; }
-  .rh-console .trhd[data-attempts="3"] .trdup,
-  .rh-console .trhd[data-attempts="few"] .trdup { display: contents; }
-}
-@media (max-width: 1699.98px) {
-  .rh-console .trhd[data-attempts="few"] { flex-wrap: wrap; gap: 14px; }
-  .rh-console .trhd[data-attempts="few"] .trdup { display: contents; }
-}
-/* Six attempts or more, at every width — no media query, because there is no width to wait for.
-   Five is the widest selector a 1728px display holds whole; at six every label ellipsizes, from
-   1700 to 1920 alike, and a row of six buttons reading "attempt 6 · a…" names none of them. So
-   this bucket keeps the header it has always had rather than buying one row with the labels. */
-.rh-console .trhd[data-attempts="many"] { flex-wrap: wrap; gap: 14px; }
-.rh-console .trhd[data-attempts="many"] .trdup { display: contents; }
-
-/* ---- the review strip (STUDIO-976) ----
-   The ticket's review runs, in their own row beneath the attempt selector. Deliberately NOT folded
-   into `.trattempts`: that selector's single-row width budget is measured per ATTEMPT count
-   (`data-attempts`), and a one-attempt ticket with reviews would have them hidden by the
-   `[data-attempts="1"]` rule at the desktop default width — while a heavily reviewed ticket's strip
-   is too long to be one row at any threshold. A review is a real run with its own trace, so an entry
-   opens it exactly as an attempt does, but it is styled as its own kind: dashed, mono, and never
-   numbered. The row sits OUTSIDE `.trhd`, so it costs the sticky header's measured height nothing. */
-.rh-console .trreviews { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 10px; }
+/* ---- the review strip (STUDIO-976, regrouped by round STUDIO-1023) ----
+   The ticket's review runs, in the controls row beside the attempt selector. A review is a real run
+   with its own trace, so an entry opens it exactly as an attempt does, but it is styled as its own
+   kind: dashed, mono, and never numbered. The strip shows every review, grouped into ROUNDS — one
+   round is a pull request (or a repeated reviewer, which marks a new head); the newest round is
+   expanded and the older rounds collapse behind a "+N earlier rounds" toggle (the view builds the
+   rounds; the stylesheet only draws them). Nothing is dropped: a review left out of the newest
+   round is still reachable behind the toggle (STUDIO-1023). */
+.rh-console .trreviews { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* The toggle that reveals the collapsed older rounds. Plain text rather than a chip, so it reads as
+   a control rather than another review. */
+.rh-console .trrevmore { font: inherit; font-size: 11px; color: var(--ink-4); background: none; border: 0; padding: 3px 4px; cursor: pointer; }
+.rh-console .trrevmore:hover { color: var(--ink-2); }
 .rh-console .trrev { font: inherit; font-family: var(--mono); font-size: 11px; color: var(--ink-3); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 3px 9px; cursor: pointer; }
 .rh-console .trrev:hover { color: var(--ink); border-color: var(--line-strong); }
 .rh-console .trrev.on { color: var(--ink); border-style: solid; border-color: var(--rust-text); }
@@ -429,6 +333,10 @@
    detail read linearly, top to bottom, is also what a long one is FOR. */
 .rh-console .trinsp { padding: 16px 18px; min-width: 0; }
 .rh-console .trinsp h4 { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-4); margin: 0 0 10px; font-weight: 600; }
+/* The "ORIENTED — WHAT <WHO> DID" heading is a LABEL over the step's content, not content itself
+   (STUDIO-1023). It takes the muted label treatment so it does not read at the weight of the call
+   cards below it, while the step title it names keeps its own contrast. */
+.rh-console .trinsp .insphead { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; font-weight: 600; color: var(--ink-4); margin: 0 0 10px; }
 .rh-console .trcard { border: 1px solid var(--line); border-radius: var(--r-sm); margin-bottom: 8px; background: var(--panel-2); overflow: hidden; }
 .rh-console .trcard .top { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 11px; font: inherit; text-align: left; border: 0; background: none; color: inherit; cursor: pointer; min-width: 0; }
 .rh-console .trcard .top:hover { background: var(--raise); }

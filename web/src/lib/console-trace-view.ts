@@ -163,6 +163,33 @@ export interface ProvenanceField {
   value: string;
   /** The config key the value came from, or "" when there is none to name. */
   origin: string;
+  /**
+   * Whether the origin is an OVERRIDE — a scoped key that supplied the value over the ordinary
+   * tier (STUDIO-1023). The header shows an override inline beside its chip as well as in the
+   * tooltip, because it is the half an operator has to notice; an ordinary origin is tooltip-only.
+   * See [`isOverrideOrigin`] for the exact rule.
+   */
+  override: boolean;
+}
+
+/**
+ * Whether a recorded origin names an OVERRIDE rather than the ordinary tier a value would take
+ * anyway (STUDIO-1023).
+ *
+ * The origins the daemon writes fall into two families: TIER names that describe where a value
+ * came from on the ordinary path (`profile`, `identity`, `project`, `global`, `ticket`,
+ * `default`), and scoped OVERRIDE keys whose whole point is that someone set a value the default
+ * path would not have produced (`review.model.claude`, `review.model`, `manager.model`,
+ * `manager.harness`). Only the second family is worth the chip's pixels inline: the STUDIO-909
+ * failure was a `review.model.opencode` override that no surface named, so the header must make
+ * an override legible at a glance while the ordinary tier stays in the tooltip.
+ *
+ * The rule is deliberately a PREFIX test on the two scoped families the daemon actually mints,
+ * not "anything with a dot in it": `claude.model`/`agent.backend` are ordinary tier keys and
+ * prefixing them all would turn every run into an override.
+ */
+export function isOverrideOrigin(origin: string): boolean {
+  return origin === "review" || origin.startsWith("review.") || origin === "manager" || origin.startsWith("manager.");
 }
 
 /**
@@ -182,12 +209,20 @@ export function provenanceFields(p: RunProvenance | undefined): ProvenanceField[
   // supplied nothing.
   const origin = (v: string | undefined, o: string | undefined) =>
     v === undefined || v === "" ? "" : (o ?? "");
+  const field = (
+    label: ProvenanceField["label"],
+    v: string | undefined,
+    o: string | undefined,
+  ): ProvenanceField => {
+    const originValue = origin(v, o);
+    return { label, value: value(v), origin: originValue, override: isOverrideOrigin(originValue) };
+  };
   return [
-    { label: "harness", value: value(p?.harness), origin: origin(p?.harness, p?.harness_origin) },
-    { label: "model", value: value(p?.model), origin: origin(p?.model, p?.model_origin) },
+    field("harness", p?.harness, p?.harness_origin),
+    field("model", p?.model, p?.model_origin),
     // The provider is derived from the harness and the model at dispatch, so it has no config key
     // of its own to name.
-    { label: "provider", value: value(p?.provider), origin: "" },
+    field("provider", p?.provider, undefined),
   ];
 }
 
@@ -598,6 +633,13 @@ export interface AttemptOption {
   /** What the button reads: "attempt 2 · jimmy", "attempt 2 · —", or "run 545". */
   label: string;
   /**
+   * What the COMPACT DROPDOWN option reads (STUDIO-1023): "attempt 2 of 5 · jimmy". It carries the
+   * ticket's total because a single collapsed control has no siblings to count, and the ordinal
+   * alone ("attempt 5") leaves the operator guessing how many there are. The unnamed fallbacks
+   * keep the run-id shape, since there is no ordinal that names anything.
+   */
+  dropdownLabel: string;
+  /**
    * Whether the label names the attempt (an ordinal, and a teammate or a dash) rather than being
    * the bare run-id fallback. The view reads it to decide whether the tooltip still has to supply
    * the run id — on a fallback label the id is already on the button.
@@ -644,13 +686,15 @@ export function attemptOptions(
     // "" from the map is the run's OWN answer that it routed to nobody; an absent key is no
     // answer at all. Only the first earns an ordinal-and-dash label.
     const recordedNobody = who === "" && identities.get(run.id) === "";
+    const named = who !== "" || recordedNobody;
     const label =
       who !== ""
         ? `attempt ${ordinal} · ${who}`
         : recordedNobody
           ? `attempt ${ordinal} · —`
           : `run ${run.id}`;
-    return { id: run.id, ordinal, label, named: who !== "" || recordedNobody, startedAt: run.started_at };
+    const dropdownLabel = named ? `attempt ${ordinal} of ${runs.length} · ${who === "" ? "—" : who}` : `run ${run.id}`;
+    return { id: run.id, ordinal, label, dropdownLabel, named, startedAt: run.started_at };
   });
 }
 
@@ -757,6 +801,138 @@ export function reviewOptions(
     };
   });
 }
+
+/** One pull-request coordinate parsed from a ticketless review run's `pr:` key. */
+export interface ReviewPr {
+  owner: string;
+  repo: string;
+  number: number;
+  /** The head branch the key names when it carries one, else "". */
+  branch: string;
+}
+
+const REVIEW_KEY = /^pr:([^/]+)\/([^#]+)#(\d+)(?:@([^@]*))?$/;
+
+/**
+ * The pull-request coordinate a review run's key names
+ * (`pr:<owner>/<repo>#<n>@<reviewer>`), or `undefined` for anything else.
+ *
+ * The console does NOT invent a PR from an ordinary ticket key: only a `pr:` key carries one, and
+ * a key the daemon did not mint in that shape (a bare `pr:owner/repo` with no number, a legacy
+ * form) resolves to nothing so the "View PR" action degrades honestly rather than pointing at a
+ * fabricated pull request.
+ */
+export function reviewPr(key: string): ReviewPr | undefined {
+  const m = REVIEW_KEY.exec(key.trim());
+  if (m === null) return undefined;
+  return { owner: m[1], repo: m[2], number: Number(m[3]), branch: m[4] ?? "" };
+}
+
+/**
+ * Where "View PR" goes on a REVIEW run (STUDIO-1023): the pull request the key itself names.
+ *
+ * This is a DIRECT link rather than the head-branch SEARCH `prSearchUrl` builds for an author run.
+ * A review run's branch is a detached review worktree (`symphony/pr_owner_repo_n_reviewer`), not
+ * the pull request's head branch, so the search finds nothing — the ticket's complaint that the
+ * button "can't find the PR". The number is in the key, so the link is exact. "" when the key is
+ * not a review key, which is the caller's cue to fall back to the search.
+ */
+export function reviewPrUrl(run: RunSummary): string {
+  const pr = reviewPr(run.issue_identifier);
+  if (pr === undefined) return "";
+  return `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`;
+}
+
+/** One round of the review strip (STUDIO-1023): a pull request and the reviewer chips against it. */
+export interface ReviewRound {
+  /** The round's identity — the PR coordinate (or the lone run's id when no PR resolves). Two
+   *  rounds of the same pull request share this key; it is the COORDINATE, not a unique handle. */
+  key: string;
+  /** Every chip this round contributes, newest-first. */
+  chips: ReviewOption[];
+  /** The newest start in the round — the rounds are ordered by it. */
+  startedAt: string;
+}
+
+/**
+ * The review strip grouped into ROUNDS (STUDIO-1023).
+ *
+ * A round is one pull request at one head: twenty-five reviews on one ticket are usually a handful
+ * of rounds plus re-reviews, and a flat strip of twenty-five chips tells the operator nothing. The
+ * daemon serves no head SHA to the console, so a round boundary is reconstructed from the two facts
+ * a client does have — the PR coordinate and the reviewers. The reviews are put in newest-first
+ * order and walked: a new round opens when the PR changes, OR when a reviewer who already appears
+ * in the round being built turns up again (a reviewer reviews one head once, so a repeat means the
+ * previous head was superseded). Consecutive reviews of one PR by different reviewers therefore
+ * stay together, which is the normal multi-reviewer round.
+ *
+ * NOTHING is dropped. An earlier model deduped each round to one chip per reviewer and discarded
+ * the rest, which silently erased every earlier review of a pull request — and with it the
+ * `changes_requested` verdict colouring STUDIO-1020 had just added (STUDIO-1023 round 1). Every
+ * review run survives as a chip, and the older rounds collapse behind the view's "+N earlier
+ * rounds" toggle rather than disappearing.
+ *
+ * The key falls back to the run id when its `pr:` coordinate cannot be parsed: an unparseable key
+ * must never merge with a real round, or two unrelated reviews would read as one PR.
+ */
+export function reviewRounds(
+  reviews: readonly RunSummary[],
+  identities: ReadonlyMap<number, string>,
+  assignee: string,
+): ReviewRound[] {
+  const ordered = [...reviews].sort((a, b) => b.started_at.localeCompare(a.started_at));
+  const rounds: {
+    key: string;
+    startedAt: string;
+    reviewers: Set<string>;
+    chips: ReviewOption[];
+  }[] = [];
+  let current: (typeof rounds)[number] | undefined;
+  for (const run of ordered) {
+    const pr = reviewPr(run.issue_identifier);
+    const key = pr === undefined ? `run:${run.id}` : `pr:${pr.owner}/${pr.repo}#${pr.number}`;
+    const who = runTeammate(run, identities, assignee);
+    const reviewer = who === "" ? `run:${run.id}` : who;
+    if (current === undefined || current.key !== key || current.reviewers.has(reviewer)) {
+      current = { key, startedAt: run.started_at, reviewers: new Set(), chips: [] };
+      rounds.push(current);
+    }
+    if (run.started_at > current.startedAt) current.startedAt = run.started_at;
+    current.reviewers.add(reviewer);
+    current.chips.push({
+      id: run.id,
+      label: who === "" ? `review ${run.id}` : `review · ${who}`,
+      named: who !== "",
+      startedAt: run.started_at,
+      state: reviewState(run),
+    });
+  }
+  // The `reviewers` set is scratch for building the rounds, never part of the model: drop it before
+  // the value leaves this function so a caller cannot start depending on it.
+  return rounds
+    .map(({ key, startedAt, chips }) => ({ key, startedAt, chips }))
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
+/**
+ * A branch name shortened in the MIDDLE, keeping head and tail (STUDIO-1023).
+ *
+ * The header's single-row budget cut the branch with an end-ellipsis, which is exactly wrong here:
+ * the meaningful half — the ticket key or the PR coordinate with its reviewer — is at the TAIL, so
+ * `symphony/pr_makewhatis_rhapsody_223_jim…` drops the only part worth reading. A middle ellipsis
+ * keeps both ends (`symphony/…223_jimmy`). The full string always rides beside this in the title
+ * and the copy button, so nothing is lost, only shortened.
+ */
+export function middleEllipsis(value: string, max: number): string {
+  if (value.length <= max || max < 3) return value;
+  const keep = max - 1;
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return `${value.slice(0, head)}…${tail === 0 ? "" : value.slice(value.length - tail)}`;
+}
+
+/** Characters the header's branch chip holds before it middle-ellipsizes. */
+export const BRANCH_DISPLAY_MAX = 34;
 
 /**
  * How many attempts the header's selector is carrying, in the buckets its single-row breakpoints

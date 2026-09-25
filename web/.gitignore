@@ -8,3 +8,7 @@ wailsjs
 *.tsbuildinfo
 vite.config.d.ts
 vitest.config.d.ts
+# Playwright (the STUDIO-1023 header layout spec): its run output and browser cache are local.
+test-results
+playwright-report
+.playwright
