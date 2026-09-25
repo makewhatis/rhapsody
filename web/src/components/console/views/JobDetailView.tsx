@@ -2204,7 +2204,9 @@ function ReviewPanel({
           <b> The manager:</b> {mgrView.reason ? `${mgrView.reason}. ` : ""}
           {mgrView.proposal
             ? "proposed this in advise mode — recorded, never applied."
-            : "the manager is authoritative for this pull request."}
+            : mgrView.mode === "act"
+              ? "the manager is authoritative for this pull request."
+              : "the manager is advising; today's review call remains authoritative."}
           {mgrView.decision ? (
             <>
               {" "}

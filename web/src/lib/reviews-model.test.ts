@@ -295,6 +295,13 @@ describe("managerView", () => {
     expect(stopped?.reason).toBe("manager run budget exhausted");
   });
 
+  // §9: an `advise` run is advisory — today's review call remains authoritative — so the console
+  // needs the mode to avoid claiming authority the manager does not have.
+  it("carries the mode so an advisory run is not read as authoritative", () => {
+    expect(managerView(managed({ state: "running", mode: "advise" }))?.mode).toBe("advise");
+    expect(managerView(managed({ state: "running", mode: "act" }))?.mode).toBe("act");
+  });
+
   // The ticket's load-bearing distinction: a proposal must NOT look like an applied decision. The
   // proposal carries its own label and accent variant, and the decision pills never use it.
   it("renders a proposal distinctly from an applied decision", () => {

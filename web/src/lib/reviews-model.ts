@@ -252,6 +252,8 @@ export interface ManagerView {
   reason: string;
   /** True for an `advise` proposal — recorded, never applied. Rendered DISTINCTLY from a decision. */
   proposal: boolean;
+  /** `act` or `advise`. In `advise` the manager is advisory: today's review call stays authoritative. */
+  mode: string;
   /** The validated decision behind the state, when one was recorded. */
   decision: {
     kind: string;
@@ -286,6 +288,7 @@ export function managerView(m: ManagerState | undefined): ManagerView | null {
     label,
     reason,
     proposal: m.proposal,
+    mode: m.mode,
     decision,
   });
   switch (m.state) {

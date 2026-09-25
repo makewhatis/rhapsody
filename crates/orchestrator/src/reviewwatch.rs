@@ -3167,8 +3167,17 @@ impl Orchestrator {
                 // enforced without a second, comment-less escalation path here.
                 if self.manager_review_authority() == rhapsody_config::teams::ReviewAuthority::Act {
                     // STUDIO-1018 (§9): the manager is authoritative, so the legacy turn is not
-                    // invoked. The reconciliation sweep already routed this stall to the manager's
-                    // intervention; defer here exactly as a plan would, and let the manager decide.
+                    // invoked. Because that turn is what used to yield a `review_escalated`
+                    // divergence for the reconciliation sweep to route, the manager would never be
+                    // started at the threshold — the review half stops here, the author half is
+                    // refused (`author_round_budget_spent`), and the pull request freezes with
+                    // nothing telling a human why. Signal the stall directly, through the same
+                    // routing/dedup path the sweep uses, so an intervention is created (or merged)
+                    // exactly once. Deferral and the fail-closed gates still apply in the pump.
+                    //
+                    // MUTATION: drop this call and `act_mode_starts_the_manager_at_the_threshold`
+                    // reds (no intervention is created; the pull request freezes).
+                    self.signal_manager_threshold_stall(&churn_key(pr));
                     report.deferred += 1;
                     self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
                     return;
@@ -10342,8 +10351,8 @@ mod tests {
 
     /// **Acceptance (STUDIO-1018, §9).** In `act` mode the manager's intervention lifecycle is
     /// authoritative, so the legacy STUDIO-956 SHIP|ESCALATE turn is NOT invoked: the threshold no
-    /// longer produces an adjudication plan. MUTATION: drop the `manager_is_authoritative` guard and
-    /// this reds (`report.adjudicate.len() == 1`).
+    /// longer produces an adjudication plan. MUTATION: drop the `ReviewAuthority::Act` branch in
+    /// `service_review_pr` and this reds (`report.adjudicate.len() == 1`).
     #[test]
     fn act_mode_suppresses_the_legacy_adjudication() {
         for authority in [
@@ -10377,6 +10386,56 @@ mod tests {
                 "nothing reached a worker either way"
             );
         }
+    }
+
+    /// **Acceptance (STUDIO-1018, §9), review B1.** Under `act` the manager is authoritative at the
+    /// adjudication threshold, but the legacy turn — which used to yield the `review_escalated`
+    /// divergence the reconciliation sweep routes — is not invoked, so the watcher must signal the
+    /// stall itself. Without that call the review half stops at the threshold, the author half is
+    /// refused (`author_round_budget_spent`), and the pull request freezes with nothing telling a
+    /// human why.
+    ///
+    /// MUTATION: drop the `signal_manager_threshold_stall` call and this reds — no intervention.
+    #[test]
+    fn act_mode_starts_the_manager_at_the_threshold() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.adjudicate.len(), 0, "no legacy adjudication");
+        let key = churn_key(&coord(12));
+        let active = o
+            .store()
+            .active_manager_intervention(&key)
+            .expect("read")
+            .expect("act mode must start the manager at the threshold");
+        assert_eq!(active.mode, rhapsody_store::MANAGER_MODE_ACT);
+        assert_eq!(active.state, rhapsody_store::MANAGER_INTERVENTION_QUEUED);
+        assert!(
+            active.stall_kinds.iter().any(|k| k == "review_escalated"),
+            "the threshold stall is the manager's, got {:?}",
+            active.stall_kinds
+        );
+
+        // §10.2/§9: with a gate refusing (a drain), the reconciliation sweep keeps the stall on the
+        // human feed, re-kinded `manager_deferred`, carrying the manager's own sentence. A
+        // watcher-originated stall must not be silent on the feed just because no divergence
+        // produced it.
+        o.drain.arm((o.now)(), crate::drain::DrainReason::Operator);
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one row, got {found:?}");
+        assert_eq!(
+            found[0].kind,
+            crate::reviewreconcile::DivergenceKind::ManagerDeferred
+        );
+        assert_eq!(found[0].reason, "manager deferred: drain");
     }
 
     /// **The threshold is not a failure when the loop CONVERGED.** A pull request whose last allowed

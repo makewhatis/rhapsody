@@ -95,6 +95,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use rhapsody_config::teams::ReviewAuthority;
 use rhapsody_store::{
     REVIEW_STATUS_APPROVED, REVIEW_STATUS_DROPPED, REVIEW_STATUS_IN_FLIGHT,
     REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED, REVIEW_STATUS_TRUNCATED, RunFilter,
@@ -1152,6 +1153,48 @@ impl Orchestrator {
             if let Some((_, reason)) = routing.surfaced.iter().find(|(k, _)| k == &pr) {
                 d.kind = DivergenceKind::ManagerDeferred;
                 d.reason = reason.clone();
+            }
+        }
+        // STUDIO-1018 (§9/§10.2): under `act` the review watcher signals the threshold stall to the
+        // manager DIRECTLY (there is no legacy adjudication to yield a `review_escalated` divergence
+        // for this sweep to route), so the manager's own deferral would otherwise have no row on the
+        // human feed. Derive it from the intervention: a non-terminal `act` intervention whose §10.2
+        // launch gates refuse is a deferred manager, and the feed must say so with the manager's own
+        // sentence, exactly as a routed stall does. An intervention whose gates PASS is not surfaced
+        // — the manager owns it, and its stall would be re-detected when it is terminal. Skipped when
+        // the pull request already has a divergence, keeping the sweep's one-row-per-pull-request rule.
+        if self.manager_review_authority() == ReviewAuthority::Act {
+            let reported: Vec<String> = found.iter().map(|d| d.pr.to_ascii_lowercase()).collect();
+            for row in self
+                .store()
+                .load_manager_interventions()
+                .unwrap_or_default()
+            {
+                if row.mode != rhapsody_store::MANAGER_MODE_ACT
+                    || rhapsody_store::manager_intervention_is_terminal(&row.state)
+                {
+                    continue;
+                }
+                if reported.contains(&row.pr.to_ascii_lowercase()) {
+                    continue;
+                }
+                if let Some(reason) = self.manager_surface_reason(self.manager_gate_env(&row.pr)) {
+                    found.push(Divergence {
+                        pr: row.pr.clone(),
+                        kind: DivergenceKind::ManagerDeferred,
+                        ticket: String::new(),
+                        reviewer: String::new(),
+                        stale_secs: 0,
+                        auto_merge_reason: None,
+                        capacity_held: None,
+                        capacity_unreadable: None,
+                        adjudicated_head: String::new(),
+                        current_head: String::new(),
+                        rounds: 0,
+                        findings: Vec::new(),
+                        reason,
+                    });
+                }
             }
         }
         self.set_review_divergences(found);

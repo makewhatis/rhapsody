@@ -255,9 +255,24 @@ impl Orchestrator {
             .filter(|b| b.is_stopped())
             .map(|b| b.stopped)
         {
+            // The stop is GENERATION-scoped, but the MODE the console reports must be the one this
+            // pull request's interventions were created under: the current config token can have
+            // moved on since a mid-flight flip. Fall back to the current token when there is no row
+            // to read it from.
+            let mode = self
+                .store()
+                .load_manager_interventions()
+                .ok()
+                .and_then(|rows| {
+                    rows.iter()
+                        .rev()
+                        .find(|r| r.pr.eq_ignore_ascii_case(pr))
+                        .map(|r| r.mode.clone())
+                })
+                .unwrap_or_else(|| self.manager_mode_token().to_string());
             return Some(ManagerStateRow {
                 state: "stopped".to_string(),
-                mode: self.manager_mode_token().to_string(),
+                mode,
                 reason,
                 ..ManagerStateRow::default()
             });
@@ -1903,5 +1918,42 @@ mod tests {
         watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
         let view = o.review_console_list().expect("list");
         assert!(view.reviews[0].manager.is_none(), "off adds nothing");
+    }
+
+    // STUDIO-1018 (§9): the derived `stopped` state reports the MODE the pull request's
+    // interventions ran under, not the current config token — a mid-flight `act`→`advise` flip must
+    // not relabel a stopped `act` generation as `advise`. MUTATION: report
+    // `self.manager_mode_token()` and this reds.
+    #[test]
+    fn a_stopped_generation_reports_the_rows_mode_not_the_current_token() {
+        let mut o = ticketless();
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Advise;
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        let pr = "makewhatis/rhapsody#12";
+        o.store().ensure_review_generation(pr).expect("generation");
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                id: "iv-1".to_string(),
+                pr: pr.to_string(),
+                generation: 1,
+                stall_kinds: vec!["review_escalated".to_string()],
+                mode: rhapsody_store::MANAGER_MODE_ACT.to_string(),
+                state: rhapsody_store::MANAGER_INTERVENTION_ESCALATED.to_string(),
+                ..rhapsody_store::ManagerInterventionRow::default()
+            })
+            .expect("save intervention");
+        o.store()
+            .stop_manager_generation(pr, "the run budget is spent")
+            .expect("stop");
+
+        let view = o.review_console_list().expect("list");
+        let manager = view.reviews[0].manager.as_ref().expect("manager state");
+        assert_eq!(manager.state, "stopped");
+        assert_eq!(
+            manager.mode, "act",
+            "the row's mode, not the current `advise` token"
+        );
+        assert_eq!(manager.reason, "the run budget is spent");
     }
 }

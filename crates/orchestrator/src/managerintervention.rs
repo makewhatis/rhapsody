@@ -34,7 +34,7 @@ use rhapsody_store::{
     MANAGER_INTERVENTION_RUNNING, MANAGER_INTERVENTION_STALE, MANAGER_INTERVENTION_SUPERSEDED,
     MANAGER_INTERVENTION_VALIDATED, MANAGER_MODE_ACT, MANAGER_MODE_ADVISE,
     MANAGER_PHASE_POST_THRESHOLD, MANAGER_PHASE_PRE_THRESHOLD, ManagerInterventionRow,
-    ManagerReservation, REVIEW_FINDING_OPEN,
+    ManagerReservation, REVIEW_FINDING_OPEN, manager_intervention_is_terminal,
 };
 
 use crate::managerdecision::{
@@ -414,6 +414,69 @@ impl Orchestrator {
         used >= self.manager_max_runs_per_generation()
     }
 
+    /// §9: whether an `advise` proposal has ALREADY been recorded for `(pr, generation)` covering
+    /// EVERY one of `kinds` — the "one shadow run per stall" rule. A proposal is terminal
+    /// (`proposed`), so it is never the ACTIVE intervention and [`plan_enqueue`] would otherwise
+    /// create a fresh one on every sweep a persistent stall is re-detected: one stall would buy a
+    /// new shadow run, a new proposal and a new room post each sweep, up to the whole shadow budget.
+    ///
+    /// Scoped to the generation and to the stall KINDS, so a genuinely new stall on the same
+    /// generation still earns its own proposal. A store read failure is fail-closed for CREATION
+    /// (treat as already recorded): a shadow run is not worth an unbounded retry loop against an
+    /// unreadable store, and creation would fail there anyway.
+    pub(crate) fn manager_advise_stall_recorded(
+        &self,
+        pr: &str,
+        generation: i64,
+        kinds: &[String],
+    ) -> bool {
+        let Ok(rows) = self.store().load_manager_interventions() else {
+            return true;
+        };
+        let mut covered: Vec<&str> = Vec::new();
+        for row in rows.iter().filter(|r| {
+            r.pr.eq_ignore_ascii_case(pr)
+                && r.generation == generation
+                && r.mode == MANAGER_MODE_ADVISE
+                && manager_intervention_is_terminal(&r.state)
+        }) {
+            for kind in &row.stall_kinds {
+                if !covered.contains(&kind.as_str()) {
+                    covered.push(kind.as_str());
+                }
+            }
+        }
+        !kinds.is_empty() && kinds.iter().all(|k| covered.contains(&k.as_str()))
+    }
+
+    /// §9: under `act` the review watcher owns the adjudication boundary but the MANAGER owns the
+    /// threshold stall, and — because the legacy turn is not invoked — there is no legacy
+    /// adjudication to yield a `review_escalated` divergence for the reconciliation sweep to route.
+    /// The watcher signals that stall HERE, through the same routing and dedup path the sweep uses,
+    /// so exactly one intervention is created or merged and every budget/concurrency rule still
+    /// applies. Deliberately silent when the manager is not authoritative (`off`/`advise`): those
+    /// modes keep today's turn and route through the sweep's own divergences.
+    pub(crate) fn signal_manager_threshold_stall(&self, pr: &str) {
+        if self.manager_review_authority() != ReviewAuthority::Act {
+            return;
+        }
+        self.route_stalls_to_manager(&[Divergence {
+            pr: pr.to_string(),
+            kind: DivergenceKind::ReviewEscalated,
+            ticket: String::new(),
+            reviewer: String::new(),
+            stale_secs: 0,
+            auto_merge_reason: None,
+            capacity_held: None,
+            capacity_unreadable: None,
+            adjudicated_head: String::new(),
+            current_head: String::new(),
+            rounds: 0,
+            findings: Vec::new(),
+            reason: String::new(),
+        }]);
+    }
+
     pub(crate) fn manager_max_interventions(&self) -> i64 {
         self.teams
             .as_ref()
@@ -528,6 +591,15 @@ impl Orchestrator {
                     // funded — and, critically, the live generation is NOT stopped.
                     if mode == MANAGER_MODE_ADVISE
                         && self.manager_shadow_budget_spent(&pr, generation)
+                    {
+                        continue;
+                    }
+                    // §9: a proposal already recorded for this stall is the whole point — it is
+                    // terminal, so it never shows up as the active intervention and would otherwise
+                    // be re-created (with a fresh shadow run) on every sweep. Only a stall whose
+                    // kinds no recorded proposal covers creates a new one.
+                    if mode == MANAGER_MODE_ADVISE
+                        && self.manager_advise_stall_recorded(&pr, generation, &kinds)
                     {
                         continue;
                     }
@@ -2441,6 +2513,59 @@ mod tests {
         );
     }
 
+    // §9 "when the mode changes mid-flight", the `validated` case: an act decision that has NOT
+    // begun applying when the authority flips to `advise` must still end `superseded` — otherwise it
+    // holds the one-active slot forever, blocking any proposal for that pull request, and would
+    // apply on a flip back to `act`. It must run no effect and must NOT become a proposal.
+    //
+    // The stored decision is deliberately UNPARSEABLE: the revalidation pass leaves such a row where
+    // it is (`revalidate_saved_manager_decisions`, "a stored decision that no longer parses is left
+    // where it is"), so `pump_manager_applying` is what must supersede it. MUTATION: drop the
+    // `supersede_validated_act_interventions` call and this reds (the row stays `validated`).
+    #[test]
+    fn a_validated_act_decision_is_superseded_when_the_mode_flips_to_advise() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        seed_open_finding(&o, "alice:F1");
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let requests = install_applier(&mut o);
+        o.store()
+            .save_manager_intervention(ManagerInterventionRow {
+                id: "iv-1".to_string(),
+                pr: PR_KEY.to_string(),
+                generation: 1,
+                stall_kinds: vec!["review_escalated".to_string()],
+                mode: MANAGER_MODE_ACT.to_string(),
+                state: MANAGER_INTERVENTION_VALIDATED.to_string(),
+                decision_json: "not a rhapsody-manager-decision block".to_string(),
+                decision_head: "deadbeef".to_string(),
+                ..ManagerInterventionRow::default()
+            })
+            .expect("save validated row");
+
+        o.teams.as_mut().expect("teams").manager.review_authority = ReviewAuthority::Advise;
+        o.pump_manager_interventions();
+
+        assert_eq!(
+            state_of(&o, "iv-1"),
+            MANAGER_INTERVENTION_SUPERSEDED,
+            "a validated act decision is superseded, not applied, once the authority is gone"
+        );
+        assert!(
+            requests.lock().expect("apply lock").is_empty(),
+            "nothing reached the applier"
+        );
+        let row = o
+            .store()
+            .manager_intervention("iv-1")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.mode, MANAGER_MODE_ACT, "the row keeps its own mode");
+        // The one-active slot is freed, so a proposal can now be created for the pull request.
+        assert!(active(&o).is_none(), "the superseded row frees the slot");
+    }
+
     // Evidence moving at the same head — the `route.fix` revision the decision named is resolved —
     // refuses activation as `stale` (§15.4, "Activation boundary": a same-head blocking review).
     #[test]
@@ -3805,6 +3930,72 @@ mod tests {
                 .is_stopped(),
             "a spent shadow budget never stops the live generation"
         );
+    }
+
+    /// **Acceptance (STUDIO-1018, §9 "one per stall"), review B2.** A proposal is TERMINAL, so it
+    /// never appears as the ACTIVE intervention: without a recorded-proposal guard a persistent
+    /// stall is re-detected on every sweep and buys a fresh shadow run, proposal and room post each
+    /// time, up to the whole shadow budget. One stall must buy exactly one proposal.
+    ///
+    /// MUTATION: drop the `manager_advise_stall_recorded` guard and this reds (twenty sweeps create
+    /// twenty proposals).
+    #[test]
+    fn a_persistent_stall_buys_one_proposal() {
+        let dir = TempDir::new();
+        let room = Arc::new(rhapsody_config::room::LocalRoom::new(dir.child("room")));
+        let (mut o, _dispatched) = orch(ReviewAuthority::Advise);
+        o.teams_room = Some(Arc::clone(&room));
+        let id = propose(&mut o);
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_PROPOSED);
+
+        // The same stall is re-detected on every sweep. A terminal proposal is invisible to
+        // `active_manager_intervention`, so each sweep would otherwise fund a new shadow run.
+        for _ in 0..20 {
+            o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)]);
+            o.pump_manager_interventions();
+        }
+
+        let rows = o.store().load_manager_interventions().expect("rows");
+        let advises: Vec<&ManagerInterventionRow> = rows
+            .iter()
+            .filter(|r| r.mode == MANAGER_MODE_ADVISE)
+            .collect();
+        assert_eq!(
+            advises.len(),
+            1,
+            "one stall buys one proposal, got {}",
+            advises.len()
+        );
+        assert_eq!(advises[0].id, id);
+        assert_eq!(advises[0].state, MANAGER_INTERVENTION_PROPOSED);
+        assert_eq!(
+            room_lines(&room).len(),
+            1,
+            "and one room post, not one per sweep"
+        );
+    }
+
+    /// §9: in `advise` the manager is NOT authoritative — today's STUDIO-956 turn still is — so a
+    /// shadow proposal never ADOPTS a stall. The signal must stay on the human feed exactly as it
+    /// would with `off`, with only the proposal added (to the room and the console).
+    ///
+    /// MUTATION: drop the `mode == ADVISE` reset in `route_stalls_to_manager` and this reds
+    /// (`adopted` names the pull request, so the reconciliation sweep would drop its escalation).
+    #[test]
+    fn advise_never_adopts_a_stall_from_the_human_feed() {
+        let (o, _dispatched) = orch(ReviewAuthority::Advise);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+        let routing =
+            o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)]);
+        assert!(
+            routing.adopted.is_empty(),
+            "advise must not adopt the stall: {routing:?}"
+        );
+        let rows = o.store().load_manager_interventions().expect("rows");
+        assert_eq!(rows.len(), 1, "the shadow run is still enqueued");
+        assert_eq!(rows[0].mode, MANAGER_MODE_ADVISE);
     }
 
     /// §9/§11.1: the maintainer's later action on the PR is recorded once as the proposal's outcome —
