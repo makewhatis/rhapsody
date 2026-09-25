@@ -2679,9 +2679,15 @@ mod tests {
     }
 
     // §7.8 / §15.4 (Exchange accounting): only a non-final post-threshold RERUN/ROUTE writes an
-    // exchange authorization. An APPROVE (or an ESCALATE — the final intervention's only allowed
-    // decisions) creates none. MUTATION: create an authorization for every post-threshold
-    // activation and the APPROVE assert reds.
+    // exchange authorization. A non-final APPROVE, a FINAL APPROVE, and an ESCALATE each create
+    // none. MUTATION: create an authorization for every post-threshold activation and the APPROVE
+    // asserts red.
+    //
+    // The `!row.is_final` guard at `managerapply.rs`'s exchange arm is defence in depth rather than
+    // the thing these asserts protect: `validate_final` confines a final intervention to APPROVE or
+    // ESCALATE, and both have an empty exchange `kind`, so removing that guard changes nothing
+    // observable. Keeping it is still correct — a future variant that IS an exchange must not slip
+    // through on a final allocation.
     #[test]
     fn a_final_intervention_approve_and_escalate_write_no_exchange() {
         // A configured threshold with one answered exchange charged makes this post-threshold, so
@@ -2749,6 +2755,72 @@ mod tests {
                 .expect("exchanges")
                 .is_empty(),
             "an APPROVE creates no authorization"
+        );
+
+        // A FINAL intervention writes none: `max_interventions = 1` makes the first reservation the
+        // generation's last, so the row is `final: true` when it approves.
+        let (mut o3, _) = orch(ReviewAuthority::Act);
+        o3.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 1;
+        o3.teams.as_mut().expect("teams").manager.max_interventions = 1;
+        o3.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 12)),
+            1,
+        );
+        pass_self_test(&o3);
+        prime_holds(&o3);
+        seed_approved_review(&o3, "approve");
+        seed_open_finding(&o3, "alice:F1");
+        install_applier(&mut o3);
+        let _id3 = launch_running(&mut o3);
+        o3.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        o3.pump_manager_interventions();
+        assert!(
+            o3.store()
+                .manager_exchanges(PR_KEY)
+                .expect("exchanges")
+                .is_empty(),
+            "a final APPROVE creates no authorization"
+        );
+
+        // An ESCALATE writes none either — it is not an exchange.
+        let (mut o4, _) = orch(ReviewAuthority::Act);
+        o4.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 1;
+        o4.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 12)),
+            1,
+        );
+        pass_self_test(&o4);
+        prime_holds(&o4);
+        seed_watch(&o4, "adopt:STUDIO-1");
+        install_applier(&mut o4);
+        let _id4 = launch_running(&mut o4);
+        let escalate = decision_text(
+            r#"{"decision":"ESCALATE","head":"deadbeef","evidence_rev":0,
+                "escalate":{"question":"which base?","checked":"compared both diffs"},
+                "rationale":"needs a human"}"#,
+        );
+        o4.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&escalate)),
+        );
+        o4.pump_manager_interventions();
+        assert!(
+            o4.store()
+                .manager_exchanges(PR_KEY)
+                .expect("exchanges")
+                .is_empty(),
+            "an ESCALATE creates no authorization"
         );
     }
 

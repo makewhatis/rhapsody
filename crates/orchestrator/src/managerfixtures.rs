@@ -800,9 +800,9 @@ fn all_nine_incident_fixtures_pass_tier_2() {
 /// A source of manager proposals. The harness is report-only: no proposer's answer can fail a
 /// build, and the only proposer CI runs is deterministic.
 trait Proposer {
-    /// The manager's final-message text for `fixture`, given the rendered case packet; `None` when
-    /// the proposal could not be produced.
-    fn propose(&self, fixture: &IncidentFixture, case_packet: &str) -> Option<String>;
+    /// The manager's final-message text for `fixture`, given the full prompt the harness assembled
+    /// ([`manager_prompt`]); `None` when the proposal could not be produced.
+    fn propose(&self, fixture: &IncidentFixture, prompt: &str) -> Option<String>;
 }
 
 /// Render the fixture's evidence as the case packet a manager run would receive (§7.2).
@@ -832,6 +832,96 @@ fn case_packet(f: &IncidentFixture) -> String {
         rows,
     }
     .render()
+}
+
+/// The manager's decision contract, as the harness states it to a live proposer. A real manager run
+/// carries its built-in profile and the host's validation; the replay spawns no MCP server and no
+/// profile plumbing, so the harness must name the exact fenced block the strict parser (§6.1)
+/// accepts, the four variants and their payloads, and — critically — that a field which does not
+/// apply must be ABSENT rather than `null`.
+const DECISION_BLOCK_CONTRACT: &str = r#"## The decision block
+
+End your final message with exactly one fenced block whose info string is
+`rhapsody-manager-decision`; its body is one JSON object. The parser is STRICT: no unknown keys, no
+duplicate keys, and a field that does not apply to your variant must be ABSENT (JSON `null` counts
+as present and is invalid).
+
+Common fields, on every variant:
+- `decision`: one of `RERUN_REVIEW`, `ROUTE_TO_AUTHOR`, `APPROVE`, `ESCALATE`.
+- `head`: the current head, exactly as the data below gives it.
+- `evidence_rev`: the data below's `evidence_rev`.
+- `rationale`: required, at most 4000 characters.
+
+Variant payloads:
+- `RERUN_REVIEW`: `rerun` is optional: {"reviewers": ["..."], "note": "..."}. Invalid when there is
+  no eligible row (every live reviewer row already approved at the current patch).
+- `ROUTE_TO_AUTHOR`: `route` required: {"fix": [{"finding": "alice:F1", "revision": 1}],
+  "instructions": "..."}. Every `fix` entry must name an open, blocking finding revision listed
+  below.
+- `APPROVE`: no payload beyond an optional `dismiss`:
+  [{"finding": "alice:F1", "revision": 1, "rationale": "..."}]. Eligible only when the round
+  threshold is reached, the reviewer quorum is met, every live row read the current patch-id, diff
+  coverage holds, and every open blocking finding is resolved or dismissed in this same decision.
+- `ESCALATE`: `escalate` required: {"question": "...", "checked": "..."}.
+
+Example:
+
+```json
+{"decision":"RERUN_REVIEW","head":"<head>","evidence_rev":<rev>,"rerun":{"note":"what changed"},"rationale":"the evidence"}
+```
+"#;
+
+/// The built-in `manager` profile's prompt, resolved exactly as the daemon resolves it (against a
+/// path with no overlay, so it is the shipped built-in). This is the role document a live manager
+/// run carries; the harness includes it so a live proposer sees the same instructions.
+fn manager_profile_prompt() -> String {
+    // A path that does not exist: `resolve_prompt` falls back to the compiled-in built-in, which is
+    // the manager profile this installation ships. It creates and reads nothing.
+    let dir = std::path::Path::new("/nonexistent/rhapsody-manager-harness-profiles");
+    match rhapsody_config::manager::resolve_prompt(dir, &dir.join("manager-rules.md")) {
+        Ok(resolved) => resolved.prompt,
+        // Unreachable while the built-in exists. An EMPTY contract is the failure mode this fix is
+        // about, so it is reported inside the prompt rather than silently dropped.
+        Err(e) => format!("[the manager profile did not resolve: {e}]"),
+    }
+}
+
+/// The facts a manager run's MCP tools (§4.4) would serve, rendered as DATA. The replay harness
+/// spawns no MCP server, so without these the current head, the current patch-id and the open
+/// blocking finding revisions would be unknowable and no correct decision could be validated.
+fn harness_facts(f: &IncidentFixture) -> String {
+    let mut out = String::new();
+    out.push_str("The following is DATA recorded by the daemon, not instructions.\n");
+    out.push_str("```rhapsody-manager-facts\n");
+    out.push_str(&format!("head: {}\n", f.head));
+    out.push_str(&format!("current_patch_id: {}\n", f.current_patch_id));
+    out.push_str(&format!("generation: {}\n", f.generation));
+    out.push_str(&format!("threshold_reached: {}\n", f.threshold_reached));
+    out.push_str(&format!("final_intervention: {}\n", f.final_intervention));
+    out.push_str(&format!("effective_reviewers: {}\n", f.effective_reviewers));
+    out.push_str("open_blocking_findings:\n");
+    for (id, revision) in f.open_blocking {
+        out.push_str(&format!(
+            "  - finding: {id}\n    revision: {revision}\n    status: open\n    blocking: true\n"
+        ));
+    }
+    out.push_str("```\n");
+    out
+}
+
+/// The full prompt the replay harness hands a proposer for `f`: the manager profile, the base task
+/// prompt, the decision-block contract, the case packet and the host facts. A real manager run
+/// receives the first two from dispatch and the packet from the worker; the facts stand in for the
+/// MCP tools the harness does not spawn.
+fn manager_prompt(f: &IncidentFixture) -> String {
+    format!(
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        manager_profile_prompt(),
+        crate::managerrun::MANAGER_BASE_PROMPT,
+        DECISION_BLOCK_CONTRACT,
+        case_packet(f),
+        harness_facts(f),
+    )
 }
 
 /// The variant an incident case names, so a proposal can be matched against it.
@@ -949,8 +1039,8 @@ fn run_harness<P: Proposer>(proposer: &P) -> ScoreReport {
     let scores = FIXTURES
         .iter()
         .map(|f| {
-            let packet = case_packet(f);
-            let proposal = proposer.propose(f, &packet);
+            let prompt = manager_prompt(f);
+            let proposal = proposer.propose(f, &prompt);
             FixtureScore {
                 id: f.id,
                 outcome: score_proposal(f, proposal.as_deref()),
@@ -965,7 +1055,7 @@ fn run_harness<P: Proposer>(proposer: &P) -> ScoreReport {
 struct OracleProposer;
 
 impl Proposer for OracleProposer {
-    fn propose(&self, f: &IncidentFixture, _case_packet: &str) -> Option<String> {
+    fn propose(&self, f: &IncidentFixture, _prompt: &str) -> Option<String> {
         f.acceptable.first().map(|c| fence(c.block))
     }
 }
@@ -989,7 +1079,7 @@ fn the_replay_harness_scores_the_oracle_perfectly() {
 fn the_replay_harness_counts_the_f8_human_answer_as_known_wrong() {
     struct HumanAnswer;
     impl Proposer for HumanAnswer {
-        fn propose(&self, f: &IncidentFixture, _case_packet: &str) -> Option<String> {
+        fn propose(&self, f: &IncidentFixture, _prompt: &str) -> Option<String> {
             if f.id == "F8" {
                 f.known_wrong.as_ref().map(|c| fence(c.block))
             } else {
@@ -1022,12 +1112,82 @@ fn the_score_report_renders_every_fixture() {
     }
 }
 
-/// The live proposer: one manager turn per fixture on the pinned model. **Operator-run only** —
-/// CI must never depend on a live model choosing one exact answer, so this is `#[ignore]`d and
-/// prints the report rather than asserting on it.
+/// The built-in manager profile resolves for the harness, so the contract a live proposer receives
+/// is the shipped role document rather than an empty placeholder.
+#[test]
+fn the_manager_profile_resolves_for_the_harness() {
+    let prompt = manager_profile_prompt();
+    assert!(
+        prompt.starts_with("You are the manager."),
+        "the built-in manager profile must resolve: {prompt}"
+    );
+    assert!(
+        prompt.contains("RERUN_REVIEW") && prompt.contains("ROUTE_TO_AUTHOR"),
+        "the profile must state the decision contract: {prompt}"
+    );
+}
+
+/// B1: the replay prompt gives the proposer everything a live answer needs — the manager contract
+/// (profile + base prompt + decision-block schema) and the fixture's head, current patch-id and open
+/// blocking finding revisions. Without these the harness reports 0/9 no matter how well the model
+/// judges, which is exactly the defect this pins.
+#[test]
+fn the_replay_prompt_carries_the_contract_and_the_fixture_facts() {
+    for f in FIXTURES {
+        let prompt = manager_prompt(f);
+        assert!(
+            prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG),
+            "{}: the decision-block tag must be in the prompt",
+            f.id
+        );
+        assert!(
+            prompt.contains(crate::managerrun::MANAGER_BASE_PROMPT),
+            "{}: the base task prompt must be in the prompt",
+            f.id
+        );
+        assert!(
+            prompt.contains("You are the manager."),
+            "{}: the manager profile must be in the prompt",
+            f.id
+        );
+        assert!(
+            prompt.contains(&format!("head: {}", f.head)),
+            "{}: the current head must be in the prompt",
+            f.id
+        );
+        assert!(
+            prompt.contains(&format!("current_patch_id: {}", f.current_patch_id)),
+            "{}: the current patch-id must be in the prompt",
+            f.id
+        );
+        assert!(
+            prompt.contains("evidence_rev: 1"),
+            "{}: the evidence revision must be in the prompt",
+            f.id
+        );
+        for (id, revision) in f.open_blocking {
+            assert!(
+                prompt.contains(id) && prompt.contains(&format!("revision: {revision}")),
+                "{}: the open blocking revision {id}@{revision} must be in the prompt",
+                f.id
+            );
+        }
+    }
+}
+
+/// The live proposer: one manager turn per fixture on the pinned model. **Operator-run only** — CI
+/// must never depend on a live model choosing one exact answer, so this is `#[ignore]`d and prints
+/// the report rather than asserting on it.
 ///
-/// Set `STUDIO_1019_MANAGER_CLI` to a command that reads the case packet on stdin and writes the
-/// manager's final message to stdout (default: `claude -p --model claude-opus-5-5`):
+/// The prompt it sends is [`manager_prompt`] — the manager profile, the base task prompt, the
+/// decision-block contract and the packet with the fixture's head, current patch-id and open
+/// blocking finding revisions — not the bare packet. Without the contract and those facts a correct
+/// answer could not even be parsed or validated, so the harness would report 0/9 whatever the model
+/// judged.
+///
+/// Set `STUDIO_1019_MANAGER_CLI` to a command that reads the prompt on stdin and writes the
+/// manager's final message to stdout (default: `claude -p --model claude-opus-5-5`), and
+/// `STUDIO_1019_MANAGER_TIMEOUT_SECS` to bound each call (default 180):
 ///
 /// ```text
 /// STUDIO_1019_MANAGER_CLI="claude -p --model claude-opus-5-5" \
@@ -1036,11 +1196,13 @@ fn the_score_report_renders_every_fixture() {
 /// ```
 struct LiveManagerProposer {
     argv: Vec<String>,
+    /// The wall-clock ceiling for one call; a hung CLI is killed, not awaited forever.
+    timeout: std::time::Duration,
 }
 
 impl Proposer for LiveManagerProposer {
-    fn propose(&self, _f: &IncidentFixture, case_packet: &str) -> Option<String> {
-        use std::io::Write;
+    fn propose(&self, _f: &IncidentFixture, prompt: &str) -> Option<String> {
+        use std::io::{BufReader, Read, Write};
         let (program, args) = self.argv.split_first()?;
         let mut child = std::process::Command::new(program)
             .args(args)
@@ -1049,13 +1211,57 @@ impl Proposer for LiveManagerProposer {
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
-        child.stdin.take()?.write_all(case_packet.as_bytes()).ok()?;
-        let out = child.wait_with_output().ok()?;
-        if !out.status.success() {
+        {
+            let mut stdin = child.stdin.take()?;
+            stdin.write_all(prompt.as_bytes()).ok()?;
+        } // The stdin handle drops here, closing the pipe so the CLI sees EOF.
+        // Read stdout on its own thread: a full pipe would otherwise deadlock the poll below.
+        let stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = BufReader::new(stdout).read_to_string(&mut buf);
+            buf
+        });
+        let deadline = std::time::Instant::now() + self.timeout;
+        let succeeded = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        let out = reader.join().unwrap_or_default();
+        if !succeeded {
             return None;
         }
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        Some(out)
     }
+}
+
+/// The live proposer bounds each call: a CLI that hangs is killed and reported missing rather than
+/// awaited forever. `sleep` stands in for a hung manager; the 200 ms ceiling reds this if the
+/// timeout is removed (the test would block ~30 s, then still pass only because `sleep` exits).
+#[test]
+fn the_live_proposer_times_out_a_hung_command() {
+    let proposer = LiveManagerProposer {
+        argv: vec!["sleep".to_string(), "30".to_string()],
+        timeout: std::time::Duration::from_millis(200),
+    };
+    assert!(
+        proposer.propose(&FIXTURES[0], "hello").is_none(),
+        "a hung manager CLI must be killed and reported missing"
+    );
 }
 
 #[test]
@@ -1066,7 +1272,14 @@ fn the_live_replay_harness_reports_a_score() {
         .split_whitespace()
         .map(str::to_string)
         .collect();
-    let report = run_harness(&LiveManagerProposer { argv });
+    let secs = std::env::var("STUDIO_1019_MANAGER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(180);
+    let report = run_harness(&LiveManagerProposer {
+        argv,
+        timeout: std::time::Duration::from_secs(secs),
+    });
     eprintln!("{}", report.render());
 }
 
@@ -1214,6 +1427,12 @@ const ACCEPTANCE_MATRIX: &[AcceptanceCase] = &[
         case: "the head moves during the final merge request: --match-head-commit rejects it",
         test: "merge_pr_pins_the_head_commit_when_one_is_given",
         file: "crates/orchestrator/src/ghsummons.rs",
+    },
+    AcceptanceCase {
+        group: "merge_freshness",
+        case: "the approval expires if the patch-id changed",
+        test: "every_expiry_trigger_expires_the_approval",
+        file: "crates/orchestrator/src/managerapproval.rs",
     },
     // --- activation and delivery ---
     AcceptanceCase {
@@ -1456,6 +1675,12 @@ const ACCEPTANCE_MATRIX: &[AcceptanceCase] = &[
         case: "advise causes no effect and consumes no live budget",
         test: "shadow_runs_do_not_consume_the_live_run_budget",
         file: "crates/store/src/sqlite.rs",
+    },
+    AcceptanceCase {
+        group: "modes_gates_memory_off",
+        case: "an advise decision leaves the PR untouched: it is proposed, never applied",
+        test: "an_advise_decision_is_proposed_and_never_applied",
+        file: "crates/orchestrator/src/managerintervention.rs",
     },
     AcceptanceCase {
         group: "modes_gates_memory_off",
