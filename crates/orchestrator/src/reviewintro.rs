@@ -1575,6 +1575,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_A.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -1633,6 +1634,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_B.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -1673,6 +1675,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_B.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         // The round threshold is reached: STUDIO-1004's answered-exchange count, one round here.
@@ -1715,6 +1718,7 @@ mod tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_A.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
