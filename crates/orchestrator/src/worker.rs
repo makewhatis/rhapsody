@@ -3939,6 +3939,77 @@ mod tests {
             "a manager run makes no tracker state move"
         );
     }
+
+    // STUDIO-1054 acceptance, item 2: the prompt a LIVE manager launch actually sends carries the
+    // decision contract. This drives the production path (`run_agent_attempt` → `run_manager_attempt`)
+    // with a non-empty packet, and reads back the turn-1 prompt the fake agent recorded. The mutation
+    // guard is the call site in `run_manager_attempt`: reverting it to `MANAGER_BASE_PROMPT` + packet
+    // alone — the pre-fix shape that caused the flux#87 incident — reds this. `managerrun`'s own
+    // builder test cannot see that regression, because it never drives the production path.
+    #[tokio::test]
+    async fn the_live_manager_launch_sends_the_decision_contract() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "ignored",
+            1,
+        );
+        d.manager_root = root.path.clone();
+        d.manager = Some(crate::managerrun::ManagerCheckout {
+            key: "pr:o/r#1@manager".to_string(),
+            run_timeout_ms: 1234,
+            case_packet: "CASE PACKET DATA".to_string(),
+        });
+        let key = "pr:o/r#1@manager";
+        let iss = Issue {
+            id: key.to_string(),
+            identifier: key.to_string(),
+            ..Default::default()
+        };
+        let (_last, _decl, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "manager attempt clean: {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG),
+            "the live launch must name the block tag: {prompt}"
+        );
+        for verb in ["RERUN_REVIEW", "ROUTE_TO_AUTHOR", "APPROVE", "ESCALATE"] {
+            assert!(
+                prompt.contains(verb),
+                "the live launch must name {verb}: {prompt}"
+            );
+        }
+        for field in ["evidence_rev", "rationale", "dismiss", "route", "escalate"] {
+            assert!(
+                prompt.contains(field),
+                "the live launch must state the {field} field: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("teams_retain"),
+            "the live launch must tell the run its only write is teams_retain: {prompt}"
+        );
+        assert!(
+            prompt.contains("no `teams_post`"),
+            "the live launch must say teams_post is not registered: {prompt}"
+        );
+        assert!(
+            prompt.contains("CASE PACKET DATA"),
+            "the case packet must ride with the contract: {prompt}"
+        );
+    }
 }
 
 #[cfg(test)]

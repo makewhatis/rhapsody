@@ -295,6 +295,21 @@ describe("managerView", () => {
     expect(stopped?.reason).toBe("manager run budget exhausted");
   });
 
+  // STUDIO-1054 item 4: an invalid-output exhaustion must be visible in the console, not just the
+  // log — the operator only has the proposal surface, so a bare "Manager exhausted" hides why.
+  it("shows an exhausted manager with the reason it gave up", () => {
+    const view = managerView(
+      managed({
+        state: "exhausted",
+        mode: "advise",
+        reason: "the manager's output didn't parse: ZeroOrManyBlocks, 3 attempts",
+        proposal: false,
+      }),
+    );
+    expect(view?.label).toBe("Manager exhausted");
+    expect(view?.reason).toBe("the manager's output didn't parse: ZeroOrManyBlocks, 3 attempts");
+  });
+
   // §9: an `advise` run is advisory — today's review call remains authoritative — so the console
   // needs the mode to avoid claiming authority the manager does not have.
   it("carries the mode so an advisory run is not read as authoritative", () => {
