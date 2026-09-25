@@ -406,10 +406,14 @@ impl Orchestrator {
             .review_divergences()
             .iter()
             .any(|d| d.capacity_unreadable.is_some());
-        let review_unexplained = self
-            .review_divergences()
-            .iter()
-            .any(|d| d.capacity_held.is_none() && d.capacity_unreadable.is_none());
+        let review_unexplained = self.review_divergences().iter().any(|d| {
+            d.capacity_held.is_none()
+                && d.capacity_unreadable.is_none()
+                // STUDIO-964: a held pull request is an EXPLAINED wait — the sweep's own row says a
+                // person holds it — so the generic "nothing has reported it blocked" string is false
+                // for it and must not light. Its own row on `/api/v1/state` is the report.
+                && d.kind != crate::reviewreconcile::DivergenceKind::HeldForHuman
+        });
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {

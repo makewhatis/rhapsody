@@ -193,6 +193,20 @@ pub enum DivergenceKind {
     /// Divergence (b): every required reviewer approved the current head and the pull request is
     /// still open, with `review.auto_merge` on. STUDIO-881's draft loop and the `BEHIND` decline.
     ApprovedStillOpen,
+    /// A pull request whose origin ticket wears the `rhapsody:human` hold, whose every live row is
+    /// APPROVED and whose repo has `review.auto_merge` on — the exact shape the auto-merge gate now
+    /// refuses (STUDIO-964). Nobody owes a run; a PERSON owes the next move, and the daemon will not
+    /// merge it.
+    ///
+    /// STUDIO-949 deliberately silenced a held ticket in this sweep, because a held ticket sitting
+    /// in Todo is working as intended. That silence is wrong for THIS shape: the pull request has
+    /// cleared every gate and the only thing between it and `main` is the hold, so the operator
+    /// must be told the wait is deliberate rather than left to infer it from an empty board. It is
+    /// its own kind — not an [`DivergenceKind::ApprovedStillOpen`] — so it is never routed to the
+    /// manager and never pages the human a second time (the breaker's own notification, or the
+    /// escalation, already did). Emitted only while adjudication is enabled, so an install that
+    /// never set `review.adjudicate_after_rounds` is byte-identical.
+    HeldForHuman,
     /// Not a divergence of intent and activity but of a BOUND: the pull request's REVIEW round
     /// budget ([`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`] × reviewers) is spent, so no
     /// further review round will be dispatched and nothing will resume on its own (STUDIO-956).
@@ -266,6 +280,7 @@ impl DivergenceKind {
             DivergenceKind::AuthorTokenCeilingStopped => "author_token_ceiling_stopped",
             DivergenceKind::ReviewTokenCeilingStopped => "review_token_ceiling_stopped",
             DivergenceKind::ApprovedStillOpen => "approved_still_open",
+            DivergenceKind::HeldForHuman => "held_for_human",
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
             DivergenceKind::ReviewEscalated => "review_escalated",
             DivergenceKind::ReviewShipped => "review_shipped",
@@ -294,6 +309,10 @@ impl DivergenceKind {
             }
             DivergenceKind::ApprovedStillOpen => {
                 "every required reviewer approved and the pull request is still open"
+            }
+            DivergenceKind::HeldForHuman => {
+                "every required reviewer approved and the pull request is still open, but its origin \
+                 ticket is held for a human — the daemon will not merge it"
             }
             DivergenceKind::RoundBudgetExhausted => {
                 "the per-pull-request review round budget is spent, so no further review round \
@@ -491,6 +510,21 @@ pub(crate) struct RowFacts {
     pub reviewer_run: Option<RunMoment>,
     /// The newest run of `ticket`.
     pub ticket_run: Option<RunMoment>,
+}
+
+/// What one HELD pull request's live rows say about its merge gate (STUDIO-964). Only used by
+/// [`Orchestrator::reconcile_review_divergence`] to decide whether the hold is the only thing
+/// keeping an otherwise-mergeable pull request open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldPrFacts {
+    /// The origin ticket wearing the hold, for the reported divergence.
+    ticket: String,
+    /// Whether `teams.review.auto_merge` is on for the repo this pull request belongs to.
+    auto_merge: bool,
+    /// Live (`open`, not `dropped`) rows.
+    live_rows: usize,
+    /// Of those, the ones NOT approved. Zero means every live reviewer approved the head.
+    unapproved: usize,
 }
 
 /// Everything known about ONE pull request this sweep. Grouped per pull request rather than per row
@@ -878,10 +912,35 @@ impl Orchestrator {
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
+        // STUDIO-964: a held pull request is dropped from the stall rules (the `continue` below),
+        // but a held pull request whose merge gate is otherwise CLEAR is not "nothing to report" —
+        // the hold is the reason it is waiting, and the operator must be told rather than left to
+        // read an empty board as converged. Collected here; reported after the rules run.
+        let mut held_order: Vec<PrCoord> = Vec::new();
+        let mut held_by_pr: HashMap<PrCoord, HeldPrFacts> = HashMap::new();
         for row in &rows {
             if let Some(ticket) = origin_ticket(&row.introduced_by)
                 && labelled.contains(&ticket.to_ascii_lowercase())
             {
+                let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+                let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
+                let entry = held_by_pr.entry(pr.clone()).or_insert_with(|| {
+                    held_order.push(pr.clone());
+                    HeldPrFacts {
+                        ticket: ticket.to_string(),
+                        auto_merge,
+                        live_rows: 0,
+                        unapproved: 0,
+                    }
+                });
+                // Only rows that still exist and have not been dropped can hold a merge back, so
+                // only they decide whether this is the merge-gate shape.
+                if row.open && row.status != REVIEW_STATUS_DROPPED {
+                    entry.live_rows += 1;
+                    if row.status != REVIEW_STATUS_APPROVED {
+                        entry.unapproved += 1;
+                    }
+                }
                 continue; // a deliberate hold, not this sweep's business
             }
             let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
@@ -969,41 +1028,62 @@ impl Orchestrator {
                         && r.status != REVIEW_STATUS_DROPPED
                         && r.status != REVIEW_STATUS_APPROVED
                 });
+                // STUDIO-972: a settled decision is reported ONLY while it still governs the head
+                // the branch carries. When the author has pushed a content-changing head since the
+                // decision, the loop is no longer stopped by it — a resumed round is owed or live —
+                // so reporting "no further review or author round will be dispatched … clear the
+                // adjudication" is false, names a superseded head, and (STUDIO-1015) is routed to
+                // the manager as a stall that is not real. Unknown (no observation) is not stale
+                // and renders exactly as before, the same direction STUDIO-1005's supersession
+                // comparison takes. The `|| !adjudicating` escape keeps an install that has UNSET
+                // the key rendering its durable decision as it did before this ticket.
+                //
+                // MUTATION: drop the `governs_observed` conjunct and
+                // `a_superseded_ship_is_not_reported_while_the_round_resumes` reds (the stale row
+                // is reported for a head the branch no longer carries, and an intervention is
+                // created). Invert the check and
+                // `a_ship_at_the_observed_head_is_still_reported` reds (a governing decision is
+                // silently suppressed).
+                let governs_observed = self.adjudication_governs_observed(pr);
                 let mut d = match self.adjudication(pr) {
                     Some(crate::reviewadjudicate::Adjudication::Escalate {
                         head,
                         rounds,
                         findings,
                         reason,
-                    }) if any_unapproved || !adjudicating => Some(Divergence {
-                        pr: pr.to_string(),
-                        kind: DivergenceKind::ReviewEscalated,
-                        ticket: facts
-                            .rows
-                            .iter()
-                            .find(|r| !r.ticket.is_empty())
-                            .map(|r| r.ticket.clone())
-                            .unwrap_or_default(),
-                        reviewer: String::new(),
-                        stale_secs: newest_activity_secs(facts, now),
-                        auto_merge_reason: None,
-                        // A manager decision, not a slot: the loop is stopped because the
-                        // adjudication settled it, and this kind's WARN arm names that cause and
-                        // returns before the capacity wording is ever reached (STUDIO-950).
-                        capacity_held: None,
-                        capacity_unreadable: None,
-                        adjudicated_head: head,
-                        // STUDIO-1005: the head the watcher last observed. `""` until it has
-                        // observed this pull request, which renders exactly as before this ticket.
-                        current_head: self
-                            .review_observed_head
-                            .get(pr)
-                            .map(|o| o.head.clone())
-                            .unwrap_or_default(),
-                        rounds,
-                        findings,
-                        reason,
-                    }),
+                    }) if (any_unapproved || !adjudicating)
+                        && (governs_observed || !adjudicating) =>
+                    {
+                        Some(Divergence {
+                            pr: pr.to_string(),
+                            kind: DivergenceKind::ReviewEscalated,
+                            ticket: facts
+                                .rows
+                                .iter()
+                                .find(|r| !r.ticket.is_empty())
+                                .map(|r| r.ticket.clone())
+                                .unwrap_or_default(),
+                            reviewer: String::new(),
+                            stale_secs: newest_activity_secs(facts, now),
+                            auto_merge_reason: None,
+                            // A manager decision, not a slot: the loop is stopped because the
+                            // adjudication settled it, and this kind's WARN arm names that cause and
+                            // returns before the capacity wording is ever reached (STUDIO-950).
+                            capacity_held: None,
+                            capacity_unreadable: None,
+                            adjudicated_head: head,
+                            // STUDIO-1005: the head the watcher last observed. `""` until it has
+                            // observed this pull request, which renders exactly as before this ticket.
+                            current_head: self
+                                .review_observed_head
+                                .get(pr)
+                                .map(|o| o.head.clone())
+                                .unwrap_or_default(),
+                            rounds,
+                            findings,
+                            reason,
+                        })
+                    }
                     // An escalation whose rows are now ALL approved is not this rule's either: the
                     // loop converged past it (STUDIO-1021), so it is the merge gate's business
                     // exactly as a fully-approved `ship` is.
@@ -1017,7 +1097,7 @@ impl Orchestrator {
                     // are ALL approved falls through below, where auto-merge either merges it or
                     // `ApprovedStillOpen` reports the gate holding it after the staleness threshold.
                     Some(crate::reviewadjudicate::Adjudication::Ship { head, rounds })
-                        if any_unapproved =>
+                        if any_unapproved && governs_observed =>
                     {
                         Some(Divergence {
                             pr: pr.to_string(),
@@ -1127,6 +1207,37 @@ impl Orchestrator {
         // owed-move row the merge wrote is the fact, read — not invented — exactly as this module's
         // contract requires: no `gh`, no tracker, local only.
         found.extend(done);
+        // STUDIO-964: a held pull request whose every live row APPROVED and whose repo has
+        // auto-merge on is the one shape the held-row filter above must NOT silence. The daemon
+        // would have merged it but for the `rhapsody:human` hold, so the operator must be told the
+        // wait is deliberate. Reported under its own kind so it is never routed to the manager and
+        // never pages a second time. Gated on adjudication being enabled, so an install that never
+        // set `review.adjudicate_after_rounds` keeps exactly its previous behaviour (acceptance).
+        if self.adjudication_threshold().is_some() {
+            found.extend(held_order.iter().filter_map(|pr| {
+                let held = held_by_pr.get(pr)?;
+                (held.auto_merge && held.live_rows > 0 && held.unapproved == 0).then(|| {
+                    Divergence {
+                        pr: pr.to_string(),
+                        kind: DivergenceKind::HeldForHuman,
+                        ticket: held.ticket.clone(),
+                        reviewer: String::new(),
+                        // Not a staleness threshold: the hold is deliberate, not a party falling behind,
+                        // so there is no crossing to report (the same reasoning
+                        // `DivergenceKind::RoundBudgetExhausted` carries).
+                        stale_secs: 0,
+                        auto_merge_reason: None,
+                        capacity_held: None,
+                        capacity_unreadable: None,
+                        adjudicated_head: String::new(),
+                        current_head: String::new(),
+                        rounds: 0,
+                        findings: Vec::new(),
+                        reason: String::new(),
+                    }
+                })
+            }));
+        }
         // STUDIO-1015: when the manager acts, the stall signals it owns go to the manager INSTEAD
         // OF the human feed — but only once the manager has ADOPTED them. A stall whose launch a
         // §10.2 gate defers, or whose manager is unavailable, must not be swallowed: it stays on the
@@ -1316,6 +1427,31 @@ impl Orchestrator {
         (attempts >= UNREADABLE_ATTEMPTS_TO_DROP_HOLD).then_some(attempts)
     }
 
+    /// Whether the adjudication recorded for `pr` still governs the head the watcher most recently
+    /// observed (STUDIO-972) — the predicate the sweep gates its `Ship`/`Escalate` reports on.
+    ///
+    /// The sweep is local-only and cannot recompute STUDIO-960's patch-id proof, so it reads the
+    /// proof the off-loop watcher carried beside the head in
+    /// [`Orchestrator::review_observed_head`], and asks the SAME
+    /// [`Adjudication::governs`](crate::reviewadjudicate::Adjudication::governs) the watcher itself
+    /// asks ([`Self::adjudication`] is that decision; a second "is this decision current"
+    /// predicate is exactly the drift the ticket forbids).
+    ///
+    /// **No observation is `true`.** The memo is empty on a restart until the rotating watcher
+    /// reaches the coordinate, and the sweep must not treat "the daemon does not know the head" as
+    /// "the head moved" — that direction renders exactly as it did before this ticket, the same
+    /// choice STUDIO-1005's supersession comparison makes. An observed head that differs and is not
+    /// patch-proven is the only case that returns `false`.
+    fn adjudication_governs_observed(&self, pr: &PrCoord) -> bool {
+        let Some(decision) = self.adjudication(pr) else {
+            return true;
+        };
+        match self.review_observed_head.get(pr) {
+            Some(observed) => decision.governs(&observed.head, &observed.unchanged_from),
+            None => true,
+        }
+    }
+
     /// The newest `runs` row for one issue identifier, or `None` when the ledger has none (a store
     /// that is off, a history pruned past it, or work that genuinely never ran).
     ///
@@ -1472,6 +1608,26 @@ impl Orchestrator {
                     // `notify:` channels, so they do not have to watch the console banner. Deduped
                     // per (PR, head) in memory.
                     self.notify_escalation(d);
+                    continue;
+                }
+                // STUDIO-964: a held pull request whose merge gate is otherwise clear. The generic
+                // copy below would be false here — the watcher's own hold gate refutes every tick —
+                // so the line names the deliberate wait and the one action that ends it. It
+                // deliberately does NOT notify: the hold is a person's own decision (or the
+                // breaker's, which notified when it applied the label), so paging again would be
+                // the double page the ticket forbids.
+                if d.kind == DivergenceKind::HeldForHuman {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        sweeps,
+                        "review reconciliation: {} — {}. A human holds it (`rhapsody:human`), so the \
+                         daemon will not merge it; remove the label or merge it by hand. This sweep \
+                         only reports.",
+                        d.pr,
+                        d.kind.detail()
+                    );
                     continue;
                 }
                 // STUDIO-956's decider: the manager SHIPPED the loop and the merge gate still holds
@@ -3281,6 +3437,96 @@ mod store_tests {
         );
     }
 
+    /// STUDIO-964: a held ticket whose pull request cleared every gate — every live row approved and
+    /// `review.auto_merge` on — is REPORTED AS HELD, not left looking converged and not as an
+    /// unexplained `ApprovedStillOpen`. STUDIO-949 silences a held ticket's stall rules; that silence
+    /// is wrong for the one shape where the hold is the ONLY thing between the pull request and
+    /// `main`, because the operator must be told the wait is deliberate.
+    ///
+    /// MUTATION: delete the held-report block from `reconcile_review_divergence` and this reds (no
+    /// divergence); report it under `ApprovedStillOpen` instead and the kind assert reds.
+    #[test]
+    fn a_held_approved_pull_request_is_reported_as_held() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+        // The origin ticket wears the hold; `note_human_label` is the current-label half the
+        // decision gates read (a selection pass records it for a candidate wearing the label).
+        o.human_holds.note_human_label("STUDIO-877");
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "the held approved pull request is reported: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::HeldForHuman);
+        assert_ne!(
+            found[0].kind,
+            DivergenceKind::ApprovedStillOpen,
+            "the report must name the hold, not the unexplained approved-and-open stall"
+        );
+        assert_eq!(found[0].ticket, "STUDIO-877");
+        assert_eq!(
+            crate::managerintervention::stall_kind_for(found[0].kind),
+            None,
+            "a held pull request is never routed to the manager, so nothing pages a second time"
+        );
+    }
+
+    /// STUDIO-964: with `review.adjudicate_after_rounds` UNSET the sweep is byte-identical — the
+    /// held report is scoped to the adjudication feature this ticket fixes, so an install that never
+    /// opted in sees exactly what it saw before.
+    #[test]
+    fn a_held_approved_pull_request_is_silent_without_adjudication() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        assert!(
+            o.adjudication_threshold_for_test().is_none(),
+            "the fixture must leave the threshold unset"
+        );
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+        o.human_holds.note_human_label("STUDIO-877");
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "with the threshold unset the held report must not appear"
+        );
+    }
+
     /// ⚠️ STUDIO-949 round 11: while the human-hold ledger has never been primed by a selection
     /// pass, the sweep reports NOTHING — even a genuinely diverged row with no hold on it. The
     /// current-label set has no writer above `on_tick`'s three early gates, and this sweep runs
@@ -3743,6 +3989,35 @@ mod store_tests {
         o.adjudication_ledger = Some(ledger);
     }
 
+    /// Records a SHIP at `head` for PR #164 (STUDIO-972), so a test can seed the watcher's
+    /// observed-head memo beside it and watch the sweep decide whether the decision still governs.
+    fn shipped_at(o: &mut Orchestrator, head: &str) {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Ship {
+                head: head.to_string(),
+                rounds: 3,
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+    }
+
+    /// Seeds the watcher's observed-head memo for PR #164 — the head, its open bit, and the
+    /// patch-id proof the off-loop watcher carries for a no-op head move (STUDIO-960/STUDIO-972).
+    fn observed_head(o: &mut Orchestrator, head: &str, unchanged_from: &[&str]) {
+        o.review_observed_head.insert(
+            PrCoord::new("makewhatis", "rhapsody", 164),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: head.to_string(),
+                unchanged_from: unchanged_from.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
     /// **STUDIO-1005 acceptance: the #210 replay.** An escalation's reason is a snapshot written
     /// once and never revalidated; when the author pushes past the head it was computed at, the
     /// sweep must say so — and must compare against the head the WATCHER OBSERVED, not the
@@ -3764,6 +4039,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_PUSHED.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -3832,6 +4108,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: one_char_later.clone(),
+                unchanged_from: Vec::new(),
             },
         );
         o.reconcile_review_divergence();
@@ -3885,6 +4162,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_PUSHED.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -3918,6 +4196,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_PUSHED.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -3949,6 +4228,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -3963,6 +4243,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_PUSHED.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
         let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
@@ -3989,6 +4270,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -4073,6 +4355,7 @@ mod store_tests {
             crate::prepare::ReviewHeadObservation {
                 open: true,
                 head: HEAD_PUSHED.to_string(),
+                unchanged_from: Vec::new(),
             },
         );
 
@@ -4220,6 +4503,146 @@ mod store_tests {
             o.review_divergences().is_empty(),
             "a shipped pull request every row approved is not a stall, got {:?}",
             o.review_divergences()
+        );
+    }
+
+    /// **STUDIO-972 acceptance.** A settled `Ship` at `HEAD`, a live row still holding findings, and
+    /// an OBSERVED head the author has since pushed a content-changing commit to: the loop is no
+    /// longer stopped by the decision — a resumed round is owed — so the sweep must NOT report the
+    /// ship at `HEAD`, and must NOT hand the false stall to the manager.
+    ///
+    /// MUTATION (the ticket's): drop the `governs_observed` conjunct in
+    /// `reconcile_review_divergence` and this reds — a stale divergence is reported at `HEAD`
+    /// while the branch carries `HEAD_PUSHED`, and an intervention is created for a pull request
+    /// that is not stuck.
+    #[test]
+    fn a_superseded_ship_is_not_reported_while_the_round_resumes() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Act;
+        reviewed_row(o, "alice", "STUDIO-972");
+        shipped_at(o, HEAD);
+        // The author pushed a content-changing head after the ship: no proof covers it.
+        observed_head(o, HEAD_PUSHED, &[]);
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert!(
+            found.is_empty(),
+            "a ship the branch has moved past must not be reported: {found:?}"
+        );
+        assert!(
+            o.store()
+                .load_manager_interventions()
+                .expect("read")
+                .is_empty(),
+            "and it must not be routed to the manager as a stall"
+        );
+    }
+
+    /// **STUDIO-972 acceptance, the control that must pass on the old code too.** With the settled
+    /// `Ship` and the head still at `HEAD`, the divergence fires exactly as before — the gate only
+    /// suppresses a head the decision no longer governs.
+    ///
+    /// MUTATION (the ticket's): suppress a GOVERNING decision and this reds.
+    #[test]
+    fn a_ship_at_the_observed_head_is_still_reported() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        reviewed_row(o, "alice", "STUDIO-972");
+        shipped_at(o, HEAD);
+        observed_head(o, HEAD, &[]);
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "the governing ship still reports: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ReviewShipped);
+        assert_eq!(found[0].adjudicated_head, HEAD);
+
+        // The acceptance's other half: where the decision still governs, the `reviews/clear`
+        // escape hatch is still the right advice and is still emitted.
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN" && e.message.contains("shipped"))
+            .unwrap_or_else(|| panic!("no shipped WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("/api/v1/reviews/clear"),
+            "the governing ship must still tell the operator how to clear it: {}",
+            warn.message
+        );
+    }
+
+    /// **STUDIO-972 acceptance: a no-op rebase still governs.** The branch is at `HEAD_PUSHED`, but
+    /// the watcher's patch-id proof shows the change is the one the manager adjudicated, so the ship
+    /// still governs and still reports — the gate must read the PROOF, not merely compare two SHA
+    /// strings.
+    #[test]
+    fn a_no_op_rebase_still_governs_and_reports() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        reviewed_row(o, "alice", "STUDIO-972");
+        shipped_at(o, HEAD);
+        // STUDIO-960: the head moved, but the change against the base is the one the ship was made
+        // at — the proof names the adjudicated head.
+        observed_head(o, HEAD_PUSHED, &[HEAD]);
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(
+            found.len(),
+            1,
+            "a no-op rebase leaves the ship governing, so it still reports: {found:?}"
+        );
+        assert_eq!(found[0].kind, DivergenceKind::ReviewShipped);
+        assert_eq!(found[0].adjudicated_head, HEAD);
+    }
+
+    /// **STUDIO-972 control: the routing assertion above is not vacuous.** The SAME fixture with the
+    /// ship still governing DOES hand the stall to the manager — so the empty intervention set in
+    /// [`a_superseded_ship_is_not_reported_while_the_round_resumes`] is a consequence of the gate,
+    /// not of routing being off.
+    #[test]
+    fn a_governing_ship_is_still_routed_to_the_manager() {
+        let o = &mut orch(false, "2026-09-22T16:14:00Z");
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 3;
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Act;
+        reviewed_row(o, "alice", "STUDIO-972");
+        shipped_at(o, HEAD);
+        observed_head(o, HEAD, &[]);
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            !o.store()
+                .load_manager_interventions()
+                .expect("read")
+                .is_empty(),
+            "a governing ship is the manager's stall: an intervention is created"
         );
     }
 

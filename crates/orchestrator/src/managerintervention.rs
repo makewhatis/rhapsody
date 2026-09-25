@@ -66,6 +66,9 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         | DivergenceKind::ReviewRequestedNoRun
         | DivergenceKind::ReviewTokenCeilingStopped
         | DivergenceKind::MergedTicketNotTerminal
+        // STUDIO-964: a held pull request is not the manager's stall — a PERSON owes the next move,
+        // and routing it to the manager would page a human a second time for work they reserved.
+        | DivergenceKind::HeldForHuman
         | DivergenceKind::ManagerDeferred => None,
     }
 }
