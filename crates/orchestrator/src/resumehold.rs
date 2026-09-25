@@ -225,6 +225,29 @@ impl ControlHandle {
                 ..Default::default()
             });
         }
+        // The ticket's current state, read BEFORE anything is committed: the requeue step needs it,
+        // and a read that fails must leave the action with nothing to undo. Read here rather than
+        // after the label removal so a tracker that can answer for labels but not states reports an
+        // error before the note is seeded.
+        let states = self
+            .reads
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .states
+            .clone();
+        let state = tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&run.issue_id))
+            .await
+            .map_err(|e| ResumeHoldError::Tracker(e.to_string()))?
+            .into_iter()
+            .next()
+            .map(|i| i.state)
+            .unwrap_or_default();
+        let active = dispatchable_state(
+            &rhapsody_core::normalize_state(&state),
+            &states.active,
+            &states.terminal,
+        );
         // 1. Seed the note FIRST, and clear the suppression with it. The note must be in place
         //    BEFORE the label comes off: the instant the hold is gone an unclaimed ticket is a
         //    dispatch candidate, and a tick racing the label removal must find the note waiting for
@@ -258,25 +281,6 @@ impl ControlHandle {
             breaker: self.breaker_hold(&run.issue_identifier),
             ..Default::default()
         };
-        let states = self
-            .reads
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .states
-            .clone();
-        let state = tracker
-            .fetch_issue_states_by_ids(std::slice::from_ref(&run.issue_id))
-            .await
-            .map_err(|e| ResumeHoldError::Tracker(e.to_string()))?
-            .into_iter()
-            .next()
-            .map(|i| i.state)
-            .unwrap_or_default();
-        let active = dispatchable_state(
-            &rhapsody_core::normalize_state(&state),
-            &states.active,
-            &states.terminal,
-        );
         if !active {
             match tracker
                 .move_issue_to_type(&run.issue_id, &run.team_id, "unstarted")
