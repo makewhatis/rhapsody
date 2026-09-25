@@ -348,9 +348,11 @@ function RunTrace({
     () => attemptOptions(runs, identities, assignee),
     [runs, identities, assignee],
   );
-  // The review strip (STUDIO-976), grouped into ROUNDS (STUDIO-1023): one chip per reviewer per
-  // pull request, the newest round expanded and older rounds collapsed. Labelled by reviewer
-  // through the SAME resolution the attempts, the batons and the header's assignee use.
+  // The review strip (STUDIO-976), grouped into ROUNDS (STUDIO-1023): one round per pull request at
+  // one head, the newest round expanded and older rounds collapsed. A round boundary is
+  // reconstructed from the PR coordinate and the reviewers, since no head SHA reaches the console;
+  // every review run survives as a chip (see `reviewRounds`). Labelled by reviewer through the SAME
+  // resolution the attempts, the batons and the header's assignee use.
   // Deliberately NOT folded into `attempts`: an attempt's ordinal is its position in the TICKET's
   // run list, and inserting reviews there would renumber every attempt label quoted in tickets,
   // PR comments and the room.
@@ -423,7 +425,6 @@ function RunTrace({
       <TraceHeader
         ref={headerRef}
         run={live}
-        issue={issue}
         originTicket={originTicket}
         originPending={originPending}
         attempts={attempts}
@@ -566,7 +567,6 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 function TraceHeader({
   ref,
   run,
-  issue,
   originTicket,
   originPending,
   attempts,
@@ -585,11 +585,10 @@ function TraceHeader({
 }: {
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
-  /** The route-level ticket being viewed — what "Open ticket" links to. A selected review run's
-   * own `issue_identifier` is a synthetic `pr:` key, never a Linear ticket. */
-  issue: string;
   /** The TICKET a review run reviews (STUDIO-1023), resolved through the daemon's origin-ticket
-   * join; "" when the daemon credited none. "Open origin ticket" and the ticket total read it. */
+   * join; "" when the daemon credited none. "Open origin ticket" and the ticket total read it. For
+   * an ordinary run this IS the route-level ticket. A selected review run's own `issue_identifier`
+   * is a synthetic `pr:` key, never a Linear ticket, so it is deliberately not a fallback here. */
   originTicket: string;
   /** Whether that origin-ticket read may still answer — see "Open origin ticket" below. */
   originPending: boolean;
@@ -619,7 +618,12 @@ function TraceHeader({
   // KIND-SPECIFIC: a review run judges a pull request rather than owning a ticket, so it gets
   // "Open origin ticket" and the PR its key names, and it is never offered Merge.
   const reviewRun = reviewPr(run.issue_identifier) !== undefined;
-  const origin = originTicket === "" ? issue : originTicket;
+  // The ticket the actions link to is the RESOLVED origin, never a fallback to the route key. On a
+  // review route the route key IS the synthetic `pr:…` string, so falling back to it built a live
+  // "Open origin ticket" link to `linear.app/<slug>/issue/pr:…#223@jimmy` while `useIssueRuns` was
+  // still pending or had credited no origin at all (STUDIO-1023 round 1). `originTicket` already
+  // IS the route ticket for an ordinary run, so this changes nothing there.
+  const origin = originTicket;
   return (
     // `data-attempts` is kept for the stylesheet and the tests that pin the attempt count; the
     // three rows below no longer reshape per count, because the selector collapses to a dropdown

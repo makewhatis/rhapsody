@@ -845,9 +845,10 @@ export function reviewPrUrl(run: RunSummary): string {
 
 /** One round of the review strip (STUDIO-1023): a pull request and the reviewer chips against it. */
 export interface ReviewRound {
-  /** The round's identity — the PR coordinate, or the lone run's id when no PR resolves. */
+  /** The round's identity — the PR coordinate (or the lone run's id when no PR resolves). Two
+   *  rounds of the same pull request share this key; it is the COORDINATE, not a unique handle. */
   key: string;
-  /** The chips this round contributes, newest run per reviewer, newest-first. */
+  /** Every chip this round contributes, newest-first. */
   chips: ReviewOption[];
   /** The newest start in the round — the rounds are ordered by it. */
   startedAt: string;
@@ -856,12 +857,20 @@ export interface ReviewRound {
 /**
  * The review strip grouped into ROUNDS (STUDIO-1023).
  *
- * A round is one pull request: twenty-five reviews on one ticket are usually a handful of review
- * rounds plus re-reviews, and a flat strip of twenty-five identical chips tells the operator
- * nothing. Within a round the chips are deduped to ONE PER REVIEWER — a reviewer who looked twice
- * is one judgement on the current head, not two — keeping the NEWEST run for each. The rounds
- * themselves stay newest-first, so the strip's head is always the current round and the older ones
- * collapse behind the "+N earlier rounds" toggle the view draws.
+ * A round is one pull request at one head: twenty-five reviews on one ticket are usually a handful
+ * of rounds plus re-reviews, and a flat strip of twenty-five chips tells the operator nothing. The
+ * daemon serves no head SHA to the console, so a round boundary is reconstructed from the two facts
+ * a client does have — the PR coordinate and the reviewers. The reviews are put in newest-first
+ * order and walked: a new round opens when the PR changes, OR when a reviewer who already appears
+ * in the round being built turns up again (a reviewer reviews one head once, so a repeat means the
+ * previous head was superseded). Consecutive reviews of one PR by different reviewers therefore
+ * stay together, which is the normal multi-reviewer round.
+ *
+ * NOTHING is dropped. An earlier model deduped each round to one chip per reviewer and discarded
+ * the rest, which silently erased every earlier review of a pull request — and with it the
+ * `changes_requested` verdict colouring STUDIO-1020 had just added (STUDIO-1023 round 1). Every
+ * review run survives as a chip, and the older rounds collapse behind the view's "+N earlier
+ * rounds" toggle rather than disappearing.
  *
  * The key falls back to the run id when its `pr:` coordinate cannot be parsed: an unparseable key
  * must never merge with a real round, or two unrelated reviews would read as one PR.
@@ -871,25 +880,26 @@ export function reviewRounds(
   identities: ReadonlyMap<number, string>,
   assignee: string,
 ): ReviewRound[] {
-  const byRound = new Map<string, { startedAt: string; byReviewer: Map<string, ReviewOption> }>();
-  const order: string[] = [];
-  for (const run of reviews) {
+  const ordered = [...reviews].sort((a, b) => b.started_at.localeCompare(a.started_at));
+  const rounds: {
+    key: string;
+    startedAt: string;
+    reviewers: Set<string>;
+    chips: ReviewOption[];
+  }[] = [];
+  let current: (typeof rounds)[number] | undefined;
+  for (const run of ordered) {
     const pr = reviewPr(run.issue_identifier);
     const key = pr === undefined ? `run:${run.id}` : `pr:${pr.owner}/${pr.repo}#${pr.number}`;
-    let round = byRound.get(key);
-    if (round === undefined) {
-      round = { startedAt: run.started_at, byReviewer: new Map() };
-      byRound.set(key, round);
-      order.push(key);
-    }
-    if (run.started_at > round.startedAt) round.startedAt = run.started_at;
     const who = runTeammate(run, identities, assignee);
     const reviewer = who === "" ? `run:${run.id}` : who;
-    const existing = round.byReviewer.get(reviewer);
-    // Newest run wins. `reviews` is newest-first, so the FIRST one seen for a reviewer is already
-    // the newest and later duplicates are skipped rather than compared again.
-    if (existing !== undefined) continue;
-    round.byReviewer.set(reviewer, {
+    if (current === undefined || current.key !== key || current.reviewers.has(reviewer)) {
+      current = { key, startedAt: run.started_at, reviewers: new Set(), chips: [] };
+      rounds.push(current);
+    }
+    if (run.started_at > current.startedAt) current.startedAt = run.started_at;
+    current.reviewers.add(reviewer);
+    current.chips.push({
       id: run.id,
       label: who === "" ? `review ${run.id}` : `review · ${who}`,
       named: who !== "",
@@ -897,15 +907,7 @@ export function reviewRounds(
       state: reviewState(run),
     });
   }
-  return order
-    .map((key) => {
-      const round = byRound.get(key) as { startedAt: string; byReviewer: Map<string, ReviewOption> };
-      const chips = [...round.byReviewer.values()].sort((a, b) =>
-        b.startedAt.localeCompare(a.startedAt),
-      );
-      return { key, chips, startedAt: round.startedAt };
-    })
-    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  return rounds.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
 
 /**

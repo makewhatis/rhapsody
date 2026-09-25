@@ -794,22 +794,41 @@ describe("reviewOptions — the run detail's review strip (STUDIO-976)", () => {
 describe("reviewRounds / reviewPrUrl — the review strip grouped by round (STUDIO-1023)", () => {
   const NONE = new Map<number, string>();
 
-  it("groups by pull request, keeps one chip per reviewer, and keeps the newest run", () => {
+  it("keeps consecutive reviews of one pull request together, one chip per reviewer", () => {
     const rounds = reviewRounds(
       [
         run({ id: 803, issue_identifier: "pr:acme/app#7@sol", started_at: "2026-09-03T12:00:00Z" }),
-        run({ id: 802, issue_identifier: "pr:acme/app#7@sol", started_at: "2026-09-03T11:00:00Z" }),
         run({ id: 801, issue_identifier: "pr:acme/app#7@alice", started_at: "2026-09-03T11:30:00Z" }),
+        run({ id: 802, issue_identifier: "pr:acme/app#7@sol", started_at: "2026-09-03T11:00:00Z" }),
       ],
       NONE,
       "",
     );
-    expect(rounds).toHaveLength(1);
-    // Newest per reviewer: sol's 12:00 run wins over 11:00.
+    // sol's 11:00 re-review says the head that the 12:00 round judged had been superseded, so it
+    // opens its OWN round. Nothing is dropped: all three runs survive across the two rounds.
+    expect(rounds).toHaveLength(2);
     expect(rounds[0].chips.map((c) => [c.label, c.id])).toEqual([
       ["review · sol", 803],
       ["review · alice", 801],
     ]);
+    expect(rounds[1].chips.map((c) => [c.label, c.id])).toEqual([["review · sol", 802]]);
+  });
+
+  it("keeps every review of one pull request reachable, never collapsing same-reviewer rounds away", () => {
+    // The shape the ticket measured: one PR, several heads, sol and alice alternating.
+    const reviews = Array.from({ length: 10 }, (_, i) =>
+      run({
+        id: 900 - i,
+        issue_identifier: `pr:acme/app#223@${i % 2 === 0 ? "sol" : "alice"}`,
+        started_at: `2026-09-03T${String(12 - i).padStart(2, "0")}:00:00Z`,
+      }),
+    );
+    const rounds = reviewRounds(reviews, NONE, "");
+    // Five heads × two reviewers, newest-first. The oldest runs are rounds, not lost runs.
+    expect(rounds).toHaveLength(5);
+    expect(rounds.map((r) => r.chips.length)).toEqual([2, 2, 2, 2, 2]);
+    const seen = rounds.flatMap((r) => r.chips.map((c) => c.id)).sort((a, b) => a - b);
+    expect(seen).toEqual([891, 892, 893, 894, 895, 896, 897, 898, 899, 900]);
   });
 
   it("orders rounds newest-first and keeps older pr numbers as their own rounds", () => {

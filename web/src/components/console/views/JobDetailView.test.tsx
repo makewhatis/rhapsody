@@ -1089,17 +1089,76 @@ describe("zone A — the header's actions are real or dependency-named, never fa
 
     await waitFor(() => expect(document.querySelector(".trhd .acts")).toBeTruthy());
     const acts = document.querySelector(".trhd .acts") as HTMLElement;
-    // Not a disabled Merge — NO Merge. There is no merge path on a review run at all.
-    expect(within(acts).queryByRole("button", { name: /^merge$/i })).toBeNull();
     await waitFor(() =>
       expect(action(/open origin ticket/i).getAttribute("href")).toBe(
         "https://linear.app/studio49/issue/STUDIO-988",
       ),
     );
+    // The mergeability verdict is not even asked for on a review run, so no Merge primary can be
+    // built from one. MUTATION GUARD: widen the gate to `teamsEnabled` and this fails immediately.
+    expect(h.fetchRunMergeability).not.toHaveBeenCalled();
+    // ...and once the origin-ticket read has settled — the same async cycle that would have
+    // delivered a verdict in the mutated build — the cluster still holds no Merge. Checking only
+    // before the read settles (as the first cut did) passed even with the guard removed, because a
+    // Merge could only appear after the verdict resolved (STUDIO-1023 round 1).
+    await waitFor(() =>
+      expect(within(acts).queryByRole("button", { name: /^merge$/i })).toBeNull(),
+    );
     // View PR is the number in the key, not a branch search that cannot find the review worktree.
     expect(action(/view pr/i).getAttribute("href")).toBe(
       "https://github.com/makewhatis/rhapsody/pull/223",
     );
+  });
+
+  // B1 (STUDIO-1023 round 1): while the origin-ticket join is still answering, the action must NOT
+  // fall back to the review's own `pr:` key and build a live Linear link to a ticket that does not
+  // exist. It stays dependency-named, and says what it is waiting for.
+  it("does not fabricate an origin-ticket link while the origin join is still pending", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#223@jimmy",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "",
+      outcome: "running",
+    });
+    h.fetchIssueRuns.mockReturnValue(new Promise(() => {})); // never answers
+    mountDetail([review], vi.fn(), [], "pr:makewhatis/rhapsody#223@jimmy");
+
+    await waitFor(() => expect(document.querySelector(".trhd .acts")).toBeTruthy());
+    // Let the workspace identity resolve: with `workspace_url_key` in hand, a fallback to the
+    // review's own `pr:` key WOULD build a live link — which is exactly what must not happen.
+    await waitFor(() => expect(h.fetchLinearIdentity).toHaveBeenCalled());
+    await act(async () => {});
+    const acts = document.querySelector(".trhd .acts") as HTMLElement;
+    expect(within(acts).queryByRole("link", { name: /open origin ticket/i })).toBeNull();
+    const dep = within(acts).getByRole("button", { name: /open origin ticket/i });
+    expect(dep.getAttribute("title")).toMatch(/resolving/i);
+  });
+
+  // ...and when the join HAS answered and credits no origin, the action names no ticket at all
+  // rather than inventing one from the key.
+  it("names no origin-ticket link when the daemon credits no origin", async () => {
+    const review = run({
+      id: 801,
+      issue_identifier: "pr:makewhatis/rhapsody#223@jimmy",
+      started_at: "2026-09-01T17:00:00Z",
+      ended_at: "",
+      outcome: "running",
+    });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [{ ...review, review_run: true }], // no `review_of`
+      next_offset: null,
+    });
+    mountDetail([review], vi.fn(), [], "pr:makewhatis/rhapsody#223@jimmy");
+
+    await waitFor(() => expect(document.querySelector(".trhd .acts")).toBeTruthy());
+    const acts = document.querySelector(".trhd .acts") as HTMLElement;
+    await waitFor(() =>
+      expect(
+        within(acts).getByRole("button", { name: /open origin ticket/i }).getAttribute("title"),
+      ).toMatch(/credits no origin ticket/i),
+    );
+    expect(within(acts).queryByRole("link", { name: /open origin ticket/i })).toBeNull();
   });
 
   it("names its dependency, rather than linking, when the remote is not a GitHub one", async () => {
