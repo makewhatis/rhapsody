@@ -479,6 +479,56 @@ mod tests {
 
     // --- §5.5 evidence-access log: the host RECORDS every diff/interdiff it serves -------------
 
+    // §4.4 / §15.4 (Startup boundary): a symlink committed into the repository is served as its
+    // blob TEXT (the link target), never followed to the file it names. `manager_file` is the
+    // host's read seam the manager uses, so this pins the end-to-end behaviour, not just
+    // `read_blob`. MUTATION: resolve the blob through the filesystem and this serves the secret.
+    #[tokio::test]
+    async fn a_manager_file_returns_a_symlink_as_its_text() {
+        let root = TempDir::new();
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").unwrap();
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        std::os::unix::fs::symlink("/Users/secret/.ssh/id_ed25519", origin.child("link")).unwrap();
+        git_run(&origin.path, &["add", "link"]);
+        git_run(&origin.path, &["commit", "-m", "add symlink"]);
+        let head = rev_parse(&origin.path, "HEAD");
+
+        let mgr = Arc::new(
+            Manager::new(WsConfig {
+                root: root.path.clone(),
+                hooks: HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("manager"),
+        );
+        mgr.ensure_from_repo(&origin.path, "", "AIE-1")
+            .await
+            .expect("provision mirror");
+
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let handle = handle_with_workspace(mgr, Arc::clone(&store));
+        let run_id = manager_run_id(store.as_ref(), &origin.path);
+
+        let got = handle
+            .manager_file(run_id, &head, "link")
+            .await
+            .expect("manager_file");
+        assert_eq!(
+            got["symlink"],
+            serde_json::json!(true),
+            "the tree mode is reported as a symlink"
+        );
+        assert_eq!(
+            got["content"],
+            serde_json::json!("/Users/secret/.ssh/id_ed25519"),
+            "the link's TEXT is served, never the target's content"
+        );
+    }
+
     fn git_run(dir: &str, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)

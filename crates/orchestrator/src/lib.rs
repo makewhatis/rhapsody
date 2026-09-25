@@ -119,6 +119,9 @@ pub mod worker;
 pub mod workspace_gc;
 
 #[cfg(test)]
+mod managerfixtures;
+
+#[cfg(test)]
 mod testsupport;
 
 // O8 e2e gate: the INF-303 no-Linear end-to-end suite (real file tracker + real runner + committed

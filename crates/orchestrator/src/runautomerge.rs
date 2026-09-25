@@ -2028,6 +2028,84 @@ mod tests {
         );
     }
 
+    /// §15.4 (Modes, gates and `off`) / D7: CI, draft and conflict gates stay ABSOLUTE. Even a plan
+    /// that counted a still-current manager approval is refused by a red check, a conflicted base or
+    /// a draft — the approval can stand in for a reviewer, never for a gate. MUTATION: consult the
+    /// approval recheck before the D7 gates and the first refused case would merge.
+    #[tokio::test]
+    async fn a_d7_gate_blocks_a_manager_approved_merge() {
+        let merger = Arc::new(FakeMerger::default());
+
+        // Red CI.
+        let d = AutoMergeDeps {
+            approvals: Some(recheck_source(true) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(&[
+                    ("lint", "SUCCESS"),
+                    ("test", "SUCCESS"),
+                    ("web", "SUCCESS"),
+                    ("desktop", "FAILURE"),
+                ]),
+                Arc::clone(&merger),
+            )
+        };
+        assert!(
+            matches!(
+                perform_auto_merge(&approved_plan(), &d).await,
+                AutoMergeOutcome::Declined(_)
+            ),
+            "D7: a red check declines even with an effective approval"
+        );
+
+        // A conflicted base.
+        let d = AutoMergeDeps {
+            approvals: Some(recheck_source(true) as Arc<dyn ApprovalRecheckSource>),
+            mergestate: merge_state(Some("DIRTY")),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+        assert!(
+            matches!(
+                perform_auto_merge(&approved_plan(), &d).await,
+                AutoMergeOutcome::Declined(_)
+            ),
+            "D7: a conflicted pull request declines"
+        );
+
+        // A draft.
+        let d = AutoMergeDeps {
+            approvals: Some(recheck_source(true) as Arc<dyn ApprovalRecheckSource>),
+            ..deps(
+                found_draft(HEAD),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+        assert!(
+            matches!(
+                perform_auto_merge(&approved_plan(), &d).await,
+                AutoMergeOutcome::Declined(_)
+            ),
+            "D7: a draft declines"
+        );
+
+        assert!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "no D7-gated merge may be requested"
+        );
+    }
+
     /// ⚠️ **The ticket's headline acceptance criterion for the recheck.** A same-head blocking review
     /// (or a hold) between planning and the merge command changes the control task's answer without
     /// moving the head, so `--match-head-commit` cannot catch it. The recheck does, and no merge is
