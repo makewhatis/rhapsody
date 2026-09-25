@@ -1348,13 +1348,25 @@ async fn execute(
     answerable: &Answerable<'_>,
     report: &mut EarsReport,
 ) -> Done {
+    // The hold is answered HERE, ahead of EVERY intent and whatever the post asked for — a
+    // `relay`, the floor's `ask`, and an `Answer` alike (STUDIO-1052 requirement 2: a held ticket's
+    // reply must name the hold, not read as idle or missing). It cannot sit behind the `find_issue`
+    // gate below, because `Answer` returns before that gate — see the next comment for why — so the
+    // lookup is its own, and a missing ticket simply falls through to that intent's own branch.
+    if let Some(iss) = find_issue(cycle.issues, &target.key)
+        && crate::teams::is_human(iss)
+    {
+        return Done::say(human_hold_reply(iss));
+    }
     // **Before the `find_issue` gate, and that placement is the whole feature.** Every action
     // intent must pass that gate, because the cycle's issue set is what team-scopes a WRITE. An
     // answer is a read, and the gate is exactly why the question that motivated this design got
     // "not found": STUDIO-725 had reached a terminal state and fallen out of `cycle.issues`, so the
     // one ticket the operator asked about was the one shape the gate could not see. `Answer`'s
     // scope guard is not this gate but `TeamScope`, applied inside the accessor to every row the
-    // gather returned — see `teamsknow`'s module doc.
+    // gather returned — see `teamsknow`'s module doc. The hold above still reads this cycle's
+    // label snapshot when it CAN see the ticket, which is the held ticket an operator has not let
+    // go terminal and the one requirement 2 speaks to.
     if target.intent == Intent::Answer {
         return Done::grounded(answer_for(target, answerable));
     }
@@ -1364,12 +1376,6 @@ async fn execute(
             target.key
         ));
     };
-    // The hold is answered HERE, ahead of every intent and whatever the post asked for — including
-    // a `relay` or the floor's `ask`, which would otherwise read as an idle ticket (STUDIO-1052
-    // requirement 2). `Answer` returned above and is a read, so it is unaffected.
-    if crate::teams::is_human(iss) {
-        return Done::say(human_hold_reply(iss));
-    }
     // The two writing branches take the report MUTABLY: their idempotency guards have to see what
     // an EARLIER post in this same pass wrote, which `cycle.issues` — one immutable fetch — cannot
     // show them (see [`PassWrites`]).
@@ -4455,6 +4461,57 @@ mod tests {
         assert!(
             replies[0].contains("Remove the `rhapsody:human` label"),
             "and tell the operator how to release it: {replies:?}"
+        );
+        assert!(
+            fx.tracker.create_issue_calls().is_empty() && fx.tracker.add_label_calls().is_empty(),
+            "and write nothing: {:?}",
+            fx.tracker.create_issue_calls()
+        );
+    }
+
+    /// **A QUESTION about a held ticket must name the hold too.** `labels+model` is the default mode
+    /// and a question is exactly what it routes to `answer`, so a hold gate that sat behind the
+    /// `Answer` early return left the operator with an idle-looking record and no hold. This is the
+    /// floor test above, one mode over.
+    #[tokio::test]
+    async fn a_question_about_a_held_ticket_answers_with_the_hold() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What is the state of STUDIO-1050?");
+        let t = teams(&["alice", "jimmy"], ManagerMode::LabelsModel);
+        let mut iss = in_review("STUDIO-1050");
+        iss.labels = Some(vec![crate::teams::HUMAN_LABEL.to_string()]);
+        let issues = vec![iss];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // The model would answer from the ticket's records, none of which carries the hold. The
+        // hold must win, so this idle-sounding prose must NOT reach the reply.
+        let ears = fx.ears(answering_with(
+            "STUDIO-1050",
+            "STUDIO-1050's last run completed.",
+        ));
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, true),
+        )
+        .await;
+
+        let replies = fx.reply_bodies();
+        assert_eq!(replies.len(), 1, "one reply: {replies:?}");
+        assert!(
+            replies[0].contains("held for a human") && replies[0].contains("rhapsody:human"),
+            "a held question must name the hold, not read as idle: {replies:?}"
+        );
+        assert!(
+            replies[0].contains("Remove the `rhapsody:human` label"),
+            "and tell the operator how to release it: {replies:?}"
+        );
+        assert!(
+            !replies[0].contains("last run completed"),
+            "the model's idle-sounding prose must not answer a held ticket: {replies:?}"
         );
         assert!(
             fx.tracker.create_issue_calls().is_empty() && fx.tracker.add_label_calls().is_empty(),
