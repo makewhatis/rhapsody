@@ -25,9 +25,9 @@
 //! manually, one per §15.4 group, and recorded in the pull request.
 
 use crate::managerdecision::{
-    ApprovalInputs, DecisionKind, FindingRef, KnownFinding, ManagerReviewRow, PreconditionInputs,
-    approval_eligibility, eligible_rows, head_is_current, parse_decision, preconditions,
-    validate_final,
+    ApprovalInputs, DecisionError, DecisionKind, FindingRef, KnownFinding, ManagerReviewRow,
+    PreconditionInputs, approval_eligibility, eligible_rows, head_is_current, parse_decision,
+    preconditions, validate_final,
 };
 use crate::managerintervention::{CaseRow, ManagerCasePacket};
 use rhapsody_store::{
@@ -834,42 +834,11 @@ fn case_packet(f: &IncidentFixture) -> String {
     .render()
 }
 
-/// The manager's decision contract, as the harness states it to a live proposer. A real manager run
-/// carries its built-in profile and the host's validation; the replay spawns no MCP server and no
-/// profile plumbing, so the harness must name the exact fenced block the strict parser (§6.1)
-/// accepts, the four variants and their payloads, and — critically — that a field which does not
-/// apply must be ABSENT rather than `null`.
-const DECISION_BLOCK_CONTRACT: &str = r#"## The decision block
-
-End your final message with exactly one fenced block whose info string is
-`rhapsody-manager-decision`; its body is one JSON object. The parser is STRICT: no unknown keys, no
-duplicate keys, and a field that does not apply to your variant must be ABSENT (JSON `null` counts
-as present and is invalid).
-
-Common fields, on every variant:
-- `decision`: one of `RERUN_REVIEW`, `ROUTE_TO_AUTHOR`, `APPROVE`, `ESCALATE`.
-- `head`: the current head, exactly as the data below gives it.
-- `evidence_rev`: the data below's `evidence_rev`.
-- `rationale`: required, at most 4000 characters.
-
-Variant payloads:
-- `RERUN_REVIEW`: `rerun` is optional: {"reviewers": ["..."], "note": "..."}. Invalid when there is
-  no eligible row (every live reviewer row already approved at the current patch).
-- `ROUTE_TO_AUTHOR`: `route` required: {"fix": [{"finding": "alice:F1", "revision": 1}],
-  "instructions": "..."}. Every `fix` entry must name an open, blocking finding revision listed
-  below.
-- `APPROVE`: no payload beyond an optional `dismiss`:
-  [{"finding": "alice:F1", "revision": 1, "rationale": "..."}]. Eligible only when the round
-  threshold is reached, the reviewer quorum is met, every live row read the current patch-id, diff
-  coverage holds, and every open blocking finding is resolved or dismissed in this same decision.
-- `ESCALATE`: `escalate` required: {"question": "...", "checked": "..."}.
-
-Example:
-
-```json
-{"decision":"RERUN_REVIEW","head":"<head>","evidence_rev":<rev>,"rerun":{"note":"what changed"},"rationale":"the evidence"}
-```
-"#;
+// The manager's decision contract lives in ONE place now (STUDIO-1054): the production builder
+// [`crate::managerrun::manager_instructions`]. The harness used to carry a private copy, which is
+// exactly why the release gate passed while every live run failed `ZeroOrManyBlocks` — a test on
+// the private copy could never see the live prompt. [`manager_prompt`] composes from the shared
+// builder, so a contract removed from production reds the tier-3 prompt test as well.
 
 /// The built-in `manager` profile's prompt, resolved exactly as the daemon resolves it (against a
 /// path with no overlay, so it is the shipped built-in). This is the role document a live manager
@@ -909,16 +878,16 @@ fn harness_facts(f: &IncidentFixture) -> String {
     out
 }
 
-/// The full prompt the replay harness hands a proposer for `f`: the manager profile, the base task
-/// prompt, the decision-block contract, the case packet and the host facts. A real manager run
-/// receives the first two from dispatch and the packet from the worker; the facts stand in for the
-/// MCP tools the harness does not spawn.
+/// The full prompt the replay harness hands a proposer for `f`: the manager profile, the shared
+/// production instructions ([`crate::managerrun::manager_instructions`]), the case packet and the
+/// host facts. A real manager run receives the profile from dispatch and the packet from the
+/// worker, and composes both through the same builder; the facts stand in for the MCP tools the
+/// harness does not spawn.
 fn manager_prompt(f: &IncidentFixture) -> String {
     format!(
-        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}",
         manager_profile_prompt(),
-        crate::managerrun::MANAGER_BASE_PROMPT,
-        DECISION_BLOCK_CONTRACT,
+        crate::managerrun::manager_instructions(),
         case_packet(f),
         harness_facts(f),
     )
@@ -1173,6 +1142,50 @@ fn the_replay_prompt_carries_the_contract_and_the_fixture_facts() {
             );
         }
     }
+}
+
+/// STUDIO-1054 acceptance, the live path end to end: the prompt the PRODUCTION builder sends a run
+/// (not a private harness copy), replayed against the recorded output of the three flux#87 shadow
+/// runs. Those runs ended in prose plus a `HANDOFF: escalate` line and no block, and the exit
+/// parser refused every one (`ZeroOrManyBlocks`). The same fixture's well-formed block, on the same
+/// prompt, must be accepted — so the fix is the prompt production sends, not the parser.
+#[test]
+fn the_live_prompt_replays_the_flux_incident_prose_only_rejected_block_accepted() {
+    let f = FIXTURES.iter().find(|f| f.id == "F1").expect("F1");
+    // The production builder, with the fixture's own case packet — what the worker sends.
+    let prompt = crate::managerrun::manager_live_prompt(&case_packet(f));
+    assert!(
+        prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG),
+        "the production prompt must state the block"
+    );
+
+    // The recorded shape of all three flux#87 runs: excellent prose, a HANDOFF line, no block.
+    let recorded = "The sealed B2 secret still holds the CHANGE_ME placeholder (9 bytes). The \
+        restore drill can only run after merge. Keeping the pull request a draft is right. The \
+        operator has exactly two actions to take.\n\nHANDOFF: escalate — operator action required.";
+    let known: Vec<KnownFinding> = f.findings.iter().map(KnownFindingRaw::to_known).collect();
+    assert!(
+        matches!(
+            parse_decision(recorded, &known),
+            Err(DecisionError::ZeroOrManyBlocks)
+        ),
+        "prose plus a HANDOFF line must be refused as ZeroOrManyBlocks"
+    );
+    // ...and the replay scorer, which reads the production prompt, agrees.
+    assert!(
+        matches!(
+            score_proposal(f, Some(recorded)),
+            ProposalScore::Refused(ref m) if m.contains("ZeroOrManyBlocks")
+        ),
+        "the replay must refuse the flux-shaped output"
+    );
+
+    // A well-formed block from the fixture, on the same prompt, is accepted.
+    let block = fence(f.acceptable.first().expect("acceptable").block);
+    assert!(
+        parse_decision(&block, &known).is_ok(),
+        "a well-formed decision block must parse"
+    );
 }
 
 /// The live proposer: one manager turn per fixture on the pinned model. **Operator-run only** — CI

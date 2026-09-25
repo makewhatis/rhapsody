@@ -815,15 +815,22 @@ impl Orchestrator {
             match reservation {
                 Ok(ManagerReservation::Reserved) => {}
                 Ok(ManagerReservation::Exhausted) => {
+                    // §7.3: nothing is refunded, so the state must not be the only trace
+                    // (STUDIO-1054). An intervention that exhausted because the manager's output
+                    // never parsed says so in the console and the room, with the reason and the
+                    // attempt count — the operator enabled advise mode to see proposals, and a WARN
+                    // line is not a proposal.
+                    let notice = self.manager_exhaustion_notice(row);
                     if row.mode == MANAGER_MODE_ADVISE {
                         // §9: the shadow budget is spent; only this proposal ends. The live
                         // generation is deliberately untouched — a shadow run can never stop it.
-                        tracing::warn!(pr = %row.pr,
+                        tracing::warn!(pr = %row.pr, reason = %notice,
                             "manager: the shadow budget is spent; the proposal ends exhausted");
                     } else {
-                        tracing::warn!(pr = %row.pr,
+                        tracing::warn!(pr = %row.pr, reason = %notice,
                             "manager: the run budget is spent; the generation is stopped");
                     }
+                    self.post_manager_room_notice(&row.pr, &notice);
                     continue;
                 }
                 Ok(ManagerReservation::Absent) => continue,
@@ -1048,9 +1055,12 @@ impl Orchestrator {
         match managerdecision::parse_decision(text, &known) {
             Ok(decision) => self.advance_manager_decision(&row, &decision, text),
             Err(err) => {
+                // STUDIO-1054: the reason is persisted on the row and its short token is the form
+                // the operator will read ("the manager's output didn't parse: ZeroOrManyBlocks"), so
+                // an eventual `exhausted` can name WHY, not just that it happened.
                 self.record_manager_failed_attempt(
                     &row,
-                    &format!("invalid manager decision: {err:?}"),
+                    &format!("the manager's output didn't parse: {}", err.code()),
                 );
             }
         }
@@ -1562,11 +1572,51 @@ impl Orchestrator {
         out
     }
 
-    /// Record a `failed_attempt` (with its reason logged) so the pump may re-queue it (§7.2).
+    /// Record a `failed_attempt` (with its reason persisted and logged) so the pump may re-queue it
+    /// (§7.2). STUDIO-1054: the reason lands on the row, not only in the log — an intervention that
+    /// later exhausts reports it in the console and the room.
     pub(crate) fn record_manager_failed_attempt(&self, row: &ManagerInterventionRow, reason: &str) {
         tracing::warn!(pr = %row.pr, id = %row.id, reason = reason,
             "manager: recording a failed attempt");
-        self.set_manager_state(row, MANAGER_INTERVENTION_FAILED_ATTEMPT);
+        let mut updated = row.clone();
+        updated.state = MANAGER_INTERVENTION_FAILED_ATTEMPT.to_string();
+        updated.failure_reason = reason.to_string();
+        if let Err(e) = self.store().save_manager_intervention(updated) {
+            tracing::warn!(pr = %row.pr, id = %row.id, err = %e,
+                "manager: writing the failed attempt failed");
+        }
+    }
+
+    /// The sentence an `exhausted` intervention reports to the console and the room (STUDIO-1054):
+    /// the last failed attempt's reason and the attempt count. With no recorded reason it still
+    /// names the count rather than saying nothing.
+    pub(crate) fn manager_exhaustion_notice(&self, row: &ManagerInterventionRow) -> String {
+        let attempts = row.attempts.max(0);
+        if row.failure_reason.is_empty() {
+            format!("the manager's intervention ended exhausted after {attempts} attempts")
+        } else {
+            format!("{}, {attempts} attempts", row.failure_reason)
+        }
+    }
+
+    /// Post a manager notice to the team room, best effort (STUDIO-1054). Reuses the proposal post's
+    /// shape — the `manager` identity, the summon-token strip, the PR as a ref — because the room is
+    /// the surface §9 says a proposal reaches and the outage report must reach it too.
+    pub(crate) fn post_manager_room_notice(&self, pr: &str, text: &str) {
+        let Some(room) = self.teams_room.as_ref() else {
+            return;
+        };
+        let line = crate::managerapply::strip_summon_tokens(&format!("manager on {pr}: {text}"));
+        if let Err(e) = room.append(
+            &Message::room(
+                crate::reviewadjudicate::MANAGER_IDENTITY,
+                (self.now)(),
+                line,
+            )
+            .with_refs([pr.to_string()]),
+        ) {
+            tracing::warn!(pr = %pr, err = %e, "manager: the room notice failed");
+        }
     }
 
     /// Idempotent state write with a warn on failure.
@@ -4091,6 +4141,81 @@ mod tests {
             !line.contains(rhapsody_core::SUMMON_TOKEN_SYMPHONY)
                 && !line.contains(rhapsody_core::SUMMON_TOKEN_RHAPSODY),
             "a proposal carries no summon token: {line}"
+        );
+    }
+
+    /// **Acceptance (STUDIO-1054, item 4).** Three runs whose output never parses end this
+    /// intervention `exhausted` — and the reason is VISIBLE: the last failure is persisted, the room
+    /// gets a notice naming the parse error and the attempt count, and the console serves the same
+    /// reason. This is the flux#87 failure mode: the analysis was excellent and thrown away, and the
+    /// operator saw only WARN lines. MUTATION: drop the failure-reason write and both assertions
+    /// red; drop `post_manager_room_notice` from the `Exhausted` arm and the room assertion reds.
+    #[test]
+    fn an_invalid_output_exhaustion_is_visible_in_the_console_and_the_room() {
+        let dir = TempDir::new();
+        let room = Arc::new(rhapsody_config::room::LocalRoom::new(dir.child("room")));
+        let (mut o, _dispatched) = orch(ReviewAuthority::Advise);
+        o.teams_room = Some(Arc::clone(&room));
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_watch(&o, "adopt:STUDIO-1");
+
+        // Three attempts, each ending in prose plus a `HANDOFF:` line and no block — the shape all
+        // three flux#87 runs produced.
+        let flux = "The sealed B2 secret still holds CHANGE_ME.\n\nHANDOFF: escalate — operator \
+            action required.";
+        for _ in 0..3 {
+            let id = launch_running(&mut o);
+            o.settle_manager_intervention(
+                "pr:makewhatis/rhapsody#12@manager",
+                &exit_with(Some(flux)),
+            );
+            assert_eq!(
+                state_of(&o, &id),
+                MANAGER_INTERVENTION_FAILED_ATTEMPT,
+                "an unparseable output is a failed attempt"
+            );
+        }
+
+        // The next reservation finds the attempt cap spent and terminalises the intervention.
+        o.pump_manager_interventions();
+        let row = o
+            .store()
+            .load_manager_interventions()
+            .expect("rows")
+            .into_iter()
+            .find(|r| r.pr.eq_ignore_ascii_case(PR_KEY))
+            .expect("intervention row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_EXHAUSTED);
+        assert!(
+            row.failure_reason.contains("didn't parse")
+                && row.failure_reason.contains("ZeroOrManyBlocks"),
+            "the parse reason must be persisted: {}",
+            row.failure_reason
+        );
+
+        // The ROOM: the exhaustion is announced, naming the reason and the attempt count.
+        let lines = room_lines(&room);
+        assert!(
+            lines.iter().any(|l| l.contains("didn't parse")
+                && l.contains("ZeroOrManyBlocks")
+                && l.contains("3 attempts")),
+            "the room must carry the exhaustion notice: {lines:?}"
+        );
+
+        // The CONSOLE: the reviews view serves the same reason under the manager state.
+        let view = o.review_console_list().expect("list");
+        let job = view
+            .reviews
+            .iter()
+            .find(|r| r.manager.is_some())
+            .expect("a manager state on the watched row");
+        let manager = job.manager.as_ref().expect("state");
+        assert_eq!(manager.state, MANAGER_INTERVENTION_EXHAUSTED);
+        assert!(
+            manager.reason.contains("didn't parse") && manager.reason.contains("3 attempts"),
+            "the console reason must carry the parse error and count: {}",
+            manager.reason
         );
     }
 
