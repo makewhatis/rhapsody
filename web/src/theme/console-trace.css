@@ -137,7 +137,7 @@
 /* ---- the review strip (STUDIO-976, regrouped by round STUDIO-1023) ----
    The ticket's review runs, in the controls row beside the attempt selector. A review is a real run
    with its own trace, so an entry opens it exactly as an attempt does, but it is styled as its own
-    kind: dashed, mono, and never numbered. The strip shows every review, grouped into ROUNDS — one
+   kind: dashed, mono, and never numbered. The strip shows every review, grouped into ROUNDS — one
    round is a pull request (or a repeated reviewer, which marks a new head); the newest round is
    expanded and the older rounds collapse behind a "+N earlier rounds" toggle (the view builds the
    rounds; the stylesheet only draws them). Nothing is dropped: a review left out of the newest
