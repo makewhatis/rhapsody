@@ -366,6 +366,8 @@ mod router_tests {
         "/api/v1/runs/7/retain",
         "/api/v1/runs/7/post",
         "/api/v1/runs/7/message",
+        // STUDIO-1053: the held-ticket "Human step done → resume" action.
+        "/api/v1/runs/7/resume-hold",
         // STUDIO-990: the ONE credentialed provider operation — the catalog refresh POST.
         "/api/v1/providers/7/models/refresh",
         // STUDIO-1048: authoring a provider DEFINITION (non-secret config, but still a local write).
@@ -633,6 +635,9 @@ mod router_tests {
         match path {
             "/api/v1/drain" => r#"{"active":false}"#,
             "/api/v1/runs/7/message" => r#"{"text":"hi"}"#,
+            // A non-empty note, so the request reaches the provider rather than the handler's
+            // `empty_note` rejection.
+            "/api/v1/runs/7/resume-hold" => r#"{"note":"done"}"#,
             // A remove reaches the provider's reference check (the definition never exists here,
             // so it answers 404 — past the guard and past body validation).
             "/api/v1/providers/config" => r#"{"op":"remove","provider_id":"unknown"}"#,

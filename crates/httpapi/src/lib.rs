@@ -57,6 +57,7 @@ mod handlers_message;
 mod handlers_projects;
 mod handlers_provider_config;
 mod handlers_providers;
+mod handlers_resumehold;
 mod handlers_reviews;
 mod handlers_runaction;
 mod handlers_rundiff;

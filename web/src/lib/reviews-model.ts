@@ -316,7 +316,7 @@ export function managerView(m: ManagerState | undefined): ManagerView | null {
     case "escalated":
       return base("blocked", "Manager escalated", m.reason);
     case "exhausted":
-      return base("blocked", "Manager exhausted");
+      return base("blocked", "Manager exhausted", m.reason);
     case "no_review_gap":
       return base("parked", "Manager: no review gap");
     case "superseded":

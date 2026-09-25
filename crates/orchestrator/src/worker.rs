@@ -555,16 +555,10 @@ async fn run_manager_attempt(
 
     // §8: the case packet is the host's own record of the stall, rendered as DATA, and it
     // accompanies the base prompt rather than replacing it. An empty packet (an older path) sends
-    // the base prompt alone, byte-identical to M7.
-    let prompt = if mgr.case_packet.is_empty() {
-        crate::managerrun::MANAGER_BASE_PROMPT.to_string()
-    } else {
-        format!(
-            "{}\n\n{}",
-            crate::managerrun::MANAGER_BASE_PROMPT,
-            mgr.case_packet
-        )
-    };
+    // the base instructions alone. STUDIO-1054: the base prompt and the decision contract come from
+    // the ONE builder the M12 harness also uses, so the live run is told the block it must emit
+    // instead of a `HANDOFF:` line.
+    let prompt = crate::managerrun::manager_live_prompt(&mgr.case_packet);
     let (final_state, result_text, loop_err) = deps
         .run_turns(
             session.as_ref(),
@@ -3943,6 +3937,77 @@ mod tests {
             tr.move_calls().len(),
             0,
             "a manager run makes no tracker state move"
+        );
+    }
+
+    // STUDIO-1054 acceptance, item 2: the prompt a LIVE manager launch actually sends carries the
+    // decision contract. This drives the production path (`run_agent_attempt` → `run_manager_attempt`)
+    // with a non-empty packet, and reads back the turn-1 prompt the fake agent recorded. The mutation
+    // guard is the call site in `run_manager_attempt`: reverting it to `MANAGER_BASE_PROMPT` + packet
+    // alone — the pre-fix shape that caused the flux#87 incident — reds this. `managerrun`'s own
+    // builder test cannot see that regression, because it never drives the production path.
+    #[tokio::test]
+    async fn the_live_manager_launch_sends_the_decision_contract() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "ignored",
+            1,
+        );
+        d.manager_root = root.path.clone();
+        d.manager = Some(crate::managerrun::ManagerCheckout {
+            key: "pr:o/r#1@manager".to_string(),
+            run_timeout_ms: 1234,
+            case_packet: "CASE PACKET DATA".to_string(),
+        });
+        let key = "pr:o/r#1@manager";
+        let iss = Issue {
+            id: key.to_string(),
+            identifier: key.to_string(),
+            ..Default::default()
+        };
+        let (_last, _decl, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "manager attempt clean: {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG),
+            "the live launch must name the block tag: {prompt}"
+        );
+        for verb in ["RERUN_REVIEW", "ROUTE_TO_AUTHOR", "APPROVE", "ESCALATE"] {
+            assert!(
+                prompt.contains(verb),
+                "the live launch must name {verb}: {prompt}"
+            );
+        }
+        for field in ["evidence_rev", "rationale", "dismiss", "route", "escalate"] {
+            assert!(
+                prompt.contains(field),
+                "the live launch must state the {field} field: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("teams_retain"),
+            "the live launch must tell the run its only write is teams_retain: {prompt}"
+        );
+        assert!(
+            prompt.contains("no `teams_post`"),
+            "the live launch must say teams_post is not registered: {prompt}"
+        );
+        assert!(
+            prompt.contains("CASE PACKET DATA"),
+            "the case packet must ride with the contract: {prompt}"
         );
     }
 }

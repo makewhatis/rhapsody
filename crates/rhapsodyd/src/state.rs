@@ -31,7 +31,8 @@ use rhapsody_orchestrator::teamsmemory::{
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError,
-    RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
+    RefreshResult, ReloadError, ResumeHoldError, ResumeHoldResult, ResumeResult, RunHoldView,
+    RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
     DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
@@ -264,6 +265,22 @@ impl StateProvider for DaemonState {
 
     async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
         self.handle.send_run_message(run_id, text).await
+    }
+
+    async fn resume_hold(
+        &self,
+        run_id: i64,
+        note: &str,
+    ) -> Result<ResumeHoldResult, ResumeHoldError> {
+        // Like stop/resume, no HTTP request-cancel is threaded (the handle's lifetime ctx bounds the
+        // reply wait); the tracker/store round-trips run on this request's own task (STUDIO-1053).
+        self.handle
+            .resume_hold(CancelWait::default(), run_id, note)
+            .await
+    }
+
+    async fn run_hold(&self, run_id: i64) -> Result<RunHoldView, ResumeHoldError> {
+        self.handle.run_hold(run_id).await
     }
 
     fn refresh(&self) -> RefreshResult {

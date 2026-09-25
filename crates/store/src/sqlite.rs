@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -579,6 +579,17 @@ CREATE INDEX IF NOT EXISTS rhapsody_manager_wake_issue
 ALTER TABLE rhapsody_manager_intervention ADD COLUMN activation_patch_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE rhapsody_manager_intervention ADD COLUMN rerequested TEXT NOT NULL DEFAULT '';
 "#,
+    // v24 -> v25: the FAILURE REASON on `rhapsody_manager_intervention` (STUDIO-1054). A
+    // Rhapsody-only column on a Rhapsody-only table, so the `rhapsody_` prefix keeps it gated out of
+    // the Go-recaptured schema golden by name.
+    //
+    // §7.3's exhausted state is terminal, but the state alone does not say WHY: an intervention can
+    // exhaust because of the run budget, the attempt cap, or a decision the strict parser refused.
+    // Recording the last failed-attempt reason is what lets the console and the room say "the
+    // manager's output didn't parse: ZeroOrManyBlocks, 3 attempts" instead of only a WARN line.
+    r#"
+ALTER TABLE rhapsody_manager_intervention ADD COLUMN failure_reason TEXT NOT NULL DEFAULT '';
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -714,7 +725,7 @@ fn map_manager_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerAppr
 const MANAGER_INTERVENTION_COLS: &str = "id, pr, generation, stall_kinds, mode, state, attempts, \
      phase_hint, final, lease_boot_id, lease_expires_at, run_id, decision_json, decision_head, \
      decision_evidence_rev, effects_json, activated_at, unapplied_explanation, outcome, outcome_at, \
-     memory_state, activation_patch_id, rerequested";
+     memory_state, activation_patch_id, rerequested, failure_reason";
 
 /// Scan one `rhapsody_manager_intervention` row selected with [`MANAGER_INTERVENTION_COLS`]
 /// (positional, in DDL order). `stall_kinds` is the newline-joined TEXT column read back through
@@ -744,6 +755,7 @@ fn map_manager_intervention(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manager
         memory_state: row.get(20)?,
         activation_patch_id: row.get(21)?,
         rerequested: split_findings(&row.get::<_, String>(22)?),
+        failure_reason: row.get(23)?,
     })
 }
 
@@ -3018,9 +3030,9 @@ impl Store for Sqlite {
                (id, pr, generation, stall_kinds, mode, state, attempts, phase_hint, final,
                 lease_boot_id, lease_expires_at, run_id, decision_json, decision_head,
                 decision_evidence_rev, effects_json, activated_at, unapplied_explanation,
-                outcome, outcome_at, memory_state, activation_patch_id, rerequested)
+                outcome, outcome_at, memory_state, activation_patch_id, rerequested, failure_reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23)
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET
                pr                    = excluded.pr,
                generation            = excluded.generation,
@@ -3043,7 +3055,8 @@ impl Store for Sqlite {
                outcome_at            = excluded.outcome_at,
                memory_state          = excluded.memory_state,
                activation_patch_id   = excluded.activation_patch_id,
-               rerequested           = excluded.rerequested",
+               rerequested           = excluded.rerequested,
+               failure_reason        = excluded.failure_reason",
             params![
                 row.id,
                 row.pr,
@@ -3068,6 +3081,7 @@ impl Store for Sqlite {
                 row.memory_state,
                 row.activation_patch_id,
                 join_findings(&row.rerequested),
+                row.failure_reason,
             ],
         )?;
         Ok(())

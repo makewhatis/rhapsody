@@ -1099,6 +1099,12 @@ pub struct ManagerInterventionRow {
     pub outcome_at: String,
     /// The memory-mirror state (§11.3): `pending` until the best-effort mirror lands.
     pub memory_state: String,
+    /// The reason this intervention last ended a run as a `failed_attempt` (STUDIO-1054): a run
+    /// failure, no result text, or a decision block the strict parser refused. Empty until one has.
+    /// It is what lets an `exhausted` intervention say WHY it is exhausted in the console and the
+    /// room, rather than only in a WARN log — §7.3's terminal state records the reason, not just the
+    /// state. Rhapsody-only column on a Rhapsody-only table.
+    pub failure_reason: String,
 }
 
 /// The outcome of an atomic manager-run reservation (§7.3): launching a run is one SQLite
