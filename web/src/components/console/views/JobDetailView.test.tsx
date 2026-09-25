@@ -36,6 +36,8 @@ const h = vi.hoisted(() => ({
   fetchLinearIdentity: vi.fn(),
   stopRun: vi.fn(),
   resumeRun: vi.fn(),
+  fetchRunHold: vi.fn(),
+  resumeHold: vi.fn(),
   mergeRun: vi.fn(),
   fetchRunMergeability: vi.fn(),
   fetchRunDiff: vi.fn(),
@@ -65,6 +67,8 @@ vi.mock("@/lib/api", async (orig) => {
     fetchLinearIdentity: h.fetchLinearIdentity,
     stopRun: h.stopRun,
     resumeRun: h.resumeRun,
+    fetchRunHold: h.fetchRunHold,
+    resumeHold: h.resumeHold,
     mergeRun: h.mergeRun,
     fetchRunMergeability: h.fetchRunMergeability,
     fetchRunDiff: h.fetchRunDiff,
@@ -239,6 +243,11 @@ function mountDetail(
     h.fetchRunProvenance.mockImplementation(async (id: number) => ({ run_id: id }));
   }
   h.fetchState.mockResolvedValue(EMPTY_STATE);
+  // The held-ticket resume action (STUDIO-1053): by default the ticket is NOT held, so the action
+  // is absent — the ordinary case. A test about the action configures this before mounting.
+  if (h.fetchRunHold.getMockImplementation() === undefined) {
+    h.fetchRunHold.mockResolvedValue({ identifier: issue, held: false });
+  }
   if (h.fetchTeamsOverview.getMockImplementation() === undefined) {
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
@@ -391,6 +400,8 @@ afterEach(() => {
   // a review watch set or a message timeline would otherwise be handed to every test after it.
   h.fetchVersion.mockReset();
   h.mergeRun.mockReset();
+  h.fetchRunHold.mockReset();
+  h.resumeHold.mockReset();
   h.fetchRunMergeability.mockReset();
   h.fetchRunDiff.mockReset();
   h.fetchRunMessages.mockReset();
@@ -1665,6 +1676,140 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await waitFor(() => expect(action(/^stop$/i)).toBeTruthy());
     fireEvent.click(action(/^stop$/i));
     await waitFor(() => expect(h.stopRun).toHaveBeenCalledExactlyOnceWith(547));
+  });
+
+  // STUDIO-1053 — the one way out of a `rhapsody:human` hold, shown on the held ticket's job page.
+  it("offers the human-step resume only on a held ticket, and names the crossed breaker limit", async () => {
+    h.fetchRunHold.mockResolvedValue({
+      identifier: "STUDIO-654",
+      held: true,
+      breaker: { rounds: 5, providers: ["anthropic"] },
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    const trigger = await screen.findByRole("button", { name: /human step done/i });
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    expect(dialog.textContent).toContain("5 completed review rounds");
+    expect(dialog.textContent).toContain("anthropic");
+    // The note is required: a bare confirmation would record nothing for the next run to read.
+    const confirm = within(dialog).getByRole("button", { name: /record and resume/i });
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("records the note, removes the hold and reports the ticket queued", async () => {
+    h.fetchRunHold.mockResolvedValue({ identifier: "STUDIO-654", held: true });
+    h.resumeHold.mockResolvedValue({
+      identifier: "STUDIO-654",
+      note_recorded: true,
+      label_removed: true,
+      queued: true,
+      moved_to: "Todo",
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "added the secrets" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() => expect(h.resumeHold).toHaveBeenCalledWith(547, "added the secrets"));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actok")?.textContent).toContain("the ticket is queued"),
+    );
+  });
+
+  it("reports a partial failure instead of claiming the ticket was queued", async () => {
+    h.fetchRunHold.mockResolvedValue({ identifier: "STUDIO-654", held: true });
+    h.resumeHold.mockResolvedValue({
+      identifier: "STUDIO-654",
+      note_recorded: true,
+      label_removed: true,
+      queued: false,
+      move_error: "no unstarted state for team",
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "done" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .acterr")?.textContent).toContain(
+        "could not be requeued",
+      ),
+    );
+  });
+
+  it("does not offer the resume action on a ticket that is not held", async () => {
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+    expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull();
+  });
+
+  // STUDIO-1053 review: the resume click removes the label, so the very next hold read answers
+  // `held:false` and unmounts the action button. The outcome must NOT unmount with it — that would
+  // be a silent success, the one thing the ticket forbids.
+  it("keeps the queued outcome after the hold read flips to not-held", async () => {
+    let resumed = false;
+    h.fetchRunHold.mockImplementation(async () => ({
+      identifier: "STUDIO-654",
+      held: !resumed,
+    }));
+    h.resumeHold.mockImplementation(async () => {
+      resumed = true;
+      return {
+        identifier: "STUDIO-654",
+        note_recorded: true,
+        label_removed: true,
+        queued: true,
+        moved_to: "Todo",
+      };
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "added the secrets" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull(),
+    );
+    expect(document.querySelector(".trhd .actok")?.textContent).toContain("the ticket is queued");
+  });
+
+  // The partial failure is the case the review called out: after the refetch clears the hold, the
+  // operator must still see that the ticket was NOT requeued.
+  it("keeps a partial-failure outcome after the hold read flips to not-held", async () => {
+    let resumed = false;
+    h.fetchRunHold.mockImplementation(async () => ({
+      identifier: "STUDIO-654",
+      held: !resumed,
+    }));
+    h.resumeHold.mockImplementation(async () => {
+      resumed = true;
+      return {
+        identifier: "STUDIO-654",
+        note_recorded: true,
+        label_removed: true,
+        queued: false,
+        move_error: "no unstarted state for team",
+      };
+    });
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    fireEvent.click(await screen.findByRole("button", { name: /human step done/i }));
+    const dialog = await screen.findByRole("dialog", { name: /human step done/i });
+    fireEvent.change(within(dialog).getByLabelText(/what did you do/i), {
+      target: { value: "done" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /record and resume/i }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /human step done/i })).toBeNull(),
+    );
+    const outcome = document.querySelector(".trhd .acterr")?.textContent ?? "";
+    expect(outcome).toContain("could not be requeued");
+    expect(outcome).toContain("no unstarted state for team");
   });
 });
 

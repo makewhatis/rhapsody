@@ -19,13 +19,36 @@ use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
 use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
-    RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
+    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult,
+    ResumeHoldError, ResumeHoldResult, ResumeResult, RetryRow, RunHoldView, RunMessageResult,
+    RunningRow, Snapshot, StopResult, TokenCounts, Totals,
 };
 use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView};
 use rhapsody_store::Noop;
 
 use crate::{ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider};
+
+/// How the fake's `resume_hold`/`run_hold` fails. [`ResumeHoldError`] is not `Clone` (its store
+/// variant wraps a non-`Clone` [`rhapsody_store::StoreError`]), so the fake stores the SHAPE and
+/// rebuilds the error per call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FakeResumeHoldError {
+    /// The tracker rejected the `rhapsody:human` removal — the 502 path.
+    LabelRemoval(String),
+    /// Any read/control failure — the 500 path.
+    Other(String),
+}
+
+impl FakeResumeHoldError {
+    fn build(&self) -> ResumeHoldError {
+        match self {
+            FakeResumeHoldError::LabelRemoval(message) => {
+                ResumeHoldError::LabelRemovalFailed(message.clone())
+            }
+            FakeResumeHoldError::Other(message) => ResumeHoldError::Tracker(message.clone()),
+        }
+    }
+}
 
 /// A canned [`StateProvider`]: a fixed snapshot (or snapshot error) plus a read-only history store.
 /// Mirrors Go `fakeProvider` (`server_test.go`), grown across the H-lane exactly as Go grows its one
@@ -60,6 +83,15 @@ pub(crate) struct FakeProvider {
     handoff_result: HandoffResult,
     handoff_err: Option<String>,
     handoff_run_id: AtomicI64,
+    /// STUDIO-1053 held-ticket resume surface: the canned result + error, the run id and note the
+    /// last POST forwarded, and the canned `run_hold` read.
+    resume_hold_result: ResumeHoldResult,
+    resume_hold_err: Option<FakeResumeHoldError>,
+    resume_hold_run_id: AtomicI64,
+    resume_hold_note: Mutex<String>,
+    run_hold_view: RunHoldView,
+    run_hold_err: Option<FakeResumeHoldError>,
+    run_hold_run_id: AtomicI64,
     /// H3 operator-message surface: canned result + recorded args (Go's `messageResult`/`messageRunID`
     /// /`messageText`). `message_text` records the TRIMMED text the handler forwarded.
     message_result: RunMessageResult,
@@ -170,6 +202,13 @@ impl FakeProvider {
             handoff_result: HandoffResult::default(),
             handoff_err: None,
             handoff_run_id: AtomicI64::new(0),
+            resume_hold_result: ResumeHoldResult::default(),
+            resume_hold_err: None,
+            resume_hold_run_id: AtomicI64::new(0),
+            resume_hold_note: Mutex::new(String::new()),
+            run_hold_view: RunHoldView::default(),
+            run_hold_err: None,
+            run_hold_run_id: AtomicI64::new(0),
             message_result: RunMessageResult::default(),
             message_run_id: AtomicI64::new(0),
             message_text: Mutex::new(String::new()),
@@ -333,6 +372,48 @@ impl FakeProvider {
     /// The run id the last `handoff_run` was called with (TRA-242).
     pub(crate) fn handoff_run_id(&self) -> i64 {
         self.handoff_run_id.load(Ordering::SeqCst)
+    }
+
+    /// Set the canned `resume_hold` result (STUDIO-1053).
+    pub(crate) fn with_resume_hold_result(mut self, result: ResumeHoldResult) -> Self {
+        self.resume_hold_result = result;
+        self
+    }
+
+    /// Make `resume_hold` fail with `err` (the 500/502 path).
+    pub(crate) fn with_resume_hold_error(mut self, err: FakeResumeHoldError) -> Self {
+        self.resume_hold_err = Some(err);
+        self
+    }
+
+    /// The run id the last `resume_hold` was called with.
+    pub(crate) fn resume_hold_run_id(&self) -> i64 {
+        self.resume_hold_run_id.load(Ordering::SeqCst)
+    }
+
+    /// The (trimmed) note the last `resume_hold` was called with.
+    pub(crate) fn resume_hold_note(&self) -> String {
+        self.resume_hold_note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set the canned `run_hold` read (STUDIO-1053).
+    pub(crate) fn with_run_hold_view(mut self, view: RunHoldView) -> Self {
+        self.run_hold_view = view;
+        self
+    }
+
+    /// Make `run_hold` fail with `err` (the 500 path).
+    pub(crate) fn with_run_hold_error(mut self, err: FakeResumeHoldError) -> Self {
+        self.run_hold_err = Some(err);
+        self
+    }
+
+    /// The run id the last `run_hold` was called with.
+    pub(crate) fn run_hold_run_id(&self) -> i64 {
+        self.run_hold_run_id.load(Ordering::SeqCst)
     }
 
     /// Set the canned `send_run_message` result (Go's `&fakeProvider{messageResult: …}`).
@@ -668,6 +749,32 @@ impl StateProvider for FakeProvider {
         self.message_run_id.store(run_id, Ordering::SeqCst);
         *self.message_text.lock().expect("message_text lock") = text.to_string();
         self.message_result.clone()
+    }
+
+    async fn resume_hold(
+        &self,
+        run_id: i64,
+        note: &str,
+    ) -> Result<ResumeHoldResult, ResumeHoldError> {
+        self.touch();
+        self.resume_hold_run_id.store(run_id, Ordering::SeqCst);
+        *self
+            .resume_hold_note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = note.to_string();
+        match &self.resume_hold_err {
+            Some(err) => Err(err.build()),
+            None => Ok(self.resume_hold_result.clone()),
+        }
+    }
+
+    async fn run_hold(&self, run_id: i64) -> Result<RunHoldView, ResumeHoldError> {
+        self.touch();
+        self.run_hold_run_id.store(run_id, Ordering::SeqCst);
+        match &self.run_hold_err {
+            Some(err) => Err(err.build()),
+            None => Ok(self.run_hold_view.clone()),
+        }
     }
 
     fn refresh(&self) -> RefreshResult {

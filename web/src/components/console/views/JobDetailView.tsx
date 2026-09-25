@@ -35,7 +35,9 @@ import { useLinearIdentity } from "@/hooks/useConfig";
 import { useIssueRuns, useLiveHistoryCosts } from "@/hooks/useHistory";
 import {
   useMergeRun,
+  useResumeHold,
   useResumeRun,
+  useRunHold,
   useRunMergeability,
   useSendRunMessage,
   useStopRun,
@@ -120,8 +122,10 @@ import {
   type TracePhase,
 } from "@/lib/trace-model";
 import type {
+  BreakerHold,
   LogEntry,
   MergeReceipt,
+  ResumeHoldResult,
   RunProvenance,
   RunSummary,
   TeamsFact,
@@ -941,6 +945,16 @@ function HeaderActions({
   const stop = useStopRun(run.id);
   const resume = useResumeRun(run.id);
   const merge = useMergeRun(run.id);
+  // Whether this run's TICKET is held with `rhapsody:human` (STUDIO-1053). The action is the
+  // operator's way out of the hold, so the button only exists when the daemon says the ticket is
+  // held. A review run's key is not a ticket, so it asks nothing.
+  const hold = useRunHold(run.id, !reviewRun);
+  // The resume-hold mutation is owned HERE, not inside the action button (STUDIO-1053 review). Its
+  // settle invalidates ["run-hold"], and the label is gone by then, so the hold read flips to
+  // `held:false` and the button unmounts — a result owned by that button would vanish with it and
+  // report nothing, which is exactly the silent success the ticket forbids. The outcome therefore
+  // renders outside the held-only guard, from this mutation's data.
+  const holdResume = useResumeHold(run.id);
   const teamsEnabled = useTeamsEnabled();
   // What the daemon would say if Merge were clicked right now (STUDIO-790). Asked only where a
   // merge path exists at all, because with Teams off the daemon serves `teams_disabled` and the
@@ -1004,6 +1018,15 @@ function HeaderActions({
           Resume
         </Button>
       ) : null}
+      {/* The hold the operator has to lift by hand — and the one the runaway breaker applied on
+          its own (STUDIO-1053). A room post cannot unblock a `rhapsody:human` ticket, so this
+          header carries the action that can. */}
+      {hold.data?.held ? (
+        <HumanResumeAction resume={holdResume} breaker={hold.data.breaker} />
+      ) : null}
+      {/* The outcome of the last resume click, OUTSIDE the held-only guard above (STUDIO-1053
+          review): the click clears the hold, so this must outlive the button that started it. */}
+      {holdResume.data === undefined ? null : <ResumeHoldOutcome result={holdResume.data} />}
       {/* Real while the run is live — `POST /api/v1/runs/{id}/message` is an endpoint the daemon
           already serves. On a finished run it is dependency-named for a different reason than the
           rest of this cluster: there is no missing endpoint, there is no agent left to read it.
@@ -1255,6 +1278,212 @@ function MergeConfirm({
           </Button>
           <Button variant="pri" onClick={onConfirm} disabled={busy}>
             {busy ? "Merging…" : "Merge"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The "Human step done → resume" action (STUDIO-1053). A ticket held with `rhapsody:human` — by the
+ * operator, or by the runaway breaker (STUDIO-1026) — cannot be unblocked by a room post: the hold
+ * makes the dispatcher refuse the ticket, and the room has no dispatch power by design. This is the
+ * one control on the job page that can, and it does three things in one confirmed click: it records
+ * the operator's note for the next run, removes the hold, and requeues the ticket.
+ *
+ * The confirmation names the crossed limit when the breaker applied the hold, and the result line
+ * (rendered by `ResumeHoldOutcome`, above the held-only button) reports exactly what happened —
+ * including the honest partial outcome where the note landed and the hold came off but the ticket
+ * could not be moved back to Todo.
+ */
+function HumanResumeAction({
+  resume,
+  breaker,
+}: {
+  resume: HoldResume;
+  breaker?: BreakerHold;
+}) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const confirm = () => {
+    const body = note.trim();
+    if (body === "" || resume.isPending) return;
+    resume.mutate(body, {
+      onSuccess: () => {
+        setOpen(false);
+        setNote("");
+      },
+    });
+  };
+  return (
+    <>
+      <Button
+        variant="pri"
+        title="Record what you did, lift the rhapsody:human hold, and requeue this ticket."
+        onClick={() => {
+          resume.reset();
+          setOpen(true);
+        }}
+      >
+        Human step done → resume
+      </Button>
+      {open ? (
+        <ResumeHoldConfirm
+          breaker={breaker}
+          busy={resume.isPending}
+          note={note}
+          onNote={setNote}
+          error={resume.error?.message ?? ""}
+          onConfirm={confirm}
+          onClose={() => setOpen(false)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** The mutation the "Human step done → resume" action drives, as `HeaderActions` owns it. */
+type HoldResume = ReturnType<typeof useResumeHold>;
+
+/**
+ * The outcome of a resume click, rendered in the header OUTSIDE the held-only action (STUDIO-1053
+ * review). The click clears the hold, so a result line owned by the button would unmount with the
+ * button the moment the hold read refetches `held:false` — leaving the operator with no report of
+ * what happened, in both the queued and the partial-failure case. This pins the outcome for as long
+ * as the mutation's data lives.
+ */
+function ResumeHoldOutcome({ result }: { result: ResumeHoldResult }) {
+  return result.queued ? (
+    <span className="actok" role="status">
+      Note recorded, hold removed
+      {result.moved_to === undefined || result.moved_to === ""
+        ? ""
+        : ` and moved to ${result.moved_to}`}{" "}
+      — the ticket is queued.
+    </span>
+  ) : (
+    <span className="acterr" role="status">
+      Note recorded and hold removed, but the ticket could not be requeued:{" "}
+      {result.move_error === undefined || result.move_error === ""
+        ? "the state move failed"
+        : result.move_error}
+      .
+    </span>
+  );
+}
+
+/** The crossed breaker limit, phrased for the confirmation. "" when the hold is not a breaker one. */
+function breakerText(breaker: BreakerHold | undefined): string {
+  if (breaker === undefined) return "";
+  const parts: string[] = [];
+  if (breaker.rounds > 0) {
+    parts.push(`${breaker.rounds} completed review rounds`);
+  }
+  if (breaker.providers.length > 0) {
+    parts.push(`per-ticket spend (${breaker.providers.join(", ")})`);
+  }
+  if (parts.length === 0) return "";
+  return `Rhapsody held this ticket because it crossed ${parts.join(" and ")}. Resuming does not reset those counters — crossing again holds it again.`;
+}
+
+/**
+ * The confirmation for the resume action. It names the crossed breaker limit (when there is one),
+ * states what the click will do, and requires the note — the one thing the next run is guaranteed to
+ * read. Escape closes it; focus moves in and is trapped, so a keyboard operator cannot re-fire the
+ * header action behind the veil.
+ */
+function ResumeHoldConfirm({
+  breaker,
+  busy,
+  note,
+  onNote,
+  error,
+  onConfirm,
+  onClose,
+}: {
+  breaker?: BreakerHold;
+  busy: boolean;
+  note: string;
+  onNote: (text: string) => void;
+  error: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const from = document.activeElement as HTMLElement | null;
+    box.current?.focus();
+    return () => from?.focus?.();
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const stops = box.current?.querySelectorAll<HTMLElement>(
+        "a[href], button:not([disabled]), textarea:not([disabled])",
+      );
+      if (stops === undefined || stops.length === 0) return;
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      const outside = !box.current?.contains(document.activeElement);
+      const to = e.shiftKey
+        ? document.activeElement === first || outside
+          ? last
+          : null
+        : document.activeElement === last || outside
+          ? first
+          : null;
+      if (to !== null) {
+        e.preventDefault();
+        to.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const limit = breakerText(breaker);
+  return (
+    <div className="mgveil" role="presentation" onClick={onClose}>
+      <div
+        className="mgconf"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Human step done"
+        ref={box}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="ttl">Human step done → resume?</div>
+        {limit === "" ? null : <p className="sub">{limit}</p>}
+        <p className="sub">
+          The note below is recorded where the next run is guaranteed to read it, the{" "}
+          <Mono>rhapsody:human</Mono> hold is removed, and the ticket is requeued. The room is a
+          place to leave team notes — it cannot unblock this ticket.
+        </p>
+        <textarea
+          aria-label="What did you do?"
+          placeholder="What did you do to finish the human step?"
+          maxLength={4000}
+          rows={3}
+          value={note}
+          disabled={busy}
+          onChange={(e) => onNote(e.target.value)}
+        />
+        {error === "" ? null : (
+          <p className="err" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="row">
+          <Button variant="sec" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="pri" onClick={onConfirm} disabled={busy || note.trim() === ""}>
+            {busy ? "Resuming…" : "Record and resume"}
           </Button>
         </div>
       </div>
@@ -2701,6 +2930,9 @@ function AskDock({
   const post = usePostToRoom();
   const [question, setQuestion] = useState("");
   const [problem, setProblem] = useState("");
+  // Whether the ticket is held (STUDIO-1053). A held ticket's dispatcher refuses it, so a room post
+  // here is a NOTE, never an unblock — the dock says so rather than implying otherwise.
+  const hold = useRunHold(run.id, true);
   // The question that LANDED, as the daemon echoed it back — never the text in the box. It is what
   // the exchange below names and what its reply is matched on, so the two can never disagree.
   const [asked, setAsked] = useState<AskedQuestion | null>(null);
@@ -2729,6 +2961,12 @@ function AskDock({
       {asked === null ? null : (
         <AskExchange key={asked.id} asked={asked} roster={roster} onOpenRoom={onOpenRoom} />
       )}
+      {hold.data?.held ? (
+        <p className="sub" role="status">
+          This ticket is held for a human — a post here is a team note and will not unblock it. Use
+          “Human step done → resume” in the header to record what you did and requeue the ticket.
+        </p>
+      ) : null}
       <div className="askdock">
         <span className="g" aria-hidden="true">
           ✦
