@@ -4312,7 +4312,7 @@ mod store_tests {
     /// ship at `HEAD`, and must NOT hand the false stall to the manager.
     ///
     /// MUTATION (the ticket's): drop the `governs_observed` conjunct in
-    /// `reconcile_review_divergence` and this reds — a `review_shipped` divergence names `HEAD`
+    /// `reconcile_review_divergence` and this reds — a stale divergence is reported at `HEAD`
     /// while the branch carries `HEAD_PUSHED`, and an intervention is created for a pull request
     /// that is not stuck.
     #[test]
