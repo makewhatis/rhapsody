@@ -2507,6 +2507,35 @@ mod tests {
         );
     }
 
+    /// §15.4 "One contract": the example block printed in §6.1 must parse, field for field. It is
+    /// the literal shape the design documents, so the parser cannot drift from the example a reader
+    /// (or a manager prompt) is given.
+    #[test]
+    fn the_design_example_block_parses() {
+        let head = format!("87aa044{}", "0".repeat(33));
+        assert_eq!(head.len(), 40, "the example head is a full 40-hex sha");
+        let block = format!(
+            r#"{{"decision":"RERUN_REVIEW","head":"{head}","evidence_rev":1234,
+                "rerun":{{"reviewers":["sol","jimmy"],"note":"Please check the shutdown path specifically."}},
+                "rationale":"Both reviewers last completed at 829a28f; head 87aa044 changes the shutdown path."}}"#
+        );
+        let d = parse_decision(&wrap(&block), &[]).expect("the design example parses");
+        assert_eq!(d.head, head);
+        assert_eq!(d.evidence_rev, 1234);
+        assert_eq!(d.variant(), "RERUN_REVIEW");
+        assert_eq!(
+            d.kind,
+            DecisionKind::RerunReview {
+                reviewers: vec!["sol".to_string(), "jimmy".to_string()],
+                note: Some("Please check the shutdown path specifically.".to_string()),
+            }
+        );
+        assert_eq!(
+            d.rationale,
+            "Both reviewers last completed at 829a28f; head 87aa044 changes the shutdown path."
+        );
+    }
+
     /// A dismissal is recorded with its rationale and never stands alone: the parser requires a
     /// `decision`, and every variant that carries a dismissal still carries its own name.
     #[test]

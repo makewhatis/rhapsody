@@ -2632,6 +2632,126 @@ mod tests {
         );
     }
 
+    // §7.6 / §15.4 (Activation and delivery): the APPROVE variant of the failed-explanation case.
+    // The approval is recorded as a PENDING local record; a definitively failed explanation never
+    // activates it, so it is never `effective` and its dismissals stay open. MUTATION: make the
+    // pending approval effective on the local write instead of the activation transaction and the
+    // approval assert reds.
+    #[test]
+    fn an_approve_whose_explanation_failed_never_becomes_effective() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        seed_approved_review(&o, "approve");
+        seed_open_finding(&o, "alice:F1");
+        install_applier(&mut o);
+        let id = launch_running(&mut o);
+        o.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLYING);
+
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_FAILED,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_APPLY_FAILED);
+        assert!(
+            !o.store()
+                .manager_approval(&id)
+                .expect("read approval")
+                .is_some_and(|a| a.state == rhapsody_store::MANAGER_APPROVAL_EFFECTIVE),
+            "an approval whose explanation failed never becomes effective"
+        );
+        assert_eq!(
+            o.store()
+                .load_review_findings(PR_KEY)
+                .expect("findings")
+                .into_iter()
+                .find(|f| f.finding_id == "alice:F1")
+                .map(|f| f.status),
+            Some(rhapsody_store::REVIEW_FINDING_OPEN.to_string()),
+            "the dismissal never became effective either"
+        );
+    }
+
+    // §7.8 / §15.4 (Exchange accounting): only a non-final post-threshold RERUN/ROUTE writes an
+    // exchange authorization. An APPROVE (or an ESCALATE — the final intervention's only allowed
+    // decisions) creates none. MUTATION: create an authorization for every post-threshold
+    // activation and the APPROVE assert reds.
+    #[test]
+    fn a_final_intervention_approve_and_escalate_write_no_exchange() {
+        // A configured threshold with one answered exchange charged makes this post-threshold, so
+        // a non-final RERUN genuinely takes the exchange-writing branch.
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        o.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 1;
+        o.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 12)),
+            1,
+        );
+        seed_open_finding(&o, "alice:F1");
+        let (id, _) = validated_then_applying(
+            &mut o,
+            &rerun_json(r#"{"finding":"alice:F1","revision":1,"rationale":"superseded"}"#),
+        );
+        o.handle_manager_effect(&effect_result(
+            &id,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_AWAITING_EFFECT);
+        assert!(
+            !o.store()
+                .manager_exchanges(PR_KEY)
+                .expect("exchanges")
+                .is_empty(),
+            "a non-final post-threshold RERUN writes an authorization"
+        );
+
+        // An APPROVE on the same post-threshold path writes none.
+        let (mut o2, _) = orch(ReviewAuthority::Act);
+        o2.teams
+            .as_mut()
+            .expect("teams")
+            .review
+            .adjudicate_after_rounds = 1;
+        o2.review_rounds.insert(
+            crate::reviewwatch::churn_key(&PrCoord::new("makewhatis", "rhapsody", 12)),
+            1,
+        );
+        pass_self_test(&o2);
+        prime_holds(&o2);
+        seed_approved_review(&o2, "approve");
+        seed_open_finding(&o2, "alice:F1");
+        install_applier(&mut o2);
+        let id2 = launch_running(&mut o2);
+        o2.settle_manager_intervention(
+            "pr:makewhatis/rhapsody#12@manager",
+            &exit_with(Some(&decision_text(&approve_json("alice:F1")))),
+        );
+        o2.pump_manager_interventions();
+        o2.handle_manager_effect(&effect_result(
+            &id2,
+            &[crate::managerapply::MANAGER_EFFECT_EXPLANATION],
+            crate::managerapply::MANAGER_EFFECT_DONE,
+        ));
+        assert_eq!(state_of(&o2, &id2), MANAGER_INTERVENTION_AWAITING_EFFECT);
+        assert!(
+            o2.store()
+                .manager_exchanges(PR_KEY)
+                .expect("exchanges")
+                .is_empty(),
+            "an APPROVE creates no authorization"
+        );
+    }
+
     // §11.3: a memory failure leaves the decision APPLIED and `memory_state = pending` — it never
     // re-runs or reverts. No memory backend is configured here, so the mirror fails.
     #[test]

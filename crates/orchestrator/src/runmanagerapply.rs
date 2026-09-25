@@ -548,4 +548,162 @@ mod tests {
         assert!(!is_definitive_rejection("HTTP 500: server error"));
         assert!(!is_definitive_rejection("timed out after 60s"));
     }
+
+    // §7.6 / §15.4 (Activation and delivery): a comment request that TIMES OUT may still have
+    // landed. The applier makes its bounded marker search before posting again, finds the late
+    // comment, and reports `done` — so the duplicate the design accepts as harmless is not even
+    // produced when the marker is visible. MUTATION: skip the marker search and re-post blindly;
+    // this reds (two attempts on a request that had already succeeded).
+    struct FlakyComments {
+        attempts: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PrCommentSink for FlakyComments {
+        async fn post_pr_comment(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _body: &str,
+        ) -> PrCommentResult {
+            let mut n = self.attempts.lock().expect("attempts");
+            *n += 1;
+            // A timeout, not a 4xx: not definitive, so the marker search runs. The request may
+            // still have completed on GitHub's side — which the search then proves.
+            if *n == 1 {
+                Err("HTTP 504: gateway timeout".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct MarkerSearch(String);
+
+    #[async_trait::async_trait]
+    impl PrCommentSearch for MarkerSearch {
+        async fn pr_comment_bodies(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+        ) -> PrCommentSearchResult {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_comment_is_reconciled_by_its_marker() {
+        let comments = Arc::new(FlakyComments {
+            attempts: Mutex::new(0),
+        });
+        let request = comment_request(MANAGER_EFFECT_EXPLANATION);
+        let (control, results) = fake_control(PreEffectCheck::Proceed, None);
+        let deps = ManagerApplyDeps {
+            control,
+            comments: Some(Arc::clone(&comments) as Arc<dyn PrCommentSink>),
+            search: Some(Arc::new(MarkerSearch(request.marker.clone())) as Arc<dyn PrCommentSearch>),
+        };
+
+        perform_manager_apply(request, &deps).await;
+        let results = take_results(&results).await;
+        assert_eq!(
+            results[0].outcomes,
+            vec![(
+                MANAGER_EFFECT_EXPLANATION.to_string(),
+                MANAGER_EFFECT_DONE.to_string()
+            )],
+            "the late comment is found by its marker and reported done"
+        );
+        assert_eq!(
+            *comments.attempts.lock().expect("attempts"),
+            1,
+            "the marker search avoids a second post entirely"
+        );
+    }
+
+    // §7.6 / §8.3 / §15.4 (Merge freshness): the check before EACH effect. A decision revoked
+    // between two mandatory effects stops at the second, and the report names what ran and what
+    // did not — a done/cancelled report with nothing further applied. MUTATION: check only once
+    // before the first effect and the ticket move would run after the authority was revoked.
+    fn fake_control_seq(
+        checks: Vec<PreEffectCheck>,
+        tracker: Option<Arc<rhapsody_tracker::fake::Fake>>,
+    ) -> (
+        crate::stop::ControlHandle,
+        Arc<Mutex<Vec<ManagerEffectResult>>>,
+    ) {
+        let o = Orchestrator::new("WORKFLOW.md");
+        let mut handle = o.control();
+        if let Some(t) = tracker {
+            handle.tracker = Some(t);
+        }
+        let results: Arc<Mutex<Vec<ManagerEffectResult>>> = Arc::new(Mutex::new(Vec::new()));
+        let results2 = Arc::clone(&results);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.events = tx;
+        tokio::spawn(async move {
+            let mut queue: std::collections::VecDeque<PreEffectCheck> = checks.into();
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    crate::control_loop::Event::ManagerApplyCheck { reply, .. } => {
+                        let check = queue.pop_front().unwrap_or(PreEffectCheck::Proceed);
+                        let _ = reply.send(check);
+                    }
+                    crate::control_loop::Event::ManagerEffect(result) => {
+                        results2.lock().expect("results").push(*result);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (handle, results)
+    }
+
+    #[tokio::test]
+    async fn a_revoked_decision_mid_effects_reports_done_and_cancelled() {
+        let comments = Arc::new(RecordingComments::default());
+        let (control, results) = fake_control_seq(
+            vec![PreEffectCheck::Proceed, PreEffectCheck::Superseded],
+            None,
+        );
+        let deps = ManagerApplyDeps {
+            control,
+            comments: Some(Arc::clone(&comments) as Arc<dyn PrCommentSink>),
+            search: Some(Arc::new(EmptySearch) as Arc<dyn PrCommentSearch>),
+        };
+        let mut request = comment_request(MANAGER_EFFECT_EXPLANATION);
+        request.effects = vec![
+            MANAGER_EFFECT_EXPLANATION.to_string(),
+            MANAGER_EFFECT_TICKET_MOVE.to_string(),
+        ];
+        request.ticket_move = Some(ManagerTicketMove {
+            issue_id: "uuid-1".to_string(),
+            team_id: "team".to_string(),
+            state: "changes".to_string(),
+        });
+
+        perform_manager_apply(request, &deps).await;
+        let results = take_results(&results).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].outcomes,
+            vec![(
+                MANAGER_EFFECT_EXPLANATION.to_string(),
+                MANAGER_EFFECT_DONE.to_string()
+            )],
+            "the first effect ran; the second never did"
+        );
+        assert_eq!(
+            results[0].halted.as_deref(),
+            Some("superseded"),
+            "the report names the revocation and what was left undone"
+        );
+        assert_eq!(
+            comments.0.lock().expect("comments").len(),
+            1,
+            "the revoked ticket move was never attempted"
+        );
+    }
 }

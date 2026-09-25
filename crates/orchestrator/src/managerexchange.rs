@@ -731,4 +731,26 @@ mod tests {
             "a retry is the same exchange and consumes nothing new"
         );
     }
+
+    /// §7.8 "Operator actions": `/clear`, `/rerun`, a manual dispatch and a person's summons sit
+    /// OUTSIDE the manager bound. The gate lives in ordinary selection
+    /// ([`Orchestrator::author_dispatch_authorized`], called by `select.rs`); the dispatch primitive
+    /// the operator paths use does not consult it. So after the threshold an operator dispatch still
+    /// runs while ordinary selection would have refused the same ticket.
+    ///
+    /// MUTATION: move the gate into `dispatch_issue` and the running-entry assert reds.
+    #[tokio::test]
+    async fn an_operator_dispatch_is_not_gated_after_the_threshold() {
+        let mut o = with_rounds(ReviewAuthority::Act, 1, 1);
+        seed_watch(&o, "STUDIO-1");
+        assert!(
+            !o.author_dispatch_authorized(&author()),
+            "ordinary selection is gated after the threshold with no authorization"
+        );
+        o.dispatch_issue(author(), None, None, String::new());
+        assert!(
+            !o.running.is_empty(),
+            "an operator-initiated dispatch does not consult the selection gate and still runs"
+        );
+    }
 }
