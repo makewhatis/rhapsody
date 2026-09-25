@@ -3553,31 +3553,13 @@ impl Orchestrator {
             }
         }
 
-        // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
-        // round 11), so on a daemon held by a bad config, an armed drain or a dead credential — the
-        // exact daemon whose dispatch has stopped — `held` is empty for the whole process lifetime
-        // and `held_origin` is `false` for a ticket that genuinely wears the label. The gate then
-        // opens and merges human-only work, irreversibly. Fail CLOSED instead: until a pass has
-        // actually READ THE BOARD, an empty set is "unknown", not "no hold". Once a pass has run the
-        // answer is real and the gate behaves exactly as before. `ledger_primed` is the same latch
-        // the round gate above reads, taken in the same lock as `held`.
-        //
-        // MUTATION: drop the fail-closed branch and
-        // `an_unprimed_hold_ledger_refuses_auto_merge` reds (a plan is proposed).
-        if !ledger_primed {
-            tracing::debug!(
-                pr = %pr,
-                "auto-merge: no selection pass has run yet, so the human-hold label set is unknown; \
-                 refusing to merge"
-            );
-        } else if held_origin {
-            tracing::debug!(
-                pr = %pr,
-                "auto-merge: the origin ticket is held for a human; not merging"
-            );
-        } else {
-            self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
-        }
+        // STUDIO-964: the human-hold gate that used to sit here (`!ledger_primed` /
+        // `held_origin`) has been folded into [`Self::propose_auto_merge`] itself. It guarded only
+        // this one tail call while the seven adjudication arms above called `propose_auto_merge`
+        // outside it, so a held ticket at the threshold could still merge. The gate's behaviour and
+        // its debug lines are unchanged — they now run inside `propose_auto_merge`, for every call
+        // site, including this one.
+        self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
     }
 
     /// The `mergeStateStatus` values that are a SETTLED non-conflict — GitHub has finished
@@ -3810,6 +3792,11 @@ impl Orchestrator {
     /// itself on every ordinary path, plus the patch-id-proven SHAs on the one path where a `ship`
     /// may satisfy approval-at-head. It is not a way to merge a verdict nobody proved: a verdict at
     /// a head outside the set is still refused as stale.
+    ///
+    /// **The one gate that is NOT optional here is the human hold** (STUDIO-964): the fail-closed
+    /// `ledger_primed && !held_origin` check is folded into this function, so no call site — the
+    /// seven adjudication arms included — can propose a merge for a `rhapsody:human`-held ticket.
+    /// See the comment on the gate below.
     fn propose_auto_merge(
         &mut self,
         mine: &[&ReviewWatchRow],
@@ -3821,6 +3808,46 @@ impl Orchestrator {
     ) {
         if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
             return; // opt-in, and off by default (the D5 invariant)
+        }
+        // STUDIO-964: the fail-closed human-hold gate lives HERE, not at the tail of
+        // `service_review_pr`. It used to guard only the one tail call, while the seven
+        // adjudication arms (STUDIO-956) each called this function at their own early return —
+        // outside it. A `rhapsody:human`-held ticket whose pull request reached the round
+        // threshold with every required approval at head could then be merged by the daemon, and
+        // the merge is the one action the next tick cannot undo. Folding the gate in makes it
+        // unreachable-by-construction for every current and future call site.
+        //
+        // The set and the latch are read together, under one lock (STUDIO-949 round 13): an empty
+        // set with no pass having looked is "unknown", not "no hold". On a daemon held by a bad
+        // config, an armed drain or a dead credential no selection pass ever runs, so the
+        // current-label set has no writer above `on_tick`'s three early-return gates and would be
+        // empty for the whole process lifetime — which is exactly the daemon whose dispatch has
+        // stopped and whose held work must not merge. Fail CLOSED until a pass has read the board;
+        // once it has, the answer is real and the gate behaves as before.
+        //
+        // MUTATION: drop either branch and the past-threshold held-ticket tests
+        // (`a_held_ticket_is_not_merged_at_the_adjudication_threshold` /
+        // `a_held_ticket_is_not_merged_by_a_governing_ship`) or the fail-closed one
+        // (`an_unprimed_hold_ledger_refuses_a_past_threshold_merge`) reds (a plan is proposed).
+        let (held, ledger_primed) = self.human_holds.labelled_and_primed();
+        let held_origin = mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+        });
+        if !ledger_primed {
+            tracing::debug!(
+                pr = %pr, head,
+                "auto-merge: no selection pass has run yet, so the human-hold label set is unknown; \
+                 refusing to merge"
+            );
+            return;
+        }
+        if held_origin {
+            tracing::debug!(
+                pr = %pr, head,
+                "auto-merge: the origin ticket is held for a human; not merging"
+            );
+            return;
         }
         // This tick ALREADY has GitHub's answer (STUDIO-961): the `mergeStateStatus` the watcher
         // read on the poll it was making anyway says the branch conflicts, and
@@ -7564,8 +7591,8 @@ mod tests {
     /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: it
     /// runs the SAME fixture through a primed daemon and proposes the plan.
     ///
-    /// MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `service_review_pr` and this reds (a
-    /// plan is proposed).
+    /// MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `propose_auto_merge` and this
+    /// reds (a plan is proposed).
     #[test]
     fn an_unprimed_hold_ledger_refuses_auto_merge() {
         let (mut o, _d) = orch_before_first_pass(ticketless_automerge(&["alice", "bob"]));
@@ -7585,6 +7612,121 @@ mod tests {
             o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
             1,
             "a primed ledger merges the approved head"
+        );
+    }
+
+    // --- STUDIO-964: no adjudication arm may skip the human-hold gate -------------------------
+
+    /// **The CONVERGED-at-the-threshold path.** This is `service_review_pr`'s convergence arm: every
+    /// live row approved the change the branch now carries (via the patch-id proof), the round
+    /// threshold is reached, so the loop hands the pull request straight to the merge gate. It used
+    /// to call `propose_auto_merge` OUTSIDE the human-hold gate, so a `rhapsody:human`-held ticket
+    /// was merged here — the most direct path the ticket names. The gate is now folded into
+    /// `propose_auto_merge` itself.
+    ///
+    /// MUTATION: drop the hold branch from `propose_auto_merge` and this reds (a plan is proposed) —
+    /// the second assert also proves the gate, and not some other gate, is what refused it.
+    #[test]
+    fn a_held_ticket_is_not_merged_at_the_adjudication_threshold() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A)); // origin ticket: `STUDIO-721`
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        o.human_holds.note_human_label("STUDIO-721");
+
+        // The branch moved to HEAD_B by a base merge; the approval is patch-id-proven.
+        let report = o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])]);
+
+        assert!(
+            report.merge.is_empty(),
+            "a held ticket's approved pull request must not merge at the threshold: {:?}",
+            report.merge
+        );
+        assert!(
+            report.adjudicate.is_empty(),
+            "convergence is not a manager decision, held or not"
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — and the merge
+        // the reviewers already approved is proposed on the next tick.
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at_proven(12, HEAD_B, &[HEAD_A.to_string()])])
+                .merge
+                .len(),
+            1,
+            "once the hold is gone the converged merge is proposed, proving the gate refused it"
+        );
+    }
+
+    /// **The governing-Ship path.** A settled `ship` decision that governs the observed head is
+    /// another of the seven early returns that bypassed the human-hold gate. Every row approved, so
+    /// the merge gate would merge — but the origin ticket is held, and a hold outranks a ship.
+    ///
+    /// MUTATION: drop the hold branch from `propose_auto_merge` and this reds (a plan is proposed).
+    #[test]
+    fn a_held_ticket_is_not_merged_by_a_governing_ship() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A)); // origin ticket: `STUDIO-721`
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+        o.human_holds.note_human_label("STUDIO-721");
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "a `ship` adjudicates the findings, never a human hold: {:?}",
+            report.merge
+        );
+
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).merge.len(),
+            1,
+            "once the hold is gone the shipped merge is proposed, proving the gate refused it"
+        );
+    }
+
+    /// **Fail-closed at an adjudication arm.** The un-primed latch is checked in
+    /// `propose_auto_merge` now, so it refuses the seven arms too — here the governing-Ship path —
+    /// and not merely the tail. On a daemon whose selection pass never ran, the empty label set is
+    /// "unknown", not "no hold".
+    ///
+    /// MUTATION: make the `!ledger_primed` branch permissive and this reds (a plan is proposed).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_a_past_threshold_merge() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.review.auto_merge = true;
+        let (mut o, _d) = orch_before_first_pass(teams);
+        let l = ledger(&mut o);
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "with no pass having looked, the hold set is unknown and no adjudication arm may \
+             merge: {:?}",
+            report.merge
         );
     }
 
