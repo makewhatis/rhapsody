@@ -561,3 +561,7 @@
    header's own `.acterr` sits underneath `.mgveil` and would never be read. */
 .rh-console .mgconf .err { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--bad); overflow-wrap: anywhere; }
 .rh-console .mgconf .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+/* The resume confirmation's required note (STUDIO-1053) — the same field treatment as the message
+   composer, so the one thing the operator types in a modal reads like every other input here. */
+.rh-console .mgconf textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px 10px; resize: vertical; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.rh-console .mgconf textarea:disabled { opacity: .6; }

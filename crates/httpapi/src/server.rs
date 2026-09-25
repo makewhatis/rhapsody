@@ -23,8 +23,9 @@ use rhapsody_orchestrator::teamsmemory::{
     TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
-    RunMessageResult, Snapshot, StopResult,
+    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult,
+    ResumeHoldError, ResumeHoldResult, ResumeResult, RunHoldView, RunMessageResult, Snapshot,
+    StopResult,
 };
 use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView};
 use rhapsody_store::StoreError;
@@ -51,6 +52,7 @@ use crate::handlers_provider_config::handle_provider_config;
 use crate::handlers_providers::{
     handle_provider_models, handle_provider_models_refresh, handle_providers,
 };
+use crate::handlers_resumehold::{handle_resume_hold, handle_run_hold};
 use crate::handlers_reviews::{
     handle_review_clear, handle_review_dismiss, handle_review_rerun, handle_reviews,
 };
@@ -195,6 +197,27 @@ pub trait StateProvider: Send + Sync {
     /// `backlog_full`); a clean accept carries the inserted `id` + `identifier` (→ 202). Mirrors the
     /// O6 `ControlHandle::send_run_message` surface this forwards to.
     async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult;
+
+    /// The operator's "Human step done → resume" action (STUDIO-1053; Rhapsody-only, no Go v0.4.0
+    /// counterpart): remove `rhapsody:human` through the tracker, record the operator's note where
+    /// the next run is guaranteed to read it, and requeue the ticket.
+    ///
+    /// Business outcomes travel in the [`ResumeHoldResult`] — unknown run (`not_found` → 404), a
+    /// ticket that is not held (`not_held` → 409), a failed requeue MOVE (200 with `queued:false`
+    /// and `move_error`). A rejected label REMOVAL is the one hard failure
+    /// ([`ResumeHoldError::LabelRemovalFailed`] → 502) because it commits nothing else; a failed
+    /// tracker/store read or a cancelled control round-trip is a 500.
+    async fn resume_hold(
+        &self,
+        run_id: i64,
+        note: &str,
+    ) -> Result<ResumeHoldResult, ResumeHoldError>;
+
+    /// Whether a run's ticket is currently held with `rhapsody:human`, and — when the durable
+    /// breaker crossing row names one — the crossed limit (`GET /api/v1/runs/{id}/hold`, STUDIO-1053;
+    /// Rhapsody-only). Read-only, so it is not behind the operator-write guard. An unknown run is
+    /// [`RunHoldView::not_found`] → 404; a failed tracker read is an `Err` → 500.
+    async fn run_hold(&self, run_id: i64) -> Result<RunHoldView, ResumeHoldError>;
 
     /// The drain's current state (`GET /api/v1/drain`, STUDIO-880) — whether new dispatch is
     /// paused so in-flight runs can reach a turn boundary before a restart.
@@ -912,6 +935,14 @@ where
             operator_write(handle_run_message),
         )
         .route("/api/v1/runs/{id}/messages", any(handle_run_messages))
+        // The held-ticket resume action (STUDIO-1053; Rhapsody-only, no Go v0.4.0 counterpart). GET
+        // reads whether the ticket is held and the crossed breaker limit; POST is the operator-write
+        // action behind the guard. More-specific than runs/{id}, so they win the match.
+        .route("/api/v1/runs/{id}/hold", any(handle_run_hold))
+        .route(
+            "/api/v1/runs/{id}/resume-hold",
+            operator_write(handle_resume_hold),
+        )
         .route("/api/v1/runs/{id}", any(handle_run_detail))
         // Per-project live status + the read-only Linear surfaces for the Settings page (H2).
         .route("/api/v1/projects", any(handle_projects))

@@ -1,12 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  fetchRunHold,
   fetchRunMergeability,
   mergeRun,
+  resumeHold,
   resumeRun,
   sendRunMessage,
   stopRun,
   type MergeRunResult,
+  type ResumeHoldResult,
   type RunActionResult,
+  type RunHoldView,
   type RunMergeability,
 } from "@/lib/api";
 import { STATE_QUERY_KEY } from "@/hooks/useStateQuery";
@@ -38,9 +42,38 @@ export function useResumeRun(runID: number) {
   });
 }
 
+// useRunHold reads whether the run's ticket is held with `rhapsody:human`, and the crossed breaker
+// limit when the hold came from the breaker (STUDIO-1053). `enabled` carries the console's own gate
+// — a review run's key is not a ticket — so a review run asks nothing.
+export function useRunHold(runID: number, enabled: boolean) {
+  return useQuery<RunHoldView>({
+    queryKey: ["run-hold", runID],
+    queryFn: () => fetchRunHold(runID),
+    enabled: enabled && runID > 0,
+    refetchOnWindowFocus: false,
+    // A hold read that fails is not a hold; the action simply stays hidden, and the daemon refuses
+    // server-side anyway. No retry storm against a tracker that is already unhappy.
+    retry: false,
+  });
+}
+
+// useResumeHold is the "Human step done → resume" action (STUDIO-1053): it records the operator's
+// note for the next run, removes the hold, and requeues the ticket. It invalidates the live state so
+// the board's held flag clears, this run's detail, and its own hold read so the action disappears
+// once the hold is gone.
+export function useResumeHold(runID: number) {
+  const qc = useQueryClient();
+  return useMutation<ResumeHoldResult, Error, string>({
+    mutationFn: (note: string) => resumeHold(runID, note),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: ["run-detail", runID] });
+      void qc.invalidateQueries({ queryKey: ["run-hold", runID] });
+    },
+  });
+}
+
 // useSendRunMessage queues an operator message for a live run's agent (INF-250), then invalidates
-// this run's message list (["run-messages", runId], matching useRunMessages) so the new row shows
-// immediately as "sent" without waiting for the next poll tick.
 export function useSendRunMessage(runID: number) {
   const qc = useQueryClient();
   return useMutation<{ id: number; identifier: string; status: string }, Error, string>({

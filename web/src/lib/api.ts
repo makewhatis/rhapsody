@@ -724,6 +724,60 @@ export function resumeRun(runID: number): Promise<RunActionResult> {
   return postRunAction(runID, "resume");
 }
 
+// BreakerHold names the runaway-breaker limit a held ticket crossed (STUDIO-1053), read from the
+// daemon's durable crossing row. `rounds` is the completed-review-run count at the last round
+// crossing (0 when none), and `providers` the per-ticket spend caps already notified.
+export interface BreakerHold {
+  rounds: number;
+  providers: string[];
+}
+
+// RunHoldView is GET /api/v1/runs/{id}/hold: whether the run's ticket wears `rhapsody:human`, and
+// — when the hold came from the breaker — the crossed limit, so the job page can say WHAT was
+// crossed rather than just that something was.
+export interface RunHoldView {
+  identifier: string;
+  held: boolean;
+  breaker?: BreakerHold;
+}
+
+// ResumeHoldResult is the 200 body of POST /api/v1/runs/{id}/resume-hold (STUDIO-1053). `queued`
+// false plus `move_error` is an honest PARTIAL success: the note was recorded and the hold lifted,
+// but the ticket could not be moved to Todo, so it is not yet a dispatch candidate.
+export interface ResumeHoldResult {
+  identifier: string;
+  note_recorded: boolean;
+  label_removed: boolean;
+  queued: boolean;
+  moved_to?: string;
+  move_error?: string;
+  breaker?: BreakerHold;
+}
+
+// fetchRunHold reads whether a run's ticket is held and, if so, the crossed breaker limit.
+export async function fetchRunHold(runID: number): Promise<RunHoldView> {
+  return getJSON<RunHoldView>(`/api/v1/runs/${runID}/hold`);
+}
+
+// resumeHold performs the "Human step done → resume" action: the daemon removes `rhapsody:human`,
+// records `note` where the next run is guaranteed to read it, and requeues the ticket. Every
+// refusal (not_held, run_not_found) and the one hard failure (label_removal_failed) throws with the
+// daemon's own message, because the reason is the whole of what the operator needs to read.
+export async function resumeHold(runID: number, note: string): Promise<ResumeHoldResult> {
+  const res = await operatorPost(`/api/v1/runs/${runID}/resume-hold`, { note });
+  const body = (await res.json().catch(() => null)) as ResumeHoldResult | ApiError | null;
+  if (!res.ok) {
+    const message =
+      body && "error" in body ? body.error.message : `resume failed: ${res.status}`;
+    throw new Error(message);
+  }
+  // A 200 the console cannot read would leave it showing nothing for an action that DID happen.
+  if (body === null || "error" in body) {
+    throw new Error("the daemon resumed the ticket but returned no result");
+  }
+  return body;
+}
+
 // MergeReceipt is what POST /api/v1/runs/{id}/merge resolved: the pull request the DAEMON derived
 // from the run's own row (the console never names one — see the daemon's `handlers_runmerge`), its
 // head commit, and how it is being merged. `said` is gh's own words, present only once merged.
