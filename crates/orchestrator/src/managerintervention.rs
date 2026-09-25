@@ -2804,7 +2804,7 @@ mod tests {
         prime_holds(&o4);
         seed_watch(&o4, "adopt:STUDIO-1");
         install_applier(&mut o4);
-        let _id4 = launch_running(&mut o4);
+        let id4 = launch_running(&mut o4);
         let escalate = decision_text(
             r#"{"decision":"ESCALATE","head":"deadbeef","evidence_rev":0,
                 "escalate":{"question":"which base?","checked":"compared both diffs"},
@@ -2815,6 +2815,11 @@ mod tests {
             &exit_with(Some(&escalate)),
         );
         o4.pump_manager_interventions();
+        assert_eq!(
+            state_of(&o4, &id4),
+            MANAGER_INTERVENTION_ESCALATED,
+            "the ESCALATE genuinely took its apply path"
+        );
         assert!(
             o4.store()
                 .manager_exchanges(PR_KEY)
