@@ -1435,7 +1435,7 @@ const ACCEPTANCE_MATRIX: &[AcceptanceCase] = &[
     AcceptanceCase {
         group: "startup_boundary",
         case: "unregistered MCP write tools: refused",
-        test: "the_canary_report_is_parsed_strictly",
+        test: "any_success_fails_the_self_test",
         file: "crates/orchestrator/src/managerselftest.rs",
     },
     AcceptanceCase {
