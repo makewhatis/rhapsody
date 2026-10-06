@@ -2,8 +2,8 @@
 //! of `$REF/desktop/internal/supervisor/testdata/fakedaemon/main.go`.
 //!
 //! It mimics the parts the supervisor cares about — a `--port` flag, a `/healthz` route, graceful
-//! SIGTERM shutdown — and can be told (via env vars) to delay readiness, exit unexpectedly, or crash
-//! on its first launch so the restart-on-crash path can be exercised. It has no tauri/lib dependency
+//! SIGTERM shutdown — and can be told (via env vars) to delay readiness, exit unexpectedly, crash
+//! on its first launch so the restart-on-crash path can be exercised, or take a while to shut down. It has no tauri/lib dependency
 //! and is located by the integration tests via `CARGO_BIN_EXE_fakedaemon`.
 
 use std::convert::Infallible;
@@ -173,6 +173,10 @@ async fn main() {
     };
     tokio::pin!(exit_timer);
 
+    // Take this long to finish a graceful shutdown once SIGTERM lands, the way the real daemon spends
+    // seconds draining before it exits (STUDIO-1116's quit tests need a stop that is still in flight).
+    let stop_delay = env_duration_ms("FAKE_STOP_DELAY_MS");
+
     loop {
         tokio::select! {
             _ = &mut shutdown => break, // SIGTERM/SIGINT -> graceful exit (drops in-flight conns)
@@ -194,4 +198,5 @@ async fn main() {
             }
         }
     }
+    tokio::time::sleep(stop_delay).await;
 }
