@@ -29,6 +29,10 @@ pub struct Config {
     pub effort: String,
     /// default `"bypassPermissions"`
     pub permission_mode: String,
+    /// `claude --tools`: the built-ins the CLI makes available. `None` omits the flag (the Go argv);
+    /// `Some("")` emits `--tools ""`, which disables EVERY built-in. Rhapsody-only (STUDIO-1117):
+    /// only the manager posture sets it.
+    pub tools: Option<String>,
     pub allowed_tools: String,
     /// `claude --disallowedTools`; omitted when empty
     pub disallowed_tools: String,
@@ -77,6 +81,7 @@ impl fmt::Debug for Config {
             .field("model", &self.model)
             .field("effort", &self.effort)
             .field("permission_mode", &self.permission_mode)
+            .field("tools", &self.tools)
             .field("allowed_tools", &self.allowed_tools)
             .field("disallowed_tools", &self.disallowed_tools)
             .field("mcp_config", &self.mcp_config)
@@ -136,6 +141,11 @@ pub fn build_args(cfg: &Config, resume_id: &str) -> Vec<String> {
     if !cfg.effort.is_empty() {
         args.push("--effort".to_string());
         args.push(cfg.effort.clone());
+    }
+    if let Some(tools) = &cfg.tools {
+        // Emitted even when empty: `--tools ""` is the CLI's "disable every built-in" spelling.
+        args.push("--tools".to_string());
+        args.push(tools.clone());
     }
     if !cfg.allowed_tools.is_empty() {
         args.push("--allowedTools".to_string());
@@ -311,6 +321,29 @@ mod tests {
         let n = got.len();
         assert_eq!(got[n - 2], "--settings");
         assert_eq!(got[n - 1], r#"{"ultracode":false}"#);
+    }
+
+    // STUDIO-1117 (no Go counterpart): `tools` is emitted only when set, and an EMPTY value is
+    // still emitted (as an empty argument) because `--tools ""` is how the CLI disables every
+    // built-in. Unset keeps the Go argv byte-identical.
+    #[test]
+    fn build_args_tools() {
+        let got = build_args(
+            &Config {
+                tools: Some(String::new()),
+                ..Default::default()
+            },
+            "",
+        );
+        let idx = got
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
+        assert_eq!(got[idx + 1], "");
+        assert!(
+            !build_args(&Config::default(), "").contains(&"--tools".to_string()),
+            "--tools must be omitted when unset"
+        );
     }
 
     // Mirrors Go `claude.TestBuildArgsAllowedTools`.

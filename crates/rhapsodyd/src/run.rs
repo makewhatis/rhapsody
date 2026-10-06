@@ -2270,9 +2270,9 @@ async fn apply_manager_self_test(
     .await;
     teams.manager.review_authority = authority;
     if let Some(reason) = reason {
-        tracing::warn!(
-            reason = %reason.message(),
-            "manager self-test failed; manager disabled and its items go to the human feed"
+        rhapsody_orchestrator::managerselftest::warn_self_test_failed(
+            rhapsody_orchestrator::managerselftest::SelfTestTrigger::Boot,
+            &reason,
         );
     } else {
         tracing::info!(cli_version = %cli_version, "manager self-test passed");
