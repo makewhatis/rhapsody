@@ -86,6 +86,14 @@ pub struct EvWorkerExit {
     /// so the next tick does not re-dispatch it, and schedules no retry; `err_msg` carries the
     /// typed reason.
     pub refused: bool,
+    /// True when the exit is the agent's typed AUTH-NEEDED outcome (STUDIO-1118,
+    /// `AgentError::AuthNeeded`): the provider rejected the run's native login, and the operator's
+    /// current login is the very one it rejected (the runner has already re-seeded and, where the
+    /// login had changed, retried once). No timed retry can succeed until a human runs
+    /// `opencode auth login`, so `on_worker_exit` records it `failed` ONCE, holds the in-memory
+    /// claim and schedules no retry — the worker has applied the human-needed label, whose
+    /// "Human step done → resume" clears both and re-dispatches onto the fresh login.
+    pub auth_needed: bool,
 }
 
 /// The ceiling on an armed retry delay. A real retry is minutes-scale by construction (the 1s
@@ -991,6 +999,31 @@ impl Orchestrator {
             self.claimed.insert(e.issue_id.clone());
             return;
         }
+        // The provider rejected the run's login and the operator's current login is the same one
+        // (STUDIO-1118). Before this branch it went out as an ordinary failure, so the backoff
+        // re-dispatched every few minutes for an hour — each attempt 401ing on the same dead copy.
+        // Recorded once and held exactly as a refusal is above; the worker labelled the ticket
+        // `rhapsody:human`, which keeps it out of selection across a restart too, and resuming it
+        // from the job page clears the claim and the label together.
+        if e.auth_needed {
+            self.completed.remove(&e.issue_id);
+            tracing::warn!(
+                run_id = re.run_id,
+                issue_id = %e.issue_id,
+                issue_identifier = %re.issue.identifier,
+                identity = %re.identity,
+                harness = %re.harness,
+                reason = %e.err_msg,
+                "agent login rejected: operator must run `opencode auth login` as the daemon's \
+                 user; recording failed once, holding the ticket for a human and scheduling no \
+                 retry"
+            );
+            self.persist_end_run(&re, store::OUTCOME_FAILED, &e.err_msg);
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            self.claimed.insert(e.issue_id.clone());
+            return;
+        }
         if !e.failed {
             // The two freshest state samples: the worker's per-turn refresh (e.last_state) and
             // reconcile's snapshot (re.issue.state). classify_clean_exit treats the ticket as having
@@ -1709,6 +1742,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -1752,6 +1786,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -1993,6 +2028,7 @@ mod tests {
                 review_verdict: None,
                 manager_text: None,
                 refused: false,
+                auth_needed: false,
             });
             let runs = store_handle
                 .list_runs(rhapsody_store::RunFilter {
@@ -2156,6 +2192,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         assert!(
             !o.running.contains_key("1"),
@@ -2192,6 +2229,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         assert_eq!(
             o.retry_attempts.get("1").expect("backoff retry").identity,
@@ -2216,6 +2254,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         assert_eq!(
             o.retry_attempts.get("1").expect("backoff retry").identity,
@@ -2239,6 +2278,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
         assert_eq!(re.attempt, 3);
@@ -2276,6 +2316,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: true,
+            auth_needed: false,
         });
 
         assert!(
@@ -2301,6 +2342,53 @@ mod tests {
         );
     }
 
+    /// STUDIO-1118: the agent's auth-needed outcome is recorded failed ONCE and schedules no timed
+    /// retry; the ticket is held for a human. MUTATION GUARD: drop the `auth_needed` branch and the
+    /// exit falls into the ordinary failure backoff, populating `retry_attempts`.
+    #[test]
+    fn an_auth_needed_exit_records_failed_once_and_schedules_no_retry() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store_handle));
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+        let msg = "opencode_auth_needed: operator must run `opencode auth login` as the daemon's \
+                   user (the operator's current login is byte-identical to the one the provider \
+                   just rejected); not retrying. turn_failed: APIError: invalidated oauth token \
+                   (status 401)";
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: msg.into(),
+            last_state: "Todo".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: true,
+        });
+
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "an auth-needed exit must schedule no timed retry"
+        );
+        assert!(o.claimed.contains("1"), "held until a human resumes it");
+        assert!(!o.running.contains_key("1"));
+        let runs = store_handle
+            .list_runs(rhapsody_store::RunFilter {
+                issue: "MT-1".to_string(),
+                ..Default::default()
+            })
+            .expect("list runs");
+        assert_eq!(runs.len(), 1, "exactly one failed row");
+        assert_eq!(runs[0].outcome, store::OUTCOME_FAILED);
+        assert_eq!(runs[0].error, msg);
+    }
+
     // Mirrors Go `TestOnWorkerExitUnknownIsNoop`.
     #[test]
     fn on_worker_exit_unknown_is_noop() {
@@ -2315,6 +2403,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         assert!(
             o.retry_attempts.is_empty(),
@@ -2374,6 +2463,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -2406,6 +2496,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -2435,6 +2526,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -2469,6 +2561,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(
@@ -2501,6 +2594,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         assert!(

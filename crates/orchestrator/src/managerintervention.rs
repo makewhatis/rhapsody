@@ -2239,6 +2239,7 @@ mod tests {
             review_verdict: None,
             manager_text: text.map(str::to_string),
             refused: false,
+            auth_needed: false,
         }
     }
 

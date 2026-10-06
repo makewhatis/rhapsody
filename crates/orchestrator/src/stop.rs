@@ -1390,6 +1390,7 @@ mod tests {
                 review_verdict: None,
                 manager_text: None,
                 refused: false,
+                auth_needed: false,
             }))
             .expect("worker-exit send");
         flush_loop(&handle).await;
