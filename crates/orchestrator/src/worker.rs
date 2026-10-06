@@ -512,7 +512,12 @@ async fn run_manager_attempt(
     // The dedicated manager configuration directory carries ONLY the model credential (§4.2), and
     // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
     // authenticate from the file on macOS (§4.5).
-    let model_credential = provision_manager_config_dir(&config_dir);
+    let model_credential = if deps.agent.id() == agent::HarnessId::Opencode {
+        // OpenCode provisions only its refresh-blank OpenAI credential in its private XDG tree.
+        None
+    } else {
+        provision_manager_config_dir(&config_dir)
+    };
 
     // Optional transcript, best-effort exactly as the ordinary path.
     let mut transcript: Option<Transcript> = None;
@@ -532,6 +537,10 @@ async fn run_manager_attempt(
     }
 
     let req = rhapsody_agent::manager::ManagerSessionStart {
+        // retry.rs stamps manager.model/effort into this dispatch-time override. MH1 routes
+        // these same fields from the selected harness entry.
+        model: deps.model_override.model.clone(),
+        effort: deps.model_override.effort.clone(),
         cwd: cwd.to_string_lossy().into_owned(),
         config_dir: config_dir.to_string_lossy().into_owned(),
         run_timeout_ms: mgr.run_timeout_ms.max(0) as u64,

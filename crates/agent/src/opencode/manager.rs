@@ -1,4 +1,16 @@
 //! Isolated OpenCode manager posture (STUDIO-1120); no Go counterpart.
+//!
+//! Measurements on OpenCode 1.18.30 (2026-10-06): `debug agent build` with only the
+//! wildcard deny and manager-tool allow (no `tools` map) resolved every reported built-in to
+//! `false`. We still name every known built-in explicitly, and MH3's self-test must fail closed
+//! on any resolved tool that is not `false`, including future names.
+//!
+//! `OPENCODE_DISABLE_MODELS_FETCH=1` did NOT make `openai/gpt-6.1-sol` resolvable in a fresh
+//! private environment: stderr reported `ProviderModelNotFoundError`. The control without that
+//! flag reported the same missing model, so this does not establish the flag caused it. The
+//! flag is omitted: the required model has not been proven to resolve with fetching disabled.
+//! Both probes used only an OpenAI login with a present-but-empty refresh field, and their
+//! private trees were removed by RAII; no run credential was read back or copied back.
 
 use std::path::{Path, PathBuf};
 
@@ -382,7 +394,7 @@ mod tests {
             check();
         }
         std::fs::write(&p, r#"{"openai":{"expires":4102444800000}}"#).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
         check();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     }

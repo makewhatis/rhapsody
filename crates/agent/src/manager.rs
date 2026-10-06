@@ -105,6 +105,10 @@ pub fn manager_credential_document(json: &str) -> Option<String> {
 /// of them is derived here, because provisioning them is the impure half.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagerSessionStart {
+    /// Selected manager entry's model; OpenCode requires an explicit provider/model.
+    pub model: String,
+    /// Selected manager entry's reasoning effort (`--variant` on OpenCode).
+    pub effort: String,
     /// The empty, daemon-owned, per-run working directory (no repository, no checkout).
     pub cwd: String,
     /// The dedicated manager configuration directory: only the model credential, none of the
