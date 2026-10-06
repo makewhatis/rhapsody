@@ -331,6 +331,10 @@ pub enum AgentError {
     /// can hold the issue for a human instead of burning a timed retry every few minutes.
     #[error("{0}")]
     AuthNeeded(String),
+    /// A manager entry's credential was rejected; selection may fall back to another harness.
+    /// Rhapsody-only (STUDIO-1120), distinct from the native worker's human-login hold.
+    #[error("{0}")]
+    AuthFailed(String),
 }
 
 /// Serializes every test that spawns an agent child against the two that MUTATE the process
