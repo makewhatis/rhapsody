@@ -83,6 +83,17 @@ impl Failure {
         }
         s
     }
+
+    /// Whether the provider rejected the run's CREDENTIAL (STUDIO-1118): an HTTP 401, or one of the
+    /// two OAuth shapes the provider reports in the message ("invalidated oauth token", "expired
+    /// token"). A retry with the same credential cannot succeed, so the runner treats this as its
+    /// own outcome rather than an ordinary failed turn.
+    pub fn is_auth(&self) -> bool {
+        let msg = self.message.to_ascii_lowercase();
+        self.status_code == 401
+            || msg.contains("invalidated oauth token")
+            || msg.contains("expired token")
+    }
 }
 
 /// A lenient view of one opencode JSONL line. Every field is optional via the container-level
@@ -286,6 +297,24 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::{EVENT_NOTIFICATION, EVENT_TURN_FAILED};
+
+    // STUDIO-1118: the credential-rejection shapes — a bare 401, and the two OAuth messages a
+    // provider reports — and nothing else (a 429 or a 500 is an ordinary, retryable failure).
+    #[test]
+    fn is_auth_recognizes_a_401_and_the_oauth_token_messages_only() {
+        let f = |code: i64, msg: &str| Failure {
+            name: "APIError".to_string(),
+            message: msg.to_string(),
+            status_code: code,
+            retryable: false,
+        };
+        assert!(f(401, "The API key you provided is invalid.").is_auth());
+        assert!(f(0, "Token refresh failed: Invalidated OAuth token").is_auth());
+        assert!(f(0, "expired token").is_auth());
+        assert!(!f(429, "rate limited").is_auth());
+        assert!(!f(500, "internal error").is_auth());
+        assert!(!f(0, "").is_auth());
+    }
 
     /// The committed spike captures (`harness/harness-spike/opencode/`) are this parser's
     /// acceptance map: they are real `opencode run --format json` output against a real provider,

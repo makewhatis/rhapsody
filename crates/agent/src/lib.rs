@@ -325,6 +325,12 @@ pub enum AgentError {
     /// An arbitrary/wrapped failure carrying its message (Go's opaque `errors.New`/`fmt.Errorf`).
     #[error("{0}")]
     Other(String),
+    /// The provider rejected the run's native login and the operator's current login is the very
+    /// one that was rejected, so no retry can succeed until a human logs in again (STUDIO-1118). The
+    /// message (`opencode_auth_needed: …`) names the fix. Rhapsody-only: typed so the orchestrator
+    /// can hold the issue for a human instead of burning a timed retry every few minutes.
+    #[error("{0}")]
+    AuthNeeded(String),
 }
 
 /// Serializes every test that spawns an agent child against the two that MUTATE the process

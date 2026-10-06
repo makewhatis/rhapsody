@@ -241,6 +241,7 @@ impl Runner {
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
         }))
     }
 }
@@ -487,6 +488,7 @@ impl crate::Runner for Runner {
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
         }))
     }
 }
@@ -526,6 +528,11 @@ struct OpencodeSession {
     /// future leave it set. [`OpencodeSession::end_of_run`] retains the state directory and writes
     /// the resume record when it is set, and cleans up when it is not.
     last_turn_failed: AtomicBool,
+    /// Whether the most recent LEGACY turn ended in an in-band credential rejection
+    /// ([`Failure::is_auth`], STUDIO-1118). Cleared as every turn begins; read by
+    /// [`OpencodeSession::run_turn_legacy`] to decide between one re-seeded retry and the
+    /// auth-needed outcome.
+    auth_failed: AtomicBool,
 }
 
 impl OpencodeSession {
@@ -724,7 +731,7 @@ impl Session for OpencodeSession {
         messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
     ) -> (TurnResult, Option<AgentError>) {
-        self.run_turn_inner(prompt, attempt, messages, on_event, None)
+        self.run_turn_entry(prompt, attempt, messages, on_event, None)
             .await
     }
 
@@ -738,14 +745,148 @@ impl Session for OpencodeSession {
         on_event: &(dyn Fn(Event) + Send + Sync),
         broker: Option<BrokerTurnAttempt>,
     ) -> (TurnResult, Option<AgentError>) {
-        self.run_turn_inner(prompt, attempt, messages, on_event, broker)
+        self.run_turn_entry(prompt, attempt, messages, on_event, broker)
             .await
     }
 }
 
 impl OpencodeSession {
+    /// Where both trait entry points land. A brokered session runs its turn as-is; a legacy one goes
+    /// through [`OpencodeSession::run_turn_legacy`], which owns the credential-rejection outcome.
+    async fn run_turn_entry(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        broker: Option<BrokerTurnAttempt>,
+    ) -> (TurnResult, Option<AgentError>) {
+        // A session adopted from a retained record (STUDIO-1043) seeds `session_id`, so its FIRST
+        // turn continues the recorded id and is told it is resuming. Decided once here, so the
+        // legacy path's immediate auth retry of that same turn is told too.
+        let resume_note = self.turn_n.load(Ordering::SeqCst) == 0 && !self.thread_id().is_empty();
+        if self.brokered.is_some() {
+            return self
+                .run_turn_inner(prompt, attempt, messages, on_event, broker, resume_note)
+                .await;
+        }
+        drop(broker);
+        self.run_turn_legacy(prompt, attempt, messages, on_event, resume_note)
+            .await
+    }
+
+    /// One LEGACY turn, plus the credential-rejection outcome (STUDIO-1118).
+    ///
+    /// A turn the provider refuses for its credential ([`Failure::is_auth`]) is not an ordinary
+    /// failure: retrying it on the same `auth.json` fails identically, and before this the daemon
+    /// did exactly that every few minutes for an hour. Instead the run directory is re-seeded from
+    /// the operator's login, and then:
+    ///
+    /// - the copy CHANGED (the operator has logged in since it was taken) ⇒ the turn is retried
+    ///   ONCE, immediately, on the fresh login;
+    /// - the copy is byte-IDENTICAL to the one just rejected (by SHA-256 digest), or the immediate
+    ///   retry is rejected too, or the source is gone ⇒ [`AgentError::AuthNeeded`], with a WARN. No
+    ///   retry can help until a human runs `opencode auth login`, and the orchestrator holds the
+    ///   issue for them rather than scheduling one.
+    ///
+    /// Only digest prefixes are ever logged; the credential's contents never are.
+    async fn run_turn_legacy(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        mut messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        resume_note: bool,
+    ) -> (TurnResult, Option<AgentError>) {
+        let (tr, err) = self
+            .run_turn_inner(
+                prompt,
+                attempt,
+                messages.as_deref_mut(),
+                on_event,
+                None,
+                resume_note,
+            )
+            .await;
+        if !self.auth_failed.load(Ordering::SeqCst) {
+            return (tr, err);
+        }
+        match self.state.reseed_legacy(&self.cfg.auth_source) {
+            Ok(r) if r.changed() => {
+                tracing::info!(
+                    issue = %self.issue.identifier, harness = resume::HARNESS,
+                    before = %r.before_prefix(), after = %r.after_prefix(),
+                    "opencode: the provider rejected the run's login, and the operator's login has \
+                     changed since it was copied; retrying the turn once on the fresh copy"
+                );
+                on_event(Event {
+                    event_type: EVENT_NOTIFICATION.to_string(),
+                    timestamp: Some(Utc::now()),
+                    message: "the provider rejected this run's opencode login; re-seeded it from \
+                              the operator's newer login and retrying the turn once"
+                        .to_string(),
+                    ..Default::default()
+                });
+                let (tr, err) = self
+                    .run_turn_inner(prompt, attempt, messages, on_event, None, resume_note)
+                    .await;
+                if !self.auth_failed.load(Ordering::SeqCst) {
+                    return (tr, err);
+                }
+                let why = "the provider rejected the freshly re-seeded login too";
+                self.auth_needed(tr, err, why, Some(&r), on_event)
+            }
+            Ok(r) => {
+                let why = "the operator's current login is byte-identical to the one the \
+                           provider just rejected";
+                self.auth_needed(tr, err, why, Some(&r), on_event)
+            }
+            Err(e) => {
+                let why = format!("the operator's login could not be re-seeded ({e})");
+                self.auth_needed(tr, err, &why, None, on_event)
+            }
+        }
+    }
+
+    /// Builds the auth-needed outcome: a WARN naming the issue, the harness and (digest prefixes
+    /// only) the rejected login, a notification on the run's own event stream, and the typed
+    /// [`AgentError::AuthNeeded`]. The original `turn_failed: …` text is carried verbatim at the end
+    /// so the provider's own reason is never lost.
+    fn auth_needed(
+        &self,
+        tr: TurnResult,
+        err: Option<AgentError>,
+        why: &str,
+        reseed: Option<&super::state::Reseed>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+    ) -> (TurnResult, Option<AgentError>) {
+        let turn = err.map(|e| e.to_string()).unwrap_or_default();
+        let whose = self.locked_model_override().identity.clone();
+        let login = reseed
+            .map(|r| r.after_prefix())
+            .unwrap_or_else(|| "-".to_string());
+        tracing::warn!(
+            issue = %self.issue.identifier, identity = %whose, harness = resume::HARNESS,
+            login = %login, reason = %why,
+            "opencode: the provider rejected the run's login and no retry can fix it; operator \
+             must run `opencode auth login` as the daemon's user"
+        );
+        let msg = format!(
+            "opencode_auth_needed: operator must run `opencode auth login` as the daemon's user \
+             ({why}); not retrying. {turn}"
+        );
+        on_event(Event {
+            event_type: EVENT_NOTIFICATION.to_string(),
+            timestamp: Some(Utc::now()),
+            message: msg.clone(),
+            ..Default::default()
+        });
+        (tr, Some(AgentError::AuthNeeded(msg)))
+    }
+
     /// The one turn implementation both trait entry points delegate to. `broker` is `Some` only for
-    /// a brokered turn; a legacy session's entry point passes `None`.
+    /// a brokered turn; a legacy session's entry point passes `None`. `resume_note` marks the first
+    /// turn of an adopted session ([`OpencodeSession::run_turn_entry`]).
     async fn run_turn_inner(
         &self,
         prompt: &str,
@@ -753,7 +894,9 @@ impl OpencodeSession {
         mut messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
         broker: Option<BrokerTurnAttempt>,
+        resume_note: bool,
     ) -> (TurnResult, Option<AgentError>) {
+        self.auth_failed.store(false, Ordering::SeqCst);
         // The same containment invariant the claude runner enforces before every exec (§9.5): the
         // workspace must be inside the root and equal to the cwd.
         if let Err(e) = rhapsody_workspace::validate_launch(
@@ -781,7 +924,7 @@ impl OpencodeSession {
         );
         // A session adopted from a retained record (STUDIO-1043) seeds `session_id`, so turn 1
         // carries the recorded id as its `-s` continuation AND is told it is resuming.
-        let resumed_first_turn = turn_n == 1 && !resume.is_empty();
+        let resumed_first_turn = resume_note && !resume.is_empty();
 
         // ⚠️ The prompt is rewritten into opencode's tool-name spelling before it is sent. Rhapsody's
         // prompts name tools literally, including the one that ends the run.
@@ -1296,6 +1439,9 @@ impl OpencodeSession {
         // and an `isRetryable` boolean directly, so both are carried into the message rather than
         // re-derived from its text (design §7.1).
         if let Some(f) = failure {
+            // Only the legacy path owns a credential to re-seed; a brokered 401 is the broker's.
+            self.auth_failed
+                .store(self.brokered.is_none() && f.is_auth(), Ordering::SeqCst);
             if !failure_surfaced {
                 on_event(Event {
                     event_type: EVENT_TURN_FAILED.to_string(),
@@ -2648,6 +2794,168 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
     }
 
     /// A model mismatch falls back to a cold start with its own directory and no `-s`.
+    /// A fake `opencode` for the credential-rejection path (STUDIO-1118). Invocation `n` (counted
+    /// in `<dir>/count`) emits the OAuth-shaped 401 while `n <= fails`, and a clean turn after.
+    /// `relogin` makes the FIRST invocation rewrite the operator's `auth.json` — the operator
+    /// running `opencode auth login` while the run is failing. Each invocation records in
+    /// `<dir>/match.<n>` whether the run's copy equalled the operator's file when it started, which
+    /// is how a test sees that a retry really ran on the re-seeded login (compared with `cmp`, never
+    /// printed).
+    fn auth_fake(dir: &TempDir, auth: &str, relogin: bool, fails: u32) -> String {
+        let d = dir.path().display();
+        let relogin = if relogin {
+            format!(
+                "[ \"$n\" -eq 1 ] && printf '%s' '{{\"openai\":{{\"type\":\"oauth\",\"fresh\":true}}}}' > '{auth}'\n"
+            )
+        } else {
+            String::new()
+        };
+        let body = format!(
+            r#"n=$(( $(cat '{d}/count' 2>/dev/null || echo 0) + 1 )); echo "$n" > '{d}/count'
+if cmp -s "$XDG_DATA_HOME/opencode/auth.json" '{auth}'; then echo same > '{d}/match.'"$n"; else echo differ > '{d}/match.'"$n"; fi
+{relogin}if [ "$n" -le {fails} ]; then
+  printf '{{"type":"error","sessionID":"ses_auth","error":{{"name":"APIError","data":{{"message":"Token refresh failed: 401 invalidated oauth token","statusCode":401,"isRetryable":false}}}}}}\n'
+  exit 1
+fi
+printf '{{"type":"step_start","sessionID":"ses_auth","part":{{"type":"step-start"}}}}\n'
+printf '{{"type":"text","sessionID":"ses_auth","part":{{"type":"text","text":"done"}}}}\n'
+printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-finish","reason":"stop","tokens":{{"total":3,"input":2,"output":1,"reasoning":0,"cache":{{"write":0,"read":0}}}}}}}}\n'
+"#
+        );
+        write_script(dir, "auth-fake.sh", &body)
+    }
+
+    fn invocations(dir: &TempDir) -> u32 {
+        std::fs::read_to_string(dir.path().join("count"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    // ⚠️⚠️ STUDIO-1118 acceptance. A credential rejection on a login the operator has NOT changed
+    // must stop at once with the typed auth-needed outcome — no re-run of the turn, and an error
+    // the orchestrator holds for a human rather than a failure it retries every five minutes for an
+    // hour on the same dead copy.
+    #[tokio::test]
+    async fn an_auth_rejection_on_an_unchanged_login_stops_with_auth_needed() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, false, 99);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_for(&script, &root, &auth, &sr)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(
+            invocations(&scripts),
+            1,
+            "an unchanged login is never retried"
+        );
+        assert_eq!(tr.status, TURN_FAILED);
+        let err = err.expect("an auth rejection is an error");
+        assert!(matches!(err, AgentError::AuthNeeded(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("opencode_auth_needed:"), "{msg}");
+        assert!(
+            msg.contains("operator must run `opencode auth login` as the daemon's user"),
+            "{msg}"
+        );
+        assert!(msg.contains("byte-identical"), "names why: {msg}");
+        assert!(
+            msg.contains("turn_failed: APIError") && msg.contains("status 401"),
+            "the provider's own reason is kept: {msg}"
+        );
+        let evs = events_of(&seen);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.event_type == EVENT_TURN_FAILED)
+                .count(),
+            1,
+            "{evs:#?}"
+        );
+        assert!(
+            evs.iter().any(|e| e.event_type == EVENT_NOTIFICATION
+                && e.message.starts_with("opencode_auth_needed:")),
+            "the run's own event stream says a human is needed: {evs:#?}"
+        );
+
+        // The failed session is retained, so the human-resumed dispatch adopts it and re-seeds.
+        sess.stop().await.expect("stop");
+        assert!(record_file(&sr, "STUDIO-1118").is_file());
+    }
+
+    // The operator logged in while the run was failing: the copy is re-seeded and the SAME turn is
+    // retried once, immediately, on the fresh login — and that retry is what the caller sees.
+    #[tokio::test]
+    async fn an_auth_rejection_after_a_relogin_retries_once_on_the_fresh_copy() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, true, 1);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let sess = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy())
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert!(
+            err.is_none(),
+            "the retry on the fresh login succeeded: {err:?}"
+        );
+        assert_eq!(tr.status, TURN_SUCCEEDED);
+        assert_eq!(invocations(&scripts), 2, "exactly one immediate retry");
+        assert_eq!(
+            std::fs::read_to_string(scripts.path().join("match.2")).expect("match.2"),
+            "same\n",
+            "the retry ran on the operator's re-seeded login"
+        );
+        let evs = events_of(&seen);
+        assert!(
+            evs.iter()
+                .any(|e| e.event_type == EVENT_NOTIFICATION && e.message.contains("retrying")),
+            "{evs:#?}"
+        );
+        assert!(evs.iter().any(|e| e.event_type == EVENT_TURN_COMPLETED));
+    }
+
+    // The re-seeded login is rejected too: that is the ONE retry spent, and the run stops with the
+    // auth-needed outcome rather than looping.
+    #[tokio::test]
+    async fn a_relogin_that_is_rejected_too_stops_after_exactly_one_retry() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, true, 99);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let sess = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy())
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let (_tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(invocations(&scripts), 2, "one retry, never a second");
+        let err = err.expect("error");
+        assert!(matches!(err, AgentError::AuthNeeded(_)), "{err:?}");
+        assert!(err.to_string().contains("freshly re-seeded"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_model_mismatch_starts_cold() {
         let _env = ENV_GUARD.read().await;
