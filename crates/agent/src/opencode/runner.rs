@@ -57,6 +57,7 @@ use crate::opencode::args::{Config, build_args};
 use crate::opencode::brokered::{
     BrokeredMaterial, CapabilityRedactor, InternalProviderId, build_brokered_args,
 };
+use crate::opencode::manager;
 use crate::opencode::mcpinject::{
     SERVER_KEY, daemon_mcp_server, inject_daemon_mcp, rewrite_tool_names,
 };
@@ -242,6 +243,7 @@ impl Runner {
             adopted,
             last_turn_failed: AtomicBool::new(false),
             auth_failed: AtomicBool::new(false),
+            manager: None,
         }))
     }
 }
@@ -389,6 +391,101 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
+    /// Its credential can never refresh, retry from a copy, or survive the run for resume.
+    fn start_manager_session(
+        &self,
+        req: crate::manager::ManagerSessionStart,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let real_home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| {
+                AgentError::Other(
+                    "manager_home_missing: daemon HOME is required for the manager MCP server"
+                        .to_string(),
+                )
+            })?;
+        if req.model.is_empty() {
+            return Err(AgentError::Other(
+                "manager_model_missing: OpenCode requires an explicit model".to_string(),
+            ));
+        }
+        let (name, base_args) = split_command(&self.cfg.command)?;
+        if base_args.iter().any(|arg| arg == "--auto") {
+            return Err(AgentError::InvalidCommand);
+        }
+        rhapsody_workspace::validate_launch(&self.cfg.workspace_root, &req.cwd, &req.cwd)
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        let operator_auth = if self.cfg.auth_source.is_empty() {
+            manager::operator_auth_path().ok_or_else(|| {
+                AgentError::AuthFailed(
+                    "operator has no OpenAI login; run opencode auth login".to_string(),
+                )
+            })?
+        } else {
+            PathBuf::from(&self.cfg.auth_source)
+        };
+        // Credential-free provisioning: never use provision_legacy, which copies every provider
+        // and leaves refresh enabled. RunState's drop cleans up even a half-built manager tree.
+        let state = RunState::provision_brokered(
+            &self.cfg.state_root,
+            &issue.identifier,
+            &self.cfg.workspace_root,
+        )?;
+        let home = state.xdg_data_home().join("home");
+        let xdg = state.xdg_data_home().join("xdg");
+        for dir in [
+            &home,
+            &xdg,
+            &xdg.join("config"),
+            &xdg.join("data"),
+            &xdg.join("cache"),
+            &xdg.join("state"),
+        ] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| AgentError::Other(format!("manager_private_dir_failed: {e}")))?;
+        }
+        manager::seed_manager_credential(&operator_auth, &xdg.join("data"))?;
+        let mut cfg = self.cfg.clone();
+        cfg.model = req.model;
+        cfg.variant = req.effort;
+        if req.run_timeout_ms > 0 {
+            cfg.turn_timeout = Duration::from_millis(req.run_timeout_ms);
+        }
+        Ok(Box::new(OpencodeSession {
+            cfg,
+            cmd_name: name,
+            cmd_args: base_args,
+            ws_path: req.cwd,
+            issue,
+            state,
+            config_path: String::new(),
+            brokered: None,
+            session_id: Mutex::new(String::new()),
+            turn_n: AtomicI64::new(0),
+            transcript: Mutex::new(transcript),
+            transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
+            poisoned: AtomicBool::new(false),
+            adopted: false,
+            last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
+            manager: Some(ManagerParams {
+                real_home,
+                home,
+                xdg,
+            }),
+        }))
+    }
+
     /// The brokered materialization (PB7, STUDIO-1002): provision a credential-FREE run state and a
     /// managed session whose turns mint a per-turn capability from the broker attempt. This is the
     /// one entry point a prepared provider dispatch uses; it never reads a harness-native credential.
@@ -497,6 +594,7 @@ impl crate::Runner for Runner {
             adopted,
             last_turn_failed: AtomicBool::new(false),
             auth_failed: AtomicBool::new(false),
+            manager: None,
         }))
     }
 }
@@ -541,6 +639,14 @@ struct OpencodeSession {
     /// [`OpencodeSession::run_turn_legacy`] to decide between one re-seeded retry and the
     /// auth-needed outcome.
     auth_failed: AtomicBool,
+    /// Manager-only environment and private dirs; never participates in legacy retry/resume.
+    manager: Option<ManagerParams>,
+}
+
+struct ManagerParams {
+    real_home: String,
+    home: PathBuf,
+    xdg: PathBuf,
 }
 
 impl OpencodeSession {
@@ -642,6 +748,10 @@ impl OpencodeSession {
     /// exactly as they were, because deleting them would throw away the session this feature exists
     /// to keep. Called from [`Session::stop`] on the normal path and from [`Drop`] on cancellation.
     fn end_of_run(&self) {
+        if self.manager.is_some() {
+            self.state.cleanup();
+            return;
+        }
         let ran_a_turn = self.turn_n.load(Ordering::SeqCst) > 0;
         if ran_a_turn && self.last_turn_failed.load(Ordering::SeqCst) {
             self.persist_resume();
@@ -773,7 +883,7 @@ impl OpencodeSession {
         // turn continues the recorded id and is told it is resuming. Decided once here, so the
         // legacy path's immediate auth retry of that same turn is told too.
         let resume_note = self.turn_n.load(Ordering::SeqCst) == 0 && !self.thread_id().is_empty();
-        if self.brokered.is_some() {
+        if self.brokered.is_some() || self.manager.is_some() {
             return self
                 .run_turn_inner(prompt, attempt, messages, on_event, broker, resume_note)
                 .await;
@@ -983,7 +1093,18 @@ impl OpencodeSession {
         let mut stderr_redactor: Option<CapabilityRedactor> = None;
         let mut brokered_material: Option<BrokeredMaterial> = None;
 
-        let args = if let Some((params, attempt)) = brokered {
+        let args = if self.manager.is_some() {
+            drop(brokered);
+            let mut args = self.cmd_args.clone();
+            let mut managed =
+                manager::manager_args(&self.ws_path, &cfg.model, &cfg.variant, &prompt);
+            if !resume.is_empty() {
+                let pos = managed.len() - 1;
+                managed.splice(pos..pos, ["-s".to_string(), resume]);
+            }
+            args.extend(managed);
+            args
+        } else if let Some((params, attempt)) = brokered {
             if self.poisoned.load(Ordering::SeqCst) {
                 return (
                     failed(Usage::default()),
@@ -1087,7 +1208,26 @@ impl OpencodeSession {
             self.run_id.load(Ordering::SeqCst),
         );
         let env = append_review_env(env, &self.locked_review_head());
-        let env = if let Some(material) = brokered_material.as_ref() {
+        let env = if let Some(params) = self.manager.as_ref() {
+            let run_id = self.run_id.load(Ordering::SeqCst).to_string();
+            let content = manager::manager_config_content(
+                &cfg.model,
+                &cfg.daemon_bin,
+                &cfg.workflow_path,
+                &params.real_home,
+                &run_id,
+            );
+            manager::manager_env(
+                &params.home,
+                &params.xdg,
+                &content,
+                &run_id,
+                &std::env::var("PATH").unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect()
+        } else if let Some(material) = brokered_material.as_ref() {
             // ⚠️ Brokered mode strips every inherited OPENCODE_*/XDG_DATA_HOME BEFORE appending the
             // authoritative managed allow-list (`§9.2`), and size-checks the result before spawn.
             match material.apply_env(env) {
@@ -1286,6 +1426,12 @@ impl OpencodeSession {
                     if c.terminal {
                         terminal_seen = true;
                     }
+                    if self.manager.is_some() && failure.is_some() {
+                        // No manager retry is useful after a credential rejection. End even if
+                        // the CLI keeps its pipes open for a retry; MH1 owns harness fallback.
+                        abort = true;
+                        break;
+                    }
                 }
                 abort
             }};
@@ -1376,6 +1522,9 @@ impl OpencodeSession {
         // process-tree teardown can block. `finish` marks a clean turn; dropping without it revokes
         // the grant and records the turn as revoked. Either way no capability remains valid between
         // outer turns.
+        if self.manager.is_some() && failure.is_some() {
+            kill_tree(pid);
+        }
         if terminal_seen && failure.is_none() {
             teardown.finish();
         } else {
@@ -1414,8 +1563,24 @@ impl OpencodeSession {
                 }
             }
         };
-        tokio::join!(drain_out, drain_err);
-        let wait_res = child.wait().await;
+        let wait_res = if self.manager.is_some() {
+            // EOF is not process exit. A manager child that closes stdout but hangs with stderr
+            // open must still obey the same run deadline while draining and reaping.
+            tokio::select! {
+                result = async {
+                    tokio::join!(drain_out, drain_err);
+                    child.wait().await
+                } => result,
+                _ = &mut deadline => {
+                    kill_tree(pid);
+                    timed_out = true;
+                    child.wait().await
+                }
+            }
+        } else {
+            tokio::join!(drain_out, drain_err);
+            child.wait().await
+        };
         teardown.disarm_tree();
 
         if dropped_messages > 0 {
@@ -1428,7 +1593,7 @@ impl OpencodeSession {
         // A deadline kill that landed after a completed turn must not discard the turn, which is
         // why `terminal_seen` is checked before `timed_out` — the same precedence the claude runner
         // gives a captured result.
-        if terminal_seen && failure.is_none() {
+        if terminal_seen && failure.is_none() && !(self.manager.is_some() && timed_out) {
             // A clean turn: the run may keep going (a continuation) or end, but it is no longer a
             // cut-off one — `end_of_run` cleans up unless a LATER turn fails (STUDIO-1043).
             self.last_turn_failed.store(false, Ordering::SeqCst);
@@ -1464,7 +1629,11 @@ impl OpencodeSession {
             }
             return (
                 failed_with_text(usage, &result_text),
-                Some(AgentError::Other(format!("turn_failed: {}", f.summary()))),
+                Some(if self.manager.is_some() && f.is_auth() {
+                    AgentError::AuthFailed(format!("turn_failed: {}", f.summary()))
+                } else {
+                    AgentError::Other(format!("turn_failed: {}", f.summary()))
+                }),
             );
         }
         if timed_out {
@@ -1606,6 +1775,381 @@ impl CappedBuffer {
 
     fn bytes(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use crate::manager::ManagerSessionStart;
+    use crate::opencode::{manager, testdir::TempDir};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    const SUCCESS: &str = r#"
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":"thinking"}}'
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":"final decision"}}'
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":" "}}'
+printf '%s\n' '{"type":"step_finish","sessionID":"ses_manager","part":{"reason":"stop"}}'
+"#;
+
+    struct Setup {
+        root: TempDir,
+        state: TempDir,
+        runner: Runner,
+        req: ManagerSessionStart,
+    }
+
+    impl Setup {
+        fn new(output: &str) -> Self {
+            let root = TempDir::new();
+            let state = TempDir::new();
+            let cwd = root.path().join("cwd");
+            let config = root.path().join("config");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::create_dir(&config).unwrap();
+            let auth = root.path().join("operator-auth.json");
+            std::fs::write(&auth, json!({"openai":{"type":"oauth","access":"test-only-access","refresh":"test-only-refresh","expires":4102444800000_i64},"other":{"key":"test-only-other"}}).to_string()).unwrap();
+            let script = root.path().join("fake.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    r#"
+set -eu
+capture='{}'
+label="${{@: -1}}"
+mkdir "$capture/$label"
+printf '%s\n' "$@" > "$capture/$label/argv"
+/usr/bin/env > "$capture/$label/env"
+printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$capture/$label/config"
+if test -z "$(ls -A .)"; then printf 'empty' > "$capture/$label/cwd-empty"; fi
+test -f "$XDG_DATA_HOME/opencode/auth.json"
+# Reproduce shared-state failure rather than hiding it behind an always-successful fake.
+mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
+{}
+"#,
+                    root.path().display(),
+                    output
+                ),
+            )
+            .unwrap();
+            let runner = Runner::new(Config {
+                command: format!("bash {}", script.display()),
+                workspace_root: root.path().to_string_lossy().into_owned(),
+                state_root: state.path().to_string_lossy().into_owned(),
+                auth_source: auth.to_string_lossy().into_owned(),
+                daemon_bin: "/bin/rhapsodyd".to_string(),
+                workflow_path: "/repo/WORKFLOW.md".to_string(),
+                auto_approve: Some(true),
+                extra_args: vec!["--auto".to_string()],
+                agent: "plan".to_string(),
+                model: "wrong-install-model".to_string(),
+                variant: "wrong-effort".to_string(),
+                turn_timeout: Duration::from_secs(5),
+                ..Default::default()
+            });
+            let req = ManagerSessionStart {
+                cwd: cwd.to_string_lossy().into_owned(),
+                config_dir: config.to_string_lossy().into_owned(),
+                run_timeout_ms: 2000,
+                model: "openai/gpt-6.1-sol".to_string(),
+                effort: "xhigh".to_string(),
+                model_credential: Some("claude-token-must-not-leak".to_string()),
+            };
+            Self {
+                root,
+                state,
+                runner,
+                req,
+            }
+        }
+
+        fn start(&self) -> Box<dyn Session> {
+            self.runner
+                .start_manager_session(self.req.clone(), Issue::default(), None)
+                .unwrap()
+        }
+
+        fn env(&self, label: &str) -> BTreeMap<String, String> {
+            std::fs::read_to_string(self.root.path().join(label).join("env"))
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    line.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                // bash itself contributes these variables, after exec's allow-list.
+                .filter(|(k, _)| !["PWD", "SHLVL", "_"].contains(&k.as_str()))
+                .collect()
+        }
+
+        fn assert_state_gone(&self) {
+            assert_eq!(
+                std::fs::read_dir(self.state.path()).unwrap().count(),
+                0,
+                "private run tree (including credential) leaked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_session_posture() {
+        let _env = crate::ENV_GUARD.write().await;
+        let keys = [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_AUTH_CONTENT",
+            "LINEAR_API_KEY",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            unsafe { std::env::set_var(k, "parent-trap") };
+        }
+        let s = Setup::new(SUCCESS);
+        let session = s.start();
+        session.set_run_id(42);
+        let (tr, err) = session.run_turn("posture", None, None, &|_| {}).await;
+        for (k, v) in saved {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            };
+        }
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(tr.status, TURN_SUCCEEDED);
+        let env = s.env("posture");
+        let home = Path::new(&env["HOME"]);
+        let xdg = Path::new(&env["XDG_DATA_HOME"]).parent().unwrap();
+        assert!(home.starts_with(s.state.path()));
+        assert_eq!(
+            env,
+            manager::manager_env(
+                home,
+                xdg,
+                &env["OPENCODE_CONFIG_CONTENT"],
+                "42",
+                &std::env::var("PATH").unwrap_or_default()
+            )
+            .into_iter()
+            .collect()
+        );
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(s.root.path().join("posture/config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg,
+            serde_json::from_str::<Value>(&manager::manager_config_content(
+                &s.req.model,
+                "/bin/rhapsodyd",
+                "/repo/WORKFLOW.md",
+                &std::env::var("HOME").unwrap(),
+                "42"
+            ))
+            .unwrap()
+        );
+        let args: Vec<_> = std::fs::read_to_string(s.root.path().join("posture/argv"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            args,
+            manager::manager_args(&s.req.cwd, &s.req.model, &s.req.effort, "posture")
+        );
+        assert!(s.root.path().join("posture/cwd-empty").is_file());
+        // Synthetic credential only. Never inspect the destination of a real login.
+        let cred: Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&env["XDG_DATA_HOME"]).join("opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cred.as_object().unwrap().len(), 1);
+        assert_eq!(cred["openai"]["refresh"], "");
+        session.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn manager_session_result_text_is_final_text() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(SUCCESS);
+        let session = s.start();
+        let (tr, err) = session.run_turn("result", None, None, &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(tr.result_text, "final decision");
+    }
+
+    #[tokio::test]
+    async fn manager_session_turn_error_is_an_error() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(
+            r#"printf '%s\n' '{"type":"error","error":{"name":"ProviderModelNotFoundError","data":{"message":"missing model"}}}'"#,
+        );
+        let session = s.start();
+        let (tr, err) = session.run_turn("error", None, None, &|_| {}).await;
+        assert_eq!(tr.status, TURN_FAILED);
+        assert!(
+            matches!(err, Some(AgentError::Other(ref reason)) if reason.contains("ProviderModelNotFoundError"))
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_session_401_is_a_typed_auth_error() {
+        let _env = crate::ENV_GUARD.read().await;
+        let measured = include_str!("../../../../harness/harness-spike/opencode/failure-401.jsonl");
+        for raw in [
+            measured,
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"invalidated oauth token"}}}"#,
+        ] {
+            let s = Setup::new(&format!("printf '%s\\n' '{}'", raw.trim()));
+            let session = s.start();
+            let (tr, err) = session.run_turn("auth", None, None, &|_| {}).await;
+            assert_eq!(tr.status, TURN_FAILED);
+            assert!(matches!(err, Some(AgentError::AuthFailed(_))), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_run_dir_removed_on_every_exit() {
+        let _env = crate::ENV_GUARD.read().await;
+        for (output, timeout) in [(SUCCESS, false), ("exit 1", false), ("sleep 30", true)] {
+            let mut s = Setup::new(output);
+            if timeout {
+                s.req.run_timeout_ms = 50;
+            }
+            let session = s.start();
+            let (_, err) = session.run_turn("cleanup", None, None, &|_| {}).await;
+            if timeout {
+                assert_eq!(err, Some(AgentError::TurnTimeout));
+            }
+            session.stop().await.unwrap();
+            s.assert_state_gone();
+            drop(session);
+            s.assert_state_gone();
+        }
+        let s = Setup::new(SUCCESS);
+        drop(s.start()); // no turn ever started
+        s.assert_state_gone();
+        let s = Setup::new(SUCCESS);
+        std::fs::write(&s.runner.cfg.auth_source, "malformed-test-only").unwrap();
+        assert!(
+            s.runner
+                .start_manager_session(s.req.clone(), Issue::default(), None)
+                .is_err()
+        );
+        s.assert_state_gone();
+        let s = Setup::new("sleep 30");
+        let session = s.start();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                session.run_turn("cancel", None, None, &|_| {})
+            )
+            .await
+            .is_err()
+        );
+        drop(session); // cancellation bypasses stop
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn concurrent_manager_sessions_are_isolated() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(&format!("sleep 0.2\n{SUCCESS}"));
+        let a = s.start();
+        let mut second = s.req.clone();
+        second.cwd = s.root.path().join("cwd-b").to_string_lossy().into_owned();
+        second.config_dir = s
+            .root
+            .path()
+            .join("config-b")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir(&second.cwd).unwrap();
+        std::fs::create_dir(&second.config_dir).unwrap();
+        let b = s
+            .runner
+            .start_manager_session(second.clone(), Issue::default(), None)
+            .unwrap();
+        let (ra, rb) = tokio::join!(
+            a.run_turn("a", None, None, &|_| {}),
+            b.run_turn("b", None, None, &|_| {})
+        );
+        assert!(ra.1.is_none() && rb.1.is_none(), "{ra:?}, {rb:?}");
+        let ea = s.env("a");
+        let eb = s.env("b");
+        assert_ne!(s.req.cwd, second.cwd);
+        for (label, cwd) in [("a", &s.req.cwd), ("b", &second.cwd)] {
+            let args = std::fs::read_to_string(s.root.path().join(label).join("argv")).unwrap();
+            assert!(args.contains(cwd));
+            assert!(s.root.path().join(label).join("cwd-empty").is_file());
+        }
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+        ] {
+            assert_ne!(ea[key], eb[key]);
+        }
+        assert_ne!(
+            Path::new(&ea["XDG_DATA_HOME"]).join("opencode/auth.json"),
+            Path::new(&eb["XDG_DATA_HOME"]).join("opencode/auth.json")
+        );
+        a.stop().await.unwrap();
+        assert!(
+            Path::new(&eb["XDG_DATA_HOME"])
+                .join("opencode/auth.json")
+                .is_file()
+        );
+        b.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn missing_real_home_is_a_typed_error() {
+        let _env = crate::ENV_GUARD.write().await;
+        let s = Setup::new(SUCCESS);
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let result = s
+            .runner
+            .start_manager_session(s.req.clone(), Issue::default(), None);
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("HOME", v);
+            }
+        };
+        assert!(
+            matches!(result, Err(AgentError::Other(ref reason)) if reason.starts_with("manager_home_missing:"))
+        );
+        s.assert_state_gone();
+        assert!(!s.root.path().join("posture").exists());
+    }
+
+    #[tokio::test]
+    async fn manager_timeout_covers_closed_stdout() {
+        let _env = crate::ENV_GUARD.read().await;
+        let mut s = Setup::new("exec 1>&-\nsleep 30");
+        s.req.run_timeout_ms = 50;
+        let session = s.start();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            session.run_turn("closed", None, None, &|_| {}),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok((_, Some(AgentError::TurnTimeout)))),
+            "closed stdout must not bypass manager deadline: {result:?}"
+        );
+        drop(session);
+        s.assert_state_gone();
     }
 }
 

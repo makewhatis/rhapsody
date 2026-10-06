@@ -1120,6 +1120,8 @@ impl CliCanaryRunner {
             ..rhapsody_core::Issue::default()
         };
         let req = rhapsody_agent::manager::ManagerSessionStart {
+            model: entry.map_or_else(String::new, |e| e.model.clone()),
+            effort: entry.map_or_else(String::new, |e| e.effort.clone()),
             cwd: dir.to_string_lossy().into_owned(),
             config_dir: config_dir.to_string_lossy().into_owned(),
             run_timeout_ms: CANARY_RUN_TIMEOUT_MS,

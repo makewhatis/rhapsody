@@ -331,7 +331,8 @@ pub enum AgentError {
     /// can hold the issue for a human instead of burning a timed retry every few minutes.
     #[error("{0}")]
     AuthNeeded(String),
-    /// Manager-native login rejection: MH1 blocks the entry and tries the next harness.
+    /// A manager entry's credential was rejected; selection may fall back to another harness.
+    /// Rhapsody-only (STUDIO-1120), distinct from the native worker's human-login hold.
     #[error("{0}")]
     AuthFailed(String),
 }

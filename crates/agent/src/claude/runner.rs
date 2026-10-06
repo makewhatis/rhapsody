@@ -215,6 +215,12 @@ impl Harness for Runner {
         }
         let cfg = crate::manager::manager_config(&self.cfg, &mcp_path);
         let mut cfg = cfg;
+        if !req.model.is_empty() {
+            cfg.model = req.model;
+        }
+        if !req.effort.is_empty() {
+            cfg.effort = req.effort;
+        }
         if req.run_timeout_ms > 0 {
             cfg.turn_timeout = std::time::Duration::from_millis(req.run_timeout_ms);
         }
@@ -1789,6 +1795,8 @@ mod tests {
             ..Default::default()
         });
         let req = crate::manager::ManagerSessionStart {
+            model: String::new(),
+            effort: String::new(),
             cwd: cwd.clone(),
             config_dir: config_dir.clone(),
             run_timeout_ms: 0,
@@ -1868,6 +1876,8 @@ mod tests {
             ..Default::default()
         });
         let req = crate::manager::ManagerSessionStart {
+            model: String::new(),
+            effort: String::new(),
             cwd: cwd.clone(),
             config_dir: config_dir.clone(),
             run_timeout_ms: 0,

@@ -1923,6 +1923,8 @@ mod tests {
             ..Default::default()
         }];
         let req = rhapsody_agent::manager::ManagerSessionStart {
+            model: re.model_override.model.clone(),
+            effort: re.model_override.effort.clone(),
             cwd: String::new(),
             config_dir: String::new(),
             run_timeout_ms: 1,
