@@ -1917,6 +1917,8 @@ mod tests {
             "--strict-mcp-config",
             "the strict flag must immediately follow the config: {argv:?}"
         );
+        // STUDIO-1117: every built-in is disabled on the LIVE launch, not only in the helper.
+        assert_eq!(after("--tools"), "");
         // §4.2: project/local setting sources are excluded.
         assert_eq!(after("--setting-sources"), "user");
         // §4.3: the allowlist is exactly the manager MCP tools, fully qualified.

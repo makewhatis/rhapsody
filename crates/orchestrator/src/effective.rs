@@ -371,6 +371,8 @@ fn claude_config_from_cfg(cfg: &Config) -> claude::Config {
         model: cfg.claude.model.clone(),
         effort: cfg.claude.effort.clone(),
         permission_mode: cfg.claude.permission_mode.clone(),
+        // Not a WORKFLOW.md knob: only the manager posture restricts built-ins (STUDIO-1117).
+        tools: None,
         allowed_tools: cfg.claude.allowed_tools.clone(),
         disallowed_tools: cfg.claude.disallowed_tools.clone(),
         mcp_config: cfg.claude.mcp_config.clone(),
