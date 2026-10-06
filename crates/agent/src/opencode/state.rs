@@ -31,7 +31,10 @@
 //!
 //! Copying an existing credential is not the daemon writing a provider config: auth still defers
 //! entirely to the operator's own `opencode auth login` (design §4.5). Nothing here creates,
-//! refreshes or edits a credential — it is moved, unread, into the directory the CLI will look in.
+//! refreshes or edits a credential — it is copied into the directory the CLI will look in, and read
+//! only to be HASHED ([`RunState::reseed_legacy`], STUDIO-1118): the digest is what decides whether a
+//! re-seed changed anything, and a short digest prefix is the most of it that is ever logged. The
+//! operator's own file is only ever the source of a copy, never written.
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -86,28 +89,9 @@ impl RunState {
         issue_identifier: &str,
         workspace_root: &str,
     ) -> Result<RunState, AgentError> {
-        let src = if auth_source.is_empty() {
-            default_auth_source()
-        } else {
-            PathBuf::from(auth_source)
-        };
         // Checked first, so the refusal names the real problem rather than leaving a provisioned
         // directory behind on the way to reporting it.
-        let meta = std::fs::metadata(&src).map_err(|e| {
-            AgentError::Other(format!(
-                "opencode_auth_missing: {}: {e}. opencode keeps its credentials inside the state \
-                 directory this backend redirects, so a run cannot authenticate without a copy. \
-                 Run `opencode auth login` as the daemon's user, or set `opencode.auth_source`",
-                src.display()
-            ))
-        })?;
-        if meta.len() == 0 {
-            return Err(AgentError::Other(format!(
-                "opencode_auth_missing: {} is empty; a run would be unauthenticated and fail as a \
-                 401. Run `opencode auth login` as the daemon's user",
-                src.display()
-            )));
-        }
+        let src = checked_auth_source(auth_source)?;
 
         let state = Self::provision_dir(state_root, issue_identifier, workspace_root)?;
         let dst_dir = state.dir.join("opencode");
@@ -222,6 +206,57 @@ impl RunState {
         })
     }
 
+    /// Re-copies the operator's CURRENT `auth.json` over this LEGACY directory's copy (STUDIO-1118).
+    ///
+    /// Called when a retained directory is adopted for resume, and after an in-band auth failure:
+    /// in both cases the copy in here may be stale — the operator has since run `opencode auth
+    /// login`, which writes only the operator's own file and never reaches a directory seeded
+    /// before it. It is a fresh COPY, never a refresh: nothing is minted or edited, and the
+    /// operator's file is only read.
+    ///
+    /// The write is atomic (a 0600 sibling renamed over `auth.json`), so a child can never observe
+    /// a half-written credential. The returned [`Reseed`] carries SHA-256 digests of the copy before
+    /// and after — the whole basis for "did re-seeding change anything", and the only form in which
+    /// the credential may be logged. A missing or empty source is the same typed
+    /// `opencode_auth_missing` refusal [`RunState::provision_legacy`] gives, and leaves the existing
+    /// copy untouched.
+    pub fn reseed_legacy(&self, auth_source: &str) -> Result<Reseed, AgentError> {
+        let src = checked_auth_source(auth_source)?;
+        let dst_dir = self.dir.join("opencode");
+        let dst = dst_dir.join("auth.json");
+        let before = std::fs::read(&dst).ok().map(|b| digest(&b));
+        let reseed = || -> std::io::Result<[u8; 32]> {
+            let bytes = std::fs::read(&src)?;
+            std::fs::create_dir_all(&dst_dir)?;
+            let tmp = dst_dir.join(format!(".auth.json.reseed-{}", std::process::id()));
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)?;
+                f.write_all(&bytes)?;
+                f.sync_all()?;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &dst) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            Ok(digest(&bytes))
+        };
+        let after = reseed().map_err(|e| {
+            AgentError::Other(format!(
+                "opencode_auth_missing: could not re-seed {} from {}: {e}",
+                dst.display(),
+                src.display()
+            ))
+        })?;
+        Ok(Reseed { before, after })
+    }
+
     /// Marks the directory as retained past this run, so `Drop` will not remove it. The caller
     /// (the runner) records the session in [`super::resume`] at the same time; a kept directory
     /// with no record is a leak, so keep and record happen together.
@@ -286,6 +321,74 @@ impl Drop for RunState {
             self.cleanup();
         }
     }
+}
+
+/// The outcome of [`RunState::reseed_legacy`]: SHA-256 digests of the run directory's `auth.json`
+/// before and after the copy. Digests only — the credential itself never leaves the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reseed {
+    /// The copy the directory held before, or `None` when it had none (or it was unreadable).
+    pub before: Option<[u8; 32]>,
+    /// The copy it holds now — the operator's current login.
+    pub after: [u8; 32],
+}
+
+impl Reseed {
+    /// Whether the re-seed put DIFFERENT bytes in place. `false` means the copy that was just in
+    /// use is byte-identical to the operator's current login, so retrying with it is pointless.
+    pub fn changed(&self) -> bool {
+        self.before != Some(self.after)
+    }
+
+    /// A short, log-safe prefix of the previous copy's digest (`-` when there was none).
+    pub fn before_prefix(&self) -> String {
+        self.before
+            .map(|d| hex_prefix(&d))
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    /// A short, log-safe prefix of the new copy's digest.
+    pub fn after_prefix(&self) -> String {
+        hex_prefix(&self.after)
+    }
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// The first 6 bytes of a digest as hex: enough to tell two logins apart in a log, far too little to
+/// say anything about the credential.
+fn hex_prefix(d: &[u8; 32]) -> String {
+    d[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Resolves the operator's credential path (`auth_source` empty ⇒ [`default_auth_source`]) and
+/// refuses one that is missing or empty with the typed `opencode_auth_missing` error, shared by the
+/// first seed and every re-seed so both name the same fix.
+fn checked_auth_source(auth_source: &str) -> Result<PathBuf, AgentError> {
+    let src = if auth_source.is_empty() {
+        default_auth_source()
+    } else {
+        PathBuf::from(auth_source)
+    };
+    let meta = std::fs::metadata(&src).map_err(|e| {
+        AgentError::Other(format!(
+            "opencode_auth_missing: {}: {e}. opencode keeps its credentials inside the state \
+             directory this backend redirects, so a run cannot authenticate without a copy. \
+             Run `opencode auth login` as the daemon's user, or set `opencode.auth_source`",
+            src.display()
+        ))
+    })?;
+    if meta.len() == 0 {
+        return Err(AgentError::Other(format!(
+            "opencode_auth_missing: {} is empty; a run would be unauthenticated and fail as a \
+             401. Run `opencode auth login` as the daemon's user",
+            src.display()
+        )));
+    }
+    Ok(src)
 }
 
 /// Where the operator's own opencode credential lives, from the DAEMON's environment:
@@ -584,6 +687,70 @@ mod tests {
         let p = st.xdg_data_home().to_path_buf();
         drop(st);
         assert!(!p.exists(), "Drop removed the directory of a cancelled run");
+    }
+
+    // STUDIO-1118: a re-seed replaces the copy with the operator's CURRENT bytes, reports whether
+    // that changed anything by digest, and never touches the operator's own file.
+    #[test]
+    fn reseed_copies_the_current_source_and_reports_the_change_by_digest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let root = tmp.path().join("root");
+        let st = RunState::provision_legacy(&root.to_string_lossy(), &auth, "STUDIO-1118", "")
+            .expect("provision");
+        let copy = st.xdg_data_home().join("opencode").join("auth.json");
+
+        let same = st.reseed_legacy(&auth).expect("reseed unchanged");
+        assert!(
+            !same.changed(),
+            "an unchanged source re-seeds identical bytes"
+        );
+
+        std::fs::write(&auth, b"{\"openai\":{\"type\":\"oauth\"}}").expect("relogin");
+        let src_before = std::fs::read(&auth).expect("read src");
+        let fresh = st.reseed_legacy(&auth).expect("reseed changed");
+        assert!(fresh.changed(), "a new login re-seeds different bytes");
+        assert_eq!(fresh.before, Some(same.after));
+        assert_eq!(std::fs::read(&copy).expect("read copy"), src_before);
+        assert_eq!(
+            std::fs::read(&auth).expect("re-read src"),
+            src_before,
+            "the operator's file is a source only, never written"
+        );
+        let mode = std::fs::metadata(&copy).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the re-seeded copy is private");
+        assert_eq!(fresh.after_prefix().len(), 12);
+        assert_eq!(
+            std::fs::read_dir(copy.parent().expect("parent"))
+                .expect("ls")
+                .count(),
+            1,
+            "no temp file is left behind"
+        );
+    }
+
+    #[test]
+    fn reseed_refuses_a_vanished_source_and_keeps_the_existing_copy() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let st = RunState::provision_legacy(
+            &tmp.path().join("root").to_string_lossy(),
+            &auth,
+            "X-1",
+            "",
+        )
+        .expect("provision");
+        let copy = st.xdg_data_home().join("opencode").join("auth.json");
+        let held = std::fs::read(&copy).expect("read");
+        std::fs::remove_file(&auth).expect("rm");
+        let err = st.reseed_legacy(&auth).expect_err("must refuse");
+        assert!(
+            err.to_string().starts_with("opencode_auth_missing:"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&copy).expect("read"), held);
     }
 
     // The default source follows XDG, and must not be `$HOME` itself — redirecting HOME is the

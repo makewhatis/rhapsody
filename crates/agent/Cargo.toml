@@ -72,6 +72,11 @@ tracing = "0.1"
 # broker crate has no reverse dependency on agent (its `tests/dependency_guard.rs` pins that), so
 # no cycle exists. Already in Cargo.lock.
 rhapsody-provider-broker = { path = "../provider-broker", default-features = false }
+# sha2 (STUDIO-1118): a legacy re-seed compares the run directory's `auth.json` against the
+# operator's by SHA-256 DIGEST — "is the copy that just 401ed byte-identical to the login we would
+# re-seed?" — so the decision never needs the credential's contents in a log line or an error.
+# Already in Cargo.lock (orchestrator, workspace, provider-broker).
+sha2 = "0.10"
 
 [dev-dependencies]
 # tokio (test-only): the current-thread runtime + timer + I/O the `#[tokio::test]` runner tests and

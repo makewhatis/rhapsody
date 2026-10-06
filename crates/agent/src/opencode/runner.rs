@@ -414,9 +414,8 @@ impl crate::Runner for Runner {
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError> {
         let (name, base_args) = split_command(&self.cfg.command)?;
-        // A retained session is resumed from its kept directory (which already holds the seeded
-        // credential); otherwise a fresh one is provisioned, refusing a missing credential before
-        // anything is spawned.
+        // A retained session is resumed from its kept directory; otherwise a fresh one is
+        // provisioned, refusing a missing credential before anything is spawned.
         let (state, resume_session, adopted) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_legacy(
@@ -426,6 +425,26 @@ impl crate::Runner for Runner {
                     &self.cfg.workspace_root,
                 )
             })?;
+        // ⚠️ An adopted directory's `auth.json` is a copy taken when it was FIRST provisioned — up
+        // to an hour of retries earlier. An operator who has since re-run `opencode auth login`
+        // only updated their own file, so the copy is re-seeded from it now, before anything spawns
+        // (STUDIO-1118). Without this a resumed run keeps 401ing on the stale login however often
+        // the operator logs in.
+        if adopted {
+            match state.reseed_legacy(&self.cfg.auth_source) {
+                Ok(r) => tracing::info!(
+                    issue = %issue.identifier, changed = r.changed(),
+                    before = %r.before_prefix(), after = %r.after_prefix(),
+                    "opencode: re-seeded the resumed session's auth.json from the operator's login"
+                ),
+                Err(e) => {
+                    // `adopt` does not mark the directory kept; keep it so this refusal does not
+                    // delete the very session the next dispatch would resume.
+                    state.keep();
+                    return Err(e);
+                }
+            }
+        }
 
         // MCP injection is best-effort, exactly as it is for claude: on any failure the run
         // proceeds without the daemon's server rather than not running at all.
@@ -2575,6 +2594,57 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
             rec.is_file(),
             "the record must survive a pre-turn ending so a later dispatch can resume"
         );
+    }
+
+    /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1118's first half. A retained legacy directory holds the
+    /// `auth.json` copied when it was first provisioned; when the operator runs `opencode auth login`
+    /// afterwards, the resumed session must see the NEW login, not keep failing on the copy it was
+    /// born with until retention expires (2026-10-06: five tickets, eleven 401 attempts each).
+    #[tokio::test]
+    async fn adopting_a_retained_session_reseeds_the_operators_current_login() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        // Provision legacy, then the cut-off marks the directory kept.
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (_tr, _e) = sess.run_turn("p", None, None, &on).await;
+        sess.stop().await.expect("stop");
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(dirs.len(), 1, "the cut-off session is retained: {dirs:?}");
+        let copy = state_root
+            .path()
+            .join(&dirs[0])
+            .join("opencode")
+            .join("auth.json");
+
+        // The operator logs in again: the source changes.
+        std::fs::write(&auth, b"{\"openai\":{\"type\":\"oauth\",\"fresh\":true}}")
+            .expect("relogin");
+
+        // The retry adopts the retained directory.
+        let retry = runner_with(&cut, &root, &auth, &sr, "m", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("adopting session");
+        assert_eq!(sess2.thread_id(), "ses_cut", "the retry adopts the session");
+        assert_eq!(
+            std::fs::read(&copy).expect("read run copy"),
+            std::fs::read(&auth).expect("read source"),
+            "an adopted legacy directory must carry the operator's CURRENT auth.json"
+        );
+        drop(sess2);
     }
 
     /// A model mismatch falls back to a cold start with its own directory and no `-s`.
