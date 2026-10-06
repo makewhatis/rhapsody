@@ -2389,6 +2389,149 @@ mod tests {
         assert_eq!(runs[0].error, msg);
     }
 
+    /// STUDIO-1118, the PRODUCTION path (alice's B1). The test above hand-sets `auth_needed`; this
+    /// one drives the real `spawn_worker` with an agent whose turn ends in the runner's typed
+    /// [`rhapsody_agent::AgentError::AuthNeeded`], so the mapping in `loop.rs` that joins the two is
+    /// what decides the outcome. The exit must carry the flag, the ticket must be labelled for a
+    /// human (what keeps the hold across a restart), and `on_worker_exit` must WARN naming the
+    /// identity and the harness, record one failed row and schedule no timed retry.
+    ///
+    /// MUTATION GUARD: force the `loop.rs` mapping to `false` and the exit falls into the ordinary
+    /// failure backoff (`retry_attempts` populated, no WARN, no label); misname the label and the
+    /// `rhapsody:human` assertion goes red.
+    #[tokio::test]
+    async fn an_auth_needed_turn_is_held_for_a_human_through_the_real_spawn() {
+        let _serial = TRACING_TEST_LOCK.lock().await; // TRA-243: this test captures events
+        let tr = Arc::new(Fake::new());
+        let (mut o, _) = orch_for_retry(Arc::clone(&tr), 10);
+        let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store_handle));
+        let msg = "opencode_auth_needed: operator must run `opencode auth login` as the daemon's \
+                   user (the operator's current login is byte-identical to the one the provider \
+                   just rejected); not retrying. turn_failed: APIError: invalidated oauth token \
+                   (status 401)";
+        let mut ag = rhapsody_agent::fake::Fake::new();
+        ag.turns = vec![rhapsody_agent::fake::TurnScript {
+            result: rhapsody_agent::TurnResult {
+                status: rhapsody_agent::TURN_FAILED.to_string(),
+                ..Default::default()
+            },
+            err: Some(rhapsody_agent::AgentError::AuthNeeded(msg.to_string())),
+            ..Default::default()
+        }];
+        let ag = Arc::new(ag);
+        let root = TempDir::new();
+        if let Some(eff) = o.eff.as_mut() {
+            eff.agent = ag.clone();
+            eff.workspace = mk_workspace(&root.child("ws"));
+            eff.prompt_tmpl = "do it".to_string();
+        }
+        // Drive the real spawn, not the recording seam.
+        o.spawn = None;
+        let mut rx = o.take_events_rx().expect("control-event receiver");
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", "Todo")
+        };
+        o.dispatch_issue(iss, None, None, String::new());
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(Event::WorkerExit(e)) => return e,
+                    Some(_) => continue,
+                    None => panic!("control channel closed before a worker exit"),
+                }
+            }
+        })
+        .await
+        .expect("the worker must post an exit");
+        assert!(exit.failed, "an auth rejection fails the run");
+        assert!(exit.auth_needed, "and carries the typed auth-needed flag");
+        assert!(!exit.refused);
+        assert_eq!(ag.start_calls(), 1, "the session really ran its turn");
+        // TRA-243: the WARN's callsite is shared with the hand-set test above, which runs with no
+        // subscriber and can pin its cached Interest to `never`. Hit it once on a throwaway
+        // orchestrator, rebuild the cache against THIS thread's subscriber, then capture for real.
+        {
+            let (mut warm, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+            warm.dispatch_issue(issue("2", "MT-2", "Todo"), None, None, String::new());
+            let st = warm.running["2"].started_at;
+            warm.on_worker_exit(EvWorkerExit {
+                issue_id: "2".into(),
+                failed: true,
+                started_at: st,
+                err_msg: msg.into(),
+                last_state: "Todo".into(),
+                declared_handoff: false,
+                review_verdict: None,
+                manager_text: None,
+                refused: false,
+                auth_needed: true,
+            });
+        }
+        tracing::callsite::rebuild_interest_cache();
+        events.lock().expect("event buffer lock").clear();
+        o.on_worker_exit(exit);
+        drop(guard);
+
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "an auth-needed exit must schedule no timed retry"
+        );
+        assert!(o.claimed.contains("1"), "held until a human resumes it");
+        assert!(!o.running.contains_key("1"));
+        let labels: Vec<(String, String, String)> = tr
+            .add_label_calls()
+            .into_iter()
+            .map(|c| (c.issue_id, c.team_id, c.label_name))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![(
+                "1".to_string(),
+                "team-1".to_string(),
+                crate::teams::HUMAN_LABEL.to_string()
+            )],
+            "the ticket is labelled for a human exactly once"
+        );
+        let runs = store_handle
+            .list_runs(rhapsody_store::RunFilter {
+                issue: "MT-1".to_string(),
+                ..Default::default()
+            })
+            .expect("list runs");
+        assert_eq!(runs.len(), 1, "exactly one failed row");
+        assert_eq!(runs[0].outcome, store::OUTCOME_FAILED);
+        assert_eq!(runs[0].error, msg);
+        let events = events.lock().expect("event buffer lock").clone();
+        let warns: Vec<_> = events
+            .iter()
+            .filter(|e| e.level == "WARN" && e.message.starts_with("agent login rejected"))
+            .collect();
+        assert_eq!(warns.len(), 1, "one WARN for the held ticket: {events:?}");
+        assert!(
+            warns[0].message.contains("opencode auth login"),
+            "{}",
+            warns[0].message
+        );
+        assert!(
+            warns[0].fields.contains_key("identity"),
+            "{:?}",
+            warns[0].fields
+        );
+        assert!(
+            warns[0].fields.contains_key("harness"),
+            "{:?}",
+            warns[0].fields
+        );
+    }
+
     // Mirrors Go `TestOnWorkerExitUnknownIsNoop`.
     #[test]
     fn on_worker_exit_unknown_is_noop() {

@@ -98,6 +98,10 @@ rhapsody-config = { path = "../config" }
 # become `Clone`: cloning one would silently extend credential custody past cancellation. Already in
 # the lock as a transitive; test-only here.
 static_assertions = "1"
+# tracing-subscriber (test-only, STUDIO-1118 review): a recording layer so the opencode runner's
+# auth-needed WARN is asserted, not only its typed error. The same version `rhapsody-tracker` and
+# `rhapsody-orchestrator` already use as a dev-dependency; already in Cargo.lock.
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

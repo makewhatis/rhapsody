@@ -819,6 +819,9 @@ impl OpencodeSession {
         if !self.auth_failed.load(Ordering::SeqCst) {
             return (tr, err);
         }
+        // Unlike adopting a retained directory, this re-seed deliberately skips the mtime guard: the
+        // copy in the directory is the one the provider just rejected, so a "newer" copy is no
+        // reason to keep it. Only the digest comparison below decides whether a retry can help.
         match self.state.reseed_legacy(&self.cfg.auth_source) {
             Ok(r) if r.changed() => {
                 tracing::info!(
@@ -2801,7 +2804,6 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
         drop(sess2);
     }
 
-    /// A model mismatch falls back to a cold start with its own directory and no `-s`.
     // The other half of re-seed-on-adopt: a retained copy that opencode refreshed IN PLACE after
     // the operator's login was taken holds the rotated token, and adopting must keep it rather than
     // replay the operator's older, spent one.
@@ -2954,6 +2956,107 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         assert!(record_file(&sr, "STUDIO-1118").is_file());
     }
 
+    /// The `level` and fields of every event a test subscriber saw — just enough to assert the
+    /// auth-needed WARN without a credential ever entering a field.
+    #[derive(Clone, Debug)]
+    struct Captured {
+        level: tracing::Level,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct Recorder(Arc<std::sync::Mutex<Vec<Captured>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit(std::collections::HashMap<String, String>);
+            impl tracing::field::Visit for Visit {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.insert(f.name().to_string(), format!("{v:?}"));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.insert(f.name().to_string(), v.to_string());
+                }
+            }
+            let mut v = Visit(std::collections::HashMap::new());
+            event.record(&mut v);
+            if let Ok(mut buf) = self.0.lock() {
+                buf.push(Captured {
+                    level: *event.metadata().level(),
+                    fields: v.0,
+                });
+            }
+        }
+    }
+
+    // STUDIO-1118 acceptance, the WARN half (alice's B1): stopping on an unchanged login is LOUD —
+    // one WARN naming the issue, the identity and the harness, carrying only a digest prefix of the
+    // rejected login.
+    #[tokio::test]
+    async fn an_auth_needed_stop_warns_naming_the_identity_and_the_harness() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _env = ENV_GUARD.read().await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Recorder(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Two identical scenarios: the first only registers the WARN's callsite on THIS thread's
+        // subscriber (a parallel test with no subscriber can pin its cached Interest to `never`,
+        // TRA-243); the cache is rebuilt and only the second is asserted on.
+        for pass in 0..2 {
+            let scripts = TempDir::new();
+            let auth = seeded_auth(&scripts);
+            let script = auth_fake(&scripts, &auth, false, 99);
+            let state_root = TempDir::new();
+            let root = TempDir::new();
+            let ws = make_ws(&root, "w");
+            let sr = state_root.path().to_string_lossy().into_owned();
+            if pass == 1 {
+                tracing::callsite::rebuild_interest_cache();
+                events.lock().expect("event buffer").clear();
+            }
+            let sess = runner_for(&script, &root, &auth, &sr)
+                .start_session(&ws, issue("STUDIO-1118"), None)
+                .await
+                .expect("session");
+            let (_seen, on_event) = collector();
+            let (_tr, err) = sess.run_turn("p", None, None, &on_event).await;
+            assert!(matches!(err, Some(AgentError::AuthNeeded(_))), "{err:?}");
+            sess.stop().await.expect("stop");
+        }
+
+        let got = events.lock().expect("event buffer").clone();
+        let warns: Vec<_> = got
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::WARN
+                    && e.fields
+                        .get("message")
+                        .is_some_and(|m| m.contains("opencode auth login"))
+            })
+            .collect();
+        assert_eq!(warns.len(), 1, "exactly one auth-needed WARN: {got:?}");
+        let w = &warns[0].fields;
+        assert_eq!(
+            w.get("issue").map(String::as_str),
+            Some("STUDIO-1118"),
+            "{w:?}"
+        );
+        assert!(w.contains_key("identity"), "{w:?}");
+        assert_eq!(
+            w.get("harness").map(String::as_str),
+            Some(resume::HARNESS),
+            "{w:?}"
+        );
+        let login = w.get("login").cloned().unwrap_or_default();
+        assert!(
+            login.len() == 12 && login.chars().all(|c| c.is_ascii_hexdigit()),
+            "only a 12-hex digest prefix is logged, never the credential: {login:?}"
+        );
+    }
+
     // The operator logged in while the run was failing: the copy is re-seeded and the SAME turn is
     // retried once, immediately, on the fresh login — and that retry is what the caller sees.
     #[tokio::test]
@@ -3018,6 +3121,7 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         assert!(err.to_string().contains("freshly re-seeded"), "{err}");
     }
 
+    /// A model mismatch falls back to a cold start with its own directory and no `-s`.
     #[tokio::test]
     async fn a_model_mismatch_starts_cold() {
         let _env = ENV_GUARD.read().await;

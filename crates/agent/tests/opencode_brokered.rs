@@ -943,3 +943,45 @@ async fn a_clean_brokered_turn_finalizes_its_receipt_as_completed() {
         "a clean turn declares normal completion before teardown"
     );
 }
+
+/// STUDIO-1118 (alice's F1): the legacy lane's credential-rejection outcome must never reach a
+/// brokered run. A brokered 401 is the broker's to answer — the turn fails as an ordinary failure,
+/// is not retried, and nothing copies an operator `auth.json` into the brokered state directory.
+#[tokio::test]
+async fn a_brokered_401_is_an_ordinary_failure_and_never_reseeds_a_login() {
+    let _serial = serial().await;
+    let fx = Fixture::new("auth401");
+    let sess = fx.start().await;
+    write_executable(
+        &fx.script,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.30; exit 0; fi\n\
+             printf '%s\\n' \"$*\" >> \"{argv}\"\n\
+             printf '{{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{{\"name\":\"APIError\",\
+             \"data\":{{\"message\":\"invalidated oauth token\",\"statusCode\":401,\
+             \"isRetryable\":false}}}}}}\\n'\nexit 1\n",
+            argv = fx.argv_log.display()
+        ),
+    );
+
+    let (tr, err, _events, _ledger) = fx.run(sess.as_ref(), "do it").await;
+    assert_eq!(tr.status, TURN_FAILED);
+    let msg = err.expect("a 401 fails the turn").to_string();
+    assert!(
+        !msg.starts_with("opencode_auth_needed:"),
+        "a brokered 401 is not the legacy login's outcome: {msg}"
+    );
+    assert_eq!(
+        fx.argv_invocations().len(),
+        1,
+        "a brokered 401 is not retried on a re-seeded login"
+    );
+    let seeded: Vec<_> = files_under(&fx.state_root)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "auth.json"))
+        .collect();
+    assert!(
+        seeded.is_empty(),
+        "no auth.json may appear in a brokered run: {seeded:?}"
+    );
+}
