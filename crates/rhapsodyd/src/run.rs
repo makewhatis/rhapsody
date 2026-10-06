@@ -406,9 +406,7 @@ where
     // task.
     let mut manager_selftest_watch: Option<(
         Arc<rhapsody_orchestrator::managerselftest::ManagerSelfTestState>,
-        String,
-        String,
-        String,
+        Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory>,
     )> = None;
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
@@ -444,13 +442,11 @@ where
         if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
             manager_selftest_watch = Some((
                 o.manager_selftest_handle(),
-                resolved
-                    .as_ref()
-                    .map_or_else(|| "claude".to_string(), |c| c.claude.command.clone()),
-                resolved
-                    .as_ref()
-                    .map_or_else(String::new, |c| c.workspace.root.clone()),
-                flags.path.to_string_lossy().into_owned(),
+                manager_canary_factory(
+                    resolved.as_ref(),
+                    &flags.path.to_string_lossy(),
+                    teams_cfg.manager.harnesses.is_empty(),
+                ),
             ));
         }
         o.teams = Some(teams_cfg.clone());
@@ -866,23 +862,13 @@ where
     // cadence and re-runs the canary whenever it changed, so a CLI that auto-updates in place is
     // re-verified without a daemon restart. It holds no `Orchestrator`: its whole contact is the
     // shared `ManagerSelfTestState` handle and the resolved command/paths.
-    let manager_watch_task =
-        manager_selftest_watch.map(|(state, command, workspace_root, workflow_path)| {
-            let ctx = shutdown.wait();
-            let daemon_bin = std::env::current_exe()
-                .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
-            tokio::spawn(async move {
-                rhapsody_orchestrator::managerselftest::run_selftest_watch_task(
-                    ctx,
-                    command,
-                    workspace_root,
-                    daemon_bin,
-                    workflow_path,
-                    state,
-                )
+    let manager_watch_task = manager_selftest_watch.map(|(state, factory)| {
+        let ctx = shutdown.wait();
+        tokio::spawn(async move {
+            rhapsody_orchestrator::managerselftest::run_selftest_watch_task(ctx, factory, state)
                 .await;
-            })
-        });
+        })
+    });
 
     // --- Rhapsody Teams triage (STUDIO-644, slice T3b; design record
     // ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md, §0.11.2) ---
@@ -2237,46 +2223,87 @@ async fn apply_manager_self_test(
     if teams.manager.review_authority == ReviewAuthority::Off {
         return;
     }
+    selftest.configure(teams.manager.effective_harnesses());
+    let factory =
+        manager_canary_factory(resolved, workflow_path, teams.manager.harnesses.is_empty());
+    rhapsody_orchestrator::managerselftest::run_entry_self_tests(factory.as_ref(), selftest).await;
+    if selftest
+        .select(
+            chrono::Utc::now().timestamp_millis(),
+            selftest.credential_probe().as_ref(),
+        )
+        .is_err()
+        && teams.manager.harnesses.is_empty()
+    {
+        // Legacy installs retain today's boot-time off transition. Explicit lists retain the
+        // configured authority, gated by selection, so a version change can re-enable an entry.
+        teams.manager.review_authority = ReviewAuthority::Off;
+    }
+}
+
+struct ManagerCanaryFactory {
+    command: String,
+    workspace_root: String,
+    daemon_bin: String,
+    workflow_path: String,
+    legacy: bool,
+}
+
+impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ManagerCanaryFactory {
+    fn probe_version(
+        &self,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> Result<String, String> {
+        match entry.harness.as_str() {
+            "claude" => rhapsody_orchestrator::managerselftest::probe_cli_version(&self.command),
+            _ => Err(format!("no self-test for harness {}", entry.harness)),
+        }
+    }
+    fn runner(
+        &self,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> Option<Box<dyn rhapsody_orchestrator::managerselftest::CanaryRunner>> {
+        match entry.harness.as_str() {
+            "claude" if self.legacy => Some(Box::new(
+                rhapsody_orchestrator::managerselftest::CliCanaryRunner {
+                    command: self.command.clone(),
+                    workspace_root: self.workspace_root.clone(),
+                    daemon_bin: self.daemon_bin.clone(),
+                    workflow_path: self.workflow_path.clone(),
+                },
+            )),
+            "claude" => Some(Box::new(
+                rhapsody_orchestrator::managerselftest::ClaudeEntryCanaryRunner {
+                    runner: rhapsody_orchestrator::managerselftest::CliCanaryRunner {
+                        command: self.command.clone(),
+                        workspace_root: self.workspace_root.clone(),
+                        daemon_bin: self.daemon_bin.clone(),
+                        workflow_path: self.workflow_path.clone(),
+                    },
+                    entry: entry.clone(),
+                },
+            )),
+            _ => None, // MH3 adds the proven OpenCode canary and credential probe.
+        }
+    }
+}
+
+fn manager_canary_factory(
+    resolved: Option<&rhapsody_config::Config>,
+    workflow_path: &str,
+    legacy: bool,
+) -> Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory> {
     let command = resolved.map_or_else(|| "claude".to_string(), |c| c.claude.command.clone());
     let workspace_root = resolved.map_or_else(String::new, |c| c.workspace.root.clone());
-    let cli_version = match rhapsody_orchestrator::managerselftest::probe_cli_version(&command) {
-        Ok(v) => v,
-        Err(e) => {
-            // No version ⇒ no passing record ⇒ the gate refuses. Typed reason to the human feed.
-            selftest.set_installed_version(None);
-            teams.manager.review_authority = ReviewAuthority::Off;
-            tracing::warn!(
-                reason = %format!("manager unavailable: cannot determine the claude CLI version: {e}"),
-                "manager self-test could not run; manager disabled"
-            );
-            return;
-        }
-    };
     let daemon_bin = std::env::current_exe()
         .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
-    let runner = rhapsody_orchestrator::managerselftest::CliCanaryRunner {
+    Arc::new(ManagerCanaryFactory {
         command,
         workspace_root,
         daemon_bin,
         workflow_path: workflow_path.to_string(),
-    };
-    let mut authority = teams.manager.review_authority;
-    let reason = rhapsody_orchestrator::managerselftest::run_boot_self_test(
-        &runner,
-        selftest,
-        &mut authority,
-        &cli_version,
-    )
-    .await;
-    teams.manager.review_authority = authority;
-    if let Some(reason) = reason {
-        rhapsody_orchestrator::managerselftest::warn_self_test_failed(
-            rhapsody_orchestrator::managerselftest::SelfTestTrigger::Boot,
-            &reason,
-        );
-    } else {
-        tracing::info!(cli_version = %cli_version, "manager self-test passed");
-    }
+        legacy,
+    })
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
