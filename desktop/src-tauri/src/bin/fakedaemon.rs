@@ -3,8 +3,9 @@
 //!
 //! It mimics the parts the supervisor cares about — a `--port` flag, a `/healthz` route, graceful
 //! SIGTERM shutdown — and can be told (via env vars) to delay readiness, exit unexpectedly, crash
-//! on its first launch so the restart-on-crash path can be exercised, or take a while to shut down. It has no tauri/lib dependency
-//! and is located by the integration tests via `CARGO_BIN_EXE_fakedaemon`.
+//! on its first launch so the restart-on-crash path can be exercised, or take a while to shut down.
+//! It has no tauri/lib dependency and is located by the integration tests via
+//! `CARGO_BIN_EXE_fakedaemon`.
 
 use std::convert::Infallible;
 use std::path::Path;
