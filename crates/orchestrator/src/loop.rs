@@ -1988,9 +1988,12 @@ impl Orchestrator {
             // even across a restart, and the job page's resume clears it once they have logged in.
             let auth_needed = matches!(
                 err,
-                Some(WorkerError::Agent(agent::AgentError::AuthNeeded(_)))
+                Some(WorkerError::Agent(
+                    agent::AgentError::AuthNeeded(_) | agent::AgentError::AuthFailed(_)
+                ))
             );
             if auth_needed
+                && deps.manager.is_none()
                 && !iss.team_id.is_empty()
                 && let Err(e) = deps
                     .tracker

@@ -428,6 +428,19 @@ pub fn parse_stored_decision(
     parse_decision_with(result_text, known, false)
 }
 
+/// Host-only metadata is persisted alongside the already-validated decision. The live parser
+/// still rejects it, so an agent cannot name who ruled or invent a fallback explanation.
+pub fn record_decided_by(
+    body: &str,
+    by: &crate::managerselftest::DecidedBy,
+) -> Result<String, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("decided_by".to_string(), serde_json::to_value(by)?);
+    }
+    serde_json::to_string(&value)
+}
+
 fn parse_decision_with(
     result_text: &str,
     known: &[KnownFinding],
@@ -454,6 +467,9 @@ fn parse_decision_with(
         "rationale",
     ];
     for (key, value) in entries {
+        if !require_open && key == "decided_by" {
+            continue;
+        }
         if !ALLOWED.contains(&key.as_str()) {
             return Err(DecisionError::UnknownField(key.clone()));
         }
@@ -488,7 +504,7 @@ fn parse_decision_with(
         _ => &[],
     };
     for (key, _) in entries {
-        if key == "decision" {
+        if key == "decision" || (!require_open && key == "decided_by") {
             continue;
         }
         let allowed = applies.contains(&key.as_str()) || common.contains(&key.as_str());

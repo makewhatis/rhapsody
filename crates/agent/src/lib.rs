@@ -331,6 +331,9 @@ pub enum AgentError {
     /// can hold the issue for a human instead of burning a timed retry every few minutes.
     #[error("{0}")]
     AuthNeeded(String),
+    /// Manager-native login rejection: MH1 blocks the entry and tries the next harness.
+    #[error("{0}")]
+    AuthFailed(String),
 }
 
 /// Serializes every test that spawns an agent child against the two that MUTATE the process

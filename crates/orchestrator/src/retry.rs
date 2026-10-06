@@ -551,22 +551,26 @@ impl Orchestrator {
                 re.model_override.identity = String::new();
             }
         }
-        // The manager run's model/effort come from M6's config (`manager.model` / `manager.effort`)
-        // and its harness is always `claude` (design §4.1 — config validation refuses any other while
-        // authority is not off). `manager` is `Some` only for a run `dispatch_manager` staged in
-        // `pending_manager`, so no other dispatch reaches this. The base model/effort are landed as a
-        // model_override, exactly as a routed profile's would be, so the session's argv and the run's
-        // provenance both describe what actually ran.
-        if manager.is_some() {
-            if let Some(teams) = self.teams.as_ref() {
-                if !teams.manager.model.is_empty() {
-                    re.model_override.model = teams.manager.model.clone();
-                }
-                if !teams.manager.effort.is_empty() {
-                    re.model_override.effort = teams.manager.effort.clone();
-                }
+        // A manager run carries the selected entry, independently of the identity's profile.
+        // The legacy no-list path retains its original non-empty-only overrides.
+        if manager.is_some()
+            && let Some(attempt) = self.manager_attempts.get(&iss.id)
+        {
+            let entry = &attempt.selected.entry;
+            if self
+                .teams
+                .as_ref()
+                .is_some_and(|t| !t.manager.harnesses.is_empty())
+            {
+                re.model_override = rhapsody_agent::ModelOverride::default();
             }
-            re.harness = "claude".to_string();
+            if !entry.model.is_empty() {
+                re.model_override.model = entry.model.clone();
+            }
+            if !entry.effort.is_empty() {
+                re.model_override.effort = entry.effort.clone();
+            }
+            re.harness = entry.harness.clone();
         }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.

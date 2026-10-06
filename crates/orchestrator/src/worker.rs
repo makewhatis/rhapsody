@@ -512,7 +512,11 @@ async fn run_manager_attempt(
     // The dedicated manager configuration directory carries ONLY the model credential (§4.2), and
     // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
     // authenticate from the file on macOS (§4.5).
-    let model_credential = provision_manager_config_dir(&config_dir);
+    let model_credential = if deps.agent.id() == rhapsody_agent::HarnessId::Claude {
+        provision_manager_config_dir(&config_dir)
+    } else {
+        None
+    };
 
     // Optional transcript, best-effort exactly as the ordinary path.
     let mut transcript: Option<Transcript> = None;

@@ -138,6 +138,31 @@ pub fn manager_explanation_body(decision: &ManagerDecision, marker: &str) -> Str
     strip_summon_tokens(&out)
 }
 
+fn manager_provenance_line(by: &crate::managerselftest::DecidedBy) -> String {
+    let model = by
+        .model
+        .split_once('/')
+        .map_or(by.model.as_str(), |(_, model)| model);
+    let mut line = format!("@manager ({model} via {}) adjudicated", by.harness);
+    if let Some(reason) = &by.fallback_reason {
+        line.push_str(&format!(" ({reason})"));
+    }
+    line.push_str(".\n");
+    line
+}
+
+pub fn manager_explanation_body_by(
+    decision: &ManagerDecision,
+    marker: &str,
+    by: Option<&crate::managerselftest::DecidedBy>,
+) -> String {
+    let body = manager_explanation_body(decision, marker);
+    match by {
+        Some(by) => strip_summon_tokens(&format!("{}{body}", manager_provenance_line(by))),
+        None => body,
+    }
+}
+
 /// The mandatory effects for a decision (§7.6), in application order. `ESCALATE` has none — its
 /// question comment is best effort and an escalation activates nothing.
 pub fn plan_effects(decision: &ManagerDecision) -> Vec<&'static str> {
@@ -647,7 +672,11 @@ impl Orchestrator {
     fn manager_escalate(&mut self, row: &ManagerInterventionRow, question: &str, checked: &str) {
         let marker = manager_explanation_marker(&row.id, MANAGER_EFFECT_ESCALATION);
         let body = strip_summon_tokens(&format!(
-            "Manager escalation.\nQuestion: {question}\nChecked: {checked}\n\n{marker}"
+            "{}Manager escalation.\nQuestion: {question}\nChecked: {checked}\n\n{marker}",
+            crate::managerselftest::DecidedBy::from_stored(&row.decision_json)
+                .as_ref()
+                .map(manager_provenance_line)
+                .unwrap_or_default()
         ));
         let (owner, repo, number) = crate::managerintervention::parse_pr_key(&row.pr)
             .map(|c| (c.owner, c.repo, c.number))
@@ -934,7 +963,8 @@ impl Orchestrator {
         effects: &[ManagerEffect],
     ) -> ManagerApplyRequest {
         let marker = manager_explanation_marker(&row.id, MANAGER_EFFECT_EXPLANATION);
-        let explanation = manager_explanation_body(decision, &marker);
+        let by = crate::managerselftest::DecidedBy::from_stored(&row.decision_json);
+        let explanation = manager_explanation_body_by(decision, &marker, by.as_ref());
         let (owner, repo, number) = crate::managerintervention::parse_pr_key(&row.pr)
             .map(|c| (c.owner, c.repo, c.number))
             .unwrap_or_default();
@@ -1170,6 +1200,20 @@ fn manager_route_wake_body(decision: &ManagerDecision) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_comment_names_model_and_harness() {
+        let d = decision(DecisionKind::Approve);
+        let by = crate::managerselftest::DecidedBy {
+            entry: 2,
+            harness: "opencode".into(),
+            model: "openai/gpt-6.1-sol".into(),
+            fallback_reason: Some("entry 1 unavailable: OpenAI login expired".into()),
+        };
+        let body = manager_explanation_body_by(&d, "marker", Some(&by));
+        assert!(body.contains("@manager (gpt-6.1-sol via opencode) adjudicated"));
+        assert!(body.contains("(entry 1 unavailable: OpenAI login expired)"));
+    }
     use crate::managerdecision::Dismissal;
 
     fn decision(kind: DecisionKind) -> ManagerDecision {
