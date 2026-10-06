@@ -245,6 +245,31 @@ fn default_review_reviewers() -> i64 {
     DEFAULT_REVIEW_REVIEWERS
 }
 
+/// One ordered manager-run harness, independent of the one-shot routing tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerHarnessEntry {
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+fn deserialize_manager_harnesses<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ManagerHarnessEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Vec::<ManagerHarnessEntry>::deserialize(deserializer)?;
+    if entries.is_empty() {
+        return Err(serde::de::Error::custom(
+            "manager.harnesses must not be empty",
+        ));
+    }
+    Ok(entries)
+}
+
 /// The `manager:` block (§2.2). Carried as config in T1; the routing function
 /// that reads `default_identity` is T3a and the model turn that reads `model` /
 /// `max_tokens` / `timeout_ms` is T3b's off-loop triage task (§0.11.2).
@@ -256,21 +281,31 @@ pub struct Manager {
     /// Validated to name a roster entry when non-empty.
     #[serde(default)]
     pub default_identity: String,
-    /// Consulted ONLY in `labels+model`, and only on a Tier-1 miss.
+    /// The one-shot triage/room/adjudication model. Also seeds the legacy manager run when
+    /// `harnesses` is absent; an explicit `harnesses` list governs manager runs independently.
     #[serde(default)]
     pub model: String,
-    /// The harness the manager's model turn runs on (STUDIO-985). **Absent means `claude`**, and
+    /// The harness for ONLY the one-shot turns (STUDIO-985). `harnesses` governs manager runs.
+    /// **Absent means `claude`**, and
     /// that default is independent of `agent.backend` and of every teammate: per the parent decision
     /// D6 the manager never borrows a teammate's tuple. Read through [`Manager::effective_harness`],
     /// never raw.
     #[serde(default)]
     pub harness: String,
-    /// The provider the manager's model turn runs on (STUDIO-985). Empty is the default-Claude
+    /// The provider for ONLY the one-shot turns (STUDIO-985). `harnesses` governs manager runs.
+    /// Empty is the default-Claude
     /// case and is the only legal value while the harness is Claude: the manager uses Claude's
     /// native auth and names no provider. Selecting an explicit provider requires a non-Claude
     /// harness (which in turn requires `model`).
     #[serde(default)]
     pub provider: String,
+    /// Ordered manager-run entries. Absent preserves the single Claude model/effort path.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_manager_harnesses"
+    )]
+    pub harnesses: Vec<ManagerHarnessEntry>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i64,
     #[serde(default = "default_timeout_ms")]
@@ -318,6 +353,7 @@ impl Default for Manager {
             model: String::new(),
             harness: String::new(),
             provider: String::new(),
+            harnesses: Vec::new(),
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             review_authority: ReviewAuthority::Off,
@@ -332,6 +368,18 @@ impl Default for Manager {
 }
 
 impl Manager {
+    pub fn effective_harnesses(&self) -> Vec<ManagerHarnessEntry> {
+        if self.harnesses.is_empty() {
+            vec![ManagerHarnessEntry {
+                harness: "claude".to_string(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+            }]
+        } else {
+            self.harnesses.clone()
+        }
+    }
+
     /// The harness the manager's model turn runs on: the explicit `harness`, else **`claude`** —
     /// never `agent.backend` and never a teammate's harness (STUDIO-985, §2.3 / parent D6). The
     /// independent Claude default is what keeps the manager stable on an installation whose
@@ -1690,19 +1738,26 @@ impl Teams {
                 manager_harness
             )));
         }
-        // STUDIO-1013 (§4.1, §12): v1 manager runs are `claude`-harness only (D1 requires Opus
-        // 5.5). A config that would give the manager review authority on any other resolved
-        // harness is a TYPED REFUSAL at validation: the manager does not launch and items stay on
-        // the human feed, rather than running a gate on a harness whose tool contract §4.7 cannot
-        // verify. Setting the authority to `off` is the way to keep a non-Claude manager.
-        if self.manager.review_authority != ReviewAuthority::Off && manager_harness != "claude" {
-            return Err(TeamsError::Invalid(format!(
-                "manager.review_authority {:?} requires the `claude` harness, but the manager \
-                 resolves to {:?} — v1 manager runs are Claude-only, because the tool contract \
-                 §4.7 verifies is the pinned Claude CLI's. Set manager.review_authority: off, or \
-                 run the manager on claude",
-                self.manager.review_authority, manager_harness
-            )));
+        // Run entries must support the isolated manager-session contract. The one-shot tuple
+        // above is independent, and an absent list always means the legacy Claude entry.
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.manager.effective_harnesses() {
+            if !matches!(entry.harness.as_str(), "claude" | "opencode") {
+                return Err(TeamsError::Invalid(format!(
+                    "manager.harnesses: no manager session for harness {:?}",
+                    entry.harness
+                )));
+            }
+            if entry.harness == "opencode" && entry.model.trim().is_empty() {
+                return Err(TeamsError::Invalid(
+                    "manager.harnesses: opencode requires model".to_string(),
+                ));
+            }
+            if !seen.insert((entry.harness, entry.model)) {
+                return Err(TeamsError::Invalid(
+                    "manager.harnesses: duplicate (harness, model)".to_string(),
+                ));
+            }
         }
         // Every configured `review.provider` value must be a canonical operator-chosen id. A
         // provider field can never carry a credential, and a non-canonical value refuses the file
@@ -3680,6 +3735,7 @@ mod tests {
                 model: "m".to_string(),
                 harness: "opencode".to_string(),
                 provider: "fireworks".to_string(),
+                harnesses: Vec::new(),
                 max_tokens: 1,
                 timeout_ms: 2,
                 // `off` with a non-Claude harness, because STUDIO-1013 makes any other authority
@@ -3796,20 +3852,55 @@ mod tests {
         assert_eq!(t.manager.run_timeout_ms, 60_000);
     }
 
-    /// §4.1/§12: any authority but `off` requires the `claude` harness; a non-Claude resolved
-    /// manager is a typed refusal, not a silently-ignored key. The mutation this pins: dropping
-    /// the check lets an `act` manager be configured on opencode.
     #[test]
-    fn review_authority_requires_the_claude_harness() {
+    fn harnesses_absent_maps_to_single_claude_entry() {
+        let t = Teams::parse("manager:\n  model: opus\n  effort: high\n").expect("parse");
+        assert_eq!(
+            t.manager.effective_harnesses(),
+            vec![ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            }]
+        );
+        let yaml = serde_yaml_ng::to_string(&t).expect("serialize");
+        assert!(!yaml.contains("harnesses:"));
+        assert_eq!(Teams::parse(&yaml).expect("round trip"), t);
+    }
+
+    #[test]
+    fn harnesses_validation() {
+        for list in [
+            "[]",
+            "[{harness: codex}]",
+            "[{harness: opencode}]",
+            "[{harness: claude, model: opus}, {harness: claude, model: opus}]",
+        ] {
+            let yaml = format!("manager:\n  harnesses: {list}\n");
+            assert!(
+                Teams::parse(&yaml).and_then(|t| t.validate()).is_err(),
+                "{yaml}"
+            );
+        }
+        Teams::parse("manager:\n  review_authority: advise\n  harnesses: [{harness: opencode, model: openai/gpt-6.1-sol, effort: xhigh}, {harness: claude, model: opus-5-5, effort: high}]\n")
+            .expect("parse").validate().expect("ordered supported entries");
+    }
+
+    #[test]
+    fn review_authority_requires_every_entry_to_support_manager_sessions() {
         let non_claude = "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  harness: opencode\n  \
                           provider: fireworks\n  model: m\n  review_authority: act\n";
-        let err = Teams::parse(non_claude)
+        Teams::parse(non_claude)
             .expect("parse")
             .validate()
-            .expect_err("a non-Claude manager with authority is refused");
+            .expect("one-shot tuple is independent of manager-run harnesses");
+        let unsupported =
+            "manager:\n  review_authority: act\n  harnesses: [{harness: codex, model: m}]\n";
         assert!(
-            err.to_string().contains("requires the `claude` harness"),
-            "the refusal must name the harness requirement: {err}"
+            Teams::parse(unsupported)
+                .expect("parse")
+                .validate()
+                .is_err()
         );
 
         // The same tuple with `off` is allowed — the way to keep a non-Claude manager.
