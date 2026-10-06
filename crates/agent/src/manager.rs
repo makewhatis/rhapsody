@@ -161,8 +161,8 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
 /// Every built-in the CLI is known to expose, named in `--disallowedTools` (§4.3). This list is a
 /// BACKSTOP, not the enforcement: the manager posture passes `--tools ""`, which disables every
 /// built-in, so a built-in this list does not name is still removed (STUDIO-1117). The pinned list
-/// proved a moving target — `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` appeared on 2.1.281 by a
-/// server-side rollout, with no CLI version change, and disabled the manager. The canary still
+/// proved a moving target — `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` later appeared even on
+/// 2.1.281, apparently by a server-side rollout with no CLI version change, and disabled the manager. The canary still
 /// reads the init `tools` array and refuses any entry that is not `mcp__*`
 /// ([`MANAGER_MCP_SERVER`]'s namespace), so a future CLI that ignores `--tools ""` AND exposes an
 /// unlisted built-in fails the self-test closed rather than silently running.
@@ -189,9 +189,10 @@ pub const MANAGER_DISALLOWED_BUILTIN_TOOLS: &[&str] = &[
     "AskUserQuestion",
 ];
 
-/// Built-ins the CLI exposed at 2.1.281 that were NOT in the original STUDIO-1014 list, plus the four
-/// `Task*` tools rolled out later (STUDIO-1117). Kept as a separate constant so the two are still visibly ONE `--disallowedTools`
-/// value built by [`manager_disallowed_tools`]; the split is organizational, not behavioral.
+/// Built-ins the CLI exposed at 2.1.281 that were NOT in the original STUDIO-1014 list, plus the
+/// four `Task*` tools rolled out later (STUDIO-1117). Kept as a separate constant so the two are
+/// still visibly ONE `--disallowedTools` value built by [`manager_disallowed_tools`]; the split is
+/// organizational, not behavioral.
 pub const MANAGER_DISALLOWED_EXTRA_BUILTINS: &[&str] = &[
     "CronCreate",
     "CronDelete",
