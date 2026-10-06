@@ -430,8 +430,16 @@ impl crate::Runner for Runner {
         // to an hour of retries earlier. An operator who has since re-run `opencode auth login`
         // only updated their own file, so the copy is re-seeded from it now, before anything spawns
         // (STUDIO-1118). Without this a resumed run keeps 401ing on the stale login however often
-        // the operator logs in.
-        if adopted {
+        // the operator logs in. Only when the operator's login is the NEWER of the two, though: a
+        // copy opencode refreshed in place holds the rotated token, and clobbering it with the
+        // operator's older one would replay a spent refresh token (`legacy_login_is_newer`).
+        if adopted && !state.legacy_login_is_newer(&self.cfg.auth_source) {
+            tracing::info!(
+                issue = %issue.identifier,
+                "opencode: kept the resumed session's own auth.json; it is not older than the \
+                 operator's login"
+            );
+        } else if adopted {
             match state.reseed_legacy(&self.cfg.auth_source) {
                 Ok(r) => tracing::info!(
                     issue = %issue.identifier, changed = r.changed(),
@@ -2794,6 +2802,60 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
     }
 
     /// A model mismatch falls back to a cold start with its own directory and no `-s`.
+    // The other half of re-seed-on-adopt: a retained copy that opencode refreshed IN PLACE after
+    // the operator's login was taken holds the rotated token, and adopting must keep it rather than
+    // replay the operator's older, spent one.
+    #[tokio::test]
+    async fn adopting_keeps_a_retained_copy_newer_than_the_operators_login() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_with(&cut, &root, &auth, &sr, "m", 1)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let _ = sess.run_turn("p", None, None, &on_event).await;
+        sess.stop().await.expect("stop");
+        drop(sess);
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(dirs.len(), 1);
+        let copy = state_root
+            .path()
+            .join(&dirs[0])
+            .join("opencode")
+            .join("auth.json");
+        // opencode refreshed the login inside the run: the copy now differs and is newer.
+        std::fs::write(&copy, b"{\"openai\":{\"type\":\"oauth\",\"rotated\":true}}")
+            .expect("in-place refresh");
+        let rotated = std::fs::read(&copy).expect("read");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&auth)
+            .expect("open")
+            .set_modified(old)
+            .expect("age the operator's login");
+
+        let sess2 = runner_with(&cut, &root, &auth, &sr, "m", 30)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("resume");
+        assert_eq!(sess2.thread_id(), "ses_cut");
+        assert_eq!(
+            std::fs::read(&copy).expect("read"),
+            rotated,
+            "a copy newer than the operator's login is the live one and must survive adoption"
+        );
+        drop(sess2);
+    }
+
     /// A fake `opencode` for the credential-rejection path (STUDIO-1118). Invocation `n` (counted
     /// in `<dir>/count`) emits the OAuth-shaped 401 while `n <= fails`, and a clean turn after.
     /// `relogin` makes the FIRST invocation rewrite the operator's `auth.json` — the operator

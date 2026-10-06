@@ -257,6 +257,30 @@ impl RunState {
         Ok(Reseed { before, after })
     }
 
+    /// Whether the operator's login is NEWER than this legacy directory's copy (by mtime), or the
+    /// directory has no readable copy at all — the condition under which re-seeding an ADOPTED
+    /// directory can only help (STUDIO-1118).
+    ///
+    /// ⚠️ Not an optimization. opencode REFRESHES an OAuth login in place: it writes the rotated
+    /// refresh token into `$XDG_DATA_HOME/opencode/auth.json` — this directory's copy — and the
+    /// provider treats the refresh token it replaced as spent. A copy written after the operator's
+    /// file was may therefore be the only live login there is, and overwriting it with the
+    /// operator's older one would hand the next refresh a spent token. An unreadable source answers
+    /// `true`, so [`RunState::reseed_legacy`] reports the real problem.
+    pub fn legacy_login_is_newer(&self, auth_source: &str) -> bool {
+        let src = if auth_source.is_empty() {
+            default_auth_source()
+        } else {
+            PathBuf::from(auth_source)
+        };
+        let copy = self.dir.join("opencode").join("auth.json");
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        match (mtime(&src), mtime(&copy)) {
+            (Some(s), Some(c)) => s > c,
+            _ => true,
+        }
+    }
+
     /// Marks the directory as retained past this run, so `Drop` will not remove it. The caller
     /// (the runner) records the session in [`super::resume`] at the same time; a kept directory
     /// with no record is a leak, so keep and record happen together.
@@ -729,6 +753,37 @@ mod tests {
             1,
             "no temp file is left behind"
         );
+    }
+
+    #[test]
+    fn a_copy_written_after_the_operators_login_is_not_older_than_it() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let st = RunState::provision_legacy(
+            &tmp.path().join("root").to_string_lossy(),
+            &auth,
+            "X-1",
+            "",
+        )
+        .expect("provision");
+        let copy = st.xdg_data_home().join("opencode").join("auth.json");
+        let at = |p: &Path, secs: u64| {
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .expect("open")
+                .set_modified(t)
+                .expect("set mtime");
+        };
+        at(Path::new(&auth), 1_000);
+        at(&copy, 2_000);
+        assert!(
+            !st.legacy_login_is_newer(&auth),
+            "a copy opencode refreshed in place after the login must not be clobbered"
+        );
+        at(Path::new(&auth), 3_000);
+        assert!(st.legacy_login_is_newer(&auth), "a later re-login is newer");
     }
 
     #[test]
