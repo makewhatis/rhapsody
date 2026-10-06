@@ -526,6 +526,34 @@ pub async fn run_boot_self_test(
     reason
 }
 
+/// Which self-test run disabled the manager: the boot gate or the version-change watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfTestTrigger {
+    /// The startup self-test ([`run_boot_self_test`]).
+    Boot,
+    /// A fresh self-test after the installed CLI version changed ([`run_selftest_watch_task`]).
+    VersionChange,
+}
+
+/// Logs a failed self-test at WARN with the summary message AND the detail naming the attempt that
+/// failed (STUDIO-1117). A guard that refuses work says why in the same line: the summary alone
+/// left the operator hand-building a probe to learn which attempt was not refused.
+pub fn warn_self_test_failed(trigger: SelfTestTrigger, reason: &ManagerUnavailable) {
+    match trigger {
+        SelfTestTrigger::Boot => tracing::warn!(
+            reason = %reason.message(),
+            detail = %reason.detail,
+            "manager self-test failed; manager disabled and its items go to the human feed"
+        ),
+        SelfTestTrigger::VersionChange => tracing::warn!(
+            reason = %reason.message(),
+            detail = %reason.detail,
+            "manager self-test watcher: the CLI version changed and the fresh self-test failed; \
+             the manager is disabled"
+        ),
+    }
+}
+
 /// Reconciles one freshly probed CLI version with the recorded verdict (STUDIO-1049, §4.7). The gate
 /// and the self-test watcher both call this: `installed_version` is set to the probe FIRST — so the
 /// gate refuses for the whole window — and if the probe's version differs from the verdict's, a
@@ -598,11 +626,7 @@ pub async fn run_selftest_watch_task(
         }
         let probed = probe_cli_version(&command);
         if let Some(reason) = reconcile_probed_version(&runner, &state, probed).await {
-            tracing::warn!(
-                reason = %reason.message(),
-                "manager self-test watcher: the CLI version changed and the fresh self-test failed; \
-                 the manager is disabled"
-            );
+            warn_self_test_failed(SelfTestTrigger::VersionChange, &reason);
         }
     }
 }
@@ -1207,6 +1231,53 @@ mod tests {
             .is_some()
         );
         assert!(state.permitted().is_err());
+    }
+
+    // STUDIO-1117: a posture that exposes a built-in the deny list does not name (the `Task*` tools
+    // a server-side rollout added) still disables the manager — `init_contract` is not loosened —
+    // and BOTH failure WARNs (boot and the version-change watcher) carry the detail naming the
+    // attempt and the tool, not only the summary message.
+    #[test]
+    fn an_unlisted_builtin_disables_the_manager_and_the_warn_names_it() {
+        let posture = parse_canary_init(
+            r#"{"type":"system","subtype":"init","tools":["mcp__symphony__manager_pr","TaskCreate"],"mcp_servers":[{"name":"symphony"}],"permissionMode":"default"}"#,
+        )
+        .expect("init parsed");
+        let (init_refused, init_detail) = init_contract(Some(&posture));
+        let mut obs = all_refused();
+        let slot = obs
+            .iter_mut()
+            .find(|o| o.attempt == CanaryAttempt::InitContract)
+            .expect("present");
+        slot.refused = init_refused;
+        slot.detail = init_detail;
+
+        let mut authority = ReviewAuthority::Advise;
+        let reason = apply(&evaluate("2.1.291", &obs), &mut authority)
+            .expect("an exposed TaskCreate must disable the manager");
+        assert_eq!(authority, ReviewAuthority::Off);
+        assert!(
+            reason.detail.contains("init_contract") && reason.detail.contains("TaskCreate"),
+            "the recorded reason must name the attempt and the tool: {}",
+            reason.detail
+        );
+
+        for trigger in [SelfTestTrigger::Boot, SelfTestTrigger::VersionChange] {
+            let ((), events) =
+                crate::testsupport::capture_events(|| warn_self_test_failed(trigger, &reason));
+            assert_eq!(events.len(), 1, "{trigger:?}: {events:?}");
+            let e = &events[0];
+            assert_eq!(e.level, "WARN");
+            assert_eq!(
+                e.fields.get("reason").map(String::as_str),
+                Some(reason.message().as_str())
+            );
+            let detail = e.fields.get("detail").map(String::as_str).unwrap_or("");
+            assert!(
+                detail.contains("init_contract") && detail.contains("TaskCreate"),
+                "{trigger:?}: the WARN must carry the detail: {e:?}"
+            );
+        }
     }
 
     // The init posture the canary reads is the CLI's own stream-json, parsed strictly.
