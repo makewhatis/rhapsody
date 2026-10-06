@@ -523,6 +523,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         let msgs = st.list_run_messages(run_id).expect("list");
@@ -579,6 +580,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         // The reopen ladder is the unit under test; drop the dispatch's claim so
         // `review_reopen_eligible` reaches its store half rather than being refused as "claimed".
