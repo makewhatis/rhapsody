@@ -1000,13 +1000,15 @@ impl Orchestrator {
             .iter()
             .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
             .filter_map(|(pr, facts)| {
-                if let Some((key, attempt)) = self.review_attempts.iter().find(|(key, attempt)| {
-                    key.owner.eq_ignore_ascii_case(&pr.owner)
-                        && key.repo.eq_ignore_ascii_case(&pr.repo)
-                        && key.number == pr.number
-                        && attempt.failures >= crate::reviewwatch::MAX_REVIEW_ATTEMPTS
-                        && rows.iter().any(|row| row.key == **key)
-                }) {
+                if let Some((key, attempt)) = rows
+                    .iter()
+                    .filter(|row| {
+                        row.key.owner.eq_ignore_ascii_case(&pr.owner)
+                            && row.key.repo.eq_ignore_ascii_case(&pr.repo)
+                            && row.key.number == pr.number
+                    })
+                    .find_map(|row| self.review_infrastructure_for(&row.key))
+                {
                     return Some(Divergence {
                         pr: pr.to_string(),
                         kind: DivergenceKind::ReviewInfrastructure,

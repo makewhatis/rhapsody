@@ -225,13 +225,11 @@ impl Orchestrator {
         let reviews = rows
             .into_iter()
             .map(|row| {
-                let infrastructure = self
-                    .review_attempts
-                    .get(&row.key)
-                    .filter(|attempt| {
-                        row.open && attempt.failures >= crate::reviewwatch::MAX_REVIEW_ATTEMPTS
-                    })
-                    .map(|attempt| attempt.message(&row.key));
+                let infrastructure = row
+                    .open
+                    .then(|| self.review_infrastructure_for(&row.key))
+                    .flatten()
+                    .map(|(key, attempt)| attempt.message(key));
                 let mut job = ReviewJobRow::from(row);
                 job.infrastructure = infrastructure;
                 let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();

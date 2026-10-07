@@ -164,6 +164,8 @@ pub(crate) const MAX_REVIEW_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FailedReviewAttempt {
+    /// The watch obligation that picked this reviewer; a refused substitute has no row of its own.
+    pub obligation: ReviewWatchKey,
     pub head: String,
     pub failures: usize,
     pub next_at: chrono::DateTime<chrono::Utc>,
@@ -188,6 +190,16 @@ impl Orchestrator {
         head: &str,
         reason: &str,
     ) {
+        self.note_failed_review_attempt_for(key, key, head, reason);
+    }
+
+    pub(crate) fn note_failed_review_attempt_for(
+        &mut self,
+        key: &ReviewWatchKey,
+        obligation: &ReviewWatchKey,
+        head: &str,
+        reason: &str,
+    ) {
         let now = (self.now)();
         let previous = self.review_attempts.get(key).filter(|a| a.head == head);
         let failures = previous.map_or(1, |a| a.failures.saturating_add(1));
@@ -196,6 +208,7 @@ impl Orchestrator {
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         let reason: String = reason.chars().take(400).collect();
         let attempt = FailedReviewAttempt {
+            obligation: obligation.clone(),
             head: head.to_string(),
             failures,
             next_at: now + chrono::Duration::seconds(delay),
@@ -205,6 +218,20 @@ impl Orchestrator {
         tracing::warn!(reviewer = %key.reviewer, head, failures, reason = %attempt.reason,
             "ticketless review: no verdict; infrastructure attempt failed, not a review round");
         self.review_attempts.insert(key.clone(), attempt);
+    }
+
+    /// Both infrastructure surfaces follow the live obligation, including an unlaunched substitute.
+    pub(crate) fn review_infrastructure_for(
+        &self,
+        obligation: &ReviewWatchKey,
+    ) -> Option<(&ReviewWatchKey, &FailedReviewAttempt)> {
+        self.review_attempts
+            .iter()
+            .filter(|(key, attempt)| {
+                (attempt.obligation == *obligation || **key == *obligation)
+                    && attempt.failures >= MAX_REVIEW_ATTEMPTS
+            })
+            .min_by_key(|(key, _)| *key)
     }
 }
 
@@ -3525,6 +3552,19 @@ impl Orchestrator {
                 report.stalled += usize::from(self.note_unassignable(pr, &id, &row.key.reviewer));
                 continue;
             };
+            // A refused substitute has not replaced the incumbent's durable row yet. Retry timing
+            // belongs to the selected reviewer, not just the row that owes the review.
+            let chosen_key = ReviewWatchKey {
+                reviewer: chosen.clone(),
+                ..row.key.clone()
+            };
+            if let Some(attempt) = self.review_attempts.get(&chosen_key)
+                && attempt.head == head
+                && attempt.next_at > (self.now)()
+            {
+                report.deferred += 1;
+                continue;
+            }
             // THE dispatch-side allowlist re-check (the slice-6 F-SEC review's item (a)). The row
             // is stored state, and a project can be disabled or repointed by a config reload
             // between introduction and now; trusting the row would let a review be dispatched
@@ -3642,7 +3682,7 @@ impl Orchestrator {
                     );
                 }
                 ReviewDispatchOutcome::Refused(why) => {
-                    self.note_failed_review_attempt(&attempt_key, head, &why);
+                    self.note_failed_review_attempt_for(&attempt_key, &row.key, head, &why);
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
                 }
@@ -10489,6 +10529,82 @@ mod tests {
         o.handle_review_clear(&coord(12));
         finish_attempt(&mut o, "bob", Some(crate::review::REVIEW_STATE_APPROVED));
         assert_eq!(o.rounds_used(&coord(12)), 0);
+    }
+
+    async fn refuse_substitute_preparation(o: &mut Orchestrator) {
+        use crate::prepare::{PreparationOutcome, RefusalReason};
+        let id = review_key(OWNER, REPO, 12, "carol");
+        let entry = o.preparing.get(&id).expect("substitute reservation");
+        let token = entry.token;
+        let fingerprint = entry.fingerprint.clone();
+        let mut completion = crate::testsupport::ready_preparation_completion();
+        completion.outcome = PreparationOutcome::Refused(RefusalReason::ResolverFailed(
+            "APIError: status 401".to_string(),
+        ));
+        o.handle_dispatch_prepared(id, token, completion).await;
+        // A changed credential revision can reopen preparation's own gate. Review attempts must
+        // still honour their independent backoff/bound, even while no substitute watch row exists.
+        o.refusal_gate.rearm(&fingerprint);
+        assert!(
+            o.store()
+                .get_review_watch(&key(12, "carol"))
+                .expect("watch")
+                .is_none()
+        );
+        assert_eq!(watch_row(o, 12, "bob").status, REVIEW_STATUS_REQUESTED);
+    }
+
+    #[tokio::test]
+    async fn no_verdict_refused_substitute_obeys_its_own_backoff() {
+        let (mut o, _) = orch(adjudicating(&["alice", "carol"], 3));
+        o.prepare_resolver = Some(Arc::new(crate::testsupport::HangResolver));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        refuse_substitute_preparation(&mut o).await;
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            o.preparing.is_empty(),
+            "Carol is still in her 30-second backoff"
+        );
+        let now = (o.now)() + chrono::Duration::seconds(30);
+        o.now = Box::new(move || now);
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(o.preparing.len(), 1, "the substitute is retried when due");
+    }
+
+    #[tokio::test]
+    async fn no_verdict_refused_substitute_reports_infrastructure_on_both_surfaces() {
+        let (mut o, _) = orch(adjudicating(&["alice", "carol"], 3));
+        let _l = ledger(&mut o);
+        o.prepare_resolver = Some(Arc::new(crate::testsupport::HangResolver));
+        introduce(&o, row(12, "bob"));
+        for _ in 0..3 {
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            refuse_substitute_preparation(&mut o).await;
+            let now = (o.now)() + chrono::Duration::hours(1);
+            o.now = Box::new(move || now);
+        }
+        let sweep = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            o.preparing.is_empty(),
+            "three refused substitute attempts exhaust her budget"
+        );
+        assert!(sweep.adjudicate.is_empty());
+        assert_eq!(o.rounds_used(&coord(12)), 0);
+        let jobs = o.review_console_list().expect("jobs");
+        let message = jobs.reviews[0]
+            .infrastructure
+            .as_deref()
+            .expect("job infrastructure");
+        assert!(message.contains("carol's runs fail with APIError: status 401 (3 attempts)"));
+        o.reconcile_review_divergence();
+        let feed = o.review_divergences();
+        let item = feed.first().expect("human feed infrastructure");
+        assert_eq!(item.kind.as_str(), "review_infrastructure");
+        assert_eq!(item.reviewer, "carol");
+        assert_eq!(item.reason, message);
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(o.preparing.len(), 1, "a new head re-arms the substitute");
     }
 
     /// [`ledger`] whose settled decisions are written through to the orchestrator's own store — the
