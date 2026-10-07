@@ -542,6 +542,17 @@ impl Orchestrator {
                 .is_none_or(|r| is_launch_candidate(&r.state));
             let surface = if surfaceable {
                 self.manager_surface_reason(self.manager_gate_env(&pr))
+                    .map(|reason| {
+                        if reason == DeferReason::Budget.human()
+                            && let Some(held) = self.manager_run_for(&pr).and_then(|run| {
+                                self.budget_ledger.get(&run.key(), self.budget_hold_ttl())
+                            })
+                        {
+                            format!("{reason}: {}", held.reason)
+                        } else {
+                            reason
+                        }
+                    })
             } else {
                 None
             };
@@ -946,12 +957,43 @@ impl Orchestrator {
         let (labelled, primed) = self.human_holds.labelled_and_primed();
         let hold_active = self.manager_pr_held(pr, &labelled);
         let ticket = self.manager_pr_ticket(pr).unwrap_or_default();
+        // §10.2: a dollar refusal must precede reserve_manager_run, so it consumes no attempt
+        // or generation allocation. Keep the exact reason on the ordinary budget-hold surface.
+        let usd_configured = self
+            .eff
+            .as_ref()
+            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0));
+        let usd_held = self.manager_run_for(pr).is_some_and(|run| {
+            if !usd_configured {
+                self.release_budget_hold(&run.key());
+                return false;
+            }
+            let entries = self
+                .teams
+                .as_ref()
+                .map(|t| t.manager.effective_harnesses())
+                .unwrap_or_default();
+            self.manager_selftest.configure(entries);
+            let Some(route) = self.review_route(&run.repo_url) else {
+                return false;
+            };
+            let Ok(selected) = self.select_manager_entry(&run) else {
+                return false;
+            };
+            if let Some(held) = self.manager_usd_budget_hold(&run, &route.slug, &selected.entry) {
+                self.note_usd_budget_hold(held);
+                true
+            } else {
+                self.release_budget_hold(&run.key());
+                false
+            }
+        });
         LaunchGateEnv {
             drain_active: self.drain.is_draining(),
             hold_known: primed,
             hold_active,
-            provider_budget_exhausted: !ticket.is_empty()
-                && self.budget_hold_for(pr, &ticket).is_some(),
+            provider_budget_exhausted: usd_held
+                || (!ticket.is_empty() && self.budget_hold_for(pr, &ticket).is_some()),
             credential_healthy: !self.credential_probe_dead(),
             selftest_permitted: self.manager_launch_permitted().is_ok(),
             at_capacity: false,
@@ -1820,6 +1862,106 @@ mod tests {
         o.human_holds.begin_pass(true);
     }
 
+    #[test]
+    fn manager_usd_deferral_consumes_no_reservation_and_resumes_when_cleared() {
+        for priced in [false, true] {
+            let (mut o, dispatched) = orch(ReviewAuthority::Act);
+            o.teams.as_mut().expect("teams").manager.model = "manager-model".into();
+            let eff = o.eff.as_mut().expect("eff");
+            eff.projects[0].mcfg.claude.billing_guard = Some(false);
+            eff.cfg.budgets.insert(
+                "anthropic".into(),
+                rhapsody_config::ProviderBudget {
+                    daily_usd: 1.0,
+                    ..Default::default()
+                },
+            );
+            if priced {
+                eff.cfg.prices.insert(
+                    "anthropic/manager-model".into(),
+                    rhapsody_config::Price::default(),
+                );
+                let id = o
+                    .store()
+                    .start_run(rhapsody_store::RunStart::default())
+                    .expect("seed run");
+                o.store()
+                    .set_turn_spend(
+                        id,
+                        &rhapsody_store::TurnSpend {
+                            turn: 1,
+                            at: crate::budget::local_day_start(),
+                            provider: "anthropic".into(),
+                            account: "anthropic".into(),
+                            model: "anthropic/manager-model".into(),
+                            usd: Some(1.0),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("seed spend");
+            }
+            pass_self_test(&o);
+            prime_holds(&o);
+            o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_KEY)]);
+            let id = active(&o).expect("intervention").id;
+            o.pump_manager_interventions();
+            let row = o
+                .store()
+                .manager_intervention(&id)
+                .expect("read")
+                .expect("row");
+            assert_eq!(row.state, MANAGER_INTERVENTION_DEFERRED);
+            assert_eq!(row.attempts, 0);
+            assert!(row.run_id.is_none());
+            assert!(dispatched.lock().expect("lock").is_empty());
+            assert!(o.running.is_empty() && o.claimed.is_empty());
+            let held = o
+                .budget_ledger
+                .get(
+                    &crate::managerrun::manager_key("makewhatis", "rhapsody", 12),
+                    o.budget_hold_ttl(),
+                )
+                .expect("visible hold");
+            assert_eq!(held.daily_usd, Some(1.0));
+            let routing =
+                o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_KEY)]);
+            assert_eq!(
+                routing.surfaced,
+                vec![(
+                    PR_KEY.into(),
+                    format!("manager deferred: budget: {}", held.reason)
+                )]
+            );
+            assert_eq!(
+                o.store()
+                    .manager_budget(PR_KEY)
+                    .expect("budget")
+                    .expect("row")
+                    .runs_used,
+                0
+            );
+            // A reload that supplies the missing price or raises the cap releases the deferral.
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.prices.insert(
+                "anthropic/manager-model".into(),
+                rhapsody_config::Price::default(),
+            );
+            eff.cfg
+                .budgets
+                .get_mut("anthropic")
+                .expect("budget")
+                .daily_usd = 2.0;
+            o.pump_manager_interventions();
+            assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
+            assert_eq!(dispatched.lock().expect("lock").len(), 1);
+            assert!(
+                o.budget_ledger
+                    .get(&held.subject, o.budget_hold_ttl())
+                    .is_none()
+            );
+        }
+    }
+
     fn divergence(kind: DivergenceKind, pr: &str) -> Divergence {
         Divergence {
             pr: pr.to_string(),
@@ -1954,6 +2096,94 @@ mod tests {
             auth_needed,
         });
     }
+    #[tokio::test]
+    async fn manager_usd_gate_checks_the_selected_fallback_before_reserving() {
+        let (mut o, dispatched, id) = multi_orch(12);
+        let eff = o.eff.as_mut().expect("eff");
+        eff.projects[0].mcfg.claude.billing_guard = Some(false);
+        eff.cfg.budgets.insert(
+            "anthropic".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        // The primary OpenCode engine has no USD cap. The pending Claude fallback does.
+        exit_fake(
+            &mut o,
+            false,
+            Some(rhapsody_agent::AgentError::AuthFailed(
+                "login rejected".into(),
+            )),
+            "",
+        )
+        .await;
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.state, MANAGER_INTERVENTION_DEFERRED);
+        assert_eq!(
+            row.attempts, 1,
+            "the refused fallback must not consume an attempt"
+        );
+        let key = crate::managerrun::manager_key("makewhatis", "rhapsody", 12);
+        let held = o
+            .budget_ledger
+            .get(&key, o.budget_hold_ttl())
+            .expect("hold");
+        assert!(held.reason.contains("no price for anthropic/opus"));
+        o.eff
+            .as_mut()
+            .expect("eff")
+            .cfg
+            .prices
+            .insert("anthropic/opus".into(), rhapsody_config::Price::default());
+        o.pump_manager_interventions();
+        let d = dispatched.lock().expect("lock");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[1].pricing.model, "anthropic/opus");
+        assert_eq!(d[1].pricing.account, "anthropic");
+        assert_eq!(d[1].harness, "claude");
+        assert_eq!(d[1].model_override.model, "opus");
+    }
+
+    #[test]
+    fn manager_usd_gate_prices_the_opencode_entry_not_the_legacy_model() {
+        let (mut o, dispatched, _) = multi_orch(12);
+        let dir = TempDir::new();
+        let auth = dir.child("auth.json");
+        std::fs::write(&auth, br#"{"openai":{"type":"api"}}"#).expect("fake auth kind");
+        let eff = o.eff.as_mut().expect("eff");
+        eff.cfg.opencode.auth_source = auth;
+        eff.cfg.budgets.insert(
+            "openai".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        let mut run = o.manager_run_for(PR_KEY).expect("manager run");
+        run.number = 13;
+        let key = run.key();
+        assert_eq!(o.dispatch_manager(run.clone()), ManagerDispatchOutcome::Refused(
+            "no price for openai/gpt-6.1-sol; add it under prices: or daily_usd for openai cannot be enforced".into()
+        ));
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+        assert!(!o.claimed.contains(&key) && !o.manager_attempts.contains_key(&key));
+        o.eff.as_mut().expect("eff").cfg.prices.insert(
+            "openai/gpt-6.1-sol".into(),
+            rhapsody_config::Price::default(),
+        );
+        assert_eq!(o.dispatch_manager(run), ManagerDispatchOutcome::Dispatched);
+        let d = dispatched.lock().expect("lock");
+        assert_eq!(d[1].pricing.model, "openai/gpt-6.1-sol");
+        assert_eq!(d[1].pricing.account, "openai");
+        assert_eq!(d[1].harness, "opencode");
+    }
+
     async fn assert_fallback(start_error: bool, error: rhapsody_agent::AgentError) {
         let (mut o, dispatched, id) = multi_orch(12);
         assert_eq!(dispatched.lock().expect("lock")[0].harness, "opencode");
