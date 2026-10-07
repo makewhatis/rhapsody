@@ -530,7 +530,7 @@ else:
     assert sys.argv[1:]==['run','--format','json','--dir',str(cwd),'--agent','build','-m','openai/gpt-6.1-sol','--variant','low',sys.argv[-1]]
     assert 'touch '+str(cwd/'canary-bash-ran') in sys.argv[-1]
     assert '--auto' not in sys.argv and '--pure' not in sys.argv
-    if mode=='timeout': time.sleep(30)
+    if mode=='timeout': time.sleep(120)
     elif mode=='error': print(json.dumps({'type':'error','error':{'name':'ProviderModelNotFoundError'}}))
     elif mode=='crash': sys.exit(1)
     else:
@@ -562,7 +562,9 @@ else:
         r.run_with_inputs(
             src,
             "/synthetic-operator",
-            std::time::Duration::from_secs(2),
+            // Python startup can exceed two seconds on a busy shared operator machine.
+            // The hanging fake still outlasts this deadline and exercises cancellation.
+            std::time::Duration::from_secs(30),
         )
         .await
     }
