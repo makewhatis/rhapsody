@@ -341,6 +341,7 @@ impl Orchestrator {
     /// Inserts the run row (outcome `running`), records its id on `re` for later
     /// `end_run`/progress/events, and marks the claim `running`. Mirrors Go `persistStartRun`.
     pub fn persist_start_run(&self, re: &mut RunningEntry, attempt: i64) {
+        re.pricing = self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
         match self.store.start_run(store::RunStart {
             issue_id: re.issue.id.clone(),
             issue_identifier: re.issue.identifier.clone(),
@@ -399,6 +400,7 @@ impl Orchestrator {
         };
         let provider = derive_provider(&harness, &model);
         store::RunProvenance {
+            engine_index: re.engine_index as i64,
             provider_origin: derive_provider_origin(&provider),
             provider,
             harness,

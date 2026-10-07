@@ -71,6 +71,9 @@ impl Orchestrator {
             return;
         }
         let now = (self.now)();
+        if let Some(re) = self.running.get(&e.issue_id) {
+            self.observe_run_cost(re, &e.ev);
+        }
         let re = match self.running.get_mut(&e.issue_id) {
             Some(re) => re,
             None => return,
@@ -284,6 +287,9 @@ impl Orchestrator {
             "stopped at its per-run token ceiling: {spent} tokens spent against \
              agent.max_run_tokens={limit}"
         );
+        if let Some(run) = re.review.as_ref() {
+            self.note_failed_review_attempt(&run.watch_key(), &run.head_sha, &reason);
+        }
         self.completed.remove(issue_id);
         self.persist_end_run(&re, store::OUTCOME_TOKEN_CEILING, &reason);
         self.persist_totals();

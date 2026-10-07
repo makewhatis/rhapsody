@@ -340,6 +340,12 @@ impl Orchestrator {
         if self.drain.is_draining() {
             return ManagerDispatchOutcome::Draining;
         }
+        if let Some(held) = self.manager_usd_budget_hold(&run, &route.slug, &selected.entry) {
+            let reason = held.reason.clone();
+            self.note_usd_budget_hold(held);
+            return ManagerDispatchOutcome::Refused(reason);
+        }
+        self.release_budget_hold(&id);
         let iss = run.synthetic_issue();
         let intervention_id = crate::managerintervention::manager_pr_key(&id)
             .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
@@ -372,6 +378,60 @@ impl Orchestrator {
         );
         self.finish_manager_dispatch(run, route, iss);
         ManagerDispatchOutcome::Dispatched
+    }
+
+    /// The same selected-entry override the shared funnel applies, including legacy inheritance.
+    pub(crate) fn manager_model_override(
+        &self,
+        inherited: rhapsody_agent::ModelOverride,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> rhapsody_agent::ModelOverride {
+        let mut model = if self
+            .teams
+            .as_ref()
+            .is_some_and(|t| !t.manager.harnesses.is_empty())
+        {
+            rhapsody_agent::ModelOverride::default()
+        } else {
+            inherited
+        };
+        if !entry.model.is_empty() {
+            model.model = entry.model.clone();
+        }
+        if !entry.effort.is_empty() {
+            model.effort = entry.effort.clone();
+        }
+        model
+    }
+
+    /// Gate the manager's actual engine, not the origin ticket's or the installation's model.
+    /// Called both before the intervention reservation and at the direct dispatch door.
+    pub(crate) fn manager_usd_budget_hold(
+        &self,
+        run: &ManagerRun,
+        project: &str,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> Option<crate::budget::BudgetHeld> {
+        if !self
+            .eff
+            .as_ref()
+            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0))
+        {
+            return None;
+        }
+        let iss = run.synthetic_issue();
+        let inherited = self
+            .route_teams(&iss)
+            .map(|td| td.model_override)
+            .unwrap_or_default();
+        let model = self.manager_model_override(inherited, entry);
+        let pricing = self.run_pricing_for(&entry.harness, &model, project);
+        let mut held = self.usd_budget_hold(&pricing)?;
+        held.subject = iss.identifier;
+        held.title = iss.title;
+        held.project = project.into();
+        held.pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
+        Some(held)
     }
 
     /// The selected harness command a manager run for `slug` would launch: the project's resolved
@@ -728,6 +788,121 @@ mod tests {
             })
             .expect("read watch");
         assert!(watch.is_none(), "a manager dispatch writes no watch row");
+    }
+
+    #[test]
+    fn manager_usd_budget_refuses_before_staging() {
+        for listed in [false, true] {
+            for priced in [false, true] {
+                let (mut o, dispatched) = orch(ReviewAuthority::Act);
+                let manager = &mut o.teams.as_mut().expect("teams").manager;
+                manager.model = "manager-model".into();
+                if listed {
+                    manager.harnesses = vec![rhapsody_config::teams::ManagerHarnessEntry {
+                        harness: "claude".into(),
+                        model: "manager-model".into(),
+                        effort: "high".into(),
+                    }];
+                }
+                let eff = o.eff.as_mut().expect("eff");
+                eff.projects[0].mcfg.claude.billing_guard = Some(false);
+                eff.cfg.budgets.insert(
+                    "anthropic".into(),
+                    rhapsody_config::ProviderBudget {
+                        daily_usd: 1.0,
+                        ..Default::default()
+                    },
+                );
+                if priced {
+                    eff.cfg.prices.insert(
+                        "anthropic/manager-model".into(),
+                        rhapsody_config::Price::default(),
+                    );
+                }
+                let id = o
+                    .store()
+                    .start_run(rhapsody_store::RunStart::default())
+                    .expect("seed run");
+                o.store()
+                    .set_turn_spend(
+                        id,
+                        &rhapsody_store::TurnSpend {
+                            turn: 1,
+                            at: crate::budget::local_day_start(),
+                            provider: "anthropic".into(),
+                            account: "anthropic".into(),
+                            model: "anthropic/manager-model".into(),
+                            usd: Some(1.0),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("seed spend");
+                pass_self_test(&o, &test_cli_version());
+                let reason = if priced {
+                    "daily_usd for anthropic is spent ($1.000000 of $1.000000)"
+                } else {
+                    "no price for anthropic/manager-model; add it under prices: or daily_usd for anthropic cannot be enforced"
+                };
+                assert_eq!(
+                    o.dispatch_manager(manager_run()),
+                    ManagerDispatchOutcome::Refused(reason.into())
+                );
+                assert!(dispatched.lock().expect("lock").is_empty());
+                assert!(o.running.is_empty() && o.claimed.is_empty());
+                assert!(o.pending_manager.is_empty() && o.manager_attempts.is_empty());
+                let held = o
+                    .budget_ledger
+                    .get(&manager_run().key(), o.budget_hold_ttl())
+                    .expect("visible refusal");
+                assert_eq!(held.reason, reason);
+                assert_eq!(held.pr, "makewhatis/rhapsody#12");
+            }
+        }
+    }
+
+    #[test]
+    fn manager_usd_subscription_equivalents_never_gate() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        o.teams.as_mut().expect("teams").manager.model = "manager-model".into();
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        let id = o
+            .store()
+            .start_run(rhapsody_store::RunStart::default())
+            .expect("seed run");
+        o.store()
+            .set_turn_spend(
+                id,
+                &rhapsody_store::TurnSpend {
+                    turn: 1,
+                    at: crate::budget::local_day_start(),
+                    provider: "anthropic".into(),
+                    account: "claude-subscription".into(),
+                    model: "anthropic/manager-model".into(),
+                    usd: Some(99.0),
+                    ..Default::default()
+                },
+            )
+            .expect("seed equivalent");
+        pass_self_test(&o, &test_cli_version());
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            dispatched.lock().expect("lock")[0].pricing.account,
+            "claude-subscription"
+        );
+        assert!(
+            o.budget_ledger
+                .get(&manager_run().key(), o.budget_hold_ttl())
+                .is_none()
+        );
     }
 
     // The overwrite guard: a second launch for the same pull request while one is live is refused.

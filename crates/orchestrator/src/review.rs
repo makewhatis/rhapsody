@@ -539,6 +539,14 @@ impl Orchestrator {
                 self.note_review_budget_hold(&id, &pr, &route.slug, &provider, limit, spent);
                 return ReviewDispatchOutcome::BudgetHeld;
             }
+            let pricing = self.review_projected_pricing(&iss, &route.slug);
+            if let Some(mut held) = self.usd_budget_hold(&pricing) {
+                held.subject = id.clone();
+                held.pr = pr;
+                held.project = route.slug.clone();
+                self.note_usd_budget_hold(held);
+                return ReviewDispatchOutcome::BudgetHeld;
+            }
             // A dispatched review clears this reviewer's own stale hold — and only this reviewer's.
             self.release_budget_hold(&id);
         }
@@ -627,6 +635,13 @@ impl Orchestrator {
         // records THIS value, not whatever the bound reads when the round finishes. A `/clear` that
         // lands while the round is out bumps the bound's generation; recording the dispatch-time
         // value is what keeps that round out of the new generation's "has had its turn" set.
+        let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
+        let bound_key = crate::reviewwatch::churn_key(&pr);
+        // Establish the generation before the first dispatch without charging a verdict round.
+        // Later completions of this run must not accidentally belong to generation zero.
+        if self.review_generation(&watch_key) == 0 {
+            self.persist_review_rounds(&bound_key);
+        }
         run.generation = self.review_generation(&watch_key);
         if let Err(e) = self.store().save_review_watch(ReviewWatchRow {
             key: watch_key.clone(),
@@ -644,6 +659,9 @@ impl Orchestrator {
             .mark_review_requested(&watch_key, &run.head_sha)
         {
             tracing::warn!(review = %id, err = %e, "recording the requested head failed; dispatching anyway");
+        }
+        if let Some(attempt) = self.review_attempts.get_mut(&watch_key) {
+            attempt.pending_exit = true;
         }
 
         // Carried to the dispatch the way a graphite stacking hint is (`pending_stack`): the worker
@@ -705,6 +723,8 @@ impl Orchestrator {
             } else {
                 e.err_msg.as_str()
             };
+            self.record_review_truncated(run);
+            self.note_failed_review_attempt(&run.watch_key(), &run.head_sha, reason);
             (store::OUTCOME_FAILED, reason)
         } else if !e.declared_handoff {
             // The `max_turns` backstop fired: the agent burned its whole turn budget without ever
@@ -729,6 +749,7 @@ impl Orchestrator {
                  truncated so the head is reviewed again"
             );
             self.record_review_truncated(run);
+            self.note_failed_review_attempt(&run.watch_key(), &run.head_sha, cause);
             (store::OUTCOME_COMPLETED, "")
         } else if e.last_state == REVIEW_STATE_UNDECLARED {
             // STUDIO-894: the agent DID emit a `HANDOFF:` line — the branch above did not fire —
@@ -748,6 +769,11 @@ impl Orchestrator {
                  verdict"
             );
             self.record_review_truncated(run);
+            self.note_failed_review_attempt(
+                &run.watch_key(),
+                &run.head_sha,
+                "review ended without a recognised verdict",
+            );
             (store::OUTCOME_COMPLETED, "")
         } else {
             let status = effective_review_status(&e.last_state, e.review_verdict.as_ref());
@@ -763,6 +789,7 @@ impl Orchestrator {
             // would read approved all the way back; this keyed-by-run row is what lets the run
             // detail's strip colour each round by its own answer.
             self.record_review_verdict(re.run_id, status);
+            self.note_review_verdict(run);
             // STUDIO-1004: this verdict may be the ANSWER to an author round that has been waiting
             // for one. An author dispatch charges nothing until a reviewer's `last_reviewed_sha`
             // reaches the head that dispatch produced, and `record_review_completed` is the only
@@ -1179,6 +1206,7 @@ mod tests {
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
                 rhapsody_config::ProviderBudget {
+                    daily_usd: 0.0,
                     daily_tokens: 200,
                     per_ticket: 0,
                 },
@@ -1285,6 +1313,7 @@ mod tests {
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
                 rhapsody_config::ProviderBudget {
+                    daily_usd: 0.0,
                     daily_tokens: 200,
                     per_ticket: 0,
                 },
@@ -1384,6 +1413,7 @@ mod tests {
         o.eff.as_mut().expect("eff").cfg.budgets.insert(
             "anthropic".to_string(),
             rhapsody_config::ProviderBudget {
+                daily_usd: 0.0,
                 daily_tokens: 200,
                 per_ticket: 0,
             },
@@ -3302,7 +3332,7 @@ mod tests {
             .get_review_watch(&run.watch_key())
             .expect("read watch row")
             .expect("row exists");
-        assert_eq!(watch.status, REVIEW_STATUS_IN_FLIGHT);
+        assert_eq!(watch.status, REVIEW_STATUS_TRUNCATED);
         assert!(watch.last_reviewed_sha.is_empty());
     }
 
@@ -3788,7 +3818,7 @@ mod tests {
             o.store()
                 .save_review_finding(rhapsody_store::ReviewFindingRow {
                     pr: PR12.to_string(),
-                    generation: 0,
+                    generation: 1,
                     reviewer: "alice".to_string(),
                     finding_id: "alice:B8".to_string(),
                     revision: 1,

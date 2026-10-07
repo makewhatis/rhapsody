@@ -53,6 +53,37 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let bytes =
         serde_yaml_ng::to_string(&def.config).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    for (model, price) in &r.prices {
+        if !model
+            .split_once('/')
+            .is_some_and(|(p, m)| !p.is_empty() && !m.is_empty())
+        {
+            return Err(ConfigError::Parse(format!(
+                "prices.{model}: expected <provider>/<model>"
+            )));
+        }
+        for (field, value) in [
+            ("input", price.input),
+            ("output", price.output),
+            ("cache_read", price.cache_read),
+            ("cache_write", price.cache_write),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::Parse(format!(
+                    "prices.{model}.{field}: must be finite and nonnegative"
+                )));
+            }
+        }
+    }
+    for (provider, budget) in &r.budgets {
+        if let Some(usd) = budget.daily_usd
+            && (!usd.is_finite() || usd < 0.0)
+        {
+            return Err(ConfigError::Parse(format!(
+                "budgets.{provider}.daily_usd: must be finite and nonnegative"
+            )));
+        }
+    }
 
     // tracker — endpoint/summon/promote/state-lists carry defaults; api_key stored verbatim
     // ($VAR resolved in C4); dependency_mode/claim_mode map verbatim (defaults materialized in
@@ -252,6 +283,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
             (
                 provider,
                 ProviderBudget {
+                    daily_usd: b.daily_usd.unwrap_or(0.0),
                     daily_tokens: b.daily_tokens.unwrap_or(0),
                     per_ticket: b.per_ticket.unwrap_or(0),
                 },
@@ -311,6 +343,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // byte-parity golden is affected.
         pr_label: or_str(r.pr_label, "rhapsody"),
         budgets,
+        prices: r.prices.into_iter().collect(),
         notify,
         providers,
     })

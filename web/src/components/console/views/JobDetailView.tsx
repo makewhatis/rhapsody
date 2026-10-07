@@ -2611,6 +2611,7 @@ function ReviewPanel({
               {row.pr} ↗
             </ExternalLink>
             {row.reviewedShort === "" ? null : <Mono>read {row.reviewedShort}</Mono>}
+            {row.job.infrastructure ? <span className="trdep">{row.job.infrastructure}</span> : null}
           </div>
         ))}
       </div>

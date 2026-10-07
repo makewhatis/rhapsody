@@ -54,6 +54,22 @@ pub const RUN_MESSAGE_DELIVERED: &str = "delivered";
 /// run ended before the message was written
 pub const RUN_MESSAGE_EXPIRED: &str = "expired";
 
+/// One turn's latest dollar snapshot (STUDIO-1124), separate from Go's run-row schema.
+/// Replacing a live estimate with its terminal value must never double-count spend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnSpend {
+    pub turn: i64,
+    pub at: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    /// None is unknown, never zero. Subscription amounts are API-equivalent only.
+    pub usd: Option<f64>,
+    pub source: String,
+    /// A positive harness report is evidence that this exact model can report cost.
+    pub harness_priced: bool,
+}
+
 /// RunStart is the dispatch-time record inserted with outcome="running".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStart {
@@ -250,6 +266,8 @@ pub struct RunSummary {
 /// string, and never re-derived at render time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunProvenance {
+    /// 0 = primary, 1 = first fallback. Kept beside the engine that actually ran.
+    pub engine_index: i64,
     pub harness: String,
     /// The config key `harness` resolved from (e.g. `profile`, `agent.backend`).
     pub harness_origin: String,
@@ -475,7 +493,7 @@ pub const REVIEW_VERDICT_CHANGES_REQUESTED: &str = "changes_requested";
 /// completer stamp the PR as reviewed-at-head and silently drops a second reviewer whose run
 /// crashed (design §14.2, "N reviewers share one per-PR SHA"), so the reviewer is part of the key
 /// rather than a column on a per-PR row.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReviewWatchKey {
     /// GitHub repository owner (the `owner` of `owner/repo#number`).
     pub owner: String,

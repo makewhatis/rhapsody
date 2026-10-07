@@ -1095,6 +1095,7 @@ mod tests {
             eff.cfg.budgets.insert(
                 (*provider).to_string(),
                 rhapsody_config::ProviderBudget {
+                    daily_usd: 0.0,
                     daily_tokens: 0,
                     per_ticket: *cap,
                 },

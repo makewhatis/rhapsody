@@ -605,6 +605,13 @@ describe("a per-provider budget hold (STUDIO-970)", () => {
     ...over,
   });
 
+  it("shows the unknown-price remedy instead of claiming dollars were spent", () => {
+    const reason = "no price for fireworks-ai/m; add it under prices: or daily_usd for fireworks-ai cannot be enforced";
+    const rows = mergeJobs(state({ budget_held: [hold({ provider: "fireworks-ai", reason, daily_tokens: 0, spent_tokens: 0, daily_usd: 10, spent_usd: 0 })] }), [], PROJECTS, NOW);
+    expect(rows[0].subLabel).toBe(reason);
+    expect(rows[0].budgetHeld).toBe("fireworks-ai");
+  });
+
   it("turns a refused ticket into a waiting row that names the provider", () => {
     // A budget-refused ticket has never run, so nothing else contributes a row for it. It is a
     // deliberate hold that clears at local midnight — NOT a human hold — so its sub-label must name

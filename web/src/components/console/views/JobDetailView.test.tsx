@@ -3078,6 +3078,17 @@ describe("Diff — the change a run produced (§5, STUDIO-749)", () => {
 });
 
 describe("Review — dependency-named, never invented (§5)", () => {
+  it("shows infrastructure failure on the PR's job page without a findings escalation", async () => {
+    h.fetchReviews.mockResolvedValue({ enabled: true, reviews: [reviewJob({
+      infrastructure: "review of #290 cannot run: jimmy's runs fail with 401 (3 attempts)",
+      status: "truncated",
+    })] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+    await waitFor(() => expect(panel().textContent).toContain("jimmy's runs fail with 401 (3 attempts)"));
+    expect(panel().textContent).not.toContain("open findings need a human");
+  });
   it("reports the reviewer and the watch-set status, and names the verdict as the dependency", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     h.fetchReviews.mockResolvedValue({

@@ -129,6 +129,9 @@ export interface BudgetHeld {
   provider: string; // the account whose budget is spent
   daily_tokens: number; // the configured ceiling
   spent_tokens: number; // today's spend on that provider
+  reason?: string; // USD/unknown-price refusal, verbatim from the dispatch gate
+  daily_usd?: number;
+  spent_usd?: number | null;
   // The pull request coordinate (`owner/repo#n`) of a REVIEW refusal, or "" for a ticket. The
   // board's discriminator: only a ticket hold becomes a card.
   pr: string;
@@ -2006,6 +2009,7 @@ export async function postTeamsRoom(body: string, refs: string[] = []): Promise<
 // not per-PR: a single reviewed-SHA per pull request would let the first completer stamp it as
 // reviewed and silently drop a second reviewer whose run crashed.
 export interface ReviewJob {
+  infrastructure?: string;
   owner: string;
   repo: string;
   number: number;

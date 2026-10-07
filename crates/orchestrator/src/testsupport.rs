@@ -359,12 +359,15 @@ pub(crate) fn empty_resolved_project(slug: &str, tracker: Arc<dyn Tracker>) -> R
 pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &str) -> RunningEntry {
     let epoch = DateTime::from_timestamp(0, 0).expect("epoch");
     RunningEntry {
+        engine_index: 0,
+        engine: None,
         issue,
         started_at: epoch,
         retry_attempt: 0,
         cancel: crate::control_loop::CancelSignal::default(),
         review: None,
         brokered: false,
+        pricing: crate::budget::RunPricing::default(),
         project_slug: project_slug.to_string(),
         project_group: project_group.to_string(),
         project_repo: String::new(),

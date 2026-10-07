@@ -415,6 +415,25 @@ fn checked_auth_source(auth_source: &str) -> Result<PathBuf, AgentError> {
     Ok(src)
 }
 
+/// Reads only the credential kind for billing attribution (STUDIO-1124).
+/// No credential contents or parser errors escape this helper.
+pub fn provider_uses_oauth(auth_source: &str, provider: &str) -> bool {
+    let path = if auth_source.is_empty() {
+        default_auth_source()
+    } else {
+        PathBuf::from(auth_source)
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|doc| {
+            doc.get(provider)
+                .and_then(|entry| entry.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("oauth")
+        })
+}
+
 /// Where the operator's own opencode credential lives, from the DAEMON's environment:
 /// `$XDG_DATA_HOME/opencode/auth.json` when that variable is set, else the XDG default
 /// `$HOME/.local/share/opencode/auth.json`.

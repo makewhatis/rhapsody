@@ -295,6 +295,7 @@ mod tests {
             status: status.to_string(),
             open,
             manager: None,
+            infrastructure: None,
         }
     }
 

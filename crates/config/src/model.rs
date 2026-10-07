@@ -419,8 +419,10 @@ pub struct Project {
 /// are not the same money, and each draws on its own account. The key is the provider string
 /// [`derive_provider`](https://docs.rs/rhapsody-orchestrator) records on a run (`anthropic`,
 /// `fireworks-ai`, ...).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderBudget {
+    /// Daily dollar ceiling (STUDIO-1124). Zero is unset; subscription equivalents never gate.
+    pub daily_usd: f64,
     /// Daily token ceiling for this provider. `<= 0` means UNLIMITED, matching the
     /// `max_concurrent` idiom, so an unset or zero budget never refuses anything. An absent map
     /// entry is likewise unlimited (the whole [`Config::budgets`] map defaults empty).
@@ -430,6 +432,16 @@ pub struct ProviderBudget {
     /// both count toward it (joined through `rhapsody_run_provenance.provider`), so a single ticket
     /// cannot consume a whole day's budget one run at a time. Rhapsody-only.
     pub per_ticket: i64,
+}
+
+/// Operator-maintained API prices in dollars per million tokens (STUDIO-1124).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 /// The `notify:` channels the runaway-loop breaker escalates to (STUDIO-1026). Rhapsody-only: the
@@ -488,6 +500,8 @@ pub struct Config {
     /// install that never configures one) is unlimited and byte-identical to today. Ordered so the
     /// effective view and any serialization are deterministic.
     pub budgets: BTreeMap<String, ProviderBudget>,
+    /// Prices keyed by the full `<provider>/<model>` name; absent means no configured prices.
+    pub prices: HashMap<String, Price>,
 
     /// The operator-notification channels the runaway-loop breaker escalates to (STUDIO-1026).
     /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
@@ -539,6 +553,7 @@ pub(crate) struct Raw {
     pub projects: Vec<RawProject>,
     /// `budgets:` front-matter block (STUDIO-957). Rhapsody-only: absent ⇒ empty ⇒ unlimited.
     pub budgets: BTreeMap<String, RawProviderBudget>,
+    pub prices: BTreeMap<String, Price>,
     /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
     /// unconfigured workflow byte-identical on the round-trip.
@@ -562,6 +577,7 @@ pub(crate) struct RawNotify {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawProviderBudget {
+    pub daily_usd: Option<f64>,
     pub daily_tokens: Option<i64>,
     /// STUDIO-1026; Rhapsody-only, absent ⇒ unlimited (0). A per-ticket token ceiling.
     pub per_ticket: Option<i64>,
