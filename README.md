@@ -61,6 +61,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Account limit observations and API (STUDIO-1123)
+
+Rhapsody adds account-limit parser/ledger primitives and read-only
+`GET /api/v1/accounts`, with no Go counterpart. The endpoint returns
+`{"accounts": [...]}` independently of `/state`; existing payloads and goldens are
+unchanged. Ledger windows retain epoch-second reset times, same-window utilization
+never regresses, and idle observations become stale after 30 minutes. An unknown
+reset is represented by `resets_at_s: 0` and never treated as already expired.
+
+The L1 foundation does not yet connect runner events to this ledger or perform a
+ChatGPT usage probe. Until that integration lands, the daemon serves an empty list.
+These primitives do not stop, switch or retry agents; limit policy belongs to L4.
+
 ### Runtime paths → `~/.rhapsody` + `rhapsody.db` (TRA-238)
 
 Rhapsody gets its own runtime home. The daemon's filesystem paths and the history DB filename are
