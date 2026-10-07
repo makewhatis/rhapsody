@@ -99,6 +99,15 @@ pub fn classify(line: &[u8]) -> Classified {
     };
     let now = Some(Utc::now());
 
+    if let Some(obs) = crate::ratelimit::parse_claude_rate_limit(line) {
+        return Classified {
+            event: Event::limit_observed(obs),
+            session_id: r.session_id,
+            ok: true,
+            ..Default::default()
+        };
+    }
+
     match r.r#type.as_str() {
         "system" => {
             if r.subtype != "init" {
@@ -255,6 +264,17 @@ fn truncate_tail(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_limit_line_is_an_additive_nonterminal_event() {
+        let c = classify(include_bytes!("../../testdata/limits/rejected.jsonl"));
+        assert!(c.ok);
+        assert!(!c.terminal);
+        assert_eq!(c.event.event_type, "limit_observed");
+        let obs = c.event.limit.unwrap();
+        assert_eq!(obs.windows.len(), 2);
+        assert!(obs.using_credits);
+    }
 
     // Mirrors Go `claude.TestClassifyInitEvent`.
     #[test]

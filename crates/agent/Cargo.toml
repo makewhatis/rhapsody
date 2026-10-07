@@ -26,7 +26,7 @@ async-trait = "0.1"
 # chrono: `Event.timestamp` is Go's `time.Time` (`Option<DateTime<Utc>>` here — see lib.rs). The
 # `clock` feature is enabled for the A2 stream-json parser that will stamp events; the type alone is
 # what A1 uses.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # thiserror: `AgentError` mirrors `errors.go`'s typed sentinels (Display strings are the contract).
 # Anticipated by the P4 plan (A1); already a workspace dependency (crates/config).
 thiserror = "1"
@@ -77,11 +77,13 @@ rhapsody-provider-broker = { path = "../provider-broker", default-features = fal
 # re-seed?" — so the decision never needs the credential's contents in a log line or an error.
 # Already in Cargo.lock (orchestrator, workspace, provider-broker).
 sha2 = "0.10"
+# STUDIO-1123: passive ChatGPT usage GET, using the workspace's existing platform-root transport.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 
 [dev-dependencies]
 # tokio (test-only): the current-thread runtime + timer + I/O the `#[tokio::test]` runner tests and
 # the fixture gate drive the async `Session`/`Runner` methods with.
-tokio = { version = "1", features = ["macros", "rt", "time", "io-util", "process"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "io-util", "process", "net"] }
 # harness-fixtures: the fixture gate loads the committed `runs/*.jsonl` goldens and applies the
 # shared `normalize` rules (Task R5) to assert the runner's event stream against them. (serde_json,
 # used to build the `/api/v1/runs/{id}/events`-shaped objects the gate compares, is already a

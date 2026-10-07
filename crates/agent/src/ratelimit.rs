@@ -3,14 +3,15 @@
 use chrono::Utc;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LimitStatus {
     Allowed,
     Warning,
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WindowObs {
     pub window: String,
     pub utilization: f64,
@@ -18,7 +19,7 @@ pub struct WindowObs {
     pub resets_at_s: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LimitObs {
     pub status: LimitStatus,
     pub windows: Vec<WindowObs>,
@@ -148,11 +149,15 @@ pub fn parse_opencode_limit(event: &Value) -> Option<LimitObs> {
                     .filter(|n| n.is_finite())
             };
             if let Some(percent) = get("used-percent").filter(|n| (0.0..=100.0).contains(n)) {
-                let reset = get("reset-after-seconds")
-                    .filter(|n| *n >= 0.0 && *n <= i32::MAX as f64)
-                    .map_or(0, |seconds| {
-                        observed_at_s.saturating_add(seconds.ceil() as i64)
-                    });
+                let reset = get("reset-at")
+                    .filter(|n| *n > 0.0 && *n < i64::MAX as f64)
+                    .map(|n| n as i64)
+                    .or_else(|| {
+                        get("reset-after-seconds")
+                            .filter(|n| *n >= 0.0 && *n <= i32::MAX as f64)
+                            .map(|seconds| observed_at_s.saturating_add(seconds.ceil() as i64))
+                    })
+                    .unwrap_or(0);
                 windows.push(WindowObs {
                     window: window.into(),
                     utilization: percent / 100.0,
@@ -308,6 +313,17 @@ mod tests {
             (obs.windows[1].utilization, obs.windows[1].resets_at_s),
             (0.55, 1791398400)
         );
+    }
+
+    #[test]
+    fn opencode_absolute_reset_at_headers_are_epoch_seconds() {
+        let event = json!({"type":"error", "timestamp":1791312000123i64, "error":{"data":{
+            "statusCode":429, "responseHeaders":{
+                "X-Codex-Primary-Used-Percent":"100", "x-codex-primary-reset-at":"1791312600",
+                "x-codex-secondary-used-percent":"55", "x-codex-secondary-reset-at":"1791398400"}}}});
+        let obs = parse_opencode_limit(&event).unwrap();
+        assert_eq!(obs.windows[0].resets_at_s, 1791312600);
+        assert_eq!(obs.windows[1].resets_at_s, 1791398400);
     }
 
     #[test]

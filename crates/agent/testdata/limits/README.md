@@ -14,4 +14,13 @@ OpenCode unit cases are source-derived boundary tests, not recorded limit fixtur
 v1.18.30 `packages/opencode/src/provider/error.ts` forwards `statusCode`,
 `responseHeaders` and `responseBody`; `cli/cmd/run.ts` emits the full error as
 `{type: "error", error: ...}`. No recorded ChatGPT 429 was found in the initial
-measurement. No live usage probe response has been measured by this ticket.
+measurement. No quota was deliberately consumed to reach a rejection.
+
+`chatgpt-usage.json` is the sanitized, non-inference HTTP 200 response projection
+measured on 2026-10-07 from `https://chatgpt.com/backend-api/wham/usage` using only
+the operator's OpenAI access token (refresh blank). It is an HTTP measurement,
+not a JSONL stream line: account identifiers and unrelated fields are omitted;
+all included provider window/credits fields are unchanged. The successful minimal
+OpenCode 1.18.30 run emitted `step_start`, `text`, `step_finish`, cost 0 and 968
+tokens, with no account utilization in stdout or `--print-logs`. Detection is
+therefore **probe**, with stream errors as the wall fallback.
