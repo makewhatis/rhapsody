@@ -304,6 +304,137 @@ async fn teardown(o: &mut Orchestrator, rx: &mut UnboundedReceiver<Event>, signa
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_limits_flow_from_runner_to_accounts_and_release_without_store() {
+    let dir = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "limit",
+            identifier: "LIMIT-1",
+            title: "limit smoke",
+            state: "Todo",
+            team_id: "",
+            latest_summon_at: "",
+        }],
+    );
+    let mut ft = build_file_tracker_orch(&src, "");
+    ft.o.set_store(Arc::new(rhapsody_store::Noop));
+    let script = dir.child("limit.sh");
+    let fixture = include_str!("../../agent/testdata/limits/allowed.jsonl");
+    std::fs::write(&script, format!("#!/bin/bash\nhead -n 1 >/dev/null\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}'\nsleep 0.3\nprintf '%s\\n' '{}'\nsleep 30\n", fixture.trim())).unwrap();
+    let eff = ft.o.eff.as_mut().unwrap();
+    eff.agent = Arc::new(claude::Runner::new(claude::Config {
+        command: format!("bash {script}"),
+        workspace_root: ft._root.path.clone(),
+        ..Default::default()
+    }));
+    eff.cfg.agent.backend = "claude".into();
+    eff.cfg.claude.model = "claude-opus-5-5".into();
+    let handle = ft.o.control();
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(5), |o| !o
+            .accounts
+            .snapshot(1791312000)
+            .is_empty())
+        .await
+    );
+    // Reload BETWEEN classification and observation: attribution must remain dispatch-frozen.
+    ft.o.eff.as_mut().unwrap().cfg.agent.backend = "opencode".into();
+    ft.o.eff.as_mut().unwrap().cfg.opencode.model = "fireworks-ai/other".into();
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(5), |o| o
+            .accounts
+            .snapshot(1791312000)
+            .first()
+            .is_some_and(|v| !v.windows.is_empty()))
+        .await,
+        "a real runner event must populate the production control-loop ledger"
+    );
+    let views = handle.accounts(1791312000);
+    assert_eq!(views[0].account, "claude-subscription");
+    assert_eq!(views[0].windows.len(), 2);
+    assert_eq!(views[0].windows[0].resets_at_s, 1791312600);
+    assert!(
+        !handle.accounts(views[0].last_seen_s + 1800)[0].stale,
+        "live account remains fresh"
+    );
+    let re = ft.o.terminate("limit").unwrap();
+    ft.o.persist_end_run(&re, OUTCOME_STOPPED, "test cancellation");
+    assert!(
+        handle.accounts(views[0].last_seen_s + 1800)[0].stale,
+        "cancellation with storage off must release activity"
+    );
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_opencode_wall_flow_uses_actual_api_auth_and_releases_on_failure() {
+    let dir = TempDir::new();
+    let state = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "wall",
+            identifier: "WALL-1",
+            title: "wall smoke",
+            state: "Todo",
+            team_id: "",
+            latest_summon_at: "",
+        }],
+    );
+    let script = dir.child("wall.sh");
+    // Source-shaped 429, not a recorded capture; no provider request or credential involved.
+    std::fs::write(&script, "printf '%s\\n' '{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"rate limited\",\"statusCode\":429,\"isRetryable\":true}}}'\nexit 1\n").unwrap();
+    let auth = dir.child("auth.json");
+    std::fs::write(&auth, br#"{"openai":{"type":"api","key":"test-only-key"}}"#).unwrap();
+    let mut ft = build_file_tracker_orch(&src, "");
+    ft.o.set_store(Arc::new(rhapsody_store::Noop));
+    let eff = ft.o.eff.as_mut().unwrap();
+    eff.agent = Arc::new(rhapsody_agent::opencode::Runner::new(
+        rhapsody_agent::opencode::Config {
+            command: format!("bash {script}"),
+            workspace_root: ft._root.path.clone(),
+            state_root: std::fs::canonicalize(&state.path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            auth_source: auth,
+            model: "openai/test".into(),
+            ..Default::default()
+        },
+    ));
+    eff.cfg.agent.backend = "opencode".into();
+    eff.cfg.opencode.model = "openai/test".into();
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(5), |o| !o
+            .accounts
+            .snapshot(1791312000)
+            .is_empty()
+            && o.running.is_empty())
+        .await,
+        "accounts: {:?}; retries: {:?}; running: {:?}",
+        ft.o.accounts.snapshot(1791312000),
+        ft.o.retry_attempts,
+        ft.o.running.keys()
+    );
+    let views =
+        ft.o.control()
+            .accounts(chrono::Utc::now().timestamp() + 1800);
+    assert_eq!(views.len(), 1);
+    assert_eq!(
+        views[0].account, "openai",
+        "model prefix alone must not imply subscription auth"
+    );
+    assert_eq!(views[0].status, "rejected");
+    assert!(views[0].stale, "failed run releases its activity");
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
 // Mirrors Go `TestFileTrackerE2E_DispatchContinuedRedispatch`.
 #[tokio::test(flavor = "multi_thread")]
 async fn file_tracker_e2e_dispatch_continued_redispatch() {

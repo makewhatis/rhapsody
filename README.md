@@ -63,16 +63,27 @@ reference (the parity goldens stay byte-strict).
 
 ### Account limit observations and API (STUDIO-1123)
 
-Rhapsody adds account-limit parser/ledger primitives and read-only
+Rhapsody observes account limits by default and adds a read-only
 `GET /api/v1/accounts`, with no Go counterpart. The endpoint returns
 `{"accounts": [...]}` independently of `/state`; existing payloads and goldens are
 unchanged. Ledger windows retain epoch-second reset times, same-window utilization
 never regresses, and idle observations become stale after 30 minutes. An unknown
 reset is represented by `resets_at_s: 0` and never treated as already expired.
 
-The L1 foundation does not yet connect runner events to this ledger or perform a
-ChatGPT usage probe. Until that integration lands, the daemon serves an empty list.
-These primitives do not stop, switch or retry agents; limit policy belongs to L4.
+Claude's account windows arrive from `rate_limit_event` or CLI rejection diagnostics.
+ChatGPT's OpenCode success stream/logs expose tokens but no account utilization;
+an access-only, non-inference `wham/usage` GET supplies advance visibility (`probe`).
+The probe never refreshes a login or follows redirects, is bounded to one attempt
+per account per ten minutes across concurrent runners, and runs only during active
+OAuth OpenAI turns. Failed probes preserve the last known data. Stream 429 and
+`usage_limit_reached` errors remain wall signals. A probe reports no credits-use
+claim: the usage response's `has_credits` describes availability, not spending.
+
+Attribution uses the dispatch-time harness/model and the session's observed auth
+kind, including review and manager runs; explicit brokered providers use their
+stable API account id. Unknown authentication remains unclassified. HTTP reads
+never touch credentials or providers. Observations do not stop, switch or retry
+agents; limit policy belongs to L4.
 
 ### Runtime paths → `~/.rhapsody` + `rhapsody.db` (TRA-238)
 

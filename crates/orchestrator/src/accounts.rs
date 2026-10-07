@@ -210,10 +210,10 @@ impl AccountLedger {
                     stale: !active
                         && (account.windows.is_empty()
                             || now_s.saturating_sub(account.last_seen_s) >= 1800),
-                    // Only a successful probe observation establishes probe detection. The live
-                    // ChatGPT measurement is still outstanding; do not claim advance visibility.
-                    detection: if name == "chatgpt-subscription" && account.source != "probe" {
-                        "wall_only"
+                    // The passive WHAM probe was measured successfully. The detection capability
+                    // stays probe even when the latest observation is a stream rejection.
+                    detection: if name == "chatgpt-subscription" {
+                        "probe"
                     } else if name == "claude-subscription" {
                         "stream"
                     } else if account.source == "probe" {
@@ -256,6 +256,57 @@ impl AccountLedger {
             .runs
             .remove(run);
     }
+
+    fn observe_run(&self, run: &str, obs: LimitObs) {
+        let account = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runs
+            .get(run)
+            .cloned();
+        if let Some(account) = account {
+            self.observe(&account, obs);
+        }
+    }
+}
+
+pub(crate) fn run_key(issue_id: &str, started_at: chrono::DateTime<chrono::Utc>) -> String {
+    format!("{issue_id}:{}", started_at.to_rfc3339())
+}
+
+impl crate::Orchestrator {
+    pub(crate) fn bind_account(
+        &self,
+        issue_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        account: &str,
+    ) {
+        if self
+            .running
+            .get(issue_id)
+            .is_some_and(|re| re.started_at == started_at)
+        {
+            self.accounts
+                .bind_run(&run_key(issue_id, started_at), account);
+        }
+    }
+
+    pub(crate) fn observe_account(
+        &self,
+        issue_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        obs: LimitObs,
+    ) {
+        if self
+            .running
+            .get(issue_id)
+            .is_some_and(|re| re.started_at == started_at)
+        {
+            self.accounts
+                .observe_run(&run_key(issue_id, started_at), obs);
+        }
+    }
 }
 
 impl crate::ControlHandle {
@@ -269,6 +320,61 @@ impl crate::ControlHandle {
 mod tests {
     use super::*;
     use rhapsody_agent::ratelimit::{LimitStatus, WindowObs};
+
+    #[test]
+    fn chatgpt_wall_and_probe_share_window_generations() {
+        let ledger = AccountLedger::default();
+        let bytes = include_bytes!("../../agent/testdata/limits/chatgpt-usage.json");
+        let first = rhapsody_agent::opencode::limits::parse_usage(bytes, 1791384678).unwrap();
+        ledger.observe("chatgpt-subscription", first);
+        let wall = rhapsody_agent::ratelimit::parse_opencode_limit(&serde_json::json!({"type":"error", "timestamp":1791384700000i64, "error":{"data":{"statusCode":429}}})).unwrap();
+        ledger.observe("chatgpt-subscription", wall);
+        assert_eq!(ledger.snapshot(1791384700)[0].status, "rejected");
+        // Boundary input derived from the measurement, not another live capture: a NEW reset
+        // generation must clear the old wall instead of leaving an unmatchable generic window.
+        let mut next: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        next["rate_limit"]["primary_window"]["used_percent"] = serde_json::json!(10);
+        next["rate_limit"]["primary_window"]["reset_at"] = serde_json::json!(1792553415);
+        ledger.observe(
+            "chatgpt-subscription",
+            rhapsody_agent::opencode::limits::parse_usage(
+                &serde_json::to_vec(&next).unwrap(),
+                1791948616,
+            )
+            .unwrap(),
+        );
+        let view = ledger.snapshot(1791948616);
+        assert_eq!(view[0].status, "allowed");
+        assert_eq!(view[0].windows.len(), 1);
+        assert_eq!(view[0].windows[0].utilization, 0.10);
+        assert_eq!(view[0].detection, "probe");
+    }
+
+    #[test]
+    fn stale_run_bindings_and_limits_cannot_change_a_redispatched_account() {
+        use crate::orchestrator::RunningEntry;
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let old = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        let current = chrono::DateTime::from_timestamp(2000, 0).unwrap();
+        let mut re = RunningEntry::empty(rhapsody_core::Issue {
+            id: "ticket".into(),
+            ..Default::default()
+        });
+        re.started_at = current;
+        o.running.insert("ticket".into(), re);
+        o.bind_account("ticket", current, "chatgpt-subscription");
+        o.bind_account("ticket", old, "claude-subscription");
+        o.observe_account("ticket", old, obs(1.0, 5000, 2200));
+        assert_eq!(o.accounts.snapshot(2200).len(), 1);
+        assert!(o.accounts.snapshot(2200)[0].windows.is_empty());
+        o.observe_account("ticket", current, obs(0.31, 5000, 2200));
+        assert_eq!(o.accounts.snapshot(2200)[0].windows[0].utilization, 0.31);
+        o.running.remove("ticket");
+        o.accounts.release_run(&run_key("ticket", current));
+        o.bind_account("ticket", current, "claude-subscription");
+        o.observe_account("ticket", current, obs(1.0, 5000, 2300));
+        assert_eq!(o.accounts.snapshot(2300)[0].windows[0].utilization, 0.31);
+    }
 
     fn obs(utilization: f64, reset: i64, seen: i64) -> LimitObs {
         LimitObs {
@@ -421,7 +527,7 @@ mod tests {
         ledger.bind_run("run", "chatgpt-subscription");
         let snapshot = ledger.snapshot(5000);
         assert_eq!(snapshot[0].status, "unknown");
-        assert_eq!(snapshot[0].detection, "wall_only");
+        assert_eq!(snapshot[0].detection, "probe");
         assert!(snapshot[0].windows.is_empty());
         assert!(ledger.tightest("chatgpt-subscription", 5000).is_none());
         serde_json::to_string(&snapshot).expect("finite API view");
