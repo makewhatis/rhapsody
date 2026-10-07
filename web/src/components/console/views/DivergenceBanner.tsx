@@ -45,7 +45,7 @@ export function DivergenceBanner() {
           <span key={`${d.pr}:${d.reviewer}`} style={{ display: "block" }}>
             {d.pr}
             {d.ticket ? ` (${d.ticket})` : ""} —{" "}
-            {d.kind === "manager_deferred" && d.reason ? d.reason : d.detail},{" "}
+            {(d.kind === "manager_deferred" || d.kind === "review_infrastructure") && d.reason ? d.reason : d.detail},{" "}
             {humanStale(d.stale_secs)}.
             {d.capacity_held
               ? ` It is held for capacity: ${d.capacity_held.holders} run(s) hold the ${d.capacity_held.budget} budget, so no reviewer run can start yet.`

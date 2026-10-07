@@ -644,6 +644,9 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// Failed launches/read attempts, separate from verdict round accounting (STUDIO-1129).
+    pub(crate) review_attempts:
+        HashMap<rhapsody_store::ReviewWatchKey, crate::reviewwatch::FailedReviewAttempt>,
     /// AUTHOR rounds each watched pull request has dispatched but that no reviewer has answered yet
     /// (STUDIO-1004), keyed by [`churn_key`](crate::reviewwatch::churn_key) exactly as
     /// [`review_rounds`](Orchestrator::review_rounds) is and dropped with it when the pull request
@@ -1175,6 +1178,7 @@ impl Orchestrator {
             manager_apply: None,
             manager_apply_submitted: std::collections::HashSet::new(),
             review_rounds: HashMap::new(),
+            review_attempts: HashMap::new(),
             author_rounds_pending: HashMap::new(),
             auto_merge_announced: HashMap::new(),
             conflict_routed: HashMap::new(),

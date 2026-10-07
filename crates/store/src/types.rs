@@ -477,7 +477,7 @@ pub const REVIEW_VERDICT_CHANGES_REQUESTED: &str = "changes_requested";
 /// completer stamp the PR as reviewed-at-head and silently drops a second reviewer whose run
 /// crashed (design §14.2, "N reviewers share one per-PR SHA"), so the reviewer is part of the key
 /// rather than a column on a per-PR row.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReviewWatchKey {
     /// GitHub repository owner (the `owner` of `owner/repo#number`).
     pub owner: String,

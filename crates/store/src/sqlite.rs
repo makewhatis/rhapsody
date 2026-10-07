@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -593,6 +593,25 @@ ALTER TABLE rhapsody_manager_intervention ADD COLUMN failure_reason TEXT NOT NUL
     // v25 -> v26: identity fallback engine provenance (STUDIO-1125). The Go runs table stays intact.
     r#"
 ALTER TABLE rhapsody_run_provenance ADD COLUMN engine_index INTEGER NOT NULL DEFAULT 0;
+"#,
+    // v26 -> v27 (STUDIO-1129): repair the old launch-based round counters exactly once on
+    // upgrade. Only a persisted reviewer verdict is evidence of a round. Prefix equality (not
+    // LIKE) keeps legal '_' and '%' repo names literal. Retention may have removed older
+    // verdicts: the surviving evidence is a lower bound, never an invented launch count.
+    // The per-run verdict ledger predates generations. After a Clear, only finding/resolution
+    // records can prove a run belongs to this generation; omit unknowns and preserve prior refunds.
+    r#"
+UPDATE rhapsody_review_bound SET dispatches = MIN(MAX(dispatches, 0), (
+  SELECT COUNT(*) FROM runs r JOIN rhapsody_review_verdicts v ON v.run_id = r.id
+  WHERE lower(substr(r.issue_identifier, 1, length(rhapsody_review_bound.pr) + 4)) = 'pr:' || lower(rhapsody_review_bound.pr) || '@'
+    AND v.verdict IN ('approved', 'changes_requested')
+    AND (rhapsody_review_bound.generation <= 1 OR EXISTS (
+      SELECT 1 FROM rhapsody_review_finding f
+      WHERE lower(f.pr) = lower(rhapsody_review_bound.pr)
+        AND f.generation = rhapsody_review_bound.generation
+        AND (f.review_run_id = r.id OR f.resolved_by = CAST(r.id AS TEXT))
+    ))
+));
 "#,
 ];
 
@@ -9558,5 +9577,149 @@ mod tests {
             ManagerReservation::Absent
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn v25_upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs() {
+        upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(25);
+    }
+
+    #[test]
+    fn upgrade_verdict_repair_never_revives_a_pre_upgrade_clear() {
+        for version in [25, 26] {
+            let scratch = scratch_dir();
+            let db = scratch.join("cleared.db");
+            {
+                let conn = Connection::open(&db).expect("raw database");
+                for migration in &MIGRATIONS[..version] {
+                    conn.execute_batch(migration).expect("old schema");
+                }
+                conn.pragma_update(None, "user_version", version as i64)
+                    .expect("version");
+                conn.execute_batch(
+                    "INSERT INTO rhapsody_review_bound (pr, dispatches, generation) VALUES
+                     ('owner/repo#290', 0, 2), ('owner/repo#291', 4, 2);
+                     INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                     (1, 'pr:owner/repo#290@bob', 'completed'),
+                     (2, 'pr:owner/repo#291@bob', 'completed'),
+                     (3, 'pr:owner/repo#291@bob', 'completed'),
+                     (4, 'pr:owner/repo#291@bob', 'completed'),
+                     (5, 'pr:owner/repo#291@carol', 'completed');
+                     INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                     (1, 'approved'), (2, 'approved'), (3, 'changes_requested'),
+                     (4, 'approved'), (5, 'approved');
+                     INSERT INTO rhapsody_review_finding
+                     (pr, generation, reviewer, finding_id, revision, review_run_id, resolved_by) VALUES
+                     ('owner/repo#290', 1, 'bob', 'B1', 1, 1, ''),
+                     ('owner/repo#291', 1, 'bob', 'B1', 1, 2, ''),
+                     ('owner/repo#291', 2, 'bob', 'B2', 1, 3, '4'),
+                     ('owner/repo#291', 2, 'bob', 'B3', 1, 3, '4');"
+                ).expect("pre-clear and current-generation evidence");
+            }
+            let store = Sqlite::open(StorePath::Disk(db)).expect("upgrade");
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#290")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                0,
+                "generation-1 history must not revive a cleared generation-2 budget"
+            );
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#291")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                2,
+                "only current-generation verdict evidence counts, once per run; unknown generations are omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn v26_upgrade_counts_verdicts_and_preserves_fallback_engine_provenance() {
+        upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(26);
+    }
+
+    fn upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(version: usize) {
+        let scratch = scratch_dir();
+        let db = scratch.join(&format!("v{version}.db"));
+        {
+            let conn = Connection::open(&db).expect("raw database");
+            for migration in &MIGRATIONS[..version] {
+                conn.execute_batch(migration).expect("old schema");
+            }
+            conn.pragma_update(None, "user_version", version as i64)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES
+                ('owner/a_b#290', 3), ('owner/a_b#291', 4), ('owner/axb#291', 9);
+                INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                (1, 'pr:owner/a_b#290@bob', 'failed'),
+                (2, 'pr:owner/a_b#290@bob', 'failed'),
+                (3, 'pr:owner/a_b#290@bob', 'completed'),
+                (4, 'pr:owner/a_b#291@bob', 'failed'),
+                (5, 'pr:owner/a_b#291@bob', 'completed'),
+                (6, 'pr:owner/a_b#291@carol', 'completed'),
+                (7, 'pr:owner/a_b#291@manager', 'completed');
+                INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                (5, 'approved'), (6, 'changes_requested');",
+            )
+            .expect("old rounds");
+            if version == 26 {
+                conn.execute_batch(
+                    "INSERT INTO rhapsody_run_provenance (run_id, harness, model, engine_index)
+                     VALUES (5, 'opencode', 'openai/gpt-6.1-sol', 2);",
+                )
+                .expect("fallback provenance");
+            }
+        }
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#290")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            2
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/axb#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        if version == 26 {
+            let provenance = store.run_provenance(5).expect("provenance").expect("row");
+            assert_eq!(provenance.engine_index, 2);
+            assert_eq!(provenance.harness, "opencode");
+            assert_eq!(provenance.model, "openai/gpt-6.1-sol");
+        }
+        store
+            .set_review_rounds("owner/a_b#291", 1)
+            .expect("operator refund");
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            1,
+            "repair is once on upgrade, not a recount that undoes operator controls every boot"
+        );
     }
 }

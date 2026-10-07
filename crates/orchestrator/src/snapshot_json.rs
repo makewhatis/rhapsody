@@ -156,8 +156,11 @@ pub fn render(s: &Snapshot) -> Value {
                         // row and carries the §10.2 human-feed sentence (`manager deferred: drain`,
                         // `manager unavailable: CLI contract`, …). Conditional on the kind, so every
                         // other row shape (and the healthy payload) is untouched.
-                        if d.kind == crate::reviewreconcile::DivergenceKind::ManagerDeferred
-                            && let Some(obj) = row.as_object_mut()
+                        if matches!(
+                            d.kind,
+                            crate::reviewreconcile::DivergenceKind::ManagerDeferred
+                                | crate::reviewreconcile::DivergenceKind::ReviewInfrastructure
+                        ) && let Some(obj) = row.as_object_mut()
                         {
                             obj.insert("reason".to_string(), json!(d.reason));
                         }

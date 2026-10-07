@@ -1259,6 +1259,16 @@ impl Orchestrator {
                 self.finish_prepared(id, target, prepared).await;
             }
             PreparationOutcome::Refused(reason) => {
+                if let PreparedTarget::Review { run, commit, .. } = &entry.target {
+                    let key = run.watch_key();
+                    let obligation = commit.as_ref().map_or(&key, |c| &c.incumbent);
+                    self.note_failed_review_attempt_for(
+                        &key,
+                        obligation,
+                        &run.head_sha,
+                        &reason.message(),
+                    );
+                }
                 // A refusal never dispatches, so a reopening summons captured for this identity is
                 // dropped with it (a later run must not inherit a summons from a reopen that never
                 // happened). The same holds for a held manager wake obligation (STUDIO-1017): its
