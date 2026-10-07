@@ -530,7 +530,9 @@ else:
     assert sys.argv[1:]==['run','--format','json','--dir',str(cwd),'--agent','build','-m','openai/gpt-6.1-sol','--variant','low',sys.argv[-1]]
     assert 'touch '+str(cwd/'canary-bash-ran') in sys.argv[-1]
     assert '--auto' not in sys.argv and '--pure' not in sys.argv
-    if mode=='timeout': time.sleep(120)
+    if mode=='timeout':
+        pathlib.Path(log+'.ready').touch()
+        time.sleep(120)
     elif mode=='error': print(json.dumps({'type':'error','error':{'name':'ProviderModelNotFoundError'}}))
     elif mode=='crash': sys.exit(1)
     else:
@@ -607,6 +609,15 @@ else:
             let obs = run_fake(&r, &src).await;
             let rows = launches(&log);
             assert!(!rows.is_empty());
+            assert_eq!(obs.len(), REQUIRED_ATTEMPTS.len());
+            if mode == "timeout" {
+                assert_eq!(rows.len(), 2, "timeout must reach the canary turn");
+                assert!(
+                    obs.iter()
+                        .all(|o| !o.refused && o.detail == "OpenCode canary timed out"),
+                    "{obs:?}"
+                );
+            }
             let root = Path::new(rows[0]["cwd"].as_str().unwrap())
                 .parent()
                 .unwrap();
@@ -619,6 +630,37 @@ else:
                 "{mode}: {obs:?}"
             );
         }
+    }
+    #[tokio::test]
+    async fn runner_cleans_up_dir_and_credential_when_future_dropped() {
+        let d = Scratch::new();
+        let (r, src, log) = fake(&d, "timeout");
+        let before = std::fs::read(&src).unwrap();
+        let ready = log.with_extension("jsonl.ready");
+        let mut run = Box::pin(run_fake(&r, &src));
+        let wait_ready = async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        // Cancel only after the fake has validated the credential and reached the turn.
+        tokio::select! {
+            obs = &mut run => panic!("canary completed before cancellation: {obs:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), wait_ready) => {
+                result.expect("fake canary never reached the turn");
+            }
+        }
+        let rows = launches(&log);
+        assert_eq!(rows.len(), 2);
+        let root = Path::new(rows[1]["cwd"].as_str().unwrap())
+            .parent()
+            .unwrap();
+        assert!(root.exists());
+        assert!(root.join("xdg/data/opencode/auth.json").is_file());
+        drop(run);
+        assert!(!root.exists());
+        assert_eq!(std::fs::read_dir(&r.workspace_root).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&src).unwrap(), before);
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
