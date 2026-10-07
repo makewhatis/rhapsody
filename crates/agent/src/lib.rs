@@ -26,6 +26,7 @@ pub mod humanize;
 pub mod manager;
 pub mod opencode;
 pub mod proctree;
+pub mod ratelimit;
 
 pub use dispatch::{
     DispatchRefusal, DispatchRunner, LaunchContext, PreparedHarnessSpec, PreparedProvider,
