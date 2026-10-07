@@ -56,6 +56,7 @@
 
 pub mod args;
 pub mod brokered;
+pub mod manager;
 pub mod mcpinject;
 pub mod parse;
 pub mod probe;

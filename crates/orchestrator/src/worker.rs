@@ -512,7 +512,12 @@ async fn run_manager_attempt(
     // The dedicated manager configuration directory carries ONLY the model credential (§4.2), and
     // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
     // authenticate from the file on macOS (§4.5).
-    let model_credential = provision_manager_config_dir(&config_dir);
+    let model_credential = if deps.agent.id() == agent::HarnessId::Claude {
+        provision_manager_config_dir(&config_dir)
+    } else {
+        // OpenCode provisions only its refresh-blank OpenAI credential in its private XDG tree.
+        None
+    };
 
     // Optional transcript, best-effort exactly as the ordinary path.
     let mut transcript: Option<Transcript> = None;
@@ -532,6 +537,9 @@ async fn run_manager_attempt(
     }
 
     let req = rhapsody_agent::manager::ManagerSessionStart {
+        // retry.rs stamps SelectedEntry.entry into this dispatch-time override.
+        model: deps.model_override.model.clone(),
+        effort: deps.model_override.effort.clone(),
         cwd: cwd.to_string_lossy().into_owned(),
         config_dir: config_dir.to_string_lossy().into_owned(),
         run_timeout_ms: mgr.run_timeout_ms.max(0) as u64,
@@ -3938,6 +3946,44 @@ mod tests {
             0,
             "a manager run makes no tracker state move"
         );
+    }
+
+    #[tokio::test]
+    async fn manager_session_start_carries_selected_model_and_effort() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "ignored", 1);
+        d.manager_root = root.path.clone();
+        d.manager = Some(crate::managerrun::ManagerCheckout {
+            key: "pr:o/r#1@manager".into(),
+            ..Default::default()
+        });
+        // These are the selected entry values stamped by the dispatch funnel, not the one-shot
+        // manager tuple. OpenCode needs them at start, before set_model_override is called.
+        for (model, effort) in [("openai/gpt-6.1-sol", "xhigh"), ("opus", "high"), ("", "")] {
+            d.model_override = agent::ModelOverride {
+                model: model.into(),
+                effort: effort.into(),
+                ..Default::default()
+            };
+            let iss = Issue {
+                id: "pr:o/r#1@manager".into(),
+                identifier: "pr:o/r#1@manager".into(),
+                ..Default::default()
+            };
+            let (_, _, err) = run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+            assert!(err.is_none(), "manager attempt clean: {err:?}");
+            let started = ag.last_manager_start().expect("manager session started");
+            assert_eq!(started.model, model);
+            assert_eq!(started.effort, effort);
+        }
     }
 
     // STUDIO-1054 acceptance, item 2: the prompt a LIVE manager launch actually sends carries the

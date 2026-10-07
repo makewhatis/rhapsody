@@ -618,6 +618,9 @@ pub struct Orchestrator {
     /// `dispatch_issue` it makes (written and consumed on the control task, exactly as
     /// `pending_review` is). STUDIO-1049.
     pub(crate) pending_manager: crate::managerrun::PendingManagers,
+    /// Control-owned attempt cursor and provenance. Infrastructure failures advance this cursor;
+    /// a malformed decision keeps its selected entry. A new intervention resets it.
+    pub(crate) manager_attempts: HashMap<String, crate::managerrun::ManagerAttempt>,
     /// The §4.7 startup self-test's recorded verdict (STUDIO-1049), behind a lock because the boot
     /// gate (off the control task) writes it and [`Orchestrator::manager_launch_permitted`] reads it.
     /// A version change invalidates it; see [`crate::managerselftest::ManagerSelfTestState`].
@@ -1160,6 +1163,7 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             pending_manager: HashMap::new(),
+            manager_attempts: HashMap::new(),
             manager_selftest: std::sync::Arc::new(
                 crate::managerselftest::ManagerSelfTestState::default(),
             ),

@@ -57,6 +57,7 @@ use crate::opencode::args::{Config, build_args};
 use crate::opencode::brokered::{
     BrokeredMaterial, CapabilityRedactor, InternalProviderId, build_brokered_args,
 };
+use crate::opencode::manager;
 use crate::opencode::mcpinject::{
     SERVER_KEY, daemon_mcp_server, inject_daemon_mcp, rewrite_tool_names,
 };
@@ -241,6 +242,8 @@ impl Runner {
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
+            manager: None,
         }))
     }
 }
@@ -388,6 +391,101 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
+    /// Its credential can never refresh, retry from a copy, or survive the run for resume.
+    fn start_manager_session(
+        &self,
+        req: crate::manager::ManagerSessionStart,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let real_home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| {
+                AgentError::Other(
+                    "manager_home_missing: daemon HOME is required for the manager MCP server"
+                        .to_string(),
+                )
+            })?;
+        if req.model.is_empty() {
+            return Err(AgentError::Other(
+                "manager_model_missing: OpenCode requires an explicit model".to_string(),
+            ));
+        }
+        let (name, base_args) = split_command(&self.cfg.command)?;
+        if base_args.iter().any(|arg| arg == "--auto") {
+            return Err(AgentError::InvalidCommand);
+        }
+        rhapsody_workspace::validate_launch(&self.cfg.workspace_root, &req.cwd, &req.cwd)
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        let operator_auth = if self.cfg.auth_source.is_empty() {
+            manager::operator_auth_path().ok_or_else(|| {
+                AgentError::AuthFailed(
+                    "operator has no OpenAI login; run opencode auth login".to_string(),
+                )
+            })?
+        } else {
+            PathBuf::from(&self.cfg.auth_source)
+        };
+        // Credential-free provisioning: never use provision_legacy, which copies every provider
+        // and leaves refresh enabled. RunState's drop cleans up even a half-built manager tree.
+        let state = RunState::provision_brokered(
+            &self.cfg.state_root,
+            &issue.identifier,
+            &self.cfg.workspace_root,
+        )?;
+        let home = state.xdg_data_home().join("home");
+        let xdg = state.xdg_data_home().join("xdg");
+        for dir in [
+            &home,
+            &xdg,
+            &xdg.join("config"),
+            &xdg.join("data"),
+            &xdg.join("cache"),
+            &xdg.join("state"),
+        ] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| AgentError::Other(format!("manager_private_dir_failed: {e}")))?;
+        }
+        manager::seed_manager_credential(&operator_auth, &xdg.join("data"))?;
+        let mut cfg = self.cfg.clone();
+        cfg.model = req.model;
+        cfg.variant = req.effort;
+        if req.run_timeout_ms > 0 {
+            cfg.turn_timeout = Duration::from_millis(req.run_timeout_ms);
+        }
+        Ok(Box::new(OpencodeSession {
+            cfg,
+            cmd_name: name,
+            cmd_args: base_args,
+            ws_path: req.cwd,
+            issue,
+            state,
+            config_path: String::new(),
+            brokered: None,
+            session_id: Mutex::new(String::new()),
+            turn_n: AtomicI64::new(0),
+            transcript: Mutex::new(transcript),
+            transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
+            poisoned: AtomicBool::new(false),
+            adopted: false,
+            last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
+            manager: Some(ManagerParams {
+                real_home,
+                home,
+                xdg,
+            }),
+        }))
+    }
+
     /// The brokered materialization (PB7, STUDIO-1002): provision a credential-FREE run state and a
     /// managed session whose turns mint a per-turn capability from the broker attempt. This is the
     /// one entry point a prepared provider dispatch uses; it never reads a harness-native credential.
@@ -414,9 +512,8 @@ impl crate::Runner for Runner {
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError> {
         let (name, base_args) = split_command(&self.cfg.command)?;
-        // A retained session is resumed from its kept directory (which already holds the seeded
-        // credential); otherwise a fresh one is provisioned, refusing a missing credential before
-        // anything is spawned.
+        // A retained session is resumed from its kept directory; otherwise a fresh one is
+        // provisioned, refusing a missing credential before anything is spawned.
         let (state, resume_session, adopted) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_legacy(
@@ -426,6 +523,34 @@ impl crate::Runner for Runner {
                     &self.cfg.workspace_root,
                 )
             })?;
+        // ⚠️ An adopted directory's `auth.json` is a copy taken when it was FIRST provisioned — up
+        // to an hour of retries earlier. An operator who has since re-run `opencode auth login`
+        // only updated their own file, so the copy is re-seeded from it now, before anything spawns
+        // (STUDIO-1118). Without this a resumed run keeps 401ing on the stale login however often
+        // the operator logs in. Only when the operator's login is the NEWER of the two, though: a
+        // copy opencode refreshed in place holds the rotated token, and clobbering it with the
+        // operator's older one would replay a spent refresh token (`legacy_login_is_newer`).
+        if adopted && !state.legacy_login_is_newer(&self.cfg.auth_source) {
+            tracing::info!(
+                issue = %issue.identifier,
+                "opencode: kept the resumed session's own auth.json; it is not older than the \
+                 operator's login"
+            );
+        } else if adopted {
+            match state.reseed_legacy(&self.cfg.auth_source) {
+                Ok(r) => tracing::info!(
+                    issue = %issue.identifier, changed = r.changed(),
+                    before = %r.before_prefix(), after = %r.after_prefix(),
+                    "opencode: re-seeded the resumed session's auth.json from the operator's login"
+                ),
+                Err(e) => {
+                    // `adopt` does not mark the directory kept; keep it so this refusal does not
+                    // delete the very session the next dispatch would resume.
+                    state.keep();
+                    return Err(e);
+                }
+            }
+        }
 
         // MCP injection is best-effort, exactly as it is for claude: on any failure the run
         // proceeds without the daemon's server rather than not running at all.
@@ -468,6 +593,8 @@ impl crate::Runner for Runner {
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
+            auth_failed: AtomicBool::new(false),
+            manager: None,
         }))
     }
 }
@@ -507,6 +634,19 @@ struct OpencodeSession {
     /// future leave it set. [`OpencodeSession::end_of_run`] retains the state directory and writes
     /// the resume record when it is set, and cleans up when it is not.
     last_turn_failed: AtomicBool,
+    /// Whether the most recent LEGACY turn ended in an in-band credential rejection
+    /// ([`Failure::is_auth`], STUDIO-1118). Cleared as every turn begins; read by
+    /// [`OpencodeSession::run_turn_legacy`] to decide between one re-seeded retry and the
+    /// auth-needed outcome.
+    auth_failed: AtomicBool,
+    /// Manager-only environment and private dirs; never participates in legacy retry/resume.
+    manager: Option<ManagerParams>,
+}
+
+struct ManagerParams {
+    real_home: String,
+    home: PathBuf,
+    xdg: PathBuf,
 }
 
 impl OpencodeSession {
@@ -608,6 +748,10 @@ impl OpencodeSession {
     /// exactly as they were, because deleting them would throw away the session this feature exists
     /// to keep. Called from [`Session::stop`] on the normal path and from [`Drop`] on cancellation.
     fn end_of_run(&self) {
+        if self.manager.is_some() {
+            self.state.cleanup();
+            return;
+        }
         let ran_a_turn = self.turn_n.load(Ordering::SeqCst) > 0;
         if ran_a_turn && self.last_turn_failed.load(Ordering::SeqCst) {
             self.persist_resume();
@@ -705,7 +849,7 @@ impl Session for OpencodeSession {
         messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
     ) -> (TurnResult, Option<AgentError>) {
-        self.run_turn_inner(prompt, attempt, messages, on_event, None)
+        self.run_turn_entry(prompt, attempt, messages, on_event, None)
             .await
     }
 
@@ -719,14 +863,151 @@ impl Session for OpencodeSession {
         on_event: &(dyn Fn(Event) + Send + Sync),
         broker: Option<BrokerTurnAttempt>,
     ) -> (TurnResult, Option<AgentError>) {
-        self.run_turn_inner(prompt, attempt, messages, on_event, broker)
+        self.run_turn_entry(prompt, attempt, messages, on_event, broker)
             .await
     }
 }
 
 impl OpencodeSession {
+    /// Where both trait entry points land. A brokered session runs its turn as-is; a legacy one goes
+    /// through [`OpencodeSession::run_turn_legacy`], which owns the credential-rejection outcome.
+    async fn run_turn_entry(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        broker: Option<BrokerTurnAttempt>,
+    ) -> (TurnResult, Option<AgentError>) {
+        // A session adopted from a retained record (STUDIO-1043) seeds `session_id`, so its FIRST
+        // turn continues the recorded id and is told it is resuming. Decided once here, so the
+        // legacy path's immediate auth retry of that same turn is told too.
+        let resume_note = self.turn_n.load(Ordering::SeqCst) == 0 && !self.thread_id().is_empty();
+        if self.brokered.is_some() || self.manager.is_some() {
+            return self
+                .run_turn_inner(prompt, attempt, messages, on_event, broker, resume_note)
+                .await;
+        }
+        drop(broker);
+        self.run_turn_legacy(prompt, attempt, messages, on_event, resume_note)
+            .await
+    }
+
+    /// One LEGACY turn, plus the credential-rejection outcome (STUDIO-1118).
+    ///
+    /// A turn the provider refuses for its credential ([`Failure::is_auth`]) is not an ordinary
+    /// failure: retrying it on the same `auth.json` fails identically, and before this the daemon
+    /// did exactly that every few minutes for an hour. Instead the run directory is re-seeded from
+    /// the operator's login, and then:
+    ///
+    /// - the copy CHANGED (the operator has logged in since it was taken) ⇒ the turn is retried
+    ///   ONCE, immediately, on the fresh login;
+    /// - the copy is byte-IDENTICAL to the one just rejected (by SHA-256 digest), or the immediate
+    ///   retry is rejected too, or the source is gone ⇒ [`AgentError::AuthNeeded`], with a WARN. No
+    ///   retry can help until a human runs `opencode auth login`, and the orchestrator holds the
+    ///   issue for them rather than scheduling one.
+    ///
+    /// Only digest prefixes are ever logged; the credential's contents never are.
+    async fn run_turn_legacy(
+        &self,
+        prompt: &str,
+        attempt: Option<i64>,
+        mut messages: Option<&mut mpsc::Receiver<String>>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+        resume_note: bool,
+    ) -> (TurnResult, Option<AgentError>) {
+        let (tr, err) = self
+            .run_turn_inner(
+                prompt,
+                attempt,
+                messages.as_deref_mut(),
+                on_event,
+                None,
+                resume_note,
+            )
+            .await;
+        if !self.auth_failed.load(Ordering::SeqCst) {
+            return (tr, err);
+        }
+        // Unlike adopting a retained directory, this re-seed deliberately skips the mtime guard: the
+        // copy in the directory is the one the provider just rejected, so a "newer" copy is no
+        // reason to keep it. Only the digest comparison below decides whether a retry can help.
+        match self.state.reseed_legacy(&self.cfg.auth_source) {
+            Ok(r) if r.changed() => {
+                tracing::info!(
+                    issue = %self.issue.identifier, harness = resume::HARNESS,
+                    before = %r.before_prefix(), after = %r.after_prefix(),
+                    "opencode: the provider rejected the run's login, and the operator's login has \
+                     changed since it was copied; retrying the turn once on the fresh copy"
+                );
+                on_event(Event {
+                    event_type: EVENT_NOTIFICATION.to_string(),
+                    timestamp: Some(Utc::now()),
+                    message: "the provider rejected this run's opencode login; re-seeded it from \
+                              the operator's newer login and retrying the turn once"
+                        .to_string(),
+                    ..Default::default()
+                });
+                let (tr, err) = self
+                    .run_turn_inner(prompt, attempt, messages, on_event, None, resume_note)
+                    .await;
+                if !self.auth_failed.load(Ordering::SeqCst) {
+                    return (tr, err);
+                }
+                let why = "the provider rejected the freshly re-seeded login too";
+                self.auth_needed(tr, err, why, Some(&r), on_event)
+            }
+            Ok(r) => {
+                let why = "the operator's current login is byte-identical to the one the \
+                           provider just rejected";
+                self.auth_needed(tr, err, why, Some(&r), on_event)
+            }
+            Err(e) => {
+                let why = format!("the operator's login could not be re-seeded ({e})");
+                self.auth_needed(tr, err, &why, None, on_event)
+            }
+        }
+    }
+
+    /// Builds the auth-needed outcome: a WARN naming the issue, the harness and (digest prefixes
+    /// only) the rejected login, a notification on the run's own event stream, and the typed
+    /// [`AgentError::AuthNeeded`]. The original `turn_failed: …` text is carried verbatim at the end
+    /// so the provider's own reason is never lost.
+    fn auth_needed(
+        &self,
+        tr: TurnResult,
+        err: Option<AgentError>,
+        why: &str,
+        reseed: Option<&super::state::Reseed>,
+        on_event: &(dyn Fn(Event) + Send + Sync),
+    ) -> (TurnResult, Option<AgentError>) {
+        let turn = err.map(|e| e.to_string()).unwrap_or_default();
+        let whose = self.locked_model_override().identity.clone();
+        let login = reseed
+            .map(|r| r.after_prefix())
+            .unwrap_or_else(|| "-".to_string());
+        tracing::warn!(
+            issue = %self.issue.identifier, identity = %whose, harness = resume::HARNESS,
+            login = %login, reason = %why,
+            "opencode: the provider rejected the run's login and no retry can fix it; operator \
+             must run `opencode auth login` as the daemon's user"
+        );
+        let msg = format!(
+            "opencode_auth_needed: operator must run `opencode auth login` as the daemon's user \
+             ({why}); not retrying. {turn}"
+        );
+        on_event(Event {
+            event_type: EVENT_NOTIFICATION.to_string(),
+            timestamp: Some(Utc::now()),
+            message: msg.clone(),
+            ..Default::default()
+        });
+        (tr, Some(AgentError::AuthNeeded(msg)))
+    }
+
     /// The one turn implementation both trait entry points delegate to. `broker` is `Some` only for
-    /// a brokered turn; a legacy session's entry point passes `None`.
+    /// a brokered turn; a legacy session's entry point passes `None`. `resume_note` marks the first
+    /// turn of an adopted session ([`OpencodeSession::run_turn_entry`]).
     async fn run_turn_inner(
         &self,
         prompt: &str,
@@ -734,7 +1015,9 @@ impl OpencodeSession {
         mut messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
         broker: Option<BrokerTurnAttempt>,
+        resume_note: bool,
     ) -> (TurnResult, Option<AgentError>) {
+        self.auth_failed.store(false, Ordering::SeqCst);
         // The same containment invariant the claude runner enforces before every exec (§9.5): the
         // workspace must be inside the root and equal to the cwd.
         if let Err(e) = rhapsody_workspace::validate_launch(
@@ -762,7 +1045,7 @@ impl OpencodeSession {
         );
         // A session adopted from a retained record (STUDIO-1043) seeds `session_id`, so turn 1
         // carries the recorded id as its `-s` continuation AND is told it is resuming.
-        let resumed_first_turn = turn_n == 1 && !resume.is_empty();
+        let resumed_first_turn = resume_note && !resume.is_empty();
 
         // ⚠️ The prompt is rewritten into opencode's tool-name spelling before it is sent. Rhapsody's
         // prompts name tools literally, including the one that ends the run.
@@ -810,7 +1093,18 @@ impl OpencodeSession {
         let mut stderr_redactor: Option<CapabilityRedactor> = None;
         let mut brokered_material: Option<BrokeredMaterial> = None;
 
-        let args = if let Some((params, attempt)) = brokered {
+        let args = if self.manager.is_some() {
+            drop(brokered);
+            let mut args = self.cmd_args.clone();
+            let mut managed =
+                manager::manager_args(&self.ws_path, &cfg.model, &cfg.variant, &prompt);
+            if !resume.is_empty() {
+                let pos = managed.len() - 1;
+                managed.splice(pos..pos, ["-s".to_string(), resume]);
+            }
+            args.extend(managed);
+            args
+        } else if let Some((params, attempt)) = brokered {
             if self.poisoned.load(Ordering::SeqCst) {
                 return (
                     failed(Usage::default()),
@@ -914,7 +1208,26 @@ impl OpencodeSession {
             self.run_id.load(Ordering::SeqCst),
         );
         let env = append_review_env(env, &self.locked_review_head());
-        let env = if let Some(material) = brokered_material.as_ref() {
+        let env = if let Some(params) = self.manager.as_ref() {
+            let run_id = self.run_id.load(Ordering::SeqCst).to_string();
+            let content = manager::manager_config_content(
+                &cfg.model,
+                &cfg.daemon_bin,
+                &cfg.workflow_path,
+                &params.real_home,
+                &run_id,
+            );
+            manager::manager_env(
+                &params.home,
+                &params.xdg,
+                &content,
+                &run_id,
+                &std::env::var("PATH").unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect()
+        } else if let Some(material) = brokered_material.as_ref() {
             // ⚠️ Brokered mode strips every inherited OPENCODE_*/XDG_DATA_HOME BEFORE appending the
             // authoritative managed allow-list (`§9.2`), and size-checks the result before spawn.
             match material.apply_env(env) {
@@ -1113,6 +1426,12 @@ impl OpencodeSession {
                     if c.terminal {
                         terminal_seen = true;
                     }
+                    if self.manager.is_some() && failure.is_some() {
+                        // No manager retry is useful after a credential rejection. End even if
+                        // the CLI keeps its pipes open for a retry; MH1 owns harness fallback.
+                        abort = true;
+                        break;
+                    }
                 }
                 abort
             }};
@@ -1203,6 +1522,9 @@ impl OpencodeSession {
         // process-tree teardown can block. `finish` marks a clean turn; dropping without it revokes
         // the grant and records the turn as revoked. Either way no capability remains valid between
         // outer turns.
+        if self.manager.is_some() && failure.is_some() {
+            kill_tree(pid);
+        }
         if terminal_seen && failure.is_none() {
             teardown.finish();
         } else {
@@ -1241,8 +1563,24 @@ impl OpencodeSession {
                 }
             }
         };
-        tokio::join!(drain_out, drain_err);
-        let wait_res = child.wait().await;
+        let wait_res = if self.manager.is_some() {
+            // EOF is not process exit. A manager child that closes stdout but hangs with stderr
+            // open must still obey the same run deadline while draining and reaping.
+            tokio::select! {
+                result = async {
+                    tokio::join!(drain_out, drain_err);
+                    child.wait().await
+                } => result,
+                _ = &mut deadline => {
+                    kill_tree(pid);
+                    timed_out = true;
+                    child.wait().await
+                }
+            }
+        } else {
+            tokio::join!(drain_out, drain_err);
+            child.wait().await
+        };
         teardown.disarm_tree();
 
         if dropped_messages > 0 {
@@ -1255,7 +1593,7 @@ impl OpencodeSession {
         // A deadline kill that landed after a completed turn must not discard the turn, which is
         // why `terminal_seen` is checked before `timed_out` — the same precedence the claude runner
         // gives a captured result.
-        if terminal_seen && failure.is_none() {
+        if terminal_seen && failure.is_none() && !(self.manager.is_some() && timed_out) {
             // A clean turn: the run may keep going (a continuation) or end, but it is no longer a
             // cut-off one — `end_of_run` cleans up unless a LATER turn fails (STUDIO-1043).
             self.last_turn_failed.store(false, Ordering::SeqCst);
@@ -1277,6 +1615,9 @@ impl OpencodeSession {
         // and an `isRetryable` boolean directly, so both are carried into the message rather than
         // re-derived from its text (design §7.1).
         if let Some(f) = failure {
+            // Only the legacy path owns a credential to re-seed; a brokered 401 is the broker's.
+            self.auth_failed
+                .store(self.brokered.is_none() && f.is_auth(), Ordering::SeqCst);
             if !failure_surfaced {
                 on_event(Event {
                     event_type: EVENT_TURN_FAILED.to_string(),
@@ -1288,7 +1629,11 @@ impl OpencodeSession {
             }
             return (
                 failed_with_text(usage, &result_text),
-                Some(AgentError::Other(format!("turn_failed: {}", f.summary()))),
+                Some(if self.manager.is_some() && f.is_auth() {
+                    AgentError::AuthFailed(format!("turn_failed: {}", f.summary()))
+                } else {
+                    AgentError::Other(format!("turn_failed: {}", f.summary()))
+                }),
             );
         }
         if timed_out {
@@ -1430,6 +1775,381 @@ impl CappedBuffer {
 
     fn bytes(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use crate::manager::ManagerSessionStart;
+    use crate::opencode::{manager, testdir::TempDir};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    const SUCCESS: &str = r#"
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":"thinking"}}'
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":"final decision"}}'
+printf '%s\n' '{"type":"text","sessionID":"ses_manager","part":{"text":" "}}'
+printf '%s\n' '{"type":"step_finish","sessionID":"ses_manager","part":{"reason":"stop"}}'
+"#;
+
+    struct Setup {
+        root: TempDir,
+        state: TempDir,
+        runner: Runner,
+        req: ManagerSessionStart,
+    }
+
+    impl Setup {
+        fn new(output: &str) -> Self {
+            let root = TempDir::new();
+            let state = TempDir::new();
+            let cwd = root.path().join("cwd");
+            let config = root.path().join("config");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::create_dir(&config).unwrap();
+            let auth = root.path().join("operator-auth.json");
+            std::fs::write(&auth, json!({"openai":{"type":"oauth","access":"test-only-access","refresh":"test-only-refresh","expires":4102444800000_i64},"other":{"key":"test-only-other"}}).to_string()).unwrap();
+            let script = root.path().join("fake.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    r#"
+set -eu
+capture='{}'
+label="${{@: -1}}"
+mkdir "$capture/$label"
+printf '%s\n' "$@" > "$capture/$label/argv"
+/usr/bin/env > "$capture/$label/env"
+printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$capture/$label/config"
+if test -z "$(ls -A .)"; then printf 'empty' > "$capture/$label/cwd-empty"; fi
+test -f "$XDG_DATA_HOME/opencode/auth.json"
+# Reproduce shared-state failure rather than hiding it behind an always-successful fake.
+mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
+{}
+"#,
+                    root.path().display(),
+                    output
+                ),
+            )
+            .unwrap();
+            let runner = Runner::new(Config {
+                command: format!("bash {}", script.display()),
+                workspace_root: root.path().to_string_lossy().into_owned(),
+                state_root: state.path().to_string_lossy().into_owned(),
+                auth_source: auth.to_string_lossy().into_owned(),
+                daemon_bin: "/bin/rhapsodyd".to_string(),
+                workflow_path: "/repo/WORKFLOW.md".to_string(),
+                auto_approve: Some(true),
+                extra_args: vec!["--auto".to_string()],
+                agent: "plan".to_string(),
+                model: "wrong-install-model".to_string(),
+                variant: "wrong-effort".to_string(),
+                turn_timeout: Duration::from_secs(5),
+                ..Default::default()
+            });
+            let req = ManagerSessionStart {
+                cwd: cwd.to_string_lossy().into_owned(),
+                config_dir: config.to_string_lossy().into_owned(),
+                run_timeout_ms: 2000,
+                model: "openai/gpt-6.1-sol".to_string(),
+                effort: "xhigh".to_string(),
+                model_credential: Some("claude-token-must-not-leak".to_string()),
+            };
+            Self {
+                root,
+                state,
+                runner,
+                req,
+            }
+        }
+
+        fn start(&self) -> Box<dyn Session> {
+            self.runner
+                .start_manager_session(self.req.clone(), Issue::default(), None)
+                .unwrap()
+        }
+
+        fn env(&self, label: &str) -> BTreeMap<String, String> {
+            std::fs::read_to_string(self.root.path().join(label).join("env"))
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    line.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                // bash itself contributes these variables, after exec's allow-list.
+                .filter(|(k, _)| !["PWD", "SHLVL", "_"].contains(&k.as_str()))
+                .collect()
+        }
+
+        fn assert_state_gone(&self) {
+            assert_eq!(
+                std::fs::read_dir(self.state.path()).unwrap().count(),
+                0,
+                "private run tree (including credential) leaked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_session_posture() {
+        let _env = crate::ENV_GUARD.write().await;
+        let keys = [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_AUTH_CONTENT",
+            "LINEAR_API_KEY",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            unsafe { std::env::set_var(k, "parent-trap") };
+        }
+        let s = Setup::new(SUCCESS);
+        let session = s.start();
+        session.set_run_id(42);
+        let (tr, err) = session.run_turn("posture", None, None, &|_| {}).await;
+        for (k, v) in saved {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            };
+        }
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(tr.status, TURN_SUCCEEDED);
+        let env = s.env("posture");
+        let home = Path::new(&env["HOME"]);
+        let xdg = Path::new(&env["XDG_DATA_HOME"]).parent().unwrap();
+        assert!(home.starts_with(s.state.path()));
+        assert_eq!(
+            env,
+            manager::manager_env(
+                home,
+                xdg,
+                &env["OPENCODE_CONFIG_CONTENT"],
+                "42",
+                &std::env::var("PATH").unwrap_or_default()
+            )
+            .into_iter()
+            .collect()
+        );
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(s.root.path().join("posture/config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg,
+            serde_json::from_str::<Value>(&manager::manager_config_content(
+                &s.req.model,
+                "/bin/rhapsodyd",
+                "/repo/WORKFLOW.md",
+                &std::env::var("HOME").unwrap(),
+                "42"
+            ))
+            .unwrap()
+        );
+        let args: Vec<_> = std::fs::read_to_string(s.root.path().join("posture/argv"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            args,
+            manager::manager_args(&s.req.cwd, &s.req.model, &s.req.effort, "posture")
+        );
+        assert!(s.root.path().join("posture/cwd-empty").is_file());
+        // Synthetic credential only. Never inspect the destination of a real login.
+        let cred: Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&env["XDG_DATA_HOME"]).join("opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cred.as_object().unwrap().len(), 1);
+        assert_eq!(cred["openai"]["refresh"], "");
+        session.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn manager_session_result_text_is_final_text() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(SUCCESS);
+        let session = s.start();
+        let (tr, err) = session.run_turn("result", None, None, &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(tr.result_text, "final decision");
+    }
+
+    #[tokio::test]
+    async fn manager_session_turn_error_is_an_error() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(
+            r#"printf '%s\n' '{"type":"error","error":{"name":"ProviderModelNotFoundError","data":{"message":"missing model"}}}'"#,
+        );
+        let session = s.start();
+        let (tr, err) = session.run_turn("error", None, None, &|_| {}).await;
+        assert_eq!(tr.status, TURN_FAILED);
+        assert!(
+            matches!(err, Some(AgentError::Other(ref reason)) if reason.contains("ProviderModelNotFoundError"))
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_session_401_is_a_typed_auth_error() {
+        let _env = crate::ENV_GUARD.read().await;
+        let measured = include_str!("../../../../harness/harness-spike/opencode/failure-401.jsonl");
+        for raw in [
+            measured,
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"invalidated oauth token"}}}"#,
+        ] {
+            let s = Setup::new(&format!("printf '%s\\n' '{}'", raw.trim()));
+            let session = s.start();
+            let (tr, err) = session.run_turn("auth", None, None, &|_| {}).await;
+            assert_eq!(tr.status, TURN_FAILED);
+            assert!(matches!(err, Some(AgentError::AuthFailed(_))), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_run_dir_removed_on_every_exit() {
+        let _env = crate::ENV_GUARD.read().await;
+        for (output, timeout) in [(SUCCESS, false), ("exit 1", false), ("sleep 30", true)] {
+            let mut s = Setup::new(output);
+            if timeout {
+                s.req.run_timeout_ms = 50;
+            }
+            let session = s.start();
+            let (_, err) = session.run_turn("cleanup", None, None, &|_| {}).await;
+            if timeout {
+                assert_eq!(err, Some(AgentError::TurnTimeout));
+            }
+            session.stop().await.unwrap();
+            s.assert_state_gone();
+            drop(session);
+            s.assert_state_gone();
+        }
+        let s = Setup::new(SUCCESS);
+        drop(s.start()); // no turn ever started
+        s.assert_state_gone();
+        let s = Setup::new(SUCCESS);
+        std::fs::write(&s.runner.cfg.auth_source, "malformed-test-only").unwrap();
+        assert!(
+            s.runner
+                .start_manager_session(s.req.clone(), Issue::default(), None)
+                .is_err()
+        );
+        s.assert_state_gone();
+        let s = Setup::new("sleep 30");
+        let session = s.start();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                session.run_turn("cancel", None, None, &|_| {})
+            )
+            .await
+            .is_err()
+        );
+        drop(session); // cancellation bypasses stop
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn concurrent_manager_sessions_are_isolated() {
+        let _env = crate::ENV_GUARD.read().await;
+        let s = Setup::new(&format!("sleep 0.2\n{SUCCESS}"));
+        let a = s.start();
+        let mut second = s.req.clone();
+        second.cwd = s.root.path().join("cwd-b").to_string_lossy().into_owned();
+        second.config_dir = s
+            .root
+            .path()
+            .join("config-b")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir(&second.cwd).unwrap();
+        std::fs::create_dir(&second.config_dir).unwrap();
+        let b = s
+            .runner
+            .start_manager_session(second.clone(), Issue::default(), None)
+            .unwrap();
+        let (ra, rb) = tokio::join!(
+            a.run_turn("a", None, None, &|_| {}),
+            b.run_turn("b", None, None, &|_| {})
+        );
+        assert!(ra.1.is_none() && rb.1.is_none(), "{ra:?}, {rb:?}");
+        let ea = s.env("a");
+        let eb = s.env("b");
+        assert_ne!(s.req.cwd, second.cwd);
+        for (label, cwd) in [("a", &s.req.cwd), ("b", &second.cwd)] {
+            let args = std::fs::read_to_string(s.root.path().join(label).join("argv")).unwrap();
+            assert!(args.contains(cwd));
+            assert!(s.root.path().join(label).join("cwd-empty").is_file());
+        }
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+        ] {
+            assert_ne!(ea[key], eb[key]);
+        }
+        assert_ne!(
+            Path::new(&ea["XDG_DATA_HOME"]).join("opencode/auth.json"),
+            Path::new(&eb["XDG_DATA_HOME"]).join("opencode/auth.json")
+        );
+        a.stop().await.unwrap();
+        assert!(
+            Path::new(&eb["XDG_DATA_HOME"])
+                .join("opencode/auth.json")
+                .is_file()
+        );
+        b.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn missing_real_home_is_a_typed_error() {
+        let _env = crate::ENV_GUARD.write().await;
+        let s = Setup::new(SUCCESS);
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let result = s
+            .runner
+            .start_manager_session(s.req.clone(), Issue::default(), None);
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("HOME", v);
+            }
+        };
+        assert!(
+            matches!(result, Err(AgentError::Other(ref reason)) if reason.starts_with("manager_home_missing:"))
+        );
+        s.assert_state_gone();
+        assert!(!s.root.path().join("posture").exists());
+    }
+
+    #[tokio::test]
+    async fn manager_timeout_covers_closed_stdout() {
+        let _env = crate::ENV_GUARD.read().await;
+        let mut s = Setup::new("exec 1>&-\nsleep 30");
+        s.req.run_timeout_ms = 50;
+        let session = s.start();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            session.run_turn("closed", None, None, &|_| {}),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok((_, Some(AgentError::TurnTimeout)))),
+            "closed stdout must not bypass manager deadline: {result:?}"
+        );
+        drop(session);
+        s.assert_state_gone();
     }
 }
 
@@ -2575,6 +3295,374 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
             rec.is_file(),
             "the record must survive a pre-turn ending so a later dispatch can resume"
         );
+    }
+
+    /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1118's first half. A retained legacy directory holds the
+    /// `auth.json` copied when it was first provisioned; when the operator runs `opencode auth login`
+    /// afterwards, the resumed session must see the NEW login, not keep failing on the copy it was
+    /// born with until retention expires (2026-10-06: five tickets, eleven 401 attempts each).
+    #[tokio::test]
+    async fn adopting_a_retained_session_reseeds_the_operators_current_login() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        // Provision legacy, then the cut-off marks the directory kept.
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_s, on) = collector();
+        let (_tr, _e) = sess.run_turn("p", None, None, &on).await;
+        sess.stop().await.expect("stop");
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(dirs.len(), 1, "the cut-off session is retained: {dirs:?}");
+        let copy = state_root
+            .path()
+            .join(&dirs[0])
+            .join("opencode")
+            .join("auth.json");
+
+        // The operator logs in again: the source changes.
+        std::fs::write(&auth, b"{\"openai\":{\"type\":\"oauth\",\"fresh\":true}}")
+            .expect("relogin");
+
+        // The retry adopts the retained directory.
+        let retry = runner_with(&cut, &root, &auth, &sr, "m", 30);
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("adopting session");
+        assert_eq!(sess2.thread_id(), "ses_cut", "the retry adopts the session");
+        assert_eq!(
+            std::fs::read(&copy).expect("read run copy"),
+            std::fs::read(&auth).expect("read source"),
+            "an adopted legacy directory must carry the operator's CURRENT auth.json"
+        );
+        drop(sess2);
+    }
+
+    // The other half of re-seed-on-adopt: a retained copy that opencode refreshed IN PLACE after
+    // the operator's login was taken holds the rotated token, and adopting must keep it rather than
+    // replay the operator's older, spent one.
+    #[tokio::test]
+    async fn adopting_keeps_a_retained_copy_newer_than_the_operators_login() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_with(&cut, &root, &auth, &sr, "m", 1)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let _ = sess.run_turn("p", None, None, &on_event).await;
+        sess.stop().await.expect("stop");
+        drop(sess);
+        let dirs = session_dirs(state_root.path());
+        assert_eq!(dirs.len(), 1);
+        let copy = state_root
+            .path()
+            .join(&dirs[0])
+            .join("opencode")
+            .join("auth.json");
+        // opencode refreshed the login inside the run: the copy now differs and is newer.
+        std::fs::write(&copy, b"{\"openai\":{\"type\":\"oauth\",\"rotated\":true}}")
+            .expect("in-place refresh");
+        let rotated = std::fs::read(&copy).expect("read");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&auth)
+            .expect("open")
+            .set_modified(old)
+            .expect("age the operator's login");
+
+        let sess2 = runner_with(&cut, &root, &auth, &sr, "m", 30)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("resume");
+        assert_eq!(sess2.thread_id(), "ses_cut");
+        assert_eq!(
+            std::fs::read(&copy).expect("read"),
+            rotated,
+            "a copy newer than the operator's login is the live one and must survive adoption"
+        );
+        drop(sess2);
+    }
+
+    /// A fake `opencode` for the credential-rejection path (STUDIO-1118). Invocation `n` (counted
+    /// in `<dir>/count`) emits the OAuth-shaped 401 while `n <= fails`, and a clean turn after.
+    /// `relogin` makes the FIRST invocation rewrite the operator's `auth.json` — the operator
+    /// running `opencode auth login` while the run is failing. Each invocation records in
+    /// `<dir>/match.<n>` whether the run's copy equalled the operator's file when it started, which
+    /// is how a test sees that a retry really ran on the re-seeded login (compared with `cmp`, never
+    /// printed).
+    fn auth_fake(dir: &TempDir, auth: &str, relogin: bool, fails: u32) -> String {
+        let d = dir.path().display();
+        let relogin = if relogin {
+            format!(
+                "[ \"$n\" -eq 1 ] && printf '%s' '{{\"openai\":{{\"type\":\"oauth\",\"fresh\":true}}}}' > '{auth}'\n"
+            )
+        } else {
+            String::new()
+        };
+        let body = format!(
+            r#"n=$(( $(cat '{d}/count' 2>/dev/null || echo 0) + 1 )); echo "$n" > '{d}/count'
+if cmp -s "$XDG_DATA_HOME/opencode/auth.json" '{auth}'; then echo same > '{d}/match.'"$n"; else echo differ > '{d}/match.'"$n"; fi
+{relogin}if [ "$n" -le {fails} ]; then
+  printf '{{"type":"error","sessionID":"ses_auth","error":{{"name":"APIError","data":{{"message":"Token refresh failed: 401 invalidated oauth token","statusCode":401,"isRetryable":false}}}}}}\n'
+  exit 1
+fi
+printf '{{"type":"step_start","sessionID":"ses_auth","part":{{"type":"step-start"}}}}\n'
+printf '{{"type":"text","sessionID":"ses_auth","part":{{"type":"text","text":"done"}}}}\n'
+printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-finish","reason":"stop","tokens":{{"total":3,"input":2,"output":1,"reasoning":0,"cache":{{"write":0,"read":0}}}}}}}}\n'
+"#
+        );
+        write_script(dir, "auth-fake.sh", &body)
+    }
+
+    fn invocations(dir: &TempDir) -> u32 {
+        std::fs::read_to_string(dir.path().join("count"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    // ⚠️⚠️ STUDIO-1118 acceptance. A credential rejection on a login the operator has NOT changed
+    // must stop at once with the typed auth-needed outcome — no re-run of the turn, and an error
+    // the orchestrator holds for a human rather than a failure it retries every five minutes for an
+    // hour on the same dead copy.
+    #[tokio::test]
+    async fn an_auth_rejection_on_an_unchanged_login_stops_with_auth_needed() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, false, 99);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_for(&script, &root, &auth, &sr)
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(
+            invocations(&scripts),
+            1,
+            "an unchanged login is never retried"
+        );
+        assert_eq!(tr.status, TURN_FAILED);
+        let err = err.expect("an auth rejection is an error");
+        assert!(matches!(err, AgentError::AuthNeeded(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("opencode_auth_needed:"), "{msg}");
+        assert!(
+            msg.contains("operator must run `opencode auth login` as the daemon's user"),
+            "{msg}"
+        );
+        assert!(msg.contains("byte-identical"), "names why: {msg}");
+        assert!(
+            msg.contains("turn_failed: APIError") && msg.contains("status 401"),
+            "the provider's own reason is kept: {msg}"
+        );
+        let evs = events_of(&seen);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.event_type == EVENT_TURN_FAILED)
+                .count(),
+            1,
+            "{evs:#?}"
+        );
+        assert!(
+            evs.iter().any(|e| e.event_type == EVENT_NOTIFICATION
+                && e.message.starts_with("opencode_auth_needed:")),
+            "the run's own event stream says a human is needed: {evs:#?}"
+        );
+
+        // The failed session is retained, so the human-resumed dispatch adopts it and re-seeds.
+        sess.stop().await.expect("stop");
+        assert!(record_file(&sr, "STUDIO-1118").is_file());
+    }
+
+    /// The `level` and fields of every event a test subscriber saw — just enough to assert the
+    /// auth-needed WARN without a credential ever entering a field.
+    #[derive(Clone, Debug)]
+    struct Captured {
+        level: tracing::Level,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct Recorder(Arc<std::sync::Mutex<Vec<Captured>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit(std::collections::HashMap<String, String>);
+            impl tracing::field::Visit for Visit {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.insert(f.name().to_string(), format!("{v:?}"));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.insert(f.name().to_string(), v.to_string());
+                }
+            }
+            let mut v = Visit(std::collections::HashMap::new());
+            event.record(&mut v);
+            if let Ok(mut buf) = self.0.lock() {
+                buf.push(Captured {
+                    level: *event.metadata().level(),
+                    fields: v.0,
+                });
+            }
+        }
+    }
+
+    // STUDIO-1118 acceptance, the WARN half (alice's B1): stopping on an unchanged login is LOUD —
+    // one WARN naming the issue, the identity and the harness, carrying only a digest prefix of the
+    // rejected login.
+    #[tokio::test]
+    async fn an_auth_needed_stop_warns_naming_the_identity_and_the_harness() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _env = ENV_GUARD.read().await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Recorder(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Two identical scenarios: the first only registers the WARN's callsite on THIS thread's
+        // subscriber (a parallel test with no subscriber can pin its cached Interest to `never`,
+        // TRA-243); the cache is rebuilt and only the second is asserted on.
+        for pass in 0..2 {
+            let scripts = TempDir::new();
+            let auth = seeded_auth(&scripts);
+            let script = auth_fake(&scripts, &auth, false, 99);
+            let state_root = TempDir::new();
+            let root = TempDir::new();
+            let ws = make_ws(&root, "w");
+            let sr = state_root.path().to_string_lossy().into_owned();
+            if pass == 1 {
+                tracing::callsite::rebuild_interest_cache();
+                events.lock().expect("event buffer").clear();
+            }
+            let sess = runner_for(&script, &root, &auth, &sr)
+                .start_session(&ws, issue("STUDIO-1118"), None)
+                .await
+                .expect("session");
+            let (_seen, on_event) = collector();
+            let (_tr, err) = sess.run_turn("p", None, None, &on_event).await;
+            assert!(matches!(err, Some(AgentError::AuthNeeded(_))), "{err:?}");
+            sess.stop().await.expect("stop");
+        }
+
+        let got = events.lock().expect("event buffer").clone();
+        let warns: Vec<_> = got
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::WARN
+                    && e.fields
+                        .get("message")
+                        .is_some_and(|m| m.contains("opencode auth login"))
+            })
+            .collect();
+        assert_eq!(warns.len(), 1, "exactly one auth-needed WARN: {got:?}");
+        let w = &warns[0].fields;
+        assert_eq!(
+            w.get("issue").map(String::as_str),
+            Some("STUDIO-1118"),
+            "{w:?}"
+        );
+        assert!(w.contains_key("identity"), "{w:?}");
+        assert_eq!(
+            w.get("harness").map(String::as_str),
+            Some(resume::HARNESS),
+            "{w:?}"
+        );
+        let login = w.get("login").cloned().unwrap_or_default();
+        assert!(
+            login.len() == 12 && login.chars().all(|c| c.is_ascii_hexdigit()),
+            "only a 12-hex digest prefix is logged, never the credential: {login:?}"
+        );
+    }
+
+    // The operator logged in while the run was failing: the copy is re-seeded and the SAME turn is
+    // retried once, immediately, on the fresh login — and that retry is what the caller sees.
+    #[tokio::test]
+    async fn an_auth_rejection_after_a_relogin_retries_once_on_the_fresh_copy() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, true, 1);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let sess = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy())
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert!(
+            err.is_none(),
+            "the retry on the fresh login succeeded: {err:?}"
+        );
+        assert_eq!(tr.status, TURN_SUCCEEDED);
+        assert_eq!(invocations(&scripts), 2, "exactly one immediate retry");
+        assert_eq!(
+            std::fs::read_to_string(scripts.path().join("match.2")).expect("match.2"),
+            "same\n",
+            "the retry ran on the operator's re-seeded login"
+        );
+        let evs = events_of(&seen);
+        assert!(
+            evs.iter()
+                .any(|e| e.event_type == EVENT_NOTIFICATION && e.message.contains("retrying")),
+            "{evs:#?}"
+        );
+        assert!(evs.iter().any(|e| e.event_type == EVENT_TURN_COMPLETED));
+    }
+
+    // The re-seeded login is rejected too: that is the ONE retry spent, and the run stops with the
+    // auth-needed outcome rather than looping.
+    #[tokio::test]
+    async fn a_relogin_that_is_rejected_too_stops_after_exactly_one_retry() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake(&scripts, &auth, true, 99);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let sess = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy())
+            .start_session(&ws, issue("STUDIO-1118"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let (_tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(invocations(&scripts), 2, "one retry, never a second");
+        let err = err.expect("error");
+        assert!(matches!(err, AgentError::AuthNeeded(_)), "{err:?}");
+        assert!(err.to_string().contains("freshly re-seeded"), "{err}");
     }
 
     /// A model mismatch falls back to a cold start with its own directory and no `-s`.

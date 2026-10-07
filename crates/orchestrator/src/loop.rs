@@ -1983,6 +1983,29 @@ impl Orchestrator {
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
             let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
+            // The provider rejected the run's login and no retry can fix it (STUDIO-1118): hold the
+            // ticket for a human with the daemon's human-needed label, so it stays out of selection
+            // even across a restart, and the job page's resume clears it once they have logged in.
+            let auth_needed = matches!(
+                err,
+                Some(WorkerError::Agent(
+                    agent::AgentError::AuthNeeded(_) | agent::AgentError::AuthFailed(_)
+                ))
+            );
+            if auth_needed
+                && deps.manager.is_none()
+                && !iss.team_id.is_empty()
+                && let Err(e) = deps
+                    .tracker
+                    .add_issue_label(&iss.id, &iss.team_id, crate::teams::HUMAN_LABEL)
+                    .await
+            {
+                tracing::warn!(
+                    issue = %iss.identifier, err = %e,
+                    "agent login rejected, but the ticket could not be labelled for a human; it is \
+                     still held in memory — apply the label by hand"
+                );
+            }
             let exit = EvWorkerExit {
                 issue_id,
                 failed: err.is_some(),
@@ -1993,6 +2016,7 @@ impl Orchestrator {
                 review_verdict: declared.review_verdict,
                 manager_text: declared.manager_text,
                 refused,
+                auth_needed,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
@@ -2432,6 +2456,7 @@ mod tests {
                 review_verdict: None,
                 manager_text: None,
                 refused: false,
+                auth_needed: false,
             }));
         }));
         (o, spawned)

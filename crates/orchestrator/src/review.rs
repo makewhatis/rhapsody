@@ -2545,6 +2545,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         run_id
     }
@@ -2569,6 +2570,7 @@ mod tests {
             review_verdict: Some(verdict),
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
         run_id
     }
@@ -3405,6 +3407,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
@@ -3575,6 +3578,7 @@ mod tests {
             review_verdict: None,
             manager_text: None,
             refused: false,
+            auth_needed: false,
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())

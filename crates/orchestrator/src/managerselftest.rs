@@ -24,7 +24,74 @@
 //! impure half is launching the canary and reading its side effects; it is abstracted behind
 //! [`CanaryRunner`] so the decision is exhaustively tested without a real model or CLI.
 
-use rhapsody_config::teams::ReviewAuthority;
+use rhapsody_config::teams::{ManagerHarnessEntry, ReviewAuthority};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialStatus {
+    NotApplicable,
+    Valid { expires_in_ms: i64 },
+    ExpiringSoon { expires_in_ms: i64 },
+    Expired,
+    Missing(String),
+}
+
+pub trait EntryCredentialProbe: Send + Sync {
+    fn status(&self, entry: &ManagerHarnessEntry, now_ms: i64) -> CredentialStatus;
+    fn fingerprint(&self, entry: &ManagerHarnessEntry) -> Option<String>;
+}
+
+/// Native Claude needs no expiry probe. MH3 installs the OpenCode login adapter.
+pub struct NativeCredentialProbe;
+impl EntryCredentialProbe for NativeCredentialProbe {
+    fn status(&self, entry: &ManagerHarnessEntry, _: i64) -> CredentialStatus {
+        if entry.harness == "claude" {
+            CredentialStatus::NotApplicable
+        } else {
+            CredentialStatus::Missing("no credential probe for harness".to_string())
+        }
+    }
+    fn fingerprint(&self, _: &ManagerHarnessEntry) -> Option<String> {
+        None
+    }
+}
+
+pub trait CanaryRunnerFactory: Send + Sync {
+    fn probe_version(&self, entry: &ManagerHarnessEntry) -> Result<String, String>;
+    fn runner(&self, entry: &ManagerHarnessEntry) -> Option<Box<dyn CanaryRunner>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedEntry {
+    pub index: usize,
+    pub entry: ManagerHarnessEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecidedBy {
+    /// One-based entry number, as the operator's ordered list and logs present it.
+    pub entry: usize,
+    pub harness: String,
+    pub model: String,
+    pub fallback_reason: Option<String>,
+}
+
+impl DecidedBy {
+    pub fn from_stored(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        serde_json::from_value(value.get("decided_by")?.clone()).ok()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EntryState {
+    entry: ManagerHarnessEntry,
+    installed_version: Option<String>,
+    record: Option<SelfTestRecord>,
+    auth_blocked: Option<Option<String>>,
+    unavailable: String,
+    warned_at_ms: Option<i64>,
+    credential_notice: String,
+}
 
 /// The canary's working directory is empty except for this project-settings directory; a project
 /// setting source that loads would run the hook below and write [`CANARY_TRAP_FILE`].
@@ -396,6 +463,8 @@ struct SelfTestInner {
     /// determined, which fails the gate closed.
     installed_version: Option<String>,
     record: Option<SelfTestRecord>,
+    entries: Vec<EntryState>,
+    credential_warnings: Vec<String>,
 }
 
 /// The daemon-wide, lock-guarded holder of the §4.7 self-test verdict (STUDIO-1049). The boot gate
@@ -404,25 +473,261 @@ struct SelfTestInner {
 ///
 /// The lock is never held across an `.await` (two map reads and out), so it is a shared-state seam
 /// only in the bookkeeping sense, exactly as [`crate::drain::DrainSignal`] is.
-#[derive(Debug, Default)]
 pub struct ManagerSelfTestState {
     inner: std::sync::Mutex<SelfTestInner>,
+    probe: std::sync::RwLock<std::sync::Arc<dyn EntryCredentialProbe>>,
+}
+
+impl std::fmt::Debug for ManagerSelfTestState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagerSelfTestState")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+impl Default for ManagerSelfTestState {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            probe: std::sync::RwLock::new(std::sync::Arc::new(NativeCredentialProbe)),
+        }
+    }
 }
 
 impl ManagerSelfTestState {
+    pub fn new(entries: Vec<ManagerHarnessEntry>) -> Self {
+        let state = Self::default();
+        state.configure(entries);
+        state
+    }
+
+    /// Boot installs the ordered entries; legacy tests may have already recorded their one verdict.
+    pub fn configure(&self, entries: Vec<ManagerHarnessEntry>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.entries.iter().map(|e| &e.entry).eq(entries.iter()) {
+            return;
+        }
+        let legacy = inner.entries.is_empty();
+        inner.entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| EntryState {
+                entry,
+                installed_version: if legacy && index == 0 {
+                    inner.installed_version.clone()
+                } else {
+                    None
+                },
+                record: if legacy && index == 0 {
+                    inner.record.clone()
+                } else {
+                    None
+                },
+                auth_blocked: None,
+                unavailable: String::new(),
+                warned_at_ms: None,
+                credential_notice: String::new(),
+            })
+            .collect();
+    }
+
+    pub fn entries(&self) -> Vec<ManagerHarnessEntry> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .map(|e| e.entry.clone())
+            .collect()
+    }
+
+    pub fn set_credential_probe(&self, probe: std::sync::Arc<dyn EntryCredentialProbe>) {
+        *self.probe.write().unwrap_or_else(|e| e.into_inner()) = probe;
+    }
+    pub fn credential_probe(&self) -> std::sync::Arc<dyn EntryCredentialProbe> {
+        self.probe.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn record_entry(&self, index: usize, record: SelfTestRecord) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = inner.entries.get_mut(index) {
+            state.installed_version = Some(record.cli_version.clone());
+            state.record = Some(record.clone());
+        }
+        if index == 0 {
+            inner.installed_version = Some(record.cli_version.clone());
+            inner.record = Some(record);
+        }
+    }
+    pub fn observe_entry_probe(&self, index: usize, probed: &Result<String, String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = inner.entries.get_mut(index) {
+            state.installed_version = probed.as_ref().ok().cloned();
+        }
+        if index == 0 {
+            inner.installed_version = probed.as_ref().ok().cloned();
+        }
+    }
+    pub fn mark_auth_blocked(&self, index: usize, fingerprint: Option<String>) {
+        if let Some(state) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get_mut(index)
+        {
+            state.auth_blocked = Some(fingerprint);
+        }
+    }
+    pub fn fallback_reason(&self, before: usize) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .take(before)
+            .enumerate()
+            .filter(|(_, e)| !e.unavailable.is_empty())
+            .map(|(i, e)| format!("entry {} unavailable: {}", i + 1, e.unavailable))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+    pub fn take_credential_warnings(&self) -> Vec<String> {
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .credential_warnings,
+        )
+    }
+
+    pub fn credential_notices(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .filter(|e| !e.credential_notice.is_empty())
+            .map(|e| e.credential_notice.clone())
+            .collect()
+    }
+    pub fn select(
+        &self,
+        now_ms: i64,
+        probe: &dyn EntryCredentialProbe,
+    ) -> Result<SelectedEntry, ManagerUnavailable> {
+        self.select_from(0, now_ms, probe)
+    }
+    pub fn select_from(
+        &self,
+        start: usize,
+        now_ms: i64,
+        probe: &dyn EntryCredentialProbe,
+    ) -> Result<SelectedEntry, ManagerUnavailable> {
+        // Credential I/O happens outside the bookkeeping lock.
+        let entries = self.entries();
+        let statuses: Vec<_> = entries
+            .iter()
+            .map(|e| (probe.status(e, now_ms), probe.fingerprint(e)))
+            .collect();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut warnings = Vec::new();
+        let mut selected = None;
+        for (index, (state, (status, fingerprint))) in inner
+            .entries
+            .iter_mut()
+            .zip(&statuses)
+            .enumerate()
+            .skip(start)
+        {
+            if state
+                .auth_blocked
+                .as_ref()
+                .is_some_and(|blocked| blocked != fingerprint)
+            {
+                state.auth_blocked = None;
+            }
+            let reason = if state.auth_blocked.is_some() {
+                Some("authentication failed; run opencode auth login as the daemon's user".to_string())
+            } else {
+                match status {
+                    CredentialStatus::Expired => Some("OpenAI login expired; run opencode auth login as the daemon's user".to_string()),
+                    CredentialStatus::Missing(reason) => Some(reason.clone()),
+                    _ => None,
+                }
+            }.or_else(|| match (&state.installed_version, &state.record) {
+                (None, _) => Some("the installed CLI version could not be determined".to_string()),
+                (_, None) => Some("no startup self-test has run for this CLI".to_string()),
+                (Some(installed), Some(record)) if installed != &record.cli_version => Some(format!("the self-test was measured on CLI version {}, not the installed {}; re-run it", record.cli_version, installed)),
+                (_, Some(SelfTestRecord { verdict: SelfTestVerdict::Failed(reason), .. })) => Some(reason.detail.clone()),
+                _ => None,
+            });
+            state.unavailable = reason.unwrap_or_default();
+            state.credential_notice = match status {
+                CredentialStatus::ExpiringSoon { expires_in_ms } => format!(
+                    "manager entry {} ({} {}): OpenAI login expires in {}h; run opencode auth login as the daemon's user",
+                    index + 1,
+                    state.entry.harness,
+                    state.entry.model,
+                    expires_in_ms / 3_600_000
+                ),
+                CredentialStatus::Expired => format!(
+                    "manager entry {} ({} {}): OpenAI login expired; run opencode auth login as the daemon's user",
+                    index + 1,
+                    state.entry.harness,
+                    state.entry.model
+                ),
+                _ => String::new(),
+            };
+            if let CredentialStatus::ExpiringSoon { .. } = status
+                && state
+                    .warned_at_ms
+                    .is_none_or(|last| now_ms.saturating_sub(last) >= 86_400_000)
+            {
+                state.warned_at_ms = Some(now_ms);
+                warnings.push(state.credential_notice.clone());
+            }
+            if state.unavailable.is_empty() && selected.is_none() {
+                selected = Some(SelectedEntry {
+                    index,
+                    entry: state.entry.clone(),
+                });
+            }
+        }
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
+        if !warnings.is_empty() {
+            inner.credential_warnings = warnings;
+        }
+        selected.ok_or_else(|| ManagerUnavailable {
+            cli_version: String::new(),
+            detail: inner
+                .entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .map(|(index, e)| format!("entry {} unavailable: {}", index + 1, e.unavailable))
+                .collect::<Vec<_>>()
+                .join("; "),
+        })
+    }
+
     /// Records a measured verdict. The recorded version becomes the installed version: this is the
     /// boot gate's one write.
     pub fn record(&self, record: SelfTestRecord) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.installed_version = Some(record.cli_version.clone());
-        inner.record = Some(record);
+        self.record_entry(0, record);
     }
 
     /// Sets the installed CLI version without a verdict — used when the probe answers but the canary
     /// could not run, so the gate must refuse (no passing record for that version).
     pub fn set_installed_version(&self, version: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.installed_version = version;
+        inner.installed_version = version.clone();
+        if let Some(entry) = inner.entries.first_mut() {
+            entry.installed_version = version;
+        }
     }
 
     /// Records a freshly probed CLI version without a verdict (§4.7). A probe that failed leaves the
@@ -503,7 +808,71 @@ impl crate::orchestrator::Orchestrator {
     /// `Ok` only when the §4.7 self-test has passed on the current CLI version; otherwise the typed
     /// reason the manager is disabled.
     pub fn manager_launch_permitted(&self) -> Result<(), ManagerUnavailable> {
-        self.manager_selftest.permitted()
+        if self.manager_selftest.entries().is_empty() {
+            return self.manager_selftest.permitted();
+        }
+        self.manager_selftest
+            .select(
+                (self.now)().timestamp_millis(),
+                self.manager_selftest.credential_probe().as_ref(),
+            )
+            .map(|_| ())
+    }
+}
+
+/// Boot and the watcher share this per-entry version reconciliation. A failed verdict is not
+/// retried until the harness version changes; absence of a factory arm fails closed with detail.
+pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &ManagerSelfTestState) {
+    for (index, entry) in state.entries().iter().enumerate() {
+        let probed = factory.probe_version(entry);
+        state.observe_entry_probe(index, &probed);
+        let version = probed.as_ref().ok().cloned().unwrap_or_default();
+        let unchanged = state
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(index)
+            .and_then(|e| e.record.as_ref())
+            .is_some_and(|r| r.cli_version == version);
+        if unchanged && probed.is_ok() {
+            continue;
+        }
+        let verdict = match probed {
+            Err(detail) => SelfTestVerdict::Failed(ManagerUnavailable {
+                cli_version: version.clone(),
+                detail,
+            }),
+            Ok(_) => match factory.runner(entry) {
+                Some(runner) => evaluate(&version, &runner.run_canary(&version).await),
+                None => SelfTestVerdict::Failed(ManagerUnavailable {
+                    cli_version: version.clone(),
+                    detail: format!("no self-test for harness {}", entry.harness),
+                }),
+            },
+        };
+        match &verdict {
+            SelfTestVerdict::Passed => tracing::info!(
+                "manager entry {} ({} {}): self-test passed",
+                index + 1,
+                entry.harness,
+                entry.model
+            ),
+            SelfTestVerdict::Failed(reason) => tracing::warn!(
+                "manager entry {} ({} {}): self-test failed: {}",
+                index + 1,
+                entry.harness,
+                entry.model,
+                reason.detail
+            ),
+        }
+        state.record_entry(
+            index,
+            SelfTestRecord {
+                cli_version: version,
+                verdict,
+            },
+        );
     }
 }
 
@@ -524,6 +893,34 @@ pub async fn run_boot_self_test(
         verdict,
     });
     reason
+}
+
+/// Which self-test run disabled the manager: the boot gate or the version-change watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfTestTrigger {
+    /// The startup self-test ([`run_boot_self_test`]).
+    Boot,
+    /// A fresh self-test after the installed CLI version changed ([`run_selftest_watch_task`]).
+    VersionChange,
+}
+
+/// Logs a failed self-test at WARN with the summary message AND the detail naming the attempt that
+/// failed (STUDIO-1117). A guard that refuses work says why in the same line: the summary alone
+/// left the operator hand-building a probe to learn which attempt was not refused.
+pub fn warn_self_test_failed(trigger: SelfTestTrigger, reason: &ManagerUnavailable) {
+    match trigger {
+        SelfTestTrigger::Boot => tracing::warn!(
+            reason = %reason.message(),
+            detail = %reason.detail,
+            "manager self-test failed; manager disabled and its items go to the human feed"
+        ),
+        SelfTestTrigger::VersionChange => tracing::warn!(
+            reason = %reason.message(),
+            detail = %reason.detail,
+            "manager self-test watcher: the CLI version changed and the fresh self-test failed; \
+             the manager is disabled"
+        ),
+    }
 }
 
 /// Reconciles one freshly probed CLI version with the recorded verdict (STUDIO-1049, §4.7). The gate
@@ -579,31 +976,19 @@ pub const MANAGER_SELFTEST_WATCH_INTERVAL: std::time::Duration = std::time::Dura
 /// changes" true for a long-lived daemon rather than only at boot.
 pub async fn run_selftest_watch_task(
     mut ctx: crate::CancelWait,
-    command: String,
-    workspace_root: String,
-    daemon_bin: String,
-    workflow_path: String,
+    factory: std::sync::Arc<dyn CanaryRunnerFactory>,
     state: std::sync::Arc<ManagerSelfTestState>,
 ) {
-    let runner = CliCanaryRunner {
-        command: command.clone(),
-        workspace_root,
-        daemon_bin,
-        workflow_path,
-    };
     loop {
         tokio::select! {
             _ = ctx.cancelled() => return,
             _ = tokio::time::sleep(MANAGER_SELFTEST_WATCH_INTERVAL) => {}
         }
-        let probed = probe_cli_version(&command);
-        if let Some(reason) = reconcile_probed_version(&runner, &state, probed).await {
-            tracing::warn!(
-                reason = %reason.message(),
-                "manager self-test watcher: the CLI version changed and the fresh self-test failed; \
-                 the manager is disabled"
-            );
-        }
+        run_entry_self_tests(factory.as_ref(), &state).await;
+        let _ = state.select(
+            chrono::Utc::now().timestamp_millis(),
+            state.credential_probe().as_ref(),
+        );
     }
 }
 
@@ -674,6 +1059,30 @@ impl CliCanaryRunner {
 #[async_trait::async_trait]
 impl CanaryRunner for CliCanaryRunner {
     async fn run_canary(&self, cli_version: &str) -> Vec<CanaryObservation> {
+        self.run_for_entry(cli_version, None).await
+    }
+}
+
+/// The factory's Claude arm pins the configured entry's model, including model-availability errors.
+pub struct ClaudeEntryCanaryRunner {
+    pub runner: CliCanaryRunner,
+    pub entry: ManagerHarnessEntry,
+}
+#[async_trait::async_trait]
+impl CanaryRunner for ClaudeEntryCanaryRunner {
+    async fn run_canary(&self, cli_version: &str) -> Vec<CanaryObservation> {
+        self.runner
+            .run_for_entry(cli_version, Some(&self.entry))
+            .await
+    }
+}
+
+impl CliCanaryRunner {
+    async fn run_for_entry(
+        &self,
+        cli_version: &str,
+        entry: Option<&ManagerHarnessEntry>,
+    ) -> Vec<CanaryObservation> {
         // A daemon-owned per-run canary directory under the workspace root. Removed on every exit
         // path below via a drop guard so neither the trap file nor the cwd outlives the self-test.
         let dir = std::path::Path::new(&self.workspace_root)
@@ -711,6 +1120,8 @@ impl CanaryRunner for CliCanaryRunner {
             ..rhapsody_core::Issue::default()
         };
         let req = rhapsody_agent::manager::ManagerSessionStart {
+            model: entry.map_or_else(String::new, |e| e.model.clone()),
+            effort: entry.map_or_else(String::new, |e| e.effort.clone()),
             cwd: dir.to_string_lossy().into_owned(),
             config_dir: config_dir.to_string_lossy().into_owned(),
             run_timeout_ms: CANARY_RUN_TIMEOUT_MS,
@@ -732,6 +1143,13 @@ impl CanaryRunner for CliCanaryRunner {
             Ok(s) => s,
             Err(e) => return self.failed(format!("could not start the canary session: {e}")),
         };
+        if let Some(entry) = entry {
+            session.set_model_override(rhapsody_agent::ModelOverride {
+                model: entry.model.clone(),
+                effort: entry.effort.clone(),
+                ..Default::default()
+            });
+        }
         let noop = |_e: rhapsody_agent::Event| {};
         let (result, err) = session.run_turn(&canary_prompt(), None, None, &noop).await;
         // The canary must actually RUN to prove anything. A CLI (or a config root) that emits a
@@ -834,6 +1252,264 @@ pub async fn run_and_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entries() -> Vec<rhapsody_config::teams::ManagerHarnessEntry> {
+        vec![
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "opencode".into(),
+                model: "openai/gpt-6.1-sol".into(),
+                effort: "xhigh".into(),
+            },
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            },
+        ]
+    }
+
+    struct FakeProbe {
+        status: CredentialStatus,
+        fingerprint: Option<String>,
+    }
+    impl EntryCredentialProbe for FakeProbe {
+        fn status(
+            &self,
+            entry: &rhapsody_config::teams::ManagerHarnessEntry,
+            _: i64,
+        ) -> CredentialStatus {
+            if entry.harness == "claude" {
+                CredentialStatus::NotApplicable
+            } else {
+                self.status.clone()
+            }
+        }
+        fn fingerprint(&self, _: &rhapsody_config::teams::ManagerHarnessEntry) -> Option<String> {
+            self.fingerprint.clone()
+        }
+    }
+    fn probe(status: CredentialStatus) -> FakeProbe {
+        FakeProbe {
+            status,
+            fingerprint: Some("login-a".into()),
+        }
+    }
+    fn passing_state() -> ManagerSelfTestState {
+        let state = ManagerSelfTestState::new(entries());
+        for index in 0..2 {
+            state.record_entry(
+                index,
+                SelfTestRecord {
+                    cli_version: "1".into(),
+                    verdict: SelfTestVerdict::Passed,
+                },
+            );
+        }
+        state
+    }
+    #[test]
+    fn select_first_passing_entry() {
+        let state = passing_state();
+        let selected = state
+            .select(0, &probe(CredentialStatus::NotApplicable))
+            .expect("available");
+        assert_eq!(selected.index, 0);
+        assert_eq!(selected.entry, entries()[0]);
+    }
+    #[test]
+    fn failed_entry_falls_through_with_detail_in_reason() {
+        let state = passing_state();
+        state.record_entry(
+            0,
+            SelfTestRecord {
+                cli_version: "1".into(),
+                verdict: SelfTestVerdict::Failed(ManagerUnavailable {
+                    cli_version: "1".into(),
+                    detail: "unknown tool exposed".into(),
+                }),
+            },
+        );
+        assert_eq!(
+            state
+                .select(0, &probe(CredentialStatus::NotApplicable))
+                .expect("fallback")
+                .index,
+            1
+        );
+        assert!(
+            state
+                .fallback_reason(1)
+                .contains("entry 1 unavailable: unknown tool exposed")
+        );
+    }
+    #[test]
+    fn expired_entry_skipped() {
+        assert_eq!(
+            passing_state()
+                .select(0, &probe(CredentialStatus::Expired))
+                .expect("fallback")
+                .index,
+            1
+        );
+    }
+    #[test]
+    fn expiring_soon_entry_still_selected_and_warns_once_per_day() {
+        let state = passing_state();
+        let p = probe(CredentialStatus::ExpiringSoon {
+            expires_in_ms: 60_000,
+        });
+        assert_eq!(state.select(0, &p).expect("available").index, 0);
+        assert_eq!(state.take_credential_warnings().len(), 1);
+        state.select(1, &p).expect("available");
+        assert!(state.take_credential_warnings().is_empty());
+        state.select(86_400_000, &p).expect("available");
+        assert_eq!(state.take_credential_warnings().len(), 1);
+    }
+    #[test]
+    fn missing_login_entry_skipped_with_message() {
+        let state = passing_state();
+        assert_eq!(
+            state
+                .select(
+                    0,
+                    &probe(CredentialStatus::Missing(
+                        "operator has no OpenAI login; run opencode auth login".into()
+                    ))
+                )
+                .expect("fallback")
+                .index,
+            1
+        );
+        assert!(
+            state
+                .fallback_reason(1)
+                .contains("operator has no OpenAI login")
+        );
+    }
+    #[test]
+    fn auth_blocked_until_fingerprint_changes() {
+        let state = passing_state();
+        state.mark_auth_blocked(0, Some("login-a".into()));
+        let mut p = probe(CredentialStatus::NotApplicable);
+        assert_eq!(state.select(0, &p).expect("fallback").index, 1);
+        assert_eq!(
+            state.select(999_999_999, &p).expect("still blocked").index,
+            1
+        );
+        p.fingerprint = Some("login-b".into());
+        assert_eq!(state.select(999_999_999, &p).expect("new login").index, 0);
+    }
+    #[test]
+    fn all_unavailable_disables_with_human_feed_reason() {
+        let state = passing_state();
+        state.mark_auth_blocked(0, Some("login-a".into()));
+        state.mark_auth_blocked(1, Some("login-a".into()));
+        let err = state
+            .select(0, &probe(CredentialStatus::NotApplicable))
+            .expect_err("disabled");
+        assert!(err.detail.contains("entry 1") && err.detail.contains("entry 2"));
+    }
+    #[test]
+    fn all_pending_matches_todays_pre_verdict_behaviour() {
+        let legacy = ManagerSelfTestState::default()
+            .permitted()
+            .expect_err("pending refuses");
+        let state = ManagerSelfTestState::new(entries());
+        let err = state
+            .select(0, &probe(CredentialStatus::NotApplicable))
+            .expect_err("pending refuses");
+        assert!(err.detail.contains(&legacy.detail));
+        assert!(state.snapshot().is_none(), "no verdict is manufactured");
+    }
+
+    struct FakeFactory {
+        versions: Vec<String>,
+        missing: bool,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl CanaryRunnerFactory for FakeFactory {
+        fn probe_version(
+            &self,
+            entry: &rhapsody_config::teams::ManagerHarnessEntry,
+        ) -> Result<String, String> {
+            Ok(self.versions[usize::from(entry.harness == "claude")].clone())
+        }
+        fn runner(
+            &self,
+            entry: &rhapsody_config::teams::ManagerHarnessEntry,
+        ) -> Option<Box<dyn CanaryRunner>> {
+            if self.missing {
+                return None;
+            }
+            self.calls.lock().expect("lock").push(entry.harness.clone());
+            Some(Box::new(FakeCanary(if entry.harness == "claude" {
+                vec![CanaryObservation {
+                    attempt: CanaryAttempt::InitContract,
+                    refused: false,
+                    detail: "unknown tool exposed".into(),
+                }]
+            } else {
+                all_refused()
+            })))
+        }
+    }
+    fn factory() -> FakeFactory {
+        FakeFactory {
+            versions: vec!["1".into(), "1".into()],
+            missing: false,
+            calls: Default::default(),
+        }
+    }
+    #[tokio::test]
+    async fn factory_without_runner_marks_entry_unavailable() {
+        let state = ManagerSelfTestState::new(entries());
+        let mut f = factory();
+        f.missing = true;
+        run_entry_self_tests(&f, &state).await;
+        let err = state
+            .select(0, &probe(CredentialStatus::NotApplicable))
+            .expect_err("no runner");
+        assert!(err.detail.contains("no self-test for harness opencode"));
+    }
+    #[tokio::test]
+    async fn boot_self_test_runs_every_entry_and_logs_detail() {
+        let state = ManagerSelfTestState::new(entries());
+        let f = factory();
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = crate::testsupport::recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        run_entry_self_tests(&f, &state).await;
+        assert_eq!(*f.calls.lock().expect("lock"), vec!["opencode", "claude"]);
+        let logs = events
+            .lock()
+            .expect("logs")
+            .iter()
+            .map(|e| format!("{} {} {:?}", e.level, e.message, e.fields))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            logs.contains("manager entry 1 (opencode openai/gpt-6.1-sol): self-test passed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("manager entry 2 (claude opus): self-test failed")
+                && logs.contains("unknown tool exposed"),
+            "{logs}"
+        );
+        println!("{logs}");
+    }
+    #[tokio::test]
+    async fn version_change_reruns_only_that_entry() {
+        let state = ManagerSelfTestState::new(entries());
+        let mut f = factory();
+        run_entry_self_tests(&f, &state).await;
+        f.calls.lock().expect("lock").clear();
+        f.versions[0] = "2".into();
+        run_entry_self_tests(&f, &state).await;
+        assert_eq!(*f.calls.lock().expect("lock"), vec!["opencode"]);
+        assert_eq!(state.snapshot().expect("record").cli_version, "2");
+    }
 
     fn refused(a: CanaryAttempt) -> CanaryObservation {
         CanaryObservation {
@@ -1207,6 +1883,53 @@ mod tests {
             .is_some()
         );
         assert!(state.permitted().is_err());
+    }
+
+    // STUDIO-1117: a posture that exposes a built-in the deny list does not name (the `Task*` tools
+    // a server-side rollout added) still disables the manager — `init_contract` is not loosened —
+    // and BOTH failure WARNs (boot and the version-change watcher) carry the detail naming the
+    // attempt and the tool, not only the summary message.
+    #[test]
+    fn an_unlisted_builtin_disables_the_manager_and_the_warn_names_it() {
+        let posture = parse_canary_init(
+            r#"{"type":"system","subtype":"init","tools":["mcp__symphony__manager_pr","TaskCreate"],"mcp_servers":[{"name":"symphony"}],"permissionMode":"default"}"#,
+        )
+        .expect("init parsed");
+        let (init_refused, init_detail) = init_contract(Some(&posture));
+        let mut obs = all_refused();
+        let slot = obs
+            .iter_mut()
+            .find(|o| o.attempt == CanaryAttempt::InitContract)
+            .expect("present");
+        slot.refused = init_refused;
+        slot.detail = init_detail;
+
+        let mut authority = ReviewAuthority::Advise;
+        let reason = apply(&evaluate("2.1.291", &obs), &mut authority)
+            .expect("an exposed TaskCreate must disable the manager");
+        assert_eq!(authority, ReviewAuthority::Off);
+        assert!(
+            reason.detail.contains("init_contract") && reason.detail.contains("TaskCreate"),
+            "the recorded reason must name the attempt and the tool: {}",
+            reason.detail
+        );
+
+        for trigger in [SelfTestTrigger::Boot, SelfTestTrigger::VersionChange] {
+            let ((), events) =
+                crate::testsupport::capture_events(|| warn_self_test_failed(trigger, &reason));
+            assert_eq!(events.len(), 1, "{trigger:?}: {events:?}");
+            let e = &events[0];
+            assert_eq!(e.level, "WARN");
+            assert_eq!(
+                e.fields.get("reason").map(String::as_str),
+                Some(reason.message().as_str())
+            );
+            let detail = e.fields.get("detail").map(String::as_str).unwrap_or("");
+            assert!(
+                detail.contains("init_contract") && detail.contains("TaskCreate"),
+                "{trigger:?}: the WARN must carry the detail: {e:?}"
+            );
+        }
     }
 
     // The init posture the canary reads is the CLI's own stream-json, parsed strictly.

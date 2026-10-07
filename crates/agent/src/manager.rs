@@ -14,8 +14,9 @@
 //!   `bypassPermissions` would make the deny-list advisory rather than enforced.
 //! * **`--mcp-config` and `--strict-mcp-config` passed together, explicitly** (§4.2). Never rely on
 //!   one implying the other.
-//! * **`--allowedTools` lists only the manager MCP tools**, and `--disallowedTools` names every
-//!   built-in (§4.3). The allowlist is the enforcement; the deny-list is belt-and-braces.
+//! * **`--tools ""` disables every built-in**, `--allowedTools` lists only the manager MCP tools,
+//!   and `--disallowedTools` names every known built-in (§4.3, STUDIO-1117). `--tools ""` is the
+//!   enforcement; the deny-list is belt-and-braces.
 //! * **The model credential is the operator's own OAuth token**, injected as
 //!   [`MANAGER_CREDENTIAL_ENV`] (§4.5). A relocated config root cannot authenticate from a copied
 //!   `.credentials.json` on macOS, where the CLI reads the login Keychain.
@@ -104,6 +105,10 @@ pub fn manager_credential_document(json: &str) -> Option<String> {
 /// of them is derived here, because provisioning them is the impure half.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagerSessionStart {
+    /// Selected manager entry's model; OpenCode requires an explicit provider/model.
+    pub model: String,
+    /// Selected manager entry's reasoning effort (`--variant` on OpenCode).
+    pub effort: String,
     /// The empty, daemon-owned, per-run working directory (no repository, no checkout).
     pub cwd: String,
     /// The dedicated manager configuration directory: only the model credential, none of the
@@ -157,15 +162,17 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
     "manager_findings",
 ];
 
-/// Every built-in the pinned CLI exposes, named in `--disallowedTools` (§4.3). The allowlist is the
-/// actual enforcement; this list is the explicit denial the design requires, kept complete for the
-/// CLI version the self-test measured (§4.7). A CLI that exposes a NEW built-in is caught by the
-/// canary, which reads the init `tools` array and refuses any entry that is not `mcp__*`
-/// ([`MANAGER_MCP_SERVER`]'s namespace): an unlisted built-in fails the self-test closed rather
-/// than silently running.
+/// Every built-in the CLI is known to expose, named in `--disallowedTools` (§4.3). This list is a
+/// BACKSTOP, not the enforcement: the manager posture passes `--tools ""`, which disables every
+/// built-in, so a built-in this list does not name is still removed (STUDIO-1117). The pinned list
+/// proved a moving target — `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` later appeared even on
+/// 2.1.281, apparently by a server-side rollout with no CLI version change, and disabled the manager. The canary still
+/// reads the init `tools` array and refuses any entry that is not `mcp__*`
+/// ([`MANAGER_MCP_SERVER`]'s namespace), so a future CLI that ignores `--tools ""` AND exposes an
+/// unlisted built-in fails the self-test closed rather than silently running.
 ///
-/// The list was completed against `claude` 2.1.281, whose init `tools` array under this posture
-/// named these plus the seventeen in [`MANAGER_DISALLOWED_EXTRA_BUILTINS`].
+/// Originally completed against `claude` 2.1.281, whose init `tools` array under the deny-list-only
+/// posture named these plus the built-ins in [`MANAGER_DISALLOWED_EXTRA_BUILTINS`].
 pub const MANAGER_DISALLOWED_BUILTIN_TOOLS: &[&str] = &[
     "Bash",
     "BashOutput",
@@ -186,9 +193,10 @@ pub const MANAGER_DISALLOWED_BUILTIN_TOOLS: &[&str] = &[
     "AskUserQuestion",
 ];
 
-/// Built-ins the CLI exposed at the pinned version (2.1.281) that were NOT in the original
-/// STUDIO-1014 list. Kept as a separate constant so the two are still visibly ONE `--disallowedTools`
-/// value built by [`manager_disallowed_tools`]; the split is organizational, not behavioral.
+/// Built-ins the CLI exposed at 2.1.281 that were NOT in the original STUDIO-1014 list, plus the
+/// four `Task*` tools rolled out later (STUDIO-1117). Kept as a separate constant so the two are
+/// still visibly ONE `--disallowedTools` value built by [`manager_disallowed_tools`]; the split is
+/// organizational, not behavioral.
 pub const MANAGER_DISALLOWED_EXTRA_BUILTINS: &[&str] = &[
     "CronCreate",
     "CronDelete",
@@ -207,6 +215,11 @@ pub const MANAGER_DISALLOWED_EXTRA_BUILTINS: &[&str] = &[
     "TaskStop",
     "ToolSearch",
     "Workflow",
+    // Rolled out server-side by 2026-10 (STUDIO-1117), seen on 2.1.281 through 2.1.291.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
 ];
 
 /// The fully-qualified (permission-rule) spelling of every manager MCP tool:
@@ -270,8 +283,9 @@ pub fn manager_mcp_config(daemon_bin: &str, workflow_path: &str) -> String {
 /// model and effort from M6's config) but with every security-relevant field overridden:
 ///
 /// * `permission_mode` = `default` (§4.3),
+/// * `tools` = `""`, disabling every built-in (STUDIO-1117),
 /// * `allowed_tools` = the manager MCP tools only (§4.3),
-/// * `disallowed_tools` = every built-in (§4.3),
+/// * `disallowed_tools` = every known built-in, as defence in depth (§4.3),
 /// * `mcp_config` = the manager-only file, so `build_args` emits `--mcp-config` AND
 ///   `--strict-mcp-config` (§4.2),
 /// * `setting_sources` = `user` (§4.2),
@@ -291,6 +305,7 @@ pub fn manager_config(base: &Config, mcp_config_path: &str) -> Config {
         model: base.model.clone(),
         effort: base.effort.clone(),
         permission_mode: "default".to_string(),
+        tools: Some(String::new()),
         allowed_tools: manager_allowed_tools(),
         disallowed_tools: manager_disallowed_tools(),
         mcp_config: mcp_config_path.to_string(),
@@ -385,6 +400,14 @@ mod tests {
         }
     }
 
+    // STUDIO-1117: `--tools ""` disables EVERY built-in, including ones a server-side rollout adds
+    // after the deny list was measured. The deny list is only the backstop; this is the enforcement.
+    #[test]
+    fn manager_disables_every_builtin_with_empty_tools() {
+        let args = manager_args(&Config::default(), "/m.json");
+        assert_eq!(arg_after(&args, "--tools"), Some(""));
+    }
+
     // §4.3: every named built-in is denied.
     #[test]
     fn manager_denies_every_builtin() {
@@ -454,6 +477,11 @@ mod tests {
             "TaskStop",
             "ToolSearch",
             "Workflow",
+            // Rolled out server-side by 2026-10 (STUDIO-1117), seen on 2.1.281 through 2.1.291.
+            "TaskCreate",
+            "TaskGet",
+            "TaskList",
+            "TaskUpdate",
         ] {
             assert!(
                 names.contains(&want),
