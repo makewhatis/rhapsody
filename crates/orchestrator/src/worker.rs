@@ -330,6 +330,8 @@ pub struct WorkerDeps {
     /// `build_dispatch_runner` remains the only production path. The custody is still moved into the
     /// non-`Clone` `DispatchRunner`; the shared harness owns no `BrokerSession`.
     pub prepared_harness: Option<Arc<dyn Harness>>,
+    /// A limit-policy switch starts fresh and seeds turn 1 with the carried note path.
+    pub engine: Option<crate::dispatch::DispatchEngine>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -1012,11 +1014,16 @@ pub async fn run_agent_attempt(
             }
         }
         None => {
-            match deps
-                .agent
-                .start_session(&ws.path, issue.clone(), transcript)
-                .await
-            {
+            let started = if deps.engine.is_some() {
+                deps.agent
+                    .start_fresh_session(&ws.path, issue.clone(), transcript)
+                    .await
+            } else {
+                deps.agent
+                    .start_session(&ws.path, issue.clone(), transcript)
+                    .await
+            };
+            match started {
                 Ok(s) => {
                     // Thread the store run id onto the session (Go: the optional-interface `SetRunID`
                     // right after `StartSession`, before the first turn) so the agent child's env
@@ -1176,6 +1183,13 @@ impl WorkerDeps {
                 Err(e) => return (issue.state.clone(), last_result, Some(e.into())),
             };
             let ident = issue.identifier.clone();
+            let p = if turn == 1 {
+                self.engine
+                    .as_ref()
+                    .map_or_else(|| p.clone(), |engine| engine.seed_prompt(p.clone()))
+            } else {
+                p
+            };
             // Arm the turn receipt SYNCHRONOUSLY, before the cancellable adapter future (design
             // §10.3). The receipt is stored in the loop-external supervisor so cancellation — which
             // drops the run future, and with it the attempt inside `run_turn_brokered` — still
@@ -1442,6 +1456,7 @@ mod tests {
             prepared: None,
             broker: None,
             prepared_harness: None,
+            engine: None,
         }
     }
 
@@ -1459,6 +1474,36 @@ mod tests {
         let mut ag = agentfake::Fake::new();
         ag.turns = turns;
         Arc::new(ag)
+    }
+
+    #[tokio::test]
+    async fn fresh_session_seeded_with_handoff_note() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = Arc::new(trackerfake::Fake::new());
+        let mut deps = make_deps(ws, ag.clone(), tr, "Task {{ issue.identifier }}", 1);
+        deps.engine = Some(crate::dispatch::DispatchEngine {
+            index: 1,
+            spec: rhapsody_config::profiles::EngineSpec {
+                harness: "claude".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            },
+            handoff_note: Some(std::path::PathBuf::from("/notes/MT-1-progress.md")),
+        });
+        let (_, _, err) = run_agent_attempt(
+            &mut deps,
+            issue("1", "MT-1", "Todo"),
+            None,
+            None,
+            &|_| {},
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(ag.started_fresh(), 1);
+        assert!(ag.last_prompt().contains("/notes/MT-1-progress.md"));
+        assert!(ag.last_prompt().contains("Task MT-1"));
     }
 
     fn fake_tracker_by_id(entries: &[(&str, &str, &str)]) -> Arc<trackerfake::Fake> {

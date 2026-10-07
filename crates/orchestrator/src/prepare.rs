@@ -1979,6 +1979,7 @@ impl Orchestrator {
         // failure leaves the row's provenance empty rather than failing the refusal.
         if run_id != 0 {
             let prov = rhapsody_store::RunProvenance {
+                engine_index: 0,
                 provider: resolved.provider.clone(),
                 // A refusal row records WHAT was selected, not the tier each field came from; the
                 // origins are deliberately empty here, exactly as `harness_origin`/`model_origin`

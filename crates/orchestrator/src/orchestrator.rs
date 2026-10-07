@@ -144,6 +144,9 @@ pub struct RunningEntry {
 
     pub thread_id: String,
     pub session_id: String,
+    /// Frozen for this run; policy must end the run before choosing another engine.
+    pub engine_index: usize,
+    pub engine: Option<crate::dispatch::DispatchEngine>,
     pub turn_count: i64,
     /// The last observed agent event type (one of `rhapsody_agent`'s `EVENT_*` values; Go's
     /// `agent.EventType`).
@@ -241,6 +244,8 @@ impl RunningEntry {
             brokered: false,
             thread_id: String::new(),
             session_id: String::new(),
+            engine_index: 0,
+            engine: None,
             turn_count: 0,
             last_event: String::new(),
             last_message: String::new(),

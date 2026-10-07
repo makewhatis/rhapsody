@@ -250,6 +250,8 @@ pub struct RunSummary {
 /// string, and never re-derived at render time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunProvenance {
+    /// 0 = primary, 1 = first fallback. Kept beside the engine that actually ran.
+    pub engine_index: i64,
     pub harness: String,
     /// The config key `harness` resolved from (e.g. `profile`, `agent.backend`).
     pub harness_origin: String,

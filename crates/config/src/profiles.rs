@@ -78,6 +78,54 @@ use crate::workflow::{self, Definition, YamlMap};
 /// body (§2.2). Matched exactly — not a Liquid tag, not whitespace-flexible.
 pub const BASE_TOKEN: &str = "{{ base }}";
 
+/// One engine a teammate may use without changing its identity (usage-limits §4.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct EngineSpec {
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+impl EngineSpec {
+    /// Fallbacks must name a known harness; OpenCode has no usable model default.
+    pub fn validate(&self) -> Result<(), String> {
+        if !crate::routing::is_known_harness(&self.harness) {
+            return Err(format!(
+                "fallback harness {:?} is not a recognized harness",
+                self.harness
+            ));
+        }
+        crate::routing::validate_routing_fields(&self.harness, "", &self.model)?;
+        if self.harness == "opencode" && self.model.trim().is_empty() {
+            return Err("fallback opencode requires a model".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// The primary profile engine followed by its ordered fallbacks. Empty primary fields inherit
+/// dispatch defaults; callers resolve those before asking about account health.
+pub fn engines(profile: &ResolvedProfile) -> Vec<EngineSpec> {
+    let mut out = vec![EngineSpec {
+        harness: profile.harness.clone(),
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+    }];
+    out.extend(profile.fallback.iter().cloned());
+    out
+}
+
+/// First healthy engine in declaration order, or no choice. Health belongs to the policy caller.
+pub fn choose_engine(
+    engines: &[EngineSpec],
+    usable: &dyn Fn(&EngineSpec) -> bool,
+) -> Option<usize> {
+    engines.iter().position(usable)
+}
+
 /// What a profile file's `extends:` says its base is (§4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extends {
@@ -357,6 +405,8 @@ pub fn is_degradable(err: &ProfileError) -> bool {
 #[derive(Debug, Default, Deserialize)]
 struct RawProfile {
     #[serde(default)]
+    fallback: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
     extends: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -375,6 +425,7 @@ struct RawProfile {
 /// A parsed profile file: its front matter plus its (trimmed) prompt body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileFile {
+    pub fallback: Vec<EngineSpec>,
     pub extends: Extends,
     pub model: String,
     pub effort: String,
@@ -450,6 +501,8 @@ pub struct Provenance {
 /// identity actually get" (§4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProfile {
+    /// Ordered alternate engines; absent means no fallback and changes no existing selection.
+    pub fallback: Vec<EngineSpec>,
     pub name: String,
     /// `claude --model` for every run dispatched to a teammate wearing this profile; empty ⇒
     /// inherit the daemon's configured `claude.model` (STUDIO-868). Read by
@@ -500,7 +553,14 @@ fn parse_definition(def: Definition) -> Result<ProfileFile, ProfileError> {
         serde_yaml_ng::from_value(serde_yaml_ng::Value::Mapping(def.config))
             .map_err(|e| ProfileError::Parse(e.to_string()))?
     };
+    let fallback = raw
+        .fallback
+        .map(serde_yaml_ng::from_value::<Vec<EngineSpec>>)
+        .transpose()
+        .map_err(|e| ProfileError::Routing(format!("fallback: {e}")))?
+        .unwrap_or_default();
     Ok(ProfileFile {
+        fallback,
         extends: Extends::parse(raw.extends.unwrap_or_default().as_str())?,
         model: raw.model.unwrap_or_default(),
         effort: raw.effort.unwrap_or_default(),
@@ -621,6 +681,11 @@ fn resolve_with(
         return Ok(from_builtin(name, base));
     }
     let file = load_profile(&path)?;
+    for engine in &file.fallback {
+        engine
+            .validate()
+            .map_err(|reason| ProfileError::Routing(format!("profile {name:?}: {reason}")))?;
+    }
     // The base is always a BUILT-IN, never another user file. That is what makes
     // an `extends` chain — and therefore a cycle — unreachable: built-ins carry
     // no `extends`, so resolution is depth-1 by construction. It also makes a
@@ -683,6 +748,7 @@ fn resolve_with(
     let (tools, tools_origin) = pick_list(&file.tools, base_profile.map_or(&[][..], |b| b.tools));
     let (prompt, body) = compose_body(base_profile.map(|b| b.body), &file.body);
     Ok(ResolvedProfile {
+        fallback: file.fallback,
         name: name.to_string(),
         model,
         effort,
@@ -727,6 +793,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
         }
     };
     ResolvedProfile {
+        fallback: Vec::new(),
         name: name.to_string(),
         model: base.model.to_string(),
         effort: base.effort.to_string(),
@@ -896,6 +963,24 @@ pub fn fork_definition(resolved: &ResolvedProfile) -> Definition {
                 .collect(),
         ),
     );
+    if !resolved.fallback.is_empty() {
+        config.insert(
+            Value::from("fallback"),
+            Value::Sequence(
+                resolved
+                    .fallback
+                    .iter()
+                    .map(|engine| {
+                        let mut fields = YamlMap::new();
+                        fields.insert(Value::from("harness"), Value::from(engine.harness.clone()));
+                        fields.insert(Value::from("model"), Value::from(engine.model.clone()));
+                        fields.insert(Value::from("effort"), Value::from(engine.effort.clone()));
+                        Value::Mapping(fields)
+                    })
+                    .collect(),
+            ),
+        );
+    }
     Definition {
         config,
         prompt_template: resolved.prompt.clone(),
@@ -913,6 +998,94 @@ pub fn fork_text(resolved: &ResolvedProfile) -> Result<String, ProfileError> {
 mod tests {
     use super::*;
     use crate::teams::Identity;
+
+    #[test]
+    fn fallback_parsed_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "swe",
+            "---\nextends: swe\nfallback:\n  - { harness: opencode, model: openai/gpt-6.1-sol, effort: high }\n  - { harness: claude }\n---\n",
+        );
+        let p = resolve(dir.path(), "swe").unwrap();
+        assert_eq!(p.fallback.len(), 2);
+        assert_eq!(
+            p.fallback[0],
+            EngineSpec {
+                harness: "opencode".into(),
+                model: "openai/gpt-6.1-sol".into(),
+                effort: "high".into(),
+            }
+        );
+        for entry in [
+            "{ harness: mystery }",
+            "{ harness: opencode }",
+            "{ model: opus }",
+            "{ harness: opencode, model: [] }",
+        ] {
+            write_profile(
+                dir.path(),
+                "swe",
+                &format!("---\nfallback: [{entry}]\n---\n"),
+            );
+            let err = resolve(dir.path(), "swe").unwrap_err();
+            assert!(
+                !is_degradable(&err),
+                "bad fallback routing must refuse: {err}"
+            );
+        }
+        // A fork must preserve the ordered fallback list on round-trip.
+        write_profile(
+            dir.path(),
+            "swe",
+            "---\nfallback: [{ harness: opencode, model: openai/gpt-6.1-sol }]\n---\nPersona",
+        );
+        let p = resolve(dir.path(), "swe").unwrap();
+        write_profile(dir.path(), "copy", &fork_text(&p).unwrap());
+        assert_eq!(resolve(dir.path(), "copy").unwrap().fallback, p.fallback);
+    }
+
+    #[test]
+    fn absent_fallback_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "plain",
+            "---\nmodel: opus\neffort: high\n---\nPersona",
+        );
+        let p = resolve(dir.path(), "plain").unwrap();
+        assert!(p.fallback.is_empty());
+        assert_eq!(
+            engines(&p),
+            vec![EngineSpec {
+                harness: String::new(),
+                model: "opus".into(),
+                effort: "high".into()
+            }]
+        );
+        assert_eq!(
+            fork_text(&p).unwrap(),
+            "---\nextends: none\nmodel: opus\neffort: high\nprovider: ''\ncapabilities: []\ntools: []\n---\nPersona\n"
+        );
+    }
+
+    #[test]
+    fn choose_first_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "swe",
+            "---\nharness: claude\nmodel: opus\nfallback:\n - { harness: opencode, model: openai/gpt-6.1-sol }\n - { harness: claude, model: sonnet }\n---\n",
+        );
+        let list = engines(&resolve(dir.path(), "swe").unwrap());
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].model, "opus");
+        assert_eq!(choose_engine(&list, &|_| true), Some(0));
+        assert_eq!(choose_engine(&list, &|e| e.harness == "opencode"), Some(1));
+        assert_eq!(choose_engine(&list, &|e| e.model == "sonnet"), Some(2));
+        assert_eq!(choose_engine(&list, &|_| false), None);
+        assert_eq!(choose_engine(&[], &|_| true), None);
+    }
 
     /// A synthetic registry carrying TWO versions of one profile, so the §4
     /// upgrade behaviours (track-latest vs pin, and the drift a pin produces)
