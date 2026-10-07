@@ -98,6 +98,18 @@ describe("DivergenceBanner", () => {
     );
   });
 
+  it("reports reviewer infrastructure without inventing a findings escalation", async () => {
+    h.fetchState.mockResolvedValue(state({ review_divergence: [divergence({
+      kind: "review_infrastructure",
+      reason: "review of #290 cannot run: jimmy's runs fail with 401 (3 attempts)",
+      detail: "review infrastructure failed before a reviewer could give a verdict; see the reason",
+    })] }));
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("jimmy's runs fail with 401 (3 attempts)");
+    expect(banner.textContent).not.toContain("open findings");
+  });
+
   // A reported divergence names the pull request, its ticket and how long — the three facts an
   // operator needs to decide whether to intervene. The wording comes from the daemon's own `detail`,
   // so the console cannot drift from it.

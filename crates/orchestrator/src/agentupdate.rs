@@ -284,6 +284,9 @@ impl Orchestrator {
             "stopped at its per-run token ceiling: {spent} tokens spent against \
              agent.max_run_tokens={limit}"
         );
+        if let Some(run) = re.review.as_ref() {
+            self.note_failed_review_attempt(&run.watch_key(), &run.head_sha, &reason);
+        }
         self.completed.remove(issue_id);
         self.persist_end_run(&re, store::OUTCOME_TOKEN_CEILING, &reason);
         self.persist_totals();

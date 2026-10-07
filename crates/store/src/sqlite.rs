@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -589,6 +589,17 @@ ALTER TABLE rhapsody_manager_intervention ADD COLUMN rerequested TEXT NOT NULL D
     // manager's output didn't parse: ZeroOrManyBlocks, 3 attempts" instead of only a WARN line.
     r#"
 ALTER TABLE rhapsody_manager_intervention ADD COLUMN failure_reason TEXT NOT NULL DEFAULT '';
+"#,
+    // v25 -> v26 (STUDIO-1129): repair the old launch-based round counters exactly once on
+    // upgrade. Only a persisted reviewer verdict is evidence of a round. Prefix equality (not
+    // LIKE) keeps legal '_' and '%' repo names literal. Retention may have removed older
+    // verdicts: the surviving evidence is a lower bound, never an invented launch count.
+    r#"
+UPDATE rhapsody_review_bound SET dispatches = (
+  SELECT COUNT(*) FROM runs r JOIN rhapsody_review_verdicts v ON v.run_id = r.id
+  WHERE lower(substr(r.issue_identifier, 1, length(pr) + 4)) = 'pr:' || lower(pr) || '@'
+    AND v.verdict IN ('approved', 'changes_requested')
+);
 "#,
 ];
 
@@ -9538,5 +9549,73 @@ mod tests {
             ManagerReservation::Absent
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn v25_upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v25.db");
+        {
+            let conn = Connection::open(&db).expect("raw database");
+            for migration in &MIGRATIONS[..25] {
+                conn.execute_batch(migration).expect("v25 schema");
+            }
+            conn.execute_batch("PRAGMA user_version = 25")
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES
+                ('owner/a_b#290', 3), ('owner/a_b#291', 4), ('owner/axb#291', 9);
+                INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                (1, 'pr:owner/a_b#290@bob', 'failed'),
+                (2, 'pr:owner/a_b#290@bob', 'failed'),
+                (3, 'pr:owner/a_b#290@bob', 'completed'),
+                (4, 'pr:owner/a_b#291@bob', 'failed'),
+                (5, 'pr:owner/a_b#291@bob', 'completed'),
+                (6, 'pr:owner/a_b#291@carol', 'completed'),
+                (7, 'pr:owner/a_b#291@manager', 'completed');
+                INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                (5, 'approved'), (6, 'changes_requested');",
+            )
+            .expect("old rounds");
+        }
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#290")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            2
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/axb#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        store
+            .set_review_rounds("owner/a_b#291", 1)
+            .expect("operator refund");
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            1,
+            "repair is once on upgrade, not a recount that undoes operator controls every boot"
+        );
     }
 }

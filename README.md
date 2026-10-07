@@ -2139,6 +2139,31 @@ names it as `held for capacity` rather than reporting it as an unexplained stall
 entry above).
 
 
+### Review attempts are not verdict rounds (STUDIO-1129)
+
+Ticketless review charges the reviewer half of its durable round budget only when a declared
+approval or findings verdict lands at the dispatch-pinned head. A failed launch, crash, timeout,
+unrecognised handoff or truncated run charges no round. The existing answered-author-exchange
+charge remains verdict-gated too; dispatch still consumes its manager authorization and reserves
+capacity, independently of verdict accounting.
+
+No-verdict attempts retry after 30 seconds, then 120 seconds, with three attempts per reviewer/head
+per daemon lifetime. An exhausted reviewer is excluded from the next selection so an eligible
+substitute can take the review. If none can, the job's review panel and human feed say
+`review_infrastructure`, naming the reviewer, failure and attempt count. Operator Re-run/Clear,
+a new head, or a daemon restart starts a fresh attempt episode. A deliberate token-ceiling hold
+continues to require the existing operator intervention. No verdict at the observed head means
+no findings adjudication, and a legacy adjudication over an unread head is cleared so review can
+re-arm.
+
+The v25→v26 data migration repairs old launch-based counters **once**, using retained per-run
+`rhapsody_review_verdicts` rows; subsequent restarts preserve operator refunds. Historical verdicts
+from before that ledger existed, pruned verdicts, and the old answered-author contribution cannot
+be reconstructed exactly. The repaired count is therefore the retained-verdict lower bound,
+rather than retaining failed launches as evidence of reviews. Zero-verdict adjudications are
+discarded during recovery. This remains Rhapsody-only (Go has no ticketless review), and changes
+no ported table, config shape or golden.
+
 ### A per-run token ceiling — `agent.max_run_tokens` (STUDIO-967)
 
 Every bound in the review loop counts ROUNDS: the shared round cap, the adjudication threshold, the

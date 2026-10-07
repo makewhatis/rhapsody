@@ -157,6 +157,57 @@ use crate::reviewadjudicate::MANAGER_IDENTITY;
 use crate::stop::ControlHandle;
 use crate::teams::LoadSnapshot;
 
+/// Attempts are per reviewer and head, independently of the verdict budget. A different reviewer
+/// can still read a head after this one exhausts its three attempts. Counts are per boot, like the
+/// legacy adjudicator's failed-turn tally; an operator re-run also clears them.
+pub(crate) const MAX_REVIEW_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FailedReviewAttempt {
+    pub head: String,
+    pub failures: usize,
+    pub next_at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+    /// An accepted retry is out; if it disappears without an exit event, observe that failure once.
+    pub pending_exit: bool,
+}
+
+impl FailedReviewAttempt {
+    pub(crate) fn message(&self, key: &ReviewWatchKey) -> String {
+        format!(
+            "review of #{} cannot run: {}'s runs fail with {} ({} attempts)",
+            key.number, key.reviewer, self.reason, self.failures
+        )
+    }
+}
+
+impl Orchestrator {
+    pub(crate) fn note_failed_review_attempt(
+        &mut self,
+        key: &ReviewWatchKey,
+        head: &str,
+        reason: &str,
+    ) {
+        let now = (self.now)();
+        let previous = self.review_attempts.get(key).filter(|a| a.head == head);
+        let failures = previous.map_or(1, |a| a.failures.saturating_add(1));
+        let delay = if failures == 1 { 30 } else { 120 };
+        // Keep diagnostics bounded and single-line on every surface.
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        let reason: String = reason.chars().take(400).collect();
+        let attempt = FailedReviewAttempt {
+            head: head.to_string(),
+            failures,
+            next_at: now + chrono::Duration::seconds(delay),
+            reason,
+            pending_exit: false,
+        };
+        tracing::warn!(reviewer = %key.reviewer, head, failures, reason = %attempt.reason,
+            "ticketless review: no verdict; infrastructure attempt failed, not a review round");
+        self.review_attempts.insert(key.clone(), attempt);
+    }
+}
+
 /// How many ROUNDS one pull request's review↔author loop may run, ever, in one daemon lifetime —
 /// the floor against force-push churn (§14.2, "no approval terminal → unbounded re-review").
 ///
@@ -1758,9 +1809,8 @@ impl Orchestrator {
     /// Applies the watcher bookkeeping a ticketless review dispatch owns, at the moment its dispatch
     /// is ACCEPTED. Called from `dispatch_review`'s synchronous path (via the `Dispatched` arm's
     /// former home) and from `finish_prepared` once an asynchronous preparation is accepted, so a
-    /// prepared review is charged the same churn budget and retires the same reassigned incumbent
-    /// (STUDIO-988 review round 7, sol #1). A no-op on the reassignment half when the round was not
-    /// reassigned.
+    /// prepared review retires the same reassigned incumbent and consumes the same authorization
+    /// (STUDIO-988). Verdict accounting belongs to the completion path (STUDIO-1129).
     pub(crate) fn commit_review_watch(
         &mut self,
         pr: &PrCoord,
@@ -1778,7 +1828,21 @@ impl Orchestrator {
                 );
             }
         }
-        let key = churn_key(pr);
+        // Dispatch spends an authorization, never a verdict round. No-verdict exits have their
+        // own bounded attempt schedule (STUDIO-1129).
+        self.consume_review_round_authorization(pr, &commit.head, &commit.head_patch_id);
+    }
+
+    /// Charges the reviewer half of a round only when its declared verdict lands (STUDIO-1129).
+    pub(crate) fn note_review_verdict(&mut self, run: &ReviewRun) {
+        self.review_attempts.remove(&run.watch_key());
+        // A Clear while the attempt was out starts a new budget. Its old-generation verdict must
+        // not charge that new budget, just as it cannot approve the new generation's change.
+        if run.generation != self.review_generation(&run.watch_key()) {
+            return;
+        }
+        let pr = PrCoord::new(&run.owner, &run.repo, run.number);
+        let key = churn_key(&pr);
         let counter = self.review_rounds.entry(key.clone()).or_default();
         *counter += 1;
         let spent = *counter;
@@ -1792,10 +1856,6 @@ impl Orchestrator {
                  further pushes will not be reviewed"
             );
         }
-        // STUDIO-1012 (§7.8): consuming the manager exchange authorization at the SAME acceptance
-        // point that charges the budget. A round refused earlier — by a budget, a model refusal or a
-        // drain — never reaches here, so it never burns an authorization it did not use.
-        self.consume_review_round_authorization(pr, &commit.head, &commit.head_patch_id);
     }
 
     /// Deletes everything durable about `pr` — the counter AND the manager's decision — for a pull
@@ -1839,6 +1899,12 @@ impl Orchestrator {
                 self.review_rounds
                     .insert(row.pr.clone(), row.dispatches as usize);
                 counters += 1;
+            }
+            if row.dispatches == 0 && row.adjudication.is_some() {
+                if let Err(e) = self.store().clear_review_adjudication(&row.pr) {
+                    tracing::warn!(pr = %row.pr, err = %e, "recovery: clearing an adjudication with no recorded verdict rounds failed");
+                }
+                continue;
             }
             if let Some(stored) = row.adjudication.as_ref()
                 && let Some(ledger) = self.adjudication_ledger.as_ref()
@@ -2110,17 +2176,8 @@ impl Orchestrator {
     /// row is the one such deferral that can persist; it is reported as `stalled` by
     /// [`Self::note_unassignable`] rather than silently, and the round genuinely has not happened.
     ///
-    /// **The round is spent the moment it is DISPATCHED at `head`.** `requested_sha` is written at
-    /// dispatch ([`Orchestrator::dispatch_review`]), so a row that has already been dispatched here
-    /// has had the one round this head buys. That matters for the two non-terminal ends: a round
-    /// that parks `truncated` (the `max_turns` backstop, or a STUDIO-967 ceiling stop) and a round
-    /// that CRASHES (`in_flight` with no live run) both keep `requested_sha == head`, so
-    /// [`review_round_due`] reports them owed again and, without this, the resumed arm would re-arm
-    /// them on every sweep until [`REVIEW_ROUNDS_PER_PR_CAP`] — spending the whole gap between the
-    /// configured threshold and the hard cap on the most expensive kind of round. The unfinished head
-    /// is the MANAGER's instead, and [`Self::open_findings`] names the review that never finished.
-    /// A row still owed its FIRST round here carries an older `requested_sha` (or none), so it is
-    /// unaffected; a live run is excluded above by [`review_round_due`]'s in-flight arm.
+    /// A failed/truncated attempt still owes a verdict at this head (STUDIO-1129). Its retries have
+    /// a separate bound and backoff; exhausting them reports infrastructure, never open findings.
     fn resumed_round_owed(
         &self,
         pr: &PrCoord,
@@ -2135,16 +2192,6 @@ impl Orchestrator {
             // A verdict the head-advance CARRIED across a patch-id-preserving move is a completed
             // review of this same change; it does not owe another round.
             if carried.contains(&r.key) {
-                return false;
-            }
-            // STUDIO-1021: the one round was already DISPATCHED at this head. `requested_sha` is
-            // written at dispatch, and only a non-terminal end (`truncated`, or a crashed
-            // `in_flight` with no live run) leaves it naming this very head while
-            // `review_round_due` calls the row due again — the unbounded re-arm alice's round-2
-            // review found. The head goes to the manager.
-            if r.requested_sha.trim() == head
-                && (r.status == REVIEW_STATUS_TRUNCATED || r.status == REVIEW_STATUS_IN_FLIGHT)
-            {
                 return false;
             }
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
@@ -2377,6 +2424,8 @@ impl Orchestrator {
         {
             self.author_rounds_pending.remove(&key);
         }
+        // This existing author-exchange charge is also contingent on a reviewer verdict. Failed
+        // attempts never settle it (STUDIO-1129).
         let round = self.reviewers_per_round();
         *self.review_rounds.entry(key.clone()).or_default() += round;
         self.persist_review_rounds(&key);
@@ -2478,6 +2527,11 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        self.review_attempts.retain(|key, _| {
+            !(key.owner.eq_ignore_ascii_case(&pr.owner)
+                && key.repo.eq_ignore_ascii_case(&pr.repo)
+                && key.number == pr.number)
+        });
         // And the author rounds awaiting an answer (STUDIO-1004), for the same two reasons: a
         // re-introduced pull request starts from zero, and a record for a gone pull request would
         // sit here for the daemon's whole life.
@@ -2914,6 +2968,12 @@ impl Orchestrator {
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
+        self.review_attempts.retain(|key, attempt| {
+            !(key.owner.eq_ignore_ascii_case(&pr.owner)
+                && key.repo.eq_ignore_ascii_case(&pr.repo)
+                && key.number == pr.number
+                && attempt.head != head)
+        });
         // The evidence revision (STUDIO-1009; §5.2) is maintained HERE, once per pull request this
         // tick re-evaluated, from the observation and the local reads. Above every gate below so a
         // change is recorded even on a tick that dispatches nothing — the head moving is evidence
@@ -3064,7 +3124,21 @@ impl Orchestrator {
         // of building one. The convergence and in-flight early returns above still run, so a pull
         // request every reviewer approved still auto-merges. In `off` and `advise` today's turn is
         // still authoritative, so the branch behaves exactly as before.
+        let verdict_at_head = mine.iter().any(|r| {
+            (r.status == REVIEW_STATUS_REVIEWED || r.status == REVIEW_STATUS_APPROVED)
+                && proven.iter().any(|sha| *sha == r.last_reviewed_sha)
+        });
+        if !verdict_at_head
+            && self.adjudication_threshold().is_some()
+            && self
+                .adjudication(pr)
+                .is_some_and(|decision| decision.governs(head, unchanged_from))
+            && let Some(ledger) = self.adjudication_ledger.as_ref()
+        {
+            ledger.clear(pr);
+        }
         if !mine.is_empty()
+            && verdict_at_head
             && let Some(threshold) = self.adjudication_threshold()
         {
             if let Some(decision) = self.adjudication(pr) {
@@ -3238,6 +3312,30 @@ impl Orchestrator {
             if !review_round_due(row, head, live) {
                 continue;
             }
+            // A crashed process (including boot recovery) may never have sent a worker exit.
+            // Observe it once, then use the same attempt schedule as an explicit failure.
+            if row.status == REVIEW_STATUS_IN_FLIGHT
+                && !live
+                && row.requested_sha == head
+                && self
+                    .review_attempts
+                    .get(&row.key)
+                    .is_none_or(|a| a.pending_exit)
+            {
+                self.note_failed_review_attempt(
+                    &row.key,
+                    head,
+                    "review process ended without a verdict",
+                );
+            }
+            if let Some(attempt) = self.review_attempts.get(&row.key)
+                && attempt.head == head
+                && attempt.next_at > (self.now)()
+                && attempt.failures < MAX_REVIEW_ATTEMPTS
+            {
+                report.deferred += 1;
+                continue;
+            }
             // STUDIO-1025: an author's run pushes INTERMEDIATE commits — a merge of the base branch
             // first, then the fixes — and a round armed on one of those reviews work that is not
             // finished. PR 223 was reviewed at a merge-only head while its author's run was still
@@ -3368,7 +3466,18 @@ impl Orchestrator {
             // `reviewers` preparations against a budget one short, overshooting on acceptance
             // (STUDIO-988 review round 8, alice #2).
             let charged = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
-            let in_flight = self.review_preparations_for(pr);
+            let in_flight = self.review_preparations_for(pr)
+                + self
+                    .running
+                    .values()
+                    .filter(|entry| {
+                        entry.review.as_ref().is_some_and(|run| {
+                            run.owner.eq_ignore_ascii_case(&pr.owner)
+                                && run.repo.eq_ignore_ascii_case(&pr.repo)
+                                && run.number == pr.number
+                        })
+                    })
+                    .count();
             let dispatched = charged.saturating_add(in_flight);
             let budget = REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round);
             if dispatched >= budget {
@@ -3385,12 +3494,24 @@ impl Orchestrator {
             // in `running`, so the SECOND round of this tick sees the first one's load and picks
             // somebody else.
             let load = LoadSnapshot::from_running(&self.running);
-            let peers: HashSet<String> = assigned
+            let mut peers: HashSet<String> = assigned
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| *i != idx)
                 .map(|(_, name)| name.clone())
                 .collect();
+            peers.extend(
+                self.review_attempts
+                    .iter()
+                    .filter(|(key, attempt)| {
+                        key.owner.eq_ignore_ascii_case(&pr.owner)
+                            && key.repo.eq_ignore_ascii_case(&pr.repo)
+                            && key.number == pr.number
+                            && attempt.head == head
+                            && attempt.failures >= MAX_REVIEW_ATTEMPTS
+                    })
+                    .map(|(key, _)| key.reviewer.clone()),
+            );
             let Some(chosen) = self.choose_review_reviewer(row, &peers, &load) else {
                 tracing::debug!(
                     pr = %pr, reviewer = %row.key.reviewer,
@@ -3476,6 +3597,7 @@ impl Orchestrator {
                 head: head.to_string(),
                 head_patch_id: head_patch_id.to_string(),
             };
+            let attempt_key = run.watch_key();
             match self.dispatch_review_watch(run, commit) {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
@@ -3520,6 +3642,7 @@ impl Orchestrator {
                     );
                 }
                 ReviewDispatchOutcome::Refused(why) => {
+                    self.note_failed_review_attempt(&attempt_key, head, &why);
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
                 }
@@ -3979,8 +4102,10 @@ impl Orchestrator {
             // become a review (STUDIO-978): handing it the round would only dispatch a run that
             // records failed and never completes.
             let on_roster = teams.roster.iter().any(|i| i.name == incumbent);
-            return (on_roster && !exclusions.unselectable.contains(incumbent))
-                .then(|| incumbent.to_string());
+            return (on_roster
+                && !exclusions.unselectable.contains(incumbent)
+                && !peers.contains(incumbent))
+            .then(|| incumbent.to_string());
         }
         let candidates: Vec<String> =
             crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts(), &exclusions)
@@ -5373,6 +5498,22 @@ mod tests {
     /// settle that path runs, so a test's answered author round charges exactly as production's does.
     fn complete(o: &mut Orchestrator, number: i64, reviewer: &str, head: &str) {
         let id = review_key(OWNER, REPO, number, reviewer);
+        if let Some(re) = o.running.get(&id) {
+            assert_eq!(re.review.as_ref().expect("review run").head_sha, head);
+            o.on_worker_exit(crate::EvWorkerExit {
+                issue_id: id,
+                started_at: re.started_at,
+                failed: false,
+                err_msg: String::new(),
+                declared_handoff: true,
+                last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
+                review_verdict: None,
+                manager_text: None,
+                refused: false,
+                auth_needed: false,
+            });
+            return;
+        }
         o.running.remove(&id);
         o.claimed.remove(&id);
         o.store()
@@ -5385,6 +5526,22 @@ mod tests {
     /// the reviewer earn again (STUDIO-960).
     fn approve(o: &mut Orchestrator, number: i64, reviewer: &str, head: &str) {
         let id = review_key(OWNER, REPO, number, reviewer);
+        if let Some(re) = o.running.get(&id) {
+            assert_eq!(re.review.as_ref().expect("review run").head_sha, head);
+            o.on_worker_exit(crate::EvWorkerExit {
+                issue_id: id,
+                started_at: re.started_at,
+                failed: false,
+                err_msg: String::new(),
+                declared_handoff: true,
+                last_state: crate::review::REVIEW_STATE_APPROVED.to_string(),
+                review_verdict: None,
+                manager_text: None,
+                refused: false,
+                auth_needed: false,
+            });
+            return;
+        }
         o.running.remove(&id);
         o.claimed.remove(&id);
         o.store()
@@ -5397,8 +5554,21 @@ mod tests {
     /// requested SHA) — the exit path deliberately does not clear it.
     fn crash(o: &mut Orchestrator, number: i64, reviewer: &str) {
         let id = review_key(OWNER, REPO, number, reviewer);
-        o.running.remove(&id);
-        o.claimed.remove(&id);
+        let re = o.running.get(&id).expect("live crash");
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: id,
+            started_at: re.started_at,
+            failed: true,
+            err_msg: "process crashed".to_string(),
+            declared_handoff: false,
+            last_state: String::new(),
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+        let now = (o.now)() + chrono::Duration::seconds(30);
+        o.now = Box::new(move || now);
     }
 
     // --- the edge trigger -------------------------------------------------------------------
@@ -6125,8 +6295,8 @@ mod tests {
         crash(&mut o, 12, "bob");
         assert_eq!(
             watch_row(&o, 12, "bob").status,
-            REVIEW_STATUS_IN_FLIGHT,
-            "the crashed round's marker is the input this test is about"
+            REVIEW_STATUS_TRUNCATED,
+            "a failed attempt has no verdict and is re-offered after backoff"
         );
 
         // Same head, same tick cadence, no restart.
@@ -8519,7 +8689,7 @@ mod tests {
         teams.review.adjudicate_after_rounds = 3;
         let (mut o, _d) = orch(teams);
         let l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, approved_row(12, "bob", HEAD_A));
         run_of(&o, "STUDIO-721");
         let mut rx = o.open_review_notify_channel();
         // The manager has already decided: the loop is stopped, and every path through
@@ -9655,8 +9825,8 @@ mod tests {
         assert_eq!(dispatch.dispatched, 1);
         assert_eq!(
             o.review_rounds.get(&churn_key(&coord(12))),
-            Some(&(charged + o.reviewers_per_round())),
-            "the review dispatch charges the REVIEW half only; the author round is still pending"
+            Some(&charged),
+            "a dispatch with no verdict charges neither half"
         );
 
         // The dispatched review truncates at HEAD_B — a max_turns backstop, no declared verdict.
@@ -9694,7 +9864,7 @@ mod tests {
 
         assert_eq!(
             o.review_rounds.get(&churn_key(&coord(12))),
-            Some(&(charged + o.reviewers_per_round())),
+            Some(&charged),
             "a truncated review answers no author round"
         );
         assert_eq!(
@@ -9722,20 +9892,16 @@ mod tests {
         o.note_author_round(&iss);
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
 
-        let run = ReviewRun {
-            owner: OWNER.to_string(),
-            repo: REPO.to_string(),
-            number: 12,
-            reviewer: "bob".to_string(),
-            head_sha: HEAD_B.to_string(),
-            ..ReviewRun::default()
-        };
-        let id = run.key();
+        let id = review_key(OWNER, REPO, 12, "bob");
         let re = o
             .running
             .get(&id)
             .cloned()
             .expect("the review is running after its dispatch");
+        let run = re
+            .review
+            .clone()
+            .expect("dispatch-pinned review including its generation");
         o.on_review_exit(
             &re,
             &run,
@@ -9944,7 +10110,7 @@ mod tests {
         for claimed_only in [false, true] {
             let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
             let l = ledger(&mut o);
-            let r = row(12, "bob");
+            let r = reviewed_row(12, "bob", HEAD_A);
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
             introduce(&o, r);
             o.claimed.insert(id.clone());
@@ -10027,7 +10193,7 @@ mod tests {
     fn a_settled_escalation_stops_the_loop_and_is_not_re_asked() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let l = ledger(&mut o);
-        introduce(&o, row(12, "bob"));
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
         o.review_rounds
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
         l.record(
@@ -10106,6 +10272,223 @@ mod tests {
         let l = Arc::new(AdjudicationLedger::default());
         o.adjudication_ledger = Some(Arc::clone(&l));
         l
+    }
+
+    fn finish_attempt(o: &mut Orchestrator, reviewer: &str, verdict: Option<&str>) {
+        let id = review_key(OWNER, REPO, 12, reviewer);
+        let re = o.running.get(&id).expect("running attempt");
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: id,
+            started_at: re.started_at,
+            failed: verdict.is_none(),
+            err_msg: verdict.map_or("APIError: status 401", |_| "").to_string(),
+            declared_handoff: verdict.is_some(),
+            last_state: verdict.unwrap_or_default().to_string(),
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+    }
+
+    fn three_failed_attempts(o: &mut Orchestrator) {
+        let start = (o.now)();
+        for attempt in 0..3 {
+            let now = start + chrono::Duration::hours(attempt);
+            o.now = Box::new(move || now);
+            assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+            finish_attempt(o, "bob", None);
+        }
+    }
+
+    #[test]
+    fn no_verdict_three_failed_runs_spend_no_rounds_or_adjudication() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        three_failed_attempts(&mut o);
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(o.rounds_used(&coord(12)), 0);
+        assert!(report.adjudicate.is_empty());
+        assert_eq!(l.peek(&coord(12)), None);
+    }
+
+    #[test]
+    fn no_verdict_a_verdict_after_a_failed_attempt_counts_once() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        introduce(&o, row(12, "bob"));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        finish_attempt(&mut o, "bob", None);
+        let now = (o.now)() + chrono::Duration::hours(1);
+        o.now = Box::new(move || now);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        finish_attempt(&mut o, "bob", Some(crate::review::REVIEW_STATE_APPROVED));
+        assert_eq!(o.rounds_used(&coord(12)), 1);
+    }
+
+    #[test]
+    fn no_verdict_repeated_failures_report_infrastructure() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        let _l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        three_failed_attempts(&mut o);
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        let d = found.first().expect("infrastructure report");
+        assert_eq!(d.kind.as_str(), "review_infrastructure");
+        assert!(
+            d.reason.contains("401") && d.reason.contains("3 attempts"),
+            "{}",
+            d.reason
+        );
+        assert!(!d.kind.detail().contains("open findings"));
+        let state = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(
+            state["review_divergence"][0]["reason"], d.reason,
+            "the human feed must receive the actionable infrastructure message on the wire"
+        );
+        let jobs = o.review_console_list().expect("review job surface");
+        assert_eq!(
+            jobs.reviews[0].infrastructure.as_deref(),
+            Some(d.reason.as_str())
+        );
+        let now = (o.now)() + chrono::Duration::days(1);
+        o.now = Box::new(move || now);
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+            0,
+            "an exhausted reviewer is not retried forever"
+        );
+    }
+
+    #[test]
+    fn no_verdict_retries_back_off_and_an_operator_rerun_rearms_exhaustion() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        introduce(&o, row(12, "bob"));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        finish_attempt(&mut o, "bob", None);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        let now = (o.now)() + chrono::Duration::seconds(30);
+        o.now = Box::new(move || now);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        finish_attempt(&mut o, "bob", None);
+        let soon = now + chrono::Duration::seconds(119);
+        o.now = Box::new(move || soon);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        let due = soon + chrono::Duration::seconds(1);
+        o.now = Box::new(move || due);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        finish_attempt(&mut o, "bob", None);
+        assert_eq!(o.rounds_used(&coord(12)), 0);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        o.handle_review_rerun(&coord(12));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+    }
+
+    #[test]
+    fn no_verdict_exhaustion_uses_a_substitute_and_a_new_head_has_a_fresh_attempt_budget() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob", "carol"], 3));
+        introduce(&o, row(12, "bob"));
+        three_failed_attempts(&mut o);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        assert!(
+            o.running
+                .contains_key(&review_key(OWNER, REPO, 12, "carol"))
+        );
+        finish_attempt(&mut o, "carol", Some(crate::review::REVIEW_STATE_APPROVED));
+        assert_eq!(o.rounds_used(&coord(12)), 1);
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergences()
+                .iter()
+                .all(|d| d.kind.as_str() != "review_infrastructure")
+        );
+        assert!(
+            o.review_console_list()
+                .expect("jobs")
+                .reviews
+                .iter()
+                .filter(|job| job.open)
+                .all(|job| job.infrastructure.is_none())
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+        assert!(
+            o.review_attempts.is_empty(),
+            "failure episodes are head-scoped"
+        );
+    }
+
+    #[test]
+    fn no_verdict_an_adjudication_at_an_unread_head_rearms() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob", "carol"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds.insert(churn_key(&coord(12)), 3);
+        l.record(
+            &coord(12),
+            Adjudication::Escalate {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "no review ran".to_string(),
+            },
+        );
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 1,
+            "a working reviewer is owed, not an escalation"
+        );
+        assert!(report.adjudicate.is_empty());
+        assert_eq!(l.peek(&coord(12)), None);
+    }
+
+    #[test]
+    fn no_verdict_crashes_without_exit_events_are_observed_once_per_attempt() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        introduce(&o, row(12, "bob"));
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        for failures in 1..=3 {
+            let id = review_key(OWNER, REPO, 12, "bob");
+            o.running.remove(&id);
+            o.claimed.remove(&id);
+            let observed = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            assert!(observed.adjudicate.is_empty());
+            assert_eq!(observed.dispatched, 0);
+            assert_eq!(
+                o.review_attempts
+                    .get(&key(12, "bob"))
+                    .expect("failure")
+                    .failures,
+                failures
+            );
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            assert_eq!(
+                o.review_attempts
+                    .get(&key(12, "bob"))
+                    .expect("failure")
+                    .failures,
+                failures,
+                "observing the same dead process again is not a new attempt"
+            );
+            let now = (o.now)() + chrono::Duration::minutes(10);
+            o.now = Box::new(move || now);
+            assert_eq!(
+                o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
+                usize::from(failures < 3)
+            );
+        }
+        assert_eq!(o.rounds_used(&coord(12)), 0);
+    }
+
+    #[test]
+    fn no_verdict_a_pre_clear_attempt_cannot_charge_the_new_generation() {
+        let (mut o, _) = orch(adjudicating(&["alice", "bob"], 3));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        o.handle_review_clear(&coord(12));
+        finish_attempt(&mut o, "bob", Some(crate::review::REVIEW_STATE_APPROVED));
+        assert_eq!(o.rounds_used(&coord(12)), 0);
     }
 
     /// [`ledger`] whose settled decisions are written through to the orchestrator's own store — the
@@ -10297,9 +10680,11 @@ mod tests {
         assert_eq!(
             o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched,
             1,
-            "one round is dispatched, and charged"
+            "one attempt is dispatched"
         );
         assert!(!dispatched.lock().expect("lock").is_empty());
+        assert_eq!(o.rounds_used(&coord(12)), 0, "a launch is not a verdict");
+        complete(&mut o, 12, "bob", HEAD_A);
         assert_eq!(o.review_rounds.get(&churn_key(&coord(12))), Some(&1));
         // And the manager decides, off-loop, exactly as `perform_adjudication` does.
         l.record(
@@ -10389,6 +10774,7 @@ mod tests {
         let l = durable_ledger(&mut o, Arc::clone(&store));
         introduce(&o, row(12, "bob"));
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        complete(&mut o, 12, "bob", HEAD_A);
         l.record(
             &coord(12),
             Adjudication::Ship {
@@ -10835,8 +11221,8 @@ mod tests {
         );
         assert_eq!(
             o.review_rounds.get(&churn_key(&coord(202))),
-            Some(&10),
-            "the durable count keeps climbing (7 + one round); it is never reset"
+            Some(&7),
+            "dispatch alone must not spend the resumed round"
         );
 
         // The round comes back with findings: the manager must decide again AT THE NEW HEAD — not
@@ -10921,7 +11307,7 @@ mod tests {
             first.dispatched, 2,
             "the one resumed round arms both live rows"
         );
-        assert_eq!(o.review_rounds.get(&churn_key(&coord(202))), Some(&8));
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(202))), Some(&6));
         assert_eq!(
             o.rounds_used(&coord(202)),
             2,
@@ -10931,6 +11317,7 @@ mod tests {
         for reviewer in ["bob", "carol"] {
             complete(&mut o, 202, reviewer, NEW_HEAD);
         }
+        assert_eq!(o.review_rounds.get(&churn_key(&coord(202))), Some(&8));
         let second = o.handle_review_sweep(&[open_at(202, NEW_HEAD)]);
         assert_eq!(
             second.dispatched, 0,
@@ -11089,10 +11476,9 @@ mod tests {
         );
         assert_eq!(
             report.adjudicate.len(),
-            1,
-            "a round that can never be dispatched is not owed: the manager is asked at the new head"
+            0,
+            "a cap cannot turn an unread head into a findings adjudication"
         );
-        assert_eq!(report.adjudicate[0].head, NEW_HEAD);
         assert!(
             dispatched.lock().expect("lock").is_empty(),
             "and no worker was handed a review"
@@ -11362,17 +11748,13 @@ mod tests {
         );
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
-        assert_eq!(report.adjudicate.len(), 1, "the manager is asked");
         assert!(
-            !report.adjudicate[0].ship_available,
-            "an unread change must not be shippable"
+            report.adjudicate.is_empty(),
+            "an unread head is not a findings loop"
         );
         assert!(
-            report.adjudicate[0]
-                .ship_unavailable_reason
-                .contains("a review round is still owed"),
-            "the reason names the gate that failed: {}",
-            report.adjudicate[0].ship_unavailable_reason
+            report.merge.is_empty(),
+            "an unread change must not be shippable"
         );
 
         // (2) A findings verdict on the change — at HEAD_A, proven identical to the observed HEAD_B.
@@ -11552,21 +11934,11 @@ mod tests {
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_C)]);
 
-        assert_eq!(report.adjudicate.len(), 1, "exactly one manager decision");
-        let plan = &report.adjudicate[0];
-        assert_eq!(plan.head, HEAD_C);
         assert!(
-            !plan.findings.is_empty(),
-            "the manager must not be handed a blank prompt when the head has moved: {:?}",
-            plan.findings
+            report.adjudicate.is_empty(),
+            "no verdict at this head means no findings adjudication"
         );
-        assert!(
-            plan.findings
-                .iter()
-                .any(|f| f.contains(&HEAD_A[..7]) && f.contains(&HEAD_C[..7])),
-            "the finding names the head that was last read AND the unread head: {:?}",
-            plan.findings
-        );
+        assert!(report.merge.is_empty());
     }
 
     /// **STUDIO-1021: "reviewed" follows STUDIO-977's patch-id proof.** With no decision yet, a
@@ -11598,16 +11970,10 @@ mod tests {
         assert!(dispatched.lock().expect("lock").is_empty());
     }
 
-    /// A TRUNCATED round at the threshold is a review that never happened; the plan must say that
-    /// rather than hand the manager "none recorded" over a round nobody completed.
-    ///
-    /// **STUDIO-1021:** the round here was already DISPATCHED at `HEAD_A` (`requested_sha`), so the
-    /// one round this head buys is spent. The threshold hands the head to the MANAGER rather than
-    /// re-arming it — the unbounded re-arm alice's round-2 review found, which spent the whole gap
-    /// between the threshold and the hard cap on the most expensive kind of round. The same fixture
-    /// at `REVIEW_ROUNDS_PER_PR_CAP` is the cap's own case and is unchanged.
+    /// STUDIO-1129 supersedes the launch-based STUDIO-1021 rule: truncation is an attempt,
+    /// never a reason to adjudicate a head nobody finished reviewing.
     #[test]
-    fn a_truncated_round_at_the_threshold_names_the_review_that_never_finished() {
+    fn a_truncated_round_at_the_threshold_owes_a_review_not_adjudication() {
         let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         introduce(&o, row(12, "bob"));
@@ -11621,31 +11987,18 @@ mod tests {
             .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
-        let plan = &report.adjudicate[0];
-        assert!(
-            !plan.findings.is_empty(),
-            "a truncated round is not 'nothing open': {:?}",
-            plan.findings
-        );
-        assert!(
-            plan.findings[0].contains(&HEAD_A[..7]),
-            "the unfinished review names the head it was attempted at: {:?}",
-            plan.findings
+        assert_eq!(report.dispatched, 1);
+        assert!(report.adjudicate.is_empty());
+        assert_eq!(
+            o.rounds_used(&coord(12)),
+            3,
+            "retrying spent no verdict round"
         );
     }
 
-    /// **STUDIO-1021 (alice's round-2 P2): a truncated resumed round does not re-arm at the same
-    /// head.** The unread head arms its one round; the round is DISPATCHED (so `requested_sha`
-    /// names this head) and then ends without a verdict. The one round is spent — the next sweep
-    /// hands the unfinished head to the manager instead of re-arming. Without the `requested_sha`
-    /// exclusion in `resumed_round_owed`, `review_round_due` calls the `truncated` row owed again
-    /// every sweep, so a review that keeps hitting the token ceiling spends every round between
-    /// `review.adjudicate_after_rounds` and `REVIEW_ROUNDS_PER_PR_CAP` before the manager is asked.
-    ///
-    /// MUTATION (the ticket's): drop the `requested_sha == head` exclusion and the second sweep
-    /// re-arms (`dispatched == 1`, `adjudicate` empty) instead of adjudicating.
+    /// A no-verdict resumed attempt retries after backoff, without spending the review budget.
     #[test]
-    fn a_truncated_resumed_round_does_not_re_arm_at_the_same_head() {
+    fn a_truncated_resumed_round_retries_at_the_same_head_without_adjudication() {
         let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
         let _l = ledger(&mut o);
         introduce(&o, reviewed_row(12, "bob", HEAD_A));
@@ -11660,29 +12013,32 @@ mod tests {
         // The round ends without declaring a verdict — the run is gone (as a real exit leaves it)
         // and the row is parked `truncated` at the head it was dispatched against.
         let id = review_key(OWNER, REPO, 12, "bob");
-        o.running.remove(&id);
-        o.claimed.remove(&id);
-        o.store()
-            .mark_review_completed(&key(12, "bob"), HEAD_B, REVIEW_STATUS_TRUNCATED)
-            .expect("completed");
-
-        // The one round is spent: the manager decides, no second round arms.
+        let started_at = o.running.get(&id).expect("attempt").started_at;
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: id,
+            started_at,
+            failed: false,
+            err_msg: String::new(),
+            last_state: String::new(),
+            declared_handoff: false,
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+        let waiting = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(waiting.dispatched, 0, "the retry waits for its backoff");
+        assert!(waiting.adjudicate.is_empty());
+        let now = (o.now)() + chrono::Duration::seconds(30);
+        o.now = Box::new(move || now);
         let next = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
-        assert_eq!(
-            next.dispatched, 0,
-            "the dispatched round is not re-armed at the same head"
-        );
-        assert_eq!(
-            next.adjudicate.len(),
-            1,
-            "the unfinished head goes to the manager: {:?}",
-            next.adjudicate
-        );
-        assert_eq!(next.adjudicate[0].head, HEAD_B);
+        assert_eq!(next.dispatched, 1, "the unread head is retried");
+        assert!(next.adjudicate.is_empty());
+        assert_eq!(o.rounds_used(&coord(12)), 3);
         assert_eq!(
             dispatched.lock().expect("lock").len(),
-            1,
-            "exactly one dispatch across both sweeps"
+            2,
+            "two attempts, still no verdict at the new head"
         );
     }
 
@@ -12006,11 +12362,14 @@ mod tests {
         let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(o.rounds_used(&coord(12)), 0);
+        complete(&mut o, 12, "bob", HEAD_A);
         assert_eq!(o.review_rounds.get("makewhatis/rhapsody#12"), Some(&1));
 
         introduce(&o, row(13, "bob"));
         complete(&mut o, 12, "bob", HEAD_A);
         o.handle_review_sweep(&[open_at(13, HEAD_A)]);
+        complete(&mut o, 13, "bob", HEAD_A);
         assert_eq!(o.review_rounds.get("makewhatis/rhapsody#13"), Some(&1));
 
         o.handle_review_sweep(&[observed(12, PrLookup::Gone)]);
@@ -12605,7 +12964,7 @@ mod tests {
     /// MUTATION GUARD: drop the `commit_review_watch` call from `finish_prepared` and the round
     /// stays 0.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_accepted_prepared_review_charges_one_round() {
+    async fn an_accepted_prepared_review_charges_only_when_it_gives_a_verdict() {
         use crate::testsupport::{ReadyResolver, ready_preparation_completion};
         let (mut o, _dispatched) = orch(ticketless(&["bob"]));
         o.prepare_resolver = Some(Arc::new(ReadyResolver));
@@ -12633,10 +12992,12 @@ mod tests {
             .await;
 
         assert_eq!(
-            o.review_rounds.get(&churn_key(&coord(31))).copied(),
-            Some(1),
-            "an accepted prepared review must charge one round against the per-PR churn budget"
+            o.rounds_used(&coord(31)),
+            0,
+            "an accepted preparation is an attempt, not a verdict"
         );
+        complete(&mut o, 31, "bob", HEAD_A);
+        assert_eq!(o.rounds_used(&coord(31)), 1);
     }
 
     /// **An ACCEPTED prepared reassignment retires the incumbent row (STUDIO-988 review round 7,
@@ -12735,8 +13096,15 @@ mod tests {
 
         assert_eq!(
             o.review_rounds.get(&churn_key(&coord(12))).copied(),
-            Some(o.shared_round_budget()),
-            "the accepted preparations must stop at the budget, never overshoot it"
+            Some(o.shared_round_budget() - 1),
+            "acceptance only reserves the last free verdict slot"
+        );
+        let re = o.running.values().next().expect("one accepted review");
+        let reviewer = re.review.as_ref().expect("review").reviewer.clone();
+        complete(&mut o, 12, &reviewer, HEAD_A);
+        assert_eq!(
+            o.review_rounds.get(&churn_key(&coord(12))).copied(),
+            Some(o.shared_round_budget())
         );
     }
 

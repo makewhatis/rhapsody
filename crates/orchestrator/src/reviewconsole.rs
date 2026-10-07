@@ -79,6 +79,9 @@ pub struct ReviewJobRow {
     /// manager is `off`, and when it has never touched this pull request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manager: Option<ManagerStateRow>,
+    /// Exhausted no-verdict attempts, independently of manager/review-loop decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infrastructure: Option<String>,
 }
 
 /// One finding revision a decision dismissed, as the console renders it.
@@ -141,6 +144,7 @@ impl From<ReviewWatchRow> for ReviewJobRow {
             status: row.status,
             open: row.open,
             manager: None,
+            infrastructure: None,
         }
     }
 }
@@ -221,7 +225,15 @@ impl Orchestrator {
         let reviews = rows
             .into_iter()
             .map(|row| {
+                let infrastructure = self
+                    .review_attempts
+                    .get(&row.key)
+                    .filter(|attempt| {
+                        row.open && attempt.failures >= crate::reviewwatch::MAX_REVIEW_ATTEMPTS
+                    })
+                    .map(|attempt| attempt.message(&row.key));
                 let mut job = ReviewJobRow::from(row);
+                job.infrastructure = infrastructure;
                 let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();
                 job.manager = states
                     .entry(key.clone())
@@ -411,6 +423,11 @@ impl Orchestrator {
             return ReviewControlOutcome::Refused("no live review of that pull request is watched");
         }
         let mut armed = 0usize;
+        self.review_attempts.retain(|key, _| {
+            !(key.owner.eq_ignore_ascii_case(&pr.owner)
+                && key.repo.eq_ignore_ascii_case(&pr.repo)
+                && key.number == pr.number)
+        });
         for row in mine {
             let id = review_key(
                 &row.key.owner,
@@ -518,6 +535,11 @@ impl Orchestrator {
         // A refusal, not an `Applied(0)`: the operator asked to clear a bound and there was none,
         // which is a different fact from "the budget is now clear" and worth saying.
         let cleared_counter = self.review_rounds.remove(&churn_key(pr)).is_some();
+        self.review_attempts.retain(|key, _| {
+            !(key.owner.eq_ignore_ascii_case(&pr.owner)
+                && key.repo.eq_ignore_ascii_case(&pr.repo)
+                && key.number == pr.number)
+        });
         // The author rounds still awaiting a reviewer's answer (STUDIO-1004) go with the budget.
         // They are not a bound — nothing is charged for them yet — but a clear promises a state
         // where both halves may run, and an un-answered author round left behind would charge a

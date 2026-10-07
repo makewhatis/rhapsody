@@ -1259,6 +1259,13 @@ impl Orchestrator {
                 self.finish_prepared(id, target, prepared).await;
             }
             PreparationOutcome::Refused(reason) => {
+                if let PreparedTarget::Review { run, .. } = &entry.target {
+                    self.note_failed_review_attempt(
+                        &run.watch_key(),
+                        &run.head_sha,
+                        &reason.message(),
+                    );
+                }
                 // A refusal never dispatches, so a reopening summons captured for this identity is
                 // dropped with it (a later run must not inherit a summons from a reopen that never
                 // happened). The same holds for a held manager wake obligation (STUDIO-1017): its

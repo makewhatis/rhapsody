@@ -296,6 +296,7 @@ function ReviewsRow({
       <td>{row.job.reviewer === "" ? "—" : row.job.reviewer}</td>
       <td>
         <Pill variant={row.variant}>{row.label}</Pill>
+        {row.job.infrastructure ? <div className="trdep">{row.job.infrastructure}</div> : null}
       </td>
       {/* The SHA the last completed round actually READ — pinned at checkout, never re-queried at
           completion, so it is the commit that was reviewed rather than whatever the head is now. */}
