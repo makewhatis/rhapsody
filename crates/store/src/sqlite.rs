@@ -598,12 +598,20 @@ ALTER TABLE rhapsody_run_provenance ADD COLUMN engine_index INTEGER NOT NULL DEF
     // upgrade. Only a persisted reviewer verdict is evidence of a round. Prefix equality (not
     // LIKE) keeps legal '_' and '%' repo names literal. Retention may have removed older
     // verdicts: the surviving evidence is a lower bound, never an invented launch count.
+    // The per-run verdict ledger predates generations. After a Clear, only finding/resolution
+    // records can prove a run belongs to this generation; omit unknowns and preserve prior refunds.
     r#"
-UPDATE rhapsody_review_bound SET dispatches = (
+UPDATE rhapsody_review_bound SET dispatches = MIN(MAX(dispatches, 0), (
   SELECT COUNT(*) FROM runs r JOIN rhapsody_review_verdicts v ON v.run_id = r.id
-  WHERE lower(substr(r.issue_identifier, 1, length(pr) + 4)) = 'pr:' || lower(pr) || '@'
+  WHERE lower(substr(r.issue_identifier, 1, length(rhapsody_review_bound.pr) + 4)) = 'pr:' || lower(rhapsody_review_bound.pr) || '@'
     AND v.verdict IN ('approved', 'changes_requested')
-);
+    AND (rhapsody_review_bound.generation <= 1 OR EXISTS (
+      SELECT 1 FROM rhapsody_review_finding f
+      WHERE lower(f.pr) = lower(rhapsody_review_bound.pr)
+        AND f.generation = rhapsody_review_bound.generation
+        AND (f.review_run_id = r.id OR f.resolved_by = CAST(r.id AS TEXT))
+    ))
+));
 "#,
 ];
 
@@ -9574,6 +9582,60 @@ mod tests {
     #[test]
     fn v25_upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs() {
         upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(25);
+    }
+
+    #[test]
+    fn upgrade_verdict_repair_never_revives_a_pre_upgrade_clear() {
+        for version in [25, 26] {
+            let scratch = scratch_dir();
+            let db = scratch.join("cleared.db");
+            {
+                let conn = Connection::open(&db).expect("raw database");
+                for migration in &MIGRATIONS[..version] {
+                    conn.execute_batch(migration).expect("old schema");
+                }
+                conn.pragma_update(None, "user_version", version as i64)
+                    .expect("version");
+                conn.execute_batch(
+                    "INSERT INTO rhapsody_review_bound (pr, dispatches, generation) VALUES
+                     ('owner/repo#290', 0, 2), ('owner/repo#291', 4, 2);
+                     INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                     (1, 'pr:owner/repo#290@bob', 'completed'),
+                     (2, 'pr:owner/repo#291@bob', 'completed'),
+                     (3, 'pr:owner/repo#291@bob', 'completed'),
+                     (4, 'pr:owner/repo#291@bob', 'completed'),
+                     (5, 'pr:owner/repo#291@carol', 'completed');
+                     INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                     (1, 'approved'), (2, 'approved'), (3, 'changes_requested'),
+                     (4, 'approved'), (5, 'approved');
+                     INSERT INTO rhapsody_review_finding
+                     (pr, generation, reviewer, finding_id, revision, review_run_id, resolved_by) VALUES
+                     ('owner/repo#290', 1, 'bob', 'B1', 1, 1, ''),
+                     ('owner/repo#291', 1, 'bob', 'B1', 1, 2, ''),
+                     ('owner/repo#291', 2, 'bob', 'B2', 1, 3, '4'),
+                     ('owner/repo#291', 2, 'bob', 'B3', 1, 3, '4');"
+                ).expect("pre-clear and current-generation evidence");
+            }
+            let store = Sqlite::open(StorePath::Disk(db)).expect("upgrade");
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#290")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                0,
+                "generation-1 history must not revive a cleared generation-2 budget"
+            );
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#291")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                2,
+                "only current-generation verdict evidence counts, once per run; unknown generations are omitted"
+            );
+        }
     }
 
     #[test]

@@ -2176,7 +2176,10 @@ re-arm.
 The v26→v27 data migration repairs old launch-based counters **once**, using retained per-run
 `rhapsody_review_verdicts` rows; subsequent restarts preserve operator refunds. Historical verdicts
 from before that ledger existed, pruned verdicts, and the old answered-author contribution cannot
-be reconstructed exactly. The repaired count is therefore the retained-verdict lower bound,
+be reconstructed exactly. The per-run ledger also lacks generation: after an operator Clear,
+only verdicts with current-generation finding/resolution evidence can be reconstructed. Unknown
+generations are omitted, and repair never raises the existing count or undoes a prior refund.
+The repaired count is therefore the retained, generation-proven verdict lower bound,
 rather than retaining failed launches as evidence of reviews. Zero-verdict adjudications are
 discarded during recovery. This remains Rhapsody-only (Go has no ticketless review), and changes
 no ported table, config shape or golden.
