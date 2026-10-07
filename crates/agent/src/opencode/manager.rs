@@ -11,6 +11,10 @@
 //! flag is omitted: the required model has not been proven to resolve with fetching disabled.
 //! Both probes used only an OpenAI login with a present-but-empty refresh field, and their
 //! private trees were removed by RAII; no run credential was read back or copied back.
+//!
+//! The operator reproduced a cold models.dev catalogue failing the first private-cache turn
+//! (2026-10-07). Both manager sessions and canaries seed only `~/.cache/opencode/models.json`
+//! before launching; they never inherit the operator's cache directory or its other contents.
 
 use std::path::{Path, PathBuf};
 
@@ -122,6 +126,39 @@ pub fn manager_env(
         ("SYMPHONY_RUN_ID".to_string(), run_id.to_string()),
     ]);
     env
+}
+
+/// Seeds the public models.dev catalogue before OpenCode starts in a cold private cache.
+pub fn seed_manager_catalogue(real_home: &Path, xdg_cache_home: &Path) -> Result<(), AgentError> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let bytes = std::fs::read(real_home.join(".cache/opencode/models.json")).map_err(|e| {
+        AgentError::Other(if e.kind() == std::io::ErrorKind::NotFound {
+            "no OpenCode model catalogue; run opencode once as the daemon's user".to_string()
+        } else {
+            "manager_model_catalogue_seed_failed: could not read OpenCode model catalogue"
+                .to_string()
+        })
+    })?;
+    let write = || -> std::io::Result<()> {
+        let dir = xdg_cache_home.join("opencode");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join("models.json"))?;
+        f.write_all(&bytes)
+    };
+    write().map_err(|_| {
+        AgentError::Other(
+            "manager_model_catalogue_seed_failed: could not write private OpenCode model catalogue"
+                .to_string(),
+        )
+    })
 }
 
 /// Writes only OpenAI, with a present-but-empty refresh field. Never reads or copies the result back.

@@ -39,7 +39,8 @@ impl OpencodeCanaryRunner {
         home: &str,
     ) -> Result<Vec<CanaryObservation>, String> {
         use rhapsody_agent::opencode::manager::{
-            manager_args, manager_config_content, manager_env, seed_manager_credential,
+            manager_args, manager_config_content, manager_env, seed_manager_catalogue,
+            seed_manager_credential,
         };
         let parent = if self.workspace_root.is_empty() {
             std::env::temp_dir()
@@ -62,6 +63,8 @@ impl OpencodeCanaryRunner {
             std::fs::create_dir_all(root.0.join(dir))
                 .map_err(|_| "could not create canary subdirectory")?;
         }
+        seed_manager_catalogue(Path::new(home), &root.0.join("xdg/cache"))
+            .map_err(|e| e.to_string())?;
         seed_manager_credential(source, &data).map_err(|e| e.to_string())?;
         let traps =
             plant_traps(&cwd, &root.0.join("out")).map_err(|_| "could not plant canary traps")?;
@@ -497,6 +500,13 @@ mod tests {
         let script = d.0.join("fake-opencode");
         let log = d.0.join("launches.jsonl");
         let src = d.0.join("source.json");
+        let cache = d.0.join(".cache/opencode");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("models.json"),
+            r#"{"openai":{"models":{"gpt-6.1-sol":{}}}}"#,
+        )
+        .unwrap();
         std::fs::write(&src,json!({"openai":{"type":"oauth","access":"synthetic","refresh":"synthetic-refresh","expires":4102444800000_i64},"other":{"key":"synthetic-other"}}).to_string()).unwrap();
         let code=r#"#!/usr/bin/env python3
 import os, sys, json, pathlib, time
@@ -511,7 +521,7 @@ assert set(config['tools'])==set(['invalid','question','bash','read','glob','gre
 assert all(x is False for x in config['tools'].values())
 assert config['permission']=={'*':'deny','symphony_*':'allow'}
 assert config['plugin']==[]
-assert config['mcp']['symphony']['environment']=={'HOME':'/synthetic-operator','SYMPHONY_RUN_ID':'0'}
+assert config['mcp']['symphony']['environment']=={'HOME':str(pathlib.Path(log).parent),'SYMPHONY_RUN_ID':'0'}
 root=cwd.parent
 assert pathlib.Path(env['HOME'])==root/'home'
 for key,leaf in [('XDG_CONFIG_HOME','config'),('XDG_DATA_HOME','data'),('XDG_CACHE_HOME','cache'),('XDG_STATE_HOME','state')]:
@@ -521,6 +531,9 @@ auth=pathlib.Path(env['XDG_DATA_HOME'])/'opencode/auth.json'
 doc=json.loads(auth.read_text())
 assert list(doc)==['openai'] and doc['openai']['refresh']==''
 assert auth.stat().st_mode & 0o777==0o600
+if mode=='catalogue':
+    catalogue=pathlib.Path(env['XDG_CACHE_HOME'])/'opencode/models.json'
+    assert catalogue.read_bytes()==(pathlib.Path(log).parent/'.cache/opencode/models.json').read_bytes()
 assert (cwd/'opencode.json').is_file() and (cwd/'.opencode/plugin/trap.js').is_file()
 if sys.argv[1:]==['debug','agent','build']:
     tools=config['tools'].copy()
@@ -563,7 +576,7 @@ else:
     async fn run_fake(r: &OpencodeCanaryRunner, src: &Path) -> Vec<CanaryObservation> {
         r.run_with_inputs(
             src,
-            "/synthetic-operator",
+            &src.parent().unwrap().to_string_lossy(),
             // Python startup can exceed two seconds on a busy shared operator machine.
             // The hanging fake still outlasts this deadline and exercises cancellation.
             std::time::Duration::from_secs(30),
@@ -577,6 +590,42 @@ else:
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
     }
+    #[tokio::test]
+    async fn manager_cache_seeded_with_models_catalogue() {
+        let d = Scratch::new();
+        let (r, src, log) = fake(&d, "catalogue");
+        let catalogue = d.0.join(".cache/opencode/models.json");
+        let before = std::fs::read(&catalogue).unwrap();
+        let mtime = std::fs::metadata(&catalogue).unwrap().modified().unwrap();
+        let obs = run_fake(&r, &src).await;
+        assert!(obs.iter().all(|o| o.refused), "{obs:?}");
+        assert_eq!(launches(&log).len(), 2);
+        assert_eq!(std::fs::read(&catalogue).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&catalogue).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read_dir(&r.workspace_root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_catalogue_is_a_typed_reason() {
+        let d = Scratch::new();
+        let (r, src, log) = fake(&d, "clean");
+        std::fs::remove_file(d.0.join(".cache/opencode/models.json")).unwrap();
+        let obs = run_fake(&r, &src).await;
+        assert_eq!(obs.len(), REQUIRED_ATTEMPTS.len());
+        assert!(
+            obs.iter().all(|o| !o.refused
+                && o.detail.contains(
+                    "no OpenCode model catalogue; run opencode once as the daemon's user"
+                )),
+            "{obs:?}"
+        );
+        assert!(!log.exists());
+        assert_eq!(std::fs::read_dir(&r.workspace_root).unwrap().count(), 0);
+    }
+
     #[tokio::test]
     async fn runner_runs_posture_then_canary_in_the_manager_env() {
         let d = Scratch::new();

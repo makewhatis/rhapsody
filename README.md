@@ -1328,6 +1328,9 @@ field. Their self-test (STUDIO-1121) checks `debug agent build` without a model 
 low-effort trap canary: no built-ins or unregistered writes, no project/plugin/instruction traps,
 and a successful `symphony_state` read. Both layers fail closed. The resolved permission tail may
 allow OpenCode's own truncated-output directory only inside that run's private XDG data tree.
+Before either launch, sessions and canaries copy the public model catalogue from
+`~/.cache/opencode/models.json` into their own private cache. A missing catalogue refuses the
+entry with `no OpenCode model catalogue; run opencode once as the daemon's user`.
 
 The manager adjudicates a stalled review loop, and the security boundary is that its agent run gets
 **no filesystem, no shell, no network and no repository checkout**: the daemon serves every read.
