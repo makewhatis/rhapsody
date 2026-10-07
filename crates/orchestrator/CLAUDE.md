@@ -136,6 +136,13 @@ the `Orchestrator` struct itself. Concretely:
     `hold`/`note_human_label`: the
     auto-promote pass writes those with a partial (Backlog-only) view, and letting it mark the set
     "known" would reopen the silent hole.
+
+  - `managerselftest.rs`'s `ManagerSelfTestState` — the boot gate and off-loop watcher write
+    version-bound verdicts per manager-run entry; the control task reads them at launch and marks
+    a rejected login auth-blocked against its dispatch-time fingerprint (STUDIO-1119). Entry
+    configuration is installed at boot. The credential probe runs outside the bookkeeping lock,
+    and no lock is held across the canary await. Attempt cursors and fallback provenance remain
+    control-task-owned in `Orchestrator::manager_attempts`; workers never mutate them.
     This is also why `dispatch` and `select` are no longer in the "never lock anything" set below:
     both call `HumanHoldLedger` methods on `&self`, so they take this one lock.
 

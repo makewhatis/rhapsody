@@ -138,6 +138,27 @@ pub fn manager_live_prompt(case_packet: &str) -> String {
 /// funnel, keyed by the run's key.
 pub type PendingManagers = std::collections::HashMap<String, ManagerRun>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ManagerAttempt {
+    pub intervention_id: String,
+    pub selected: crate::managerselftest::SelectedEntry,
+    pub next_index: usize,
+    pub fallback_reason: String,
+    pub credential_fingerprint: Option<String>,
+}
+
+impl ManagerAttempt {
+    pub fn decided_by(&self) -> crate::managerselftest::DecidedBy {
+        crate::managerselftest::DecidedBy {
+            entry: self.selected.index + 1,
+            harness: self.selected.entry.harness.clone(),
+            model: self.selected.entry.model.clone(),
+            fallback_reason: (!self.fallback_reason.is_empty())
+                .then(|| self.fallback_reason.clone()),
+        }
+    }
+}
+
 /// The checkout coordinates a manager launch carries onto its [`RunningEntry`](crate::orchestrator::RunningEntry)
 /// and hands to the worker. Deliberately narrow: the worker provisions an EMPTY cwd and never a
 /// repository, so all it needs is the run's key (to name the per-run directory) and the run timeout.
@@ -292,35 +313,104 @@ impl Orchestrator {
         // acts again. Re-probe the installed version HERE — and record it — so a CLI that updated
         // itself in place mid-process can never be acted on before the off-loop self-test watcher
         // re-runs the canary (the watcher re-runs because the verdict's version no longer matches).
-        // `claude --version` is ~15 ms and manager launches are rare.
-        let command = self.manager_cli_command(&route.slug);
-        let probed = crate::managerselftest::probe_cli_version(&command);
-        self.manager_selftest.observe_probe(&probed);
-        if let Err(reason) = self.manager_launch_permitted() {
-            tracing::warn!(
-                pr = %format!("{}/{}#{}", run.owner, run.repo, run.number),
-                reason = %reason.message(),
-                "manager run refused: the startup self-test has not passed on the current CLI"
-            );
-            return ManagerDispatchOutcome::SelfTestFailed(reason);
+        // Re-probe each entry's own command before selecting it.
+        let entries = self
+            .teams
+            .as_ref()
+            .map(|t| t.manager.effective_harnesses())
+            .unwrap_or_default();
+        self.manager_selftest.configure(entries.clone());
+        for (index, entry) in entries.iter().enumerate() {
+            let command = self.manager_cli_command(&route.slug, &entry.harness);
+            let probed = crate::managerselftest::probe_cli_version(&command);
+            self.manager_selftest.observe_entry_probe(index, &probed);
         }
+        let selected = match self.select_manager_entry(&run) {
+            Ok(selected) => selected,
+            Err(reason) => {
+                tracing::warn!(
+                    pr = %format!("{}/{}#{}", run.owner, run.repo, run.number),
+                    reason = %reason.message(),
+                    detail = %reason.detail,
+                    "manager run refused: the startup self-test has not passed on the current CLI"
+                );
+                return ManagerDispatchOutcome::SelfTestFailed(reason);
+            }
+        };
         if self.drain.is_draining() {
             return ManagerDispatchOutcome::Draining;
         }
         let iss = run.synthetic_issue();
+        let intervention_id = crate::managerintervention::manager_pr_key(&id)
+            .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
+            .map(|r| r.id)
+            .unwrap_or_default();
+        let prior_reason = self
+            .manager_attempts
+            .get(&id)
+            .filter(|a| a.intervention_id == intervention_id)
+            .map(|a| a.fallback_reason.clone())
+            .unwrap_or_default();
+        let skipped = self.manager_selftest.fallback_reason(selected.index);
+        let fallback_reason = [prior_reason, skipped]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.manager_attempts.insert(
+            id,
+            ManagerAttempt {
+                intervention_id,
+                next_index: selected.index,
+                credential_fingerprint: self
+                    .manager_selftest
+                    .credential_probe()
+                    .fingerprint(&selected.entry),
+                selected,
+                fallback_reason,
+            },
+        );
         self.finish_manager_dispatch(run, route, iss);
         ManagerDispatchOutcome::Dispatched
     }
 
-    /// The `claude` command a manager run for `slug` would launch: the routed project's resolved
+    /// The selected harness command a manager run for `slug` would launch: the project's resolved
     /// command, else the CLI name. Used only to re-probe `--version` at the §4.7 gate.
-    fn manager_cli_command(&self, slug: &str) -> String {
-        self.eff
+    fn manager_cli_command(&self, slug: &str, harness: &str) -> String {
+        let config = self
+            .eff
             .as_ref()
             .and_then(|e| e.projects.iter().find(|p| p.slug == slug))
-            .map(|p| p.mcfg.claude.command.clone())
+            .map(|p| &p.mcfg);
+        config
+            .map(|c| match harness {
+                "claude" => c.claude.command.clone(),
+                "opencode" => c.opencode.command.clone(),
+                _ => String::new(),
+            })
             .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| "claude".to_string())
+            .unwrap_or_else(|| harness.to_string())
+    }
+
+    pub(crate) fn select_manager_entry(
+        &self,
+        run: &ManagerRun,
+    ) -> Result<crate::managerselftest::SelectedEntry, crate::managerselftest::ManagerUnavailable>
+    {
+        let active_id = crate::managerintervention::manager_pr_key(&run.key())
+            .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
+            .map(|r| r.id)
+            .unwrap_or_default();
+        let start = self
+            .manager_attempts
+            .get(&run.key())
+            .filter(|a| a.intervention_id == active_id)
+            .map_or(0, |a| a.next_index);
+        self.manager_selftest.select_from(
+            start,
+            (self.now)().timestamp_millis(),
+            self.manager_selftest.credential_probe().as_ref(),
+        )
     }
 
     /// The tail of a manager dispatch: stage the coordinates for
@@ -360,6 +450,56 @@ impl Orchestrator {
         // intervention must not stay `running` until its lease expires — a clean exit with a valid
         // decision becomes `decided`/`validated`, and anything else a `failed_attempt`.
         self.settle_manager_intervention(&re.issue.id, e);
+        if e.failed
+            && self
+                .teams
+                .as_ref()
+                .is_some_and(|t| !t.manager.harnesses.is_empty())
+        {
+            if let Some(attempt) = self.manager_attempts.get_mut(&re.issue.id) {
+                if e.auth_needed {
+                    self.manager_selftest.mark_auth_blocked(
+                        attempt.selected.index,
+                        attempt.credential_fingerprint.clone(),
+                    );
+                }
+                attempt.next_index = attempt.selected.index.saturating_add(1);
+                let reason = format!(
+                    "entry {} unavailable: {}",
+                    attempt.selected.index + 1,
+                    manager_failure_class(e)
+                );
+                if !attempt.fallback_reason.is_empty() {
+                    attempt.fallback_reason.push_str("; ");
+                }
+                attempt.fallback_reason.push_str(&reason);
+            }
+            // The same intervention returns through the ordinary launch gates and atomic budget.
+            self.pump_manager_interventions();
+        }
+    }
+}
+
+/// Fallback provenance is persisted and published. Harness stderr is untrusted and may contain a
+/// credential, so only a closed failure classification may cross that boundary.
+fn manager_failure_class(exit: &crate::retry::EvWorkerExit) -> &'static str {
+    if exit.auth_needed {
+        return "authentication failed";
+    }
+    let code = exit
+        .err_msg
+        .trim()
+        .split(|c: char| c == ':' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    match code {
+        "agent_not_found" | "agent_command_invalid" | "startup_failed" | "manager_cwd_failed" => {
+            "session start failed"
+        }
+        "turn_timeout" => "run timeout",
+        "turn_failed" => "session crashed or turn failed",
+        "billing_guard_failed" => "session startup contract failed",
+        _ => "manager session failed",
     }
 }
 
@@ -618,8 +758,8 @@ mod tests {
         );
     }
 
-    // The manager run's harness is always `claude` and its model/effort come from M6's config
-    // (`manager.model`/`manager.effort`). Pinned because alice's review noted the override could be
+    // Without a harnesses list, the manager run retains the legacy Claude model/effort.
+    // Pinned because alice's review noted the override could be
     // disabled (`if false && manager.is_some()`) with every test still green.
     #[test]
     fn a_dispatched_manager_run_carries_the_manager_model_effort_and_harness() {
@@ -638,7 +778,7 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(
             d[0].harness, "claude",
-            "a manager run is always the claude harness"
+            "an absent harnesses list retains the legacy Claude harness"
         );
         assert_eq!(d[0].model_override.model, "claude-opus-5-5");
         assert_eq!(d[0].model_override.effort, "high");

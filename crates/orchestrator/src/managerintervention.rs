@@ -649,7 +649,27 @@ impl Orchestrator {
     pub(crate) fn manager_surface_reason(&self, env: LaunchGateEnv) -> Option<String> {
         match evaluate_launch_gates(env) {
             LaunchGate::Deferred(reason) => Some(reason.human().to_string()),
-            LaunchGate::Unavailable => Some("manager unavailable: CLI contract".to_string()),
+            LaunchGate::Unavailable => {
+                if self
+                    .teams
+                    .as_ref()
+                    .is_some_and(|t| !t.manager.harnesses.is_empty())
+                {
+                    self.manager_selftest
+                        .select(
+                            (self.now)().timestamp_millis(),
+                            self.manager_selftest.credential_probe().as_ref(),
+                        )
+                        .err()
+                        .map(|e| format!("manager unavailable: {}", e.detail))
+                } else {
+                    Some("manager unavailable: CLI contract".to_string())
+                }
+            }
+            LaunchGate::Proceed => {
+                let notices = self.manager_selftest.credential_notices();
+                (!notices.is_empty()).then(|| notices.join("; "))
+            }
             _ => None,
         }
     }
@@ -704,6 +724,11 @@ impl Orchestrator {
                 r.state == MANAGER_INTERVENTION_LAUNCHING || r.state == MANAGER_INTERVENTION_RUNNING
             })
             .count();
+        self.manager_attempts.retain(|_, attempt| {
+            all.iter().any(|row| {
+                row.id == attempt.intervention_id && !manager_intervention_is_terminal(&row.state)
+            })
+        });
         let mut slots = (self.manager_max_concurrent().max(0) as usize).saturating_sub(running);
 
         for row in all.iter().filter(|r| is_launch_candidate(&r.state)) {
@@ -711,6 +736,36 @@ impl Orchestrator {
                 break; // `manager.max_concurrent` full: the rest stay queued
             }
             let env = self.manager_gate_env(&row.pr);
+            if matches!(
+                evaluate_launch_gates(env),
+                LaunchGate::Proceed | LaunchGate::Unavailable
+            ) && let Some(run) = self.manager_run_for(&row.pr)
+                && self
+                    .manager_attempts
+                    .get(&run.key())
+                    .is_some_and(|a| a.intervention_id == row.id && a.next_index > a.selected.index)
+                && let Err(reason) = self.select_manager_entry(&run)
+            {
+                let failed = self
+                    .manager_attempts
+                    .get(&run.key())
+                    .map(|a| a.fallback_reason.as_str())
+                    .unwrap_or_default();
+                let detail = [failed, reason.detail.as_str()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if let Err(e) = self.store().stop_manager_intervention(
+                    &row.id,
+                    rhapsody_store::MANAGER_INTERVENTION_ESCALATED,
+                    &format!("manager unavailable after fallback: {detail}"),
+                ) {
+                    tracing::warn!(pr = %row.pr, err = %e, "manager: recording exhausted harnesses failed");
+                }
+                self.post_manager_room_notice(&row.pr, &detail);
+                continue;
+            }
             match evaluate_launch_gates(env) {
                 LaunchGate::Deferred(reason) => {
                     if row.state != MANAGER_INTERVENTION_DEFERRED {
@@ -1092,11 +1147,27 @@ impl Orchestrator {
         }
         // Store the decision and move to `decided`, clearing the lease. The stored body is the
         // fenced block itself, so M9's activation can re-parse it.
-        let body =
+        let mut body =
             crate::reviewfindings::fenced_blocks(text, managerdecision::MANAGER_DECISION_TAG)
                 .into_iter()
                 .next()
                 .unwrap_or_default();
+        if let Some(coord) = parse_pr_key(&row.pr) {
+            let key = crate::managerrun::manager_key(&coord.owner, &coord.repo, coord.number);
+            if let Some(attempt) = self
+                .manager_attempts
+                .get(&key)
+                .filter(|a| a.intervention_id == row.id)
+            {
+                match managerdecision::record_decided_by(&body, &attempt.decided_by()) {
+                    Ok(record) => body = record,
+                    Err(err) => {
+                        tracing::warn!(pr = %row.pr, err = %err, "manager: recording provenance failed");
+                        return;
+                    }
+                }
+            }
+        }
         if let Err(e) = self.store().record_manager_decision(
             &row.id,
             &body,
@@ -1778,6 +1849,308 @@ mod tests {
             .expect("read")
             .expect("row")
             .state
+    }
+
+    struct LoginProbe;
+    impl crate::managerselftest::EntryCredentialProbe for LoginProbe {
+        fn status(
+            &self,
+            _: &rhapsody_config::teams::ManagerHarnessEntry,
+            _: i64,
+        ) -> crate::managerselftest::CredentialStatus {
+            crate::managerselftest::CredentialStatus::NotApplicable
+        }
+        fn fingerprint(&self, _: &rhapsody_config::teams::ManagerHarnessEntry) -> Option<String> {
+            Some("login-a".into())
+        }
+    }
+    fn multi_orch(max_runs: i64) -> (Orchestrator, DispatchedEntries, String) {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        let manager = &mut o.teams.as_mut().expect("teams").manager;
+        manager.max_runs_per_generation = max_runs;
+        manager.harnesses = vec![
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "opencode".into(),
+                model: "openai/gpt-6.1-sol".into(),
+                effort: "xhigh".into(),
+            },
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            },
+        ];
+        o.manager_selftest.configure(manager.effective_harnesses());
+        o.manager_selftest
+            .set_credential_probe(Arc::new(LoginProbe));
+        o.eff.as_mut().expect("eff").projects[0]
+            .mcfg
+            .opencode
+            .command = test_cli_command();
+        for index in 0..2 {
+            o.manager_selftest.record_entry(
+                index,
+                SelfTestRecord {
+                    cli_version: test_cli_version(),
+                    verdict: SelfTestVerdict::Passed,
+                },
+            );
+        }
+        prime_holds(&o);
+        o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_KEY)]);
+        let id = active(&o).expect("intervention").id;
+        o.pump_manager_interventions();
+        (o, dispatched, id)
+    }
+    async fn exit_fake(
+        o: &mut Orchestrator,
+        start_error: bool,
+        err: Option<rhapsody_agent::AgentError>,
+        text: &str,
+    ) {
+        let key = crate::managerrun::manager_key("makewhatis", "rhapsody", 12);
+        let re = o.running.get(&key).expect("manager running").clone();
+        let mut fake = rhapsody_agent::fake::Fake::new();
+        if start_error {
+            fake.start_err = err.clone();
+        }
+        fake.turns = vec![rhapsody_agent::fake::TurnScript {
+            err,
+            result: rhapsody_agent::TurnResult {
+                result_text: text.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let req = rhapsody_agent::manager::ManagerSessionStart {
+            model: re.model_override.model.clone(),
+            effort: re.model_override.effort.clone(),
+            cwd: String::new(),
+            config_dir: String::new(),
+            run_timeout_ms: 1,
+            model_credential: None,
+        };
+        let (result, error) = match rhapsody_agent::Harness::start_manager_session(
+            &fake,
+            req,
+            re.issue.clone(),
+            None,
+        ) {
+            Ok(session) => session.run_turn("case", None, None, &|_| {}).await,
+            Err(error) => (Default::default(), Some(error)),
+        };
+        let auth_needed = matches!(error, Some(rhapsody_agent::AgentError::AuthFailed(_)));
+        o.on_worker_exit(crate::retry::EvWorkerExit {
+            issue_id: key,
+            failed: error.is_some(),
+            started_at: re.started_at,
+            err_msg: error.map(|e| e.to_string()).unwrap_or_default(),
+            last_state: String::new(),
+            declared_handoff: false,
+            review_verdict: None,
+            manager_text: Some(result.result_text),
+            refused: false,
+            auth_needed,
+        });
+    }
+    async fn assert_fallback(start_error: bool, error: rhapsody_agent::AgentError) {
+        let (mut o, dispatched, id) = multi_orch(12);
+        assert_eq!(dispatched.lock().expect("lock")[0].harness, "opencode");
+        assert_eq!(
+            dispatched.lock().expect("lock")[0].model_override.model,
+            "openai/gpt-6.1-sol"
+        );
+        assert_eq!(
+            dispatched.lock().expect("lock")[0].model_override.effort,
+            "xhigh"
+        );
+        exit_fake(&mut o, start_error, Some(error), "").await;
+        let d = dispatched.lock().expect("lock");
+        assert_eq!(d.len(), 2, "fallback launches immediately");
+        assert_eq!(d[1].harness, "claude");
+        assert_eq!(d[1].model_override.model, "opus");
+        assert_eq!(
+            o.store()
+                .manager_intervention(&id)
+                .expect("read")
+                .expect("row")
+                .attempts,
+            2
+        );
+    }
+    #[tokio::test]
+    async fn falls_back_on_session_start_error() {
+        assert_fallback(true, rhapsody_agent::AgentError::StartupFailed).await;
+    }
+    #[tokio::test]
+    async fn falls_back_on_auth_error_and_blocks_entry() {
+        let (mut o, _, _) = multi_orch(12);
+        exit_fake(
+            &mut o,
+            false,
+            Some(rhapsody_agent::AgentError::AuthFailed("401".into())),
+            "",
+        )
+        .await;
+        assert_eq!(
+            o.manager_selftest
+                .select(0, &LoginProbe)
+                .expect("fallback")
+                .index,
+            1
+        );
+    }
+    #[tokio::test]
+    async fn falls_back_on_timeout() {
+        assert_fallback(false, rhapsody_agent::AgentError::TurnTimeout).await;
+    }
+    #[tokio::test]
+    async fn falls_back_on_crash() {
+        assert_fallback(false, rhapsody_agent::AgentError::TurnFailed).await;
+    }
+    #[tokio::test]
+    async fn malformed_decision_does_not_fall_back() {
+        let (mut o, dispatched, id) = multi_orch(12);
+        exit_fake(&mut o, false, None, "not a decision").await;
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_FAILED_ATTEMPT);
+        o.pump_manager_interventions();
+        assert_eq!(dispatched.lock().expect("lock")[1].harness, "opencode");
+    }
+    #[tokio::test]
+    async fn every_attempt_counts_against_max_runs_per_generation() {
+        let (mut o, dispatched, id) = multi_orch(1);
+        exit_fake(
+            &mut o,
+            false,
+            Some(rhapsody_agent::AgentError::TurnFailed),
+            "",
+        )
+        .await;
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+        assert_eq!(
+            state_of(&o, &id),
+            rhapsody_store::MANAGER_INTERVENTION_EXHAUSTED
+        );
+        assert!(
+            o.store()
+                .manager_budget(PR_KEY)
+                .expect("budget")
+                .expect("row")
+                .is_stopped()
+        );
+    }
+    #[tokio::test]
+    async fn no_entry_left_after_fallbacks_escalates() {
+        let (mut o, dispatched, id) = multi_orch(12);
+        exit_fake(
+            &mut o,
+            false,
+            Some(rhapsody_agent::AgentError::TurnFailed),
+            "",
+        )
+        .await;
+        exit_fake(
+            &mut o,
+            false,
+            Some(rhapsody_agent::AgentError::TurnTimeout),
+            "",
+        )
+        .await;
+        o.pump_manager_interventions();
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+        assert_eq!(
+            state_of(&o, &id),
+            rhapsody_store::MANAGER_INTERVENTION_ESCALATED
+        );
+    }
+    #[tokio::test]
+    async fn decision_record_carries_decided_by() {
+        let (mut o, _, id) = multi_orch(12);
+        let text = format!(
+            "```rhapsody-manager-decision\n{{\"decision\":\"ESCALATE\",\"head\":\"{}\",\"evidence_rev\":0,\"rationale\":\"need human\",\"escalate\":{{\"question\":\"what now?\",\"checked\":\"reviews\"}}}}\n```",
+            "a".repeat(40)
+        );
+        exit_fake(&mut o, false, None, &text).await;
+        let row = o
+            .store()
+            .manager_intervention(&id)
+            .expect("read")
+            .expect("row");
+        let json: serde_json::Value = serde_json::from_str(&row.decision_json).expect("json");
+        assert_eq!(json["decided_by"]["entry"], 1);
+        assert_eq!(json["decided_by"]["harness"], "opencode");
+        assert_eq!(json["decided_by"]["model"], "openai/gpt-6.1-sol");
+        assert!(
+            managerdecision::parse_stored_decision(
+                &format!("```rhapsody-manager-decision\n{}\n```", row.decision_json),
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            managerdecision::parse_decision(
+                &format!("```rhapsody-manager-decision\n{}\n```", row.decision_json),
+                &[]
+            )
+            .is_err(),
+            "the agent cannot forge host provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_record_keeps_a_bounded_classification_not_stderr() {
+        let text = format!(
+            "```rhapsody-manager-decision\n{{\"decision\":\"ESCALATE\",\"head\":\"{}\",\"evidence_rev\":0,\"rationale\":\"need human\",\"escalate\":{{\"question\":\"what now?\",\"checked\":\"reviews\"}}}}\n```",
+            "a".repeat(40)
+        );
+        for (error, expected) in [
+            (
+                rhapsody_agent::AgentError::StartupFailed,
+                "session start failed",
+            ),
+            (rhapsody_agent::AgentError::TurnTimeout, "run timeout"),
+            (
+                rhapsody_agent::AgentError::TurnFailed,
+                "session crashed or turn failed",
+            ),
+            (
+                rhapsody_agent::AgentError::AuthFailed("rejected opaque-login-value".into()),
+                "authentication failed; entry 1 unavailable: authentication failed; run opencode auth login as the daemon's user",
+            ),
+            (
+                rhapsody_agent::AgentError::Other(format!(
+                    "turn_failed: sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789{}",
+                    "stderr".repeat(1000)
+                )),
+                "session crashed or turn failed",
+            ),
+            (
+                rhapsody_agent::AgentError::Other(
+                    "opaque-login-value without a recognized error code".into(),
+                ),
+                "manager session failed",
+            ),
+        ] {
+            let (mut o, _, id) = multi_orch(12);
+            exit_fake(&mut o, false, Some(error), "").await;
+            exit_fake(&mut o, false, None, &text).await;
+            let row = o
+                .store()
+                .manager_intervention(&id)
+                .expect("read")
+                .expect("row");
+            let by = crate::managerselftest::DecidedBy::from_stored(&row.decision_json)
+                .expect("provenance");
+            assert_eq!(
+                by.fallback_reason,
+                Some(format!("entry 1 unavailable: {expected}"))
+            );
+            let decision = managerdecision::parse_stored_decision(&text, &[]).expect("decision");
+            let body =
+                crate::managerapply::manager_explanation_body_by(&decision, "marker", Some(&by));
+            assert!(!body.contains("sk-ant-api03-") && !body.contains("opaque-login-value"));
+        }
     }
 
     // --- pure rules ---------------------------------------------------------------------------

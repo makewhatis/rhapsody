@@ -1313,6 +1313,19 @@ Go-recaptured schema golden; `divergent_objects_are_gated_by_name_only` pins the
 
 ### The manager run's host-served reads — no checkout, no `gh`, no `git` (STUDIO-1014)
 
+**Ordered manager-run harnesses (STUDIO-1119).** `manager.harnesses` optionally selects an ordered
+list of `{harness, model, effort}` entries (`claude` or `opencode`); the one-shot
+`manager.harness`/`provider` tuple remains independent. An absent list preserves the existing
+single-Claude run with `manager.model`/`effort`, including its boot-failure behavior. Each configured
+entry has its own version-bound, fail-closed self-test, with the failure detail in its log line.
+Explicit lists use the first passing, credential-available entry; startup failures, authentication
+rejections, crashes and timeouts advance to the next available entry through the same atomic run
+reservation. Malformed decisions retain the existing same-entry failed-attempt handling. Every
+launched attempt counts against the generation budget. The host records `decided_by` beside a
+validated decision, and its explanation names the model, harness and fallback reason. OpenCode
+entries remain unavailable until their isolated manager session and self-test adapters are installed
+by the subsequent MH2/MH3 slices.
+
 The manager adjudicates a stalled review loop, and the security boundary is that its agent run gets
 **no filesystem, no shell, no network and no repository checkout**: the daemon serves every read.
 Rhapsody adds a `manager` MCP role, a set of `/api/v1/manager/*` read endpoints, and one new
