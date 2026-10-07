@@ -54,6 +54,22 @@ pub const RUN_MESSAGE_DELIVERED: &str = "delivered";
 /// run ended before the message was written
 pub const RUN_MESSAGE_EXPIRED: &str = "expired";
 
+/// One turn's latest dollar snapshot (STUDIO-1124), separate from Go's run-row schema.
+/// Replacing a live estimate with its terminal value must never double-count spend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnSpend {
+    pub turn: i64,
+    pub at: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    /// None is unknown, never zero. Subscription amounts are API-equivalent only.
+    pub usd: Option<f64>,
+    pub source: String,
+    /// A positive harness report is evidence that this exact model can report cost.
+    pub harness_priced: bool,
+}
+
 /// RunStart is the dispatch-time record inserted with outcome="running".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStart {

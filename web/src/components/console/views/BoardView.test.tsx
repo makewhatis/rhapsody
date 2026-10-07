@@ -233,6 +233,14 @@ describe("the board (STUDIO-925)", () => {
     expect(card?.querySelector(".hchip")).toBeNull();
   });
 
+  it("keeps the exact USD refusal remedy on the budget chip", () => {
+    const reason = "no price for fireworks-ai/m; add it under prices: or daily_usd for fireworks-ai cannot be enforced";
+    mount([], vi.fn(), COUNTS, 4, { budgetHeld: [{ subject: "STUDIO-1124", title: "USD budgets", project: "rhapsody", provider: "fireworks-ai", daily_tokens: 0, spent_tokens: 0, daily_usd: 10, reason, pr: "" }] });
+    const chip = document.querySelector(".bcard .bchip");
+    expect(chip?.textContent).toBe("fireworks-ai budget held");
+    expect(chip?.getAttribute("title")).toBe(reason);
+  });
+
   // STUDIO-970 — a REVIEW budget hold names a pull request coordinate and is the reconciliation
   // sweep's surface. The board must not invent a ticket card for it.
   it("draws no card for a review budget hold (STUDIO-970)", () => {

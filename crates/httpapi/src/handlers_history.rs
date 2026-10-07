@@ -3175,6 +3175,9 @@ mod tests {
     /// One ticket budget hold, with only the fields the tally reads spelled out.
     fn budget_hold(subject: &str, pr: &str) -> rhapsody_orchestrator::budget::BudgetHeld {
         rhapsody_orchestrator::budget::BudgetHeld {
+            reason: String::new(),
+            daily_usd: None,
+            spent_usd: None,
             subject: subject.into(),
             title: "meter spend per provider".into(),
             project: "rhapsody".into(),

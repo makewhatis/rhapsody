@@ -593,19 +593,7 @@ impl Orchestrator {
             && let Some(attempt) = self.manager_attempts.get(&iss.id)
         {
             let entry = &attempt.selected.entry;
-            if self
-                .teams
-                .as_ref()
-                .is_some_and(|t| !t.manager.harnesses.is_empty())
-            {
-                re.model_override = rhapsody_agent::ModelOverride::default();
-            }
-            if !entry.model.is_empty() {
-                re.model_override.model = entry.model.clone();
-            }
-            if !entry.effort.is_empty() {
-                re.model_override.effort = entry.effort.clone();
-            }
+            re.model_override = self.manager_model_override(re.model_override, entry);
             re.harness = entry.harness.clone();
         }
         if let Some(engine) = &engine {
@@ -715,8 +703,8 @@ impl Orchestrator {
             //
             // A MANAGER run is excluded for the same reason a review is (STUDIO-1049): the run is
             // already staged in `pending_manager` and its own gate is `dispatch_manager`; a refusal
-            // at THIS point would strand it while the caller answered `Dispatched`. The design's
-            // §10.2 provider-budget deferral for a manager launch is M8's gate.
+            // at THIS point would strand it while the caller answered `Dispatched`.
+            // Its USD gate is checked before both the intervention reservation and direct launch.
             if review.is_none() && manager.is_none() && self.budgets_configured() {
                 let provider =
                     self.projected_provider(&re.harness, &re.model_override, &re.project_slug);
@@ -729,6 +717,15 @@ impl Orchestrator {
                         limit,
                         spent,
                     );
+                    return;
+                }
+                let pricing =
+                    self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
+                if let Some(mut held) = self.usd_budget_hold(&pricing) {
+                    held.subject = iss.identifier.clone();
+                    held.title = iss.title.clone();
+                    held.project = re.project_slug.clone();
+                    self.note_usd_budget_hold(held);
                     return;
                 }
                 // The ticket dispatched, so a stale hold from an earlier tick must not linger on

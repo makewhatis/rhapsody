@@ -9985,6 +9985,7 @@ mod tests {
         o.eff.as_mut().expect("eff").cfg.budgets.insert(
             "anthropic".to_string(),
             rhapsody_config::ProviderBudget {
+                daily_usd: 0.0,
                 daily_tokens: 200,
                 per_ticket: 0,
             },

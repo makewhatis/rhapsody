@@ -207,11 +207,17 @@ fn raw_from_config(c: &Config) -> Raw {
         r.budgets.insert(
             provider.clone(),
             RawProviderBudget {
+                daily_usd: (b.daily_usd != 0.0).then_some(b.daily_usd),
                 daily_tokens: Some(b.daily_tokens),
                 per_ticket: (b.per_ticket > 0).then_some(b.per_ticket),
             },
         );
     }
+    r.prices = c
+        .prices
+        .iter()
+        .map(|(model, price)| (model.clone(), price.clone()))
+        .collect();
     // STUDIO-1026 (Rhapsody-only): emit the `notify:` block only when some channel is configured, so
     // a workflow that never writes it round-trips byte-identically (every channel defaults off).
     if c.notify.macos || !c.notify.webhook.is_empty() || !c.notify.ntfy.is_empty() {

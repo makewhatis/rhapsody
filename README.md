@@ -3197,6 +3197,55 @@ poll interval, so the poll bound alone under-covers it. And the local midnight i
 the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
 longer folds an extra hour of yesterday's spend into today.
 
+### Dollar budgets and operator-maintained model prices (STUDIO-1124)
+
+The Go reference has no dollar budget. Rhapsody adds `budgets.<provider>.daily_usd`
+(zero/unset means unlimited) and a `prices:` table keyed by the full
+`<provider>/<model>` name, with `input`, `output`, `cache_read` and `cache_write`
+rates in dollars per million tokens:
+
+```yaml
+prices:
+  fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash:
+    input: 0.27
+    output: 1.10
+    cache_read: 0.07
+    cache_write: 0.27
+budgets:
+  fireworks-ai:
+    daily_usd: 10
+```
+
+These are example operator-maintained rates, not a bundled price catalog. A configured
+price takes precedence over the harness's reported dollars; a missing or zero harness
+cost is **unknown**, not a free API model. New dispatch requires either a table entry
+or a previous positive harness-cost observation for that exact provider/model. Otherwise
+it refuses with `no price for <model>; add it under prices: or daily_usd for <provider>
+cannot be enforced`. USD holds carry the reason on the state snapshot, dashboard and
+reconciliation report. A token ceiling and a USD ceiling may coexist; either can hold
+new dispatch. Existing continuation exemptions and token-only budgets are unchanged.
+Manager runs check their selected engine's USD budget at launch and before reserving
+an intervention attempt. An unknown price or spent cap defers them without consuming
+an attempt or generation allocation; a cleared budget releases the hold.
+
+Dollar snapshots are persisted per run/turn in `rhapsody_turn_spend`, leaving Go-owned
+tables and their goldens untouched. Live snapshots are replaced by terminal totals,
+never summed twice; a turn belongs to the local day of its first usage observation.
+Unreadable/unknown dollar spend or disabled dollar storage refuses a configured USD
+budget. Previously unpriced spend remains unknown for that day; adding a price enables
+future observations but does not invent historical dollars.
+
+The private provider-broker path supplies an authoritative token total without a
+priceable input/output/cache breakdown. A configured USD budget therefore refuses
+new brokered dispatch, including a priced model, rather than billing from the child's
+comparison-only token reports. Native API-key providers use the pricing order above.
+
+Claude runs with the subscription billing guard and OpenCode `openai` OAuth runs record
+API-equivalent dollars under their subscription accounts, for information only. Those
+figures never gate USD dispatch. The existing per-provider token budgets remain available
+for subscriptions. An install without `daily_usd` or `prices:` preserves its dispatch
+behavior and the Go-pinned config/state shapes.
+
 ### The PR-state watcher polls with conditional requests — `polling.pr_state_interval_ms` (STUDIO-974)
 
 The ticketless review watcher re-asks GitHub where every watched pull request stands on a timer, and
