@@ -91,6 +91,7 @@ investigation and recorded findings, act on them now.]";
 /// Builds opencode sessions.
 pub struct Runner {
     cfg: Config,
+    force_fresh: bool,
 }
 
 impl Runner {
@@ -112,7 +113,10 @@ impl Runner {
         if cfg.turn_timeout.is_zero() {
             cfg.turn_timeout = Duration::from_secs(3600);
         }
-        Runner { cfg }
+        Runner {
+            cfg,
+            force_fresh: false,
+        }
     }
 
     /// Resolves the private state directory for a dispatch of `issue`, preferring a session
@@ -133,6 +137,10 @@ impl Runner {
         issue: &Issue,
         provision: impl FnOnce() -> Result<RunState, AgentError>,
     ) -> Result<(RunState, String, bool), AgentError> {
+        if self.force_fresh {
+            resume::discard(&self.cfg.state_root, &issue.identifier);
+            return provision().map(|state| (state, String::new(), false));
+        }
         let now = Utc::now().timestamp_millis();
         match resume::select(
             &self.cfg.state_root,
@@ -501,6 +509,18 @@ impl Harness for Runner {
 
 #[async_trait]
 impl crate::Runner for Runner {
+    async fn start_fresh_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        let fresh = Runner {
+            cfg: self.cfg.clone(),
+            force_fresh: true,
+        };
+        fresh.start_session(workspace_path, issue, transcript).await
+    }
     /// ⚠️ Provisions the session's private state directory BEFORE returning, so a missing
     /// credential is refused here — at dispatch, with a message naming the fix — rather than
     /// surfacing mid-turn as a 401 indistinguishable from a real provider problem. This is the
@@ -3096,6 +3116,53 @@ sleep 30
             model: model.to_string(),
             ..Default::default()
         })
+    }
+
+    /// An engine switch must not adopt an unrelated retained session for the same ticket.
+    #[tokio::test]
+    async fn fresh_session_does_not_adopt_a_retained_opencode_session() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let auth = seeded_auth(&scripts);
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1125"), None)
+            .await
+            .unwrap();
+        let (_, err) = sess.run_turn("old engine", None, None, &|_| {}).await;
+        assert!(err.is_some());
+        sess.stop().await.unwrap();
+        drop(sess);
+        assert!(record_file(&sr, "STUDIO-1125").exists());
+        let argv_log = scripts.path().join("argv.txt");
+        let clean = write_script(
+            &scripts,
+            "fresh.sh",
+            &format!(
+                "printf '%s\\n' \"$*\" > '{}'\nprintf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_new\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+                argv_log.display()
+            ),
+        );
+        let fresh_runner = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        let fresh = fresh_runner
+            .start_fresh_session(&ws, issue("STUDIO-1125"), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.thread_id(), "");
+        let (_, err) = fresh.run_turn("handoff note", None, None, &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        let argv = std::fs::read_to_string(argv_log).unwrap();
+        assert!(!argv.contains("-s ses_cut"), "must not resume: {argv}");
+        assert!(!argv.contains("Resuming a cut-off attempt"));
+        assert_eq!(fresh.thread_id(), "ses_new");
+        fresh.stop().await.unwrap();
+        drop(fresh);
+        assert!(session_dirs(state_root.path()).is_empty());
     }
 
     /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1043. A turn killed by `turn_timeout` must keep its private

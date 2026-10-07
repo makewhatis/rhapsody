@@ -514,6 +514,9 @@ pub(crate) fn run_provenance_response(
     let mut obj = serde_json::Map::new();
     obj.insert("run_id".to_string(), json!(run_id));
     if let Some(p) = p {
+        if p.engine_index > 0 {
+            obj.insert("engine_index".to_string(), json!(p.engine_index));
+        }
         for (key, value) in [
             ("harness", &p.harness),
             ("harness_origin", &p.harness_origin),

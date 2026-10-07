@@ -971,7 +971,9 @@ pub(crate) async fn handle_run_detail(
     match tokio::time::timeout(SNAPSHOT_TIMEOUT, provider.snapshot()).await {
         Ok(Ok(snap)) => {
             if let Some(row) = snap.running.iter().find(|r| r.run_id == run_id) {
-                return write_json(StatusCode::OK, &run_detail_from_running(row, &now));
+                let mut detail = run_detail_from_running(row, &now);
+                decorate_engine_index(&mut detail, provider.history().as_ref(), run_id);
+                return write_json(StatusCode::OK, &detail);
             }
         }
         Ok(Err(err)) => {
@@ -1007,10 +1009,26 @@ pub(crate) async fn handle_run_detail(
             Vec::new()
         }
     };
-    write_json(
-        StatusCode::OK,
-        &run_detail_from_summary(&run, &events, &now),
-    )
+    let mut detail = run_detail_from_summary(&run, &events, &now);
+    decorate_engine_index(&mut detail, provider.history().as_ref(), run_id);
+    write_json(StatusCode::OK, &detail)
+}
+
+/// Fallback-only decoration: primary/legacy runs retain their byte-identical Go wire shape.
+fn decorate_engine_index(
+    detail: &mut serde_json::Value,
+    store: &dyn crate::HistoryStore,
+    run_id: i64,
+) {
+    match store.run_provenance(run_id) {
+        Ok(Some(p)) if p.engine_index > 0 => {
+            detail["engine_index"] = serde_json::json!(p.engine_index)
+        }
+        Err(err) => {
+            tracing::warn!(run_id, error = %err, "run detail: engine provenance unavailable")
+        }
+        _ => {}
+    }
 }
 
 /// `GET /api/v1/events?q=&issue=&kind=&limit=`: a cross-run substring search over event text. `limit`
@@ -3895,6 +3913,47 @@ mod tests {
 
     // ---- run provenance (STUDIO-909; Rhapsody-only, no Go counterpart) ----
 
+    #[tokio::test]
+    async fn engine_index_recorded() {
+        for live in [false, true] {
+            let store = Arc::new(mem_store());
+            let run_id = seed_completed_run(&store);
+            let mut snap = empty_snapshot();
+            if live {
+                let mut row = running_row("MT-1");
+                row.run_id = run_id;
+                snap.running.push(row);
+            }
+            let base = spawn(FakeProvider::ok(snap).with_history(store.clone())).await;
+            for index in [0, 2] {
+                store
+                    .set_run_provenance(
+                        run_id,
+                        &rhapsody_store::RunProvenance {
+                            engine_index: index,
+                            harness: "opencode".into(),
+                            model: "openai/gpt-6.1-sol".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                for suffix in ["", "/provenance"] {
+                    let (status, body) =
+                        get_json(&format!("{base}/api/v1/runs/{run_id}{suffix}")).await;
+                    assert_eq!(status, 200);
+                    if index == 0 {
+                        assert!(
+                            body.get("engine_index").is_none(),
+                            "primary keeps its wire shape"
+                        );
+                    } else {
+                        assert_eq!(body["engine_index"], index);
+                    }
+                }
+            }
+        }
+    }
+
     /// The forensic endpoint: all three values plus the origin of each configurable one, so an
     /// override (`review.model.opencode`) is visible on the run rather than invisible.
     #[tokio::test]
@@ -3911,6 +3970,7 @@ mod tests {
                     model_origin: "review.model.opencode".into(),
                     provider: "fireworks-ai".into(),
                     provider_origin: "default".into(),
+                    engine_index: 0,
                 },
             )
             .expect("set provenance");
@@ -4112,6 +4172,7 @@ mod tests {
                     model_origin: "profile".into(),
                     provider: "fireworks-ai".into(),
                     provider_origin: "default".into(),
+                    engine_index: 0,
                 },
             )
             .expect("set provenance");
@@ -4146,6 +4207,7 @@ mod tests {
                     model_origin: "claude.model".into(),
                     provider: "anthropic".into(),
                     provider_origin: "default".into(),
+                    engine_index: 0,
                 },
             )
             .expect("set provenance");
@@ -4183,6 +4245,7 @@ mod tests {
                     model_origin: "claude.model".into(),
                     provider: "anthropic".into(),
                     provider_origin: "default".into(),
+                    engine_index: 0,
                 },
             )
             .expect("set provenance");
@@ -4206,6 +4269,7 @@ mod tests {
                     model_origin: "opencode.model".into(),
                     provider: "fireworks-ai".into(),
                     provider_origin: "default".into(),
+                    engine_index: 0,
                 },
             )
             .expect("set old provenance");
