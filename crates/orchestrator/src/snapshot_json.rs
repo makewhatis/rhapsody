@@ -203,7 +203,7 @@ pub fn render(s: &Snapshot) -> Value {
                 s.budget_held
                     .iter()
                     .map(|h| {
-                        json!({
+                        let mut row = json!({
                             "subject": h.subject,
                             "title": h.title,
                             "project": h.project,
@@ -217,7 +217,15 @@ pub fn render(s: &Snapshot) -> Value {
                             // struct already carries this discriminator, so it travels rather than
                             // being re-derived from the subject's `pr:` convention.
                             "pr": h.pr,
-                        })
+                        });
+                        if !h.reason.is_empty()
+                            && let Some(obj) = row.as_object_mut()
+                        {
+                            obj.insert("reason".into(), json!(h.reason));
+                            obj.insert("daily_usd".into(), json!(h.daily_usd));
+                            obj.insert("spent_usd".into(), json!(h.spent_usd));
+                        }
+                        row
                     })
                     .collect::<Vec<_>>(),
             ),

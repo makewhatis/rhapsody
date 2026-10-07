@@ -139,6 +139,7 @@ export interface BoardCard {
    * surfaces those, and a ticket card for one would be work that does not exist.
    */
   budgetHeld?: string;
+  budgetReason?: string;
 }
 
 /** The four lanes, left to right — the order a ticket travels them. */
@@ -461,6 +462,7 @@ export function buildConsoleBoard(
       // hold only. Reading the snapshot set here would be a second source of truth for the same
       // fact and could disagree with the row's status/sub-label.
       budgetHeld: row.budgetHeld,
+      budgetReason: row.budgetReason,
     };
     cards.push(card);
     byIssue.set(row.issue, card);
@@ -558,6 +560,7 @@ export function buildConsoleBoard(
       dependencies: [],
       heldForHuman: false,
       budgetHeld: b.provider,
+      budgetReason: b.reason,
     };
     cards.push(card);
     byIssue.set(b.subject, card);

@@ -1659,6 +1659,58 @@ impl Orchestrator {
         target: PreparedTarget,
         prepared: PreparedDispatch,
     ) {
+        // L2 (STUDIO-1124): explicit-provider models are opaque, so deriving their provider from
+        // a slash in the model would bypass its budget. The broker receipt currently has only a
+        // token total, not the input/output/cache breakdown a dollar price needs. Fail closed
+        // rather than promote comparison-only child usage into billable spend.
+        if prepared.has_custody()
+            && let Some(limit) = self
+                .eff
+                .as_ref()
+                .and_then(|e| e.cfg.budgets.get(&prepared.provider))
+                .map(|b| b.daily_usd)
+                .filter(|v| *v > 0.0)
+        {
+            let (issue, project, pr, fresh) = match &target {
+                PreparedTarget::Ticket {
+                    issue,
+                    route,
+                    attempt,
+                    ..
+                } => (
+                    issue,
+                    route.as_ref().map_or("", |r| r.slug.as_str()),
+                    String::new(),
+                    attempt.is_none(),
+                ),
+                PreparedTarget::Review {
+                    issue, route, run, ..
+                } => (
+                    issue,
+                    route.slug.as_str(),
+                    format!("{}/{}#{}", run.owner, run.repo, run.number),
+                    true,
+                ),
+            };
+            if fresh {
+                let model = format!("{}/{}", prepared.provider, prepared.model);
+                let reason = match self.eff.as_ref() {
+                    Some(eff) => crate::budget::usd_gate(&prepared.provider, &model, &eff.cfg, 0.0).err(),
+                    None => None,
+                }.unwrap_or_else(|| format!("daily_usd for {} cannot be enforced: broker usage has no priced token breakdown", prepared.provider));
+                self.note_usd_budget_hold(crate::budget::BudgetHeld {
+                    subject: issue.identifier.clone(),
+                    title: issue.title.clone(),
+                    project: project.into(),
+                    provider: prepared.provider.clone(),
+                    reason,
+                    daily_usd: Some(limit),
+                    pr,
+                    ..Default::default()
+                });
+                return;
+            }
+        }
         match target {
             PreparedTarget::Ticket {
                 issue,
@@ -3913,6 +3965,33 @@ mod tests {
         );
         PreparedDispatch::new("opencode", "accounts/fireworks/models/x", "fireworks", "7")
             .with_provider(provider, plan)
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_usd_never_bypasses_the_gate_with_an_opaque_model() {
+        let (mut o, sink) = crate::testsupport::orch_for_retry(Arc::new(Fake::new()), 10);
+        o.eff.as_mut().unwrap().cfg.budgets.insert(
+            "fireworks".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        o.finish_prepared("1".into(), ticket_target("Todo"), custody_dispatch())
+            .await;
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "opaque models must not evade their explicit provider's USD budget"
+        );
+        let held = o
+            .budget_ledger
+            .get("MT-1", o.budget_hold_ttl())
+            .expect("visible refusal");
+        assert_eq!(held.provider, "fireworks");
+        assert_eq!(
+            held.reason,
+            "no price for fireworks/accounts/fireworks/models/x; add it under prices: or daily_usd for fireworks cannot be enforced"
+        );
     }
 
     /// A per-provider observed-revision watermark stand-in for the daemon's credential boundary

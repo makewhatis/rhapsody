@@ -321,6 +321,18 @@ impl Store for Noop {
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
+    fn usd_accounting_available(&self) -> bool {
+        false
+    }
+    fn set_turn_spend(&self, _run_id: i64, _spend: &TurnSpend) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn turn_spend_since(&self, _since: &str) -> Result<Vec<TurnSpend>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn model_has_reported_cost(&self, _provider: &str, _model: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
         Ok(Vec::new())
     }

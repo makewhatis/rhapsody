@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -589,6 +589,23 @@ ALTER TABLE rhapsody_manager_intervention ADD COLUMN rerequested TEXT NOT NULL D
     // manager's output didn't parse: ZeroOrManyBlocks, 3 attempts" instead of only a WARN line.
     r#"
 ALTER TABLE rhapsody_manager_intervention ADD COLUMN failure_reason TEXT NOT NULL DEFAULT '';
+"#,
+    // v25 -> v26: USD observations (STUDIO-1124). Go-owned tables and goldens are unchanged.
+    r#"
+CREATE TABLE rhapsody_turn_spend (
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  turn INTEGER NOT NULL,
+  at TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  account TEXT NOT NULL,
+  model TEXT NOT NULL,
+  usd REAL,
+  source TEXT NOT NULL,
+  harness_priced INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (run_id, turn)
+);
+CREATE INDEX rhapsody_turn_spend_at ON rhapsody_turn_spend(at);
+CREATE INDEX rhapsody_turn_spend_model ON rhapsody_turn_spend(provider, model, harness_priced);
 "#,
 ];
 
@@ -1778,6 +1795,62 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn set_turn_spend(&self, run_id: i64, spend: &TurnSpend) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_turn_spend (run_id, turn, at, provider, account, model, usd, source, harness_priced)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(run_id, turn) DO UPDATE SET usd = excluded.usd,
+               source = excluded.source, harness_priced = MAX(harness_priced, excluded.harness_priced)",
+            params![run_id, spend.turn, spend.at, spend.provider, spend.account, spend.model,
+                spend.usd, spend.source, spend.harness_priced],
+        )?;
+        Ok(())
+    }
+
+    fn usd_accounting_available(&self) -> bool {
+        true
+    }
+
+    fn turn_spend_since(&self, since: &str) -> Result<Vec<TurnSpend>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT turn, at, provider, account, model, usd, source, harness_priced
+            FROM rhapsody_turn_spend WHERE at >= ?1
+            UNION ALL
+            SELECT 0, r.started_at, p.provider, p.provider, p.model, NULL, 'unknown', 0
+              FROM runs r JOIN rhapsody_run_provenance p ON p.run_id = r.id
+             WHERE r.started_at >= ?1 AND r.total_tokens > 0
+               AND NOT EXISTS (SELECT 1 FROM rhapsody_turn_spend s WHERE s.run_id = r.id)
+            ORDER BY at, turn",
+        )?;
+        let rows = stmt.query_map([since], |row| {
+            Ok(TurnSpend {
+                turn: row.get(0)?,
+                at: row.get(1)?,
+                provider: row.get(2)?,
+                account: row.get(3)?,
+                model: row.get(4)?,
+                usd: row.get(5)?,
+                source: row.get(6)?,
+                harness_priced: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn model_has_reported_cost(&self, provider: &str, model: &str) -> Result<bool, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rhapsody_turn_spend
+            WHERE provider = ?1 AND model = ?2 AND account = provider AND harness_priced = 1)",
+                params![provider, model],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
@@ -4169,6 +4242,51 @@ mod tests {
         let dir = scratch_dir();
         let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp");
         (dir, store)
+    }
+
+    #[test]
+    fn turn_spend_replaces_snapshots_survives_restart_and_keeps_day_boundary() {
+        let (dir, store) = open_temp();
+        let id = store.start_run(RunStart::default()).unwrap();
+        let mut spend = TurnSpend {
+            turn: 1,
+            at: "2026-10-06T23:59:00Z".into(),
+            provider: "p".into(),
+            account: "p".into(),
+            model: "p/m".into(),
+            usd: Some(0.125),
+            source: "harness_reported".into(),
+            harness_priced: true,
+        };
+        store.set_turn_spend(id, &spend).unwrap();
+        spend.at = "2026-10-07T00:01:00Z".into();
+        spend.usd = Some(0.25);
+        store.set_turn_spend(id, &spend).unwrap();
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).unwrap();
+        let rows = store.turn_spend_since("2026-10-06T00:00:00Z").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].usd, Some(0.25));
+        assert_eq!(rows[0].at, "2026-10-06T23:59:00Z");
+        assert!(
+            store
+                .turn_spend_since("2026-10-07T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.model_has_reported_cost("p", "p/m").unwrap());
+        assert!(!store.model_has_reported_cost("other", "p/m").unwrap());
+        assert!(!store.model_has_reported_cost("p", "p/other").unwrap());
+        spend.turn = 2;
+        spend.account = "chatgpt-subscription".into();
+        spend.model = "p/subscription".into();
+        store.set_turn_spend(id, &spend).unwrap();
+        assert!(
+            !store
+                .model_has_reported_cost("p", "p/subscription")
+                .unwrap(),
+            "subscription equivalents never prove API spend"
+        );
     }
 
     /// Create a transcript fixture file (Go `writeFileForTest`).
@@ -7848,6 +7966,9 @@ mod tests {
                 "rhapsody_manager_intervention_active".to_string(),
                 "rhapsody_manager_wake".to_string(),
                 "rhapsody_manager_wake_issue".to_string(),
+                "rhapsody_turn_spend".to_string(),
+                "rhapsody_turn_spend_at".to_string(),
+                "rhapsody_turn_spend_model".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

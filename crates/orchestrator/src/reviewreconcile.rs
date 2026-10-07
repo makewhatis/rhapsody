@@ -1774,6 +1774,14 @@ impl Orchestrator {
                         );
                     }
                     (None, Some(hold), _) => {
+                        let reason = if hold.reason.is_empty() {
+                            format!(
+                                "the provider {}'s daily token budget is spent ({} of {})",
+                                hold.provider, hold.spent_tokens, hold.daily_tokens
+                            )
+                        } else {
+                            hold.reason.clone()
+                        };
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -1784,15 +1792,12 @@ impl Orchestrator {
                             provider = %hold.provider,
                             daily_tokens = hold.daily_tokens,
                             spent_tokens = hold.spent_tokens,
-                            "review reconciliation: {} — {}. It is held for budget: the provider \
-                             {}'s daily token budget is spent ({} of {}), so no run on it can start \
+                            "review reconciliation: {} — {}. It is held for budget: {}, so no run on it can start \
                              yet. Work on other providers continues; this sweep only reports, so it \
                              needs a human.",
                             d.pr,
                             d.kind.detail(),
-                            hold.provider,
-                            hold.spent_tokens,
-                            hold.daily_tokens
+                            reason
                         );
                     }
                     (None, None, Some(reason)) => {

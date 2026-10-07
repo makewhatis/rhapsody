@@ -362,8 +362,7 @@ pub async fn start_brokered_session(
 ///   mcp/sandbox exclusivity that `crate::harness` defers to slice 5 is a codex constraint and does
 ///   not apply: this harness honours both at once, as the capture proves.
 /// * `usage: TokensAndCost` — `[RAN]` `step_finish.part.cost` alongside a full token breakdown.
-///   As with claude, the cost half is declared but not yet extracted: `crate::Usage` has no cost
-///   field, and adding one is slice 7 / §7.4's spend-budget work, not this adapter's.
+///   The adapter sums per-step cost into `Event::cost_usd` for USD accounting (STUDIO-1124).
 /// * `budgets: false` — the turn deadline below is the daemon's, not a CLI-enforced budget;
 ///   opencode has no budget flag at all (design §7.2).
 /// * `stdin: ClosedAtStart` — the measured difference from claude (module doc).
@@ -1312,6 +1311,7 @@ impl OpencodeSession {
         };
 
         let mut usage = Usage::default();
+        let mut cost_usd = Some(0.0);
         let mut result_text = String::new();
         let mut terminal_seen = false;
         let mut failure: Option<Failure> = None;
@@ -1395,6 +1395,13 @@ impl OpencodeSession {
                         add_usage(&mut usage, &step);
                     }
                     let mut ev = c.event.clone();
+                    if c.step_usage.is_some() {
+                        cost_usd = match (cost_usd, c.event.cost_usd) {
+                            (Some(total), Some(step)) if step.is_finite() && step >= 0.0 => Some(total + step),
+                            _ => None,
+                        };
+                        ev.cost_usd = cost_usd;
+                    }
                     ev.pid = pid as i64;
                     // ⚠️ A usage-bearing NOTIFICATION must carry the RUNNING TURN TOTAL, not this
                     // step's own figures. The orchestrator's live estimate is LAST-WINS, not
@@ -1607,6 +1614,7 @@ impl OpencodeSession {
                 timestamp: Some(Utc::now()),
                 pid: pid as i64,
                 usage: Some(usage),
+                cost_usd,
                 ..Default::default()
             });
             return (tr, None);
@@ -2405,7 +2413,7 @@ exit 0
         // A raw string keeps the JSON's own quotes readable; `{reason}` is substituted by
         // `replace` rather than `format!` so no brace in the JSON needs doubling.
         let step = |reason: &str| {
-            const TMPL: &str = r#"printf '{"type":"step_finish","sessionID":"ses_x","part":{"reason":"REASON","tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n'
+            const TMPL: &str = r#"printf '{"type":"step_finish","sessionID":"ses_x","part":{"reason":"REASON","cost":0.125,"tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n'
 "#;
             TMPL.replace("REASON", reason)
         };
@@ -2447,6 +2455,16 @@ exit 0
         // The invariant stated plainly: a last-wins consumer reading only the final notification
         // must land on the same number the turn commits.
         assert_eq!(live.last().copied(), Some(tr.usage.total_tokens));
+        let costs: Vec<_> = events_of(&seen)
+            .iter()
+            .filter(|e| e.usage.is_some())
+            .map(|e| e.cost_usd)
+            .collect();
+        assert_eq!(
+            costs,
+            [Some(0.125), Some(0.25), Some(0.375), Some(0.375)],
+            "live and terminal dollars must sum every step exactly once"
+        );
     }
 
     // ⚠️ EVERY turn announces its session, and a continuation turn resumes with `-s <id>`.

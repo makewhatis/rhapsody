@@ -539,6 +539,14 @@ impl Orchestrator {
                 self.note_review_budget_hold(&id, &pr, &route.slug, &provider, limit, spent);
                 return ReviewDispatchOutcome::BudgetHeld;
             }
+            let pricing = self.review_projected_pricing(&iss, &route.slug);
+            if let Some(mut held) = self.usd_budget_hold(&pricing) {
+                held.subject = id.clone();
+                held.pr = pr;
+                held.project = route.slug.clone();
+                self.note_usd_budget_hold(held);
+                return ReviewDispatchOutcome::BudgetHeld;
+            }
             // A dispatched review clears this reviewer's own stale hold — and only this reviewer's.
             self.release_budget_hold(&id);
         }
@@ -1179,6 +1187,7 @@ mod tests {
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
                 rhapsody_config::ProviderBudget {
+                    daily_usd: 0.0,
                     daily_tokens: 200,
                     per_ticket: 0,
                 },
@@ -1285,6 +1294,7 @@ mod tests {
             eff.cfg.budgets.insert(
                 "anthropic".to_string(),
                 rhapsody_config::ProviderBudget {
+                    daily_usd: 0.0,
                     daily_tokens: 200,
                     per_ticket: 0,
                 },
@@ -1384,6 +1394,7 @@ mod tests {
         o.eff.as_mut().expect("eff").cfg.budgets.insert(
             "anthropic".to_string(),
             rhapsody_config::ProviderBudget {
+                daily_usd: 0.0,
                 daily_tokens: 200,
                 per_ticket: 0,
             },

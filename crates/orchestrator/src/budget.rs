@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, LocalResult, SecondsFormat, TimeDelta, TimeZone, Utc};
+use rhapsody_config::{Config, Price};
 use rhapsody_store::Store;
 use serde::Serialize;
 
@@ -50,6 +51,132 @@ const SPEND_CACHE_TTL: Duration = Duration::from_secs(3);
 /// half of every cycle. A REVIEW hold takes the wider of that and the review watcher's own
 /// [`CAPACITY_HOLD_TTL`](crate::reviewwatch::CAPACITY_HOLD_TTL) — see [`Entry::ttl`].
 const HOLD_TTL_FLOOR: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenCounts {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostSource {
+    PriceTable,
+    HarnessReported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunCost {
+    Priced { usd: f64, source: CostSource },
+    Unknown,
+}
+
+/// Configured prices win. A missing, zero, negative or non-finite harness cost is unknown.
+/// In particular OpenCode's subscription `cost: 0` is not evidence of a free API model.
+pub fn run_cost_usd(
+    model: &str,
+    tokens: &TokenCounts,
+    harness_reported_usd: Option<f64>,
+    prices: &HashMap<String, Price>,
+) -> RunCost {
+    if let Some(p) = prices.get(model) {
+        let usd = (tokens.input.max(0) as f64 * p.input
+            + tokens.output.max(0) as f64 * p.output
+            + tokens.cache_read.max(0) as f64 * p.cache_read
+            + tokens.cache_write.max(0) as f64 * p.cache_write)
+            / 1_000_000.0;
+        if usd.is_finite() && usd >= 0.0 {
+            return RunCost::Priced {
+                usd,
+                source: CostSource::PriceTable,
+            };
+        }
+    }
+    match harness_reported_usd.filter(|v| v.is_finite() && *v > 0.0) {
+        Some(usd) => RunCost::Priced {
+            usd,
+            source: CostSource::HarnessReported,
+        },
+        None => RunCost::Unknown,
+    }
+}
+
+/// Actual spend only. Unknown observations or an unreadable store fail closed, never as $0.
+pub fn daily_spend_usd(store: &dyn Store, provider: &str, since: &str) -> f64 {
+    match store.turn_spend_since(since) {
+        Ok(rows) => rows
+            .iter()
+            .filter(|r| r.provider == provider && r.account == provider)
+            .map(|r| {
+                r.usd
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(f64::INFINITY)
+            })
+            .sum(),
+        Err(error) => {
+            tracing::warn!(%error, provider, "USD budget: today's spend is unreadable; refusing new dispatch");
+            f64::INFINITY
+        }
+    }
+}
+
+/// Subscription equivalents are information only; this function is never a dispatch predicate.
+pub fn api_equivalent_usd_today(store: &dyn Store, account: &str) -> f64 {
+    match store.turn_spend_since(&local_day_start()) {
+        Ok(rows) => rows
+            .iter()
+            .filter(|r| r.account == account && r.account != r.provider)
+            .filter_map(|r| r.usd.filter(|v| v.is_finite() && *v >= 0.0))
+            .sum(),
+        Err(error) => {
+            tracing::warn!(%error, account, "subscription equivalent: reading today's dollars failed");
+            0.0
+        }
+    }
+}
+
+pub fn usd_gate(provider: &str, model: &str, cfg: &Config, spent_usd: f64) -> Result<(), String> {
+    usd_gate_with_reported_price(provider, model, cfg, spent_usd, false)
+}
+
+fn usd_gate_with_reported_price(
+    provider: &str,
+    model: &str,
+    cfg: &Config,
+    spent_usd: f64,
+    harness_priced: bool,
+) -> Result<(), String> {
+    let limit = cfg.budgets.get(provider).map_or(0.0, |b| b.daily_usd);
+    if limit <= 0.0 || matches!(provider, "claude-subscription" | "chatgpt-subscription") {
+        return Ok(());
+    }
+    if !cfg.prices.contains_key(model) && !harness_priced {
+        return Err(format!(
+            "no price for {model}; add it under prices: or daily_usd for {provider} cannot be enforced"
+        ));
+    }
+    if !spent_usd.is_finite() {
+        return Err(format!(
+            "daily_usd for {provider} cannot be enforced: today's spend is unknown"
+        ));
+    }
+    if spent_usd >= limit {
+        return Err(format!(
+            "daily_usd for {provider} is spent (${spent_usd:.6} of ${limit:.6})"
+        ));
+    }
+    Ok(())
+}
+
+/// Dispatch-time billing identity and price snapshot, immune to a later config reload.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RunPricing {
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub prices: HashMap<String, Price>,
+}
 
 /// Reports whether a provider's configured daily budget is SPENT. `limit <= 0` is unlimited (the
 /// `max_concurrent` idiom), as is the absence of a limit (the caller only calls this with a
@@ -136,7 +263,7 @@ fn spent_by_provider(store: &dyn Store, since: &str) -> HashMap<String, i64> {
 /// reviewers of one PR independent (sol round 1 on PR #199 — one reviewer's successful dispatch
 /// used to erase a sibling reviewer's still-active hold), and this field is how the reconciliation
 /// sweep still finds every hold for a coordinate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BudgetHeld {
     pub subject: String,
     pub title: String,
@@ -145,6 +272,12 @@ pub struct BudgetHeld {
     pub daily_tokens: i64,
     pub spent_tokens: i64,
     pub pr: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent_usd: Option<f64>,
 }
 
 /// The budget ledger: the CURRENT refused set the console reads off `/api/v1/state`, a once-per-
@@ -306,13 +439,150 @@ impl BudgetLedger {
 pub type SharedBudgetLedger = Arc<BudgetLedger>;
 
 impl crate::orchestrator::Orchestrator {
+    pub(crate) fn run_pricing_for(
+        &self,
+        harness: &str,
+        model_override: &rhapsody_agent::ModelOverride,
+        project: &str,
+    ) -> RunPricing {
+        let (harness, model) = self.resolved_harness_model(harness, model_override, project);
+        let provider = crate::persist::derive_provider(&harness, &model);
+        let key = if model.contains('/') {
+            model
+        } else {
+            format!("{provider}/{model}")
+        };
+        let mut pricing = RunPricing {
+            account: provider.clone(),
+            provider,
+            model: key.clone(),
+            ..Default::default()
+        };
+        if let Some(eff) = &self.eff {
+            if let Some(price) = eff.cfg.prices.get(&key) {
+                pricing.prices.insert(key, price.clone());
+            }
+            let guard = eff
+                .project_by_slug(project)
+                .map_or(eff.cfg.claude.billing_guard, |p| {
+                    p.mcfg.claude.billing_guard
+                });
+            if harness == "claude" && guard.unwrap_or(true) {
+                pricing.account = "claude-subscription".into();
+            } else if harness == "opencode"
+                && pricing.provider == "openai"
+                && rhapsody_agent::opencode::state::provider_uses_oauth(
+                    &eff.cfg.opencode.auth_source,
+                    "openai",
+                )
+            {
+                pricing.account = "chatgpt-subscription".into();
+            }
+        }
+        pricing
+    }
+
+    /// USD binds only pay-per-token accounts. A prior positive report for this exact model is
+    /// evidence for the harness fallback; an unobserved model needs an operator-maintained price.
+    pub(crate) fn usd_budget_hold(&self, pricing: &RunPricing) -> Option<BudgetHeld> {
+        let cfg = &self.eff.as_ref()?.cfg;
+        let limit = cfg.budgets.get(&pricing.provider)?.daily_usd;
+        if limit <= 0.0 || pricing.account != pricing.provider {
+            return None;
+        }
+        let spent = daily_spend_usd(self.store(), &pricing.provider, &local_day_start());
+        let known = match self
+            .store()
+            .model_has_reported_cost(&pricing.provider, &pricing.model)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "USD budget: model cost history is unreadable");
+                false
+            }
+        };
+        let reason =
+            usd_gate_with_reported_price(&pricing.provider, &pricing.model, cfg, spent, known)
+                .err()
+                .or_else(|| {
+                    (!self.store().usd_accounting_available()).then(|| {
+                format!(
+                    "daily_usd for {} cannot be enforced: dollar accounting storage is unavailable",
+                    pricing.provider
+                )
+            })
+                })?;
+        Some(BudgetHeld {
+            provider: pricing.provider.clone(),
+            reason,
+            daily_usd: Some(limit),
+            spent_usd: spent.is_finite().then_some(spent),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn note_usd_budget_hold(&self, held: BudgetHeld) {
+        let first = self.budget_ledger.hold(&held.subject, held.clone());
+        if first {
+            tracing::warn!(subject = %held.subject, provider = %held.provider, reason = %held.reason, "skipping dispatch: USD budget refusal");
+        }
+    }
+
+    /// Latest per-turn usage replaces the live estimate. No turn-total accumulation here: the
+    /// store keys by run and turn, so a terminal report cannot count the same spend twice.
+    pub(crate) fn observe_run_cost(
+        &self,
+        re: &crate::orchestrator::RunningEntry,
+        ev: &rhapsody_agent::Event,
+    ) {
+        let Some(u) = ev.usage else {
+            return;
+        };
+        if re.run_id == 0 || re.pricing.provider.is_empty() || re.brokered {
+            return;
+        }
+        let tokens = TokenCounts {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_tokens,
+            cache_write: u.cache_creation_tokens,
+        };
+        let (usd, source) =
+            match run_cost_usd(&re.pricing.model, &tokens, ev.cost_usd, &re.pricing.prices) {
+                RunCost::Priced { usd, source } => (
+                    Some(usd),
+                    match source {
+                        CostSource::PriceTable => "price_table",
+                        CostSource::HarnessReported => "harness_reported",
+                    },
+                ),
+                RunCost::Unknown => (None, "unknown"),
+            };
+        let spend = rhapsody_store::TurnSpend {
+            turn: re.turn_count.max(1),
+            at: crate::persist::rfc3339((self.now)()),
+            provider: re.pricing.provider.clone(),
+            account: re.pricing.account.clone(),
+            model: re.pricing.model.clone(),
+            usd,
+            source: source.into(),
+            harness_priced: ev.cost_usd.is_some_and(|v| v.is_finite() && v > 0.0),
+        };
+        if let Err(error) = self.store().set_turn_spend(re.run_id, &spend) {
+            tracing::warn!(%error, run_id = re.run_id, "USD budget: spend persistence failed");
+        }
+    }
+
     /// Whether ANY provider has a configured (positive) daily budget. The gates test this first so a
     /// daemon that configures none does no provider resolution at all on the dispatch path — the
     /// strong form of "unset is byte-identical to today".
     pub(crate) fn budgets_configured(&self) -> bool {
-        self.eff
-            .as_ref()
-            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_tokens > 0))
+        self.eff.as_ref().is_some_and(|e| {
+            e.cfg
+                .budgets
+                .values()
+                .any(|b| b.daily_tokens > 0 || b.daily_usd > 0.0)
+        })
     }
 
     /// The configured daily token limit for a provider, or `None` when there is no budget for it or
@@ -381,6 +651,7 @@ impl crate::orchestrator::Orchestrator {
             daily_tokens: limit,
             spent_tokens: spent,
             pr: String::new(),
+            ..Default::default()
         })
     }
 
@@ -407,6 +678,7 @@ impl crate::orchestrator::Orchestrator {
             daily_tokens: limit,
             spent_tokens: spent,
             pr: pr.to_string(),
+            ..Default::default()
         })
     }
 
@@ -459,23 +731,26 @@ impl crate::orchestrator::Orchestrator {
         iss: &rhapsody_core::Issue,
         project_slug: &str,
     ) -> String {
+        self.review_projected_pricing(iss, project_slug).provider
+    }
+
+    pub(crate) fn review_projected_pricing(
+        &self,
+        iss: &rhapsody_core::Issue,
+        project: &str,
+    ) -> RunPricing {
         let harness = self.review_harness_for(iss);
-        let fallback = self.configured_backend();
-        // The reviewer's own profile model first (the same `route_teams` value `dispatch_issue`
-        // stamps), then the operator's `review.model` override when it wins — and, when BOTH are
-        // empty (the common install), `projected_provider` falls back to the harness's configured
-        // model exactly as `run_provenance_for` will, so the gate and the recorded row agree.
         let mut mo = self
             .route_teams(iss)
             .map(|td| td.model_override)
             .unwrap_or_default();
-        if let Some(teams) = self.teams.as_ref()
-            && let rhapsody_config::teams::ReviewModelChoice::Use(m) =
-                teams.review_model_for(&harness, &fallback)
+        if let Some(teams) = &self.teams
+            && let rhapsody_config::teams::ReviewModelChoice::Use(model) =
+                teams.review_model_for(&harness, &self.configured_backend())
         {
-            mo.model = m.to_string();
+            mo.model = model.into();
         }
-        self.projected_provider(&harness, &mo, project_slug)
+        self.run_pricing_for(&harness, &mo, project)
     }
 }
 
@@ -490,9 +765,428 @@ mod tests {
     use super::*;
     use crate::testsupport::{issue, orch_for_retry};
 
+    fn usd_config(yaml: &str) -> rhapsody_config::Config {
+        rhapsody_config::decode(&rhapsody_config::workflow::Definition {
+            config: serde_yaml_ng::from_str(yaml).expect("front matter"),
+            prompt_template: String::new(),
+        })
+        .expect("config")
+    }
+
+    #[test]
+    fn price_table_wins() {
+        let cfg = usd_config(
+            "prices:\n  fireworks-ai/m: {input: 2, output: 8, cache_read: 0.5, cache_write: 3}\n",
+        );
+        let tokens = TokenCounts {
+            input: 1_000_000,
+            output: 250_000,
+            cache_read: 2_000_000,
+            cache_write: 100_000,
+        };
+        assert_eq!(
+            run_cost_usd("fireworks-ai/m", &tokens, Some(99.0), &cfg.prices),
+            RunCost::Priced {
+                usd: 5.3,
+                source: CostSource::PriceTable
+            }
+        );
+    }
+
+    #[test]
+    fn harness_cost_used_when_no_price() {
+        assert_eq!(
+            run_cost_usd(
+                "fireworks-ai/m",
+                &TokenCounts::default(),
+                Some(0.125),
+                &HashMap::new()
+            ),
+            RunCost::Priced {
+                usd: 0.125,
+                source: CostSource::HarnessReported
+            }
+        );
+        assert_eq!(
+            run_cost_usd(
+                "fireworks-ai/m",
+                &TokenCounts::default(),
+                None,
+                &HashMap::new()
+            ),
+            RunCost::Unknown
+        );
+    }
+
+    #[test]
+    fn zero_harness_cost_on_subscription_is_not_a_price() {
+        assert_eq!(
+            run_cost_usd(
+                "openai/gpt-test",
+                &TokenCounts::default(),
+                Some(0.0),
+                &HashMap::new()
+            ),
+            RunCost::Unknown
+        );
+        let cfg = usd_config("budgets:\n  openai: {daily_usd: 10}\n");
+        assert!(usd_gate("openai", "openai/gpt-test", &cfg, 0.0).is_err());
+    }
+
+    #[test]
+    fn unknown_price_with_daily_usd_refuses_with_reason() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nbudgets:\n  fireworks-ai: {daily_usd: 10}\n",
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert!(dispatched.lock().unwrap().is_empty());
+        let held = o
+            .budget_ledger
+            .get("MT-1", o.budget_hold_ttl())
+            .expect("visible hold");
+        assert_eq!(
+            held.reason,
+            "no price for fireworks-ai/m; add it under prices: or daily_usd for fireworks-ai cannot be enforced"
+        );
+        assert!(!o.claimed.contains("1"));
+        let snapshot = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(snapshot["budget_held"][0]["reason"], held.reason);
+        assert_eq!(snapshot["budget_held"][0]["daily_usd"], 10.0);
+    }
+
+    #[test]
+    fn daily_usd_spent_refuses() {
+        let cfg = usd_config(
+            "prices:\n  fireworks-ai/m: {input: 1, output: 1}\nbudgets:\n  fireworks-ai: {daily_usd: 10}\n",
+        );
+        assert!(usd_gate("fireworks-ai", "fireworks-ai/m", &cfg, 9.99).is_ok());
+        assert_eq!(
+            usd_gate("fireworks-ai", "fireworks-ai/m", &cfg, 10.0),
+            Err("daily_usd for fireworks-ai is spent ($10.000000 of $10.000000)".into())
+        );
+    }
+
+    #[test]
+    fn tokens_and_usd_tighter_wins() {
+        for (tokens, usd) in [(200, 0.5), (100, 1.0), (100, 0.5)] {
+            let store = Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+            let id = seed_spend(store.as_ref(), "fireworks-ai", tokens);
+            store
+                .set_turn_spend(
+                    id,
+                    &rhapsody_store::TurnSpend {
+                        turn: 1,
+                        at: local_day_start(),
+                        provider: "fireworks-ai".into(),
+                        account: "fireworks-ai".into(),
+                        model: "fireworks-ai/m".into(),
+                        usd: Some(usd),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let (mut o, dispatched) = orch_with_budgets(store, &[]);
+            o.eff.as_mut().unwrap().cfg = usd_config(
+                "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nprices:\n  fireworks-ai/m: {input: 1, output: 1}\nbudgets:\n  fireworks-ai: {daily_usd: 1, daily_tokens: 200}\n",
+            );
+            o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+            assert_eq!(
+                dispatched.lock().unwrap().is_empty(),
+                tokens >= 200 || usd >= 1.0
+            );
+        }
+    }
+
+    #[test]
+    fn no_budgets_unlimited_unchanged() {
+        let cfg = usd_config("{}");
+        assert!(cfg.prices.is_empty());
+        assert!(cfg.budgets.is_empty());
+        assert!(usd_gate("fireworks-ai", "unknown", &cfg, f64::INFINITY).is_ok());
+        let encoded = rhapsody_config::encode(&cfg).unwrap();
+        assert!(!encoded.config.contains_key("prices"));
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        seed_spend(store.as_ref(), "anthropic", i64::MAX);
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().as_slice(), ["1"]);
+    }
+
+    #[test]
+    fn api_equivalent_never_gates() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store.start_run(RunStart::default()).unwrap();
+        store
+            .set_turn_spend(
+                id,
+                &rhapsody_store::TurnSpend {
+                    turn: 1,
+                    at: local_day_start(),
+                    provider: "anthropic".into(),
+                    account: "claude-subscription".into(),
+                    model: "anthropic/claude-opus-4-8".into(),
+                    usd: Some(100.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            api_equivalent_usd_today(store.as_ref(), "claude-subscription"),
+            100.0
+        );
+        assert_eq!(
+            daily_spend_usd(store.as_ref(), "anthropic", &local_day_start()),
+            0.0
+        );
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.eff.as_mut().unwrap().cfg.budgets.insert(
+            "anthropic".into(),
+            ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().as_slice(), ["1"]);
+    }
+
+    #[test]
+    fn cost_observations_replace_live_totals_and_pin_dispatch_prices() {
+        use crate::agentupdate::AgentUpdate;
+        use rhapsody_agent::{
+            EVENT_NOTIFICATION, EVENT_SESSION_STARTED, EVENT_TURN_COMPLETED, Event, Usage,
+        };
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let (mut o, dispatched) = orch_with_budgets(store.clone(), &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nprices:\n  fireworks-ai/m: {input: 2, output: 8, cache_read: 0.5, cache_write: 3}\n",
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+        o.eff.as_mut().unwrap().cfg.prices.clear(); // A reload never rewrites what this run costs.
+        let mut update = |kind: &str, usage: Option<Usage>, cost_usd| {
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev: Event {
+                    event_type: kind.into(),
+                    usage,
+                    cost_usd,
+                    ..Default::default()
+                },
+            });
+        };
+        update(EVENT_SESSION_STARTED, None, None);
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 250_000,
+            cache_creation_tokens: 100_000,
+            cache_read_tokens: 2_000_000,
+            total_tokens: 3_350_000,
+        };
+        update(EVENT_NOTIFICATION, Some(usage), Some(99.0));
+        update(EVENT_TURN_COMPLETED, Some(usage), Some(99.0));
+        update(EVENT_SESSION_STARTED, None, None);
+        update(EVENT_TURN_COMPLETED, Some(usage), Some(99.0));
+        assert_eq!(
+            daily_spend_usd(store.as_ref(), "fireworks-ai", &local_day_start()),
+            10.6
+        );
+        let rows = store.turn_spend_since(&local_day_start()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.source == "price_table"));
+    }
+
+    #[test]
+    fn positive_harness_history_enables_only_the_exact_model() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store.start_run(RunStart::default()).unwrap();
+        store
+            .set_turn_spend(
+                id,
+                &rhapsody_store::TurnSpend {
+                    turn: 1,
+                    at: local_day_start(),
+                    provider: "fireworks-ai".into(),
+                    account: "fireworks-ai".into(),
+                    model: "fireworks-ai/m".into(),
+                    usd: Some(0.25),
+                    harness_priced: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nbudgets:\n  fireworks-ai: {daily_usd: 1}\n",
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().as_slice(), ["1"]);
+        o.eff.as_mut().unwrap().cfg.opencode.model = "fireworks-ai/other".into();
+        o.dispatch_issue(issue("2", "MT-2", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().as_slice(), ["1"]);
+    }
+
+    #[test]
+    fn unknown_spend_and_disabled_store_do_not_read_as_zero_dollars() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store.start_run(RunStart::default()).unwrap();
+        store
+            .set_turn_spend(
+                id,
+                &rhapsody_store::TurnSpend {
+                    turn: 1,
+                    at: local_day_start(),
+                    provider: "fireworks-ai".into(),
+                    account: "fireworks-ai".into(),
+                    model: "fireworks-ai/m".into(),
+                    usd: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nprices:\n  fireworks-ai/m: {input: 1, output: 1}\nbudgets:\n  fireworks-ai: {daily_usd: 1}\n",
+        );
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert!(dispatched.lock().unwrap().is_empty());
+        assert!(
+            o.budget_ledger
+                .get("MT-1", o.budget_hold_ttl())
+                .unwrap()
+                .reason
+                .contains("today's spend is unknown")
+        );
+        o.set_store(Arc::new(rhapsody_store::Noop));
+        o.dispatch_issue(issue("2", "MT-2", "Todo"), None, None, String::new());
+        assert!(dispatched.lock().unwrap().is_empty());
+        assert!(
+            o.budget_ledger
+                .get("MT-2", o.budget_hold_ttl())
+                .unwrap()
+                .reason
+                .contains("storage is unavailable")
+        );
+    }
+
+    #[test]
+    fn historical_tokens_without_dollar_observations_are_unknown_spend() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        seed_spend(&store, "fireworks-ai", 100);
+        assert!(
+            daily_spend_usd(&store, "fireworks-ai", &local_day_start()).is_infinite(),
+            "an upgrade or newly enabled USD budget must not erase today's unpriced spend"
+        );
+    }
+
+    #[test]
+    fn invalid_costs_are_unknown_but_explicit_zero_prices_are_valid() {
+        for cost in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+        ] {
+            assert_eq!(
+                run_cost_usd("p/m", &TokenCounts::default(), cost, &HashMap::new()),
+                RunCost::Unknown
+            );
+        }
+        let prices = HashMap::from([("p/m".into(), Price::default())]);
+        assert_eq!(
+            run_cost_usd(
+                "p/m",
+                &TokenCounts {
+                    input: i64::MAX,
+                    ..Default::default()
+                },
+                None,
+                &prices
+            ),
+            RunCost::Priced {
+                usd: 0.0,
+                source: CostSource::PriceTable
+            }
+        );
+    }
+
+    #[test]
+    fn configured_prices_and_usd_round_trip_and_reject_invalid_numbers() {
+        let cfg = usd_config(
+            "prices:\n  p/m: {input: 2, output: 8, cache_read: 0.5, cache_write: 3}\nbudgets:\n  p: {daily_usd: 2.5, daily_tokens: 100, per_ticket: 10}\n",
+        );
+        let encoded = rhapsody_config::encode(&cfg).unwrap();
+        let decoded = rhapsody_config::decode(&encoded).unwrap();
+        assert_eq!(decoded.prices, cfg.prices);
+        assert_eq!(decoded.budgets, cfg.budgets);
+        for yaml in [
+            "budgets:\n  p: {daily_usd: .nan}",
+            "budgets:\n  p: {daily_usd: -1}",
+            "prices:\n  p/m: {input: .inf}",
+            "prices:\n  p/m: {cache_read: -1}",
+            "prices:\n  m: {input: 1}",
+        ] {
+            let def = rhapsody_config::workflow::Definition {
+                config: serde_yaml_ng::from_str(yaml).unwrap(),
+                prompt_template: String::new(),
+            };
+            assert!(rhapsody_config::decode(&def).is_err(), "must reject {yaml}");
+        }
+    }
+
+    #[test]
+    fn chatgpt_equivalents_never_gate_even_with_a_table_and_a_spent_usd_limit() {
+        use rhapsody_agent::{EVENT_SESSION_STARTED, EVENT_TURN_COMPLETED, Event, Usage};
+        let dir = crate::testsupport::TempDir::new();
+        let auth = dir.child("auth.json");
+        std::fs::write(&auth, br#"{"openai":{"type":"oauth"}}"#).unwrap();
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let (mut o, dispatched) = orch_with_budgets(store.clone(), &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: openai/gpt-test}\nprices:\n  openai/gpt-test: {input: 2, output: 8}\nbudgets:\n  openai: {daily_usd: 1}\n",
+        );
+        o.eff.as_mut().unwrap().cfg.opencode.auth_source = auth;
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        for event in [
+            Event {
+                event_type: EVENT_SESSION_STARTED.into(),
+                ..Default::default()
+            },
+            Event {
+                event_type: EVENT_TURN_COMPLETED.into(),
+                cost_usd: Some(0.0),
+                usage: Some(Usage {
+                    input_tokens: 1_000_000,
+                    total_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: "1".into(),
+                ev: event,
+            });
+        }
+        assert_eq!(
+            api_equivalent_usd_today(store.as_ref(), "chatgpt-subscription"),
+            2.0
+        );
+        assert_eq!(
+            daily_spend_usd(store.as_ref(), "openai", &local_day_start()),
+            0.0
+        );
+        o.dispatch_issue(issue("2", "MT-2", "Todo"), None, None, String::new());
+        assert_eq!(dispatched.lock().unwrap().as_slice(), ["1", "2"]);
+        assert!(o.budget_ledger.held(o.budget_hold_ttl()).is_empty());
+    }
+
     /// Seeds a completed run billed to `provider` with `tokens` total, starting NOW (so it falls in
     /// today's local window the budget reads).
-    fn seed_spend(store: &dyn Store, provider: &str, tokens: i64) {
+    fn seed_spend(store: &dyn Store, provider: &str, tokens: i64) -> i64 {
         let started = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         let id = store
             .start_run(RunStart {
@@ -523,6 +1217,7 @@ mod tests {
                 },
             )
             .expect("provenance");
+        id
     }
 
     /// An orchestrator on a real store whose configured claude model resolves to `anthropic`, with
@@ -544,6 +1239,7 @@ mod tests {
                 ProviderBudget {
                     daily_tokens: *limit,
                     per_ticket: 0,
+                    ..Default::default()
                 },
             );
         }
@@ -713,6 +1409,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 250,
             pr: String::new(),
+            ..Default::default()
         };
         assert!(l.hold("MT-1", h.clone()), "first refusal announces");
         assert!(!l.hold("MT-1", h.clone()), "a repeat does not re-announce");
@@ -737,6 +1434,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 250,
             pr: String::new(),
+            ..Default::default()
         };
         let old = Instant::now()
             .checked_sub(HOLD_TTL_FLOOR + Duration::from_secs(1))
@@ -778,6 +1476,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 250,
             pr: String::new(),
+            ..Default::default()
         };
         let five_minutes_ago = Instant::now()
             .checked_sub(Duration::from_secs(300 + 1))
@@ -809,6 +1508,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 300,
             pr: "o/r#12".into(),
+            ..Default::default()
         };
         let alice = held("anthropic");
         let jerry = held("fireworks-ai");
@@ -846,6 +1546,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 300,
             pr: "o/r#12".into(),
+            ..Default::default()
         };
         let ticket = BudgetHeld {
             subject: "MT-1".into(),
@@ -855,6 +1556,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 300,
             pr: String::new(),
+            ..Default::default()
         };
         let old = Instant::now()
             .checked_sub(HOLD_TTL_FLOOR + Duration::from_secs(1))
@@ -899,6 +1601,7 @@ mod tests {
             daily_tokens: 200,
             spent_tokens: 300,
             pr: coordinate.into(),
+            ..Default::default()
         };
         let one = held("o/r#1", "pr:o/r#1@alice");
         let two = held("o/r#2", "pr:o/r#2@bob");

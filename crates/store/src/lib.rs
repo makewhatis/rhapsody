@@ -243,6 +243,25 @@ pub trait Store {
     /// The window is the point (STUDIO-909 round 1): a lifetime total rendered under a "today"
     /// heading answers a question nobody asked and cannot be reconciled with `day_totals`.
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
+
+    /// Whether this backend can durably account dollars (STUDIO-1124).
+    fn usd_accounting_available(&self) -> bool {
+        false
+    }
+
+    /// Replace one turn's latest spend snapshot; the original timestamp stays fixed.
+    /// Rhapsody-only (STUDIO-1124). Disabled/test stores have no spend signal.
+    fn set_turn_spend(&self, _run_id: i64, _spend: &TurnSpend) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Dollar observations since a local-day boundary, including live runs.
+    fn turn_spend_since(&self, _since: &str) -> Result<Vec<TurnSpend>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// Whether an exact model has previously produced a positive harness dollar report.
+    fn model_has_reported_cost(&self, _provider: &str, _model: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Every run's tokens summed per (`issue_identifier`, provider), over the WHOLE store — the
     /// ledger behind a ticket's cost on the console (STUDIO-926). Unlike `list_issue_runs` this does
     /// not keep only each key's newest run: a ticket's cost is every run that spent on it. One row

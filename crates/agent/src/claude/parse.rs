@@ -57,6 +57,7 @@ struct RawLine {
     result: String,
     /// top-level usage (present on `result` lines)
     usage: Option<RawUsage>,
+    total_cost_usd: Option<f64>,
     /// nested message (present on `assistant` lines; carries its own per-call usage)
     message: Option<RawMessage>,
     /// present on the system/init line; the billing guard asserts it equals `"none"`.
@@ -168,6 +169,7 @@ pub fn classify(line: &[u8]) -> Classified {
                     timestamp: now,
                     message,
                     usage: Some(usage),
+                    cost_usd: r.total_cost_usd,
                     ..Default::default()
                 },
                 session_id: r.session_id,
@@ -254,6 +256,15 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extracts_result_dollars_without_inventing_missing_cost() {
+        let priced = super::classify(
+            br#"{"type":"result","total_cost_usd":0.125,"usage":{"input_tokens":10}}"#,
+        );
+        assert_eq!(priced.event.cost_usd, Some(0.125));
+        let absent = super::classify(br#"{"type":"result","usage":{"input_tokens":10}}"#);
+        assert_eq!(absent.event.cost_usd, None);
+    }
     use super::*;
 
     // Mirrors Go `claude.TestClassifyInitEvent`.

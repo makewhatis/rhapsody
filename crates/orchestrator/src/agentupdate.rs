@@ -71,6 +71,9 @@ impl Orchestrator {
             return;
         }
         let now = (self.now)();
+        if let Some(re) = self.running.get(&e.issue_id) {
+            self.observe_run_cost(re, &e.ev);
+        }
         let re = match self.running.get_mut(&e.issue_id) {
             Some(re) => re,
             None => return,

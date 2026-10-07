@@ -681,6 +681,15 @@ impl Orchestrator {
                     );
                     return;
                 }
+                let pricing =
+                    self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
+                if let Some(mut held) = self.usd_budget_hold(&pricing) {
+                    held.subject = iss.identifier.clone();
+                    held.title = iss.title.clone();
+                    held.project = re.project_slug.clone();
+                    self.note_usd_budget_hold(held);
+                    return;
+                }
                 // The ticket dispatched, so a stale hold from an earlier tick must not linger on
                 // the console. Best-effort and idempotent.
                 self.release_budget_hold(&iss.identifier);

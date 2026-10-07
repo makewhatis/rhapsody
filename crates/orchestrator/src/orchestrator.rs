@@ -210,6 +210,7 @@ pub struct RunningEntry {
     /// entry has already been terminated can be reconciled from the receipt without needing to know
     /// what the child had contributed, because it contributed nothing to the aggregate.
     pub(crate) brokered: bool,
+    pub(crate) pricing: crate::budget::RunPricing,
 }
 
 impl RunningEntry {
@@ -239,6 +240,7 @@ impl RunningEntry {
             last_delivered_summon_at: zero_time(),
             review: None,
             brokered: false,
+            pricing: crate::budget::RunPricing::default(),
             thread_id: String::new(),
             session_id: String::new(),
             turn_count: 0,

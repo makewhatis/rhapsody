@@ -129,6 +129,9 @@ export interface BudgetHeld {
   provider: string; // the account whose budget is spent
   daily_tokens: number; // the configured ceiling
   spent_tokens: number; // today's spend on that provider
+  reason?: string; // USD/unknown-price refusal, verbatim from the dispatch gate
+  daily_usd?: number;
+  spent_usd?: number | null;
   // The pull request coordinate (`owner/repo#n`) of a REVIEW refusal, or "" for a ticket. The
   // board's discriminator: only a ticket hold becomes a card.
   pr: string;
