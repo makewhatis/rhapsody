@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rhapsody_credential_ipc::domain::CredentialRef;
-use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
+use rhapsody_desktop::app::{
+    App, CloseDecision, CredentialStatusDto, SHUTDOWN_WAIT_BOUND, StatusDto,
+};
 use rhapsody_desktop::credential_bootstrap::{ChannelObservations, default_socket_dir};
 use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATOR};
 use rhapsody_desktop::linearprojects::Project;
@@ -524,10 +526,15 @@ fn run() -> tauri::Result<()> {
                 }
             }
             // Final-teardown backstop: when the drain already ran this returns at once; a quit that
-            // bypassed the close hook does its own bounded Stop here. Mirrors Go `OnShutdown`.
+            // bypassed the close hook (⌘Q / the app-menu Quit go straight here, never through
+            // ExitRequested) does its own bounded Stop. Mirrors Go `OnShutdown`. This is the MAIN
+            // thread, so the wait is wall-clock bounded and never a `block_on` (STUDIO-1116).
             tauri::RunEvent::Exit => {
                 if let Some(app) = handle.try_state::<App>().map(|s| s.inner().clone()) {
-                    tauri::async_runtime::block_on(app.on_shutdown());
+                    app.on_shutdown_blocking(
+                        tauri::async_runtime::handle().inner(),
+                        SHUTDOWN_WAIT_BOUND,
+                    );
                 }
             }
             _ => {}

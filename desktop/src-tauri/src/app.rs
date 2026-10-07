@@ -158,6 +158,23 @@ impl CloseDecision {
     }
 }
 
+/// The wall-clock bound on the quit's final teardown ([`App::on_shutdown_blocking`]). A little past
+/// [`App::on_shutdown`]'s own 10s waits, so on a healthy runtime those report first, and short enough
+/// that a quit always exits within about 15 seconds.
+pub const SHUTDOWN_WAIT_BOUND: Duration = Duration::from_secs(12);
+
+/// How [`App::on_shutdown_blocking`]'s wall-clock wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownWait {
+    /// [`App::on_shutdown`] ran to completion inside the bound.
+    Completed,
+    /// The bound expired first; the caller exits without waiting any longer.
+    TimedOut,
+    /// The runtime dropped the shutdown task without running it to completion (it is shutting down),
+    /// so there is nothing left to wait for.
+    Abandoned,
+}
+
 /// Why a tray/UI `start_daemon` (or `restart_daemon`) could not proceed. Mirrors the two Go
 /// `fmt.Errorf` refusals in `StartDaemon`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +446,46 @@ impl App {
                 .is_err()
         {
             eprintln!("rhapsody-desktop: daemon stop on shutdown timed out");
+        }
+    }
+
+    /// Runs [`App::on_shutdown`] from a thread OUTSIDE the runtime — the main thread, in
+    /// `RunEvent::Exit` — and waits for it at most `bound` of wall-clock time (STUDIO-1116).
+    ///
+    /// `on_shutdown`'s own bounds are `tokio::time::timeout`s, and a tokio timer only fires while a
+    /// runtime WORKER polls the I/O + time driver; a thread blocked in `block_on` from outside never
+    /// polls it. The tray's refresh task marshals its setters onto the main thread and blocks the
+    /// worker running it until the main thread answers — and that worker is the one a timer woke, the
+    /// one holding the driver. With the main thread in `block_on`, nothing ever drives the runtime
+    /// again: no timer fires and no child exit is seen, so the quit hangs forever.
+    ///
+    /// So the shutdown runs as a task ON the runtime (spawning it wakes an idle worker, which then
+    /// takes over the driver), and this thread waits on a plain channel with a wall-clock timeout
+    /// that holds whether or not the runtime makes progress. Go's `OnShutdown` gets the same
+    /// guarantee for free: its `time.After` needs no event loop.
+    pub fn on_shutdown_blocking(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        bound: Duration,
+    ) -> ShutdownWait {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let app = self.clone();
+        runtime.spawn(async move {
+            app.on_shutdown().await;
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(bound) {
+            Ok(()) => ShutdownWait::Completed,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "rhapsody-desktop: shutdown did not finish within {bound:?}; exiting anyway"
+                );
+                ShutdownWait::TimedOut
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("rhapsody-desktop: the runtime dropped the shutdown task; exiting");
+                ShutdownWait::Abandoned
+            }
         }
     }
 
