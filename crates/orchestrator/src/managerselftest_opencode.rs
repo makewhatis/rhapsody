@@ -1,4 +1,10 @@
 //! OpenCode's two-layer manager boundary self-test (STUDIO-1121); no Go counterpart.
+//!
+//! OpenCode 1.18.30's no-model trap control loaded the project plugin when
+//! OPENCODE_DISABLE_PROJECT_CONFIG was removed. `--pure` suppressed it, but added
+//! no observable protection with the manager's private dirs and disable flag intact;
+//! it is therefore not added to MH2's manager argv. The posture exception for truncated
+//! tool output is checked against the host's private data path, never a path from stdout.
 
 use crate::managerselftest::{CanaryAttempt, CanaryObservation, REQUIRED_ATTEMPTS};
 use rhapsody_agent::opencode::manager::OPENCODE_KNOWN_BUILTINS;
@@ -100,12 +106,11 @@ impl OpencodeCanaryRunner {
         } else {
             let mut reply = String::new();
             for line in turn.stdout.lines() {
-                if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    if v["type"] == "text" {
-                        if let Some(text) = v["part"]["text"].as_str() {
-                            reply.push_str(text);
-                        }
-                    }
+                if let Ok(v) = serde_json::from_str::<Value>(line)
+                    && v["type"] == "text"
+                    && let Some(text) = v["part"]["text"].as_str()
+                {
+                    reply.push_str(text);
                 }
             }
             obs.extend(evaluate_canary(&turn.stdout, &reply, &traps));
@@ -382,6 +387,7 @@ pub fn evaluate_canary(events: &str, reply: &str, traps: &TrapPaths) -> Vec<Cana
                 });
             }
             Some("tool_use") => {
+                stopped = false;
                 let Some(tool) = v["part"]["tool"].as_str() else {
                     return turn_failure("canary tool event has no tool name");
                 };
@@ -402,7 +408,9 @@ pub fn evaluate_canary(events: &str, reply: &str, traps: &TrapPaths) -> Vec<Cana
             Some("step_finish") => {
                 stopped = v["part"]["reason"] == "stop";
             }
-            Some("text" | "step_start") => {}
+            Some("text" | "step_start") => {
+                stopped = false;
+            }
             _ => return turn_failure("unknown canary event type"),
         }
     }
@@ -441,14 +449,13 @@ pub fn evaluate_canary(events: &str, reply: &str, traps: &TrapPaths) -> Vec<Cana
             }
         }
     }
-    if traps.trap_words.iter().any(|word| reply.contains(word)) {
-        if let Some(o) = obs
+    if traps.trap_words.iter().any(|word| reply.contains(word))
+        && let Some(o) = obs
             .iter_mut()
             .find(|o| o.attempt == CanaryAttempt::SettingSourceHook)
-        {
-            o.refused = false;
-            o.detail = "instruction trap word in reply".into();
-        }
+    {
+        o.refused = false;
+        o.detail = "instruction trap word in reply".into();
     }
     obs
 }
@@ -813,6 +820,17 @@ else:
                     .all(|o| !o.refused && o.detail != "not implemented")
             );
         }
+    }
+
+    #[test]
+    fn canary_truncated_step_after_stop_fails_closed() {
+        let d = Scratch::new();
+        let raw = format!("{}{}\n", clean(), json!({"type":"step_start"}));
+        assert!(
+            evaluate_canary(&raw, "", &traps(&d))
+                .iter()
+                .all(|o| !o.refused)
+        );
     }
     #[test]
     fn canary_turn_error_detail_names_the_model_error() {
