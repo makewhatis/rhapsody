@@ -467,7 +467,7 @@ impl Orchestrator {
                 let reason = format!(
                     "entry {} unavailable: {}",
                     attempt.selected.index + 1,
-                    e.err_msg
+                    manager_failure_class(e)
                 );
                 if !attempt.fallback_reason.is_empty() {
                     attempt.fallback_reason.push_str("; ");
@@ -477,6 +477,29 @@ impl Orchestrator {
             // The same intervention returns through the ordinary launch gates and atomic budget.
             self.pump_manager_interventions();
         }
+    }
+}
+
+/// Fallback provenance is persisted and published. Harness stderr is untrusted and may contain a
+/// credential, so only a closed failure classification may cross that boundary.
+fn manager_failure_class(exit: &crate::retry::EvWorkerExit) -> &'static str {
+    if exit.auth_needed {
+        return "authentication failed";
+    }
+    let code = exit
+        .err_msg
+        .trim()
+        .split(|c: char| c == ':' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    match code {
+        "agent_not_found" | "agent_command_invalid" | "startup_failed" | "manager_cwd_failed" => {
+            "session start failed"
+        }
+        "turn_timeout" => "run timeout",
+        "turn_failed" => "session crashed or turn failed",
+        "billing_guard_failed" => "session startup contract failed",
+        _ => "manager session failed",
     }
 }
 

@@ -908,7 +908,7 @@ fn require_open_blocking(
 /// The secret-shape scanner (§6.1). A conservative PREFIX/known-marker check rather than an entropy
 /// heuristic: a 40-hex SHA is not a secret, and a false positive here refuses a legitimate decision,
 /// so the scanner fires only on shapes that can only be a credential.
-fn contains_secret_shape(text: &str) -> bool {
+pub(crate) fn contains_secret_shape(text: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "ghp_",
         "gho_",

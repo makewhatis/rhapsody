@@ -145,6 +145,13 @@ fn manager_provenance_line(by: &crate::managerselftest::DecidedBy) -> String {
         .map_or(by.model.as_str(), |(_, model)| model);
     let mut line = format!("@manager ({model} via {}) adjudicated", by.harness);
     if let Some(reason) = &by.fallback_reason {
+        // Stored provenance predating the closed runtime classification can still contain stderr.
+        // Apply the decision's posted-text guard here too, including on escalation comments.
+        let reason = if crate::managerdecision::contains_secret_shape(reason) {
+            "failure details withheld: secret-shaped text"
+        } else {
+            reason
+        };
         line.push_str(&format!(" ({reason})"));
     }
     line.push_str(".\n");
@@ -1213,6 +1220,26 @@ mod tests {
         let body = manager_explanation_body_by(&d, "marker", Some(&by));
         assert!(body.contains("@manager (gpt-6.1-sol via opencode) adjudicated"));
         assert!(body.contains("(entry 1 unavailable: OpenAI login expired)"));
+    }
+
+    #[test]
+    fn fallback_provenance_does_not_post_secret_shaped_stderr() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
+        let by = crate::managerselftest::DecidedBy {
+            entry: 2,
+            harness: "claude".into(),
+            model: "opus".into(),
+            fallback_reason: Some(format!("entry 1 unavailable: turn_failed: {secret}")),
+        };
+        let body =
+            manager_explanation_body_by(&decision(DecisionKind::Approve), "marker", Some(&by));
+        assert!(
+            !body.contains(secret),
+            "fallback stderr leaked into PR body"
+        );
+        // The same rendering feeds the escalation comment, including older persisted provenance.
+        assert!(!manager_provenance_line(&by).contains(secret));
+        assert!(body.contains("failure details withheld"));
     }
     use crate::managerdecision::Dismissal;
 

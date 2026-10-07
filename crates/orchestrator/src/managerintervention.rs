@@ -2098,6 +2098,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fallback_record_keeps_a_bounded_classification_not_stderr() {
+        let text = format!(
+            "```rhapsody-manager-decision\n{{\"decision\":\"ESCALATE\",\"head\":\"{}\",\"evidence_rev\":0,\"rationale\":\"need human\",\"escalate\":{{\"question\":\"what now?\",\"checked\":\"reviews\"}}}}\n```",
+            "a".repeat(40)
+        );
+        for (error, expected) in [
+            (
+                rhapsody_agent::AgentError::StartupFailed,
+                "session start failed",
+            ),
+            (rhapsody_agent::AgentError::TurnTimeout, "run timeout"),
+            (
+                rhapsody_agent::AgentError::TurnFailed,
+                "session crashed or turn failed",
+            ),
+            (
+                rhapsody_agent::AgentError::AuthFailed("rejected opaque-login-value".into()),
+                "authentication failed; entry 1 unavailable: authentication failed; run opencode auth login as the daemon's user",
+            ),
+            (
+                rhapsody_agent::AgentError::Other(format!(
+                    "turn_failed: sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789{}",
+                    "stderr".repeat(1000)
+                )),
+                "session crashed or turn failed",
+            ),
+            (
+                rhapsody_agent::AgentError::Other(
+                    "opaque-login-value without a recognized error code".into(),
+                ),
+                "manager session failed",
+            ),
+        ] {
+            let (mut o, _, id) = multi_orch(12);
+            exit_fake(&mut o, false, Some(error), "").await;
+            exit_fake(&mut o, false, None, &text).await;
+            let row = o
+                .store()
+                .manager_intervention(&id)
+                .expect("read")
+                .expect("row");
+            let by = crate::managerselftest::DecidedBy::from_stored(&row.decision_json)
+                .expect("provenance");
+            assert_eq!(
+                by.fallback_reason,
+                Some(format!("entry 1 unavailable: {expected}"))
+            );
+            let decision = managerdecision::parse_stored_decision(&text, &[]).expect("decision");
+            let body =
+                crate::managerapply::manager_explanation_body_by(&decision, "marker", Some(&by));
+            assert!(!body.contains("sk-ant-api03-") && !body.contains("opaque-login-value"));
+        }
+    }
+
     // --- pure rules ---------------------------------------------------------------------------
 
     #[test]
