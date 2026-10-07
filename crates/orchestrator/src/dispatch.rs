@@ -35,6 +35,30 @@ use rhapsody_store::OUTCOME_INTERRUPTED;
 
 use crate::orchestrator::Orchestrator;
 
+/// A policy-selected engine for one run. It decorates routing; it never reassigns the teammate.
+/// Sessions cannot move between engines, so an override always starts a fresh conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchEngine {
+    /// 0 is primary, 1 is the first profile fallback.
+    pub index: usize,
+    pub spec: rhapsody_config::profiles::EngineSpec,
+    pub handoff_note: Option<std::path::PathBuf>,
+}
+
+impl DispatchEngine {
+    /// Seed only the first turn. The note is read by the worker, not the control task.
+    pub(crate) fn seed_prompt(&self, prompt: String) -> String {
+        match &self.handoff_note {
+            Some(path) => format!(
+                "## Engine handoff\n\nYou are continuing as the same teammate on a fresh session. \
+                 Read the handoff note at {} before continuing the work.\n\n{prompt}",
+                path.display()
+            ),
+            None => prompt,
+        }
+    }
+}
+
 /// Orders issues by priority asc (nil/`None` last), then created_at oldest first (nil/`None` last),
 /// then identifier lexicographically (upstream §8.2). Stable, mirroring Go `SortForDispatch`
 /// (`sort.SliceStable`).

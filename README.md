@@ -1008,6 +1008,23 @@ behaviour of seeing only what the lookback window covers right now.
 
 ### A run records what actually ran it — `rhapsody_run_provenance` (STUDIO-909)
 
+**Identity fallback engines (STUDIO-1125).** A profile may declare an ordered `fallback:` list of
+`{harness, model, effort}` entries. Each entry must name a known harness; OpenCode additionally
+requires a model. The primary engine is index `0`, followed by fallback entries at indices `1…`.
+Engine choice accepts a caller-supplied health predicate; limit thresholds and switching decisions
+belong to the limit-policy layer.
+
+An explicit dispatch engine override keeps the ticket's identity label, persona, memory bank and
+room cursor. Only the harness/model/effort change. It starts a fresh session, bypassing OpenCode's
+retained-session adoption, and the first-turn prompt names the supplied handoff-note path. A live
+run's engine is pinned: a second override is refused until that run ends.
+
+The engine index is recorded with its harness/model in `rhapsody_run_provenance.engine_index`
+(migration **26**), leaving the Go `runs` schema byte-identical. `/api/v1/runs/{id}` and its
+`/provenance` endpoint expose `engine_index` only for a fallback (`> 0`); primary and legacy runs
+omit it, so existing run JSON and goldens stay byte-identical. An absent profile `fallback:` stays
+empty, adds nothing to a forked profile's output, and changes no dispatch or session behavior.
+
 The `runs` row recorded how many tokens a run spent and **nothing about what spent them**. On an
 installation now running two harnesses and two providers at once, that made two questions
 unanswerable from the product: *which provider/model did this failed run use* (the failure that

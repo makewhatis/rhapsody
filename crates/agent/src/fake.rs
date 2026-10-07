@@ -71,6 +71,7 @@ fn default_capabilities() -> HarnessCapabilities {
 #[derive(Default)]
 struct Recorded {
     start_calls: i64,
+    started_fresh: i64,
     /// The prompt text of the most recent `run_turn` (turn 1 is the rendered task prompt), so tests
     /// can assert which prompt source/template the worker fed the agent.
     last_prompt: String,
@@ -114,6 +115,11 @@ impl Fake {
     /// Number of `start_session` calls.
     pub fn start_calls(&self) -> i64 {
         self.lock().start_calls
+    }
+
+    /// Number of explicit fresh-session starts (engine switches).
+    pub fn started_fresh(&self) -> i64 {
+        self.lock().started_fresh
     }
 
     /// The prompt of the most recent `run_turn`.
@@ -189,6 +195,15 @@ impl Fake {
 
 #[async_trait]
 impl Runner for Fake {
+    async fn start_fresh_session(
+        &self,
+        _workspace_path: &str,
+        _issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.lock().started_fresh += 1;
+        self.start_session_sync(transcript)
+    }
     async fn start_session(
         &self,
         _workspace_path: &str,
