@@ -2224,6 +2224,9 @@ async fn apply_manager_self_test(
         return;
     }
     selftest.configure(teams.manager.effective_harnesses());
+    selftest.set_credential_probe(Arc::new(ManagerEntryCredentialProbe {
+        operator_auth: rhapsody_agent::opencode::manager::operator_auth_path(),
+    }));
     let factory =
         manager_canary_factory(resolved, workflow_path, teams.manager.harnesses.is_empty());
     rhapsody_orchestrator::managerselftest::run_entry_self_tests(factory.as_ref(), selftest).await;
@@ -2243,10 +2246,58 @@ async fn apply_manager_self_test(
 
 struct ManagerCanaryFactory {
     command: String,
+    opencode_command: String,
     workspace_root: String,
     daemon_bin: String,
     workflow_path: String,
     legacy: bool,
+}
+
+struct ManagerEntryCredentialProbe {
+    operator_auth: Option<std::path::PathBuf>,
+}
+
+impl rhapsody_orchestrator::managerselftest::EntryCredentialProbe for ManagerEntryCredentialProbe {
+    fn status(
+        &self,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+        now_ms: i64,
+    ) -> rhapsody_orchestrator::managerselftest::CredentialStatus {
+        use rhapsody_agent::opencode::manager::{OpenAiLoginStatus, openai_login_status};
+        use rhapsody_orchestrator::managerselftest::CredentialStatus;
+        if entry.harness == "claude" {
+            return CredentialStatus::NotApplicable;
+        }
+        if entry.harness != "opencode" {
+            return CredentialStatus::Missing("no credential probe for harness".into());
+        }
+        let Some(path) = &self.operator_auth else {
+            return CredentialStatus::Missing(
+                "operator has no OpenAI login; run opencode auth login".into(),
+            );
+        };
+        match openai_login_status(path) {
+            OpenAiLoginStatus::Missing(reason) => CredentialStatus::Missing(reason),
+            OpenAiLoginStatus::Valid { expires_ms } | OpenAiLoginStatus::Expired { expires_ms } => {
+                let expires_in_ms = expires_ms.saturating_sub(now_ms);
+                if expires_in_ms <= 0 {
+                    CredentialStatus::Expired
+                } else if expires_in_ms <= 86_400_000 {
+                    CredentialStatus::ExpiringSoon { expires_in_ms }
+                } else {
+                    CredentialStatus::Valid { expires_in_ms }
+                }
+            }
+        }
+    }
+    fn fingerprint(&self, entry: &rhapsody_config::teams::ManagerHarnessEntry) -> Option<String> {
+        if entry.harness != "opencode" {
+            return None;
+        }
+        self.operator_auth
+            .as_ref()
+            .and_then(|p| rhapsody_agent::opencode::manager::openai_login_fingerprint(p))
+    }
 }
 
 impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ManagerCanaryFactory {
@@ -2256,6 +2307,9 @@ impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ManagerCana
     ) -> Result<String, String> {
         match entry.harness.as_str() {
             "claude" => rhapsody_orchestrator::managerselftest::probe_cli_version(&self.command),
+            "opencode" => {
+                rhapsody_orchestrator::managerselftest::probe_cli_version(&self.opencode_command)
+            }
             _ => Err(format!("no self-test for harness {}", entry.harness)),
         }
     }
@@ -2283,7 +2337,16 @@ impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ManagerCana
                     entry: entry.clone(),
                 },
             )),
-            _ => None, // MH3 adds the proven OpenCode canary and credential probe.
+            "opencode" => Some(Box::new(
+                rhapsody_orchestrator::managerselftest_opencode::OpencodeCanaryRunner {
+                    command: self.opencode_command.clone(),
+                    workspace_root: self.workspace_root.clone(),
+                    daemon_bin: self.daemon_bin.clone(),
+                    workflow_path: self.workflow_path.clone(),
+                    entry: entry.clone(),
+                },
+            )),
+            _ => None,
         }
     }
 }
@@ -2294,11 +2357,14 @@ fn manager_canary_factory(
     legacy: bool,
 ) -> Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory> {
     let command = resolved.map_or_else(|| "claude".to_string(), |c| c.claude.command.clone());
+    let opencode_command =
+        resolved.map_or_else(|| "opencode".to_string(), |c| c.opencode.command.clone());
     let workspace_root = resolved.map_or_else(String::new, |c| c.workspace.root.clone());
     let daemon_bin = std::env::current_exe()
         .map_or_else(|_| String::new(), |p| p.to_string_lossy().into_owned());
     Arc::new(ManagerCanaryFactory {
         command,
+        opencode_command,
         workspace_root,
         daemon_bin,
         workflow_path: workflow_path.to_string(),
@@ -2522,6 +2588,80 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn factory_opencode_arm_and_probe() {
+        use rhapsody_orchestrator::managerselftest::{CredentialStatus, EntryCredentialProbe};
+        let entry = rhapsody_config::teams::ManagerHarnessEntry {
+            harness: "opencode".into(),
+            model: "openai/gpt-6.1-sol".into(),
+            effort: "xhigh".into(),
+        };
+        let factory = manager_canary_factory(None, "/synthetic/WORKFLOW.md", false);
+        assert!(factory.runner(&entry).is_some());
+        let d = TempDir::new();
+        let p = d.child("auth.json");
+        let version_script = d.child("version.sh");
+        std::fs::write(
+            &version_script,
+            "test \"$1\" = --version || exit 1\nprintf 'opencode-test-version\\n'\n",
+        )
+        .unwrap();
+        let mut config = decode(&workflow::Definition {
+            config: workflow::YamlMap::new(),
+            prompt_template: String::new(),
+        })
+        .unwrap();
+        config.opencode.command = format!("bash {}", version_script.display());
+        let factory = manager_canary_factory(Some(&config), "/synthetic/WORKFLOW.md", false);
+        assert_eq!(
+            factory.probe_version(&entry).unwrap(),
+            "opencode-test-version"
+        );
+        let probe = ManagerEntryCredentialProbe {
+            operator_auth: Some(p.clone()),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(matches!(
+            probe.status(&entry, now),
+            CredentialStatus::Missing(_)
+        ));
+        for (delta, expected) in [
+            (-1, CredentialStatus::Expired),
+            (0, CredentialStatus::Expired),
+            (1, CredentialStatus::ExpiringSoon { expires_in_ms: 1 }),
+            (
+                86_400_000,
+                CredentialStatus::ExpiringSoon {
+                    expires_in_ms: 86_400_000,
+                },
+            ),
+            (
+                86_400_001,
+                CredentialStatus::Valid {
+                    expires_in_ms: 86_400_001,
+                },
+            ),
+        ] {
+            // Future synthetic clock avoids coupling the 24h boundary to wall-clock elapsed time.
+            let clock = now + 1_000_000;
+            std::fs::write(&p,serde_json::json!({"openai":{"expires":clock+delta,"access":"synthetic","refresh":""}}).to_string()).unwrap();
+            assert_eq!(probe.status(&entry, clock), expected);
+            assert_eq!(probe.fingerprint(&entry).unwrap().len(), 64);
+        }
+        std::fs::write(&p, "malformed").unwrap();
+        assert!(matches!(
+            probe.status(&entry, now),
+            CredentialStatus::Missing(_)
+        ));
+        let claude = rhapsody_config::teams::ManagerHarnessEntry {
+            harness: "claude".into(),
+            model: String::new(),
+            effort: String::new(),
+        };
+        assert_eq!(probe.status(&claude, now), CredentialStatus::NotApplicable);
+        assert!(probe.fingerprint(&claude).is_none());
+    }
 
     // A minimal valid workflow, HERMETIC: the tracker points at a dead loopback address (fetches fail
     // fast, non-fatal), and workspace.root + logging.dir + storage stay inside the temp dir so a test
