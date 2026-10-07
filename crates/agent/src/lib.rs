@@ -300,6 +300,17 @@ pub trait Runner: Send + Sync {
         issue: Issue,
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError>;
+
+    /// Starts a new conversation after an engine switch, never adopting a retained session.
+    /// The default is correct for harnesses (including Claude) that start fresh on every dispatch.
+    async fn start_fresh_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.start_session(workspace_path, issue, transcript).await
+    }
 }
 
 /// Typed agent error categories (upstream §10.6, §14.1) — the parity mirror of Go `errors.go`.

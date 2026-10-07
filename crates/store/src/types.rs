@@ -266,6 +266,8 @@ pub struct RunSummary {
 /// string, and never re-derived at render time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunProvenance {
+    /// 0 = primary, 1 = first fallback. Kept beside the engine that actually ran.
+    pub engine_index: i64,
     pub harness: String,
     /// The config key `harness` resolved from (e.g. `profile`, `agent.backend`).
     pub harness_origin: String,
@@ -491,7 +493,7 @@ pub const REVIEW_VERDICT_CHANGES_REQUESTED: &str = "changes_requested";
 /// completer stamp the PR as reviewed-at-head and silently drops a second reviewer whose run
 /// crashed (design §14.2, "N reviewers share one per-PR SHA"), so the reviewer is part of the key
 /// rather than a column on a per-PR row.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReviewWatchKey {
     /// GitHub repository owner (the `owner` of `owner/repo#number`).
     pub owner: String,

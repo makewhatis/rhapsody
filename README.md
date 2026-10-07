@@ -1008,6 +1008,23 @@ behaviour of seeing only what the lookback window covers right now.
 
 ### A run records what actually ran it — `rhapsody_run_provenance` (STUDIO-909)
 
+**Identity fallback engines (STUDIO-1125).** A profile may declare an ordered `fallback:` list of
+`{harness, model, effort}` entries. Each entry must name a known harness; OpenCode additionally
+requires a model. The primary engine is index `0`, followed by fallback entries at indices `1…`.
+Engine choice accepts a caller-supplied health predicate; limit thresholds and switching decisions
+belong to the limit-policy layer.
+
+An explicit dispatch engine override keeps the ticket's identity label, persona, memory bank and
+room cursor. Only the harness/model/effort change. It starts a fresh session, bypassing OpenCode's
+retained-session adoption, and the first-turn prompt names the supplied handoff-note path. A live
+run's engine is pinned: a second override is refused until that run ends.
+
+The engine index is recorded with its harness/model in `rhapsody_run_provenance.engine_index`
+(migration **26**), leaving the Go `runs` schema byte-identical. `/api/v1/runs/{id}` and its
+`/provenance` endpoint expose `engine_index` only for a fallback (`> 0`); primary and legacy runs
+omit it, so existing run JSON and goldens stay byte-identical. An absent profile `fallback:` stays
+empty, adds nothing to a forked profile's output, and changes no dispatch or session behavior.
+
 The `runs` row recorded how many tokens a run spent and **nothing about what spent them**. On an
 installation now running two harnesses and two providers at once, that made two questions
 unanswerable from the product: *which provider/model did this failed run use* (the failure that
@@ -2138,6 +2155,34 @@ A review held for want of a slot is a deliberate wait, not a fault, and the reco
 names it as `held for capacity` rather than reporting it as an unexplained stall (see the STUDIO-898
 entry above).
 
+
+### Review attempts are not verdict rounds (STUDIO-1129)
+
+Ticketless review charges the reviewer half of its durable round budget only when a declared
+approval or findings verdict lands at the dispatch-pinned head. A failed launch, crash, timeout,
+unrecognised handoff or truncated run charges no round. The existing answered-author-exchange
+charge remains verdict-gated too; dispatch still consumes its manager authorization and reserves
+capacity, independently of verdict accounting.
+
+No-verdict attempts retry after 30 seconds, then 120 seconds, with three attempts per reviewer/head
+per daemon lifetime. An exhausted reviewer is excluded from the next selection so an eligible
+substitute can take the review. If none can, the job's review panel and human feed say
+`review_infrastructure`, naming the reviewer, failure and attempt count. Operator Re-run/Clear,
+a new head, or a daemon restart starts a fresh attempt episode. A deliberate token-ceiling hold
+continues to require the existing operator intervention. No verdict at the observed head means
+no findings adjudication, and a legacy adjudication over an unread head is cleared so review can
+re-arm.
+
+The v26→v27 data migration repairs old launch-based counters **once**, using retained per-run
+`rhapsody_review_verdicts` rows; subsequent restarts preserve operator refunds. Historical verdicts
+from before that ledger existed, pruned verdicts, and the old answered-author contribution cannot
+be reconstructed exactly. The per-run ledger also lacks generation: after an operator Clear,
+only verdicts with current-generation finding/resolution evidence can be reconstructed. Unknown
+generations are omitted, and repair never raises the existing count or undoes a prior refund.
+The repaired count is therefore the retained, generation-proven verdict lower bound,
+rather than retaining failed launches as evidence of reviews. Zero-verdict adjudications are
+discarded during recovery. This remains Rhapsody-only (Go has no ticketless review), and changes
+no ported table, config shape or golden.
 
 ### A per-run token ceiling — `agent.max_run_tokens` (STUDIO-967)
 

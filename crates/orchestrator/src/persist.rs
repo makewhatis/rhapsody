@@ -400,6 +400,7 @@ impl Orchestrator {
         };
         let provider = derive_provider(&harness, &model);
         store::RunProvenance {
+            engine_index: re.engine_index as i64,
             provider_origin: derive_provider_origin(&provider),
             provider,
             harness,

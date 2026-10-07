@@ -121,7 +121,7 @@ pub(crate) struct RetryTarget<'a> {
 /// (Go passes a `*resolvedProject`; the Rust borrow checker forbids holding that borrow across the
 /// `&mut self` dispatch, so the fields the dispatch stamps are cloned out).
 #[derive(Debug, Clone)]
-pub(crate) struct DispatchRoute {
+pub struct DispatchRoute {
     pub slug: String,
     pub group: String,
     pub repo: String,
@@ -332,6 +332,42 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
         stack_context: String,
         prepared: Option<PreparedHarnessSpec>,
+    ) {
+        self.dispatch_issue_on_engine(iss, attempt, route, stack_context, prepared, None);
+    }
+
+    /// L3 mechanism; L4 supplies the health/limit decision. A live run is immutable: trying to
+    /// replace it would orphan its worker and let two engines race on the same ticket. `Ok(false)`
+    /// means an existing dispatch gate held the ticket; no run was admitted.
+    pub fn dispatch_issue_with_engine(
+        &mut self,
+        iss: Issue,
+        attempt: Option<i64>,
+        route: Option<DispatchRoute>,
+        stack_context: String,
+        engine: crate::dispatch::DispatchEngine,
+    ) -> Result<bool, String> {
+        if self.running.contains_key(&iss.id) {
+            return Err(
+                "engine is pinned for a live run; end it before another dispatch".to_string(),
+            );
+        }
+        engine.spec.validate()?;
+        i64::try_from(engine.index)
+            .map_err(|_| "engine index exceeds the run record range".to_string())?;
+        let id = iss.id.clone();
+        self.dispatch_issue_on_engine(iss, attempt, route, stack_context, None, Some(engine));
+        Ok(self.running.contains_key(&id))
+    }
+
+    fn dispatch_issue_on_engine(
+        &mut self,
+        iss: Issue,
+        attempt: Option<i64>,
+        route: Option<DispatchRoute>,
+        stack_context: String,
+        prepared: Option<PreparedHarnessSpec>,
+        engine: Option<crate::dispatch::DispatchEngine>,
     ) {
         // STUDIO-880, a backstop and NOT a gate. Every path that decides whether to dispatch refuses
         // or parks above this line — `on_tick`, `on_retry`, `dispatch_review` — because each of them
@@ -572,6 +608,16 @@ impl Orchestrator {
             }
             re.harness = entry.harness.clone();
         }
+        if let Some(engine) = &engine {
+            re.engine_index = engine.index;
+            re.engine = Some(engine.clone());
+            re.harness = engine.spec.harness.clone();
+            re.model_override = rhapsody_agent::ModelOverride {
+                identity: re.identity.clone(),
+                model: engine.spec.model.clone(),
+                effort: engine.spec.effort.clone(),
+            };
+        }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {
@@ -600,14 +646,18 @@ impl Orchestrator {
         // that never happened. Only an EMPTY name — a dispatch routed to a profile that names none —
         // resolves to the configured backend.
         let actual_harness = self.effective_harness(&re.harness);
-        re.harness_origin = if manager.is_some() {
+        re.harness_origin = if engine.is_some() {
+            format!("profile.engine[{}]", re.engine_index)
+        } else if manager.is_some() {
             "manager.harness".to_string()
         } else if re.harness.is_empty() {
             "agent.backend".to_string()
         } else {
             "profile".to_string()
         };
-        re.model_origin = if review_model_overrode {
+        re.model_origin = if engine.is_some() {
+            format!("profile.engine[{}]", re.engine_index)
+        } else if review_model_overrode {
             // The legacy bare-scalar spelling is `review.model`; the per-harness map spelling names
             // the harness. `HarnessScoped::legacy` is the one reader that tells them apart, so the
             // label cannot disagree with `teams show`.
@@ -797,6 +847,7 @@ impl Orchestrator {
                 review_checkout,
                 manager_checkout,
                 prepared,
+                engine,
             );
         }
     }
