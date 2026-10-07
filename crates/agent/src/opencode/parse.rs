@@ -120,6 +120,7 @@ struct RawPart {
     /// `tool_use` only: the tool's name in opencode's own spelling (`symphony_symphony_state`).
     tool: String,
     tokens: Option<RawTokens>,
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -208,6 +209,7 @@ pub fn classify(line: &[u8]) -> Classified {
                     event_type: EVENT_NOTIFICATION.to_string(),
                     timestamp: now,
                     usage,
+                    cost_usd: part.cost,
                     ..Default::default()
                 },
                 session_id: r.session_id,
@@ -300,6 +302,19 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extracts_step_dollars_and_preserves_subscription_zero() {
+        for (field, cost) in [
+            ("", None),
+            (",\"cost\":0", Some(0.0)),
+            (",\"cost\":0.125", Some(0.125)),
+        ] {
+            let line = format!(
+                "{{\"type\":\"step_finish\",\"part\":{{\"reason\":\"stop\",\"tokens\":{{\"input\":10}}{field}}}}}"
+            );
+            assert_eq!(super::classify(line.as_bytes()).event.cost_usd, cost);
+        }
+    }
     use super::*;
     use crate::{EVENT_NOTIFICATION, EVENT_TURN_FAILED};
 

@@ -228,6 +228,7 @@ export interface JobRow {
    * work that does not exist.
    */
   budgetHeld?: string;
+  budgetReason?: string;
 }
 
 export interface ProjectMeta {
@@ -320,6 +321,7 @@ interface MergedRow {
   /** A synthetic per-provider BUDGET hold (from state.budget_held, STUDIO-957/970) — the provider
    *  whose daily budget is spent. Distinct from `heldForHuman`; gives the row its own sub-label. */
   budgetHeld?: string;
+  budgetReason?: string;
   /** Failure reason (history rows only; drives the failed sub-label). */
   error: string;
 }
@@ -520,6 +522,7 @@ export function mergeJobs(
       queued: false,
       waiting: true,
       budgetHeld: b.provider,
+      budgetReason: b.reason,
       error: "",
     });
   }
@@ -609,7 +612,7 @@ export function mergeJobs(
       subLabel: heldForHuman
         ? "held for a human"
         : budgetHeldActive
-          ? `${budgetHeld} daily budget spent`
+          ? budgetRow?.budgetReason || `${budgetHeld} daily budget spent`
           : isWaiting
             ? `waiting on ${waitingRow?.waitingOn ?? ""}`
             : status === "failed"
@@ -617,6 +620,7 @@ export function mergeJobs(
               : undefined,
       heldForHuman,
       budgetHeld: budgetHeldActive ? budgetHeld : undefined,
+      budgetReason: budgetHeldActive ? budgetRow?.budgetReason : undefined,
     });
   }
 

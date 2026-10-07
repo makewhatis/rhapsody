@@ -380,9 +380,9 @@ function BoardCardView({
         <div className="bchips" aria-label="Held by a provider budget">
           <span
             className="dchip bchip"
-            title={`${card.budgetHeld} daily token budget is spent — the dispatcher resumes at local midnight`}
+            title={card.budgetReason ?? `${card.budgetHeld} daily token budget is spent — the dispatcher resumes at local midnight`}
           >
-            {card.budgetHeld} budget spent
+            {card.budgetReason ? `${card.budgetHeld} budget held` : `${card.budgetHeld} budget spent`}
           </span>
         </div>
       )}

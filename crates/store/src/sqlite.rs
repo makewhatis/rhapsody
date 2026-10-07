@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 28;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -590,6 +590,46 @@ ALTER TABLE rhapsody_manager_intervention ADD COLUMN rerequested TEXT NOT NULL D
     r#"
 ALTER TABLE rhapsody_manager_intervention ADD COLUMN failure_reason TEXT NOT NULL DEFAULT '';
 "#,
+    // v25 -> v26: identity fallback engine provenance (STUDIO-1125). The Go runs table stays intact.
+    r#"
+ALTER TABLE rhapsody_run_provenance ADD COLUMN engine_index INTEGER NOT NULL DEFAULT 0;
+"#,
+    // v26 -> v27 (STUDIO-1129): repair the old launch-based round counters exactly once on
+    // upgrade. Only a persisted reviewer verdict is evidence of a round. Prefix equality (not
+    // LIKE) keeps legal '_' and '%' repo names literal. Retention may have removed older
+    // verdicts: the surviving evidence is a lower bound, never an invented launch count.
+    // The per-run verdict ledger predates generations. After a Clear, only finding/resolution
+    // records can prove a run belongs to this generation; omit unknowns and preserve prior refunds.
+    r#"
+UPDATE rhapsody_review_bound SET dispatches = MIN(MAX(dispatches, 0), (
+  SELECT COUNT(*) FROM runs r JOIN rhapsody_review_verdicts v ON v.run_id = r.id
+  WHERE lower(substr(r.issue_identifier, 1, length(rhapsody_review_bound.pr) + 4)) = 'pr:' || lower(rhapsody_review_bound.pr) || '@'
+    AND v.verdict IN ('approved', 'changes_requested')
+    AND (rhapsody_review_bound.generation <= 1 OR EXISTS (
+      SELECT 1 FROM rhapsody_review_finding f
+      WHERE lower(f.pr) = lower(rhapsody_review_bound.pr)
+        AND f.generation = rhapsody_review_bound.generation
+        AND (f.review_run_id = r.id OR f.resolved_by = CAST(r.id AS TEXT))
+    ))
+));
+"#,
+    // v27 -> v28: USD observations (STUDIO-1124). Go-owned tables and goldens are unchanged.
+    r#"
+CREATE TABLE rhapsody_turn_spend (
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  turn INTEGER NOT NULL,
+  at TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  account TEXT NOT NULL,
+  model TEXT NOT NULL,
+  usd REAL,
+  source TEXT NOT NULL,
+  harness_priced INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (run_id, turn)
+);
+CREATE INDEX rhapsody_turn_spend_at ON rhapsody_turn_spend(at);
+CREATE INDEX rhapsody_turn_spend_model ON rhapsody_turn_spend(provider, model, harness_priced);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -978,7 +1018,7 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 /// The `rhapsody_run_provenance` value columns, in DDL order — the single shared list for every
 /// provenance read, read positionally by [`map_run_provenance`].
 const PROVENANCE_COLS: &str =
-    "harness, harness_origin, model, model_origin, provider, provider_origin";
+    "harness, harness_origin, model, model_origin, provider, provider_origin, engine_index";
 
 /// The `rhapsody_run_usage` value columns, in DDL order — the single shared list for the usage read,
 /// read positionally by [`map_run_usage`].
@@ -995,6 +1035,7 @@ const PROVENANCE_BIND_CHUNK: usize = 500;
 /// the query leads with `run_id`).
 fn map_run_provenance_at(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<RunProvenance> {
     Ok(RunProvenance {
+        engine_index: row.get(off + 6)?,
         harness: row.get(off)?,
         harness_origin: row.get(off + 1)?,
         model: row.get(off + 2)?,
@@ -1549,12 +1590,13 @@ impl Store for Sqlite {
         // same run id (impossible today) must overwrite rather than fail a PRIMARY KEY constraint.
         conn.execute(
             "INSERT INTO rhapsody_run_provenance
-               (run_id, harness, harness_origin, model, model_origin, provider, provider_origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               (run_id, harness, harness_origin, model, model_origin, provider, provider_origin, engine_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(run_id) DO UPDATE SET
                harness = excluded.harness, harness_origin = excluded.harness_origin,
                model = excluded.model, model_origin = excluded.model_origin,
-               provider = excluded.provider, provider_origin = excluded.provider_origin",
+               provider = excluded.provider, provider_origin = excluded.provider_origin,
+               engine_index = excluded.engine_index",
             params![
                 run_id,
                 p.harness,
@@ -1563,6 +1605,7 @@ impl Store for Sqlite {
                 p.model_origin,
                 p.provider,
                 p.provider_origin,
+                p.engine_index,
             ],
         )?;
         Ok(())
@@ -1778,6 +1821,62 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn set_turn_spend(&self, run_id: i64, spend: &TurnSpend) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_turn_spend (run_id, turn, at, provider, account, model, usd, source, harness_priced)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(run_id, turn) DO UPDATE SET usd = excluded.usd,
+               source = excluded.source, harness_priced = MAX(harness_priced, excluded.harness_priced)",
+            params![run_id, spend.turn, spend.at, spend.provider, spend.account, spend.model,
+                spend.usd, spend.source, spend.harness_priced],
+        )?;
+        Ok(())
+    }
+
+    fn usd_accounting_available(&self) -> bool {
+        true
+    }
+
+    fn turn_spend_since(&self, since: &str) -> Result<Vec<TurnSpend>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT turn, at, provider, account, model, usd, source, harness_priced
+            FROM rhapsody_turn_spend WHERE at >= ?1
+            UNION ALL
+            SELECT 0, r.started_at, p.provider, p.provider, p.model, NULL, 'unknown', 0
+              FROM runs r JOIN rhapsody_run_provenance p ON p.run_id = r.id
+             WHERE r.started_at >= ?1 AND r.total_tokens > 0
+               AND NOT EXISTS (SELECT 1 FROM rhapsody_turn_spend s WHERE s.run_id = r.id)
+            ORDER BY at, turn",
+        )?;
+        let rows = stmt.query_map([since], |row| {
+            Ok(TurnSpend {
+                turn: row.get(0)?,
+                at: row.get(1)?,
+                provider: row.get(2)?,
+                account: row.get(3)?,
+                model: row.get(4)?,
+                usd: row.get(5)?,
+                source: row.get(6)?,
+                harness_priced: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn model_has_reported_cost(&self, provider: &str, model: &str) -> Result<bool, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rhapsody_turn_spend
+            WHERE provider = ?1 AND model = ?2 AND account = provider AND harness_priced = 1)",
+                params![provider, model],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
@@ -4169,6 +4268,51 @@ mod tests {
         let dir = scratch_dir();
         let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp");
         (dir, store)
+    }
+
+    #[test]
+    fn turn_spend_replaces_snapshots_survives_restart_and_keeps_day_boundary() {
+        let (dir, store) = open_temp();
+        let id = store.start_run(RunStart::default()).unwrap();
+        let mut spend = TurnSpend {
+            turn: 1,
+            at: "2026-10-06T23:59:00Z".into(),
+            provider: "p".into(),
+            account: "p".into(),
+            model: "p/m".into(),
+            usd: Some(0.125),
+            source: "harness_reported".into(),
+            harness_priced: true,
+        };
+        store.set_turn_spend(id, &spend).unwrap();
+        spend.at = "2026-10-07T00:01:00Z".into();
+        spend.usd = Some(0.25);
+        store.set_turn_spend(id, &spend).unwrap();
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).unwrap();
+        let rows = store.turn_spend_since("2026-10-06T00:00:00Z").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].usd, Some(0.25));
+        assert_eq!(rows[0].at, "2026-10-06T23:59:00Z");
+        assert!(
+            store
+                .turn_spend_since("2026-10-07T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.model_has_reported_cost("p", "p/m").unwrap());
+        assert!(!store.model_has_reported_cost("other", "p/m").unwrap());
+        assert!(!store.model_has_reported_cost("p", "p/other").unwrap());
+        spend.turn = 2;
+        spend.account = "chatgpt-subscription".into();
+        spend.model = "p/subscription".into();
+        store.set_turn_spend(id, &spend).unwrap();
+        assert!(
+            !store
+                .model_has_reported_cost("p", "p/subscription")
+                .unwrap(),
+            "subscription equivalents never prove API spend"
+        );
     }
 
     /// Create a transcript fixture file (Go `writeFileForTest`).
@@ -6810,6 +6954,7 @@ mod tests {
 
     fn provenance_fixture(harness: &str, model: &str, provider: &str) -> RunProvenance {
         RunProvenance {
+            engine_index: 0,
             harness: harness.into(),
             harness_origin: "profile".into(),
             model: model.into(),
@@ -6821,6 +6966,17 @@ mod tests {
                 "default".into()
             },
         }
+    }
+
+    #[test]
+    fn engine_index_recorded() {
+        let (_dir, st) = open_temp();
+        let id = st.start_run(RunStart::default()).unwrap();
+        let mut p = provenance_fixture("opencode", "openai/gpt-6.1-sol", "openai");
+        p.engine_index = 2;
+        st.set_run_provenance(id, &p).unwrap();
+        assert_eq!(st.run_provenance(id).unwrap().unwrap().engine_index, 2);
+        assert_eq!(st.load_run_provenances(&[id]).unwrap()[&id].engine_index, 2);
     }
 
     fn start_provenance_run(store: &Sqlite, key: &str) -> i64 {
@@ -7067,6 +7223,7 @@ mod tests {
                 "model_origin",
                 "provider",
                 "provider_origin",
+                "engine_index",
             ],
             "provenance holds identity + origins only, never a credential or runtime provider id"
         );
@@ -7848,6 +8005,9 @@ mod tests {
                 "rhapsody_manager_intervention_active".to_string(),
                 "rhapsody_manager_wake".to_string(),
                 "rhapsody_manager_wake_issue".to_string(),
+                "rhapsody_turn_spend".to_string(),
+                "rhapsody_turn_spend_at".to_string(),
+                "rhapsody_turn_spend_model".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -9538,5 +9698,149 @@ mod tests {
             ManagerReservation::Absent
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn v25_upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs() {
+        upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(25);
+    }
+
+    #[test]
+    fn upgrade_verdict_repair_never_revives_a_pre_upgrade_clear() {
+        for version in [25, 26] {
+            let scratch = scratch_dir();
+            let db = scratch.join("cleared.db");
+            {
+                let conn = Connection::open(&db).expect("raw database");
+                for migration in &MIGRATIONS[..version] {
+                    conn.execute_batch(migration).expect("old schema");
+                }
+                conn.pragma_update(None, "user_version", version as i64)
+                    .expect("version");
+                conn.execute_batch(
+                    "INSERT INTO rhapsody_review_bound (pr, dispatches, generation) VALUES
+                     ('owner/repo#290', 0, 2), ('owner/repo#291', 4, 2);
+                     INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                     (1, 'pr:owner/repo#290@bob', 'completed'),
+                     (2, 'pr:owner/repo#291@bob', 'completed'),
+                     (3, 'pr:owner/repo#291@bob', 'completed'),
+                     (4, 'pr:owner/repo#291@bob', 'completed'),
+                     (5, 'pr:owner/repo#291@carol', 'completed');
+                     INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                     (1, 'approved'), (2, 'approved'), (3, 'changes_requested'),
+                     (4, 'approved'), (5, 'approved');
+                     INSERT INTO rhapsody_review_finding
+                     (pr, generation, reviewer, finding_id, revision, review_run_id, resolved_by) VALUES
+                     ('owner/repo#290', 1, 'bob', 'B1', 1, 1, ''),
+                     ('owner/repo#291', 1, 'bob', 'B1', 1, 2, ''),
+                     ('owner/repo#291', 2, 'bob', 'B2', 1, 3, '4'),
+                     ('owner/repo#291', 2, 'bob', 'B3', 1, 3, '4');"
+                ).expect("pre-clear and current-generation evidence");
+            }
+            let store = Sqlite::open(StorePath::Disk(db)).expect("upgrade");
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#290")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                0,
+                "generation-1 history must not revive a cleared generation-2 budget"
+            );
+            assert_eq!(
+                store
+                    .review_bound("owner/repo#291")
+                    .expect("bound")
+                    .expect("row")
+                    .dispatches,
+                2,
+                "only current-generation verdict evidence counts, once per run; unknown generations are omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn v26_upgrade_counts_verdicts_and_preserves_fallback_engine_provenance() {
+        upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(26);
+    }
+
+    fn upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(version: usize) {
+        let scratch = scratch_dir();
+        let db = scratch.join(&format!("v{version}.db"));
+        {
+            let conn = Connection::open(&db).expect("raw database");
+            for migration in &MIGRATIONS[..version] {
+                conn.execute_batch(migration).expect("old schema");
+            }
+            conn.pragma_update(None, "user_version", version as i64)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO rhapsody_review_bound (pr, dispatches) VALUES
+                ('owner/a_b#290', 3), ('owner/a_b#291', 4), ('owner/axb#291', 9);
+                INSERT INTO runs (id, issue_identifier, outcome) VALUES
+                (1, 'pr:owner/a_b#290@bob', 'failed'),
+                (2, 'pr:owner/a_b#290@bob', 'failed'),
+                (3, 'pr:owner/a_b#290@bob', 'completed'),
+                (4, 'pr:owner/a_b#291@bob', 'failed'),
+                (5, 'pr:owner/a_b#291@bob', 'completed'),
+                (6, 'pr:owner/a_b#291@carol', 'completed'),
+                (7, 'pr:owner/a_b#291@manager', 'completed');
+                INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES
+                (5, 'approved'), (6, 'changes_requested');",
+            )
+            .expect("old rounds");
+            if version == 26 {
+                conn.execute_batch(
+                    "INSERT INTO rhapsody_run_provenance (run_id, harness, model, engine_index)
+                     VALUES (5, 'opencode', 'openai/gpt-6.1-sol', 2);",
+                )
+                .expect("fallback provenance");
+            }
+        }
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#290")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            2
+        );
+        assert_eq!(
+            store
+                .review_bound("owner/axb#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            0
+        );
+        if version == 26 {
+            let provenance = store.run_provenance(5).expect("provenance").expect("row");
+            assert_eq!(provenance.engine_index, 2);
+            assert_eq!(provenance.harness, "opencode");
+            assert_eq!(provenance.model, "openai/gpt-6.1-sol");
+        }
+        store
+            .set_review_rounds("owner/a_b#291", 1)
+            .expect("operator refund");
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store
+                .review_bound("owner/a_b#291")
+                .expect("bound")
+                .expect("row")
+                .dispatches,
+            1,
+            "repair is once on upgrade, not a recount that undoes operator controls every boot"
+        );
     }
 }

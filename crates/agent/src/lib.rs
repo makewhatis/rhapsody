@@ -117,6 +117,10 @@ pub struct Event {
     pub message: String,
     /// present on usage-bearing events
     pub usage: Option<Usage>,
+    /// Dollars reported by the harness, cumulative within this turn (STUDIO-1124).
+    /// None is absent; subscription OpenCode commonly reports Some(0), not a free API price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     /// `turn` is the 1-based turn number the event belongs to; set on `EVENT_OPERATOR_MESSAGE` so
     /// the orchestrator can record which turn an operator message was delivered into (INF-250).
     /// Zero on events that don't carry a turn.
@@ -322,6 +326,17 @@ pub trait Runner: Send + Sync {
         issue: Issue,
         transcript: Option<Transcript>,
     ) -> Result<Box<dyn Session>, AgentError>;
+
+    /// Starts a new conversation after an engine switch, never adopting a retained session.
+    /// The default is correct for harnesses (including Claude) that start fresh on every dispatch.
+    async fn start_fresh_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        self.start_session(workspace_path, issue, transcript).await
+    }
 }
 
 /// Typed agent error categories (upstream §10.6, §14.1) — the parity mirror of Go `errors.go`.

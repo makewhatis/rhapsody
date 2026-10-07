@@ -152,10 +152,8 @@ impl crate::Runner for Runner {
 /// exclusivity defect this crate's `harness` module defers to slice 5 is a codex-only constraint);
 /// `usage: TokensAndCost` — the harness itself reports cost: the committed
 /// `harness/harness-spike/claude/happy.jsonl` capture's `result` line carries `total_cost_usd`
-/// (`STUDIO-869-harness-spike-findings.md` §2, `[RAN]`), even though the `Usage` struct this crate
-/// currently populates (`lib.rs`) has no cost field yet — extracting `total_cost_usd` into `Usage`
-/// is unstarted, adapter-owned work (design §3's "usage extraction is the adapter's job") that
-/// belongs to slice 7/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
+/// (`STUDIO-869-harness-spike-findings.md` §2, `[RAN]`), extracted onto `Event::cost_usd`
+/// for USD accounting (STUDIO-1124); `budgets: false` (the turn
 /// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
 /// the mailbox.
 pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {

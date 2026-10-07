@@ -156,8 +156,11 @@ pub fn render(s: &Snapshot) -> Value {
                         // row and carries the §10.2 human-feed sentence (`manager deferred: drain`,
                         // `manager unavailable: CLI contract`, …). Conditional on the kind, so every
                         // other row shape (and the healthy payload) is untouched.
-                        if d.kind == crate::reviewreconcile::DivergenceKind::ManagerDeferred
-                            && let Some(obj) = row.as_object_mut()
+                        if matches!(
+                            d.kind,
+                            crate::reviewreconcile::DivergenceKind::ManagerDeferred
+                                | crate::reviewreconcile::DivergenceKind::ReviewInfrastructure
+                        ) && let Some(obj) = row.as_object_mut()
                         {
                             obj.insert("reason".to_string(), json!(d.reason));
                         }
@@ -203,7 +206,7 @@ pub fn render(s: &Snapshot) -> Value {
                 s.budget_held
                     .iter()
                     .map(|h| {
-                        json!({
+                        let mut row = json!({
                             "subject": h.subject,
                             "title": h.title,
                             "project": h.project,
@@ -217,7 +220,15 @@ pub fn render(s: &Snapshot) -> Value {
                             // struct already carries this discriminator, so it travels rather than
                             // being re-derived from the subject's `pr:` convention.
                             "pr": h.pr,
-                        })
+                        });
+                        if !h.reason.is_empty()
+                            && let Some(obj) = row.as_object_mut()
+                        {
+                            obj.insert("reason".into(), json!(h.reason));
+                            obj.insert("daily_usd".into(), json!(h.daily_usd));
+                            obj.insert("spent_usd".into(), json!(h.spent_usd));
+                        }
+                        row
                     })
                     .collect::<Vec<_>>(),
             ),

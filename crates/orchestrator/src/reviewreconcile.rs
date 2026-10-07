@@ -268,6 +268,8 @@ pub enum DivergenceKind {
     /// stays on the human feed with the manager's own words. `Divergence.reason` carries the exact
     /// feed text (`manager deferred: drain`, `manager unavailable: CLI contract`, …).
     ManagerDeferred,
+    /// The reviewer exhausted no-verdict attempts (STUDIO-1129), not a findings loop.
+    ReviewInfrastructure,
 }
 
 impl DivergenceKind {
@@ -286,6 +288,7 @@ impl DivergenceKind {
             DivergenceKind::ReviewShipped => "review_shipped",
             DivergenceKind::MergedTicketNotTerminal => "merged_ticket_not_terminal",
             DivergenceKind::ManagerDeferred => "manager_deferred",
+            DivergenceKind::ReviewInfrastructure => "review_infrastructure",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -333,6 +336,9 @@ impl DivergenceKind {
             DivergenceKind::ManagerDeferred => {
                 "the manager adopted this stall but its launch is deferred or the manager is \
                  unavailable; see the reason"
+            }
+            DivergenceKind::ReviewInfrastructure => {
+                "review infrastructure failed before a reviewer could give a verdict; see the reason"
             }
         }
     }
@@ -994,6 +1000,36 @@ impl Orchestrator {
             .iter()
             .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
             .filter_map(|(pr, facts)| {
+                if let Some((key, attempt)) = rows
+                    .iter()
+                    .filter(|row| {
+                        row.key.owner.eq_ignore_ascii_case(&pr.owner)
+                            && row.key.repo.eq_ignore_ascii_case(&pr.repo)
+                            && row.key.number == pr.number
+                    })
+                    .find_map(|row| self.review_infrastructure_for(&row.key))
+                {
+                    return Some(Divergence {
+                        pr: pr.to_string(),
+                        kind: DivergenceKind::ReviewInfrastructure,
+                        ticket: facts
+                            .rows
+                            .iter()
+                            .find(|r| !r.ticket.is_empty())
+                            .map(|r| r.ticket.clone())
+                            .unwrap_or_default(),
+                        reviewer: key.reviewer.clone(),
+                        stale_secs: 0,
+                        auto_merge_reason: None,
+                        capacity_held: None,
+                        capacity_unreadable: None,
+                        adjudicated_head: String::new(),
+                        current_head: attempt.head.clone(),
+                        rounds: 0,
+                        findings: Vec::new(),
+                        reason: attempt.message(key),
+                    });
+                }
                 // STUDIO-956, first because it is the cause and the staleness rules below would only
                 // report the resulting silence an hour and a half later, without naming the bound. A
                 // spent shared review↔author budget stops BOTH halves of the loop, so a round that is
@@ -1715,7 +1751,9 @@ impl Orchestrator {
                 // STUDIO-1015 §10.2: the manager adopted this stall but its launch is refused — a
                 // drain, provider budget, failed credentials or the CLI self-test. The manager's own
                 // wording is the news, so the line names it instead of the generic copy.
-                if d.kind == DivergenceKind::ManagerDeferred {
+                if d.kind == DivergenceKind::ManagerDeferred
+                    || d.kind == DivergenceKind::ReviewInfrastructure
+                {
                     tracing::warn!(
                         pr = %d.pr,
                         kind = d.kind.as_str(),
@@ -1774,6 +1812,14 @@ impl Orchestrator {
                         );
                     }
                     (None, Some(hold), _) => {
+                        let reason = if hold.reason.is_empty() {
+                            format!(
+                                "the provider {}'s daily token budget is spent ({} of {})",
+                                hold.provider, hold.spent_tokens, hold.daily_tokens
+                            )
+                        } else {
+                            hold.reason.clone()
+                        };
                         tracing::warn!(
                             pr = %d.pr,
                             kind = d.kind.as_str(),
@@ -1784,15 +1830,12 @@ impl Orchestrator {
                             provider = %hold.provider,
                             daily_tokens = hold.daily_tokens,
                             spent_tokens = hold.spent_tokens,
-                            "review reconciliation: {} — {}. It is held for budget: the provider \
-                             {}'s daily token budget is spent ({} of {}), so no run on it can start \
+                            "review reconciliation: {} — {}. It is held for budget: {}, so no run on it can start \
                              yet. Work on other providers continues; this sweep only reports, so it \
                              needs a human.",
                             d.pr,
                             d.kind.detail(),
-                            hold.provider,
-                            hold.spent_tokens,
-                            hold.daily_tokens
+                            reason
                         );
                     }
                     (None, None, Some(reason)) => {

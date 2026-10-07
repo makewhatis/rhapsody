@@ -92,6 +92,7 @@ investigation and recorded findings, act on them now.]";
 pub struct Runner {
     cfg: Config,
     limits: std::sync::Arc<super::limits::UsageProbe>,
+    force_fresh: bool,
 }
 
 impl Runner {
@@ -116,6 +117,7 @@ impl Runner {
         Runner {
             cfg,
             limits: super::limits::shared_probe(),
+            force_fresh: false,
         }
     }
 
@@ -137,6 +139,10 @@ impl Runner {
         issue: &Issue,
         provision: impl FnOnce() -> Result<RunState, AgentError>,
     ) -> Result<(RunState, String, bool), AgentError> {
+        if self.force_fresh {
+            resume::discard(&self.cfg.state_root, &issue.identifier);
+            return provision().map(|state| (state, String::new(), false));
+        }
         let now = Utc::now().timestamp_millis();
         match resume::select(
             &self.cfg.state_root,
@@ -368,8 +374,7 @@ pub async fn start_brokered_session(
 ///   mcp/sandbox exclusivity that `crate::harness` defers to slice 5 is a codex constraint and does
 ///   not apply: this harness honours both at once, as the capture proves.
 /// * `usage: TokensAndCost` — `[RAN]` `step_finish.part.cost` alongside a full token breakdown.
-///   As with claude, the cost half is declared but not yet extracted: `crate::Usage` has no cost
-///   field, and adding one is slice 7 / §7.4's spend-budget work, not this adapter's.
+///   The adapter sums per-step cost into `Event::cost_usd` for USD accounting (STUDIO-1124).
 /// * `budgets: false` — the turn deadline below is the daemon's, not a CLI-enforced budget;
 ///   opencode has no budget flag at all (design §7.2).
 /// * `stdin: ClosedAtStart` — the measured difference from claude (module doc).
@@ -509,6 +514,19 @@ impl Harness for Runner {
 
 #[async_trait]
 impl crate::Runner for Runner {
+    async fn start_fresh_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        let fresh = Runner {
+            cfg: self.cfg.clone(),
+            force_fresh: true,
+            limits: std::sync::Arc::clone(&self.limits),
+        };
+        fresh.start_session(workspace_path, issue, transcript).await
+    }
     /// ⚠️ Provisions the session's private state directory BEFORE returning, so a missing
     /// credential is refused here — at dispatch, with a message naming the fix — rather than
     /// surfacing mid-turn as a 401 indistinguishable from a real provider problem. This is the
@@ -1345,6 +1363,7 @@ impl OpencodeSession {
         };
 
         let mut usage = Usage::default();
+        let mut cost_usd = Some(0.0);
         let mut result_text = String::new();
         let mut terminal_seen = false;
         let mut failure: Option<Failure> = None;
@@ -1445,6 +1464,13 @@ impl OpencodeSession {
                         add_usage(&mut usage, &step);
                     }
                     let mut ev = c.event.clone();
+                    if c.step_usage.is_some() {
+                        cost_usd = match (cost_usd, c.event.cost_usd) {
+                            (Some(total), Some(step)) if step.is_finite() && step >= 0.0 => Some(total + step),
+                            _ => None,
+                        };
+                        ev.cost_usd = cost_usd;
+                    }
                     ev.pid = pid as i64;
                     if let Some(obs) = ev.limit.take() {
                         on_event(Event::limit_observed(obs));
@@ -1661,6 +1687,7 @@ impl OpencodeSession {
                 timestamp: Some(Utc::now()),
                 pid: pid as i64,
                 usage: Some(usage),
+                cost_usd,
                 ..Default::default()
             });
             return (tr, None);
@@ -2596,7 +2623,7 @@ exit 1"#,
         // A raw string keeps the JSON's own quotes readable; `{reason}` is substituted by
         // `replace` rather than `format!` so no brace in the JSON needs doubling.
         let step = |reason: &str| {
-            const TMPL: &str = r#"printf '{"type":"step_finish","sessionID":"ses_x","part":{"reason":"REASON","tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n'
+            const TMPL: &str = r#"printf '{"type":"step_finish","sessionID":"ses_x","part":{"reason":"REASON","cost":0.125,"tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n'
 "#;
             TMPL.replace("REASON", reason)
         };
@@ -2638,6 +2665,16 @@ exit 1"#,
         // The invariant stated plainly: a last-wins consumer reading only the final notification
         // must land on the same number the turn commits.
         assert_eq!(live.last().copied(), Some(tr.usage.total_tokens));
+        let costs: Vec<_> = events_of(&seen)
+            .iter()
+            .filter(|e| e.usage.is_some())
+            .map(|e| e.cost_usd)
+            .collect();
+        assert_eq!(
+            costs,
+            [Some(0.125), Some(0.25), Some(0.375), Some(0.375)],
+            "live and terminal dollars must sum every step exactly once"
+        );
     }
 
     // ⚠️ EVERY turn announces its session, and a continuation turn resumes with `-s <id>`.
@@ -3287,6 +3324,53 @@ sleep 30
             model: model.to_string(),
             ..Default::default()
         })
+    }
+
+    /// An engine switch must not adopt an unrelated retained session for the same ticket.
+    #[tokio::test]
+    async fn fresh_session_does_not_adopt_a_retained_opencode_session() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let auth = seeded_auth(&scripts);
+        let cut = write_script(&scripts, "cut.sh", FAKE_CUT_OFF);
+        let runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1125"), None)
+            .await
+            .unwrap();
+        let (_, err) = sess.run_turn("old engine", None, None, &|_| {}).await;
+        assert!(err.is_some());
+        sess.stop().await.unwrap();
+        drop(sess);
+        assert!(record_file(&sr, "STUDIO-1125").exists());
+        let argv_log = scripts.path().join("argv.txt");
+        let clean = write_script(
+            &scripts,
+            "fresh.sh",
+            &format!(
+                "printf '%s\\n' \"$*\" > '{}'\nprintf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_new\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+                argv_log.display()
+            ),
+        );
+        let fresh_runner = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        let fresh = fresh_runner
+            .start_fresh_session(&ws, issue("STUDIO-1125"), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.thread_id(), "");
+        let (_, err) = fresh.run_turn("handoff note", None, None, &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        let argv = std::fs::read_to_string(argv_log).unwrap();
+        assert!(!argv.contains("-s ses_cut"), "must not resume: {argv}");
+        assert!(!argv.contains("Resuming a cut-off attempt"));
+        assert_eq!(fresh.thread_id(), "ses_new");
+        fresh.stop().await.unwrap();
+        drop(fresh);
+        assert!(session_dirs(state_root.path()).is_empty());
     }
 
     /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1043. A turn killed by `turn_timeout` must keep its private

@@ -623,6 +623,7 @@ fn worker_deps_for(
         broker: None,
         // Test seam only; production always builds the dispatch runner from the prepared knobs.
         prepared_harness: None,
+        engine: None,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1843,6 +1844,7 @@ impl Orchestrator {
         review: Option<crate::review::ReviewCheckout>,
         manager: Option<crate::managerrun::ManagerCheckout>,
         prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
+        engine: Option<crate::dispatch::DispatchEngine>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
@@ -1896,6 +1898,7 @@ impl Orchestrator {
         // its first turn (STUDIO-868). Empty leaves the runner's own `claude.model`/`effort` in
         // place, so a dispatch that routed to nobody is byte-identical to today.
         deps.model_override = model_override;
+        deps.engine = engine;
         // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.

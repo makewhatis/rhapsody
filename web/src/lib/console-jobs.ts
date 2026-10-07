@@ -444,6 +444,7 @@ export interface ConsoleJobRow {
    * two holds clear differently, and the card must not say a person is needed for a clock.
    */
   budgetHeld?: string;
+  budgetReason?: string;
   /**
    * What this row's own RUN did, when the status beside it is the TICKET's and the two are
    * different facts — "run done" on a ticket parked in review (STUDIO-780). See [`statusNote`].
@@ -856,6 +857,7 @@ export function buildConsoleJobs(
       updatedAtMs,
       subLabel: job.subLabel,
       budgetHeld: job.budgetHeld,
+      budgetReason: job.budgetReason,
       // Not when the row already has a `subLabel`: that is the held/failed detail, and on a failed
       // row it IS the error, which says more than "run failed" does. See [`statusNote`].
       statusNote:

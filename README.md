@@ -1032,6 +1032,23 @@ behaviour of seeing only what the lookback window covers right now.
 
 ### A run records what actually ran it — `rhapsody_run_provenance` (STUDIO-909)
 
+**Identity fallback engines (STUDIO-1125).** A profile may declare an ordered `fallback:` list of
+`{harness, model, effort}` entries. Each entry must name a known harness; OpenCode additionally
+requires a model. The primary engine is index `0`, followed by fallback entries at indices `1…`.
+Engine choice accepts a caller-supplied health predicate; limit thresholds and switching decisions
+belong to the limit-policy layer.
+
+An explicit dispatch engine override keeps the ticket's identity label, persona, memory bank and
+room cursor. Only the harness/model/effort change. It starts a fresh session, bypassing OpenCode's
+retained-session adoption, and the first-turn prompt names the supplied handoff-note path. A live
+run's engine is pinned: a second override is refused until that run ends.
+
+The engine index is recorded with its harness/model in `rhapsody_run_provenance.engine_index`
+(migration **26**), leaving the Go `runs` schema byte-identical. `/api/v1/runs/{id}` and its
+`/provenance` endpoint expose `engine_index` only for a fallback (`> 0`); primary and legacy runs
+omit it, so existing run JSON and goldens stay byte-identical. An absent profile `fallback:` stays
+empty, adds nothing to a forked profile's output, and changes no dispatch or session behavior.
+
 The `runs` row recorded how many tokens a run spent and **nothing about what spent them**. On an
 installation now running two harnesses and two providers at once, that made two questions
 unanswerable from the product: *which provider/model did this failed run use* (the failure that
@@ -2163,6 +2180,34 @@ names it as `held for capacity` rather than reporting it as an unexplained stall
 entry above).
 
 
+### Review attempts are not verdict rounds (STUDIO-1129)
+
+Ticketless review charges the reviewer half of its durable round budget only when a declared
+approval or findings verdict lands at the dispatch-pinned head. A failed launch, crash, timeout,
+unrecognised handoff or truncated run charges no round. The existing answered-author-exchange
+charge remains verdict-gated too; dispatch still consumes its manager authorization and reserves
+capacity, independently of verdict accounting.
+
+No-verdict attempts retry after 30 seconds, then 120 seconds, with three attempts per reviewer/head
+per daemon lifetime. An exhausted reviewer is excluded from the next selection so an eligible
+substitute can take the review. If none can, the job's review panel and human feed say
+`review_infrastructure`, naming the reviewer, failure and attempt count. Operator Re-run/Clear,
+a new head, or a daemon restart starts a fresh attempt episode. A deliberate token-ceiling hold
+continues to require the existing operator intervention. No verdict at the observed head means
+no findings adjudication, and a legacy adjudication over an unread head is cleared so review can
+re-arm.
+
+The v26→v27 data migration repairs old launch-based counters **once**, using retained per-run
+`rhapsody_review_verdicts` rows; subsequent restarts preserve operator refunds. Historical verdicts
+from before that ledger existed, pruned verdicts, and the old answered-author contribution cannot
+be reconstructed exactly. The per-run ledger also lacks generation: after an operator Clear,
+only verdicts with current-generation finding/resolution evidence can be reconstructed. Unknown
+generations are omitted, and repair never raises the existing count or undoes a prior refund.
+The repaired count is therefore the retained, generation-proven verdict lower bound,
+rather than retaining failed launches as evidence of reviews. Zero-verdict adjudications are
+discarded during recovery. This remains Rhapsody-only (Go has no ticketless review), and changes
+no ported table, config shape or golden.
+
 ### A per-run token ceiling — `agent.max_run_tokens` (STUDIO-967)
 
 Every bound in the review loop counts ROUNDS: the shared round cap, the adjudication threshold, the
@@ -3175,6 +3220,55 @@ watcher's rotation (a `PR_STATE_POLL_INTERVAL` sleep plus up to two serial `gh` 
 poll interval, so the poll bound alone under-covers it. And the local midnight is resolved through
 the zone's own transition rules rather than `now`'s current offset, so a DST transition day no
 longer folds an extra hour of yesterday's spend into today.
+
+### Dollar budgets and operator-maintained model prices (STUDIO-1124)
+
+The Go reference has no dollar budget. Rhapsody adds `budgets.<provider>.daily_usd`
+(zero/unset means unlimited) and a `prices:` table keyed by the full
+`<provider>/<model>` name, with `input`, `output`, `cache_read` and `cache_write`
+rates in dollars per million tokens:
+
+```yaml
+prices:
+  fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash:
+    input: 0.27
+    output: 1.10
+    cache_read: 0.07
+    cache_write: 0.27
+budgets:
+  fireworks-ai:
+    daily_usd: 10
+```
+
+These are example operator-maintained rates, not a bundled price catalog. A configured
+price takes precedence over the harness's reported dollars; a missing or zero harness
+cost is **unknown**, not a free API model. New dispatch requires either a table entry
+or a previous positive harness-cost observation for that exact provider/model. Otherwise
+it refuses with `no price for <model>; add it under prices: or daily_usd for <provider>
+cannot be enforced`. USD holds carry the reason on the state snapshot, dashboard and
+reconciliation report. A token ceiling and a USD ceiling may coexist; either can hold
+new dispatch. Existing continuation exemptions and token-only budgets are unchanged.
+Manager runs check their selected engine's USD budget at launch and before reserving
+an intervention attempt. An unknown price or spent cap defers them without consuming
+an attempt or generation allocation; a cleared budget releases the hold.
+
+Dollar snapshots are persisted per run/turn in `rhapsody_turn_spend`, leaving Go-owned
+tables and their goldens untouched. Live snapshots are replaced by terminal totals,
+never summed twice; a turn belongs to the local day of its first usage observation.
+Unreadable/unknown dollar spend or disabled dollar storage refuses a configured USD
+budget. Previously unpriced spend remains unknown for that day; adding a price enables
+future observations but does not invent historical dollars.
+
+The private provider-broker path supplies an authoritative token total without a
+priceable input/output/cache breakdown. A configured USD budget therefore refuses
+new brokered dispatch, including a priced model, rather than billing from the child's
+comparison-only token reports. Native API-key providers use the pricing order above.
+
+Claude runs with the subscription billing guard and OpenCode `openai` OAuth runs record
+API-equivalent dollars under their subscription accounts, for information only. Those
+figures never gate USD dispatch. The existing per-provider token budgets remain available
+for subscriptions. An install without `daily_usd` or `prices:` preserves its dispatch
+behavior and the Go-pinned config/state shapes.
 
 ### The PR-state watcher polls with conditional requests — `polling.pr_state_interval_ms` (STUDIO-974)
 

@@ -562,6 +562,12 @@ pub async fn perform_adjudication(
     deps: &AdjudicationDeps,
     at: DateTime<Utc>,
 ) {
+    // A stale zero-round plan is not a findings loop. Leave the reviewer obligation armed;
+    // the next watcher sweep will retry it without spending a manager turn (STUDIO-1129).
+    if plan.rounds == 0 {
+        deps.ledger.clear(&plan.pr);
+        return;
+    }
     let req = AdjudicationRequest {
         pr: plan.pr.to_string(),
         head: plan.head.clone(),

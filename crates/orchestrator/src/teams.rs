@@ -2090,6 +2090,99 @@ mod tests {
         }
     }
 
+    fn fallback_engine() -> crate::dispatch::DispatchEngine {
+        crate::dispatch::DispatchEngine {
+            index: 1,
+            spec: rhapsody_config::profiles::EngineSpec {
+                harness: "opencode".into(),
+                model: "openai/gpt-6.1-sol".into(),
+                effort: "high".into(),
+            },
+            handoff_note: Some(std::path::PathBuf::from("/notes/MT-1-progress.md")),
+        }
+    }
+
+    #[test]
+    fn override_keeps_identity_label_bank() {
+        let dir = TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "swe".into();
+        teams.roster[0].bank = "alice-custom".into();
+        let (mut o, store) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::Path::new(&dir.path).join("profiles"));
+        let bank = Arc::new(
+            LocalBank::new(
+                dir.child(rhapsody_config::memory::DEFAULT_BANKS_SUBDIR),
+                "agent-",
+            )
+            .with_bank_overrides([("alice", "alice-custom")]),
+        );
+        o.teams_bank = Some(Arc::clone(&bank));
+        bank.retain(&stamped("alice", "MT-1", "7", "Remember the WIP."))
+            .unwrap();
+        let iss = with_labels(&["rhapsody:@alice", "rust"]);
+        let labels = iss.labels.clone();
+        let (room, cursors) = attach_room(&mut o, &dir);
+        let message = room
+            .append(&posted("bob", 1, "The handoff is ready."))
+            .unwrap();
+        let mut prior = Cursor::parse(&message);
+        prior.seq += 1; // Cursor stores the next unread line, not the consumed message's line.
+        cursors.save("alice", &prior).unwrap();
+        o.dispatch_issue_with_engine(iss, None, None, String::new(), fallback_engine())
+            .unwrap();
+        let re = &o.running["1"];
+        assert_eq!(re.identity, "alice");
+        assert_eq!(re.issue.labels, labels);
+        assert!(re.teammate_section.contains("You are working as alice"));
+        assert!(re.teammate_section.contains("Remember the WIP."));
+        assert_eq!(re.harness, "opencode");
+        assert_eq!(re.model_override.model, "openai/gpt-6.1-sol");
+        assert_eq!(re.model_override.effort, "high");
+        assert_eq!(re.model_override.identity, "alice");
+        let provenance = store.run_provenance(re.run_id).unwrap().unwrap();
+        assert_eq!(provenance.engine_index, 1);
+        assert_eq!(provenance.harness, "opencode");
+        assert_eq!(provenance.model, "openai/gpt-6.1-sol");
+        assert_eq!(o.teams.as_ref().unwrap().roster[0].bank, "alice-custom");
+        assert!(Arc::ptr_eq(&cursors, o.teams_cursors.as_ref().unwrap()));
+        assert!(
+            !re.teammate_section.contains("The handoff is ready."),
+            "already read room posts must stay read"
+        );
+        assert_eq!(cursors.load("alice"), prior);
+        assert!(
+            std::path::Path::new(&dir.child(rhapsody_config::memory::DEFAULT_BANKS_SUBDIR))
+                .join("alice-custom")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn no_engine_ping_pong() {
+        let (mut o, _) = orch_with_teams(teams_with(vec![ident("alice", &["rust"], 0)]));
+        let iss = with_labels(&["rhapsody:@alice"]);
+        o.dispatch_issue_with_engine(iss.clone(), None, None, String::new(), fallback_engine())
+            .unwrap();
+        let run_id = o.running["1"].run_id;
+        let mut primary = fallback_engine();
+        primary.index = 0;
+        primary.spec.harness = "claude".into();
+        primary.spec.model = "opus".into();
+        assert!(
+            o.dispatch_issue_with_engine(iss, None, None, String::new(), primary)
+                .is_err()
+        );
+        assert_eq!(o.running["1"].run_id, run_id);
+        assert_eq!(o.running["1"].engine_index, 1);
+        assert_eq!(o.running["1"].harness, "opencode");
+        let list = [fallback_engine().spec];
+        assert_eq!(
+            rhapsody_config::profiles::choose_engine(&list, &|_| false),
+            None
+        );
+    }
+
     /// A retained fact comes back on the NEXT dispatch of the same identity,
     /// inside the teammate section and after the profile header (§0.11.6's
     /// fixed order).
