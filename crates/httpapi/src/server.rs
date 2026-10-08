@@ -30,7 +30,9 @@ use rhapsody_orchestrator::{
 use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView};
 use rhapsody_store::StoreError;
 
-use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
+use crate::handlers::{
+    handle_accounts, handle_healthz, handle_refresh, handle_state, handle_version,
+};
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
@@ -84,6 +86,11 @@ use crate::web::{WebDist, serve_web};
 /// Every handler tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
+    /// Read-only account ledger snapshot (STUDIO-1123); no control round-trip or provider I/O.
+    fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
+        Vec::new()
+    }
+
     /// The synchronous runtime view served at `/api/v1/state` (Go `Snapshot(ctx)`). An `Err` renders
     /// as a 503 `snapshot_unavailable` envelope; the HTTP layer bounds the wait (the state handler's
     /// `SNAPSHOT_TIMEOUT`, mirroring Go's request-scoped `snapshotTimeout`).
@@ -786,6 +793,7 @@ where
         // Build identity (STUDIO-380): which commit this daemon was built from. Additive and
         // state-free — `/state` is golden-pinned to the Go daemon's payload and cannot carry it.
         .route("/api/v1/version", any(handle_version))
+        .route("/api/v1/accounts", any(handle_accounts))
         // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
         // GET yields a 405 envelope rather than the SPA fallback.
         .route("/api/v1/refresh", operator_write(handle_refresh))

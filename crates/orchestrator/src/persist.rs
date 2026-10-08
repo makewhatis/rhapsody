@@ -470,6 +470,8 @@ impl Orchestrator {
     /// the UI/GET don't show them as forever-pending (INF-250) — this is the single end-of-run point
     /// every termination path flows through. Mirrors Go `persistEndRun`.
     pub fn persist_end_run(&self, re: &RunningEntry, outcome: &str, err_str: &str) {
+        self.accounts
+            .release_run(&crate::accounts::run_key(&re.issue.id, re.started_at));
         // The per-run operator mailbox (INF-250) dies with the run — drop it at this single end-of-run
         // chokepoint every termination path flows through, BEFORE the store-gated early return below
         // (the mailbox is independent of the store). Mirrors Go's `runningEntry.mailbox` being GC'd

@@ -31,6 +31,7 @@
 //! `crates/orchestrator`. This O1 slice — the core state, the effective config view, and the
 //! telemetry attrs — compiles standalone and introduces none.
 
+pub mod accounts;
 pub mod agentupdate;
 pub mod automerge;
 pub mod backoff;

@@ -103,6 +103,7 @@ pub(crate) struct FakeProvider {
     /// behaviour the route tests are about, and a canned status could not show that a `POST` is what
     /// changed the subsequent `GET`.
     drain: rhapsody_orchestrator::drain::DrainSignal,
+    accounts: Vec<rhapsody_orchestrator::accounts::AccountView>,
     /// The WORKFLOW.md path the config endpoints read/write (Go's `fakeProvider.workflowPath`); its
     /// parent dir is the `resolve` base in [`validate_config`].
     workflow_path: String,
@@ -182,12 +183,21 @@ pub(crate) struct FakeProvider {
 }
 
 impl FakeProvider {
+    pub(crate) fn with_accounts(
+        mut self,
+        accounts: Vec<rhapsody_orchestrator::accounts::AccountView>,
+    ) -> Self {
+        self.accounts = accounts;
+        self
+    }
+
     /// A provider that returns `snap` from every `snapshot()` call, with an empty (Noop) history store.
     pub(crate) fn ok(snap: Snapshot) -> Self {
         Self {
             snap,
             snap_err: None,
             drain: rhapsody_orchestrator::drain::DrainSignal::new(),
+            accounts: Vec::new(),
             history: Arc::new(Noop),
             transcript: None,
             linear_projects: Vec::new(),
@@ -642,6 +652,10 @@ impl FakeProvider {
 
 #[async_trait]
 impl StateProvider for FakeProvider {
+    fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
+        self.accounts.clone()
+    }
+
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         self.touch();
         match &self.snap_err {

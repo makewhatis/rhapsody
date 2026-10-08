@@ -1027,6 +1027,8 @@ pub struct Orchestrator {
     /// armed) makes the whole mechanism inert, so a daemon nobody drains behaves exactly as it did
     /// before the feature existed.
     pub(crate) drain: crate::drain::DrainSignal,
+    /// Account observations written on the control task and read off-loop by HTTP.
+    pub(crate) accounts: Arc<crate::accounts::AccountLedger>,
     /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
     /// when the previous tick found the drain armed, which is what makes the cancel transition
     /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
@@ -1237,6 +1239,7 @@ impl Orchestrator {
             // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
             // inert, i.e. byte-identical to a daemon built before the feature.
             drain: crate::drain::DrainSignal::new(),
+            accounts: Arc::new(crate::accounts::AccountLedger::default()),
             drain_gate: None,
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
             // default and every dispatch path is byte-identical to a daemon built before the feature.

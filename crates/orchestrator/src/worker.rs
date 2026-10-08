@@ -1169,6 +1169,7 @@ impl WorkerDeps {
         let mut turn: i64 = 1;
         let mut last_result = String::new();
         let mut issue = issue;
+        let auth_reported = std::sync::atomic::AtomicBool::new(false);
         loop {
             let p = match build_turn_prompt(
                 prompt_tmpl,
@@ -1214,7 +1215,22 @@ impl WorkerDeps {
             let (tr, terr) = {
                 // Emit the agent event as a (trace-correlated) log line and forward it. Scoped so the
                 // forwarding closure is dropped before `issue.state` is mutated below.
+                let auth_reported = &auth_reported;
                 let wrapped = move |e: Event| {
+                    if let Some(oauth) = sess.account_oauth()
+                        && !auth_reported.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        on_event(Event {
+                            event_type: agent::EVENT_ACCOUNT_AUTH.into(),
+                            message: if oauth { "oauth" } else { "api" }.into(),
+                            ..Default::default()
+                        });
+                    }
+                    // OpenCode reports auth before exec, independently of child output. The
+                    // once-per-run classification above consumes that marker without duplicates.
+                    if e.event_type == agent::EVENT_ACCOUNT_AUTH {
+                        return;
+                    }
                     tracing::debug!(
                         issue_identifier = %ident,
                         event = %e.event_type,

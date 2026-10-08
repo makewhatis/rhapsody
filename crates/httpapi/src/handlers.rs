@@ -112,6 +112,20 @@ pub(crate) async fn handle_refresh(
     )
 }
 
+/// Additive, read-only account-limit view (STUDIO-1123); existing parity payloads stay unchanged.
+pub(crate) async fn handle_accounts(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(response) = require_get(&method) {
+        return response;
+    }
+    write_json(
+        StatusCode::OK,
+        &serde_json::json!({"accounts": provider.accounts()}),
+    )
+}
+
 /// Enforce GET/HEAD on a read-only route: `Some(405 envelope)` (with `Allow: GET, HEAD`) on any other
 /// method, `None` when allowed. The routes are registered method-agnostically (`any`) so a mismatch
 /// reaches the handler and yields an explicit 405 rather than the SPA fallback swallowing it into a
@@ -188,6 +202,56 @@ mod tests {
     }
 
     // ------- healthz (mirrors healthz_test.go) -------
+
+    #[tokio::test]
+    async fn accounts_endpoint_shape() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let response = reqwest::get(format!("{base}/api/v1/accounts"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            serde_json::json!({"accounts":[]})
+        );
+        let response = crate::testutil::operator_client()
+            .post(format!("{base}/api/v1/accounts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405);
+        assert_eq!(response.headers()["allow"], "GET, HEAD");
+
+        let ledger = rhapsody_orchestrator::accounts::AccountLedger::default();
+        let mut observation = rhapsody_agent::ratelimit::parse_claude_rate_limit(include_bytes!(
+            "../../agent/testdata/limits/allowed.jsonl"
+        ))
+        .unwrap();
+        observation.observed_at_s = 1791312000;
+        ledger.observe("claude-subscription", observation);
+        let base =
+            spawn(FakeProvider::ok(empty_snapshot()).with_accounts(ledger.snapshot(1791312000)))
+                .await;
+        let (status, body) = get_json(&format!("{base}/api/v1/accounts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            serde_json::json!({"accounts":[{
+                "account":"claude-subscription",
+                "windows":[{"window":"five_hour","utilization":0.05,"resets_at_s":1791312600},
+                    {"window":"seven_day","utilization":0.02,"resets_at_s":1791680400}],
+                "status":"allowed","using_credits":false,"last_seen_s":1791312000,
+                "source":"stream","stale":false,"detection":"stream"
+            }]})
+        );
+        let head = reqwest::Client::new()
+            .head(format!("{base}/api/v1/accounts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200);
+        assert!(head.bytes().await.unwrap().is_empty());
+    }
 
     // Mirrors Go `TestHealthzEndpoint`.
     #[tokio::test]

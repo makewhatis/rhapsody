@@ -179,6 +179,10 @@ impl DaemonState {
 
 #[async_trait]
 impl StateProvider for DaemonState {
+    fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
+        self.handle.accounts(Utc::now().timestamp())
+    }
+
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         // `None` means the control loop is not serving — it is gone (the daemon is shutting down) or
         // has not published its first snapshot yet; Go's `Snapshot(ctx)` surfaces that as an error the
