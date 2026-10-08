@@ -9,7 +9,7 @@
 //! this state land in later P5 tickets (O2–O7), each extending this struct and the entry types with
 //! the fields its behavior needs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1022,12 +1022,11 @@ pub struct Orchestrator {
     /// via [`set_credential_probe`](Orchestrator::set_credential_probe).
     pub(crate) cred_probe: Option<Arc<dyn crate::preflight::CredentialProbe>>,
     /// The cached credential-probe verdict for the dispatch preflight. Mutated only by on_tick's
-    /// `credential_preflight` on the single control task, so it needs no lock. `None` until the first
-    /// probe.
-    pub(crate) probe_cache: Option<crate::preflight::ProbeCache>,
-    /// The per-probe timeout bound: a probe that does not answer within this is treated as "cannot
-    /// verify → skip dispatch" (fail closed), well under the poll interval so a hang never wedges the
-    /// tick. A field (not a const) so tests can shrink it; defaulted to
+    /// `credential_preflight` on the single control task, so it needs no lock. Keyed by credential
+    /// context; an empty map means no probe verdicts yet.
+    pub(crate) probe_cache: BTreeMap<crate::preflight::ProbeKey, crate::preflight::CachedProbe>,
+    /// The per-probe timeout bound: no answer is unknown, permits dispatch and retries next tick.
+    /// A field (not a const) so tests can shrink it; defaulted to
     /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
     pub(crate) probe_timeout: std::time::Duration,
 
@@ -1039,6 +1038,7 @@ pub struct Orchestrator {
     pub(crate) drain: crate::drain::DrainSignal,
     /// Account observations written on the control task and read off-loop by HTTP.
     pub(crate) accounts: Arc<crate::accounts::AccountLedger>,
+    pub(crate) chatgpt_queued: bool,
     pub(crate) limit_policy: crate::limitpolicy::LimitPolicy,
     /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
     /// when the previous tick found the drain armed, which is what makes the cancel transition
@@ -1251,12 +1251,13 @@ impl Orchestrator {
             // BO-59: no credential probe by default → the preflight is a no-op and dispatch is
             // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.
             cred_probe: None,
-            probe_cache: None,
+            probe_cache: BTreeMap::new(),
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
             // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
             // inert, i.e. byte-identical to a daemon built before the feature.
             drain: crate::drain::DrainSignal::new(),
             accounts: Arc::new(crate::accounts::AccountLedger::default()),
+            chatgpt_queued: false,
             limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by

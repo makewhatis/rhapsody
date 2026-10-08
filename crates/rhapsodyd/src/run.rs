@@ -60,6 +60,8 @@ struct BootSeams {
     /// Overrides [`RUNTIME_HEAL_INTERVAL`] so a test can observe the self-heal without waiting 30s.
     heal_interval: Option<Duration>,
     manager_canary: Option<Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory>>,
+    usage_probe_endpoint: Option<String>,
+    account_now_s: Option<i64>,
 }
 
 /// Starts the Rhapsody daemon for the workflow selected by `args`, running until `ctx` is cancelled.
@@ -112,6 +114,8 @@ where
         home,
         heal_interval,
         manager_canary,
+        usage_probe_endpoint,
+        account_now_s,
     } = seams;
     let heal_interval = heal_interval.unwrap_or(RUNTIME_HEAL_INTERVAL);
     // `rhapsodyd mcp [WORKFLOW.md]` runs the local MCP facade over stdio instead of the daemon
@@ -293,6 +297,9 @@ where
     };
 
     let mut o = Orchestrator::new(flags.path.to_string_lossy().into_owned());
+    if let Some(now) = account_now_s.and_then(|s| chrono::DateTime::from_timestamp(s, 0)) {
+        o.now = Box::new(move || now);
+    }
     // Inject the broker registration handle before `o.control()` snapshots the off-loop handle and
     // moves the orchestrator into the control task (design §11.1 step 3). The handle is create-only:
     // PB7's prepared dispatch consumes it, and it refuses with the typed `provider_broker_unavailable`
@@ -795,6 +802,7 @@ where
         }
         let provider = Arc::new(
             DaemonState::new(handle.clone())
+                .with_account_clock(account_now_s)
                 .with_teams_config_path(teams_config_path)
                 .with_provider_runtime(provider_runtime),
         );
@@ -877,6 +885,39 @@ where
             }
         }
     }
+
+    // Probe only after the API listener has started. Hermetic boot tests opt in through
+    // an injected endpoint; production shares one admission gate across the process.
+    let usage_probe_task = if install_probe || usage_probe_endpoint.is_some() {
+        let probe = usage_probe_endpoint
+            .map(|endpoint| Arc::new(rhapsody_agent::opencode::limits::UsageProbe::new(endpoint)))
+            .unwrap_or_else(rhapsody_agent::opencode::limits::shared_probe);
+        let handle = handle.clone();
+        let mut ctx = shutdown.wait();
+        Some(tokio::spawn(async move {
+            let work = async {
+                if !handle.wait_for_snapshot().await {
+                    return;
+                }
+                let mut boot = true;
+                loop {
+                    if let Some(path) = handle.chatgpt_probe_path(boot).await
+                        && let Some(result) = probe.observe(&path).await
+                    {
+                        handle.record_chatgpt_probe(result);
+                    }
+                    boot = false;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            };
+            tokio::select! {
+                _ = ctx.cancelled() => {},
+                _ = work => {},
+            }
+        }))
+    } else {
+        None
+    };
 
     // --- startup banner (purely additive) ---
     let color = banner_color_enabled(is_terminal, flags.no_color, |k| {
@@ -1671,6 +1712,9 @@ where
     // upstream calls via the listener's shutdown broadcast.
     broker_runtime.revoke_all();
     shutdown.cancel();
+    if let Some(task) = usage_probe_task {
+        let _ = task.await;
+    }
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
     // The manager self-test watcher is cancelled by the same signal and checks it around its sleep,
@@ -2875,6 +2919,107 @@ mod tests {
     }
 
     const OFF_STORAGE: &str = "storage:\n  path: \"off\"\n";
+
+    async fn read_accounts(port: i32) -> Option<serde_json::Value> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port as u16))
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                b"GET /api/v1/accounts HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.ok()?;
+        let start = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        serde_json::from_slice(&bytes[start..]).ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_probe_populates_accounts_and_stops_new_work_from_real_plan() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new();
+        let auth = dir.child("auth.json");
+        let login = br#"{"openai":{"type":"oauth","access":"test-access","refresh":"refresh-canary","expires":4102444800000}}"#;
+        std::fs::write(&auth, login).unwrap();
+        let (listener, base) = crate::testutil::http_listener().await;
+        let endpoint = format!("{base}/usage");
+        let home = dir.path.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /usage http/1.1"));
+            assert!(request.contains("authorization: bearer test-access"));
+            assert!(!request.contains("refresh-canary"));
+            let info = runtimeport::read_in(&home).unwrap();
+            assert!(read_accounts(info.port).await.is_some());
+            let body = include_str!("../../agent/testdata/limits/chatgpt-usage.json");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let wf = write_wf(
+            &dir,
+            OFF_STORAGE,
+            &format!(
+                "server:\n  port: 0\nopencode:\n  auth_source: {}\nlimits:\n  thresholds:\n    warn: 20\n    stop_new: 30\n    handoff: 95\n",
+                auth.display()
+            ),
+        );
+        let signal = CancelSignal::new();
+        let ctx = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let seams = BootSeams {
+            home: Some(dir.path.clone()),
+            usage_probe_endpoint: Some(endpoint),
+            account_now_s: Some(1791384678),
+            ..Default::default()
+        };
+        let task = tokio::spawn(async move {
+            run_with_seam(ctx, &argv, SharedBuf::new(), false, false, seams).await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(info) = runtimeport::read_in(&dir.path)
+                    && let Some(doc) = read_accounts(info.port).await
+                    && let Some(view) = doc["accounts"]
+                        .as_array()
+                        .and_then(|a| a.iter().find(|a| a["account"] == "chatgpt-subscription"))
+                    && view["source"] == "probe"
+                {
+                    break view.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        signal.cancel();
+        assert_eq!(task.await.unwrap(), 0);
+        server.abort();
+        let _ = server.await;
+        let view = result.expect("boot must probe even with no live or queued work");
+        assert_eq!(view["detection"], "probe");
+        assert_eq!(view["stale"], false);
+        assert_eq!(view["level"], "stop-new");
+        assert_eq!(view["windows"][0]["utilization"], 0.31);
+        assert_eq!(view["windows"][0]["resets_at_s"], 1791948615i64);
+        assert_eq!(std::fs::read(auth).unwrap(), login);
+    }
 
     /// STUDIO-1013 (§12): `manager.review_authority` is refused and forced back to `off` when the
     /// daemon has no durable store. The mutation this pins — accepting `act` with the Noop store —

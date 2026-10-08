@@ -143,6 +143,7 @@ pub struct DaemonState {
     /// answers, exactly what a daemon with no `providers:` block serves. The two `GET` routes read
     /// this cache only; the one credentialed operation is the operator-guarded refresh POST.
     provider: Option<Arc<crate::providers::ProviderRuntime>>,
+    account_now_s: Option<i64>,
 }
 
 impl DaemonState {
@@ -155,6 +156,7 @@ impl DaemonState {
             history,
             teams_config_path: String::new(),
             provider: None,
+            account_now_s: None,
         }
     }
 
@@ -165,6 +167,12 @@ impl DaemonState {
         runtime: Arc<crate::providers::ProviderRuntime>,
     ) -> Self {
         self.provider = Some(runtime);
+        self
+    }
+
+    /// Boot test clock for recorded window epochs; production uses the current time.
+    pub(crate) fn with_account_clock(mut self, now_s: Option<i64>) -> Self {
+        self.account_now_s = now_s;
         self
     }
 
@@ -183,7 +191,8 @@ impl StateProvider for DaemonState {
         self.handle.lead_reports()
     }
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
-        self.handle.accounts(Utc::now().timestamp())
+        self.handle
+            .accounts(self.account_now_s.unwrap_or_else(|| Utc::now().timestamp()))
     }
 
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {

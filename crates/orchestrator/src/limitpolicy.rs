@@ -68,6 +68,13 @@ pub fn level(ledger: &AccountLedger, account: &str, cfg: &Limits, now_s: i64) ->
         return Level::Ok;
     };
     let t = cfg.for_account(account);
+    if account == "openai" && view.source == "budget" {
+        return if view.status == "rejected" {
+            Level::Wall
+        } else {
+            Level::Ok
+        };
+    }
     if cfg.credits == "always" && t.warn == 100.0 && t.stop_new == 100.0 && t.handoff == 100.0 {
         return Level::Ok;
     }
@@ -176,6 +183,23 @@ struct ResumeRecord {
 pub(crate) const RETRY_LIMIT_PREFIX: &str = "limit continuation: ";
 
 impl Orchestrator {
+    fn account_level(&self, account: &str, cfg: &Limits, now: i64) -> Level {
+        let plan = level(&self.accounts, account, cfg, now);
+        // Keep reporting the real plan independently; its workers still obey the operator's
+        // runaway budget wall, even when credit spending or plan thresholds are disabled.
+        if account == "chatgpt-subscription" && self.openai_budget_rejected(now) {
+            Level::Wall
+        } else {
+            plan
+        }
+    }
+
+    pub(crate) fn openai_budget_rejected(&self, now: i64) -> bool {
+        self.accounts
+            .snapshot(now)
+            .iter()
+            .any(|a| a.account == "openai" && a.source == "budget" && a.status == "rejected")
+    }
     pub(crate) fn limits_config(&self) -> Limits {
         self.eff
             .as_ref()
@@ -198,7 +222,7 @@ impl Orchestrator {
                 return false;
             }
         }
-        level(&self.accounts, account, &cfg, now) < Level::StopNew
+        self.account_level(account, &cfg, now) < Level::StopNew
     }
 
     pub(crate) fn engine_list(&self, identity: &str, primary: EngineSpec) -> Vec<EngineSpec> {
@@ -229,7 +253,9 @@ impl Orchestrator {
             },
             project,
         );
-        self.account_usable(&pricing.account) && self.usd_budget_hold(&pricing).is_none()
+        !self.credential_probe_held(&spec.harness, project)
+            && self.account_usable(&pricing.account)
+            && self.usd_budget_hold(&pricing).is_none()
     }
 
     /// Resolve the engine without composing the persona or advancing the room cursor. A refused
@@ -301,9 +327,11 @@ impl Orchestrator {
 
     pub(crate) fn limit_dispatch_ready(&self, issue: &rhapsody_core::Issue, project: &str) -> bool {
         let now = (self.now)().timestamp();
-        if !self.accounts.snapshot(now).iter().any(|a| {
-            level(&self.accounts, &a.account, &self.limits_config(), now) >= Level::StopNew
-        }) {
+        if !self.has_credential_holds()
+            && !self.accounts.snapshot(now).iter().any(|a| {
+                level(&self.accounts, &a.account, &self.limits_config(), now) >= Level::StopNew
+            })
+        {
             return true;
         }
         let run = self.limit_projection(issue, project);
@@ -313,7 +341,7 @@ impl Orchestrator {
         } else {
             &run.pricing.account
         };
-        if self.account_usable(account) {
+        if !self.credential_probe_held(&run.harness, project) && self.account_usable(account) {
             return true;
         }
         let (harness, model) =
@@ -342,7 +370,12 @@ impl Orchestrator {
             title: issue.title.clone(),
             project: project.into(),
             provider: account.clone(),
-            reason: format!("waiting: {account} limit, resets {reset}"),
+            reason: self
+                .credential_probe_reason(&run.harness, project)
+                .map_or_else(
+                    || format!("waiting: {account} limit, resets {reset}"),
+                    |reason| format!("waiting: {account} credential — {reason}"),
+                ),
             ..Default::default()
         });
         false
@@ -406,12 +439,17 @@ impl Orchestrator {
             self.note_usd_budget_hold(held);
             return false;
         }
-        if self.account_usable(account) || self.credit_approved(&re.issue.id, account) {
+        if self.run_credential_probe_reason(re).is_none()
+            && (self.account_usable(account) || self.credit_approved(&re.issue.id, account))
+        {
             self.limit_policy.holds.remove(&re.issue.identifier);
             if self
                 .budget_ledger
                 .get(&re.issue.identifier, self.budget_hold_ttl())
-                .is_some_and(|h| h.reason.starts_with("waiting:") && h.reason.contains(" limit"))
+                .is_some_and(|h| {
+                    h.reason.starts_with("waiting:")
+                        && (h.reason.contains(" limit") || h.reason.contains(" credential"))
+                })
             {
                 self.release_budget_hold(&re.issue.identifier);
             }
@@ -459,7 +497,10 @@ impl Orchestrator {
             .accounts
             .tightest(account, (self.now)().timestamp())
             .map_or(0, |w| w.resets_at_s);
-        let reason = format!("waiting: {account} limit, resets {reset}");
+        let reason = self.run_credential_probe_reason(re).map_or_else(
+            || format!("waiting: {account} limit, resets {reset}"),
+            |reason| format!("waiting: {account} credential — {reason}"),
+        );
         if self
             .limit_policy
             .holds
@@ -508,11 +549,12 @@ impl Orchestrator {
                 && ((cfg.credits == "never"
                     || (cfg.credits == "manager_urgent" && !self.credit_approved(id, &account)))
                     || (cfg.credits == "daily_cap" && spent >= cfg.credits_daily_usd));
-            let lvl = level(&self.accounts, &account, &cfg, now);
+            let lvl = self.account_level(&account, &cfg, now);
             let approved = self.credit_approved(id, &account);
             let provider_rejected = views
                 .iter()
-                .any(|v| v.account == account && v.status == "rejected");
+                .any(|v| v.account == account && v.status == "rejected")
+                || (account == "chatgpt-subscription" && self.openai_budget_rejected(now));
             if credit_wall || (lvl == Level::Wall && (!approved || provider_rejected)) {
                 if credit_wall && cfg.credits != "manager_urgent" {
                     self.accounts.reject_until_reset(&account, now);
