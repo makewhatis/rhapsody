@@ -87,14 +87,17 @@ pub fn model_credential_from_config_json(json: &str) -> Option<String> {
 }
 
 /// The FILTERED `~/.claude/.credentials.json` a manager config directory carries: only
-/// `claudeAiOauth`, and only when it holds a non-empty access token. Returns `None` when the source
+/// `claudeAiOauth.accessToken` and expiry metadata, never its refresh token. Returns `None` when the source
 /// document has no usable OAuth credential, in which case nothing is written (the config dir then
 /// carries no third-party credential at all, and the run authenticates through
 /// [`MANAGER_CREDENTIAL_ENV`] or not at all — fail closed).
 pub fn manager_credential_document(json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let oauth = v.get("claudeAiOauth")?.clone();
-    model_credential_from_config_json(json)?;
+    let token = model_credential_from_config_json(json)?;
+    let mut oauth = serde_json::json!({"accessToken": token});
+    if let Some(expires) = v["claudeAiOauth"].get("expiresAt") {
+        oauth["expiresAt"] = expires.clone();
+    }
     Some(serde_json::json!({ "claudeAiOauth": oauth }).to_string())
 }
 
@@ -527,6 +530,10 @@ mod tests {
             Some("sk-ant-oat01-model")
         );
         let filtered = manager_credential_document(source).expect("document");
+        assert!(
+            !filtered.contains("refreshToken"),
+            "a manager must never rotate a copied login"
+        );
         assert!(
             !filtered.contains("third-party-secret"),
             "unrelated mcpOAuth tokens must not be copied: {filtered}"

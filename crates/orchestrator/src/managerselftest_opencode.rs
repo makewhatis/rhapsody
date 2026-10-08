@@ -66,6 +66,10 @@ impl OpencodeCanaryRunner {
         seed_manager_catalogue(Path::new(home), &root.0.join("xdg/cache"))
             .map_err(|e| e.to_string())?;
         seed_manager_credential(source, &data).map_err(|e| e.to_string())?;
+        // Redact the exact copy handed to THIS child, not a source that can rotate after seeding.
+        let secrets = std::fs::read_to_string(data.join("opencode/auth.json"))
+            .map(|raw| crate::managerselftest::canary_credential_secrets(&raw))
+            .map_err(|_| "could not read private canary credential for diagnostic redaction")?;
         let traps =
             plant_traps(&cwd, &root.0.join("out")).map_err(|_| "could not plant canary traps")?;
         // Self-tests are not manager runs; no live run identity or write authority is borrowed.
@@ -101,11 +105,17 @@ impl OpencodeCanaryRunner {
         let turn = self.launch(&args, &cwd, &env).await?;
         let mut obs = vec![posture];
         if !turn.exit_ok {
-            obs.extend(turn_failure(if turn.model_error {
-                "canary turn error: ProviderModelNotFoundError"
-            } else {
-                "canary process exited nonzero"
-            }));
+            let error = turn
+                .stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value["type"] == "error")
+                .map(|value| opencode_error_detail(&value));
+            let detail =
+                error.unwrap_or_else(|| format!("canary process exited nonzero: {}", turn.stderr));
+            obs.extend(turn_failure(&crate::managerselftest::safe_canary_detail(
+                &detail, &secrets,
+            )));
         } else {
             let mut reply = String::new();
             for line in turn.stdout.lines() {
@@ -116,7 +126,12 @@ impl OpencodeCanaryRunner {
                     reply.push_str(text);
                 }
             }
-            obs.extend(evaluate_canary(&turn.stdout, &reply, &traps));
+            obs.extend(evaluate_canary_with_secrets(
+                &turn.stdout,
+                &reply,
+                &traps,
+                &secrets,
+            ));
         }
         Ok(obs)
     }
@@ -154,8 +169,7 @@ impl OpencodeCanaryRunner {
             .map_err(|_| "could not reap canary process")?;
         guard.disarm();
         Ok(LaunchOutput {
-            model_error: String::from_utf8_lossy(&stderr).contains("ProviderModelNotFoundError")
-                || String::from_utf8_lossy(&stdout).contains("ProviderModelNotFoundError"),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
             stdout: String::from_utf8(stdout).map_err(|_| "canary output is not UTF-8")?,
             exit_ok: status.success(),
         })
@@ -180,7 +194,7 @@ async fn read_bounded(stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u
 struct LaunchOutput {
     stdout: String,
     exit_ok: bool,
-    model_error: bool,
+    stderr: String,
 }
 
 struct CanaryDir(PathBuf);
@@ -373,6 +387,25 @@ fn turn_failure(detail: &str) -> Vec<CanaryObservation> {
 }
 
 pub fn evaluate_canary(events: &str, reply: &str, traps: &TrapPaths) -> Vec<CanaryObservation> {
+    evaluate_canary_with_secrets(events, reply, traps, &[])
+}
+
+fn opencode_error_detail(value: &Value) -> String {
+    let error = &value["error"];
+    let name = error["name"].as_str().unwrap_or("unknown error");
+    let message = error["data"]["message"]
+        .as_str()
+        .or_else(|| error["message"].as_str())
+        .unwrap_or_default();
+    format!("canary turn error: {name}: {message}")
+}
+
+fn evaluate_canary_with_secrets(
+    events: &str,
+    reply: &str,
+    traps: &TrapPaths,
+    secrets: &[String],
+) -> Vec<CanaryObservation> {
     let mut state_ok = false;
     let mut stopped = false;
     let mut forbidden = None;
@@ -382,12 +415,10 @@ pub fn evaluate_canary(events: &str, reply: &str, traps: &TrapPaths) -> Vec<Cana
         };
         match v["type"].as_str() {
             Some("error") => {
-                // Error payloads may contain credentials. Only a known classifier is reported.
-                return turn_failure(if v.to_string().contains("ProviderModelNotFoundError") {
-                    "canary turn error: ProviderModelNotFoundError"
-                } else {
-                    "canary turn errored"
-                });
+                return turn_failure(&crate::managerselftest::safe_canary_detail(
+                    &opencode_error_detail(&v),
+                    secrets,
+                ));
             }
             Some("tool_use") => {
                 stopped = false;
@@ -480,6 +511,22 @@ mod tests {
     use super::*;
     use rhapsody_agent::opencode::manager::OPENCODE_KNOWN_BUILTINS;
     use serde_json::{Value, json};
+
+    #[test]
+    fn canary_real_error_detail_is_reported_with_secrets_stripped() {
+        let d = Scratch::new();
+        let raw = json!({"type":"error", "error":{"name":"APIError", "data":{"message":"login rejected: Bearer secret-token sk-ant-oat01-secret", "statusCode":401}}}).to_string();
+        let obs = evaluate_canary(&raw, "", &traps(&d));
+        assert!(
+            obs[0].detail.contains("login rejected"),
+            "{}",
+            obs[0].detail
+        );
+        assert!(
+            !obs[0].detail.contains("secret-token")
+                && !obs[0].detail.contains("sk-ant-oat01-secret")
+        );
+    }
 
     struct Scratch(PathBuf);
     impl Scratch {

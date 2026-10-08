@@ -96,6 +96,21 @@ creating recursive manager work. Existing Go-owned tables, config/state goldens 
 normalization are unchanged.
 Limit and PR managers share `manager.max_concurrent`, including reserved and stopping runs.
 
+### Manager boot self-tests and recovery (STUDIO-1139)
+
+The Teams manager's boundary canaries run off-loop only after the API listener is started and
+`runtime.json` names this daemon's port/PID. Configured review authority stays intact while the
+existing verdict gate refuses pending/failed entries. A failed entry retries after about 60 seconds,
+then every 15 minutes; CLI version changes still trigger a fresh test, and passing entries are not
+periodically retested. Shutdown cancels in-flight canaries.
+
+Claude manager credentials use an unexpired file login first, falling back on macOS to the
+`Claude Code-credentials` Keychain service, preferring the daemon user's account item over a stale
+account-less legacy item. Private manager files carry only the access token and
+expiry, never a refresh token or unrelated MCP login. Missing/expired logins refuse before launch
+with actionable detail; both harnesses report bounded, secret-stripped canary turn errors. These
+are Teams-only behaviors with no frozen Go counterpart; existing API/golden shapes are unchanged.
+
 ### Account-limit reporting (STUDIO-1128)
 
 The default-on ledger and policy now report account state transitions (including reset and
