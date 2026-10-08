@@ -233,6 +233,8 @@ pub enum Event {
     Refresh,
     /// A worker task's terminal report (Go `evWorkerExit`).
     WorkerExit(EvWorkerExit),
+    /// Off-loop limit reassignment's tracker result; continuation mutation stays loop-owned.
+    LimitReassigned(Box<crate::managerlimits::LimitReassigned>),
     /// Ticket worker's blocked ending; sent before its exit and checked against its dispatch time.
     LeadBlockedHandoff {
         issue_id: String,
@@ -929,6 +931,11 @@ impl Orchestrator {
             Event::ManagerEffect(result) => {
                 self.handle_manager_effect(&result);
             }
+            Event::LimitReassigned(result) => {
+                if let Err(error) = self.finish_limit_reassign(*result) {
+                    tracing::warn!(%error,"limit: reassignment not activated");
+                }
+            }
         }
     }
 
@@ -1010,7 +1017,9 @@ impl Orchestrator {
         // never be bounded, because the per-issue retention check only fires on a redispatch.
         self.sweep_retained_opencode_sessions();
         self.enforce_limits();
+        self.pump_limit_decisions().await;
         self.resume_due_limits().await;
+        self.pump_limit_managers();
         self.reconcile().await;
         // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
         // state against its activity and REPORT any that disagree. Local reads only (the watch set

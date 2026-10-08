@@ -730,18 +730,15 @@ impl Orchestrator {
                 return;
             }
         };
-        let running = all
-            .iter()
-            .filter(|r| {
-                r.state == MANAGER_INTERVENTION_LAUNCHING || r.state == MANAGER_INTERVENTION_RUNNING
-            })
-            .count();
-        self.manager_attempts.retain(|_, attempt| {
-            all.iter().any(|row| {
-                row.id == attempt.intervention_id && !manager_intervention_is_terminal(&row.state)
-            })
+        self.manager_attempts.retain(|key, attempt| {
+            // Limit cases have no PR intervention row; their episode owns cursor cleanup.
+            key.starts_with("limit:")
+                || all.iter().any(|row| {
+                    row.id == attempt.intervention_id
+                        && !manager_intervention_is_terminal(&row.state)
+                })
         });
-        let mut slots = (self.manager_max_concurrent().max(0) as usize).saturating_sub(running);
+        let mut slots = self.manager_available_slots(&all, None);
 
         for row in all.iter().filter(|r| is_launch_candidate(&r.state)) {
             if slots == 0 {
@@ -1046,6 +1043,7 @@ impl Orchestrator {
             .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, &candidate))
             .map(|p| p.repo.clone())?;
         Some(ManagerRun {
+            limit_account: String::new(),
             owner: coord.owner,
             repo: coord.repo,
             number: coord.number,
@@ -2154,6 +2152,8 @@ mod tests {
     #[test]
     fn manager_usd_gate_prices_the_opencode_entry_not_the_legacy_model() {
         let (mut o, dispatched, _) = multi_orch(12);
+        // This pricing test deliberately dispatches a second PR alongside the first manager.
+        o.teams.as_mut().expect("teams").manager.max_concurrent = 2;
         let dir = TempDir::new();
         let auth = dir.child("auth.json");
         std::fs::write(&auth, br#"{"openai":{"type":"api"}}"#).expect("fake auth kind");
@@ -2753,6 +2753,39 @@ mod tests {
                 .runs_used,
             1
         );
+    }
+
+    #[test]
+    fn limit_manager_defers_pr_reservation_without_charging_an_attempt() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o);
+        prime_holds(&o);
+        o.teams.as_mut().unwrap().manager.max_concurrent = 1;
+        let limit = crate::managerrun::ManagerRun {
+            limit_account: "claude-subscription".into(),
+            repo_url: REPO_URL.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.dispatch_manager(limit.clone()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_KEY)]);
+        let id = active(&o).unwrap().id;
+        o.pump_manager_interventions();
+        let row = o.store().manager_intervention(&id).unwrap().unwrap();
+        assert_eq!(row.state, MANAGER_INTERVENTION_QUEUED);
+        assert_eq!(
+            row.attempts, 0,
+            "capacity must be checked before reservation"
+        );
+        assert!(row.run_id.is_none());
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+        o.running.remove(&limit.key());
+        o.claimed.remove(&limit.key());
+        o.pump_manager_interventions();
+        assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_RUNNING);
+        assert_eq!(dispatched.lock().unwrap().len(), 2);
     }
 
     // The case packet is assembled from the host's own records: a seeded watch row's reviewer,

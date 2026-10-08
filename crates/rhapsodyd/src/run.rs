@@ -401,8 +401,8 @@ where
     // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
     // manager's replies. See the sharing note where the off-loop tasks take their clones.
     let mut teams_room: Option<Arc<rhapsody_config::room::LocalRoom>> = None;
-    // The off-loop self-test watcher wiring: `Some` only when
-    // `manager.review_authority` is configured, so a default install spawns
+    // The off-loop self-test watcher wiring: `Some` when review authority is configured or an
+    // enabled manager can judge limits, so a default install spawns
     // no task and has no delta. Carried out of the Teams block for `teams_prefetch`'s reason — the
     // watcher is spawned beside the prune scheduler, by which point `o` has moved into the control
     // task.
@@ -429,7 +429,12 @@ where
         // Configure now, but do not launch until the API is serving and runtime.json names THIS
         // daemon. Preserve even legacy authority: the verdict gate fails closed while pending or
         // failed, and a background pass can then recover without changing the operator's config.
-        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+        // Hermetic boots skip real probes; an explicitly injected canary still exercises startup.
+        if (install_probe || manager_canary.is_some())
+            && (teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+                || (teams_cfg.enabled
+                    && teams_cfg.manager.mode != rhapsody_config::teams::ManagerMode::Off))
+        {
             o.manager_selftest_state()
                 .configure(teams_cfg.manager.effective_harnesses());
             o.manager_selftest_state().set_credential_probe(Arc::new(
@@ -465,6 +470,7 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_manager_limit_fallback(&teams_cfg);
         report_over_pinned_reviewers(o.teams.as_ref());
         report_unknown_required_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
@@ -2458,6 +2464,19 @@ fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
     }
 }
 
+fn report_manager_limit_fallback(teams: &rhapsody_config::teams::Teams) {
+    if teams.enabled
+        && let Some(warning) = rhapsody_orchestrator::managerlimits::manager_fallback_warning(
+            &teams.manager,
+            &|entry| {
+                rhapsody_orchestrator::accounts::account_for(&entry.harness, &entry.model, true)
+            },
+        )
+    {
+        tracing::warn!("{warning}");
+    }
+}
+
 /// Warns when a model-consulting manager is given a timeout too small for the turn it bounds
 /// (STUDIO-673). Reported at boot, never clamped: the operator's explicit value still wins and
 /// triage keeps working, deterministically — this line is what stops that being discoverable only
@@ -2656,6 +2675,53 @@ mod tests {
     use super::*;
     use crate::testutil::{SharedBuf, TempDir};
     use rhapsody_orchestrator::CancelSignal;
+    #[test]
+    fn boot_limit_fallback_warning_is_warn_and_teams_gated() {
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        _: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+                let mut visitor = Visitor(format!("{} ", event.metadata().level()));
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+        let record = Recorder::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(record.clone()),
+            || {
+                super::report_manager_limit_fallback(&rhapsody_config::teams::Teams::disabled());
+                assert!(record.0.lock().unwrap().is_empty());
+                super::report_manager_limit_fallback(&rhapsody_config::teams::Teams {
+                    enabled: true,
+                    ..Default::default()
+                });
+            },
+        );
+        let got = record.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].contains("WARN")
+                && got[0].contains("no fallback on a different account")
+                && got[0].contains("claude-subscription"),
+            "{got:?}"
+        );
+    }
     use rhapsody_provider_broker::BrokerError;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -2892,6 +2958,15 @@ mod tests {
     // STUDIO-1139: the boot canary observes publication and an actual successful API response.
     #[tokio::test(flavor = "multi_thread")]
     async fn manager_canary_starts_only_after_runtime_publication_and_live_listener() {
+        assert_manager_canary_startup("advise").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn limit_manager_canary_starts_with_review_authority_off() {
+        assert_manager_canary_startup("off").await;
+    }
+
+    async fn assert_manager_canary_startup(review_authority: &str) {
         use rhapsody_orchestrator::managerselftest::{
             CanaryObservation, CanaryRunner, CanaryRunnerFactory, REQUIRED_ATTEMPTS,
         };
@@ -2963,7 +3038,7 @@ mod tests {
         );
         std::fs::write(
             dir.path.join("teams.yaml"),
-            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: advise\n",
+            format!("enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: {review_authority}\n"),
         )
         .expect("teams config");
         let (tx, rx) = tokio::sync::oneshot::channel();

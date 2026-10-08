@@ -135,6 +135,15 @@ impl Orchestrator {
                         windows: view.windows.clone(),
                         tickets: Vec::new(),
                         credits_policy: cfg.credits.clone(),
+                        resets_at_s: reset,
+                        budgets: self
+                            .eff
+                            .as_ref()
+                            .map(|e| e.cfg.budgets.clone())
+                            .unwrap_or_default(),
+                        manager_status: String::new(),
+                        proposal: None,
+                        manager_runs: 0,
                     };
                     let outcome = if crate::managerrun::is_manager_key(id) {
                         HandoffOutcome::ManagerItem(item)

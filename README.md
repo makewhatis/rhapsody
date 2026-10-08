@@ -61,6 +61,41 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Manager account-limit judgment calls (STUDIO-1127)
+
+The isolated manager role adds a read-only `manager_accounts` MCP tool over the existing
+`GET /api/v1/accounts` snapshot. Claude's explicit allowlist and OpenCode's server-prefixed
+allow cover it; ordinary workers acquire no new tool. Account-scoped `limit` cases include
+windows/reset times, affected tickets, engine lists/health, handoff-note paths, review status,
+provider budgets and the credits policy. They use the same isolated manager launch funnel and
+ordered, self-tested harness entries as PR cases, independently of review authority.
+
+`manager.limit_authority` accepts `advise` or `act` and defaults to `act`. The decision block
+uses `kind: "limit"`, `account`, `ticket`, `action` and `rationale`; its actions are `wait`,
+`switch_engine <index>` (0=primary, 1=first fallback), `reassign <identity>`, and `spend_credits`.
+Wait preserves the session until reset + 120 seconds. Switching preserves identity and uses
+a fresh session with the handoff note. Reassignment changes only identity labels through
+bounded off-loop tracker operations, preserves unrelated labels, and seeds a fresh session
+from that note. A ticketless review switches engine or waits rather than relabeling a
+synthetic PR key. Every continuation still rechecks eligibility and account health.
+
+Credit decisions are refused unless `limits.credits: manager_urgent`; authorization applies
+only to the named continuation until its account reset, never to other work on the account.
+Provider rejection and independent USD budgets remain gates. Advise-mode proposals and
+unavailable/exhausted manager cases remain on the `limit_items` human feed. Decision attempts
+are bounded and carried in the existing suspension record; interrupted reassignment stays
+held for the operator rather than guessing which label mutation landed.
+Resume and competing decisions are held while reassignment label writes are in flight;
+that transaction marker is persisted independently of the human-feed display status.
+
+Boot warns when the effective manager list has one entry or no cross-account fallback.
+Enabled managers self-test for limit decisions even with review authority off; the existing
+hermetic boot option skips CLI probes/canaries. A manager limited during its own judgment
+advances to another healthy entry, rather than restoring a deleted private session or
+creating recursive manager work. Existing Go-owned tables, config/state goldens and fixture
+normalization are unchanged.
+Limit and PR managers share `manager.max_concurrent`, including reserved and stopping runs.
+
 ### Manager boot self-tests and recovery (STUDIO-1139)
 
 The Teams manager's boundary canaries run off-loop only after the API listener is started and

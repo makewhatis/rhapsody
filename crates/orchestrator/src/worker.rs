@@ -596,7 +596,11 @@ async fn run_manager_attempt(
     // the base instructions alone. STUDIO-1054: the base prompt and the decision contract come from
     // the ONE builder the M12 harness also uses, so the live run is told the block it must emit
     // instead of a `HANDOFF:` line.
-    let prompt = crate::managerrun::manager_live_prompt(&mgr.case_packet);
+    let prompt = if mgr.key.starts_with("limit:") {
+        mgr.case_packet.clone()
+    } else {
+        crate::managerrun::manager_live_prompt(&mgr.case_packet)
+    };
     let (final_state, result_text, loop_err) = deps
         .run_turns(
             session.as_ref(),

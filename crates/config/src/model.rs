@@ -419,7 +419,7 @@ pub struct Project {
 /// are not the same money, and each draws on its own account. The key is the provider string
 /// [`derive_provider`](https://docs.rs/rhapsody-orchestrator) records on a run (`anthropic`,
 /// `fireworks-ai`, ...).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProviderBudget {
     /// Daily dollar ceiling (STUDIO-1124). Zero is unset; subscription equivalents never gate.
     pub daily_usd: f64,

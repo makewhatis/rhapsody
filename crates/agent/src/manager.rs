@@ -153,6 +153,7 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
     "teams_retain",
     // Host-served reads (§4.4): PR metadata via the host's `gh`, and repository reads from git
     // objects in the bare mirror.
+    "manager_accounts",
     "manager_pr",
     "manager_pr_activity",
     "manager_pr_commits",
@@ -330,6 +331,28 @@ pub fn manager_config(base: &Config, mcp_config_path: &str) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_accounts_tool_registered_read_only() {
+        assert!(MANAGER_MCP_TOOLS.contains(&"manager_accounts"));
+        let args = manager_args(&Config::default(), "/m.json");
+        assert!(
+            arg_after(&args, "--allowedTools")
+                .unwrap()
+                .split(',')
+                .any(|t| t == "mcp__symphony__manager_accounts")
+        );
+        let raw = crate::opencode::manager::manager_config_content(
+            "openai/gpt",
+            "/bin/daemon",
+            "",
+            "/home/test",
+            "42",
+        );
+        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(config["permission"]["symphony_*"], "allow");
+        assert_eq!(config["permission"]["*"], "deny");
+    }
 
     fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let i = args.iter().position(|a| a == flag)?;

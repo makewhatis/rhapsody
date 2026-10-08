@@ -28,6 +28,8 @@ pub struct LimitTicket {
     pub fallback: Vec<EngineSpec>,
     pub healthy: Vec<bool>,
     pub mid_review: bool,
+    #[serde(default)]
+    pub engine_index: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_note: Option<PathBuf>,
 }
@@ -38,6 +40,16 @@ pub struct LimitItem {
     pub windows: Vec<WindowView>,
     pub tickets: Vec<LimitTicket>,
     pub credits_policy: String,
+    #[serde(default)]
+    pub resets_at_s: i64,
+    #[serde(default)]
+    pub budgets: BTreeMap<String, rhapsody_config::ProviderBudget>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manager_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<Box<crate::managerlimits::LimitDecision>>,
+    #[serde(default)]
+    pub manager_runs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
@@ -120,6 +132,11 @@ pub(crate) struct LimitPolicy {
     pub resume_sessions: HashMap<String, String>,
     pub pinned_engines: HashMap<String, crate::dispatch::DispatchEngine>,
     pub fed_budgets: BTreeMap<String, rhapsody_config::ProviderBudget>,
+    pub manager_cases: HashMap<String, LimitItem>,
+    pub limited_managers: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    pub pending_reassignments: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    pub decisions: Vec<crate::managerlimits::LimitDecision>,
+    pub credit_approvals: HashMap<String, (String, i64)>,
 }
 
 pub(crate) struct Suspended {
@@ -150,6 +167,10 @@ struct ResumeRecord {
     outcome: HandoffOutcome,
     note: Option<PathBuf>,
     account: Option<crate::accounts::AccountView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credit_approval: Option<(String, i64)>,
+    #[serde(default)]
+    reassignment_pending: bool,
 }
 
 pub(crate) const RETRY_LIMIT_PREFIX: &str = "limit continuation: ";
@@ -385,7 +406,7 @@ impl Orchestrator {
             self.note_usd_budget_hold(held);
             return false;
         }
-        if self.account_usable(account) {
+        if self.account_usable(account) || self.credit_approved(&re.issue.id, account) {
             self.limit_policy.holds.remove(&re.issue.identifier);
             if self
                 .budget_ledger
@@ -484,17 +505,22 @@ impl Orchestrator {
                 0.0
             };
             let credit_wall = using
-                && (matches!(cfg.credits.as_str(), "never" | "manager_urgent")
+                && ((cfg.credits == "never"
+                    || (cfg.credits == "manager_urgent" && !self.credit_approved(id, &account)))
                     || (cfg.credits == "daily_cap" && spent >= cfg.credits_daily_usd));
             let lvl = level(&self.accounts, &account, &cfg, now);
-            if credit_wall || lvl == Level::Wall {
-                if credit_wall {
+            let approved = self.credit_approved(id, &account);
+            let provider_rejected = views
+                .iter()
+                .any(|v| v.account == account && v.status == "rejected");
+            if credit_wall || (lvl == Level::Wall && (!approved || provider_rejected)) {
+                if credit_wall && cfg.credits != "manager_urgent" {
                     self.accounts.reject_until_reset(&account, now);
                 }
                 stops.push((id.clone(), account));
                 continue;
             }
-            if lvl >= Level::Handoff {
+            if lvl >= Level::Handoff && !approved {
                 if let Some(deadline) = self.limit_policy.deadlines.get(id) {
                     if now >= *deadline {
                         stops.push((id.clone(), account));
@@ -629,8 +655,14 @@ impl Orchestrator {
             &format!("{account} limit"),
         );
         self.persist_totals();
+        if crate::managerrun::is_manager_key(&re.issue.id)
+            && self.continue_limited_manager(&re, worker_finished)
+        {
+            return;
+        }
         self.claimed.insert(re.issue.id.clone());
         self.completed.remove(&re.issue.id);
+        self.limit_policy.credit_approvals.remove(&re.issue.id);
         if let Some(review) = &re.review
             && let Some(attempt) = self.review_attempts.get_mut(&review.watch_key())
         {
@@ -669,10 +701,27 @@ impl Orchestrator {
                     .iter()
                     .map(|e| self.engine_usable(e, &re.project_slug))
                     .collect(),
-                mid_review: re.review.is_some(),
+                mid_review: re.review.is_some()
+                    || self.eff.as_ref().is_some_and(|eff| {
+                        eff.review_states
+                            .contains(&rhapsody_core::normalize_state(&re.issue.state))
+                    }),
+                engine_index: re.engine_index,
                 handoff_note: None,
             }],
             credits_policy: cfg.credits.clone(),
+            resets_at_s: self
+                .accounts
+                .tightest(account, now)
+                .map_or(0, |w| w.resets_at_s),
+            budgets: self
+                .eff
+                .as_ref()
+                .map(|e| e.cfg.budgets.clone())
+                .unwrap_or_default(),
+            manager_status: String::new(),
+            proposal: None,
+            manager_runs: 0,
         };
         // Manager runs have no teammate profile or ticket workspace, and their credential/config
         // directory is deliberately removed on exit. L5 owns their ordered engine fallback; a
@@ -902,7 +951,16 @@ impl Orchestrator {
                 return;
             }
         };
-        if !self.engine_usable(&spec, &old.project_slug) {
+        if !self.engine_usable(&spec, &old.project_slug)
+            && !self.credit_approved(
+                id,
+                &suspended
+                    .account
+                    .as_ref()
+                    .map(|a| a.account.clone())
+                    .unwrap_or_default(),
+            )
+        {
             self.limit_policy.suspended.insert(id.into(), suspended);
             return;
         }
@@ -955,6 +1013,7 @@ impl Orchestrator {
     }
 
     fn drop_limit(&mut self, id: &str) {
+        self.limit_policy.credit_approvals.remove(id);
         if let Some(s) = self.limit_policy.suspended.remove(id) {
             self.claimed.remove(id);
             self.persist_release(&s.run.issue.identifier);
@@ -967,7 +1026,7 @@ impl Orchestrator {
         }
     }
 
-    fn persist_limit_resume(&self, id: &str) {
+    pub(crate) fn persist_limit_resume(&self, id: &str) {
         let Some(s) = self.limit_policy.suspended.get(id) else {
             return;
         };
@@ -990,6 +1049,8 @@ impl Orchestrator {
             outcome: s.outcome.clone(),
             note: s.note.clone(),
             account: s.account.clone(),
+            credit_approval: self.limit_policy.credit_approvals.get(id).cloned(),
+            reassignment_pending: self.limit_policy.pending_reassignments.contains_key(id),
         };
         match serde_json::to_string(&record) {
             Ok(json) => {
@@ -1014,7 +1075,13 @@ impl Orchestrator {
     pub(crate) fn restore_limit_retry(&mut self, key: &str, text: &str) -> Option<String> {
         let json = text.strip_prefix(RETRY_LIMIT_PREFIX)?;
         match serde_json::from_str::<ResumeRecord>(json) {
-            Ok(record) => {
+            Ok(mut record) => {
+                if let HandoffOutcome::ManagerItem(item) = &mut record.outcome
+                    && (record.reassignment_pending || item.manager_status == "reassign pending")
+                {
+                    item.manager_status =
+                        "reassign interrupted: inspect labels before resuming".into();
+                }
                 if let Some(account) = &record.account
                     && account.source != "budget"
                 {
@@ -1064,6 +1131,11 @@ impl Orchestrator {
                 run.stack_context = record.stack_context;
                 run.review = record.review;
                 let id = run.issue.id.clone();
+                if let Some(approval) = record.credit_approval {
+                    self.limit_policy
+                        .credit_approvals
+                        .insert(id.clone(), approval);
+                }
                 self.clear_retry(key);
                 self.claimed.remove(key);
                 self.claimed.insert(id.clone());
@@ -1290,6 +1362,15 @@ impl Orchestrator {
     }
 
     pub(crate) fn request_limit_resume(&mut self, id: &str) -> bool {
+        // A handled refusal must retain the claim: Resume finalize otherwise releases it to
+        // ordinary dispatch while off-loop label writes are still changing the identity.
+        if self.limit_policy.pending_reassignments.contains_key(id) {
+            tracing::warn!(
+                issue_id = id,
+                "limit: Resume refused while reassignment is pending"
+            );
+            return true;
+        }
         let Some(s) = self.limit_policy.suspended.get(id) else {
             return false;
         };
@@ -1334,6 +1415,11 @@ impl Orchestrator {
         {
             existing.windows = item.windows;
             existing.credits_policy = item.credits_policy;
+            existing.resets_at_s = item.resets_at_s;
+            existing.budgets = item.budgets;
+            existing.manager_status = item.manager_status;
+            existing.proposal = item.proposal;
+            existing.manager_runs = item.manager_runs;
             for ticket in item.tickets {
                 existing.tickets.retain(|t| t.ticket != ticket.ticket);
                 existing.tickets.push(ticket);
@@ -1343,7 +1429,7 @@ impl Orchestrator {
         }
     }
 
-    fn remove_limit_item_ticket(&mut self, ticket: &str) {
+    pub(crate) fn remove_limit_item_ticket(&mut self, ticket: &str) {
         for item in &mut self.limit_policy.items {
             item.tickets.retain(|t| t.ticket != ticket);
         }
@@ -1466,6 +1552,11 @@ mod tests {
             windows: vec![],
             tickets: vec![],
             credits_policy: "never".into(),
+            resets_at_s: 0,
+            budgets: BTreeMap::new(),
+            manager_status: String::new(),
+            proposal: None,
+            manager_runs: 0,
         }
     }
 
