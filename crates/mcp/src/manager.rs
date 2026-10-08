@@ -162,18 +162,6 @@ pub(crate) struct TrackerDocumentsArgs {
 
 impl Facade {
     pub(crate) async fn manager_ticket_with_history(&self, identifier: &str) -> CallToolResult {
-        let run_id = match manager_run_id(&self.opts.default_run_id) {
-            Ok(id) => id,
-            Err(e) => return err_result(&e),
-        };
-        let path = format!(
-            "/api/v1/manager/tracker/ticket{}",
-            encode_query(vec![("run_id", run_id), ("identifier", identifier.into())])
-        );
-        let tracker = match self.client.get_operator(&path).await {
-            Ok(body) => body,
-            Err(e) => return err_result(&e),
-        };
         let history = match self
             .client
             .get(&format!(
@@ -185,22 +173,62 @@ impl Facade {
             Ok(body) => body,
             Err(e) => return err_result(&e),
         };
-        let merged = (|| {
-            let mut history: serde_json::Value = serde_json::from_slice(&history).ok()?;
-            let tracker: serde_json::Value = serde_json::from_slice(&tracker).ok()?;
-            let map = history.as_object_mut()?;
-            for field in ["issue", "documents", "documents_truncated", "untrusted"] {
-                map.insert(field.into(), tracker.get(field)?.clone());
-            }
-            Some(history.to_string())
-        })();
-        match merged {
-            Some(body) => text_result(body.as_bytes()),
-            None => err_result(&FacadeError::new(
-                "bad_response",
-                "daemon ticket response is malformed",
-            )),
+        // Manager env defaults name synthetic run histories, not Linear issues. Keep the existing
+        // no-argument read verbatim; only real tracker identifiers can acquire attached documents.
+        if ["lead:", "pr:", "limit:"]
+            .iter()
+            .any(|prefix| identifier.starts_with(prefix))
+        {
+            return text_result(&history);
         }
+        let mut history: serde_json::Map<String, serde_json::Value> =
+            match serde_json::from_slice(&history) {
+                Ok(history) => history,
+                Err(_) => {
+                    return err_result(&FacadeError::new(
+                        "bad_response",
+                        "daemon history response is malformed",
+                    ));
+                }
+            };
+        let tracker = async {
+            let run_id = manager_run_id(&self.opts.default_run_id)?;
+            let path = format!(
+                "/api/v1/manager/tracker/ticket{}",
+                encode_query(vec![("run_id", run_id), ("identifier", identifier.into())])
+            );
+            let body = self.client.get_operator(&path).await?;
+            let ticket: ManagerTicket = serde_json::from_slice(&body).map_err(|_| {
+                FacadeError::new("bad_response", "daemon ticket response is malformed")
+            })?;
+            Ok::<_, FacadeError>(ticket)
+        }
+        .await;
+        match tracker {
+            Ok(ticket) => {
+                history.insert("issue".into(), serde_json::Value::Object(ticket.issue));
+                history.insert(
+                    "documents".into(),
+                    serde_json::Value::Array(ticket.documents),
+                );
+                history.insert(
+                    "documents_truncated".into(),
+                    ticket.documents_truncated.into(),
+                );
+                history.insert("untrusted".into(), ticket.untrusted.into());
+            }
+            Err(error) => {
+                // A failed augmentation must neither discard history nor imply an empty document
+                // set. Keep its failure explicit, so the lead can retry the tracker read.
+                history.insert(
+                    "tracker_error".into(),
+                    serde_json::json!({
+                        "code": error.code, "message": error.message
+                    }),
+                );
+            }
+        }
+        text_result(serde_json::Value::Object(history).to_string().as_bytes())
     }
     pub(crate) async fn manager_evidence_get(
         &self,
@@ -221,6 +249,15 @@ impl Facade {
             Err(e) => err_result(&e),
         }
     }
+}
+
+/// Required augmentation fields: decode all of them before adding any to a valid history.
+#[derive(Deserialize)]
+struct ManagerTicket {
+    issue: serde_json::Map<String, serde_json::Value>,
+    documents: Vec<serde_json::Value>,
+    documents_truncated: bool,
+    untrusted: bool,
 }
 
 /// Reads the manager run id for a call, refusing with the mcp crate's usual `bad_request` envelope
@@ -691,6 +728,145 @@ mod tests {
                 );
             }
         }
+        let _ = client.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn manager_ticket_defaults_to_synthetic_run_history_without_tracker_lookup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for key in [
+            "lead:owner/repo#0:1@manager",
+            "pr:owner/repo#312@manager",
+            "limit:claude-subscription@manager",
+        ] {
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let counted = lookups.clone();
+            let expected =
+                serde_json::json!({"identifier":key,"runs":[{"id":42}],"reviews":[],"verdicts":[]})
+                    .to_string();
+            let history = expected.clone();
+            let router = Router::new()
+                .route("/api/v1/issues/{identifier}/history", get(move |axum::extract::Path(identifier): axum::extract::Path<String>| {
+                    let history = history.clone();
+                    async move { assert_eq!(identifier, key); history }
+                }))
+                .route("/api/v1/manager/tracker/ticket", get(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    async { (axum::http::StatusCode::BAD_GATEWAY, r#"{"error":{"code":"tracker_failed","message":"not a Linear key"}}"#) }
+                }));
+            let port = spawn_router(router).await;
+            let client = connect(Facade::new(
+                &test_config(),
+                client_for_port(port),
+                Options {
+                    default_issue: key.into(),
+                    ..manager_options()
+                },
+            ))
+            .await;
+            let response = client
+                .call_tool(CallToolRequestParams::new("symphony_ticket"))
+                .await
+                .unwrap();
+            assert_eq!(response.is_error, Some(false), "{}", result_text(&response));
+            assert_eq!(result_text(&response), expected);
+            assert_eq!(lookups.load(Ordering::SeqCst), 0);
+            let _ = client.cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_ticket_preserves_history_when_tracker_augmentation_fails() {
+        for (status, body, code) in [
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                r#"{"error":{"code":"tracker_failed","message":"lookup failed"}}"#,
+                "tracker_failed",
+            ),
+            (axum::http::StatusCode::OK, "not JSON", "bad_response"),
+            (
+                axum::http::StatusCode::OK,
+                r#"{"issue":{},"documents":[]}"#,
+                "bad_response",
+            ),
+        ] {
+            let router = Router::new()
+                .route("/api/v1/issues/STUDIO-598/history", get(|| async { r#"{"identifier":"STUDIO-598","runs":[{"id":7}],"reviews":[{"id":8}],"verdicts":[{"id":9}]}"# }))
+                .route("/api/v1/manager/tracker/ticket", get(move || async move { (status, body) }));
+            let port = spawn_router(router).await;
+            let client = connect(Facade::new(
+                &test_config(),
+                client_for_port(port),
+                manager_options(),
+            ))
+            .await;
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new("symphony_ticket").with_arguments(
+                        serde_json::json!({"identifier":"STUDIO-598"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.is_error, Some(false), "{}", result_text(&response));
+            let value: serde_json::Value = serde_json::from_str(&result_text(&response)).unwrap();
+            assert_eq!(value["runs"][0]["id"], 7);
+            assert_eq!(value["reviews"][0]["id"], 8);
+            assert_eq!(value["verdicts"][0]["id"], 9);
+            assert_eq!(value["tracker_error"]["code"], code);
+            assert!(
+                value.get("documents").is_none(),
+                "unavailable does not mean no documents"
+            );
+            assert!(
+                value.get("issue").is_none(),
+                "malformed augmentation must not partly merge"
+            );
+            let _ = client.cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_ticket_history_failure_is_still_an_error() {
+        let router = Router::new().route(
+            "/api/v1/issues/STUDIO-598/history",
+            get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":{"code":"history_failed","message":"store unavailable"}}"#,
+                )
+            }),
+        );
+        let port = spawn_router(router).await;
+        let client = connect(Facade::new(
+            &test_config(),
+            client_for_port(port),
+            manager_options(),
+        ))
+        .await;
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("symphony_ticket").with_arguments(
+                    serde_json::json!({"identifier":"STUDIO-598"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(true));
+        assert!(
+            result_text(&response).contains("history_failed"),
+            "{}",
+            result_text(&response)
+        );
         let _ = client.cancel().await;
     }
 

@@ -74,7 +74,9 @@ explicit MCP allowlist and OpenCode's server-prefixed permissions allow these re
 enabling any built-in file, shell or web tool. The daemon keeps the tracker key; no document-write
 tool is added. Manager `symphony_ticket` augments its existing run/review history with the scoped
 ticket and attached documents using `/api/v1/manager/tracker/ticket`; ordinary facade history and
-Go-owned payloads remain byte-identical.
+Go-owned payloads remain byte-identical. Synthetic manager keys (including the no-argument default)
+return run history verbatim without a tracker lookup. A real identifier retains its history when
+augmentation fails, reporting `tracker_error` instead of inventing an empty document set.
 
 Local reads are confined to the canonical `~/.rhapsody/docs` tree, including symlink/parent
 resolution, and descriptor-relative no-follow opens refuse path replacement escapes. Only regular
