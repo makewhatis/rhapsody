@@ -861,6 +861,10 @@ impl Orchestrator {
                 continue;
             }
             let harness = self.effective_harness(&profile_harness);
+            if !self.account_usable(&self.reviewer_limit_account(teams, &ident.name)) {
+                exclusions.unselectable.insert(ident.name.clone());
+                continue;
+            }
             if matches!(
                 teams.review_model_for(&harness, &backend),
                 rhapsody_config::teams::ReviewModelChoice::Refuse(_)

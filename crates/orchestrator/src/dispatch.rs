@@ -839,6 +839,7 @@ impl Orchestrator {
             if r.started_at.is_empty()
                 || r.outcome == OUTCOME_INTERRUPTED
                 || r.outcome == rhapsody_store::OUTCOME_REFUSED
+                || r.outcome == rhapsody_store::OUTCOME_LIMIT
             {
                 continue;
             }

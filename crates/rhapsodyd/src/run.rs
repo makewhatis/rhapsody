@@ -535,8 +535,11 @@ where
     // to be on the handle that performs the handoff. Created ONLY on the ticketless path, which for
     // THIS channel is a security property rather than a cost control: a request on it names the
     // repository a `bypassPermissions` agent will check out, so on every other installation the
-    // introduction is unrepresentable rather than merely skipped.
-    let review_intro_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_intro_channel());
+    // introduction is unrepresentable rather than merely skipped. The lead's missing-PR probes
+    // reuse this task with NO reviewers; on a positive lookup they introduce and link nothing.
+    let review_intro_rx = (spawn_review_intro(&teams_cfg)
+        || (teams_cfg.enabled && teams_cfg.manager.lead.enabled))
+        .then(|| o.open_review_intro_channel());
     // --- ticketless review completion notification (STUDIO-723, slice 9; design record §14.2
     // "author re-summon needs the brand token") ---
     //
@@ -1311,7 +1314,12 @@ where
         Arc::new(
             rhapsody_orchestrator::reviewadjudicate::AdjudicationLedger::with_store(Arc::clone(
                 &store,
-            )),
+            ))
+            .with_lead_enabled(
+                o.teams
+                    .as_ref()
+                    .is_some_and(|t| t.enabled && t.manager.lead.enabled),
+            ),
         )
     });
     o.adjudication_ledger = adjudication_ledger.clone();

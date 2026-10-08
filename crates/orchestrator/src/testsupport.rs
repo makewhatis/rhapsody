@@ -361,6 +361,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
     RunningEntry {
         engine_index: 0,
         engine: None,
+        resume_session: String::new(),
         issue,
         started_at: epoch,
         retry_attempt: 0,

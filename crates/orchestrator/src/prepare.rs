@@ -936,7 +936,7 @@ impl Orchestrator {
     /// unconditionally so a hot reload or a project-only provider is honoured, but a daemon that
     /// defines none must keep the legacy inline dispatch path byte-identical, so this is the
     /// effective-config gate `begin_preparation` consults rather than the boot-time provider map.
-    fn config_defines_any_provider(&self) -> bool {
+    pub(crate) fn config_defines_any_provider(&self) -> bool {
         // No loaded config is "no opinion", not "no provider": every real dispatch path already
         // requires `eff` (it early-returns without one), so only test/embedding builds reach this
         // with `None`, and they must keep the generic preparation machinery reachable.
@@ -1852,11 +1852,11 @@ impl Orchestrator {
                     Err(()) => return,
                 };
                 let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
-                self.finish_review_dispatch_prepared(*run, route, issue, spec);
+                let dispatched = self.finish_review_dispatch_prepared(*run, route, issue, spec);
                 // The watcher bookkeeping the synchronous arm applies in `reviewwatch`: a prepared
                 // review must charge the same churn budget and retire the same reassigned incumbent
                 // once its dispatch is accepted (STUDIO-988 review round 7, sol #1).
-                if let Some(commit) = commit {
+                if dispatched && let Some(commit) = commit {
                     self.commit_review_watch(&pr, &commit);
                 }
             }

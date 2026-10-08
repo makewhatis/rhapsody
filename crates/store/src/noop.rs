@@ -12,6 +12,12 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn enqueue_lead_item(&self, _trigger: &LeadTrigger, _at: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
+        Ok(Vec::new())
+    }
     fn start_run(&self, _r: RunStart) -> Result<i64, StoreError> {
         Ok(0)
     }
@@ -173,6 +179,13 @@ impl Store for Noop {
     }
     fn count_runs_for(&self, _identifier: &str) -> Result<i64, StoreError> {
         Ok(0)
+    }
+
+    fn account_credit_spend(&self, _account: &str, _since: &str) -> Result<f64, StoreError> {
+        Ok(0.0)
+    }
+    fn account_credit_notified(&self, _account: &str, _since: &str) -> Result<bool, StoreError> {
+        Ok(false)
     }
     fn ticket_spend_by_provider(
         &self,

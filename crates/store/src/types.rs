@@ -7,6 +7,77 @@
 //! tags on the read-side/wire types are preserved as the snake_case field names here (the HTTP API
 //! wire mapping lands with rhapsody-httpapi in a later phase).
 
+// --- tech-lead queue (STUDIO-1134; no Go counterpart) -----------------------------------------
+/// Tech-lead work (STUDIO-1134); no Go counterpart. Shared here to avoid a store/orchestrator cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeadTrigger {
+    BlockedHandoff {
+        ticket: String,
+        question: String,
+    },
+    ReviewEscalation {
+        pr: String,
+        head: String,
+    },
+    ImpossibleState {
+        subject: String,
+        kind: String,
+    },
+    LimitJudgment {
+        account: String,
+    },
+    BreakerHold {
+        ticket: String,
+        pr: String,
+        kinds: Vec<String>,
+    },
+}
+
+impl LeadTrigger {
+    pub fn subject(&self) -> &str {
+        match self {
+            Self::BlockedHandoff { ticket, .. } => ticket,
+            Self::ReviewEscalation { pr, .. } => pr,
+            Self::ImpossibleState { subject, .. } => subject,
+            Self::LimitJudgment { account } => account,
+            Self::BreakerHold { ticket, .. } => ticket,
+        }
+    }
+
+    /// SQL discriminator, dedupe question, and variant payload. Detection never charges attempts.
+    pub(crate) fn queue_parts(&self) -> (&'static str, String, &str) {
+        match self {
+            Self::BlockedHandoff { question, .. } => (
+                "blocked_handoff",
+                question.split_whitespace().collect::<Vec<_>>().join(" "),
+                question,
+            ),
+            Self::ReviewEscalation { head, .. } => (
+                "review_escalation",
+                format!("review_escalation:{head}"),
+                head,
+            ),
+            Self::ImpossibleState { kind, .. } => ("impossible_state", kind.clone(), kind),
+            Self::LimitJudgment { account } => ("limit_judgment", "limit_judgment".into(), account),
+            Self::BreakerHold { pr, kinds, .. } => (
+                "breaker_hold",
+                format!("breaker_hold:{pr}:{}", kinds.join("\n")),
+                pr,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeadItem {
+    pub id: i64,
+    pub trigger: LeadTrigger,
+    pub subject: String,
+    pub created_at: String,
+    pub state: String,
+    pub attempts_on_question: i64,
+}
+
 // --- outcome taxonomy v2 (INF-272) -----------------------------------------------------------
 // Values for runs.outcome. Segment dispositions; the UI derives the four job-level statuses from
 // these. The v4->v5 migration rewrites the old strings to exactly this six-value set.
@@ -17,6 +88,8 @@ pub const OUTCOME_RUNNING: &str = "running";
 pub const OUTCOME_CONTINUED: &str = "continued";
 /// agent-declared hand-off verified by state, or Done-type terminal
 pub const OUTCOME_COMPLETED: &str = "completed";
+/// An account limit ended this segment, independently of failure/review/loop budgets (L4).
+pub const OUTCOME_LIMIT: &str = "limit";
 /// Stop button, cancel-type terminal, or external wind-down
 pub const OUTCOME_STOPPED: &str = "stopped";
 /// error exit (incl. turn timeout) or stall (reason="stalled")

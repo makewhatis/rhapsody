@@ -151,6 +151,8 @@ pub struct WorkerDeclaration {
     /// `None` on every non-manager run. Carried rather than re-read: the worker still holds the
     /// final text when it builds this, exactly as `review_verdict` is.
     pub manager_text: Option<String>,
+    /// A ticket run's decision request, detected off-loop only when the tech lead is enabled.
+    pub blocked_question: Option<String>,
 }
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
@@ -332,6 +334,10 @@ pub struct WorkerDeps {
     pub prepared_harness: Option<Arc<dyn Harness>>,
     /// A limit-policy switch starts fresh and seeds turn 1 with the carried note path.
     pub engine: Option<crate::dispatch::DispatchEngine>,
+    pub resume_session: String,
+    /// Tech-lead detection is opt-in; progress notes are read only on this worker task.
+    pub lead_enabled: bool,
+    pub lead_progress_dir: Option<std::path::PathBuf>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -588,6 +594,7 @@ async fn run_manager_attempt(
             // The manager's final text is parsed at the exit path, where the finding ledger is in
             // hand: the decision's dismissals name finding revisions only the daemon knows.
             manager_text: Some(result_text),
+            blocked_question: None,
         },
         loop_err,
     )
@@ -1014,7 +1021,7 @@ pub async fn run_agent_attempt(
             }
         }
         None => {
-            let started = if deps.engine.is_some() {
+            let started = if deps.engine.is_some() && deps.resume_session.is_empty() {
                 deps.agent
                     .start_fresh_session(&ws.path, issue.clone(), transcript)
                     .await
@@ -1054,6 +1061,15 @@ pub async fn run_agent_attempt(
             }
         }
     };
+    if !deps.resume_session.is_empty()
+        && let Err(error) = sess.resume_from(&deps.resume_session)
+    {
+        return (
+            issue.state.clone(),
+            WorkerDeclaration::default(),
+            Some(error.into()),
+        );
+    }
     // Hand the non-secret ledger receiver to the loop-external supervisor, so an armed receipt
     // survives cancellation (design §10.3).
     if let (Some(slots), Some(receiver)) = (deps.broker.as_ref(), broker_turns)
@@ -1093,12 +1109,29 @@ pub async fn run_agent_attempt(
         .review
         .as_ref()
         .and_then(|_| reviewfindings::parse_verdict_block(&result_text));
+    let blocked_question = if deps.lead_enabled
+        && deps.review.is_none()
+        && final_state != crate::limitpolicy::HANDOFF_LIMIT_MARKER
+    {
+        let progress = if crate::leaditems::detect_blocked_handoff(&result_text, None).is_none()
+            && !crate::leaditems::final_declares_complete(&result_text)
+        {
+            crate::leaditems::read_progress(deps.lead_progress_dir.as_deref(), &issue.identifier)
+                .await
+        } else {
+            None
+        };
+        crate::leaditems::detect_blocked_handoff(&result_text, progress.as_deref())
+    } else {
+        None
+    };
     (
         final_state,
         WorkerDeclaration {
             declared_handoff: has_handoff_marker(&result_text),
             review_verdict,
             manager_text: None,
+            blocked_question,
         },
         loop_err,
     )
@@ -1262,6 +1295,17 @@ impl WorkerDeps {
             // Remember the freshest final result text; the HANDOFF: marker (if any) is on the last
             // completed turn, which is what the caller classifies against (INF-272).
             last_result = tr.result_text;
+            if last_result
+                .lines()
+                .any(|line| line.trim() == crate::limitpolicy::HANDOFF_LIMIT_MARKER)
+            {
+                sess.retain_for_limit();
+                return (
+                    crate::limitpolicy::HANDOFF_LIMIT_MARKER.into(),
+                    last_result,
+                    None,
+                );
+            }
             // Review-mode wind-down (STUDIO-716; design record
             // `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md` §14.2, "wind-down: team_id is a
             // red herring"). A review run's `pr:` key resolves to no tracker issue, so BOTH of the
@@ -1435,6 +1479,8 @@ mod tests {
         max_turns: i64,
     ) -> WorkerDeps {
         WorkerDeps {
+            lead_enabled: false,
+            lead_progress_dir: None,
             workspace: ws,
             agent: ag,
             tracker: tr,
@@ -1473,6 +1519,7 @@ mod tests {
             broker: None,
             prepared_harness: None,
             engine: None,
+            resume_session: String::new(),
         }
     }
 
@@ -1490,6 +1537,30 @@ mod tests {
         let mut ag = agentfake::Fake::new();
         ag.turns = turns;
         Arc::new(ag)
+    }
+
+    #[tokio::test]
+    async fn limit_marker_stops_the_fake_harness_without_a_review_move() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.into(),
+                result_text: "Saved WIP.\nHANDOFF: limit".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = Arc::new(trackerfake::Fake::new());
+        let mut deps = make_deps(ws, ag, tr.clone(), "Work", 20);
+        deps.review_handoff_state = Some("In Review".into());
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.team_id = "team".into();
+        let (state, declaration, error) =
+            run_agent_attempt(&mut deps, iss, None, None, &|_| {}, None).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(state, crate::limitpolicy::HANDOFF_LIMIT_MARKER);
+        assert!(declaration.declared_handoff);
+        assert!(tr.move_calls().is_empty());
     }
 
     #[tokio::test]
@@ -2923,6 +2994,67 @@ mod tests {
             turns.load(Ordering::SeqCst),
             1,
             "a drained review ends at its boundary, not at max_turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_worker_carries_a_blocked_in_review_ending() {
+        for enabled in [false, true] {
+            let ag = fake_agent(vec![agentfake::TurnScript {
+                result: TurnResult {
+                    status: TURN_SUCCEEDED.to_string(),
+                    result_text: "Blocked pending two human decisions.\nAuthorize a credential source and clarify the Event representation.\nHANDOFF: in-review".into(),
+                    ..Default::default()
+                }, ..Default::default()
+            }]);
+            let mut tr = trackerfake::Fake::new();
+            tr.states_by_ids_func = Some(Box::new(|_| Ok(vec![issue("1", "MT-1", "In Review")])));
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 1);
+            d.lead_enabled = enabled;
+            let (_, declared, err) =
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+            assert!(err.is_none());
+            assert_eq!(declared.blocked_question.is_some(), enabled);
+            if enabled {
+                assert!(
+                    declared
+                        .blocked_question
+                        .expect("question")
+                        .contains("Event representation")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_worker_reads_current_progress_beside_a_plain_handoff() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "HANDOFF: in-review".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let dir = std::path::PathBuf::from(&root.path);
+        std::fs::write(
+            dir.join("MT-1-progress.md"),
+            "## Current blocker\nBLOCKED: Human must decide the Event representation.",
+        )
+        .expect("progress");
+        let mut d = make_deps(ws, ag, Arc::new(trackerfake::Fake::new()), "do it", 1);
+        d.lead_enabled = true;
+        d.lead_progress_dir = Some(dir);
+        let (_, declaration, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none());
+        assert!(
+            declaration
+                .blocked_question
+                .expect("question")
+                .contains("Event representation")
         );
     }
 

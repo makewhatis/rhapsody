@@ -215,6 +215,9 @@ impl Orchestrator {
 
         let mut wedged: Vec<String> = Vec::new();
         for (id, re) in self.running.iter_mut() {
+            if self.limit_policy.deadlines.contains_key(id) {
+                continue;
+            }
             let Some(stall) = timeouts.get(id).copied() else {
                 continue;
             };
@@ -344,6 +347,10 @@ impl Orchestrator {
     /// `outcome` metric label, which is dropped telemetry).
     pub(crate) fn terminate(&mut self, id: &str) -> Option<RunningEntry> {
         let re = self.running.remove(id)?;
+        self.limit_policy.deadlines.remove(id);
+        if let Some(timer) = self.retry_timers.remove(&format!("limit:{id}")) {
+            timer.abort();
+        }
         self.release_teams_run(&re);
         re.cancel.cancel();
         // A review run's detached worktree is reclaimed at its EXIT, and a termination is the one

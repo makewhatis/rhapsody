@@ -233,6 +233,14 @@ pub enum Event {
     Refresh,
     /// A worker task's terminal report (Go `evWorkerExit`).
     WorkerExit(EvWorkerExit),
+    /// Ticket worker's blocked ending; sent before its exit and checked against its dispatch time.
+    LeadBlockedHandoff {
+        issue_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        question: String,
+    },
+    /// The adoption task positively found no open PR for a ticket parked in review.
+    ReviewMissingPr(crate::reviewintro::ReviewIntroRequest),
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
     AgentUpdate(AgentUpdate),
     /// Nonsecret auth classification, frozen against the dispatch-time engine and run generation.
@@ -569,6 +577,8 @@ fn worker_deps_for(
         Some(Arc::clone(&eff.transcripts))
     };
     let mut deps = WorkerDeps {
+        lead_enabled: false,
+        lead_progress_dir: None,
         workspace: Arc::clone(&eff.workspace),
         agent: Arc::clone(&eff.agent),
         tracker: Arc::clone(&eff.tracker),
@@ -624,6 +634,7 @@ fn worker_deps_for(
         // Test seam only; production always builds the dispatch runner from the prepared knobs.
         prepared_harness: None,
         engine: None,
+        resume_session: String::new(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -738,6 +749,12 @@ impl Orchestrator {
                 self.on_tick().await;
             }
             Event::WorkerExit(e) => self.on_worker_exit(e),
+            Event::LeadBlockedHandoff {
+                issue_id,
+                started_at,
+                question,
+            } => self.handle_lead_blocked(&issue_id, started_at, question),
+            Event::ReviewMissingPr(req) => self.handle_lead_missing_pr(&req),
             Event::BrokerUsage {
                 issue_id,
                 run_id,
@@ -990,6 +1007,8 @@ impl Orchestrator {
         // drain or a dead credential is exactly one whose kept opencode sessions would otherwise
         // never be bounded, because the per-issue retention check only fires on a redispatch.
         self.sweep_retained_opencode_sessions();
+        self.enforce_limits();
+        self.resume_due_limits().await;
         self.reconcile().await;
         // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
         // state against its activity and REPORT any that disagree. Local reads only (the watch set
@@ -1850,6 +1869,11 @@ impl Orchestrator {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
+        deps.lead_enabled = self.lead_enabled();
+        if deps.lead_enabled {
+            deps.lead_progress_dir = std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".rhapsody/docs"));
+        }
         // Resolve once, before the task exists. A later reload never reattributes this run.
         let (mut account_harness, mut account_model) =
             self.resolved_harness_model(&harness, &model_override, &project_slug);
@@ -1899,6 +1923,11 @@ impl Orchestrator {
         // place, so a dispatch that routed to nobody is byte-identical to today.
         deps.model_override = model_override;
         deps.engine = engine;
+        deps.resume_session = self
+            .running
+            .get(&iss.id)
+            .map(|r| r.resume_session.clone())
+            .unwrap_or_default();
         // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
@@ -2064,6 +2093,13 @@ impl Orchestrator {
                     "agent login rejected, but the ticket could not be labelled for a human; it is \
                      still held in memory — apply the label by hand"
                 );
+            }
+            if let Some(question) = declared.blocked_question {
+                let _ = events_exit.send(Event::LeadBlockedHandoff {
+                    issue_id: issue_id.clone(),
+                    started_at,
+                    question,
+                });
             }
             let exit = EvWorkerExit {
                 issue_id,

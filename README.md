@@ -61,6 +61,75 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Default-on account limit policy (STUDIO-1126)
+
+`limits:` adds an intentional scheduling divergence from Go: an absent block still uses
+80/90/95 percent warn/stop-new/handoff thresholds, a 30-minute maximum wait, a ten-minute
+handoff grace period, and `credits: never`. Per-account threshold overrides inherit the
+other thresholds. Non-default settings survive a config save; the existing Go config
+goldens keep their shape. Setting all thresholds to 100 and credits to `always` disables
+this policy; separately configured provider budgets remain independent.
+
+Known limited accounts refuse new work before spending selection slots. Implementers use
+a healthy profile fallback when available, and reviewer selection excludes limited accounts.
+The final dispatch gate also rechecks prepared dispatches before their run starts. Limit
+handoffs use the existing operator mailbox and the exact `HANDOFF: limit` marker, which
+does not move a ticket to review. The daemon stops at the wall or grace deadline, preserves
+the work, and writes an owner-only, atomically replaced handoff note beside the ticket's
+progress file, using bounded progress/transcript reads.
+
+Short waits resume the same engine and conversation at the reset plus 120 seconds; a tight
+`seven_day` window never parks. Longer waits switch to a healthy fallback or produce a
+`limit_items` human-feed item pending manager limit actions. Parked work rechecks current
+ticket eligibility, assignment and project scope (including already-assigned pool work),
+or the review's pinned head/generation. Manager runs have no ticket workspace and remove
+their isolated configuration on exit, so they produce a human-feed item rather than a
+parked conversation; their ordered engine fallback is owned by manager integration.
+Resume metadata uses the existing retry queue and
+restores known holds at boot without changing the Go schema. `limit` is a distinct run
+outcome and charges no failure/review verdict budget or completed-review breaker round.
+If the handoff note cannot be written, a note-absent human decision item and suspension
+still persist; a restart does not silently release the ticket.
+
+Under `never`, observed overage stops immediately and the account remains rejected until
+reset. `manager_urgent` is likewise fail-closed until manager authorization lands.
+`daily_cap` meters positive reported-cost deltas while credits are in use; estimates and
+once-per-account/local-day credit-spend events persist in the existing event ledger. An
+unreadable ledger or an omitted terminal cost refuses further credits.
+An omitted overage cost is recorded as unknown and refuses credits for the rest of the
+local day across restarts. Credit permission never bypasses a rejected account window.
+Subscription API-equivalent dollars do not become provider budget windows. Pay-per-token
+budgets feed daily windows, and changing/removing an operator cap replaces only its budget observation,
+never an external stream/probe observation.
+
+Actual Claude session resumption after a five-hour gap remains unverified; fake-harness
+tests pin the first-turn `--resume` argument and avoid real quota.
+
+### Tech-lead trigger queue (STUDIO-1134)
+
+`manager.lead.enabled` in the boot-loaded Teams configuration opts into a durable
+`rhapsody_lead_items` queue (schema migrations **29–30**). Blocked ticket endings asking for a
+decision, review escalations, and impossible states (zero verdicts at the escalated head,
+In Review with an authoritative empty PR lookup, exhausted draft pokes, and exhausted review
+or manager attempts) queue lead work instead of reaching the existing human feed or escalation
+audit. Breaker crossings queue `BreakerHold { ticket, pr, kinds }` instead of the human hold and
+notification plan; no notification task is needed for lead detection. The queue deduplicates on
+`(subject, question)` across restarts; detecting the same condition again does not charge a
+decision attempt. The usage-limit judgment seam queues an
+account item only; its policy producer belongs to the limits program.
+
+This slice detects and queues; the isolated lead runs and decision executors are subsequent
+slices. It grants no new manager tools or action authority. A failed/disabled store keeps the
+existing human report. With the lead disabled (the default), existing feed, audit and config
+serialization bytes are unchanged. Go has no lead queue, and the `rhapsody_` schema-name rule
+keeps the ported tables and golden fixtures byte-strict.
+
+An operator review clear also resets the breaker's round count for that PR, whether the lead is
+enabled or disabled. Migration **30** adds `rhapsody_breaker_cleared_runs`: the clear transaction
+snapshots already-completed run IDs and resets the round crossing watermark. Only completions
+after clear count, including reviews already in flight when clear happened. The snapshot survives
+restarts and is pruned with its runs; lifetime token spend and provider cap crossings are retained.
+
 ### Account limit observations and API (STUDIO-1123)
 
 Rhapsody observes account limits by default and adds a read-only
@@ -1225,9 +1294,10 @@ providers whose per-ticket cap has fired.
 The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
 (`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
 (`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs from the `runs` ledger**
-(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter — an operator
-`clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
-author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
+(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter. An operator
+`clear` resets both round counts (STUDIO-1134); only post-clear completed reviews count for the
+breaker. Spend sums the ticket's author runs plus its pull request's review runs, split by
+`rhapsody_run_provenance.provider`. The
 `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the eighth name.
 

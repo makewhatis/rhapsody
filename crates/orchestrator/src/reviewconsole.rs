@@ -507,6 +507,8 @@ impl Orchestrator {
     /// reset, and the durable bound row is KEPT (with its generation bumped, STUDIO-1009) rather than
     /// deleted, so a cleared pull request starts its next round from zero exactly as a re-introduced
     /// one does while the generation records that the clear happened.
+    /// It also resets the breaker's completed-review baseline and round crossing watermark
+    /// (STUDIO-1134); lifetime token spend and provider cap crossings are retained.
     ///
     /// Deliberately NOT allowlist-gated, for [`Self::handle_review_dismiss`]'s reason: it performs
     /// no checkout and no dispatch (dispatch re-checks the allowlist itself), and gating it would
@@ -562,6 +564,7 @@ impl Orchestrator {
                 pr = %pr, err = %e,
                 "ticketless review: clearing the pull request's review bound failed"
             );
+            return ReviewControlOutcome::Failed(e.to_string());
         }
         tracing::info!(
             pr = %pr,
