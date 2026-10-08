@@ -322,12 +322,14 @@ impl Orchestrator {
         {
             return ManagerDispatchOutcome::AlreadyInFlight;
         }
-        if is_limit
-            && self.teams.as_ref().is_some_and(|t| {
-                self.running.keys().filter(|id| is_manager_key(id)).count() as i64
-                    >= t.manager.max_concurrent.max(1)
-            })
-        {
+        let reservations = match self.store().load_manager_interventions() {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "manager: capacity unreadable; not launching");
+                return ManagerDispatchOutcome::Refused("manager capacity unreadable".into());
+            }
+        };
+        if self.manager_available_slots(&reservations, Some(&id)) == 0 {
             return ManagerDispatchOutcome::Refused("manager capacity".into());
         }
         // §4.7/§10.2: the self-test must have passed on the CURRENT CLI version before the manager
@@ -410,6 +412,32 @@ impl Orchestrator {
         );
         self.finish_manager_dispatch(run, route, iss);
         ManagerDispatchOutcome::Dispatched
+    }
+
+    /// One pool for every manager run kind, including a reserved PR run not yet live. A live
+    /// reservation consumes one slot, not two; the dispatch door excludes its own reservation.
+    pub(crate) fn manager_available_slots(
+        &self,
+        reservations: &[rhapsody_store::ManagerInterventionRow],
+        dispatching: Option<&str>,
+    ) -> usize {
+        let mut occupied: std::collections::HashSet<String> = self
+            .running
+            .keys()
+            .chain(self.limit_policy.limited_managers.keys())
+            .filter(|id| is_manager_key(id))
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
+        for row in reservations.iter().filter(|row| {
+            row.state == rhapsody_store::MANAGER_INTERVENTION_LAUNCHING
+                || row.state == rhapsody_store::MANAGER_INTERVENTION_RUNNING
+        }) {
+            let key = format!("pr:{}{MANAGER_KEY_SUFFIX}", row.pr.to_ascii_lowercase());
+            if dispatching.is_none_or(|id| !key.eq_ignore_ascii_case(id)) {
+                occupied.insert(key);
+            }
+        }
+        (self.manager_max_concurrent().max(0) as usize).saturating_sub(occupied.len())
     }
 
     /// The same selected-entry override the shared funnel applies, including legacy inheritance.
@@ -877,6 +905,73 @@ mod tests {
             })
             .expect("read watch");
         assert!(watch.is_none(), "a manager dispatch writes no watch row");
+    }
+
+    #[test]
+    fn pr_manager_respects_capacity_consumed_by_limit_manager() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        pass_self_test(&o, &test_cli_version());
+        o.teams.as_mut().unwrap().manager.max_concurrent = 1;
+        let limit = ManagerRun {
+            limit_account: "claude-subscription".into(),
+            repo_url: REPO_URL.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.dispatch_manager(limit.clone()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Refused("manager capacity".into())
+        );
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+        o.running.remove(&limit.key());
+        o.claimed.remove(&limit.key());
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            o.dispatch_manager(limit),
+            ManagerDispatchOutcome::Refused("manager capacity".into())
+        );
+    }
+
+    #[test]
+    fn manager_capacity_deduplicates_live_reservations_and_counts_stopping_workers() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o, &test_cli_version());
+        o.teams.as_mut().unwrap().manager.max_concurrent = 2;
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        let reservation = rhapsody_store::ManagerInterventionRow {
+            pr: "makewhatis/rhapsody#12".into(),
+            state: rhapsody_store::MANAGER_INTERVENTION_RUNNING.into(),
+            ..Default::default()
+        };
+        assert_eq!(o.manager_available_slots(&[reservation.clone()], None), 1);
+        let mut reserved = reservation.clone();
+        reserved.pr = "makewhatis/rhapsody#13".into();
+        reserved.state = rhapsody_store::MANAGER_INTERVENTION_LAUNCHING.into();
+        assert_eq!(
+            o.manager_available_slots(&[reservation.clone(), reserved.clone()], None),
+            0
+        );
+        assert_eq!(
+            o.manager_available_slots(
+                &[reservation, reserved],
+                Some(&manager_key("makewhatis", "rhapsody", 13))
+            ),
+            1
+        );
+        o.limit_policy.limited_managers.insert(
+            crate::managerlimits::limit_manager_key("claude-subscription"),
+            chrono::Utc::now(),
+        );
+        assert_eq!(o.manager_available_slots(&[], None), 0);
     }
 
     #[test]
