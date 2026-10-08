@@ -48,10 +48,14 @@ struct Scratch {
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("rhapsody-doctor-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rhapsody-doctor-{}-{tag}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("scratch dir");
         Self { dir }
     }
 
@@ -68,6 +72,19 @@ impl Drop for Scratch {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+#[test]
+fn scratch_calls_with_the_same_tag_are_independent() {
+    let first = Scratch::new("isolation");
+    let marker = first.write("marker", "first");
+    let second = Scratch::new("isolation");
+    assert_ne!(first.dir, second.dir);
+    drop(second);
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("read marker"),
+        "first"
+    );
 }
 
 fn run(path: &Path) -> (i32, String, String) {

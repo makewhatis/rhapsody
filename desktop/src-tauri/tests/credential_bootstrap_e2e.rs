@@ -121,13 +121,17 @@ struct TempDir {
 
 impl TempDir {
     fn new(prefix: &str) -> TempDir {
+        Self::new_in(&std::env::temp_dir(), prefix)
+    }
+
+    fn new_in(base: &std::path::Path, prefix: &str) -> TempDir {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = base.join(format!(
             "{prefix}-{}-{}-{nonce}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
@@ -204,7 +208,7 @@ async fn legitimate_launch_authenticates_and_reads_a_real_credential() {
         revision: std::sync::Mutex::new(connected_revision),
     };
 
-    let socket_dir = std::env::temp_dir().join(format!("rd-cbe2e-sock-{}", std::process::id()));
+    let socket_dir = TempDir::new_in(Path::new("/tmp"), "rd-cbe2e-sock");
     let listener = BootstrapListener::bind(&socket_dir).expect("bind real unix socket");
     let bootstrap_msg = listener.bootstrap_message();
     let (serve_fut, shutdown) = listener.accept_and_serve(owner);
@@ -306,7 +310,7 @@ async fn wrong_token_launch_reports_owner_unauthorized() {
         revision: std::sync::Mutex::new(connected_revision),
     };
 
-    let socket_dir = std::env::temp_dir().join(format!("rd-cbe2e-sock-wt-{}", std::process::id()));
+    let socket_dir = TempDir::new_in(Path::new("/tmp"), "rd-cbe2e-sock-wt");
     let listener = BootstrapListener::bind(&socket_dir).expect("bind real unix socket");
     let mut bootstrap_msg = listener.bootstrap_message();
     // The token nobody issued: the real owner never generated this value, so the daemon's Hello
