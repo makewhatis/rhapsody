@@ -219,6 +219,16 @@ pub trait Session: Send + Sync {
     /// Returns the stable backend thread/session id (empty before turn 1).
     fn thread_id(&self) -> String;
 
+    /// Restore a parked conversation. Refuse instead of silently starting fresh when unsupported.
+    fn resume_from(&self, _thread_id: &str) -> Result<(), AgentError> {
+        Err(AgentError::Other(
+            "session resume is not supported by this harness".into(),
+        ))
+    }
+
+    /// Preserve a conversation after a voluntary limit handoff (including a successful last turn).
+    fn retain_for_limit(&self) {}
+
     /// Records the store run-row id for this session, so the backend can expose it to the agent
     /// child as `SYMPHONY_RUN_ID`/`RHAPSODY_RUN_ID` (the "me" identity env, INF-473). Mirrors Go's
     /// `SetRunID`, which the worker calls once right after `StartSession` and before the first
