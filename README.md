@@ -61,6 +61,30 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Tech-lead decisions and guarded execution (STUDIO-1136)
+
+With the opt-in lead enabled, queued items launch on the manager's isolated, boot-self-tested
+runtime with the same ordered harness fallback and USD admission gates. Lead runs use a distinct
+`lead:owner/repo#number:item@manager` key and a strict `rhapsody-lead-decision` block; they gain no
+built-in tools. The daemon's off-loop executor can prepend answers and standing credential rules,
+move to Todo, clear review state, relabel, commission diagnosis-only work, or escalate. It has no
+merge, push, commit, shell, credential-copy or credit-spending action. Full tracker reads are
+project-scoped; state, labels, open status and PR head are rechecked before acting. Reassignment is
+explicit lead authority; the older triage path's additive-only label rule is unchanged.
+
+Migration **31** adds `rhapsody_lead_decisions` (with its timestamp index) and
+`rhapsody_lead_execution`. The decision rows are also the durable digest input; they carry actions,
+reasoning, evidence, harness/model and overrule fields for the subsequent reporting slice. Effects
+leave tokenless ticket and room lines and a context retain (`by: lead`) to `operator-decisions`.
+Missing mirrors are reported and recorded without replaying effects. There is at most **one**
+route-back per durable subject/question, reserved before external writes. A repeated block reopens
+the item for commission/escalation; a completed escalation is not recreated by duplicate detection.
+Uncertain effects after a restart are escalated for reconciliation rather than replayed. A
+commissioned item parks, retaining its ticket linkage, and resumes with bounded, fresh regular-file
+findings from `~/.rhapsody/docs/<ticket>-findings.md`. Preference recall, sandbox investigation,
+digest delivery, immediate pages and overrule UI belong to subsequent slices. With the lead disabled,
+existing payloads, schema goldens and dispatch behavior remain unchanged.
+
 ### Tech-lead trigger queue (STUDIO-1134)
 
 `manager.lead.enabled` in the boot-loaded Teams configuration opts into a durable
@@ -74,8 +98,8 @@ notification plan; no notification task is needed for lead detection. The queue 
 decision attempt. The usage-limit judgment seam queues an
 account item only; its policy producer belongs to the limits program.
 
-This slice detects and queues; the isolated lead runs and decision executors are subsequent
-slices. It grants no new manager tools or action authority. A failed/disabled store keeps the
+This slice detects and queues; STUDIO-1136 supplies the isolated lead runs and decision executors
+described above. It grants no new manager tools. A failed/disabled store keeps the
 existing human report. With the lead disabled (the default), existing feed, audit and config
 serialization bytes are unchanged. Go has no lead queue, and the `rhapsody_` schema-name rule
 keeps the ported tables and golden fixtures byte-strict.

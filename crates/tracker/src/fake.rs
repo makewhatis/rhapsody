@@ -360,6 +360,23 @@ impl Fake {
 
 #[async_trait]
 impl Tracker for Fake {
+    async fn fetch_issue_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Issue>, TrackerError> {
+        Ok(self
+            .candidates
+            .iter()
+            .find(|i| i.identifier.eq_ignore_ascii_case(identifier))
+            .cloned())
+    }
+    async fn update_issue_description(
+        &self,
+        _id: &str,
+        _description: &str,
+    ) -> Result<(), TrackerError> {
+        Ok(())
+    }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         self.lock().candidate_calls += 1;
         if let Some(e) = &self.candidates_err {

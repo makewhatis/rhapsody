@@ -439,7 +439,9 @@ where
         // When the manager may act, keep the §4.7 verdict fresh across a CLI version change: the
         // watcher re-probes the installed version and re-runs the canary whenever it changed. The
         // launch gate re-probes too, so nothing acts on a stale verdict in the meantime.
-        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+            || teams_cfg.manager.lead.enabled
+        {
             manager_selftest_watch = Some((
                 o.manager_selftest_handle(),
                 manager_canary_factory(
@@ -657,6 +659,22 @@ where
 
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
+    if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
+        o.lead_runtime = Some(Arc::new(rhapsody_orchestrator::leadexec::LeadRuntime {
+            control: handle.clone(),
+            store: store.clone(),
+            projects: Vec::new(),
+            teams: teams_cfg.clone(),
+            prs: Arc::new(rhapsody_orchestrator::ghsummons::GH::new("", None)),
+            room: o
+                .teams_room
+                .as_ref()
+                .map(|r| r.clone() as Arc<dyn rhapsody_config::room::RoomLog>),
+            memory: o.teams_memory.as_ref().map(|m| m.backend()),
+            findings_dir: std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".rhapsody/docs")),
+        }));
+    }
 
     // The observability server + prune scheduler run until `run` decides to exit. Their shutdown is a
     // SEPARATE signal `run` cancels AFTER the control loop returns — mirroring Go's `pruneCancel` +
@@ -2228,7 +2246,7 @@ async fn apply_manager_self_test(
     workflow_path: &str,
 ) {
     use rhapsody_config::teams::ReviewAuthority;
-    if teams.manager.review_authority == ReviewAuthority::Off {
+    if teams.manager.review_authority == ReviewAuthority::Off && !teams.manager.lead.enabled {
         return;
     }
     selftest.configure(teams.manager.effective_harnesses());

@@ -15,6 +15,65 @@ use crate::TrackerError;
 use rhapsody_core::Issue;
 use serde::Deserialize;
 
+/// Single-issue read used only by the lead. Project membership is checked on every read,
+/// including a terminal issue: an identifier from another installation cannot mint authority.
+pub(super) async fn fetch_issue_by_identifier(
+    c: &Client,
+    identifier: &str,
+) -> Result<Option<Issue>, TrackerError> {
+    #[derive(Deserialize)]
+    struct Page {
+        issue: Option<Node>,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        #[serde(flatten)]
+        raw: super::RawIssue,
+        project: Option<Project>,
+    }
+    #[derive(Deserialize)]
+    struct Project {
+        #[serde(rename = "slugId", deserialize_with = "super::decode::null_to_empty")]
+        slug: String,
+    }
+    if identifier.trim().is_empty() {
+        return Ok(None);
+    }
+    let page: Page = c.do_graphql("query LeadIssue($id: String!) { issue(id: $id) { id identifier title description url updatedAt state { name } team { id } project { slugId } labels { nodes { name } } attachments(first: 100) { nodes { sourceType metadata } } } }", Some(serde_json::json!({"id":identifier}))).await?;
+    Ok(page
+        .issue
+        .filter(|n| {
+            n.project
+                .as_ref()
+                .is_some_and(|p| p.slug == c.config.project_slug)
+        })
+        .map(|n| c.normalize_issue(n.raw))
+        .filter(|i| i.identifier.eq_ignore_ascii_case(identifier)))
+}
+
+pub(super) async fn update_issue_description(
+    c: &Client,
+    id: &str,
+    description: &str,
+) -> Result<(), TrackerError> {
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(rename = "issueUpdate")]
+        update: Update,
+    }
+    #[derive(Deserialize)]
+    struct Update {
+        success: bool,
+    }
+    let page: Page = c.do_graphql("mutation LeadDescription($id: String!, $description: String!) { issueUpdate(id: $id, input: { description: $description }) { success } }", Some(serde_json::json!({"id":id,"description":description}))).await?;
+    if !page.update.success {
+        return Err(TrackerError::Other(
+            "lead description update rejected".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The `issues` connection shape for the by-ids / branch-by-id queries (no pagination).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -148,6 +207,56 @@ mod tests {
     use crate::linear::testutil::{MockResp, new_test_client};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn lead_issue_read_is_project_scoped_and_normalizes_nulls() {
+        for (project, accepted) in [("proj", true), ("other-installation", false)] {
+            let (client, _server) = new_test_client(move |req| {
+                assert!(req.query.contains("issue(id: $id)"));
+                assert_eq!(req.var("id").and_then(|v| v.as_str()), Some("TEST-100"));
+                MockResp::ok(format!(r#"{{"data":{{"issue":{{"id":"uuid-100","identifier":"TEST-100","title":null,"description":"original acceptance","state":{{"name":"In Review"}},"team":{{"id":"team"}},"labels":{{"nodes":[{{"name":"Rhapsody:@Jerry"}}]}},"project":{{"slugId":"{project}"}}}}}}}}"#))
+            }).await;
+            let issue = client
+                .fetch_issue_by_identifier("TEST-100")
+                .await
+                .expect("lookup");
+            assert_eq!(issue.is_some(), accepted);
+            if let Some(issue) = issue {
+                assert_eq!(issue.id, "uuid-100");
+                assert_eq!(issue.team_id, "team");
+                assert_eq!(issue.state, "In Review");
+                assert!(issue.title.is_empty());
+                assert_eq!(issue.labels, Some(vec!["rhapsody:@jerry".into()]));
+                assert_eq!(issue.description.as_deref(), Some("original acceptance"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_description_update_mutates_only_description_and_refuses_rejection() {
+        for success in [true, false] {
+            let (client, _server) = new_test_client(move |req| {
+                assert!(req.query.contains("input: { description: $description }"));
+                assert!(!req.query.contains("stateId") && !req.query.contains("labelIds"));
+                assert_eq!(req.var("id").and_then(|v| v.as_str()), Some("uuid-100"));
+                assert_eq!(
+                    req.var("description").and_then(|v| v.as_str()),
+                    Some("answer\n\noriginal acceptance")
+                );
+                MockResp::ok(format!(
+                    r#"{{"data":{{"issueUpdate":{{"success":{success}}}}}}}"#
+                ))
+            })
+            .await;
+            assert_eq!(
+                client
+                    .update_issue_description("uuid-100", "answer\n\noriginal acceptance")
+                    .await
+                    .is_ok(),
+                success
+            );
+        }
+    }
 
     // Mirrors Go TestFetchByIDsEmptyMakesNoCall.
     #[tokio::test]

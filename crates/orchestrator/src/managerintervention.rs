@@ -735,11 +735,14 @@ impl Orchestrator {
             .filter(|r| {
                 r.state == MANAGER_INTERVENTION_LAUNCHING || r.state == MANAGER_INTERVENTION_RUNNING
             })
-            .count();
-        self.manager_attempts.retain(|_, attempt| {
-            all.iter().any(|row| {
-                row.id == attempt.intervention_id && !manager_intervention_is_terminal(&row.state)
-            })
+            .count()
+            + self.lead_cases.len();
+        self.manager_attempts.retain(|key, attempt| {
+            self.lead_cases.contains_key(key)
+                || all.iter().any(|row| {
+                    row.id == attempt.intervention_id
+                        && !manager_intervention_is_terminal(&row.state)
+                })
         });
         let mut slots = (self.manager_max_concurrent().max(0) as usize).saturating_sub(running);
 
@@ -1045,6 +1048,7 @@ impl Orchestrator {
             .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, &candidate))
             .map(|p| p.repo.clone())?;
         Some(ManagerRun {
+            lead_item: None,
             owner: coord.owner,
             repo: coord.repo,
             number: coord.number,

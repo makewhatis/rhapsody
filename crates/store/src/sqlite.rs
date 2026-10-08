@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -653,6 +653,31 @@ CREATE TABLE rhapsody_breaker_cleared_runs (
   PRIMARY KEY (pr, run_id)
 );
 "#,
+    // v30 -> v31: lead decisions and parked investigation linkage (STUDIO-1136).
+    r#"
+CREATE TABLE rhapsody_lead_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item INTEGER NOT NULL REFERENCES rhapsody_lead_items(id),
+  at TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reasoning TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  actions TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  model TEXT NOT NULL,
+  overruled_at TEXT,
+  overrule_note TEXT
+);
+CREATE INDEX rhapsody_lead_decisions_at ON rhapsody_lead_decisions(at);
+CREATE TABLE rhapsody_lead_execution (
+  item INTEGER PRIMARY KEY REFERENCES rhapsody_lead_items(id),
+  snapshot TEXT NOT NULL,
+  commission_ticket TEXT NOT NULL,
+  commissioned_at TEXT NOT NULL,
+  findings TEXT NOT NULL,
+  run_attempts INTEGER NOT NULL DEFAULT 0
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1191,7 +1216,11 @@ impl Store for Sqlite {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at, kinds) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (subject, question) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (subject, question) DO UPDATE SET \
+             state = CASE WHEN excluded.trigger = 'blocked_handoff' AND rhapsody_lead_items.state = 'done' \
+             AND EXISTS(SELECT 1 FROM rhapsody_lead_decisions d WHERE d.item = rhapsody_lead_items.id \
+             AND d.id = (SELECT MAX(id) FROM rhapsody_lead_decisions WHERE item = rhapsody_lead_items.id) AND d.decision LIKE 'done:%') \
+             THEN 'queued' ELSE rhapsody_lead_items.state END",
             params![kind, subject, question, detail, at, kinds],
         )?;
         let id = tx.query_row(
@@ -1260,6 +1289,98 @@ impl Store for Sqlite {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+    fn set_lead_item_state(&self, item: i64, state: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE rhapsody_lead_items SET state = ?2 WHERE id = ?1",
+            params![item, state],
+        )?;
+        Ok(())
+    }
+
+    fn reserve_lead_route_back(&self, item: i64) -> Result<bool, StoreError> {
+        Ok(self.lock().execute("UPDATE rhapsody_lead_items SET attempts_on_question = 1 WHERE id = ?1 AND attempts_on_question = 0", params![item])? == 1)
+    }
+
+    fn reserve_lead_run(&self, item: i64, pr: &str, max: i64) -> Result<bool, StoreError> {
+        self.ensure_review_generation(pr)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let available: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_lead_execution WHERE item = ?1 AND run_attempts < 3)", params![item], |r| r.get(0))?;
+        if !available {
+            return Ok(false);
+        }
+        let changed = tx.execute("UPDATE rhapsody_review_bound SET manager_runs_used = manager_runs_used + 1 WHERE pr = ?1 AND manager_runs_used < ?2", params![pr, max])?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE rhapsody_lead_execution SET run_attempts = run_attempts + 1 WHERE item = ?1",
+            params![item],
+        )?;
+        tx.execute(
+            "UPDATE rhapsody_lead_items SET state = 'running' WHERE id = ?1",
+            params![item],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn save_lead_execution(&self, row: &LeadExecution) -> Result<(), StoreError> {
+        self.lock().execute("INSERT INTO rhapsody_lead_execution (item, snapshot, commission_ticket, commissioned_at, findings, run_attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(item) DO UPDATE SET snapshot = excluded.snapshot, commission_ticket = excluded.commission_ticket, commissioned_at = excluded.commissioned_at, findings = excluded.findings, run_attempts = excluded.run_attempts", params![row.item, row.snapshot, row.commission_ticket, row.commissioned_at, row.findings, row.run_attempts])?;
+        Ok(())
+    }
+
+    fn lead_execution(&self, item: i64) -> Result<Option<LeadExecution>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT item, snapshot, commission_ticket, commissioned_at, findings, run_attempts FROM rhapsody_lead_execution WHERE item = ?1")?;
+        let mut rows = stmt.query_map(params![item], |r| {
+            Ok(LeadExecution {
+                item: r.get(0)?,
+                snapshot: r.get(1)?,
+                commission_ticket: r.get(2)?,
+                commissioned_at: r.get(3)?,
+                findings: r.get(4)?,
+                run_attempts: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    fn save_lead_decision(&self, row: &LeadDecisionRow) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        if row.id > 0 {
+            conn.execute("UPDATE rhapsody_lead_decisions SET decision = ?2, reasoning = ?3, evidence = ?4, actions = ?5 WHERE id = ?1", params![row.id, row.decision, row.reasoning, row.evidence, row.actions])?;
+            return Ok(row.id);
+        }
+        conn.execute("INSERT INTO rhapsody_lead_decisions (item, at, decision, reasoning, evidence, actions, harness, model, overruled_at, overrule_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![row.item, row.at, row.decision, row.reasoning, row.evidence, row.actions, row.harness, row.model, row.overruled_at, row.overrule_note])?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn load_lead_decisions(&self) -> Result<Vec<LeadDecisionRow>, StoreError> {
+        self.lead_digest_entries("")
+    }
+
+    fn lead_digest_entries(&self, since: &str) -> Result<Vec<LeadDecisionRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, item, at, decision, reasoning, evidence, actions, harness, model, overruled_at, overrule_note FROM rhapsody_lead_decisions WHERE at >= ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(LeadDecisionRow {
+                id: r.get(0)?,
+                item: r.get(1)?,
+                at: r.get(2)?,
+                decision: r.get(3)?,
+                reasoning: r.get(4)?,
+                evidence: r.get(5)?,
+                actions: r.get(6)?,
+                harness: r.get(7)?,
+                model: r.get(8)?,
+                overruled_at: r.get(9)?,
+                overrule_note: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError> {
         let started = if r.started_at.is_empty() {
             now_rfc3339()
@@ -8143,6 +8264,9 @@ mod tests {
                 "rhapsody_turn_spend_model".to_string(),
                 "rhapsody_lead_items".to_string(),
                 "rhapsody_breaker_cleared_runs".to_string(),
+                "rhapsody_lead_decisions".to_string(),
+                "rhapsody_lead_decisions_at".to_string(),
+                "rhapsody_lead_execution".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

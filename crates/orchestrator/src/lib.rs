@@ -50,6 +50,8 @@ pub mod ghenrich;
 pub mod ghsummons;
 pub mod handoff;
 pub mod issuelog;
+pub mod leaddecision;
+pub mod leadexec;
 pub mod leaditems;
 pub mod lifecycle;
 pub mod liveness;

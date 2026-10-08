@@ -112,6 +112,38 @@ pub type ManagerReadOutcome = Result<serde_json::Value, ManagerReadError>;
 /// without a daemon: the key must parse as a `pr:` coordinate carrying the `manager` role, and the
 /// row must name a repository for the mirror.
 pub fn manager_coordinate(run: &RunSummary) -> Result<ManagerCoordinate, ManagerReadError> {
+    if let Some(rest) = run
+        .issue_identifier
+        .strip_prefix("lead:")
+        .and_then(|s| s.strip_suffix("@manager"))
+    {
+        let (coord, item) = rest
+            .rsplit_once(':')
+            .ok_or(ManagerReadError::NotAManagerRun)?;
+        let item: i64 = item.parse().map_err(|_| ManagerReadError::NotAManagerRun)?;
+        let (slug, number) = coord
+            .rsplit_once('#')
+            .ok_or(ManagerReadError::NotAManagerRun)?;
+        let number: i64 = number
+            .parse()
+            .map_err(|_| ManagerReadError::NotAManagerRun)?;
+        let (owner, repo) = slug
+            .split_once('/')
+            .ok_or(ManagerReadError::NotAManagerRun)?;
+        if item <= 0
+            || number < 0
+            || run.repo.is_empty()
+            || crate::ghsummons::parse_repo(&run.repo) != Some((owner.into(), repo.into()))
+        {
+            return Err(ManagerReadError::NotAManagerRun);
+        }
+        return Ok(ManagerCoordinate {
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+            repo_url: run.repo.clone(),
+        });
+    }
     let Some(pr) = parse_pr_ref(&run.issue_identifier) else {
         return Err(ManagerReadError::NotAManagerRun);
     };
@@ -440,6 +472,30 @@ mod tests {
         assert_eq!(got.number, 42);
         assert_eq!(got.pr_slug(), "makewhatis/rhapsody#42");
         assert_eq!(got.repo_url, "git@github.com:makewhatis/rhapsody.git");
+    }
+
+    #[test]
+    fn lead_reads_use_the_run_repo_and_an_optional_real_pr() {
+        for number in [0, 290] {
+            let row = run_row(
+                &format!("lead:o/r#{number}:7@manager"),
+                "https://github.com/o/r.git",
+            );
+            let coord = manager_coordinate(&row).expect("lead coordinate");
+            assert_eq!(coord.owner, "o");
+            assert_eq!(coord.repo, "r");
+            assert_eq!(coord.number, number);
+        }
+        for key in [
+            "lead:other/r#290:7@manager",
+            "lead:o/r#290:0@manager",
+            "lead:o/r#290:7@author",
+        ] {
+            assert!(
+                manager_coordinate(&run_row(key, "https://github.com/o/r.git")).is_err(),
+                "{key}"
+            );
+        }
     }
 
     // A review run's key (`@alice`) is NOT a manager run: the manager surface must refuse it.

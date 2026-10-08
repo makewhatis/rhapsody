@@ -500,6 +500,20 @@ pub enum Event {
     /// The control task folds the states into `effects_json` and, when every mandatory effect is
     /// done, runs the activation transaction.
     ManagerEffect(Box<crate::managerapply::ManagerEffectResult>),
+    LeadPrepared {
+        item: i64,
+        result:
+            Box<Result<Option<(crate::leadexec::LeadCase, crate::managerrun::ManagerRun)>, String>>,
+    },
+    LeadFinished {
+        item: i64,
+        result: Result<crate::leadexec::LeadResult, String>,
+    },
+    LeadAllowed {
+        repo: String,
+        ticket: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// An off-loop preparation's completion (STUDIO-988, P6; NEW beyond Go v0.4.0). The resolver task
     /// sends this back; the control task accepts it only for the CURRENT token/config generation and
     /// drops a stale payload without touching loop state.
@@ -926,6 +940,27 @@ impl Orchestrator {
             Event::ManagerEffect(result) => {
                 self.handle_manager_effect(&result);
             }
+            Event::LeadPrepared { item, result } => self.handle_lead_prepared(item, *result),
+            Event::LeadFinished { item, result } => {
+                self.lead_pending.remove(&item);
+                if let Err(reason) = result {
+                    tracing::warn!(
+                        item,
+                        reason,
+                        "lead execution incomplete; inspect the durable paper trail"
+                    );
+                }
+            }
+            Event::LeadAllowed {
+                repo,
+                ticket,
+                reply,
+            } => {
+                let allowed = self.lead_enabled()
+                    && self.review_route(&repo).is_some()
+                    && (ticket.is_empty() || !self.ticket_run_live(&ticket));
+                let _ = reply.send(allowed);
+            }
         }
     }
 
@@ -1022,6 +1057,7 @@ impl Orchestrator {
         // the launch itself rides the existing dispatch funnel. A no-op while
         // `manager.review_authority` is `off`.
         self.pump_manager_interventions();
+        self.pump_lead_items();
         // STUDIO-1026: the runaway-loop breaker — hold a ticket and notify the operator when its
         // completed-review-round count or its per-ticket spend crosses a configured limit. Beside the
         // sweep and above the same early returns, for the same reason: a daemon whose dispatch is
@@ -2363,6 +2399,26 @@ impl ControlHandle {
     /// a gone loop costs nothing, and recovery re-submits the unresolved effects.
     pub fn manager_effect_result(&self, result: crate::managerapply::ManagerEffectResult) {
         let _ = self.events.send(Event::ManagerEffect(Box::new(result)));
+    }
+
+    pub async fn lead_allowed(&self, repo: &str, ticket: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .events
+            .send(Event::LeadAllowed {
+                repo: repo.into(),
+                ticket: ticket.into(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
     }
 
     /// Requests a coalesced poll+reconcile tick (Go's non-blocking `evTick` send), backing the P6
