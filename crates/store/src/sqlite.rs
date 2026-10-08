@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -644,6 +644,15 @@ CREATE TABLE rhapsody_lead_items (
   UNIQUE (subject, question)
 );
 "#,
+    // v29 -> v30: breaker lead payload and operator-clear round baseline (STUDIO-1134).
+    r#"
+ALTER TABLE rhapsody_lead_items ADD COLUMN kinds TEXT NOT NULL DEFAULT '';
+CREATE TABLE rhapsody_breaker_cleared_runs (
+  pr TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  PRIMARY KEY (pr, run_id)
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1173,13 +1182,17 @@ impl Sqlite {
 impl Store for Sqlite {
     fn enqueue_lead_item(&self, trigger: &LeadTrigger, at: &str) -> Result<i64, StoreError> {
         let (kind, question, detail) = trigger.queue_parts();
+        let kinds = match trigger {
+            LeadTrigger::BreakerHold { kinds, .. } => kinds.join("\n"),
+            _ => String::new(),
+        };
         let subject = trigger.subject();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (subject, question) DO NOTHING",
-            params![kind, subject, question, detail, at],
+            "INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at, kinds) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (subject, question) DO NOTHING",
+            params![kind, subject, question, detail, at, kinds],
         )?;
         let id = tx.query_row(
             "SELECT id FROM rhapsody_lead_items WHERE subject = ?1 AND question = ?2",
@@ -1193,7 +1206,7 @@ impl Store for Sqlite {
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, trigger, subject, detail, created_at, state, attempts_on_question \
+            "SELECT id, trigger, subject, detail, created_at, state, attempts_on_question, kinds \
              FROM rhapsody_lead_items ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1216,6 +1229,18 @@ impl Store for Sqlite {
                 "limit_judgment" => LeadTrigger::LimitJudgment {
                     account: subject.clone(),
                 },
+                "breaker_hold" => {
+                    let kinds: String = row.get(7)?;
+                    LeadTrigger::BreakerHold {
+                        ticket: subject.clone(),
+                        pr: detail,
+                        kinds: if kinds.is_empty() {
+                            Vec::new()
+                        } else {
+                            kinds.split('\n').map(str::to_string).collect()
+                        },
+                    }
+                }
                 _ => {
                     return Err(rusqlite::Error::InvalidColumnType(
                         1,
@@ -1797,8 +1822,14 @@ impl Store for Sqlite {
         // failed or was truncated never counts.
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM runs \
-              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2",
-            params![review_run_pattern(owner, repo, number), OUTCOME_COMPLETED],
+              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2 \
+                AND NOT EXISTS (SELECT 1 FROM rhapsody_breaker_cleared_runs c \
+                                WHERE c.pr = ?3 AND c.run_id = runs.id)",
+            params![
+                review_run_pattern(owner, repo, number),
+                OUTCOME_COMPLETED,
+                format!("{owner}/{repo}#{number}").to_ascii_lowercase()
+            ],
             |row| row.get(0),
         )?;
         Ok(n)
@@ -2724,6 +2755,30 @@ impl Store for Sqlite {
                 manager_terminal_states_sql()
             ),
             params![pr, MANAGER_INTERVENTION_SUPERSEDED],
+        )?;
+        // Snapshot completions, not start IDs or second-precision timestamps: a review already
+        // running at clear still counts if it completes afterwards, including in the same second.
+        // The baseline and round watermark reset commit with the generation; lifetime spend stays.
+        let breaker_pr = pr.to_ascii_lowercase();
+        tx.execute(
+            "DELETE FROM rhapsody_breaker_cleared_runs WHERE pr = ?1",
+            params![breaker_pr],
+        )?;
+        tx.execute(
+            "INSERT INTO rhapsody_breaker_cleared_runs (pr, run_id) \
+             SELECT ?1, id FROM runs WHERE issue_identifier LIKE ?2 ESCAPE '\\' AND outcome = ?3",
+            params![
+                breaker_pr,
+                format!("{}%", escape_like(&format!("pr:{breaker_pr}@"))),
+                OUTCOME_COMPLETED
+            ],
+        )?;
+        tx.execute(
+            "UPDATE rhapsody_breaker_crossings SET notified_rounds = 0 WHERE ticket IN \
+             (SELECT trim(substr(introduced_by, instr(introduced_by, ':') + 1)) \
+              FROM rhapsody_review_watch WHERE lower(owner || '/' || repo || '#' || number) = ?1 \
+                AND (introduced_by GLOB 'handoff:*' OR introduced_by GLOB 'adopt:*'))",
+            params![breaker_pr],
         )?;
         tx.commit()?;
         Ok(())
@@ -8087,6 +8142,7 @@ mod tests {
                 "rhapsody_turn_spend_at".to_string(),
                 "rhapsody_turn_spend_model".to_string(),
                 "rhapsody_lead_items".to_string(),
+                "rhapsody_breaker_cleared_runs".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -9812,6 +9868,11 @@ mod tests {
             LeadTrigger::LimitJudgment {
                 account: "claude-subscription".into(),
             },
+            LeadTrigger::BreakerHold {
+                ticket: "STUDIO-1123".into(),
+                pr: "owner/repo#297".into(),
+                kinds: vec!["review rounds".into(), "per-ticket spend".into()],
+            },
         ];
         let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
         for trigger in &triggers {
@@ -9865,6 +9926,136 @@ mod tests {
         let items = store.load_lead_items().expect("items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].attempts_on_question, 0);
+    }
+
+    #[test]
+    fn breaker_clear_baseline_is_pr_scoped_durable_and_preserves_spend() {
+        let dir = scratch_dir();
+        let db = dir.join("breaker-clear.db");
+        // Upgrade an existing v29 queue: its rows must survive the new payload column.
+        {
+            let conn = Connection::open(&db).expect("v29 db");
+            for migration in &MIGRATIONS[..29] {
+                conn.execute_batch(migration).expect("migration");
+            }
+            conn.pragma_update(None, "user_version", 29)
+                .expect("version");
+            conn.execute_batch("INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at) VALUES ('limit_judgment', 'claude', 'limit_judgment', 'claude', 'at');").expect("old queue");
+        }
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
+        assert_eq!(
+            store.load_lead_items().expect("queue")[0].trigger,
+            LeadTrigger::LimitJudgment {
+                account: "claude".into()
+            }
+        );
+        let at = "2026-10-08T00:00:00Z";
+        let cleared = start_run_at(&store, "pr:o/a_b#1@alice", at);
+        let other = start_run_at(&store, "pr:o/axb#1@alice", at);
+        end_run_with(&store, cleared, OUTCOME_COMPLETED, 100, at);
+        end_run_with(&store, other, OUTCOME_COMPLETED, 200, at);
+        let mut watch = introduced(wkey("o", "a_b", 1, "alice"));
+        watch.introduced_by = "adopt:STUDIO-1123".into();
+        store.save_review_watch(watch).expect("adopt");
+        store
+            .save_breaker_crossing(&BreakerCrossingRow {
+                ticket: "STUDIO-1123".into(),
+                notified_rounds: 5,
+                notified_providers: vec!["anthropic".into()],
+            })
+            .expect("crossing");
+        let spend = store
+            .ticket_spend_by_provider("STUDIO-1123", "o", "a_b", 1)
+            .expect("spend");
+        store.increment_review_generation("o/a_b#1").expect("clear");
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(
+            store
+                .count_completed_review_runs("O", "A_B", 1)
+                .expect("count"),
+            0
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("o", "axb", 1)
+                .expect("other PR"),
+            1
+        );
+        assert_eq!(
+            store.load_breaker_crossings().expect("crossings")[0],
+            BreakerCrossingRow {
+                ticket: "STUDIO-1123".into(),
+                notified_rounds: 0,
+                notified_providers: vec!["anthropic".into()]
+            }
+        );
+        assert_eq!(
+            store
+                .ticket_spend_by_provider("STUDIO-1123", "o", "a_b", 1)
+                .expect("spend"),
+            spend
+        );
+        // Retention deletes the snapshot rows with their run; it cannot subtract future rounds.
+        store
+            .lock()
+            .execute("DELETE FROM runs WHERE id = ?1", params![cleared])
+            .expect("retention");
+        let baseline: i64 = store
+            .lock()
+            .query_row(
+                "SELECT count(*) FROM rhapsody_breaker_cleared_runs",
+                [],
+                |row| row.get(0),
+            )
+            .expect("baseline");
+        assert_eq!(baseline, 0);
+        let next = start_run_at(&store, "pr:o/a_b#1@alice", at);
+        end_run_with(&store, next, OUTCOME_COMPLETED, 10, at);
+        assert_eq!(
+            store
+                .count_completed_review_runs("o", "a_b", 1)
+                .expect("new count"),
+            1
+        );
+    }
+
+    #[test]
+    fn breaker_clear_storage_failure_rolls_back_generation_and_crossings() {
+        let store = open_mem();
+        store.ensure_review_generation("o/r#1").expect("generation");
+        store.set_review_rounds("o/r#1", 5).expect("budget");
+        let mut watch = introduced(wkey("o", "r", 1, "alice"));
+        watch.introduced_by = "handoff:STUDIO-1123".into();
+        store.save_review_watch(watch).expect("watch");
+        store
+            .save_breaker_crossing(&BreakerCrossingRow {
+                ticket: "STUDIO-1123".into(),
+                notified_rounds: 5,
+                notified_providers: Vec::new(),
+            })
+            .expect("crossing");
+        let id = start_run_at(&store, "pr:o/r#1@alice", "2026-10-08T00:00:00Z");
+        end_run_with(&store, id, OUTCOME_COMPLETED, 10, "2026-10-08T00:00:00Z");
+        let before = store.review_bound("o/r#1").expect("bound");
+        let crossings = store.load_breaker_crossings().expect("crossings");
+        store
+            .lock()
+            .execute_batch("CREATE TRIGGER rhapsody_test_refuse_reset BEFORE UPDATE ON rhapsody_breaker_crossings BEGIN SELECT RAISE(ABORT, 'injected reset failure'); END;")
+            .expect("inject failure");
+        assert!(store.increment_review_generation("o/r#1").is_err());
+        assert_eq!(store.review_bound("o/r#1").expect("bound"), before);
+        assert_eq!(
+            store.load_breaker_crossings().expect("crossings"),
+            crossings
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("o", "r", 1)
+                .expect("count"),
+            1,
+            "the baseline insertion rolls back with the generation and watermark"
+        );
     }
 
     #[test]

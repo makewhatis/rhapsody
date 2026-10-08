@@ -64,12 +64,14 @@ reference (the parity goldens stay byte-strict).
 ### Tech-lead trigger queue (STUDIO-1134)
 
 `manager.lead.enabled` in the boot-loaded Teams configuration opts into a durable
-`rhapsody_lead_items` queue (schema migration **29**). Blocked ticket endings asking for a
+`rhapsody_lead_items` queue (schema migrations **29–30**). Blocked ticket endings asking for a
 decision, review escalations, and impossible states (zero verdicts at the escalated head,
 In Review with an authoritative empty PR lookup, exhausted draft pokes, and exhausted review
 or manager attempts) queue lead work instead of reaching the existing human feed or escalation
-audit. The queue deduplicates on `(subject, question)` across restarts; detecting the same
-condition again does not charge a decision attempt. The usage-limit judgment seam queues an
+audit. Breaker crossings queue `BreakerHold { ticket, pr, kinds }` instead of the human hold and
+notification plan; no notification task is needed for lead detection. The queue deduplicates on
+`(subject, question)` across restarts; detecting the same condition again does not charge a
+decision attempt. The usage-limit judgment seam queues an
 account item only; its policy producer belongs to the limits program.
 
 This slice detects and queues; the isolated lead runs and decision executors are subsequent
@@ -77,6 +79,12 @@ slices. It grants no new manager tools or action authority. A failed/disabled st
 existing human report. With the lead disabled (the default), existing feed, audit and config
 serialization bytes are unchanged. Go has no lead queue, and the `rhapsody_` schema-name rule
 keeps the ported tables and golden fixtures byte-strict.
+
+An operator review clear also resets the breaker's round count for that PR, whether the lead is
+enabled or disabled. Migration **30** adds `rhapsody_breaker_cleared_runs`: the clear transaction
+snapshots already-completed run IDs and resets the round crossing watermark. Only completions
+after clear count, including reviews already in flight when clear happened. The snapshot survives
+restarts and is pruned with its runs; lifetime token spend and provider cap crossings are retained.
 
 ### Account limit observations and API (STUDIO-1123)
 
@@ -1242,9 +1250,10 @@ providers whose per-ticket cap has fired.
 The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
 (`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
 (`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs from the `runs` ledger**
-(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter — an operator
-`clear` resets that one, and the breaker bounds spend that really happened. Spend sums the ticket's
-author runs plus its pull request's review runs, split by `rhapsody_run_provenance.provider`. The
+(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter. An operator
+`clear` resets both round counts (STUDIO-1134); only post-clear completed reviews count for the
+breaker. Spend sums the ticket's author runs plus its pull request's review runs, split by
+`rhapsody_run_provenance.provider`. The
 `rhapsody_` prefix keeps the new table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the eighth name.
 

@@ -11,10 +11,26 @@
 /// Tech-lead work (STUDIO-1134); no Go counterpart. Shared here to avoid a store/orchestrator cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeadTrigger {
-    BlockedHandoff { ticket: String, question: String },
-    ReviewEscalation { pr: String, head: String },
-    ImpossibleState { subject: String, kind: String },
-    LimitJudgment { account: String },
+    BlockedHandoff {
+        ticket: String,
+        question: String,
+    },
+    ReviewEscalation {
+        pr: String,
+        head: String,
+    },
+    ImpossibleState {
+        subject: String,
+        kind: String,
+    },
+    LimitJudgment {
+        account: String,
+    },
+    BreakerHold {
+        ticket: String,
+        pr: String,
+        kinds: Vec<String>,
+    },
 }
 
 impl LeadTrigger {
@@ -24,6 +40,7 @@ impl LeadTrigger {
             Self::ReviewEscalation { pr, .. } => pr,
             Self::ImpossibleState { subject, .. } => subject,
             Self::LimitJudgment { account } => account,
+            Self::BreakerHold { ticket, .. } => ticket,
         }
     }
 
@@ -42,6 +59,11 @@ impl LeadTrigger {
             ),
             Self::ImpossibleState { kind, .. } => ("impossible_state", kind.clone(), kind),
             Self::LimitJudgment { account } => ("limit_judgment", "limit_judgment".into(), account),
+            Self::BreakerHold { pr, kinds, .. } => (
+                "breaker_hold",
+                format!("breaker_hold:{pr}:{}", kinds.join("\n")),
+                pr,
+            ),
         }
     }
 }

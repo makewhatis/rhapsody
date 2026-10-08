@@ -693,11 +693,12 @@ pub trait Store {
 
     /// How many COMPLETED review runs this daemon has recorded for one pull request — every `runs`
     /// row whose `issue_identifier` is `pr:<owner>/<repo>#<number>@<any reviewer>` with
-    /// `outcome = completed`.
+    /// `outcome = completed`, excluding completions already present at the last operator clear.
     ///
     /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
-    /// an operator's `clear` resets it. The breaker bounds SPEND, so it counts the runs that
-    /// actually HAPPENED. Reads with the caller's explicit empty/whitespace identifiers truncated by
+    /// an operator's `clear` resets both counts (STUDIO-1134). The breaker counts only completed
+    /// runs, including a run in flight at clear that completes later. Reads with the caller's explicit
+    /// empty/whitespace identifiers truncated by
     /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
     fn count_completed_review_runs(
         &self,
