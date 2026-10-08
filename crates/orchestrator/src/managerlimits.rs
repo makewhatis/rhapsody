@@ -1076,6 +1076,28 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A competing decision's refusal changes display status, but not the transaction.
+        o.limit_manager_status(
+            "claude-subscription",
+            "manager unavailable: decision refused",
+        );
+        let record = o
+            .store()
+            .load_recovery()
+            .unwrap()
+            .retries
+            .into_iter()
+            .find(|r| r.issue_id == "MT-1")
+            .unwrap();
+        let (mut recovered, _, _recovered_dir) = setup();
+        recovered.limit_policy.items.clear();
+        recovered
+            .restore_limit_retry("MT-1", &record.error)
+            .unwrap();
+        assert_eq!(
+            recovered.limit_policy.items[0].manager_status,
+            "reassign interrupted: inspect labels before resuming"
+        );
         gate_tx.send(true).unwrap();
         let mut rx = o.events_rx.lock().unwrap().take().unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())

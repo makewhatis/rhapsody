@@ -958,7 +958,10 @@ mod tests {
             state: rhapsody_store::MANAGER_INTERVENTION_RUNNING.into(),
             ..Default::default()
         };
-        assert_eq!(o.manager_available_slots(&[reservation.clone()], None), 1);
+        assert_eq!(
+            o.manager_available_slots(std::slice::from_ref(&reservation), None),
+            1
+        );
         let mut reserved = reservation.clone();
         reserved.pr = "makewhatis/rhapsody#13".into();
         reserved.state = rhapsody_store::MANAGER_INTERVENTION_LAUNCHING.into();

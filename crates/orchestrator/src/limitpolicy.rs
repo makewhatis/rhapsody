@@ -169,6 +169,8 @@ struct ResumeRecord {
     account: Option<crate::accounts::AccountView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credit_approval: Option<(String, i64)>,
+    #[serde(default)]
+    reassignment_pending: bool,
 }
 
 pub(crate) const RETRY_LIMIT_PREFIX: &str = "limit continuation: ";
@@ -1048,6 +1050,7 @@ impl Orchestrator {
             note: s.note.clone(),
             account: s.account.clone(),
             credit_approval: self.limit_policy.credit_approvals.get(id).cloned(),
+            reassignment_pending: self.limit_policy.pending_reassignments.contains_key(id),
         };
         match serde_json::to_string(&record) {
             Ok(json) => {
@@ -1074,7 +1077,7 @@ impl Orchestrator {
         match serde_json::from_str::<ResumeRecord>(json) {
             Ok(mut record) => {
                 if let HandoffOutcome::ManagerItem(item) = &mut record.outcome
-                    && item.manager_status == "reassign pending"
+                    && (record.reassignment_pending || item.manager_status == "reassign pending")
                 {
                     item.manager_status =
                         "reassign interrupted: inspect labels before resuming".into();

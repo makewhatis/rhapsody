@@ -85,6 +85,8 @@ Provider rejection and independent USD budgets remain gates. Advise-mode proposa
 unavailable/exhausted manager cases remain on the `limit_items` human feed. Decision attempts
 are bounded and carried in the existing suspension record; interrupted reassignment stays
 held for the operator rather than guessing which label mutation landed.
+Resume and competing decisions are held while reassignment label writes are in flight;
+that transaction marker is persisted independently of the human-feed display status.
 
 Boot warns when the effective manager list has one entry or no cross-account fallback.
 Enabled managers self-test for limit decisions even with review authority off; the existing
@@ -92,6 +94,7 @@ hermetic boot option skips CLI probes/canaries. A manager limited during its own
 advances to another healthy entry, rather than restoring a deleted private session or
 creating recursive manager work. Existing Go-owned tables, config/state goldens and fixture
 normalization are unchanged.
+Limit and PR managers share `manager.max_concurrent`, including reserved and stopping runs.
 
 ### Account-limit reporting (STUDIO-1128)
 
