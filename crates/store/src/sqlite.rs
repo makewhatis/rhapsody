@@ -1396,6 +1396,18 @@ impl Store for Sqlite {
         Ok(self.lock().execute("INSERT INTO rhapsody_lead_reporting (key, count) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET count = count + 1 WHERE count < ?2", params![key, max])? == 1)
     }
 
+    fn reserve_lead_page(&self, decision: i64) -> Result<bool, StoreError> {
+        // One statement shares the overrule transaction's write boundary, so a stale reporter
+        // snapshot cannot admit a page after the operator's note has committed.
+        Ok(self.lock().execute(
+            "INSERT INTO rhapsody_lead_reporting (key, count)
+             SELECT ?1, 1 FROM rhapsody_lead_decisions
+             WHERE id = ?2 AND overruled_at IS NULL AND substr(decision, 1, 10) = 'escalate: '
+             ON CONFLICT(key) DO NOTHING",
+            params![format!("page-decision:{decision}"), decision],
+        )? == 1)
+    }
+
     fn overrule_lead_decision(
         &self,
         id: i64,

@@ -65,7 +65,8 @@ pub(crate) async fn handle_state(
 }
 
 /// `GET /api/v1/version` — this daemon's build identity (`version`/`commit`/`built_at`), plus
-/// `teams_enabled` (STUDIO-652). Rhapsody-only (STUDIO-380); no Go counterpart. See
+/// `teams_enabled` (STUDIO-652) and effective `lead_enabled` (STUDIO-1138). Rhapsody-only
+/// (STUDIO-380); no Go counterpart. See
 /// [`crate::build_info`] for why this is its own route rather than a field on `/state`, and why the
 /// Teams gate rides here rather than costing a request of its own.
 ///
@@ -82,7 +83,7 @@ pub(crate) async fn handle_version(
     }
     write_json(
         StatusCode::OK,
-        &build_info::response(provider.teams_enabled()),
+        &build_info::response(provider.teams_enabled(), provider.lead_reports().is_some()),
     )
 }
 

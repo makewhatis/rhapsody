@@ -28,6 +28,9 @@ impl Store for Noop {
     fn reserve_lead_report(&self, _key: &str, _max: i64) -> Result<bool, StoreError> {
         Ok(false)
     }
+    fn reserve_lead_page(&self, _decision: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn overrule_lead_decision(
         &self,
         _id: i64,

@@ -287,7 +287,7 @@ impl LeadReports {
             if let Some(need) = row.decision.strip_prefix("escalate: ")
                 && self
                     .store
-                    .reserve_lead_report(&format!("page-decision:{}", row.id), 1)
+                    .reserve_lead_page(row.id)
                     .map_err(|e| e.to_string())?
             {
                 let subject = items
@@ -505,6 +505,57 @@ mod tests {
             vec!["TEST-1: needs a B2 console key: scope X, file Y"]
         );
         assert!(r.pages().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn overruled_escalation_does_not_page() {
+        let r = reports();
+        let id = decision(
+            &r,
+            "2026-10-08T10:00:00Z",
+            "escalate: needs a B2 console key: scope X, file Y",
+        );
+        r.overrule(id, "Use the existing key; no console step needed.")
+            .await
+            .unwrap();
+        assert!(r.pages().unwrap().is_empty());
+        assert_eq!(
+            r.store
+                .lead_report_count(&format!("page-decision:{id}"))
+                .unwrap(),
+            0
+        );
+        assert!(r.pages().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn page_reservation_rechecks_overrule_after_snapshot() {
+        let r = reports();
+        let id = decision(
+            &r,
+            "2026-10-08T10:00:00Z",
+            "escalate: operator login needed",
+        );
+        let candidate = r.store.load_lead_decisions().unwrap().remove(0);
+        assert!(candidate.overruled_at.is_none());
+        r.overrule(id, "No login needed.").await.unwrap();
+        assert!(!r.store.reserve_lead_page(candidate.id).unwrap());
+        assert_eq!(
+            r.store
+                .lead_report_count(&format!("page-decision:{id}"))
+                .unwrap(),
+            0
+        );
+
+        let live = decision(
+            &r,
+            "2026-10-08T10:01:00Z",
+            "escalate: new console key needed",
+        );
+        assert!(r.store.reserve_lead_page(live).unwrap());
+        assert!(!r.store.reserve_lead_page(live).unwrap());
+        let proposal = decision(&r, "2026-10-08T10:02:00Z", "proposed: requeue");
+        assert!(!r.store.reserve_lead_page(proposal).unwrap());
+        assert!(!r.store.reserve_lead_page(i64::MAX).unwrap());
+        assert!(!rhapsody_store::Noop.reserve_lead_page(live).unwrap());
     }
     #[test]
     fn cap_queues_non_escalations_for_tomorrow() {

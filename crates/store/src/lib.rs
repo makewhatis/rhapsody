@@ -176,6 +176,11 @@ pub trait Store {
     fn reserve_lead_report(&self, _key: &str, _max: i64) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// Admit a page once, atomically rechecking that the decision is still an escalation and
+    /// has not been overruled. Delivery admitted before an overrule cannot be recalled.
+    fn reserve_lead_page(&self, _decision: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Atomically mark the decision and queue its undo/redo work. Repeats return the same item.
     fn overrule_lead_decision(
         &self,

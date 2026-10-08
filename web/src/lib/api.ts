@@ -717,6 +717,9 @@ export interface DaemonVersion {
   // request and, when it is false, never touches /api/v1/teams* at all — no chip, no panel, no
   // fetches. Optional because a daemon older than STUDIO-652 omits it, which reads as off.
   teams_enabled?: boolean;
+  // Effective Lead reporting capability (enabled plus durable storage). Missing reads as off;
+  // disabled and older daemons omit it. Confirm before fetching /api/v1/lead/*.
+  lead_enabled?: boolean;
 }
 
 // fetchVersion reads the daemon's build identity. Unlike the shell's appVersion() this works in a

@@ -73,7 +73,7 @@ describe("gateConsoleRoute", () => {
 
   it("leaves teams-only routes alone when teams is on", () => {
     for (const name of TEAMS_ONLY_ROUTES) {
-      expect(gateConsoleRoute({ name, key: "" }, true)).toEqual({ name, key: "" });
+      expect(gateConsoleRoute({ name, key: "" }, true, true)).toEqual({ name, key: "" });
     }
   });
 

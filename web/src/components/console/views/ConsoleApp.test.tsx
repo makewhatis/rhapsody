@@ -22,6 +22,7 @@ const h = vi.hoisted(() => {
   const downCbs = new Set<() => void>();
   return {
     fetchVersion: vi.fn(),
+    fetchLeadDecisions: vi.fn(),
     fetchIssueRuns: vi.fn(),
     getStatus: vi.fn(),
     hasOverlayTitlebar: vi.fn(() => false),
@@ -66,6 +67,7 @@ vi.mock("@/lib/api", async (orig) => {
   return {
     ...actual,
     fetchVersion: h.fetchVersion,
+    fetchLeadDecisions: h.fetchLeadDecisions,
     fetchAccounts: vi.fn(async () => []),
     fetchLimitHandoffs: vi.fn(async () => []),
     fetchState: vi.fn(async () => ({
@@ -176,6 +178,7 @@ beforeEach(() => {
   ]);
   h.probeTools.mockResolvedValue([]);
   h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+  h.fetchLeadDecisions.mockResolvedValue({ decisions: [], queued: [] });
 });
 
 afterEach(() => {
@@ -188,7 +191,7 @@ describe("the rail is capability-gated on /api/v1/version (§2.2)", () => {
   it("renders Jobs, Teams, Memory and Settings when teams is on", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
   });
 
   // Box 2.2 — the load-bearing one: ABSENT, not greyed.
@@ -206,6 +209,39 @@ describe("the rail is capability-gated on /api/v1/version (§2.2)", () => {
     h.fetchVersion.mockResolvedValue({ version: "v0.3.0", commit: "old", built_at: "" });
     mount();
     await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "settings"]));
+  });
+});
+
+describe("Lead's effective capability (STUDIO-1138)", () => {
+  it.each([false, undefined])("omits Lead and redirects its deep link with lead_enabled=%s", async (lead_enabled) => {
+    h.fetchVersion.mockResolvedValue({ ...version(true), lead_enabled });
+    mount("#lead");
+    await waitFor(() => expect(window.location.hash).toBe("#jobs"));
+    expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]);
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
+  });
+
+  it("waits for capability before fetching Lead and preserves an enabled deep link", async () => {
+    let resolve!: (data: DaemonVersion) => void;
+    h.fetchVersion.mockReturnValue(new Promise<DaemonVersion>((done) => { resolve = done; }));
+    mount("#lead");
+    await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
+    expect(window.location.hash).toBe("#lead");
+    expect(document.querySelector("[data-nav='lead']")).toBeNull();
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
+    await act(async () => resolve({ ...version(true), lead_enabled: true }));
+    await waitFor(() => expect(screen.getByText("No lead decisions yet.")).toBeTruthy());
+    expect(window.location.hash).toBe("#lead");
+    expect(activeNavs()).toEqual(["lead"]);
+    expect(h.fetchLeadDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Lead unreachable with Teams off even if a stale capability says enabled", async () => {
+    h.fetchVersion.mockResolvedValue({ ...version(false), lead_enabled: true });
+    mount("#lead");
+    await waitFor(() => expect(window.location.hash).toBe("#jobs"));
+    expect(document.querySelector("[data-nav='lead']")).toBeNull();
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
   });
 });
 
@@ -430,7 +466,7 @@ describe("first run routes to onboarding (§8.1, audit G2)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
     expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
   });
 
@@ -458,7 +494,7 @@ describe("first run routes to onboarding (§8.1, audit G2)", () => {
     // The wizard's success path calls back into the shell, which re-reads status; the poll would
     // reach the same place a beat later.
     h.getStatus.mockResolvedValue(status(true));
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]), {
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]), {
       timeout: 4000,
     });
     expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
@@ -484,7 +520,7 @@ describe("a partial first-run write survives the swap into the console", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start playing" }));
 
     // The shell swaps to the console...
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]), {
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]), {
       timeout: 4000,
     });
     // ...and the failure came with it.
@@ -527,7 +563,7 @@ describe("the desktop bridge survives the flip", () => {
   it("routes the tray's Settings… item to Settings and Dashboard back to Jobs", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
 
     act(() => h.emitNavigate("settings"));
     await waitFor(() => expect(activeNavs()).toEqual(["settings"]));
@@ -549,7 +585,7 @@ describe("the desktop bridge survives the flip", () => {
   it("shows the shutdown overlay when the app begins quitting", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
     expect(screen.queryByText("Shutting down…")).toBeNull();
 
     act(() => h.emitShuttingDown());
@@ -571,7 +607,7 @@ describe("desktop window chrome (STUDIO-701)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
     expect(document.querySelector(".app.rh-console.overlay-titlebar")).not.toBeNull();
     const drag = document.querySelector(".rail")?.firstElementChild;
     expect(drag?.className).toBe("drag");
@@ -596,7 +632,7 @@ describe("desktop window chrome (STUDIO-701)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
     expect(document.querySelector(".overlay-titlebar")).toBeNull();
     expect(document.querySelector("[data-tauri-drag-region]")).toBeNull();
     expect(document.querySelector(".rail")?.firstElementChild?.classList.contains("logo")).toBe(true);

@@ -38,8 +38,8 @@ import { LeadRoute } from "./LeadPage";
 // view, the capability gate that decides what it contains, and the router that decides what the
 // main column renders.
 //
-// The gate is ONE field on `GET /api/v1/version`: `teams_enabled`. With Teams off the rail is
-// Jobs and Settings and NOTHING ELSE — Teams and Memory are absent from the DOM rather than
+// The gates ride on `GET /api/v1/version`: `teams_enabled` and effective `lead_enabled`.
+// With Teams off the Teams surfaces are absent from the DOM rather than
 // greyed out, because a disabled row still advertises a feature the operator cannot reach
 // (§2.2). `useConsoleRoute` applies the same gate to the route itself.
 export function ConsoleApp() {
@@ -54,7 +54,10 @@ export function ConsoleApp() {
   // the field answers with it absent, which settles to `false` — off — rather than staying
   // unknown forever. See `useConsoleRoute` for why the difference matters.
   const teamsEnabled = version.data === undefined ? undefined : version.data.teams_enabled === true;
-  const [route, navigate] = useConsoleRoute(teamsEnabled);
+  const leadEnabled = version.data === undefined
+    ? undefined
+    : teamsEnabled === true && version.data.lead_enabled === true;
+  const [route, navigate] = useConsoleRoute(teamsEnabled, leadEnabled);
   // How much of the job history is loaded (STUDIO-792). Owned by the shell so that the window
   // OUTLIVES the view: opening a row navigates away from Jobs and unmounts it, and an operator who
   // paged down to the older tickets should not land back on the newest 50 when they come back.
@@ -101,7 +104,7 @@ export function ConsoleApp() {
     () => [
       { id: "jobs", label: "Jobs", icon: <JobsIcon />, count: openJobs },
       { id: "accounts", label: "Accounts", icon: <SettingsIcon /> },
-      { id: "lead", label: "Lead", icon: <JobsIcon />, enabled: teamsEnabled === true },
+      { id: "lead", label: "Lead", icon: <JobsIcon />, enabled: leadEnabled === true },
       // Unknown is treated as off HERE, deliberately: the rail must not advertise a surface the
       // daemon has not confirmed it has. Unlike the route gate this costs nothing if it is
       // briefly wrong — an item appears a moment later; it does not rewrite anyone's URL.
@@ -109,7 +112,7 @@ export function ConsoleApp() {
       { id: "memory", label: "Memory", icon: <MemoryIcon />, enabled: teamsEnabled === true },
       { id: "settings", label: "Settings", icon: <SettingsIcon />, separatorBefore: true },
     ],
-    [teamsEnabled, openJobs],
+    [teamsEnabled, leadEnabled, openJobs],
   );
 
   const go = (name: ConsoleRouteName, key = "") => navigate({ name, key });
@@ -153,6 +156,7 @@ export function ConsoleApp() {
         <ConsoleBody
           route={route}
           teamsEnabled={teamsEnabled}
+          leadEnabled={leadEnabled}
           go={go}
           updater={updater}
           jobsLimit={jobsLimit}
@@ -191,6 +195,7 @@ function MemoryPage({ go }: { go: (name: ConsoleRouteName, key?: string) => void
 function ConsoleBody({
   route,
   teamsEnabled,
+  leadEnabled,
   go,
   updater,
   jobsLimit,
@@ -198,6 +203,7 @@ function ConsoleBody({
 }: {
   route: ConsoleRoute;
   teamsEnabled: boolean | undefined;
+  leadEnabled: boolean | undefined;
   go: (name: ConsoleRouteName, key?: string) => void;
   updater: Updater;
   // Threaded from `ConsoleApp` rather than held here (STUDIO-792), so the window survives opening
@@ -219,7 +225,7 @@ function ConsoleBody({
 
   switch (route.name) {
     case "lead":
-      return <LeadRoute />;
+      return leadEnabled === true ? <LeadRoute /> : null;
     case "accounts":
       return <AccountsPage />;
     case "job":

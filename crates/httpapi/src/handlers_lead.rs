@@ -121,6 +121,44 @@ mod tests {
     use crate::testutil::{FakeProvider, empty_snapshot, spawn_router};
     use rhapsody_store::{LeadDecisionRow, LeadTrigger, Sqlite, Store, StorePath};
     #[tokio::test]
+    async fn version_exposes_effective_lead_capability() {
+        for enabled in [false, true] {
+            let provider = FakeProvider::ok(empty_snapshot());
+            let provider = if enabled {
+                provider.with_lead_reports(Arc::new(
+                    rhapsody_orchestrator::leadreport::LeadReports {
+                        store: Arc::new(Sqlite::open(StorePath::InMemory).unwrap()),
+                        memory: None,
+                    },
+                ))
+            } else {
+                provider
+            };
+            let url = spawn_router(crate::new_handler(Arc::new(provider), None)).await;
+            let version: serde_json::Value = reqwest::get(format!("{url}/api/v1/version"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(version["lead_enabled"].as_bool().unwrap_or(false), enabled);
+            if !enabled {
+                assert!(version.get("lead_enabled").is_none());
+            }
+            assert_eq!(
+                reqwest::get(format!("{url}/api/v1/lead/decisions"))
+                    .await
+                    .unwrap()
+                    .status(),
+                if enabled {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+        }
+    }
+    #[tokio::test]
     async fn decisions_api_since() {
         let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
         let item = store

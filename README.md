@@ -78,6 +78,9 @@ Investigation settings can tighten its existing hard ceilings (2 CPUs, 4g, 10-mi
 Advise decisions become terminal proposals in the human feed, without work mutations. Explicit
 escalations still page with the stated need. The console's Lead page lists the paper trail and
 offers Overrule in both the browser dashboard and desktop window.
+The additive `/api/v1/version` capability `lead_enabled: true` is present only when the reporting
+service is installed (lead enabled and durable storage available); otherwise it is omitted.
+The console omits Lead and redirects its deep link when that capability is unavailable.
 
 Migration **32** adds `rhapsody_lead_reporting`: local-day launch counts are charged atomically
 with the existing attempt/generation reservation, and notification dedupe survives restarts.
@@ -87,6 +90,8 @@ digest of yesterday's decisions/escalations plus queued work and links to `/#lea
 Notification delivery is best-effort and bounded; a reservation precedes delivery, so failed
 channels log rather than repeatedly page. With the lead disabled, existing human-feed and
 Go-owned schema/payload goldens remain unchanged.
+Page admission atomically rechecks the escalation's overrule status: an overrule committed before
+reservation suppresses the page without marking it delivered. Already admitted delivery cannot be recalled.
 
 ### Tech-lead operator memory (STUDIO-1137)
 
