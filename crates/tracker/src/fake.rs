@@ -377,6 +377,13 @@ impl Tracker for Fake {
     ) -> Result<(), TrackerError> {
         Ok(())
     }
+    async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
+        let candidates = self.fetch_candidate_issues().await?;
+        Ok(candidates
+            .into_iter()
+            .find(|i| i.id == id)
+            .or_else(|| self.by_id.get(id).cloned()))
+    }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         self.lock().candidate_calls += 1;
         if let Some(e) = &self.candidates_err {

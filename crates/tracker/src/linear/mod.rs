@@ -64,6 +64,9 @@ impl crate::Tracker for Client {
     ) -> Result<(), TrackerError> {
         by_ids::update_issue_description(self, id, description).await
     }
+    async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
+        candidates::fetch_parked_issue(self, id).await
+    }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         candidates::fetch_candidate_issues(self).await
     }

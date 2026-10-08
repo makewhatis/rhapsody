@@ -54,6 +54,7 @@ pub mod leaddecision;
 pub mod leadexec;
 pub mod leaditems;
 pub mod lifecycle;
+pub mod limitpolicy;
 pub mod liveness;
 pub mod managerapply;
 pub mod managerapproval;

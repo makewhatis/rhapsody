@@ -595,7 +595,19 @@ impl Orchestrator {
                 fallback_reason,
             },
         );
+        let lead_item = run.lead_item;
+        let key = run.key();
         self.finish_manager_dispatch(run, route, iss);
+        if let Some(item) = lead_item
+            && !self.running.contains_key(&key)
+        {
+            self.pending_manager.remove(&key);
+            self.manager_attempts.remove(&key);
+            if let Err(e) = self.store().set_lead_item_state(item, "queued") {
+                tracing::warn!(item, err = %e, "lead admission changed; restoring queue state failed");
+            }
+            return ManagerDispatchOutcome::Refused("lead dispatch admission changed".into());
+        }
         ManagerDispatchOutcome::Dispatched
     }
 
@@ -635,6 +647,7 @@ impl Orchestrator {
             .eff
             .as_ref()
             .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0))
+            && self.accounts.snapshot((self.now)().timestamp()).is_empty()
         {
             return None;
         }
@@ -645,7 +658,15 @@ impl Orchestrator {
             .unwrap_or_default();
         let model = self.manager_model_override(inherited, entry);
         let pricing = self.run_pricing_for(&entry.harness, &model, project);
-        let mut held = self.usd_budget_hold(&pricing)?;
+        let mut held = if !self.account_usable(&pricing.account) {
+            crate::budget::BudgetHeld {
+                provider: pricing.account.clone(),
+                reason: format!("waiting: {} limit", pricing.account),
+                ..Default::default()
+            }
+        } else {
+            self.usd_budget_hold(&pricing)?
+        };
         held.subject = iss.identifier;
         held.title = iss.title;
         held.project = project.into();

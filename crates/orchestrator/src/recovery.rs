@@ -28,7 +28,7 @@
 //! shows up in `/state` as `retrying` and its claim keeps `select_dispatch` skipping the issue, so the
 //! ticket deadlocks silently and permanently — and a restart just re-reads the same row and repeats it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration};
 use rhapsody_core::Issue;
@@ -67,6 +67,7 @@ impl Orchestrator {
         // Index retries by key so we can re-arm + look up the attempt for interrupted-running claims. A
         // recovered retry whose non-empty project_slug is no longer configured is RELEASED on boot.
         let mut retry_by_key: HashMap<String, store::RetryRow> = HashMap::new();
+        let mut limit_claims = HashSet::new();
         for rr in rec.retries {
             if !rr.project_slug.is_empty() && self.project_unconfigured(&rr.project_slug) {
                 tracing::info!(issue_identifier = %rr.identifier, project_slug = %rr.project_slug, "recovery: releasing recovered retry; project no longer configured");
@@ -78,6 +79,16 @@ impl Orchestrator {
             } else {
                 rr.identifier.clone()
             };
+            if rr.error.starts_with(crate::limitpolicy::RETRY_LIMIT_PREFIX)
+                && let Some(id) = self.restore_limit_retry(&key, &rr.error)
+            {
+                limit_claims.insert(key);
+                self.arm_retry_timer(
+                    &format!("limit:{id}"),
+                    rr.due_at_ms.saturating_sub((self.now)().timestamp_millis()),
+                );
+                continue;
+            }
             retry_by_key.insert(key, rr.clone());
             self.re_arm_retry(rr);
         }
@@ -87,6 +98,9 @@ impl Orchestrator {
         // `ClaimRow.issue_id` IS the identifier (store PK).
         for cl in rec.claims {
             let identifier = cl.issue_id;
+            if limit_claims.contains(&identifier) {
+                continue;
+            }
             if !cl.project_slug.is_empty() && self.project_unconfigured(&cl.project_slug) {
                 tracing::info!(issue_identifier = %identifier, project_slug = %cl.project_slug, "recovery: releasing recovered claim; project no longer configured");
                 self.persist_release(&identifier);

@@ -625,130 +625,153 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
     use rhapsody_config::teams::{
         Identity, ManagerHarnessEntry, ReviewAuthority, ReviewMode, Teams,
     };
-    let (store, _, case) = setup("which event shape?");
-    store
-        .save_lead_execution(&rhapsody_store::LeadExecution {
-            item: case.item.id,
-            ..Default::default()
-        })
-        .expect("execution");
-    let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
-    let mut eff = empty_effective(tracker.clone());
-    let mut project = empty_resolved_project("proj", tracker);
-    project.repo = "https://github.com/o/r.git".into();
-    project.mcfg.claude.command = "/bin/echo 9.9.9".into();
-    project.mcfg.opencode.command = "/bin/echo 9.9.9".into();
-    eff.projects.push(project);
-    eff.max_concurrent = 10;
-    let mut o = crate::Orchestrator::new("WORKFLOW.md");
-    o.eff = Some(eff);
-    o.set_store(store.clone());
-    let mut teams = Teams::disabled();
-    teams.enabled = true;
-    teams.manager.lead.enabled = true;
-    teams.manager.review_authority = ReviewAuthority::Act;
-    teams.review.mode = ReviewMode::Ticketless;
-    teams.manager.harnesses = vec![
-        ManagerHarnessEntry {
-            harness: "opencode".into(),
-            model: "openai/gpt-test".into(),
-            effort: "high".into(),
-        },
-        ManagerHarnessEntry {
-            harness: "claude".into(),
-            model: "claude-test".into(),
-            effort: "high".into(),
-        },
-    ];
-    teams.roster.push(Identity {
-        name: "jerry".into(),
-        profile: "swe".into(),
-        ..Default::default()
-    });
-    o.manager_selftest
-        .configure(teams.manager.effective_harnesses());
-    o.manager_selftest
-        .set_credential_probe(Arc::new(ValidLogin));
-    o.teams = Some(teams);
-    let dispatched = Arc::new(Mutex::new(Vec::new()));
-    let sink = dispatched.clone();
-    o.spawn = Some(Box::new(move |_, _, re| {
-        sink.lock().expect("spawn").push(re.clone());
-    }));
-    let run = crate::managerrun::ManagerRun {
-        lead_item: Some(case.item.id),
-        owner: "o".into(),
-        repo: "r".into(),
-        number: 290,
-        repo_url: "https://github.com/o/r.git".into(),
-        case_packet: case.evidence.clone(),
-        ..Default::default()
-    };
-    assert!(matches!(
-        o.dispatch_manager(run.clone()),
-        crate::managerrun::ManagerDispatchOutcome::SelfTestFailed(_)
-    ));
-    assert_eq!(
+    for limited_default in [false, true] {
+        let (store, _, case) = setup("which event shape?");
         store
-            .lead_execution(case.item.id)
-            .expect("execution")
-            .expect("row")
-            .run_attempts,
-        0
-    );
-    let version = crate::managerselftest::probe_cli_version("/bin/echo 9.9.9").expect("version");
-    for index in 0..2 {
-        o.manager_selftest.record_entry(
-            index,
-            SelfTestRecord {
-                cli_version: version.clone(),
-                verdict: SelfTestVerdict::Passed,
+            .save_lead_execution(&rhapsody_store::LeadExecution {
+                item: case.item.id,
+                ..Default::default()
+            })
+            .expect("execution");
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let mut eff = empty_effective(tracker.clone());
+        let mut project = empty_resolved_project("proj", tracker);
+        project.repo = "https://github.com/o/r.git".into();
+        project.mcfg.claude.command = "/bin/echo 9.9.9".into();
+        project.mcfg.opencode.command = "/bin/echo 9.9.9".into();
+        eff.projects.push(project);
+        eff.max_concurrent = 10;
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.set_store(store.clone());
+        let mut teams = Teams::disabled();
+        teams.enabled = true;
+        teams.manager.lead.enabled = true;
+        teams.manager.review_authority = ReviewAuthority::Act;
+        teams.review.mode = ReviewMode::Ticketless;
+        teams.manager.harnesses = vec![
+            ManagerHarnessEntry {
+                harness: "opencode".into(),
+                model: "openai/gpt-test".into(),
+                effort: "high".into(),
             },
+            ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "claude-test".into(),
+                effort: "high".into(),
+            },
+        ];
+        teams.roster.push(Identity {
+            name: "jerry".into(),
+            profile: "swe".into(),
+            ..Default::default()
+        });
+        o.manager_selftest
+            .configure(teams.manager.effective_harnesses());
+        o.manager_selftest
+            .set_credential_probe(Arc::new(ValidLogin));
+        o.teams = Some(teams);
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let sink = dispatched.clone();
+        o.spawn = Some(Box::new(move |_, _, re| {
+            sink.lock().expect("spawn").push(re.clone());
+        }));
+        let run = crate::managerrun::ManagerRun {
+            lead_item: Some(case.item.id),
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 290,
+            repo_url: "https://github.com/o/r.git".into(),
+            case_packet: case.evidence.clone(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            o.dispatch_manager(run.clone()),
+            crate::managerrun::ManagerDispatchOutcome::SelfTestFailed(_)
+        ));
+        assert_eq!(
+            store
+                .lead_execution(case.item.id)
+                .expect("execution")
+                .expect("row")
+                .run_attempts,
+            0
         );
+        let version =
+            crate::managerselftest::probe_cli_version("/bin/echo 9.9.9").expect("version");
+        for index in 0..2 {
+            o.manager_selftest.record_entry(
+                index,
+                SelfTestRecord {
+                    cli_version: version.clone(),
+                    verdict: SelfTestVerdict::Passed,
+                },
+            );
+        }
+        if limited_default {
+            let now = chrono::Utc::now().timestamp();
+            o.accounts.observe(
+                "claude-subscription",
+                rhapsody_agent::ratelimit::LimitObs {
+                    status: rhapsody_agent::ratelimit::LimitStatus::Rejected,
+                    windows: vec![rhapsody_agent::ratelimit::WindowObs {
+                        window: "five_hour".into(),
+                        utilization: 1.0,
+                        resets_at_s: now + 5000,
+                    }],
+                    using_credits: false,
+                    source: "stream",
+                    observed_at_s: now,
+                },
+            );
+        }
+        o.handle_lead_prepared(case.item.id, Ok(Some((case.clone(), run.clone()))));
+        assert_eq!(dispatched.lock().expect("spawn")[0].harness, "opencode");
+        assert!(store.load_review_watch().expect("watch").is_empty());
+        if limited_default {
+            continue;
+        }
+        o.pump_manager_interventions();
+        assert!(
+            o.manager_attempts.contains_key(&run.key()),
+            "a manager sweep must preserve the active lead's cursor"
+        );
+        let re = o.running.get(&run.key()).expect("running").clone();
+        o.on_worker_exit(crate::retry::EvWorkerExit {
+            issue_id: run.key(),
+            started_at: re.started_at,
+            failed: true,
+            auth_needed: true,
+            err_msg: "turn_failed".into(),
+            last_state: String::new(),
+            declared_handoff: false,
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+        });
+        let spawned = dispatched.lock().expect("spawn");
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[1].harness, "claude");
+        assert_eq!(spawned[1].model_override.model, "claude-test");
+        drop(spawned);
+        assert_eq!(
+            store
+                .manager_budget("o/r#290")
+                .expect("budget")
+                .expect("row")
+                .runs_used,
+            2
+        );
+        assert_eq!(
+            store
+                .lead_execution(case.item.id)
+                .expect("execution")
+                .expect("row")
+                .run_attempts,
+            2
+        );
+        assert!(o.lead_cases.contains_key(&run.key()));
     }
-    o.handle_lead_prepared(case.item.id, Ok(Some((case.clone(), run.clone()))));
-    assert_eq!(dispatched.lock().expect("spawn")[0].harness, "opencode");
-    assert!(store.load_review_watch().expect("watch").is_empty());
-    o.pump_manager_interventions();
-    assert!(
-        o.manager_attempts.contains_key(&run.key()),
-        "a manager sweep must preserve the active lead's cursor"
-    );
-    let re = o.running.get(&run.key()).expect("running").clone();
-    o.on_worker_exit(crate::retry::EvWorkerExit {
-        issue_id: run.key(),
-        started_at: re.started_at,
-        failed: true,
-        auth_needed: true,
-        err_msg: "turn_failed".into(),
-        last_state: String::new(),
-        declared_handoff: false,
-        review_verdict: None,
-        manager_text: None,
-        refused: false,
-    });
-    let spawned = dispatched.lock().expect("spawn");
-    assert_eq!(spawned.len(), 2);
-    assert_eq!(spawned[1].harness, "claude");
-    assert_eq!(spawned[1].model_override.model, "claude-test");
-    drop(spawned);
-    assert_eq!(
-        store
-            .manager_budget("o/r#290")
-            .expect("budget")
-            .expect("row")
-            .runs_used,
-        2
-    );
-    assert_eq!(
-        store
-            .lead_execution(case.item.id)
-            .expect("execution")
-            .expect("row")
-            .run_attempts,
-        2
-    );
-    assert!(o.lead_cases.contains_key(&run.key()));
 }
 
 #[test]

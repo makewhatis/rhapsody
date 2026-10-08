@@ -366,9 +366,38 @@ impl Orchestrator {
         attempt: Option<i64>,
         route: Option<DispatchRoute>,
         stack_context: String,
-        prepared: Option<PreparedHarnessSpec>,
-        engine: Option<crate::dispatch::DispatchEngine>,
+        mut prepared: Option<PreparedHarnessSpec>,
+        mut engine: Option<crate::dispatch::DispatchEngine>,
     ) {
+        if engine.is_none() && attempt.is_some() {
+            engine = self.limit_policy.pinned_engines.get(&iss.id).cloned();
+        }
+        if prepared.is_none()
+            && engine.is_none()
+            // A lead was admitted against its selected manager entry. A teammate/default
+            // projection here would test the wrong account; the final actual-account gate below
+            // still runs after the manager override is installed.
+            && !self.pending_manager.get(&iss.id).is_some_and(|m| m.lead_item.is_some())
+            && !self.limit_dispatch_ready(&iss, route.as_ref().map_or("", |r| r.slug.as_str()))
+        {
+            if let Some(attempt) = attempt {
+                self.schedule_retry_for(
+                    RetryTarget {
+                        id: &iss.id,
+                        identifier: &iss.identifier,
+                        project_slug: route.as_ref().map_or("", |r| r.slug.as_str()),
+                        project_repo: route.as_ref().map_or("", |r| r.repo.as_str()),
+                    },
+                    attempt,
+                    60_000,
+                    "waiting: account limit",
+                    iss.clone(),
+                    self.planned_identity(&iss, &self.teammate_load())
+                        .unwrap_or_default(),
+                );
+            }
+            return;
+        }
         // STUDIO-880, a backstop and NOT a gate. Every path that decides whether to dispatch refuses
         // or parks above this line — `on_tick`, `on_retry`, `dispatch_review` — because each of them
         // owns bookkeeping a refusal here would strand (a claim, a retry entry, a watch row recorded
@@ -678,6 +707,41 @@ impl Orchestrator {
             };
             re.project_repo = r.repo.clone();
         }
+        self.feed_budget_windows();
+        let prepared_account = prepared
+            .as_ref()
+            .and_then(|s| s.provider.as_ref())
+            .map(|p| p.stable_id().to_string());
+        if !self.gate_limit_dispatch(&mut re, &mut engine, prepared_account.as_deref()) {
+            if let Some(attempt) = attempt {
+                self.schedule_retry_for(
+                    RetryTarget {
+                        id: &iss.id,
+                        identifier: &iss.identifier,
+                        project_slug: &re.project_slug,
+                        project_repo: &re.project_repo,
+                    },
+                    attempt,
+                    60_000,
+                    "waiting: account limit",
+                    iss.clone(),
+                    re.identity.clone(),
+                );
+            }
+            return;
+        }
+        if prepared.is_some() && !re.brokered {
+            prepared = None;
+        }
+        if engine.is_some() {
+            re.harness_origin = format!("profile.engine[{}]", re.engine_index);
+            re.model_origin = re.harness_origin.clone();
+        }
+        re.resume_session = self
+            .limit_policy
+            .resume_sessions
+            .remove(&iss.id)
+            .unwrap_or_default();
         // STUDIO-957: the per-provider daily budget, the STOP beside the concurrency gate. It
         // bounds NEW dispatch only, and it is checked HERE — after the run's harness/model are
         // resolved (so the provider it reads is the one [`persist_start_run`](Orchestrator::persist_start_run)
@@ -975,11 +1039,39 @@ impl Orchestrator {
             .get(&e.issue_id)
             .is_some_and(|re| re.started_at == e.started_at);
         if !live {
+            if let Some(suspended) = self.limit_policy.suspended.get_mut(&e.issue_id)
+                && suspended.run.started_at == e.started_at
+            {
+                suspended.worker_finished = true;
+            }
             return; // already terminated/cleaned by reconcile, or a stale exit from a prior dispatch
+        }
+        if e.last_state == crate::limitpolicy::HANDOFF_LIMIT_MARKER {
+            if let Some(re) = self.running.remove(&e.issue_id) {
+                self.release_teams_run(&re);
+                let account = self
+                    .accounts
+                    .account_for_run(&crate::accounts::run_key(&e.issue_id, re.started_at))
+                    .unwrap_or_else(|| re.pricing.account.clone());
+                self.finish_limit_stop(re, &account, true);
+            }
+            return;
         }
         let Some(re) = self.running.remove(&e.issue_id) else {
             return;
         };
+        self.limit_policy.deadlines.remove(&e.issue_id);
+        self.limit_policy
+            .cost_baselines
+            .retain(|(run, _), _| *run != re.run_id);
+        if let Some(timer) = self.retry_timers.remove(&format!("limit:{}", e.issue_id)) {
+            timer.abort();
+        }
+        if let Some(engine) = &re.engine {
+            self.limit_policy
+                .pinned_engines
+                .insert(e.issue_id.clone(), engine.clone());
+        }
         self.release_teams_run(&re);
         // A review run's worktree has no other reclaimer: its `pr:` id reaches no terminal tracker
         // state, so `reconcile`'s TerminateCleanup never fires for it (STUDIO-715, design §14.2).
@@ -1112,6 +1204,7 @@ impl Orchestrator {
                 }
             }
             if release {
+                self.limit_policy.pinned_engines.remove(&e.issue_id);
                 // Left the active set: declared hand-off (completed), external non-terminal move
                 // (stopped), a Done-type terminal (completed), or a cancel-type terminal (stopped).
                 // Drop the claim + continuation marker and DON'T schedule a retry.
@@ -1187,6 +1280,17 @@ impl Orchestrator {
     /// candidate set, and re-checks per-project + per-state + global slots — then re-dispatches,
     /// requeues, or releases the claim. Mirrors Go `onRetry`. A control-loop (O7) entry point.
     pub async fn on_retry(&mut self, e: EvRetry) {
+        if let Some(id) = e.issue_id.strip_prefix("limit:") {
+            self.enforce_limits();
+            self.resume_limit(id).await;
+            return;
+        }
+        if let Some(text) = self.retry_attempts.get(&e.issue_id).map(|r| r.err.clone())
+            && text.starts_with(crate::limitpolicy::RETRY_LIMIT_PREFIX)
+        {
+            self.recover_limit_retry(&e.issue_id, &text).await;
+            return;
+        }
         // STUDIO-880: the drain gate's SECOND entry point, and the one that is easy to miss.
         // `on_tick` is not the only path that dispatches — a due retry dispatches straight from
         // here, bypassing the tick entirely — so a drain that gated only `on_tick` would settle the

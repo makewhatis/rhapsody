@@ -147,6 +147,7 @@ pub struct RunningEntry {
     /// Frozen for this run; policy must end the run before choosing another engine.
     pub engine_index: usize,
     pub engine: Option<crate::dispatch::DispatchEngine>,
+    pub resume_session: String,
     pub turn_count: i64,
     /// The last observed agent event type (one of `rhapsody_agent`'s `EVENT_*` values; Go's
     /// `agent.EventType`).
@@ -248,6 +249,7 @@ impl RunningEntry {
             session_id: String::new(),
             engine_index: 0,
             engine: None,
+            resume_session: String::new(),
             turn_count: 0,
             last_event: String::new(),
             last_message: String::new(),
@@ -1033,6 +1035,7 @@ pub struct Orchestrator {
     pub(crate) drain: crate::drain::DrainSignal,
     /// Account observations written on the control task and read off-loop by HTTP.
     pub(crate) accounts: Arc<crate::accounts::AccountLedger>,
+    pub(crate) limit_policy: crate::limitpolicy::LimitPolicy,
     /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
     /// when the previous tick found the drain armed, which is what makes the cancel transition
     /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
@@ -1247,6 +1250,7 @@ impl Orchestrator {
             // inert, i.e. byte-identical to a daemon built before the feature.
             drain: crate::drain::DrainSignal::new(),
             accounts: Arc::new(crate::accounts::AccountLedger::default()),
+            limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
             // default and every dispatch path is byte-identical to a daemon built before the feature.

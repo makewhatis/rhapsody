@@ -194,6 +194,10 @@ impl Orchestrator {
         // in-flight estimate, result events the authoritative per-turn total), which is what makes
         // the bound a STOP rather than a report. An unset ceiling returns immediately.
         self.enforce_run_token_ceiling(&e.issue_id);
+        self.observe_credit_cost(&e.issue_id, &e.ev);
+        if e.ev.usage.is_some() || e.ev.cost_usd.is_some() {
+            self.enforce_limits();
+        }
     }
 
     /// Stops a run whose live spend has reached the configured per-run token ceiling (STUDIO-967).

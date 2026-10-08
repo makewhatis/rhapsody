@@ -114,6 +114,32 @@ pub(super) async fn fetch_candidate_issues(c: &Client) -> Result<Vec<Issue>, Tra
     .await
 }
 
+pub(super) async fn fetch_parked_issue(
+    c: &Client,
+    id: &str,
+) -> Result<Option<Issue>, TrackerError> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let viewer = super::client::resolve_viewer(c).await?;
+    let mut extra = vec![
+        ("id", Value::String(id.into())),
+        ("assigneeID", Value::String(viewer.id)),
+    ];
+    let milestone = !c.config.milestone.is_empty();
+    if milestone {
+        extra.push(("milestoneID", Value::String(resolve_milestone_id(c).await?)));
+    }
+    let issues = paginate(
+        c,
+        &query::query_parked_issue(milestone),
+        &candidate_states(c),
+        &extra,
+    )
+    .await?;
+    Ok(issues.into_iter().find(|i| i.id == id))
+}
+
 /// candidateStates returns active ∪ review states — review states appended after the active ones,
 /// dedup'd by exact name. With no review states it returns the active slice unchanged, preserving
 /// the ordering the live API was verified against (candidates.go's `candidateStates`).

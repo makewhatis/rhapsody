@@ -19,14 +19,14 @@ pub fn account_for(harness: &str, model: &str, oauth: bool) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct WindowView {
     pub window: String,
     pub utilization: f64,
     pub resets_at_s: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct AccountView {
     pub account: String,
     pub windows: Vec<WindowView>,
@@ -60,6 +60,7 @@ struct WindowState {
     view: WindowView,
     status: LimitStatus,
     using_credits: bool,
+    source: String,
 }
 
 fn expired(window: &WindowView, now_s: i64) -> bool {
@@ -128,6 +129,7 @@ impl AccountLedger {
                     old.view.resets_at_s = 0;
                     old.status = status;
                     old.using_credits = using_credits;
+                    old.source = obs.source.into();
                 }
                 Some(old)
                     if window.resets_at_s == 0 || old.view.resets_at_s == window.resets_at_s =>
@@ -135,6 +137,7 @@ impl AccountLedger {
                     old.view.utilization = old.view.utilization.max(window.utilization);
                     if severity(status) > severity(old.status) {
                         old.status = status;
+                        old.source = obs.source.into();
                     }
                     if obs.observed_at_s >= account.last_seen_s {
                         old.using_credits = using_credits;
@@ -151,6 +154,7 @@ impl AccountLedger {
                             },
                             status,
                             using_credits,
+                            source: obs.source.into(),
                         },
                     );
                 }
@@ -257,6 +261,50 @@ impl AccountLedger {
             .remove(run);
     }
 
+    pub fn account_for_run(&self, run: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runs
+            .get(run)
+            .cloned()
+    }
+
+    /// Operator-owned budget windows are replaced when their cap changes; stream/probe windows
+    /// keep L1's monotonic same-window rule and are never cleared by a workflow edit.
+    pub fn forget_budget(&self, account: &str) {
+        if let Some(account) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accounts
+            .get_mut(account)
+        {
+            account.windows.retain(|_, w| w.source != "budget");
+        }
+    }
+
+    /// A forbidden credit observation holds the account until this window's reset, even if a
+    /// later stream line stops reporting overage. Same-window status monotonicity owns the latch.
+    pub fn reject_until_reset(&self, account: &str, now_s: i64) {
+        if let Some(window) = self.tightest(account, now_s) {
+            self.observe(
+                account,
+                LimitObs {
+                    status: LimitStatus::Rejected,
+                    windows: vec![rhapsody_agent::ratelimit::WindowObs {
+                        window: window.window,
+                        utilization: window.utilization,
+                        resets_at_s: window.resets_at_s,
+                    }],
+                    using_credits: false,
+                    source: "stream",
+                    observed_at_s: now_s,
+                },
+            );
+        }
+    }
+
     fn observe_run(&self, run: &str, obs: LimitObs) {
         let account = self
             .state
@@ -277,7 +325,7 @@ pub(crate) fn run_key(issue_id: &str, started_at: chrono::DateTime<chrono::Utc>)
 
 impl crate::Orchestrator {
     pub(crate) fn bind_account(
-        &self,
+        &mut self,
         issue_id: &str,
         started_at: chrono::DateTime<chrono::Utc>,
         account: &str,
@@ -287,13 +335,18 @@ impl crate::Orchestrator {
             .get(issue_id)
             .is_some_and(|re| re.started_at == started_at)
         {
+            if !account.is_empty()
+                && let Some(re) = self.running.get_mut(issue_id)
+            {
+                re.pricing.account = account.into();
+            }
             self.accounts
                 .bind_run(&run_key(issue_id, started_at), account);
         }
     }
 
     pub(crate) fn observe_account(
-        &self,
+        &mut self,
         issue_id: &str,
         started_at: chrono::DateTime<chrono::Utc>,
         obs: LimitObs,
@@ -305,6 +358,7 @@ impl crate::Orchestrator {
         {
             self.accounts
                 .observe_run(&run_key(issue_id, started_at), obs);
+            self.enforce_limits();
         }
     }
 }

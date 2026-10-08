@@ -852,6 +852,19 @@ impl Drop for OpencodeSession {
 
 #[async_trait]
 impl Session for OpencodeSession {
+    fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
+        if thread_id.is_empty() || *self.locked_session_id() != thread_id {
+            return Err(AgentError::Other(
+                "parked OpenCode session could not be restored from retained state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn retain_for_limit(&self) {
+        self.last_turn_failed.store(true, Ordering::SeqCst);
+        self.persist_resume();
+    }
     fn account_oauth(&self) -> Option<bool> {
         self.account_oauth.get().copied().flatten()
     }

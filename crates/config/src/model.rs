@@ -502,6 +502,8 @@ pub struct Config {
     pub budgets: BTreeMap<String, ProviderBudget>,
     /// Prices keyed by the full `<provider>/<model>` name; absent means no configured prices.
     pub prices: HashMap<String, Price>,
+    /// Default-on account limit handling (STUDIO-1126), independent of provider budgets.
+    pub limits: crate::limits::Limits,
 
     /// The operator-notification channels the runaway-loop breaker escalates to (STUDIO-1026).
     /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
@@ -554,6 +556,7 @@ pub(crate) struct Raw {
     /// `budgets:` front-matter block (STUDIO-957). Rhapsody-only: absent ⇒ empty ⇒ unlimited.
     pub budgets: BTreeMap<String, RawProviderBudget>,
     pub prices: BTreeMap<String, Price>,
+    pub limits: Option<crate::limits::Limits>,
     /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
     /// unconfigured workflow byte-identical on the round-trip.

@@ -85,6 +85,50 @@ findings from `~/.rhapsody/docs/<ticket>-findings.md`. Preference recall, sandbo
 digest delivery, immediate pages and overrule UI belong to subsequent slices. With the lead disabled,
 existing payloads, schema goldens and dispatch behavior remain unchanged.
 
+### Default-on account limit policy (STUDIO-1126)
+
+`limits:` adds an intentional scheduling divergence from Go: an absent block still uses
+80/90/95 percent warn/stop-new/handoff thresholds, a 30-minute maximum wait, a ten-minute
+handoff grace period, and `credits: never`. Per-account threshold overrides inherit the
+other thresholds. Non-default settings survive a config save; the existing Go config
+goldens keep their shape. Setting all thresholds to 100 and credits to `always` disables
+this policy; separately configured provider budgets remain independent.
+
+Known limited accounts refuse new work before spending selection slots. Implementers use
+a healthy profile fallback when available, and reviewer selection excludes limited accounts.
+The final dispatch gate also rechecks prepared dispatches before their run starts. Limit
+handoffs use the existing operator mailbox and the exact `HANDOFF: limit` marker, which
+does not move a ticket to review. The daemon stops at the wall or grace deadline, preserves
+the work, and writes an owner-only, atomically replaced handoff note beside the ticket's
+progress file, using bounded progress/transcript reads.
+
+Short waits resume the same engine and conversation at the reset plus 120 seconds; a tight
+`seven_day` window never parks. Longer waits switch to a healthy fallback or produce a
+`limit_items` human-feed item pending manager limit actions. Parked work rechecks current
+ticket eligibility, assignment and project scope (including already-assigned pool work),
+or the review's pinned head/generation. Manager runs have no ticket workspace and remove
+their isolated configuration on exit, so they produce a human-feed item rather than a
+parked conversation; their ordered engine fallback is owned by manager integration.
+Resume metadata uses the existing retry queue and
+restores known holds at boot without changing the Go schema. `limit` is a distinct run
+outcome and charges no failure/review verdict budget or completed-review breaker round.
+If the handoff note cannot be written, a note-absent human decision item and suspension
+still persist; a restart does not silently release the ticket.
+
+Under `never`, observed overage stops immediately and the account remains rejected until
+reset. `manager_urgent` is likewise fail-closed until manager authorization lands.
+`daily_cap` meters positive reported-cost deltas while credits are in use; estimates and
+once-per-account/local-day credit-spend events persist in the existing event ledger. An
+unreadable ledger or an omitted terminal cost refuses further credits.
+An omitted overage cost is recorded as unknown and refuses credits for the rest of the
+local day across restarts. Credit permission never bypasses a rejected account window.
+Subscription API-equivalent dollars do not become provider budget windows. Pay-per-token
+budgets feed daily windows, and changing/removing an operator cap replaces only its budget observation,
+never an external stream/probe observation.
+
+Actual Claude session resumption after a five-hour gap remains unverified; fake-harness
+tests pin the first-turn `--resume` argument and avoid real quota.
+
 ### Tech-lead trigger queue (STUDIO-1134)
 
 `manager.lead.enabled` in the boot-loaded Teams configuration opts into a durable
