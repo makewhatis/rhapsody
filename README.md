@@ -1409,8 +1409,9 @@ manager harness still has no built-in shell, edit or web tools. This has no Go c
 The manager-only MCP tool proxies the additive, operator-guarded
 `POST /api/v1/manager/investigate?run_id=...`; ordinary workers do not register the tool.
 
-The host verifies the live run's own PR head, provisions a hook-free detached worktree from
-cached mirror objects, mounts it and a dependency cache read-only, and provides writable scratch
+The host verifies the live run's own PR head, exports it with Git's built-in tar archive from
+cached mirror objects (no host checkout, content filters or hooks), mounts the unpacked export and
+a dependency cache read-only, and provides writable scratch
 tmpfs. Network, operator credentials, home mounts, capabilities and privilege escalation are
 absent. Limits are 2 CPUs, 4 GiB RAM, 512 processes, ten minutes per command, thirty per session
 and 64 KiB combined output. A separate networked, credential-free warm-up sees dependency metadata

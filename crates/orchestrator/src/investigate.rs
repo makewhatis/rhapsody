@@ -521,8 +521,8 @@ impl Drop for CheckoutGuard {
         let id = self.run_id;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if mgr.remove_investigate_worktree(&repo, id).await.is_err() {
-                    tracing::warn!(run = id, "investigate: detached worktree cleanup failed");
+                if mgr.remove_investigate_export(&repo, id).await.is_err() {
+                    tracing::warn!(run = id, "investigate: PR export cleanup failed");
                 }
             });
         }
@@ -702,14 +702,14 @@ impl Investigations {
                 return Err(InvestigateError::SessionEnded);
             }
             if session.is_none() {
-                // A dropped request must not abandon an in-progress git checkout. The bounded
+                // A dropped request must not abandon an in-progress PR export. The bounded
                 // task owns its result guard; an unconsumed result drops and removes the tree.
                 let checkout_mgr = mgr.clone();
                 let checkout_repo = repo.to_string();
                 let checkout_head = head.to_string();
                 let provisioning = tokio::spawn(async move {
                     let ws = checkout_mgr
-                        .ensure_investigate_worktree(&checkout_repo, id, &checkout_head)
+                        .ensure_investigate_export(&checkout_repo, id, &checkout_head)
                         .await
                         .map_err(|_| {
                             InvestigateError::Unavailable(
@@ -725,7 +725,7 @@ impl Investigations {
                 });
                 let (ws, checkout) = provisioning
                     .await
-                    .map_err(|_| InvestigateError::Unavailable("checkout task failed".into()))??;
+                    .map_err(|_| InvestigateError::Unavailable("PR export task failed".into()))??;
                 let cache = self.warm_cache(&ws.path, &image).await?;
                 let name = format!("rhapsody-investigate-{}-{id}", unique());
                 let container =

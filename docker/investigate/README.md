@@ -20,11 +20,16 @@ revision of the same source version. The runtime pins the resulting immutable im
   The manager's authority and other tools continue to work.
 - Docker uses an empty daemon-owned config and a local Unix socket, never registry credentials or
   credential helpers. The default socket is `/var/run/docker.sock`; set `DOCKER_HOST=unix://...`
-  before daemon startup for a different local engine. Remote Docker endpoints are not supported.
-- Only a live manager run can investigate its own PR's verified head SHA. Checkout uses cached
-  mirror objects, without fetching, lifecycle hooks or operator git configuration. An uncached head
+  before daemon startup for a different local engine. OrbStack's Docker-compatible engine is the
+  supported engine on macOS. Remote Docker endpoints are not supported.
+- Only a live manager run can investigate its own PR's verified head SHA. `git archive --format=tar`
+  exports cached mirror objects into a disposable directory, without fetching, host checkout,
+  content filters, lifecycle hooks or operator git configuration. An uncached head
   gives a typed refusal; commission the author to supply the evidence instead.
-- `/repo` is a read-only detached worktree; `/cache` is a read-only cache volume; `/scratch` is a
+  Archive reads only the mirror's object database through an empty daemon-owned Git directory:
+  invoking archive in the mirror itself can still run its configured smudge/process filters.
+- `/repo` is a read-only PR-head export without `.git` metadata (Git history commands are unavailable);
+  `/cache` is a read-only cache volume; `/scratch` is a
   1 GiB executable tmpfs. The root filesystem is read-only. Containers have no network, capabilities
   or privilege escalation, run as uid/gid 1000, and have 2 CPUs, 4 GiB RAM and 512 processes maximum.
 - Commands start with only `PATH` and `HOME=/scratch`. There are no host-home, SSH, OpenCode-data,

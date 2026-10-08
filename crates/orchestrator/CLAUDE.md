@@ -138,8 +138,8 @@ the `Orchestrator` struct itself. Concretely:
     "known" would reopen the silent hole.
 
   - `investigate.rs`'s `Investigations` (STUDIO-1135) — control only binds/releases live manager
-    ids through `bind_teams_run`/`release_teams_run`. Request tasks own Docker, cached detached
-    checkouts, per-session async locks and the warm-up lock. The registry mutex never spans an
+    ids through `bind_teams_run`/`release_teams_run`. Request tasks own Docker, cached PR-head
+    archive exports, per-session async locks and the warm-up lock. The registry mutex never spans an
     await. Run release cancels investigation work and schedules cleanup; deadlines also remove
     idle containers. Failed sandbox self-tests disable this tool only, leaving authority intact.
 
