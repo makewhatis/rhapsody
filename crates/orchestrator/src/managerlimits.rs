@@ -381,6 +381,8 @@ impl Orchestrator {
 
     pub(crate) fn credit_approved(&self, id: &str, account: &str) -> bool {
         self.limits_config().credits == "manager_urgent"
+            && !(account == "chatgpt-subscription"
+                && self.openai_budget_rejected((self.now)().timestamp()))
             && self
                 .limit_policy
                 .credit_approvals
