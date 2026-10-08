@@ -113,6 +113,18 @@ pub fn query_candidates(with_milestone: bool, pool: bool) -> String {
     q
 }
 
+/// L4's scoped recheck: identical full fields and eligibility filters, but the viewer owns the
+/// already-claimed ticket even under pool mode. The id bound admits at most one issue.
+pub fn query_parked_issue(with_milestone: bool) -> String {
+    query_candidates(with_milestone, false)
+        .replacen("query Candidates(", "query ParkedIssue($id: ID!, ", 1)
+        .replacen(
+            "filter: { project:",
+            "filter: { id: { eq: $id }, project:",
+            1,
+        )
+}
+
 /// Builds the `BacklogCandidates` query (mirrors Go `queryBacklogCandidates`). Full issue nodes
 /// (same selection as `query_candidates`) filtered to the Backlog state TYPE and the API key
 /// owner's assigned issues, paginated. `with_milestone` adds the `$milestoneID: ID!` variable + a

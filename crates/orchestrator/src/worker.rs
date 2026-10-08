@@ -332,6 +332,7 @@ pub struct WorkerDeps {
     pub prepared_harness: Option<Arc<dyn Harness>>,
     /// A limit-policy switch starts fresh and seeds turn 1 with the carried note path.
     pub engine: Option<crate::dispatch::DispatchEngine>,
+    pub resume_session: String,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -1014,7 +1015,7 @@ pub async fn run_agent_attempt(
             }
         }
         None => {
-            let started = if deps.engine.is_some() {
+            let started = if deps.engine.is_some() && deps.resume_session.is_empty() {
                 deps.agent
                     .start_fresh_session(&ws.path, issue.clone(), transcript)
                     .await
@@ -1054,6 +1055,15 @@ pub async fn run_agent_attempt(
             }
         }
     };
+    if !deps.resume_session.is_empty()
+        && let Err(error) = sess.resume_from(&deps.resume_session)
+    {
+        return (
+            issue.state.clone(),
+            WorkerDeclaration::default(),
+            Some(error.into()),
+        );
+    }
     // Hand the non-secret ledger receiver to the loop-external supervisor, so an armed receipt
     // survives cancellation (design §10.3).
     if let (Some(slots), Some(receiver)) = (deps.broker.as_ref(), broker_turns)
@@ -1262,6 +1272,17 @@ impl WorkerDeps {
             // Remember the freshest final result text; the HANDOFF: marker (if any) is on the last
             // completed turn, which is what the caller classifies against (INF-272).
             last_result = tr.result_text;
+            if last_result
+                .lines()
+                .any(|line| line.trim() == crate::limitpolicy::HANDOFF_LIMIT_MARKER)
+            {
+                sess.retain_for_limit();
+                return (
+                    crate::limitpolicy::HANDOFF_LIMIT_MARKER.into(),
+                    last_result,
+                    None,
+                );
+            }
             // Review-mode wind-down (STUDIO-716; design record
             // `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md` §14.2, "wind-down: team_id is a
             // red herring"). A review run's `pr:` key resolves to no tracker issue, so BOTH of the
@@ -1473,6 +1494,7 @@ mod tests {
             broker: None,
             prepared_harness: None,
             engine: None,
+            resume_session: String::new(),
         }
     }
 
@@ -1490,6 +1512,30 @@ mod tests {
         let mut ag = agentfake::Fake::new();
         ag.turns = turns;
         Arc::new(ag)
+    }
+
+    #[tokio::test]
+    async fn limit_marker_stops_the_fake_harness_without_a_review_move() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.into(),
+                result_text: "Saved WIP.\nHANDOFF: limit".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = Arc::new(trackerfake::Fake::new());
+        let mut deps = make_deps(ws, ag, tr.clone(), "Work", 20);
+        deps.review_handoff_state = Some("In Review".into());
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.team_id = "team".into();
+        let (state, declaration, error) =
+            run_agent_attempt(&mut deps, iss, None, None, &|_| {}, None).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(state, crate::limitpolicy::HANDOFF_LIMIT_MARKER);
+        assert!(declaration.declared_handoff);
+        assert!(tr.move_calls().is_empty());
     }
 
     #[tokio::test]

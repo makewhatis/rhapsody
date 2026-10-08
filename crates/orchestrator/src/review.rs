@@ -72,7 +72,7 @@ pub(crate) struct ReviewWatchCommit {
 /// — the checkout, the `SYMPHONY_REVIEW_HEAD` the agent reads, the `requested_sha` in the watch set,
 /// and (in slice 4) the SHA recorded as reviewed — is this same value, so a head that advances
 /// mid-review cannot be recorded as having been read.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReviewRun {
     /// GitHub repository owner.
     pub owner: String,
@@ -517,6 +517,11 @@ impl Orchestrator {
             tracing::warn!(review = %id, reason = %why, "ticketless review: refused");
             return ReviewDispatchOutcome::Refused(why);
         }
+        self.feed_budget_windows();
+        let pricing = self.review_projected_pricing(&iss, &route.slug);
+        if !self.account_usable(&pricing.account) {
+            return ReviewDispatchOutcome::BudgetHeld;
+        }
 
         // STUDIO-957: the per-provider daily budget, the drain gate's sibling. It must refuse HERE
         // rather than inside `dispatch_issue` for the SAME reason the drain gate does: the writes
@@ -567,7 +572,9 @@ impl Orchestrator {
                 // The synchronous path applies the watcher commit inline, in the same order the
                 // watcher's own `Dispatched` arm used to: dispatch tail first, then retire/charge.
                 let pr = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
-                self.finish_review_dispatch(run, route, iss);
+                if !self.finish_review_dispatch(run, route, iss) {
+                    return ReviewDispatchOutcome::BudgetHeld;
+                }
                 if let Some(commit) = commit {
                     self.commit_review_watch(&pr, &commit);
                 }
@@ -594,8 +601,8 @@ impl Orchestrator {
         run: ReviewRun,
         route: DispatchRoute,
         iss: Issue,
-    ) {
-        self.finish_review_dispatch_prepared(run, route, iss, None);
+    ) -> bool {
+        self.finish_review_dispatch_prepared(run, route, iss, None)
     }
 
     /// The prepared-review tail (PB7, STUDIO-1002): identical to [`Self::finish_review_dispatch`]
@@ -607,8 +614,25 @@ impl Orchestrator {
         route: DispatchRoute,
         iss: Issue,
         prepared: Option<rhapsody_agent::PreparedHarnessSpec>,
-    ) {
+    ) -> bool {
         let id = run.key();
+        self.feed_budget_windows();
+        let account = prepared
+            .as_ref()
+            .and_then(|p| p.provider.as_ref())
+            .map(|p| p.stable_id().to_string())
+            .unwrap_or_else(|| self.review_projected_pricing(&iss, &route.slug).account);
+        if !self.account_usable(&account) {
+            self.note_usd_budget_hold(crate::budget::BudgetHeld {
+                subject: id.clone(),
+                project: route.slug.clone(),
+                provider: account.clone(),
+                pr: format!("{}/{}#{}", run.owner, run.repo, run.number),
+                reason: format!("waiting: {account} limit"),
+                ..Default::default()
+            });
+            return false;
+        }
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
         // watcher's re-review condition is level-triggered and stays true on every tick between
         // introduction and first completion, which is what produced the duplicate dispatch the guard
@@ -667,8 +691,9 @@ impl Orchestrator {
         // Carried to the dispatch the way a graphite stacking hint is (`pending_stack`): the worker
         // spawn happens INSIDE `dispatch_issue`, so the pinned head has to be in place before the
         // call rather than stamped onto the running entry after it.
-        self.pending_review.insert(id, run);
+        self.pending_review.insert(id.clone(), run);
         self.dispatch_issue_prepared(iss, None, Some(route), String::new(), prepared);
+        self.running.contains_key(&id)
     }
 
     /// Resolves the dispatch routing for a pull request's repository: the enabled project whose

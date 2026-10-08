@@ -962,7 +962,8 @@ impl Orchestrator {
         let usd_configured = self
             .eff
             .as_ref()
-            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0));
+            .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0))
+            || !self.accounts.snapshot((self.now)().timestamp()).is_empty();
         let usd_held = self.manager_run_for(pr).is_some_and(|run| {
             if !usd_configured {
                 self.release_budget_hold(&run.key());

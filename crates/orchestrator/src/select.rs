@@ -222,6 +222,9 @@ impl Orchestrator {
                     );
                     continue;
                 }
+                if !self.limit_dispatch_ready(&iss, "") {
+                    continue;
+                }
                 let pst = normalize_state(&eff.review_promote_state);
                 if count(&state_counts, &pst)
                     >= state_limit(
@@ -256,6 +259,9 @@ impl Orchestrator {
                     // Surface the otherwise-silent blocker drop (INF-249); no-op for any other reason.
                     self.log_blocked_skip(&iss, &elig.blocked_by);
                 }
+                continue;
+            }
+            if !self.limit_dispatch_ready(&iss, "") {
                 continue;
             }
             // STUDIO-1016 (§7.9): a ticket with an unspent manager wake obligation is owned by the
@@ -632,6 +638,9 @@ impl Orchestrator {
                 if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
                     continue;
                 }
+                if !self.limit_dispatch_ready(&ti.iss, &p.slug) {
+                    continue;
+                }
                 let pst = normalize_state(&eff.review_promote_state);
                 if count(&state_counts, &pst)
                     >= state_limit(
@@ -665,6 +674,9 @@ impl Orchestrator {
                 } else {
                     self.log_blocked_skip(&ti.iss, &elig.blocked_by);
                 }
+                continue;
+            }
+            if !self.limit_dispatch_ready(&ti.iss, &p.slug) {
                 continue;
             }
             // STUDIO-1017 (§7.9): the multi-project ladder's half of the wake-obligation

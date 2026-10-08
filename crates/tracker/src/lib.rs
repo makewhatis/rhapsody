@@ -125,6 +125,16 @@ pub trait Tracker: Any + Send + Sync {
     /// project.
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError>;
 
+    /// Full eligibility recheck for a limit-parked ticket. Linear keeps project/milestone and
+    /// viewer scope but reads an already-assigned pool ticket rather than the unassigned pool.
+    async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
+        Ok(self
+            .fetch_candidate_issues()
+            .await?
+            .into_iter()
+            .find(|i| i.id == id))
+    }
+
     /// FetchIssuesByStates returns issues in the given states for the configured project. An
     /// empty states slice returns an empty result with no API call.
     async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError>;

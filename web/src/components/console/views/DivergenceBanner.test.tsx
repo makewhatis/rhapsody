@@ -57,6 +57,19 @@ describe("DivergenceBanner", () => {
     vi.clearAllMocks();
   });
 
+  it("routes a limit decision item to the human feed until manager actions exist", async () => {
+    h.fetchState.mockResolvedValue(state({ limit_items: [{
+      account: "claude-subscription", windows: [], credits_policy: "never",
+      tickets: [{ ticket: "STUDIO-1126", identity: "alice", mid_review: true,
+        fallback: [{ harness: "opencode", model: "openai/model", effort: "high" }], healthy: [false] }],
+    }] } as Partial<StateResponse>));
+    renderBanner();
+    await waitFor(() => expect(screen.getByText(/STUDIO-1126.*alice/)).toBeTruthy());
+    expect(screen.getByText(/claude-subscription.*limit/)).toBeTruthy();
+    expect(screen.getByText(/Credits policy: never/)).toBeTruthy();
+    expect(screen.getByText(/mid-review/)).toBeTruthy();
+  });
+
   // The daemon omits the key entirely on a healthy board, so an ordinary console has no banner to
   // suppress — and none that can be left showing by mistake.
   it("renders nothing on a healthy board", async () => {

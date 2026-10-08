@@ -51,6 +51,9 @@ macro_rules! tracker_span {
 
 #[async_trait]
 impl crate::Tracker for Client {
+    async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
+        candidates::fetch_parked_issue(self, id).await
+    }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         candidates::fetch_candidate_issues(self).await
     }

@@ -1736,6 +1736,16 @@ impl Store for Sqlite {
         Ok(n)
     }
 
+    fn account_credit_spend(&self, account: &str, since: &str) -> Result<f64, StoreError> {
+        let conn = self.lock();
+        Ok(conn.query_row("SELECT COALESCE(SUM(json_extract(text, '$.usd')), 0.0) FROM events WHERE kind = 'limit.credit_cost' AND at >= ?1 AND json_extract(text, '$.account') = ?2", params![since, account], |row| row.get(0))?)
+    }
+
+    fn account_credit_notified(&self, account: &str, since: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'limit.credit_spend' AND at >= ?1 AND json_extract(text, '$.account') = ?2)", params![since, account], |row| row.get(0))?)
+    }
+
     fn ticket_spend_by_provider(
         &self,
         ticket: &str,

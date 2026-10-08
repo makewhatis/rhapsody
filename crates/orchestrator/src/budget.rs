@@ -194,6 +194,10 @@ pub fn local_day_start() -> String {
     day_start(Local::now())
 }
 
+pub(crate) fn local_day_start_at(now: DateTime<Utc>) -> String {
+    day_start(now.with_timezone(&Local))
+}
+
 /// The local-day boundary for `now`, resolved through the ZONE's own transition rules rather than
 /// through `now`'s current offset.
 ///

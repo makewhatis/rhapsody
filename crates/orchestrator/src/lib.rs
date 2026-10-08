@@ -51,6 +51,7 @@ pub mod ghsummons;
 pub mod handoff;
 pub mod issuelog;
 pub mod lifecycle;
+pub mod limitpolicy;
 pub mod liveness;
 pub mod managerapply;
 pub mod managerapproval;
