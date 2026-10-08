@@ -1,4 +1,4 @@
-//! Shared helpers for the desktop integration tests that launch a REAL `rhapsodyd`.
+//! Shared helpers for desktop integration tests that launch `rhapsodyd` or `fakedaemon`.
 //!
 //! STUDIO-1038: the gated e2e tests spawn a real daemon through the supervisor, which puts the child
 //! in its OWN process group (`setpgid(0, 0)` — see `supervisor/mod.rs`). A test that reaches an
@@ -40,6 +40,7 @@ impl SupervisorGuard {
 
 impl Drop for SupervisorGuard {
     fn drop(&mut self) {
+        self.supervisor.request_stop();
         let pid = self.supervisor.status().pid;
         // 0 means the supervisor already reached Stopped (the clean-stop path ran); nothing to do.
         if pid <= 0 {

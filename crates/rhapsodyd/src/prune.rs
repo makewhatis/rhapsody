@@ -65,7 +65,13 @@ pub async fn run_prune_schedule<SF, RF, PW, Fut, RL>(
                         "startup prune: retention not loaded yet; skipping worktree GC this cycle"
                     );
                 } else {
-                    prune_workspaces(days).await;
+                    // Worktree GC can be waiting on the control task that shutdown has already
+                    // stopped. Do not hold run()'s prune join open waiting for that reply.
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancelled() => return,
+                        _ = prune_workspaces(days) => {},
+                    }
                 }
             }
         }
@@ -89,6 +95,36 @@ mod tests {
 
     fn mem_store() -> Arc<dyn Store + Send + Sync> {
         Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"))
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_pending_worktree_prune() {
+        let signal = CancelSignal::new();
+        let st = mem_store();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started = std::sync::Mutex::new(Some(started_tx));
+        let mut task = tokio::spawn(run_prune_schedule(
+            signal.wait(),
+            move || Arc::clone(&st),
+            || 30,
+            move |_| {
+                if let Some(tx) = started.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<usize>()
+            },
+            || true,
+        ));
+        tokio::time::timeout(StdDuration::from_secs(2), started_rx)
+            .await
+            .expect("worktree prune should start")
+            .unwrap();
+        signal.cancel();
+        let result = tokio::time::timeout(StdDuration::from_secs(2), &mut task).await;
+        task.abort();
+        result
+            .expect("cancellation must interrupt pending worktree GC")
+            .expect("prune scheduler must exit without panicking");
     }
 
     // Mirrors Go `TestPruneScheduleRunsOnceOnFreshDB`: the scheduler's startup prune runs without

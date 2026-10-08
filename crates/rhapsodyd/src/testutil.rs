@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
+#[cfg(feature = "test-timeout-canary")]
+#[test]
+fn deliberately_hanging_timeout_canary() {
+    loop {
+        std::thread::park();
+    }
+}
+
 pub async fn http_listener() -> (tokio::net::TcpListener, String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

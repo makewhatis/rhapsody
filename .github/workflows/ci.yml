@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   lint:
+    timeout-minutes: 30
     # Fork-PR guard (TRA-264): every job runs only on trusted events — a push, or a same-repo
     # `pull_request` (head repo IS this repo). A fork PR skips all jobs so untrusted code never
     # executes on the self-hosted runners; its required checks never report, keeping it
@@ -73,8 +74,10 @@ jobs:
       # a leaked `rhapsody-*` scratch dir into a scratch root and asserts the scan reds on it (and
       # stays green on an older entry and a non-`rhapsody-` one). Bash-only, so it rides `lint`.
       - run: harness/ci/check-tmp-leaks_test.sh
+      - run: python3 harness/ci/check-process-leaks_test.py
 
   test:
+    timeout-minutes: 45
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -89,6 +92,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.100
+      - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       # `--no-fail-fast` (STUDIO-1028): cargo stops at the first failing CRATE by default, so one
       # crates/* failure hides every later crate's result. The full set must surface in one run —
       # a Linux portability failure is the signal this matrix exists to give, and iterating one
@@ -98,7 +105,11 @@ jobs:
       # dir carries other worktrees' entries, which would otherwise false-fail this gate. A guard
       # nobody removed (or a reverted one) leaves a directory the scan then names.
       - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --workspace --no-fail-fast
+      # Process-level deadlines still fire when a test's Tokio runtime or a blocking lock is wedged.
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" bash harness/ci/check-test-timeout.sh
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --workspace --profile ci --no-fail-fast
+      # nextest does not run doctests; preserve the coverage cargo test supplied.
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --workspace --doc --no-fail-fast
       # STUDIO-1032: `ensure_from_repo_hook_runs_unlocked` now proves the two same-repo after_create
       # hooks run concurrently with a cross-process barrier instead of inferring it from wall-clock
       # [start,end] interval overlap. The flake it replaces was a Linux-only timing artifact (the
@@ -114,8 +125,11 @@ jobs:
             TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace --lib repo::tests::ensure_from_repo_hook_runs_unlocked -- --exact | grep -q 'test result: ok. 1 passed' || exit 1
           done
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
+      - if: always()
+        run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup
 
   web:
+    timeout-minutes: 15
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -143,6 +157,7 @@ jobs:
   # don't share a filesystem). NOTE: add `boot-e2e` to the branch-protection required contexts to gate
   # merges on it (needs admin, like the lint/test/web contexts — see the PR body).
   boot-e2e:
+    timeout-minutes: 30
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -156,13 +171,17 @@ jobs:
           node-version: 22
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
+      - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       - run: harness/e2e/boot.sh
+      - if: always()
+        run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup
 
   # The Tauri desktop app (P7) is its OWN cargo workspace, excluded from the root workspace, so it
   # is linted/built/tested here rather than by the `lint`/`test` jobs. Unsigned build only — the
   # signed/notarized .app + .dmg are human-gated (P7-D5 / desktop SIGNING). Job name `desktop` is a
   # branch-protection context; keep it stable.
   desktop:
+    timeout-minutes: 60
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -171,6 +190,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show   # installs the toolchain pinned by the shared repo-root rust-toolchain.toml
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.100
+      - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -193,7 +216,9 @@ jobs:
       # their own un-guarded `rhapsody-d2-sup-*` / `rhapsody-d4-*` helpers. A job-private
       # `$TMPDIR` keeps the scan exact (see the `test` job).
       - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci
+        working-directory: desktop
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked --doc
         working-directory: desktop
       # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app. The CLI
       # install is idempotent and persists on the self-hosted runner. `make app` (run from the repo
@@ -212,8 +237,10 @@ jobs:
       # P7-D5 parity e2e: the app's supervisor drives the packaged rhapsodyd through
       # start -> healthy -> dashboard -> stop (against the R3 linear-stub + fake-claude harness). Gated
       # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make app` built).
-      - run: RHAPSODY_PARITY_E2E=1 TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked -p rhapsody-desktop --test parity_e2e -- --nocapture
+      - run: RHAPSODY_PARITY_E2E=1 TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci -p rhapsody-desktop --test parity_e2e
         working-directory: desktop
       # The gate runs at the END so it sees the whole job: cargo test, `make app`, and the parity
       # e2e (which drives the real rhapsodyd through a scratch `$TMPDIR` of its own).
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
+      - if: always()
+        run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup

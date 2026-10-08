@@ -13,6 +13,27 @@ per-issue workspaces, and runs Claude Code agents inside them. The daemon binary
 
 Build: `cargo build --workspace` · Test: `make test` · Lint: `make lint`
 
+CI runs tests with **cargo-nextest 0.9.100** and the `ci` profile in `.config/nextest.toml`.
+Every test has a five-minute process-level deadline; daemon `run::tests` / `prune::tests` have
+a one-minute deadline, followed by at most two seconds of termination grace. This works even
+when a test cannot poll an async timer. Job limits bound builds and the remaining shell/doctest
+steps as well. To reproduce CI after installing cargo-nextest:
+
+```sh
+cargo nextest run --workspace --profile ci --no-fail-fast
+cargo test --workspace --doc --no-fail-fast
+bash harness/ci/check-test-timeout.sh
+# In desktop/ (its own workspace):
+cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci
+cargo test --locked --doc
+```
+
+The timeout check explicitly enables the test-only `test-timeout-canary` feature, verifies that
+the deliberately blocking test fails with its own name in about one second, and treats that
+expected failure as success. Do not enable this feature for ordinary test runs. CI snapshots
+checkout-scoped test processes before testing and checks for new survivors on every job exit;
+it names and cleans up leaks while preserving pre-existing processes and other checkouts.
+
 ## Claude Code plugin
 
 This repo is also a Claude Code **marketplace**. `plugin/` ships the skills that describe how to
@@ -60,6 +81,16 @@ requires byte-identical output. Editing, corrupting, or losing a committed golde
 Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this section says
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
+
+### Shutdown cancellation backstops (STUDIO-1147)
+
+The prune scheduler now observes shutdown while awaiting asynchronous worktree GC, so a pending
+control-task reply cannot hold the daemon's prune join open. Go passes a cancellation context to
+its synchronous GC callback; the Rust callback's await needs an explicit cancellation select.
+Desktop sidecars are killed on child-handle drop if their supervisor task/runtime is cancelled;
+normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop before signaling,
+preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
+API payload, schema or golden changes.
 
 ### Manager findings and tracker documents (STUDIO-1146)
 
