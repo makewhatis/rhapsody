@@ -61,6 +61,25 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Account-limit reporting (STUDIO-1128)
+
+The default-on ledger and policy now report account state transitions (including reset and
+staleness), rather than pushing for each run. `notify.macos` and `notify.ntfy` use the existing
+transports, with affected-run counts and projected park/switch/wait dispositions. L4's
+once-per-account/local-day credit-spend event also produces a push under every credits policy.
+Notification delivery is best-effort and time-bounded, off the control task; deduplication is
+decided before delivery, so a refused channel is logged rather than retried per tick.
+
+Each completed limit handoff produces a room post and a tokenless tracker comment (a PR
+comment for a synthetic review/manager run), naming the engine, disposition, resume time or
+condition, and note path. The existing events ledger records `limit.handoff` for the job page.
+The additive Accounts endpoint gains policy `level`, `cost_kind` and known `today_usd`;
+unknown costs are omitted rather than reported as zero. Raw policy snapshots are unchanged.
+The console's Accounts route and job chips share the daemon/browser and desktop build.
+`/state` adds `limit_jobs` only while a limit disposition exists, leaving Go-owned payloads,
+tables and committed goldens untouched. State-transition dedupe is process-local; credit-spend
+dedupe retains L4's durable daily event history.
+
 ### Default-on account limit policy (STUDIO-1126)
 
 `limits:` adds an intentional scheduling divergence from Go: an absent block still uses

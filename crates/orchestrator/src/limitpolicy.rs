@@ -107,6 +107,8 @@ pub fn decide(
 
 #[derive(Default)]
 pub(crate) struct LimitPolicy {
+    pub report_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::limitreport::Report>>,
+    pub reported_states: BTreeMap<String, (Level, bool)>,
     pub deadlines: HashMap<String, i64>,
     pub suspended: HashMap<String, Suspended>,
     pub items: Vec<LimitItem>,
@@ -554,6 +556,14 @@ impl Orchestrator {
             self.limit_policy
                 .credit_notified
                 .insert(view.account.clone(), day(now));
+            self.send_limit_report(crate::limitreport::Report::Push {
+                account: view.account.clone(),
+                title: format!("{} credits in use", view.account),
+                body: format!(
+                    "{} is spending credits today (policy: {}).",
+                    view.account, cfg.credits
+                ),
+            });
             if let Some(re) = self
                 .running
                 .values_mut()
@@ -576,6 +586,7 @@ impl Orchestrator {
         for (id, delay) in wakes {
             self.arm_retry_timer(&format!("limit:{id}"), delay);
         }
+        self.report_account_transitions();
         for (id, account) in stops {
             if let Some(re) = self.running.get(&id)
                 && !re.cancel.is_armed()
@@ -691,6 +702,7 @@ impl Orchestrator {
             HandoffOutcome::Switch { .. } => Some(0),
             HandoffOutcome::ManagerItem(_) => None,
         };
+        self.report_limit_handoff(&re, account, &outcome, note.as_deref());
         let id = re.issue.id.clone();
         self.limit_policy.suspended.insert(
             re.issue.id.clone(),
@@ -1454,6 +1466,236 @@ mod tests {
             windows: vec![],
             tickets: vec![],
             credits_policy: "never".into(),
+        }
+    }
+
+    #[test]
+    fn push_on_transition_not_per_run() {
+        let (mut o, _, clock, _dir) = setup(true);
+        let mut rx = o.open_limit_report_channel();
+        dispatch(&mut o);
+        let mut second = o.running["1"].clone();
+        second.issue.id = "2".into();
+        second.issue.identifier = "MT-2".into();
+        o.accounts.bind_run(
+            &crate::accounts::run_key("2", second.started_at),
+            "claude-subscription",
+        );
+        o.running.insert("2".into(), second);
+        o.accounts
+            .observe("claude-subscription", observation(0.95, 1200));
+        o.enforce_limits();
+        let crate::limitreport::Report::Push { body, .. } = rx.try_recv().unwrap() else {
+            panic!("push expected")
+        };
+        assert!(body.contains("95%"), "{body}");
+        assert!(body.contains("2 runs handing off"), "{body}");
+        assert!(body.contains("2 parked until"), "{body}");
+        o.enforce_limits();
+        assert!(
+            rx.try_recv().is_err(),
+            "same state never pushes per run/tick"
+        );
+        clock.store(1201, Ordering::SeqCst);
+        o.enforce_limits();
+        let crate::limitreport::Report::Push { body, .. } = rx.try_recv().unwrap() else {
+            panic!("reset push expected")
+        };
+        assert!(body.contains("ok"), "{body}");
+    }
+
+    #[test]
+    fn credit_spend_push() {
+        for policy in ["never", "daily_cap", "manager_urgent", "always"] {
+            let (mut o, _, clock, _dir) = setup(false);
+            let mut rx = o.open_limit_report_channel();
+            o.eff.as_mut().unwrap().cfg.limits.credits = policy.into();
+            dispatch(&mut o);
+            let mut obs = observation(0.9, 200000);
+            obs.using_credits = true;
+            o.accounts.observe("claude-subscription", obs);
+            o.enforce_limits();
+            let pushes: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(pushes.iter().filter(|r| matches!(r, crate::limitreport::Report::Push { title, body, .. } if title.contains("credits") && body.contains(policy))).count(), 1);
+            o.enforce_limits();
+            assert!(rx.try_recv().is_err());
+            clock.store(100000, Ordering::SeqCst);
+            // A new day's credit spend is a fresh observation, even after `never` latched a wall.
+            let mut obs = observation(0.9, 300000);
+            obs.observed_at_s = 100000;
+            obs.using_credits = true;
+            o.accounts.observe("claude-subscription", obs);
+            o.enforce_limits();
+            assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, crate::limitreport::Report::Push { title, .. } if title.contains("credits"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn room_post_per_handoff() {
+        use rhapsody_config::room::{Cursor, LocalRoom};
+        let (mut o, _, _, dir) = setup(true);
+        let mut rx = o.open_limit_report_channel();
+        let room = LocalRoom::new(dir.child("room"));
+        dispatch(&mut o);
+        o.accounts
+            .observe("claude-subscription", observation(1.0, 9000));
+        o.enforce_limits();
+        while let Ok(report) = rx.try_recv() {
+            crate::limitreport::perform_report(report, Some(&room), &[], None).await;
+        }
+        let posts = room.read_since("alice", &Cursor::default(), 20).unwrap();
+        assert_eq!(posts.messages.len(), 1);
+        let body = &posts.messages[0].body;
+        for expected in [
+            "MT-1",
+            "claude",
+            "opus",
+            "opencode",
+            "fireworks-ai/model",
+            "MT-1-limit-handoff.md",
+        ] {
+            assert!(body.contains(expected), "missing {expected}: {body}");
+        }
+        o.enforce_limits();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tracker_comment_is_tokenless() {
+        let (mut o, _, _, _dir) = setup(false);
+        let tracker = Arc::new(Fake::new());
+        o.eff.as_mut().unwrap().tracker = tracker.clone();
+        let mut rx = o.open_limit_report_channel();
+        dispatch(&mut o);
+        o.running.get_mut("1").unwrap().model = "model @symphony".into();
+        o.eff.as_mut().unwrap().summon_token = "#wake".into();
+        o.running.get_mut("1").unwrap().identity = "alice #wake".into();
+        o.accounts
+            .observe("claude-subscription", observation(1.0, 1200));
+        o.enforce_limits();
+        while let Ok(report) = rx.try_recv() {
+            crate::limitreport::perform_report(report, None, &[], None).await;
+        }
+        let comments = tracker.create_comment_calls();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].body.contains("resumes"));
+        assert!(!crate::reviewnotify::summons_author(
+            &comments[0].body,
+            "#wake"
+        ));
+        assert!(
+            !comments[0].body.contains('@'),
+            "report must never mint a mention"
+        );
+    }
+
+    #[test]
+    fn transition_warn_log_fields() {
+        let (mut o, _, _, _dir) = setup(false);
+        o.accounts
+            .observe("claude-subscription", observation(0.81, 1200));
+        let (_, events) = crate::testsupport::capture_events(|| o.enforce_limits());
+        let event = events
+            .iter()
+            .find(|e| e.message.contains("account state transition"))
+            .unwrap();
+        for field in ["account", "window", "utilization", "reset", "state"] {
+            assert!(event.fields.contains_key(field), "missing {field}");
+        }
+        assert_eq!(event.level, "WARN");
+    }
+
+    #[tokio::test]
+    async fn stripping_mentions_cannot_create_a_custom_summon() {
+        for token in ["foo", "removed", "aba"] {
+            let (mut o, _, _, _dir) = setup(false);
+            let tracker = Arc::new(Fake::new());
+            o.eff.as_mut().unwrap().tracker = tracker.clone();
+            o.eff.as_mut().unwrap().summon_token = token.into();
+            let mut rx = o.open_limit_report_channel();
+            dispatch(&mut o);
+            let mut run = o.running["1"].clone();
+            run.model = "f@oo rem@oved aababa".into();
+            o.report_limit_handoff(
+                &run,
+                "claude-subscription",
+                &HandoffOutcome::Park { resume_at_s: 1320 },
+                None,
+            );
+            crate::limitreport::perform_report(rx.try_recv().unwrap(), None, &[], None).await;
+            let calls = tracker.create_comment_calls();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                !crate::reviewnotify::summons_author(&calls[0].body, token),
+                "{token}: {}",
+                calls[0].body
+            );
+            assert!(!calls[0].body.contains(token));
+        }
+    }
+
+    #[test]
+    fn account_reporting_uses_configured_levels_and_unknown_costs() {
+        let (mut o, store, _, _dir) = setup(false);
+        dispatch(&mut o);
+        let mut limits = o.limits_config();
+        limits.thresholds.stop_new = 85.0;
+        o.reads.write().unwrap().limits = limits;
+        o.accounts
+            .observe("claude-subscription", observation(0.86, 5000));
+        let at = crate::budget::local_day_start_at((o.now)());
+        let mut spend = rhapsody_store::TurnSpend {
+            turn: 1,
+            at,
+            provider: "anthropic".into(),
+            account: "claude-subscription".into(),
+            usd: Some(1.25),
+            ..Default::default()
+        };
+        store.set_turn_spend(o.running["1"].run_id, &spend).unwrap();
+        let view = o.control().accounts(1000).remove(0);
+        assert_eq!(view.level.as_deref(), Some("stop-new"));
+        assert_eq!(view.cost_kind.as_deref(), Some("api_equivalent"));
+        assert_eq!(view.today_usd, Some(1.25));
+        spend.usd = None;
+        store.set_turn_spend(o.running["1"].run_id, &spend).unwrap();
+        assert_eq!(o.control().accounts(1000)[0].today_usd, None);
+        assert!(
+            o.accounts.snapshot(1000)[0].level.is_none(),
+            "reporting never alters raw policy snapshots"
+        );
+    }
+
+    #[test]
+    fn job_report_survives_park_and_switch_and_records_note() {
+        for reset in [1200, 9000] {
+            let (mut o, store, _, _dir) = setup(true);
+            dispatch(&mut o);
+            let run_id = o.running["1"].run_id;
+            o.accounts
+                .observe("claude-subscription", observation(1.0, reset));
+            o.enforce_limits();
+            let snapshot = crate::snapshot_json::render(&o.build_snapshot());
+            let job = &snapshot["limit_jobs"][0];
+            assert_eq!(job["ticket"], "MT-1");
+            assert!(
+                job["note"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("MT-1-limit-handoff.md")
+            );
+            if reset == 1200 {
+                assert_eq!(job["state"], "parked");
+                assert_eq!(job["resume_at_s"], 1320);
+            } else {
+                assert_eq!(job["state"], "switched");
+                assert_eq!(job["model"], "fireworks-ai/model");
+            }
+            let events = store.run_events(run_id).unwrap();
+            assert_eq!(
+                events.iter().filter(|e| e.kind == "limit.handoff").count(),
+                1
+            );
         }
     }
 
