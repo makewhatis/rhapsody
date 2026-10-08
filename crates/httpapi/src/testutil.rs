@@ -978,6 +978,28 @@ impl StateProvider for FakeProvider {
         self.take_manager(format!("file:{run_id}:{sha}:{path}"))
     }
 
+    async fn docs_read(&self, run_id: i64, path: String) -> ManagerReadOutcome {
+        self.take_manager(format!("docs_read:{run_id}:{path}"))
+    }
+    async fn docs_list(&self, run_id: i64, glob: String) -> ManagerReadOutcome {
+        self.take_manager(format!("docs_list:{run_id}:{glob}"))
+    }
+    async fn tracker_documents(
+        &self,
+        run_id: i64,
+        project: String,
+        issue: String,
+        query: String,
+        excerpt: bool,
+    ) -> ManagerReadOutcome {
+        self.take_manager(format!(
+            "documents:{run_id}:{project}:{issue}:{query}:{excerpt}"
+        ))
+    }
+    async fn manager_ticket(&self, run_id: i64, identifier: String) -> ManagerReadOutcome {
+        self.take_manager(format!("ticket:{run_id}:{identifier}"))
+    }
+
     async fn operator_preferences(&self, run_id: i64, query: String) -> ManagerReadOutcome {
         match &self.teams_memory {
             Some(memory) => memory.operator_preferences(run_id, &query).await,

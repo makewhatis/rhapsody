@@ -158,9 +158,17 @@ fn render(outcome: Result<serde_json::Value, ManagerReadError>) -> Response {
         Err(e @ ManagerReadError::Gh(_)) => {
             write_error(StatusCode::BAD_GATEWAY, e.code(), e.message(), None)
         }
+        Err(e @ ManagerReadError::Tracker) => {
+            write_error(StatusCode::BAD_GATEWAY, e.code(), e.message(), None)
+        }
+        Err(e @ ManagerReadError::Invalid(_)) => {
+            write_error(StatusCode::BAD_REQUEST, e.code(), e.message(), None)
+        }
         // A host git read (or a store read): its own code carries the meaning, so the status is
         // derived from the SAME code the tool sees rather than from a second mapping that can drift.
-        Err(e @ ManagerReadError::Read(_)) | Err(e @ ManagerReadError::Store(_)) => {
+        Err(e @ ManagerReadError::Read(_))
+        | Err(e @ ManagerReadError::Store(_))
+        | Err(e @ ManagerReadError::Docs(_)) => {
             let code = e.code();
             let status = match code {
                 "not_found" => StatusCode::NOT_FOUND,
@@ -171,6 +179,88 @@ fn render(outcome: Result<serde_json::Value, ManagerReadError>) -> Response {
             write_error(status, code, e.message(), None)
         }
     }
+}
+
+pub(crate) async fn handle_docs_read(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_get(&method) {
+        return r;
+    }
+    let (run_id, path) = match (run_id_param(&q), required_param(&q, "path")) {
+        (Ok(id), Ok(path)) => (id, path),
+        (Err(r), _) | (_, Err(r)) => return *r,
+    };
+    render(provider.docs_read(run_id, path).await)
+}
+
+pub(crate) async fn handle_docs_list(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_get(&method) {
+        return r;
+    }
+    let run_id = match run_id_param(&q) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    render(provider.docs_list(run_id, optional_param(&q, "glob")).await)
+}
+
+pub(crate) async fn handle_tracker_documents(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_get(&method) {
+        return r;
+    }
+    let run_id = match run_id_param(&q) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let excerpt = match q.get("excerpt").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => {
+            return write_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "excerpt must be true or false",
+                None,
+            );
+        }
+    };
+    render(
+        provider
+            .tracker_documents(
+                run_id,
+                optional_param(&q, "project"),
+                optional_param(&q, "issue"),
+                optional_param(&q, "query"),
+                excerpt,
+            )
+            .await,
+    )
+}
+
+pub(crate) async fn handle_manager_ticket(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_get(&method) {
+        return r;
+    }
+    let (run_id, identifier) = match (run_id_param(&q), required_param(&q, "identifier")) {
+        (Ok(id), Ok(identifier)) => (id, identifier),
+        (Err(r), _) | (_, Err(r)) => return *r,
+    };
+    render(provider.manager_ticket(run_id, identifier).await)
 }
 
 pub(crate) async fn handle_operator_preferences(
@@ -444,6 +534,68 @@ mod tests {
 
     async fn spawn(provider: Arc<FakeProvider>) -> String {
         spawn_router(new_handler(provider, None)).await
+    }
+
+    #[tokio::test]
+    async fn commissioned_evidence_routes_are_get_only_and_forward_declared_args() {
+        for (suffix, signature) in [
+            (
+                "docs/read?run_id=7&path=STUDIO-1142-findings.md",
+                "docs_read:7:STUDIO-1142-findings.md",
+            ),
+            ("docs/list?run_id=7&glob=STUDIO-*", "docs_list:7:STUDIO-*"),
+            (
+                "tracker/documents?run_id=7&project=rhapsody&query=plugins&excerpt=true",
+                "documents:7:rhapsody::plugins:true",
+            ),
+            (
+                "tracker/ticket?run_id=7&identifier=STUDIO-598",
+                "ticket:7:STUDIO-598",
+            ),
+        ] {
+            let provider = Arc::new(
+                FakeProvider::ok(empty_snapshot())
+                    .with_manager_outcome(Ok(serde_json::json!({"untrusted":true}))),
+            );
+            let url = spawn(provider.clone()).await;
+            let path = format!("{url}/api/v1/manager/{suffix}");
+            assert_eq!(reqwest::get(&path).await.unwrap().status(), 200);
+            assert_eq!(provider.manager_asked().as_deref(), Some(signature));
+            for method in [
+                reqwest::Method::POST,
+                reqwest::Method::PUT,
+                reqwest::Method::DELETE,
+            ] {
+                assert_eq!(
+                    crate::testutil::operator_client()
+                        .request(method, &path)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    405
+                );
+            }
+        }
+        for (error, status, code) in [
+            (
+                ManagerReadError::Invalid("outside docs"),
+                400,
+                "path_refused",
+            ),
+            (ManagerReadError::Docs("too_large"), 413, "too_large"),
+            (ManagerReadError::Tracker, 502, "tracker_failed"),
+        ] {
+            let url = spawn(Arc::new(
+                FakeProvider::ok(empty_snapshot()).with_manager_outcome(Err(error)),
+            ))
+            .await;
+            let response = reqwest::get(format!("{url}/api/v1/manager/docs/read?run_id=7&path=x"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(body_json(response).await["error"]["code"], code);
+        }
     }
 
     async fn body_json(resp: reqwest::Response) -> Value {

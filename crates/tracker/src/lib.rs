@@ -109,6 +109,47 @@ pub struct NewIssue {
     pub labels: Vec<String>,
 }
 
+/// Read-only document metadata, separate from the frozen Go Issue shape (STUDIO-1146).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Document {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Documents {
+    pub documents: Vec<Document>,
+    pub truncated: bool,
+}
+
+impl Documents {
+    /// Bound every adapter's output, including test/custom trackers, before serving it to a lead.
+    pub fn bounded(mut self) -> Self {
+        self.truncated |= self.documents.len() > 200;
+        self.documents.truncate(200);
+        for doc in &mut self.documents {
+            doc.id = document_text(&doc.id, 128);
+            doc.title = document_text(&doc.title, 512);
+            doc.url = document_text(&doc.url, 2048);
+            doc.updated_at = document_text(&doc.updated_at, 64);
+            doc.excerpt = doc.excerpt.as_deref().map(|s| document_text(s, 2048));
+        }
+        self
+    }
+}
+
+fn document_text(text: &str, cap: usize) -> String {
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].into()
+}
+
 /// Tracker is the issue-tracker contract used by the orchestrator (upstream §11.1).
 /// Implementations must return normalized [`Issue`](rhapsody_core::Issue) values.
 ///
@@ -121,6 +162,16 @@ pub struct NewIssue {
 /// adds no method to the contract surface).
 #[async_trait]
 pub trait Tracker: Any + Send + Sync {
+    /// Documents in this client's configured project, or directly attached to a scoped issue.
+    /// Unsupported is an error, never an authoritative empty result. No write counterpart.
+    async fn fetch_documents(
+        &self,
+        _issue: Option<&str>,
+        _query: &str,
+        _excerpt: bool,
+    ) -> Result<Documents, TrackerError> {
+        Err(TrackerError::Other("documents lookup unsupported".into()))
+    }
     /// Tech-lead freshness read, scoped to this tracker's configured project (STUDIO-1136).
     async fn fetch_issue_by_identifier(
         &self,

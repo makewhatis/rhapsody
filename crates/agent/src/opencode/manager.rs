@@ -292,6 +292,10 @@ mod tests {
             assert_eq!(v["tools"][name], false, "{name}");
         }
         assert_eq!(v["permission"], json!({"*":"deny", "symphony_*":"allow"}));
+        for name in ["docs_read", "docs_list", "tracker_documents"] {
+            assert!(crate::manager::MANAGER_MCP_TOOLS.contains(&name));
+            assert_eq!(v["permission"]["symphony_*"], "allow", "symphony_{name}");
+        }
         assert_eq!(v["plugin"], json!([]));
         assert_eq!(v["autoupdate"], false);
         assert_eq!(v["share"], "disabled");

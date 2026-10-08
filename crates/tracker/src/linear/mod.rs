@@ -16,6 +16,7 @@ mod claim;
 mod client;
 mod create;
 mod decode;
+mod documents;
 mod errors;
 mod labels;
 mod move_state;
@@ -51,6 +52,14 @@ macro_rules! tracker_span {
 
 #[async_trait]
 impl crate::Tracker for Client {
+    async fn fetch_documents(
+        &self,
+        issue: Option<&str>,
+        query: &str,
+        excerpt: bool,
+    ) -> Result<crate::Documents, TrackerError> {
+        documents::fetch_documents(self, issue, query, excerpt).await
+    }
     async fn fetch_issue_by_identifier(
         &self,
         identifier: &str,

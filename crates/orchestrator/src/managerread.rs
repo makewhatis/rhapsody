@@ -65,6 +65,12 @@ pub enum ManagerReadError {
     Gh(String),
     /// A store read failed.
     Store(String),
+    /// A document path, glob or tracker selector violated the read boundary.
+    Invalid(&'static str),
+    /// A bounded local document read failed.
+    Docs(&'static str),
+    /// The daemon's tracker could not answer (never an authoritative empty result).
+    Tracker,
 }
 
 impl ManagerReadError {
@@ -77,6 +83,9 @@ impl ManagerReadError {
             ManagerReadError::Read(e) => read_error_code(e),
             ManagerReadError::Gh(_) => "gh_failed",
             ManagerReadError::Store(_) => "store_error",
+            ManagerReadError::Invalid(_) => "path_refused",
+            ManagerReadError::Docs(code) => code,
+            ManagerReadError::Tracker => "tracker_failed",
         }
     }
 
@@ -89,6 +98,9 @@ impl ManagerReadError {
             ManagerReadError::Read(e) => e.to_string(),
             ManagerReadError::Gh(e) => e.clone(),
             ManagerReadError::Store(e) => e.clone(),
+            ManagerReadError::Invalid(why) => (*why).into(),
+            ManagerReadError::Docs(code) => format!("document read failed: {code}"),
+            ManagerReadError::Tracker => "tracker read failed; no absence was confirmed".into(),
         }
     }
 }
@@ -164,6 +176,141 @@ pub fn manager_coordinate(run: &RunSummary) -> Result<ManagerCoordinate, Manager
 }
 
 impl crate::ControlHandle {
+    pub(crate) fn require_live_manager(&self, run_id: i64) -> Result<(), ManagerReadError> {
+        self.teams_memory()
+            .ok_or(ManagerReadError::Unavailable(
+                "manager bindings unavailable",
+            ))?
+            .require_live_manager(run_id)
+    }
+
+    /// Local I/O runs on the blocking pool; the facade never sees a host filesystem capability.
+    pub async fn docs_read(&self, run_id: i64, path: &str) -> ManagerReadOutcome {
+        self.require_live_manager(run_id)?;
+        let root = docs_root()?;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || crate::managerdocs::read(&root, &path))
+            .await
+            .map_err(|_| ManagerReadError::Docs("read_failed"))?
+    }
+
+    pub async fn docs_list(&self, run_id: i64, glob: &str) -> ManagerReadOutcome {
+        self.require_live_manager(run_id)?;
+        let root = docs_root()?;
+        let glob = glob.to_string();
+        tokio::task::spawn_blocking(move || crate::managerdocs::list(&root, &glob))
+            .await
+            .map_err(|_| ManagerReadError::Docs("read_failed"))?
+    }
+
+    /// Uses only this run's repository's enabled project clients from the existing reads cell.
+    async fn evidence_trackers(
+        &self,
+        run_id: i64,
+        project: &str,
+    ) -> Result<Vec<crate::reads::ProjectTracker>, ManagerReadError> {
+        self.require_live_manager(run_id)?;
+        let coord = self.manager_coordinate_for(run_id).await?;
+        let reads = self
+            .reads
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let trackers: Vec<_> = reads
+            .project_trackers
+            .iter()
+            .zip(&reads.project_facts)
+            .filter(|(p, f)| {
+                f.pr_owner.eq_ignore_ascii_case(&coord.owner)
+                    && f.pr_repo.eq_ignore_ascii_case(&coord.repo)
+                    && (project.is_empty() || p.slug == project)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if trackers.is_empty() {
+            return Err(ManagerReadError::Unavailable(
+                "no configured project for this manager repository",
+            ));
+        }
+        Ok(trackers)
+    }
+
+    pub async fn tracker_documents(
+        &self,
+        run_id: i64,
+        project: &str,
+        issue: &str,
+        query: &str,
+        excerpt: bool,
+    ) -> ManagerReadOutcome {
+        if (project.is_empty() == issue.is_empty())
+            || query.len() > 4000
+            || project.len() > 256
+            || issue.len() > 128
+        {
+            return Err(ManagerReadError::Invalid(
+                "name exactly one configured project slug or issue identifier; query at most 4000 bytes",
+            ));
+        }
+        let trackers = self.evidence_trackers(run_id, project).await?;
+        for p in trackers {
+            if !issue.is_empty()
+                && p.tracker
+                    .fetch_issue_by_identifier(issue)
+                    .await
+                    .map_err(|_| ManagerReadError::Tracker)?
+                    .is_none()
+            {
+                continue;
+            }
+            let docs = p
+                .tracker
+                .fetch_documents(
+                    if issue.is_empty() { None } else { Some(issue) },
+                    query,
+                    excerpt,
+                )
+                .await
+                .map_err(|_| ManagerReadError::Tracker)?
+                .bounded();
+            return Ok(
+                serde_json::json!({"project":p.slug, "issue":issue, "documents":docs.documents,"truncated":docs.truncated, "untrusted":true}),
+            );
+        }
+        Err(ManagerReadError::Docs("not_found"))
+    }
+
+    /// Additive manager ticket view. Ordinary workers keep the Go run-history payload verbatim.
+    pub async fn manager_ticket(&self, run_id: i64, identifier: &str) -> ManagerReadOutcome {
+        if identifier.is_empty() || identifier.len() > 128 {
+            return Err(ManagerReadError::Invalid(
+                "issue identifier required (at most 128 bytes)",
+            ));
+        }
+        for p in self.evidence_trackers(run_id, "").await? {
+            let Some(issue) = p
+                .tracker
+                .fetch_issue_by_identifier(identifier)
+                .await
+                .map_err(|_| ManagerReadError::Tracker)?
+            else {
+                continue;
+            };
+            let docs = p
+                .tracker
+                .fetch_documents(Some(identifier), "", false)
+                .await
+                .map_err(|_| ManagerReadError::Tracker)?
+                .bounded();
+            let issue = serde_json::to_value(issue).map_err(|_| ManagerReadError::Tracker)?;
+            if issue.to_string().len() > 128 * 1024 {
+                return Err(ManagerReadError::Docs("too_large"));
+            }
+            return Ok(
+                serde_json::json!({"identifier":identifier, "issue":issue, "documents":docs.documents, "documents_truncated":docs.truncated, "untrusted":true}),
+            );
+        }
+        Err(ManagerReadError::Docs("not_found"))
+    }
     /// Resolves a run's manager coordinate from its own row. Every manager route starts here, so a
     /// review run's id can never be read through the manager's surface.
     pub(crate) async fn manager_coordinate_for(
@@ -439,6 +586,13 @@ impl crate::ControlHandle {
     }
 }
 
+fn docs_root() -> Result<std::path::PathBuf, ManagerReadError> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| std::path::PathBuf::from(home).join(".rhapsody/docs"))
+        .ok_or(ManagerReadError::Unavailable("daemon HOME is unavailable"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +604,110 @@ mod tests {
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::TempDir;
     use crate::workspace_gc::WorkspaceGcPlan;
+
+    #[tokio::test]
+    async fn tracker_documents_against_fake_tracker_requires_live_role_and_configured_project() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        tracker.candidates.push(rhapsody_core::Issue {
+            id: "uuid".into(),
+            identifier: "STUDIO-598".into(),
+            ..Default::default()
+        });
+        let docs = rhapsody_tracker::Documents {
+            documents: vec![rhapsody_tracker::Document {
+                title: "STUDIO-598 plugins".into(),
+                url: "https://linear.app/document/plugins".into(),
+                updated_at: "2026-08-29".into(),
+                excerpt: Some("design record".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        tracker.documents.insert("".into(), docs.clone());
+        tracker.documents.insert("STUDIO-598".into(), docs);
+        let (handle, id, memory) =
+            crate::testsupport::manager_evidence_handle(store, Arc::new(tracker));
+        for (project, issue) in [("rhapsody", ""), ("", "STUDIO-598")] {
+            let got = handle
+                .tracker_documents(id, project, issue, "plugins", true)
+                .await
+                .unwrap();
+            assert_eq!(
+                got["documents"][0]["url"],
+                "https://linear.app/document/plugins"
+            );
+            assert_eq!(got["documents"][0]["excerpt"], "design record");
+            assert_eq!(got["untrusted"], true);
+        }
+        let ticket = handle.manager_ticket(id, "STUDIO-598").await.unwrap();
+        assert_eq!(ticket["issue"]["identifier"], "STUDIO-598");
+        assert_eq!(ticket["documents"][0]["updated_at"], "2026-08-29");
+        assert!(ticket["documents"][0].get("excerpt").is_none());
+        assert!(
+            handle
+                .tracker_documents(id, "other-installation", "", "", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .tracker_documents(id, "", "OTHER-1", "", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .tracker_documents(id, "rhapsody", "STUDIO-598", "", false)
+                .await
+                .is_err()
+        );
+        memory.bind_run(
+            id,
+            crate::teamsmemory::RunProvenance {
+                identity: "jerry".into(),
+                ticket: "STUDIO-1146".into(),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            handle
+                .tracker_documents(id, "rhapsody", "", "", false)
+                .await,
+            Err(ManagerReadError::NotAManagerRun)
+        ));
+        assert!(matches!(
+            handle.docs_read(id, "README.md").await,
+            Err(ManagerReadError::NotAManagerRun)
+        ));
+        memory.release_run(id);
+        assert!(matches!(
+            handle.docs_list(id, "*").await,
+            Err(ManagerReadError::NoSuchRun)
+        ));
+        assert!(matches!(
+            handle.manager_ticket(id, "STUDIO-598").await,
+            Err(ManagerReadError::NoSuchRun)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tracker_document_failure_is_not_an_empty_lookup() {
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        tracker.documents_err = Some(rhapsody_tracker::TrackerError::Other(
+            "transport down".into(),
+        ));
+        let (handle, id, _) = crate::testsupport::manager_evidence_handle(store, Arc::new(tracker));
+        assert_eq!(
+            handle
+                .tracker_documents(id, "rhapsody", "", "", false)
+                .await
+                .unwrap_err()
+                .code(),
+            "tracker_failed"
+        );
+    }
 
     fn run_row(key: &str, repo: &str) -> RunSummary {
         RunSummary {
