@@ -68,6 +68,50 @@ use crate::memory::{
 /// tenant the deployed API exposes — every path is literally `/v1/default/…`).
 pub const TENANT: &str = "default";
 
+/// Host-only operator memory. Runs can recall it, but only the daemon retains decisions/overrules.
+#[derive(Debug)]
+pub struct OperatorMemory {
+    backend: HindsightBackend,
+    bank: String,
+}
+
+impl OperatorMemory {
+    pub fn new(endpoint: &str, api_key: &str) -> Result<Self, MemoryError> {
+        Self::for_bank(endpoint, api_key, "operator-decisions")
+    }
+
+    /// Explicit bank for hermetic/scratch callers; never inferred from an identity or bank prefix.
+    pub fn for_bank(endpoint: &str, api_key: &str, bank: &str) -> Result<Self, MemoryError> {
+        HindsightBackend::checked_shared_bank(bank)?;
+        Ok(Self {
+            backend: HindsightBackend::new(endpoint, "", api_key)?,
+            bank: bank.into(),
+        })
+    }
+
+    pub async fn recall(&self, query: &Query) -> Result<Recalled, MemoryError> {
+        self.backend.recall_shared(&self.bank, query).await
+    }
+
+    pub async fn retain_decision(&self, record: &Record) -> Result<String, MemoryError> {
+        self.retain(record, "lead").await
+    }
+
+    /// Called by the operator-guarded overrule flow, never exposed as an agent tool.
+    pub async fn retain_overrule(&self, record: &Record) -> Result<String, MemoryError> {
+        self.retain(record, "David").await
+    }
+
+    async fn retain(&self, record: &Record, by: &str) -> Result<String, MemoryError> {
+        let mut stamped = record.clone();
+        stamped.identity = by.into();
+        stamped.content = format!("by: {by}; context, not precedent. {}", record.content);
+        self.backend
+            .retain_tagged_in_bank(&self.bank, &stamped, Some(by))
+            .await
+    }
+}
+
 /// The whole-request timeout. Short and explicit: a recall that has not answered
 /// in this long has already missed the prefetch cycle it was fired for, and the
 /// prompt is better off without the section than the task is parked.
@@ -430,6 +474,15 @@ impl HindsightBackend {
     /// identity's bank and calls this; `retain_shared` passes the team bank
     /// straight through.
     async fn retain_in_bank(&self, bank: &str, rec: &Record) -> Result<String, MemoryError> {
+        self.retain_tagged_in_bank(bank, rec, None).await
+    }
+
+    async fn retain_tagged_in_bank(
+        &self,
+        bank: &str,
+        rec: &Record,
+        by: Option<&str>,
+    ) -> Result<String, MemoryError> {
         // Best-effort and never fatal to the retain (§5.1): a bank whose
         // consolidation could not be switched off still stores the fact.
         if let Err(e) = self.ensure_bank_config(bank).await {
@@ -441,7 +494,7 @@ impl HindsightBackend {
             );
         }
         let url = format!("{}/memories", self.bank_url(bank));
-        let body = json!({
+        let mut body = json!({
             "items": [{
                 "content": truncate_bytes(&rec.content, MAX_RETAIN_CONTENT_BYTES),
                 "timestamp": rec.at.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -456,6 +509,14 @@ impl HindsightBackend {
             }],
             "async": true,
         });
+        if let Some(by) = by {
+            body["items"][0]["metadata"]["by"] = json!(by);
+            body["items"][0]["tags"] = if by == "lead" {
+                json!(["lead"])
+            } else {
+                json!(["overrule"])
+            };
+        }
         let resp = self
             .send(self.http.post(&url).json(&body), "hindsight retain")
             .await?
@@ -789,7 +850,11 @@ impl RecallResult {
         // The bank we asked is the identity's, so `identity` is authoritative;
         // the metadata copy is only a fallback for a fact retained before the
         // stamp existed.
-        let stamped = get("identity");
+        let stamped = if get("identity").is_empty() {
+            get("by")
+        } else {
+            get("identity")
+        };
         Fact {
             id: self.id,
             identity: if stamped.is_empty() {
@@ -1177,6 +1242,77 @@ mod tests {
 
     fn backend(stub: &Stub) -> HindsightBackend {
         HindsightBackend::new(&stub.url, "agent-", "k-123").expect("backend")
+    }
+
+    #[tokio::test]
+    async fn decision_retained_by_lead_as_context() {
+        let stub = Stub::accepting().await;
+        let memory = OperatorMemory::for_bank(&stub.url, "k-123", "scratch-lead").unwrap();
+        memory
+            .retain_decision(&record(
+                "manager",
+                "Choose commission, because it needs network.",
+            ))
+            .await
+            .unwrap();
+        let request = stub.request("POST", "/memories");
+        assert_eq!(request.path, "/v1/default/banks/scratch-lead/memories");
+        let item = &request.body["items"][0];
+        assert_eq!(item["metadata"]["by"], "lead");
+        assert_eq!(item["metadata"]["identity"], "lead");
+        assert_eq!(item["tags"], json!(["lead"]));
+        assert!(
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("context, not precedent")
+        );
+        assert!(
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("Choose commission")
+        );
+        assert_eq!(item["metadata"]["ticket"], "STUDIO-660");
+    }
+
+    #[tokio::test]
+    async fn overrule_retained_by_operator() {
+        let stub = Stub::accepting().await;
+        let memory = OperatorMemory::for_bank(&stub.url, "", "scratch-overrule").unwrap();
+        memory
+            .retain_overrule(&record(
+                "manager",
+                "Overrule decision 42: prefer waiting to buying credits.",
+            ))
+            .await
+            .unwrap();
+        let item = stub.request("POST", "/memories").body["items"][0].clone();
+        assert_eq!(item["metadata"]["by"], "David");
+        assert_eq!(item["metadata"]["identity"], "David");
+        assert!(
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("prefer waiting to buying credits")
+        );
+        assert!(item["content"].as_str().unwrap().contains("by: David"));
+    }
+
+    #[tokio::test]
+    async fn operator_recall_never_configures_or_writes_a_bank() {
+        let stub =
+            Stub::start(|_| Reply::ok(&recall_body("Prefer bounded diagnosis first."))).await;
+        let memory = OperatorMemory::for_bank(&stub.url, "k-123", "scratch-recall").unwrap();
+        let facts = memory.recall(&ticket_query("TEST-1")).await.unwrap();
+        assert_eq!(facts.facts[0].content, "Prefer bounded diagnosis first.");
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/v1/default/banks/scratch-recall/memories/recall"
+        );
+        assert_eq!(requests[0].authorization, "Bearer k-123");
     }
 
     fn at() -> DateTime<Utc> {
