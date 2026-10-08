@@ -123,6 +123,18 @@ describe("DivergenceBanner", () => {
     expect(banner.textContent).not.toContain("open findings");
   });
 
+  it("names a credential infrastructure report without calling it a pull request", async () => {
+    h.fetchState.mockResolvedValue(state({ review_divergence: [divergence({
+      pr: "claude credential probe (claude-subscription)",
+      kind: "credential_infrastructure", ticket: "", reviewer: "",
+      reason: "claude probe for claude-subscription: infrastructure problem, 3 consecutive timeouts. Dispatch continues.",
+    })] }));
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("3 consecutive timeouts. Dispatch continues.");
+    expect(banner.textContent).not.toContain("pull request");
+  });
+
   // A reported divergence names the pull request, its ticket and how long — the three facts an
   // operator needs to decide whether to intervene. The wording comes from the daemon's own `detail`,
   // so the console cannot drift from it.

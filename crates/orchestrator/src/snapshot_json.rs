@@ -171,6 +171,7 @@ pub fn render(s: &Snapshot) -> Value {
                             d.kind,
                             crate::reviewreconcile::DivergenceKind::ManagerDeferred
                                 | crate::reviewreconcile::DivergenceKind::ReviewInfrastructure
+                                | crate::reviewreconcile::DivergenceKind::CredentialInfrastructure
                         ) && let Some(obj) = row.as_object_mut()
                         {
                             obj.insert("reason".to_string(), json!(d.reason));

@@ -9,31 +9,13 @@
 //! recovers on its own. Zero-token 1-second failures are the signature of an infra fault, not a ticket
 //! fault.
 //!
-//! # The gate
+//! # Scoped admission (STUDIO-1144)
 //!
-//! [`Orchestrator::on_tick`](crate::orchestrator::Orchestrator) already runs
-//! `reconcile → validate() → fetch candidates → dispatch`, and on a `validate()` error it logs, skips
-//! dispatch **without claiming anything**, and re-arms the timer — exactly the desired behavior for a
-//! dead credential. This module adds the missing *check itself* at that same gate: a credential-liveness
-//! probe run right after `validate()`, before any candidate fetch, so a dead credential skips dispatch
-//! without ever holding a claim (see the on_tick call site and the "claims nothing" invariant below).
-//!
-//! # Design (the requirements this satisfies)
-//!
-//! * **Cache** — `validate()` runs every tick (`polling.interval_ms` is 30s); shelling out that often
-//!   is unacceptable. A healthy verdict is cached for [`PROBE_TTL`] (probe at most once per TTL); a dead
-//!   verdict is never cached past the tick, so recovery is detected on the very next tick rather than
-//!   after waiting out the TTL.
-//! * **Non-blocking** — each probe is bounded by [`Orchestrator::probe_timeout`], well under the poll
-//!   interval; a hang fails closed ("cannot verify → skip dispatch"), never wedging the loop.
-//! * **Backend-aware** — only the configured backend is probed ([`backend_has_probe`]); a backend with
-//!   no probe (`codex`, or any future backend) is a clean no-op that never blocks dispatch.
-//! * **Never holds a claim** — the check runs before candidate fetch; the existing `retry_queue` /
-//!   `claims` behavior is untouched.
-//! * **Legible skip** — transitions (healthy→dead, dead→healthy) log loudly; the steady-state dead
-//!   repeat is rate-limited ([`DEAD_LOG_INTERVAL`]) so `/api/v1/logs` shows the cause without drowning.
-//!   The dead condition also surfaces as a per-project advisory on `/api/v1/projects`
-//!   ([`CREDENTIAL_DEAD_WARNING`]).
+//! Probe verdicts are keyed by account, harness and effective command/environment policy. Healthy
+//! answers cache for five minutes; definite credential failures hold only that context before claim
+//! or slot admission. Unknown answers (including timeouts) permit dispatch and retry next tick.
+//! Supported contexts probe concurrently under one timeout window. Three consecutive timeouts report
+//! an infrastructure fault in the log and human feed; account holds/reasons are cache-only ledger reads.
 //!
 //! # Same scrubbed environment as the children
 //!
@@ -44,6 +26,7 @@
 //! `scrub_env` + `scrubbed_env_vars` + `TRACKER_ENV_VARS` primitives, honoring the effective
 //! `billing_guard` (only the per-issue "me" identity is omitted — a probe has no issue).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +51,7 @@ const PROBE_OK: &str = "OK";
 pub(crate) const PROBE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// The default per-probe timeout: well under the 30s poll interval. A probe that does not answer within
-/// this is treated as "cannot verify → skip dispatch" (fail closed). It is a field on the orchestrator
+/// this is treated as unknown and allows dispatch. It is a field on the orchestrator
 /// ([`Orchestrator::probe_timeout`]) so tests can shrink it; this is the production default.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -79,16 +62,17 @@ const DEAD_LOG_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// The operator advisory surfaced on each project's `/api/v1/projects` status while the credential
 /// probe reports dead (the state-visible half of the "legible skip" requirement).
-pub(crate) const CREDENTIAL_DEAD_WARNING: &str =
-    "agent credential probe failing — dispatch paused until the login is refreshed";
+pub(crate) const CREDENTIAL_DEAD_WARNING: &str = "an agent account has a definite credential failure — see /api/v1/accounts for the probe reason";
 
 /// The inputs a credential probe needs, captured from the effective config at probe time so a
-/// hot-reloaded command / billing_guard / key is honored. The credential is host-global, so these come
-/// from the top-level (legacy) config; per-project claude overrides share the same host login.
-#[derive(Debug, Clone)]
+/// hot-reloaded command / billing_guard / key is honored. Never debug-print this request: commands
+/// and tracker credentials can contain secrets.
+#[derive(Clone)]
 pub struct ProbeRequest {
     /// The configured agent backend (`claude` / `codex`). Only a backend with a probe is probed.
     pub backend: String,
+    /// Non-secret ledger account id, not a credential value.
+    pub account: String,
     /// The claude command (default `claude`), shell-split into name+args like the runner.
     pub command: String,
     /// The EFFECTIVE billing guard (already resolved via `billing_guard_enabled`); it selects which env
@@ -104,8 +88,10 @@ pub struct ProbeRequest {
 pub enum ProbeOutcome {
     /// The credential is live (probe exited 0 with `OK`).
     Healthy,
-    /// The credential is dead / unverifiable; the string is the operator-facing reason for the skip log.
+    /// A definite expired, missing or rejected credential. Reasons must be non-secret.
     Dead(String),
+    /// Infrastructure/protocol failures cannot establish expiry and do not hold dispatch.
+    Unknown(String),
 }
 
 /// The injectable credential-liveness probe seam (BO-59). Production installs [`ClaudeCredentialProbe`];
@@ -180,11 +166,8 @@ impl CredentialProbe for ClaudeCredentialProbe {
         }
         let (name, base_args) = match split_command(&req.command) {
             Ok(v) => v,
-            Err(e) => {
-                return ProbeOutcome::Dead(format!(
-                    "invalid claude command {:?}: {e}",
-                    req.command
-                ));
+            Err(_) => {
+                return ProbeOutcome::Unknown("invalid claude probe command".into());
             }
         };
         let env = scrub_child_env(
@@ -206,7 +189,7 @@ impl CredentialProbe for ClaudeCredentialProbe {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // Reap the child if the caller's timeout drops this future mid-probe (fail-closed cleanup).
+        // Reap the child if the caller's timeout drops this future mid-probe.
         cmd.kill_on_drop(true);
 
         match cmd.output().await {
@@ -216,22 +199,20 @@ impl CredentialProbe for ClaudeCredentialProbe {
                 &out.stdout,
                 &out.stderr,
             ),
-            Err(e) => ProbeOutcome::Dead(format!("could not launch claude probe: {e}")),
+            Err(_) => ProbeOutcome::Unknown("could not launch claude credential probe".into()),
         }
     }
 }
 
-/// Derives the liveness verdict from a completed probe process (pure, so the core "exit 0 with `OK` =
-/// live, else dead" contract is unit-tested without spawning a real `claude`). Live iff the process
-/// exited 0 AND printed the `OK` reply on stdout; otherwise dead, with an operator-facing reason built
-/// from the exit code + a trimmed stderr tail (the OAuth-expired incident ends on a verbatim stderr
-/// line). Taking primitives (not a `std::process::Output`, whose `ExitStatus` has no portable test
-/// constructor) keeps it directly testable.
+/// A completed process is healthy only with exit 0 and OK, dead only with an explicit auth failure,
+/// otherwise unknown. Never forward raw diagnostics to a human-facing surface.
 fn classify_probe(success: bool, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> ProbeOutcome {
     if success && stdout_is_ok(stdout) {
         ProbeOutcome::Healthy
+    } else if let Some(reason) = definite_credential_failure(stdout, stderr) {
+        ProbeOutcome::Dead(reason.into())
     } else {
-        ProbeOutcome::Dead(probe_failure_reason(code, stderr))
+        ProbeOutcome::Unknown(probe_failure_reason(code))
     }
 }
 
@@ -243,20 +224,39 @@ fn stdout_is_ok(stdout: &[u8]) -> bool {
         .any(|l| l.trim() == PROBE_OK)
 }
 
-/// A concise operator-facing reason for a failed probe: the exit status plus a trimmed tail of stderr.
-fn probe_failure_reason(code: Option<i32>, stderr: &[u8]) -> String {
+/// A closed operator-facing reason for a failed probe, without process output.
+fn probe_failure_reason(code: Option<i32>) -> String {
     let code = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    let stderr = String::from_utf8_lossy(stderr);
-    let trimmed = stderr.trim();
-    let n = trimmed.chars().count();
-    let tail: String = trimmed.chars().skip(n.saturating_sub(400)).collect();
-    if tail.is_empty() {
-        format!("claude probe exited {code} without OK")
-    } else {
-        format!("claude probe exited {code}: {tail}")
+    format!("claude credential probe exited {code} without OK; credential status unknown")
+}
+
+fn definite_credential_failure(stdout: &[u8], stderr: &[u8]) -> Option<&'static str> {
+    // Inspect diagnostics, but never publish them: a harness may echo credential contents.
+    for bytes in [stdout, stderr] {
+        let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+        if text.contains("oauth session expired") || text.contains("token has expired") {
+            return Some("claude credential expired; refresh the login");
+        }
+        if text.contains("not logged in") || text.contains("missing api key") {
+            return Some("claude credential missing; log in before dispatch");
+        }
+        if [
+            "api error: 401",
+            "http 401",
+            "status code: 401",
+            "\"statuscode\":401",
+            "invalid api key",
+            "invalid_api_key",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+        {
+            return Some("claude credential rejected (401/invalid key); refresh the login");
+        }
     }
+    None
 }
 
 /// The cached credential-probe verdict for the dispatch preflight. Control-task-owned (only on_tick's
@@ -310,7 +310,54 @@ fn dead_log_decision(
     }
 }
 
+/// No secrets in the account/harness coordinates; the command stays private and is never rendered.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ProbeKey {
+    account: String,
+    harness: String,
+    command: String,
+    billing_guard: bool,
+}
+
+impl ProbeRequest {
+    fn key(&self) -> ProbeKey {
+        ProbeKey {
+            account: self.account.clone(),
+            harness: self.backend.clone(),
+            command: self.command.clone(),
+            billing_guard: self.billing_guard,
+        }
+    }
+}
+
+pub(crate) struct CachedProbe {
+    cache: ProbeCache,
+    held: bool,
+    reason: String,
+    timeouts: usize,
+}
+
 impl Orchestrator {
+    #[cfg(test)]
+    pub(crate) fn seed_dead_probe(&mut self, harness: &str, project: &str) {
+        let req = self
+            .probe_request_for(harness, project)
+            .expect("probe context");
+        self.probe_cache.insert(
+            req.key(),
+            CachedProbe {
+                cache: ProbeCache {
+                    checked_at: (self.now)(),
+                    healthy: false,
+                    last_logged_dead_at: None,
+                },
+                held: true,
+                reason: "expired login".into(),
+                timeouts: 0,
+            },
+        );
+    }
+
     /// Installs the production credential-liveness probe (BO-59). The daemon calls this once at startup;
     /// without it the credential preflight is a no-op and dispatch is byte-identical to the pre-feature
     /// behavior (the default for tests and any non-production build).
@@ -318,95 +365,225 @@ impl Orchestrator {
         self.cred_probe = Some(probe);
     }
 
-    /// Builds the probe request from the current effective config (top-level / legacy path). `None` when
-    /// no config is loaded. The credential is host-global, so the top-level claude command +
-    /// billing_guard + tracker key are used (per-project claude overrides share the same host login).
-    fn probe_request(&self) -> Option<ProbeRequest> {
+    fn probe_request_for(&self, harness: &str, project: &str) -> Option<ProbeRequest> {
         let eff = self.eff.as_ref()?;
+        let cfg = eff.project_by_slug(project).map_or(&eff.cfg, |p| &p.mcfg);
+        let backend = self.effective_harness(harness);
+        if !backend_has_probe(&backend) {
+            return None;
+        }
+        let billing_guard = billing_guard_enabled(cfg.claude.billing_guard);
         Some(ProbeRequest {
-            backend: eff.cfg.agent.backend.clone(),
-            command: eff.cfg.claude.command.clone(),
-            billing_guard: billing_guard_enabled(eff.cfg.claude.billing_guard),
-            tracker_api_key: eff.cfg.tracker.api_key.clone(),
+            account: crate::accounts::account_for(&backend, "", billing_guard),
+            backend,
+            command: cfg.claude.command.clone(),
+            billing_guard,
+            tracker_api_key: cfg.tracker.api_key.clone(),
         })
     }
 
-    /// Whether the credential probe currently reports the backend dead — read by `project_statuses` to
-    /// surface [`CREDENTIAL_DEAD_WARNING`] on `/api/v1/projects` while dispatch is paused.
-    pub(crate) fn credential_probe_dead(&self) -> bool {
-        self.probe_cache.as_ref().is_some_and(|c| !c.healthy)
+    pub(crate) fn credential_probe_held(&self, harness: &str, project: &str) -> bool {
+        self.credential_probe_reason(harness, project).is_some()
     }
 
-    /// The dispatch credential-liveness preflight (BO-59): returns `true` when dispatch may proceed.
-    /// Runs at the existing on_tick gate (right after `validate()`), BEFORE any candidate fetch, so a
-    /// dead credential skips dispatch WITHOUT claiming anything. Caches a healthy verdict for
-    /// [`PROBE_TTL`] (probing at most once per TTL) and re-probes immediately after a failure; bounds
-    /// each probe with [`Orchestrator::probe_timeout`] (a hang fails closed); only probes a backend that
-    /// has a probe (a probe-less backend never blocks dispatch); and logs transitions loudly while
-    /// rate-limiting the steady-state dead repeat.
-    pub(crate) async fn credential_preflight(&mut self) -> bool {
-        // Seam absent → the feature is off; dispatch unchanged (all existing tests + non-prod builds).
+    pub(crate) fn has_credential_holds(&self) -> bool {
+        self.probe_cache.values().any(|c| c.held)
+    }
+
+    pub(crate) fn credential_probe_reason(&self, harness: &str, project: &str) -> Option<&str> {
+        self.probe_request_for(harness, project)
+            .and_then(|r| self.probe_cache.get(&r.key()))
+            .filter(|c| c.held)
+            .map(|c| c.reason.as_str())
+    }
+
+    fn manager_probe_request(&self, harness: &str, project: &str) -> Option<ProbeRequest> {
+        let mut req = self.probe_request_for(harness, project)?;
+        // Isolated managers use native OAuth even under the worker API-billing escape hatch.
+        req.billing_guard = true;
+        req.account = "claude-subscription".into();
+        Some(req)
+    }
+
+    pub(crate) fn manager_credential_probe_reason(
+        &self,
+        harness: &str,
+        project: &str,
+    ) -> Option<&str> {
+        self.manager_probe_request(harness, project)
+            .and_then(|r| self.probe_cache.get(&r.key()))
+            .filter(|c| c.held)
+            .map(|c| c.reason.as_str())
+    }
+
+    pub(crate) fn run_credential_probe_reason(&self, run: &crate::RunningEntry) -> Option<&str> {
+        if crate::managerrun::is_manager_key(&run.issue.id) {
+            self.manager_credential_probe_reason(&run.harness, &run.project_slug)
+        } else {
+            self.credential_probe_reason(&run.harness, &run.project_slug)
+        }
+    }
+
+    pub(crate) fn credential_human_feed(&self) -> Vec<crate::reviewreconcile::Divergence> {
+        self.probe_cache.iter().enumerate().filter(|(_, (_, c))| c.timeouts >= 3).map(|(index, (key, c))| {
+            crate::reviewreconcile::Divergence {
+                pr: format!("{} credential probe {} ({})", key.harness, index + 1, key.account),
+                kind: crate::reviewreconcile::DivergenceKind::CredentialInfrastructure,
+                ticket: String::new(), reviewer: String::new(), stale_secs: 0,
+                auto_merge_reason: None, capacity_held: None, capacity_unreadable: None,
+                adjudicated_head: String::new(), current_head: String::new(), rounds: 0,
+                findings: Vec::new(),
+                reason: format!("{} credential probe for {}: infrastructure problem, {} consecutive timeouts; {}. Dispatch continues; retry next tick.", key.harness, key.account, c.timeouts, c.reason),
+            }
+        }).collect()
+    }
+
+    /// Refresh scoped contexts concurrently; no credential verdict returns early from the whole tick.
+    pub(crate) async fn credential_preflight(&mut self) {
         let Some(probe) = self.cred_probe.clone() else {
-            return true;
+            return;
         };
-        let Some(req) = self.probe_request() else {
-            return true; // no config loaded (defensive; production always has one after reload)
-        };
-        // Backend without a probe (codex, …) → clean no-op; never blocks dispatch. Clear any cached
-        // verdict so a stale dead reading from a prior claude config can't linger (e.g. after a
-        // hot-reload from claude to codex) and surface a false advisory.
-        if !backend_has_probe(&req.backend) {
-            self.probe_cache = None;
-            return true;
+        let mut requests = BTreeMap::new();
+        let projects: Vec<String> = self
+            .eff
+            .as_ref()
+            .map(|e| {
+                if e.projects.is_empty() {
+                    vec![String::new()]
+                } else {
+                    e.projects
+                        .iter()
+                        .filter(|p| !p.disabled)
+                        .map(|p| p.slug.clone())
+                        .collect()
+                }
+            })
+            .unwrap_or_default();
+        // Profiles may choose Claude even when a project's configured primary is OpenCode.
+        let mut harnesses = vec![String::new()];
+        if let (Some(teams), Some(dir)) = (&self.teams, &self.teams_profiles_dir) {
+            for ident in &teams.roster {
+                if let Ok(profile) = rhapsody_config::profiles::resolve(dir, &ident.profile) {
+                    harnesses.push(profile.harness);
+                    harnesses.extend(profile.fallback.into_iter().map(|e| e.harness));
+                }
+            }
         }
+        for project in projects {
+            for harness in &harnesses {
+                if let Some(req) = self.probe_request_for(harness, &project) {
+                    requests.insert(req.key(), req);
+                }
+            }
+            if let Some(teams) = &self.teams {
+                for entry in teams.manager.effective_harnesses() {
+                    if let Some(req) = self.manager_probe_request(&entry.harness, &project) {
+                        requests.insert(req.key(), req);
+                    }
+                }
+            }
+        }
+        self.probe_cache.retain(|key, _| requests.contains_key(key));
         let now = (self.now)();
-        // Trust a fresh healthy verdict (cache). A dead verdict is never fresh → re-probe every tick.
-        if let Some(cache) = &self.probe_cache
-            && healthy_and_fresh(cache, now, PROBE_TTL)
-        {
-            return true;
-        }
-        // Probe, bounded by the timeout that fails closed on a hang.
-        let outcome = match tokio::time::timeout(self.probe_timeout, probe.probe(&req)).await {
-            Ok(o) => o,
-            Err(_) => ProbeOutcome::Dead(format!(
-                "credential probe did not answer within {:?}; cannot verify — skipping dispatch",
-                self.probe_timeout
-            )),
-        };
-        let prev_healthy = self.probe_cache.as_ref().map(|c| c.healthy);
-        match outcome {
-            ProbeOutcome::Healthy => {
-                if prev_healthy == Some(false) {
-                    tracing::warn!(
-                        "agent credential recovered; dispatch resuming (BO-59 dispatch preflight)"
-                    );
-                }
-                self.probe_cache = Some(ProbeCache {
-                    checked_at: now,
-                    healthy: true,
-                    last_logged_dead_at: None,
-                });
-                true
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut pending = BTreeSet::new();
+        for (key, req) in requests {
+            if self
+                .probe_cache
+                .get(&key)
+                .is_some_and(|c| healthy_and_fresh(&c.cache, now, PROBE_TTL))
+            {
+                continue;
             }
-            ProbeOutcome::Dead(reason) => {
-                let (should_log, last_logged) =
-                    dead_log_decision(self.probe_cache.as_ref(), now, DEAD_LOG_INTERVAL);
-                if should_log {
-                    tracing::error!(
-                        reason = %reason,
-                        "agent credential probe FAILED; skipping ALL dispatch this tick — an expired \
-                         login fails fast instead of burning a run every ~5 min (BO-59 dispatch preflight)"
-                    );
-                }
-                self.probe_cache = Some(ProbeCache {
-                    checked_at: now,
-                    healthy: false,
-                    last_logged_dead_at: last_logged,
-                });
-                false
-            }
+            let probe = probe.clone();
+            let timeout = self.probe_timeout;
+            pending.insert(key.clone());
+            tasks.spawn(async move {
+                let (outcome, timed_out) =
+                    match tokio::time::timeout(timeout, probe.probe(&req)).await {
+                        Ok(outcome) => (outcome, false),
+                        Err(_) => (
+                            ProbeOutcome::Unknown(format!(
+                                "no answer within {timeout:?}; credential status unknown"
+                            )),
+                            true,
+                        ),
+                    };
+                (key, outcome, timed_out)
+            });
         }
+        while let Some(result) = tasks.join_next().await {
+            let Ok((key, outcome, timed_out)) = result else {
+                tracing::warn!("credential probe task failed; credential status unknown");
+                continue;
+            };
+            pending.remove(&key);
+            let prev = self.probe_cache.get(&key);
+            let timeouts = if timed_out {
+                prev.map_or(1, |c| c.timeouts.saturating_add(1))
+            } else {
+                0
+            };
+            let held = matches!(outcome, ProbeOutcome::Dead(_));
+            let healthy = matches!(outcome, ProbeOutcome::Healthy);
+            let reason = match outcome {
+                ProbeOutcome::Healthy => String::new(),
+                ProbeOutcome::Dead(reason) | ProbeOutcome::Unknown(reason) => reason,
+            };
+            let (log, last_logged) = if healthy {
+                (false, None)
+            } else {
+                dead_log_decision(prev.map(|c| &c.cache), now, DEAD_LOG_INTERVAL)
+            };
+            if prev.is_some_and(|c| c.held || c.timeouts >= 3) && healthy {
+                tracing::warn!(account = %key.account, harness = %key.harness, "credential probe recovered; context may dispatch");
+            }
+            if log || timeouts == 3 || prev.is_some_and(|c| c.held != held) {
+                tracing::warn!(account = %key.account, harness = %key.harness, %reason, held, timeouts,
+                    "credential probe result; definite failures hold only this context; repeated timeouts are infrastructure faults");
+            }
+            self.probe_cache.insert(
+                key,
+                CachedProbe {
+                    cache: ProbeCache {
+                        checked_at: now,
+                        healthy,
+                        last_logged_dead_at: last_logged,
+                    },
+                    held,
+                    reason,
+                    timeouts,
+                },
+            );
+        }
+        // A probe task failing before it returns is unknown too; never keep its previous hold.
+        for key in pending {
+            self.probe_cache.insert(
+                key,
+                CachedProbe {
+                    cache: ProbeCache {
+                        checked_at: now,
+                        healthy: false,
+                        last_logged_dead_at: Some(now),
+                    },
+                    held: false,
+                    reason: "credential probe task failed; credential status unknown".into(),
+                    timeouts: 0,
+                },
+            );
+        }
+        self.accounts.replace_credential_probes(
+            self.probe_cache
+                .iter()
+                .map(|(key, c)| crate::accounts::CredentialView {
+                    account: key.account.clone(),
+                    harness: key.harness.clone(),
+                    held: c.held,
+                    reason: c.reason.clone(),
+                    checked_at_s: c.cache.checked_at.timestamp(),
+                })
+                .collect(),
+        );
     }
 }
 
@@ -530,8 +707,8 @@ mod tests {
             classify_probe(true, Some(0), b"warming up\nOK\n", b""),
             ProbeOutcome::Healthy
         ));
-        // The incident: a NON-ZERO exit is dead even if stdout somehow contained OK, and the reason
-        // carries the exit code + the stderr tail an operator needs.
+        // The incident: explicit expiry is dead even if stdout somehow contained OK; the reason
+        // names the credential failure without echoing the diagnostic.
         match classify_probe(
             false,
             Some(1),
@@ -540,30 +717,30 @@ mod tests {
         ) {
             ProbeOutcome::Dead(reason) => {
                 assert!(
-                    reason.contains("exited 1"),
-                    "reason names the exit code: {reason}"
+                    reason.contains("expired"),
+                    "reason names the credential failure: {reason}"
                 );
                 assert!(
-                    reason.contains("OAuth session expired"),
-                    "reason carries the stderr tail: {reason}"
+                    !reason.contains("could not be refreshed"),
+                    "reason must not echo stderr: {reason}"
                 );
             }
-            ProbeOutcome::Healthy => panic!("a non-zero exit must be classified dead"),
+            _ => panic!("an explicit OAuth expiry must be classified dead"),
         }
-        // exit 0 but stdout lacks the OK token → dead (a broken / differently-behaving probe).
+        // exit 0 but stdout lacks OK → unknown (a broken / differently-behaving probe).
         assert!(matches!(
             classify_probe(true, Some(0), b"something else\n", b""),
-            ProbeOutcome::Dead(_)
+            ProbeOutcome::Unknown(_)
         ));
-        // killed by a signal (no exit code) with no stderr → dead with a generic reason.
+        // killed by a signal (no exit code) with no stderr → unknown with a generic reason.
         match classify_probe(false, None, b"", b"") {
-            ProbeOutcome::Dead(reason) => {
+            ProbeOutcome::Unknown(reason) => {
                 assert!(
                     reason.contains("signal") && reason.contains("without OK"),
                     "{reason}"
                 );
             }
-            ProbeOutcome::Healthy => panic!("a signalled probe must be dead"),
+            _ => panic!("a signalled probe is unknown, not expired"),
         }
     }
 
@@ -576,6 +753,34 @@ mod tests {
         assert!(!stdout_is_ok(b"OKAY"), "a substring must not pass");
         assert!(!stdout_is_ok(b"not ok"));
         assert!(!stdout_is_ok(b""));
+    }
+
+    #[test]
+    fn only_definite_auth_errors_hold_and_diagnostics_never_echo_secrets() {
+        for diagnostic in [
+            "API Error: 401 token=secret-canary",
+            "OAuth session expired secret-canary",
+            "Not logged in secret-canary",
+            "Invalid API key secret-canary",
+        ] {
+            let ProbeOutcome::Dead(reason) =
+                classify_probe(false, Some(1), b"", diagnostic.as_bytes())
+            else {
+                panic!("explicit credential refusal must hold");
+            };
+            assert!(!reason.contains("secret-canary"));
+        }
+        for diagnostic in [
+            "network timeout secret-canary",
+            "request 401 completed without a response",
+        ] {
+            let ProbeOutcome::Unknown(reason) =
+                classify_probe(false, Some(1), b"", diagnostic.as_bytes())
+            else {
+                panic!("a transport failure is not an expired login");
+            };
+            assert!(!reason.contains("secret-canary"));
+        }
     }
 
     // --- backend gating (requirement 3) ------------------------------------------------------------
@@ -722,6 +927,211 @@ mod tests {
         }
     }
 
+    struct ScopedProbe {
+        timeout: bool,
+    }
+
+    #[async_trait]
+    impl CredentialProbe for ScopedProbe {
+        async fn probe(&self, req: &ProbeRequest) -> ProbeOutcome {
+            if req.billing_guard {
+                if self.timeout {
+                    std::future::pending::<()>().await;
+                }
+                ProbeOutcome::Dead("expired login".into())
+            } else {
+                ProbeOutcome::Healthy
+            }
+        }
+    }
+
+    fn mixed_accounts(
+        timeout: bool,
+    ) -> (Orchestrator, DispatchedEntries, crate::testsupport::TempDir) {
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("claude.md"),
+            "---\nextends: swe\nharness: claude\n---\nClaude.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.child("chatgpt.md"),
+            "---\nextends: swe\nharness: opencode\nmodel: openai/gpt-test\n---\nOpenCode.\n",
+        )
+        .unwrap();
+        let (mut o, sink, _) = orch_with_probe(false, FakeKind::Healthy);
+        let mut teams = rhapsody_config::teams::Teams {
+            enabled: true,
+            ..rhapsody_config::teams::Teams::disabled()
+        };
+        let eff = o.eff.as_mut().unwrap();
+        eff.cfg.providers.clear();
+        for (slug, backend, guard) in [
+            ("subscription", "claude", true),
+            ("api", "claude", false),
+            ("chatgpt", "opencode", true),
+        ] {
+            let mut tr = Fake::new();
+            let mut candidate = issue(slug, slug, "Todo");
+            candidate.labels = Some(vec![format!("rhapsody:@{slug}")]);
+            tr.candidates = vec![candidate];
+            let mut p = empty_resolved_project(slug, Arc::new(tr));
+            p.active_states = set_of(&["todo"]);
+            p.max_concurrent = 10;
+            p.mcfg.providers.clear();
+            p.mcfg.claude.billing_guard = Some(guard);
+            p.mcfg.opencode.model = "openai/gpt-test".into();
+            eff.projects.push(p);
+            teams.roster.push(rhapsody_config::teams::Identity {
+                name: slug.into(),
+                profile: if backend == "opencode" {
+                    "chatgpt"
+                } else {
+                    "claude"
+                }
+                .into(),
+                ..Default::default()
+            });
+        }
+        o.teams = Some(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("")));
+        o.cred_probe = Some(Arc::new(ScopedProbe { timeout }));
+        o.probe_timeout = Duration::from_millis(10);
+        (o, sink, dir)
+    }
+
+    #[tokio::test]
+    async fn scoped_timeout_other_accounts_still_dispatch() {
+        let (mut o, sink, _dir) = mixed_accounts(true);
+        drive_tick(&mut o).await;
+        let entries = sink.lock().unwrap();
+        assert!(entries.iter().any(|e| e.issue.id == "api"));
+        assert!(entries.iter().any(|e| e.issue.id == "chatgpt"));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.issue.id == "chatgpt")
+                .unwrap()
+                .harness,
+            "opencode"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_timeout_dispatches_affected_work() {
+        let (mut o, sink, _dir) = mixed_accounts(true);
+        drive_tick(&mut o).await;
+        assert!(
+            sink.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.issue.id == "subscription")
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_expiry_holds_only_affected_account() {
+        let (mut o, sink, _dir) = mixed_accounts(false);
+        drive_tick(&mut o).await;
+        let entries = sink.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.issue.id != "subscription"));
+        assert!(!o.claimed.contains("subscription"));
+        assert!(o.retry_attempts.is_empty());
+        let accounts = o.control().accounts((o.now)().timestamp());
+        let held = accounts
+            .iter()
+            .find(|a| a.account == "claude-subscription")
+            .unwrap();
+        assert_eq!(held.status, "credential_held");
+        assert_eq!(held.level.as_deref(), Some("stop_new"));
+        assert!(
+            serde_json::to_value(held).unwrap()["probe_reason"]
+                .as_str()
+                .unwrap()
+                .contains("expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_expiry_does_not_hold_another_harness_on_the_same_account() {
+        let (mut o, sink, dir) = mixed_accounts(false);
+        let eff = o.eff.as_mut().unwrap();
+        let api = eff.projects.iter_mut().find(|p| p.slug == "api").unwrap();
+        api.mcfg.opencode.model = "anthropic/claude-test".into();
+        std::fs::write(dir.child("anthropic.md"), "---\nextends: swe\nharness: opencode\nmodel: anthropic/claude-test\n---\nOpenCode Anthropic.\n").unwrap();
+        o.teams
+            .as_mut()
+            .unwrap()
+            .roster
+            .iter_mut()
+            .find(|i| i.name == "api")
+            .unwrap()
+            .profile = "anthropic".into();
+        let mut claude_api = empty_resolved_project("claude-api", Arc::new(Fake::new()));
+        claude_api.mcfg.claude.billing_guard = Some(false);
+        eff.projects.push(claude_api);
+        // Explicitly reject Claude API auth; OpenCode's own Anthropic login remains independent.
+        o.cred_probe = Some(Arc::new(FakeProbe {
+            kind: FakeKind::Dead,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        drive_tick(&mut o).await;
+        assert!(sink.lock().unwrap().iter().any(|e| e.issue.id == "api"));
+        assert!(o.credential_probe_held("claude", "claude-api"));
+    }
+
+    #[tokio::test]
+    async fn scoped_command_reload_invalidates_a_healthy_cache() {
+        let (mut o, _, calls) = orch_with_probe(false, FakeKind::Healthy);
+        drive_tick(&mut o).await;
+        o.eff.as_mut().unwrap().cfg.claude.command = "different-command".into();
+        drive_tick(&mut o).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(o.probe_cache.len(), 1, "old context must be retired");
+    }
+
+    #[tokio::test]
+    async fn scoped_repeated_timeouts_report_infrastructure_and_recover() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = crate::testsupport::recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let (mut o, _, _dir) = mixed_accounts(true);
+        for _ in 0..2 {
+            drive_tick(&mut o).await;
+            assert!(o.build_snapshot().review_divergence.is_empty());
+        }
+        drive_tick(&mut o).await;
+        let report = o.build_snapshot().review_divergence;
+        assert_eq!(report.len(), 1);
+        assert!(report[0].reason.contains("claude-subscription"));
+        assert!(report[0].reason.contains("claude"));
+        assert!(report[0].reason.contains("infrastructure"));
+        let wire = crate::snapshot_json::render(&o.build_snapshot());
+        assert!(
+            wire["review_divergence"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("3 consecutive timeouts")
+        );
+        assert!(events.lock().unwrap().iter().any(|e| {
+            e.level == "WARN"
+                && e.message.contains("infrastructure faults")
+                && e.fields
+                    .get("account")
+                    .is_some_and(|a| a == "claude-subscription")
+                && e.fields.get("harness").is_some_and(|h| h == "claude")
+                && e.fields.get("timeouts").is_some_and(|t| t == "3")
+        }));
+        o.cred_probe = Some(Arc::new(FakeProbe {
+            kind: FakeKind::Healthy,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        drive_tick(&mut o).await;
+        assert!(o.build_snapshot().review_divergence.is_empty());
+    }
+
     // Requirement: a probe that fails causes on_tick to SKIP dispatch — without claiming anything.
     #[tokio::test(flavor = "multi_thread")]
     async fn dead_probe_skips_dispatch_without_claiming() {
@@ -787,19 +1197,18 @@ mod tests {
         );
     }
 
-    // Requirement: a probe that hangs is bounded by its timeout and fails closed.
+    // A hanging probe is bounded and permits dispatch with an unknown credential state.
     #[tokio::test(flavor = "multi_thread")]
-    async fn hanging_probe_fails_closed_within_timeout() {
+    async fn hanging_probe_dispatches_within_timeout() {
         let (mut o, sink, _calls) = orch_with_probe(true, FakeKind::Hang);
         o.probe_timeout = Duration::from_millis(50);
         let start = std::time::Instant::now();
         drive_tick(&mut o).await;
         let elapsed = start.elapsed();
         assert!(
-            sink.lock().expect("dispatch sink").is_empty(),
-            "a hanging probe must fail closed (skip dispatch)"
+            sink.lock().expect("dispatch sink").len() == 1,
+            "a hanging probe is unknown and permits dispatch"
         );
-        assert!(o.claimed.is_empty(), "a fail-closed skip claims nothing");
         assert!(
             elapsed < Duration::from_secs(5),
             "the probe timeout must bound the tick (got {elapsed:?})"
@@ -813,22 +1222,15 @@ mod tests {
         let (mut o, _sink, calls) = orch_with_probe(false, FakeKind::Dead);
         o.eff.as_mut().expect("eff").cfg.agent.backend = "codex".to_string();
         // Seed a stale dead verdict (as if the backend had just hot-reloaded from claude).
-        o.probe_cache = Some(ProbeCache {
-            checked_at: (o.now)(),
-            healthy: false,
-            last_logged_dead_at: None,
-        });
-        assert!(
-            o.credential_preflight().await,
-            "a probe-less backend (codex) must never block dispatch"
-        );
+        o.seed_dead_probe("claude", "");
+        o.credential_preflight().await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
             "a codex backend must not invoke the claude probe at all"
         );
         assert!(
-            !o.credential_probe_dead(),
+            o.probe_cache.is_empty(),
             "switching to a probe-less backend must clear a stale dead verdict"
         );
     }
@@ -855,11 +1257,7 @@ mod tests {
         );
 
         // Mark the cached verdict dead → the advisory appears on the project status.
-        o.probe_cache = Some(ProbeCache {
-            checked_at: (o.now)(),
-            healthy: false,
-            last_logged_dead_at: None,
-        });
+        o.seed_dead_probe("claude", "alpha");
         let after = o.project_statuses();
         assert!(
             after[0]
