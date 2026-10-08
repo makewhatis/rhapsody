@@ -178,6 +178,8 @@ pub struct ManagerCheckout {
 /// trusted repository origin its project route is resolved from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagerRun {
+    /// Account-scoped judgment call; empty preserves the PR review-loop run kind.
+    pub limit_account: String,
     pub owner: String,
     pub repo: String,
     pub number: i64,
@@ -196,6 +198,9 @@ pub struct ManagerRun {
 impl ManagerRun {
     /// The run's issue id and identifier: `pr:owner/repo#number@manager`.
     pub(crate) fn key(&self) -> String {
+        if !self.limit_account.is_empty() {
+            return crate::managerlimits::limit_manager_key(&self.limit_account);
+        }
         manager_key(&self.owner, &self.repo, self.number)
     }
 
@@ -216,10 +221,14 @@ impl ManagerRun {
         let key = self.key();
         Issue {
             id: key.clone(),
-            title: format!(
-                "Manager run for {}/{}#{}",
-                self.owner, self.repo, self.number
-            ),
+            title: if self.limit_account.is_empty() {
+                format!(
+                    "Manager run for {}/{}#{}",
+                    self.owner, self.repo, self.number
+                )
+            } else {
+                format!("Manager limit decision for {}", self.limit_account)
+            },
             identifier: key,
             team_id: self.team_id.clone(),
             labels: Some(vec![format!("rhapsody:{MANAGER_KEY_SUFFIX}")]),
@@ -283,13 +292,14 @@ impl Orchestrator {
         }
         // §10.2: `review_authority: off` means the manager does not act. This is the config gate the
         // whole feature hangs on, and `off` must remain byte-identical — so it is checked first.
-        if self.manager_review_authority() == ReviewAuthority::Off {
+        let is_limit = !run.limit_account.is_empty();
+        if !is_limit && self.manager_review_authority() == ReviewAuthority::Off {
             return ManagerDispatchOutcome::AuthorityOff;
         }
-        if run.owner.is_empty() || run.repo.is_empty() {
+        if !is_limit && (run.owner.is_empty() || run.repo.is_empty()) {
             return ManagerDispatchOutcome::Refused("pull request has no owner/repo".to_string());
         }
-        if run.number <= 0 {
+        if !is_limit && run.number <= 0 {
             return ManagerDispatchOutcome::Refused(
                 "pull-request number is not positive".to_string(),
             );
@@ -306,8 +316,19 @@ impl Orchestrator {
         // THE overwrite guard: never point a second agent at a live manager run's identity. Checked
         // before the self-test gate's version re-probe so a repeated sweep for an in-flight run does
         // no work.
-        if self.running.contains_key(&id) || self.claimed.contains(&id) {
+        if self.running.contains_key(&id)
+            || self.claimed.contains(&id)
+            || self.limit_policy.limited_managers.contains_key(&id)
+        {
             return ManagerDispatchOutcome::AlreadyInFlight;
+        }
+        if is_limit
+            && self.teams.as_ref().is_some_and(|t| {
+                self.running.keys().filter(|id| is_manager_key(id)).count() as i64
+                    >= t.manager.max_concurrent.max(1)
+            })
+        {
+            return ManagerDispatchOutcome::Refused("manager capacity".into());
         }
         // §4.7/§10.2: the self-test must have passed on the CURRENT CLI version before the manager
         // acts again. Re-probe the installed version HERE — and record it — so a CLI that updated
@@ -358,7 +379,18 @@ impl Orchestrator {
             .map(|a| a.fallback_reason.clone())
             .unwrap_or_default();
         let skipped = self.manager_selftest.fallback_reason(selected.index);
-        let fallback_reason = [prior_reason, skipped]
+        let limited = entries
+            .iter()
+            .take(selected.index)
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let account = crate::accounts::account_for(&entry.harness, &entry.model, true);
+                (!self.account_usable(&account))
+                    .then(|| format!("entry {} limited: {account}", index + 1))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let fallback_reason = [prior_reason, skipped, limited]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -427,15 +459,24 @@ impl Orchestrator {
             .unwrap_or_default();
         let model = self.manager_model_override(inherited, entry);
         let pricing = self.run_pricing_for(&entry.harness, &model, project);
-        let mut held = if !self.account_usable(&pricing.account) {
-            crate::budget::BudgetHeld {
-                provider: pricing.account.clone(),
-                reason: format!("waiting: {} limit", pricing.account),
-                ..Default::default()
-            }
+        // The isolated manager credential is native OAuth; retain the workflow's independent
+        // provider budget gate as well, rather than granting a limit decision a budget exemption.
+        let native_account = crate::accounts::account_for(&entry.harness, &pricing.model, true);
+        let blocked_account = if !self.account_usable(&pricing.account) {
+            &pricing.account
         } else {
-            self.usd_budget_hold(&pricing)?
+            &native_account
         };
+        let mut held =
+            if !self.account_usable(&pricing.account) || !self.account_usable(&native_account) {
+                crate::budget::BudgetHeld {
+                    provider: blocked_account.clone(),
+                    reason: format!("waiting: {blocked_account} limit"),
+                    ..Default::default()
+                }
+            } else {
+                self.usd_budget_hold(&pricing)?
+            };
         held.subject = iss.identifier;
         held.title = iss.title;
         held.project = project.into();
@@ -475,11 +516,34 @@ impl Orchestrator {
             .get(&run.key())
             .filter(|a| a.intervention_id == active_id)
             .map_or(0, |a| a.next_index);
-        self.manager_selftest.select_from(
-            start,
-            (self.now)().timestamp_millis(),
-            self.manager_selftest.credential_probe().as_ref(),
-        )
+        let mut cursor = start;
+        let mut reasons = Vec::new();
+        loop {
+            let selected = self.manager_selftest.select_from(
+                cursor,
+                (self.now)().timestamp_millis(),
+                self.manager_selftest.credential_probe().as_ref(),
+            )?;
+            let project = self
+                .review_route(&run.repo_url)
+                .map(|r| r.slug)
+                .unwrap_or_default();
+            if let Some(held) = self.manager_usd_budget_hold(run, &project, &selected.entry) {
+                if !held.reason.starts_with("waiting:") {
+                    return Ok(selected);
+                }
+                reasons.push(format!("entry {}: {}", selected.index + 1, held.reason));
+                cursor = selected.index.saturating_add(1);
+                if cursor >= self.manager_selftest.entries().len() {
+                    return Err(crate::managerselftest::ManagerUnavailable {
+                        cli_version: String::new(),
+                        detail: reasons.join("; "),
+                    });
+                }
+            } else {
+                return Ok(selected);
+            }
+        }
     }
 
     /// The tail of a manager dispatch: stage the coordinates for
@@ -515,6 +579,21 @@ impl Orchestrator {
         self.persist_end_run(re, outcome, reason);
         self.persist_complete(&re.issue.identifier);
         self.persist_totals();
+        if re.issue.id.starts_with("limit:") {
+            self.settle_limit_manager(&re.issue.id, e);
+            if e.failed
+                && let Some(attempt) = self.manager_attempts.get_mut(&re.issue.id)
+            {
+                if e.auth_needed {
+                    self.manager_selftest.mark_auth_blocked(
+                        attempt.selected.index,
+                        attempt.credential_fingerprint.clone(),
+                    );
+                }
+                attempt.next_index = attempt.selected.index.saturating_add(1);
+            }
+            return;
+        }
         // M8: settle the intervention the run belonged to (§7.2). The run has ended, so the
         // intervention must not stay `running` until its lease expires — a clean exit with a valid
         // decision becomes `decided`/`validated`, and anything else a `failed_attempt`.
@@ -651,6 +730,7 @@ mod tests {
 
     fn manager_run() -> ManagerRun {
         ManagerRun {
+            limit_account: String::new(),
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
             number: 12,

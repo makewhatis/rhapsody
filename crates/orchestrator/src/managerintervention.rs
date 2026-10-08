@@ -1046,6 +1046,7 @@ impl Orchestrator {
             .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, &candidate))
             .map(|p| p.repo.clone())?;
         Some(ManagerRun {
+            limit_account: String::new(),
             owner: coord.owner,
             repo: coord.repo,
             number: coord.number,

@@ -429,17 +429,23 @@ where
         // any successful attempt, an unexercised attempt, or a canary that cannot run forces the
         // authority back to `off` and records the typed reason. The recorded verdict is what
         // `manager_launch_permitted()` (and M8's launch gate) reads.
-        apply_manager_self_test(
-            &mut teams_cfg,
-            o.manager_selftest_state(),
-            resolved.as_ref(),
-            &flags.path.to_string_lossy(),
-        )
-        .await;
+        if install_probe {
+            apply_manager_self_test(
+                &mut teams_cfg,
+                o.manager_selftest_state(),
+                resolved.as_ref(),
+                &flags.path.to_string_lossy(),
+            )
+            .await;
+        }
         // When the manager may act, keep the §4.7 verdict fresh across a CLI version change: the
         // watcher re-probes the installed version and re-runs the canary whenever it changed. The
         // launch gate re-probes too, so nothing acts on a stale verdict in the meantime.
-        if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+        if install_probe
+            && (teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+                || (teams_cfg.enabled
+                    && teams_cfg.manager.mode != rhapsody_config::teams::ManagerMode::Off))
+        {
             manager_selftest_watch = Some((
                 o.manager_selftest_handle(),
                 manager_canary_factory(
@@ -454,6 +460,7 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_manager_limit_fallback(&teams_cfg);
         report_over_pinned_reviewers(o.teams.as_ref());
         report_unknown_required_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
@@ -2228,7 +2235,9 @@ async fn apply_manager_self_test(
     workflow_path: &str,
 ) {
     use rhapsody_config::teams::ReviewAuthority;
-    if teams.manager.review_authority == ReviewAuthority::Off {
+    if teams.manager.review_authority == ReviewAuthority::Off
+        && (!teams.enabled || teams.manager.mode == rhapsody_config::teams::ManagerMode::Off)
+    {
         return;
     }
     selftest.configure(teams.manager.effective_harnesses());
@@ -2391,6 +2400,19 @@ fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
              will route and no teammate section will be prepended, which is exactly the behaviour \
              of `enabled: false`. Set manager.default_identity to run every ticket as one teammate."
         );
+    }
+}
+
+fn report_manager_limit_fallback(teams: &rhapsody_config::teams::Teams) {
+    if teams.enabled
+        && let Some(warning) = rhapsody_orchestrator::managerlimits::manager_fallback_warning(
+            &teams.manager,
+            &|entry| {
+                rhapsody_orchestrator::accounts::account_for(&entry.harness, &entry.model, true)
+            },
+        )
+    {
+        tracing::warn!("{warning}");
     }
 }
 
@@ -2592,6 +2614,53 @@ mod tests {
     use super::*;
     use crate::testutil::{SharedBuf, TempDir};
     use rhapsody_orchestrator::CancelSignal;
+    #[test]
+    fn boot_limit_fallback_warning_is_warn_and_teams_gated() {
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        _: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+                let mut visitor = Visitor(format!("{} ", event.metadata().level()));
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+        let record = Recorder::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(record.clone()),
+            || {
+                super::report_manager_limit_fallback(&rhapsody_config::teams::Teams::disabled());
+                assert!(record.0.lock().unwrap().is_empty());
+                super::report_manager_limit_fallback(&rhapsody_config::teams::Teams {
+                    enabled: true,
+                    ..Default::default()
+                });
+            },
+        );
+        let got = record.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].contains("WARN")
+                && got[0].contains("no fallback on a different account")
+                && got[0].contains("claude-subscription"),
+            "{got:?}"
+        );
+    }
     use rhapsody_provider_broker::BrokerError;
     use std::net::SocketAddr;
     use std::sync::Mutex;
