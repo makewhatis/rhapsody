@@ -47,7 +47,7 @@ use crate::handlers_manager::handle_investigate;
 use crate::handlers_manager::{
     handle_manager_diff, handle_manager_file, handle_manager_findings, handle_manager_grep,
     handle_manager_interdiff, handle_manager_ls, handle_manager_patch_id, handle_manager_pr,
-    handle_manager_pr_activity, handle_manager_pr_commits,
+    handle_manager_pr_activity, handle_manager_pr_commits, handle_operator_preferences,
 };
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
@@ -579,6 +579,10 @@ pub trait StateProvider: Send + Sync {
     // does: a provider with no manager subsystem genuinely has no answer to give, and the tool
     // renders it as a stated reason rather than a fault.
 
+    async fn operator_preferences(&self, _run_id: i64, _query: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable("operator memory unavailable"))
+    }
+
     /// `GET /api/v1/manager/file?run_id&sha&path` — one blob at a commit sha, from git objects.
     async fn manager_file(&self, _run_id: i64, _sha: String, _path: String) -> ManagerReadOutcome {
         Err(ManagerReadError::Unavailable(
@@ -873,6 +877,10 @@ where
         // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
         // than `/pr`; axum's matchit dispatches them regardless of order.
         .route("/api/v1/manager/file", any(handle_manager_file))
+        .route(
+            "/api/v1/manager/operator-preferences",
+            any(handle_operator_preferences),
+        )
         .route(
             "/api/v1/manager/investigate",
             operator_write(handle_investigate),

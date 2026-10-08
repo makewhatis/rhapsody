@@ -484,6 +484,17 @@ impl StateProvider for DaemonState {
         self.handle.manager_file(run_id, &sha, &path).await
     }
 
+    async fn operator_preferences(&self, run_id: i64, query: String) -> ManagerReadOutcome {
+        match self.handle.teams_memory() {
+            Some(memory) => memory.operator_preferences(run_id, &query).await,
+            None => Err(
+                rhapsody_orchestrator::managerread::ManagerReadError::Unavailable(
+                    "operator memory unavailable",
+                ),
+            ),
+        }
+    }
+
     async fn investigate(
         &self,
         run_id: i64,

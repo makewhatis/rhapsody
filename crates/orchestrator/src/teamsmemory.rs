@@ -299,6 +299,7 @@ impl From<MemoryError> for TeamsMemoryError {
 pub struct TeamsMemory {
     teams: Arc<Teams>,
     backend: Arc<dyn MemoryBackend>,
+    operator_memory: Option<Arc<rhapsody_config::hindsight::OperatorMemory>>,
     /// How the backend resolves an identity to its bank id, so the roster view
     /// reports what the STORE actually uses rather than re-deriving it and
     /// risking disagreement (an identity with a roster `bank:` override would
@@ -324,6 +325,22 @@ impl TeamsMemory {
     /// Creates nothing: with `backend: none` (or Teams off) the backend is a
     /// no-op and the filesystem is never touched.
     pub fn new(teams: Arc<Teams>, backend: Arc<dyn MemoryBackend>) -> Self {
+        let operator_memory = if teams.enabled && teams.manager.lead.enabled {
+            match rhapsody_config::hindsight::OperatorMemory::new(
+                &teams.memory.endpoint,
+                &teams.memory.api_key,
+            ) {
+                Ok(memory) => Some(Arc::new(memory)),
+                Err(_) => {
+                    tracing::warn!(
+                        "Operator memory unavailable: Hindsight endpoint is not configured or invalid; lead will decide without memory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Resolved through the backend's OWN rule rather than re-derived: a `bank:` override that
         // is not label-safe is DROPPED by `with_bank_overrides`, so copying it verbatim reported a
         // bank id no backend ever opens — the roster view lied, and the team-scope guard built on
@@ -341,6 +358,7 @@ impl TeamsMemory {
         Self {
             teams,
             backend,
+            operator_memory,
             bank_ids,
             runs: RwLock::new(HashMap::new()),
             room: None,
@@ -543,6 +561,60 @@ impl TeamsMemory {
     /// trait is the whole `MemoryBackend` — so the caller owns keeping it a read.
     pub fn backend(&self) -> Arc<dyn MemoryBackend> {
         Arc::clone(&self.backend)
+    }
+
+    pub fn operator_memory(&self) -> Option<Arc<rhapsody_config::hindsight::OperatorMemory>> {
+        self.operator_memory.clone()
+    }
+
+    /// Read-only and off-loop. A worker's binding cannot be used to access the manager tool.
+    pub async fn operator_preferences(
+        &self,
+        run_id: i64,
+        query: &str,
+    ) -> crate::managerread::ManagerReadOutcome {
+        use crate::managerread::ManagerReadError;
+        let prov = self
+            .read_runs()
+            .get(&run_id)
+            .cloned()
+            .ok_or(ManagerReadError::NoSuchRun)?;
+        // The host-bound run KEY defines its role. Existing routing can attach the manager's
+        // default teammate identity; requiring identity == manager would reject those live runs.
+        if !self.enabled() || !crate::managerrun::is_manager_key(&prov.ticket) {
+            return Err(ManagerReadError::NotAManagerRun);
+        }
+        if query.trim().is_empty() || query.len() > 4000 {
+            return Err(ManagerReadError::Unavailable(
+                "query must contain 1–4000 bytes",
+            ));
+        }
+        let q = Query {
+            title: query.into(),
+            top_k: usize::try_from(self.teams.memory.recall_top_k)
+                .ok()
+                .filter(|k| *k > 0)
+                .unwrap_or(rhapsody_config::memory::FALLBACK_TOP_K),
+            ..Default::default()
+        };
+        let recalled = match &self.operator_memory {
+            Some(memory) => memory.recall(&q).await.ok(),
+            None => None,
+        };
+        match recalled {
+            Some(recalled) => Ok(
+                serde_json::json!({"available":true,"context":"context, not binding precedent or policy", "facts":recalled.facts,"skipped":recalled.skipped.len()}),
+            ),
+            None => {
+                tracing::warn!(
+                    run_id,
+                    "Operator memory unavailable; manager will decide without memory"
+                );
+                Ok(
+                    serde_json::json!({"available":false,"facts":[],"note":"Operator memory unavailable; decide without memory and say so."}),
+                )
+            }
+        }
     }
 
     pub fn bank_ids(&self) -> &HashMap<String, String> {

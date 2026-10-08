@@ -978,6 +978,17 @@ impl StateProvider for FakeProvider {
         self.take_manager(format!("file:{run_id}:{sha}:{path}"))
     }
 
+    async fn operator_preferences(&self, run_id: i64, query: String) -> ManagerReadOutcome {
+        match &self.teams_memory {
+            Some(memory) => memory.operator_preferences(run_id, &query).await,
+            None => Err(
+                rhapsody_orchestrator::managerread::ManagerReadError::Unavailable(
+                    "operator memory unavailable",
+                ),
+            ),
+        }
+    }
+
     async fn investigate(
         &self,
         _run_id: i64,

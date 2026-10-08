@@ -681,7 +681,11 @@ where
     if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
         o.lead_reports = Some(Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
             store: store.clone(),
-            memory: o.teams_memory.as_ref().map(|m| m.backend()),
+            memory: o
+                .teams_memory
+                .as_ref()
+                .and_then(|m| m.operator_memory())
+                .map(|m| m as Arc<dyn rhapsody_orchestrator::leadreport::OverruleMemory>),
         }));
         o.lead_report_tx = Some(lead_report_tx);
     }
@@ -702,6 +706,7 @@ where
                 .as_ref()
                 .map(|r| r.clone() as Arc<dyn rhapsody_config::room::RoomLog>),
             memory: o.teams_memory.as_ref().map(|m| m.backend()),
+            operator_memory: o.teams_memory.as_ref().and_then(|m| m.operator_memory()),
             findings_dir: std::env::var_os("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".rhapsody/docs")),
         }));

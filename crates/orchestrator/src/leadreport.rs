@@ -1,12 +1,25 @@
 //! Tech-lead reporting and operator overrules (STUDIO-1138). No Go counterpart.
 
-use rhapsody_config::memory::{MemoryBackend, Record};
+use rhapsody_config::memory::{MemoryError, Record};
 use rhapsody_store::{LeadDecisionRow, LeadTrigger, Store};
 use std::sync::Arc;
 
 pub struct LeadReports {
     pub store: Arc<dyn Store + Send + Sync>,
-    pub memory: Option<Arc<dyn MemoryBackend>>,
+    pub memory: Option<Arc<dyn OverruleMemory>>,
+}
+
+/// The host-only T3 retain seam, never a teammate/personal-bank write.
+#[async_trait::async_trait]
+pub trait OverruleMemory: Send + Sync {
+    async fn retain_overrule(&self, record: &Record) -> Result<String, MemoryError>;
+}
+
+#[async_trait::async_trait]
+impl OverruleMemory for rhapsody_config::hindsight::OperatorMemory {
+    async fn retain_overrule(&self, record: &Record) -> Result<String, MemoryError> {
+        rhapsody_config::hindsight::OperatorMemory::retain_overrule(self, record).await
+    }
 }
 
 impl crate::ControlHandle {
@@ -142,7 +155,7 @@ impl LeadReports {
             true
         } else if let Some(memory) = &self.memory {
             let record = Record {
-                identity: "operator".into(),
+                identity: "David".into(),
                 document_id: format!("lead-overrule-{id}"),
                 at,
                 content: format!(
@@ -152,7 +165,7 @@ impl LeadReports {
             };
             match tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                memory.retain_shared("operator-decisions", &record),
+                memory.retain_overrule(&record),
             )
             .await
             {
@@ -361,6 +374,16 @@ mod tests {
     use super::*;
     use rhapsody_store::{LeadDecisionRow, LeadTrigger, Sqlite, StorePath};
 
+    #[derive(Default)]
+    struct RecordingMemory(std::sync::Mutex<Vec<Record>>);
+    #[async_trait::async_trait]
+    impl OverruleMemory for RecordingMemory {
+        async fn retain_overrule(&self, record: &Record) -> Result<String, MemoryError> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok("retained-overrule".into())
+        }
+    }
+
     fn reports() -> LeadReports {
         LeadReports {
             store: Arc::new(Sqlite::open(StorePath::InMemory).unwrap()),
@@ -416,10 +439,8 @@ mod tests {
     #[tokio::test]
     async fn overrule_retains_and_opens_item() {
         let mut r = reports();
-        let dir = crate::testsupport::TempDir::new();
-        r.memory = Some(Arc::new(rhapsody_config::memory::LocalBank::new(
-            &dir.path, "agent-",
-        )));
+        let memory = Arc::new(RecordingMemory::default());
+        r.memory = Some(memory.clone());
         let id = decision(&r, "2026-10-07T10:00:00Z", "done: requeue");
         let view = r
             .overrule(id, "Prefer diagnosis before retry.")
@@ -434,25 +455,20 @@ mod tests {
         let items = r.store.load_lead_items().unwrap();
         assert_eq!(items.len(), 2);
         assert!(format!("{:?}", items[1].trigger).contains("Prefer diagnosis"));
-        let remembered = r
-            .memory
-            .as_ref()
-            .unwrap()
-            .recall_shared(
-                "operator-decisions",
-                &rhapsody_config::memory::Query {
-                    title: "Prefer diagnosis".into(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(remembered.facts.len(), 1);
-        assert!(remembered.facts[0].content.contains("by: David"));
+        let remembered = memory.0.lock().unwrap().clone();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].identity, "David");
+        assert!(remembered[0].content.contains("by: David"));
+        assert!(
+            remembered[0]
+                .content
+                .contains("Prefer diagnosis before retry.")
+        );
         r.overrule(id, "Prefer diagnosis before retry.")
             .await
             .unwrap();
         assert_eq!(r.store.load_lead_items().unwrap().len(), 2);
+        assert_eq!(memory.0.lock().unwrap().len(), 1);
     }
     #[test]
     fn digest_at_configured_time_one_push() {

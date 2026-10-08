@@ -88,6 +88,23 @@ Notification delivery is best-effort and bounded; a reservation precedes deliver
 channels log rather than repeatedly page. With the lead disabled, existing human-feed and
 Go-owned schema/payload goldens remain unchanged.
 
+### Tech-lead operator memory (STUDIO-1137)
+
+The manager role adds the read-only `operator_preferences(query)` tool, proxied through
+`GET /api/v1/manager/operator-preferences?run_id=&query=` and restricted to live manager bindings.
+Claude's tool allowlist and OpenCode's server-prefixed permissions cover it; ordinary facades do
+not register it. Operator recall uses the configured Hindsight endpoint and the exact bank
+`operator-decisions`, independent of the personal-bank prefix or the team's local/remote backend.
+Lead preparation prefetches operator preferences and the configured team bank off-loop, before
+dispatch; quoted, attributed memory is context, never binding precedent or policy. Missing or
+unavailable memory is stated in the case packet/tool answer, and the lead continues deciding.
+
+The daemon retains each lead decision with `by: lead` metadata and the `lead` tag. The host-only
+`OperatorMemory::retain_overrule` method records `by: David` and the operator's note; the subsequent
+overrule endpoint slice calls this method. These mirrors are best-effort and cannot fail or replay
+an applied decision. No model tool can write to the operator bank. Existing Teams retain payloads,
+ported API/config/schema goldens, and lead-disabled dispatch behavior are unchanged.
+
 ### Tech-lead decisions and guarded execution (STUDIO-1136)
 
 With the opt-in lead enabled, queued items launch on the manager's isolated, boot-self-tested
