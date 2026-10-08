@@ -477,6 +477,18 @@ impl StateProvider for DaemonState {
         self.handle.manager_file(run_id, &sha, &path).await
     }
 
+    async fn investigate(
+        &self,
+        run_id: i64,
+        head: String,
+        cmd: String,
+    ) -> Result<
+        rhapsody_orchestrator::investigate::CommandOutput,
+        rhapsody_orchestrator::investigate::InvestigateError,
+    > {
+        self.handle.investigate(run_id, &head, &cmd).await
+    }
+
     async fn manager_ls(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
         self.handle.manager_ls(run_id, &sha, &path).await
     }

@@ -450,6 +450,18 @@ where
             ));
         }
         o.teams = Some(teams_cfg.clone());
+        // A failed sandbox self-test disables only investigate, never manager authority.
+        if teams_cfg.enabled
+            && teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+            && let Some(cfg) = resolved.as_ref()
+        {
+            o.investigate = Some(
+                rhapsody_orchestrator::investigate::Investigations::boot(std::path::PathBuf::from(
+                    &cfg.workspace.root,
+                ))
+                .await,
+            );
+        }
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
@@ -1526,6 +1538,13 @@ where
 
     // --- run the control loop until ctx is cancelled ---
     let run_err = o.run(ctx.clone()).await;
+    if let Some(runtime) = &o.investigate
+        && tokio::time::timeout(Duration::from_secs(30), runtime.shutdown())
+            .await
+            .is_err()
+    {
+        tracing::warn!("investigate: shutdown cleanup timed out");
+    }
 
     // The control loop has returned (ctx cancel OR a fatal reload error) — now stop the server + prune
     // regardless of why (Go's `pruneCancel` + `defer srv.Shutdown`).

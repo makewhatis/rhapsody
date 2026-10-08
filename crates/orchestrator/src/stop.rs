@@ -188,6 +188,10 @@ pub struct ControlHandle {
     /// takes no claim and needs no control round-trip. `None` ⇒ the daemon was built with no GitHub
     /// access and the manager's pull-request reads have no answer to give.
     pub(crate) manager_gh: Option<std::sync::Arc<dyn crate::ghsummons::ManagerGhSource>>,
+
+    /// The SAME off-loop investigation runtime as the orchestrator (STUDIO-1135). Only live
+    /// manager run ids are bound; requests never carry a caller-selected repository or host path.
+    pub(crate) investigate: Option<std::sync::Arc<crate::investigate::Investigations>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -219,6 +223,7 @@ impl crate::orchestrator::Orchestrator {
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
             manager_gh: self.manager_gh_deps.as_ref().map(std::sync::Arc::clone),
+            investigate: self.investigate.clone(),
         }
     }
 }

@@ -1377,6 +1377,25 @@ facade registers none of them — the manager surface is opt-in via `rhapsodyd m
 The `rhapsody_` prefix keeps the evidence table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the thirteenth name.
 
+### A disposable investigation shell for the manager (STUDIO-1135)
+
+The tech lead design's T-D3 deliberately extends the manager with `investigate(ref, cmd)`:
+repository code can run only in a disposable Docker container, through the host, while the
+manager harness still has no built-in shell, edit or web tools. This has no Go counterpart.
+The manager-only MCP tool proxies the additive, operator-guarded
+`POST /api/v1/manager/investigate?run_id=...`; ordinary workers do not register the tool.
+
+The host verifies the live run's own PR head, provisions a hook-free detached worktree from
+cached mirror objects, mounts it and a dependency cache read-only, and provides writable scratch
+tmpfs. Network, operator credentials, home mounts, capabilities and privilege escalation are
+absent. Limits are 2 CPUs, 4 GiB RAM, 512 processes, ten minutes per command, thirty per session
+and 64 KiB combined output. A separate networked, credential-free warm-up sees dependency metadata
+only and disables npm lifecycle scripts. Boot probes fail closed for this tool alone: the manager
+continues with a typed unavailable reason and a WARN when Docker/image/isolation is unavailable.
+Build instructions, cache/build usage and the explicit real-container acceptance tests are in
+[`docker/investigate/README.md`](docker/investigate/README.md). Existing ported endpoints, schemas,
+goldens and ordinary-worker tool sets are unchanged.
+
 ### The manager intervention lifecycle — one active per PR, leased runs, atomic budgets (STUDIO-1015)
 
 The manager's lifecycle (`manager-agent-design.md` §7.1–§7.5, §10.2) adds one table and three

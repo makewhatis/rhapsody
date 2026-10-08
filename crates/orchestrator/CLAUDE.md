@@ -137,6 +137,12 @@ the `Orchestrator` struct itself. Concretely:
     auto-promote pass writes those with a partial (Backlog-only) view, and letting it mark the set
     "known" would reopen the silent hole.
 
+  - `investigate.rs`'s `Investigations` (STUDIO-1135) — control only binds/releases live manager
+    ids through `bind_teams_run`/`release_teams_run`. Request tasks own Docker, cached detached
+    checkouts, per-session async locks and the warm-up lock. The registry mutex never spans an
+    await. Run release cancels investigation work and schedules cleanup; deadlines also remove
+    idle containers. Failed sandbox self-tests disable this tool only, leaving authority intact.
+
   - `managerselftest.rs`'s `ManagerSelfTestState` — the boot gate and off-loop watcher write
     version-bound verdicts per manager-run entry; the control task reads them at launch and marks
     a rejected login auth-blocked against its dispatch-time fingerprint (STUDIO-1119). Entry

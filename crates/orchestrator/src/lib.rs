@@ -48,6 +48,7 @@ pub mod effective;
 pub mod ghenrich;
 pub mod ghsummons;
 pub mod handoff;
+pub mod investigate;
 pub mod issuelog;
 pub mod lifecycle;
 pub mod liveness;

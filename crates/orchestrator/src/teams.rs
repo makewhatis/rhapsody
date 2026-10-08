@@ -1237,6 +1237,11 @@ impl Orchestrator {
     /// into a commit SHA happens later, off-loop, on the HTTP task that serves
     /// the retain.
     pub(crate) fn bind_teams_run(&self, re: &RunningEntry) {
+        if crate::managerrun::is_manager_key(&re.issue.identifier)
+            && let Some(runtime) = &self.investigate
+        {
+            runtime.bind_run(re.run_id);
+        }
         let Some(mem) = self.teams_memory.as_ref() else {
             return;
         };
@@ -1265,6 +1270,9 @@ impl Orchestrator {
     /// Releases a finished run's binding, so a completed run cannot keep
     /// retaining and the roster's derived status stays live.
     pub(crate) fn release_teams_run(&self, re: &RunningEntry) {
+        if let Some(runtime) = &self.investigate {
+            runtime.release_run(re.run_id);
+        }
         if let Some(mem) = self.teams_memory.as_ref() {
             mem.release_run(re.run_id);
         }

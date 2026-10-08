@@ -136,6 +136,17 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, FacadeError> {
+        self.do_request_timeout(method, path, body, HTTP_TIMEOUT)
+            .await
+    }
+
+    async fn do_request_timeout(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, FacadeError> {
         let base = self.base.as_deref().ok_or_else(|| {
             unreachable(
                 "daemon HTTP API not reachable — set a fixed server.port in WORKFLOW.md so `symphony mcp` can address the daemon",
@@ -149,7 +160,7 @@ impl Client {
             .ok_or_else(|| unreachable("daemon HTTP client unavailable"))?;
 
         let url = format!("{base}{path}");
-        let mut req = http.request(method.clone(), &url);
+        let mut req = http.request(method.clone(), &url).timeout(timeout);
         let body = if method == reqwest::Method::GET {
             body
         } else {
@@ -207,6 +218,22 @@ impl Client {
     ) -> Result<Vec<u8>, FacadeError> {
         self.do_request(reqwest::Method::POST, path, Some(payload))
             .await
+    }
+
+    /// T4: first use may spend 10 minutes warming dependencies, then 10 on the command.
+    /// Keep the Go-parity 15-second timeout on every other tool.
+    pub(crate) async fn post_investigate(
+        &self,
+        path: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, FacadeError> {
+        self.do_request_timeout(
+            reqwest::Method::POST,
+            path,
+            Some(payload),
+            Duration::from_secs(1320),
+        )
+        .await
     }
 
     /// Fetches and decodes `GET /api/v1/state` (client.go's `getState`).
